@@ -583,7 +583,15 @@ public final class Qwen3Model: LanguageModel {
                     device: device
                 )
             }
-        case .auraQuantized(let scheme):
+        case .auraQuantized(let requestedScheme):
+            // Auto-asymmetric policy: GQA ≥ 6 amplifies K-quantization
+            // error across the shared-K-head fan-out, so bump K to
+            // 8-bit when the model is in that regime (mirrors canonical
+            // TQ+'s TURBO_AUTO_ASYMMETRIC env behavior). Default ON;
+            // FFAI_AURA_AUTO_ASYM=0 disables.
+            let gqaFactor = nHeads / max(nKVHeads, 1)
+            let scheme = AURAScheme.autoAsymmetric(
+                requested: requestedScheme, gqaFactor: gqaFactor)
             // Codebooks are shared across layers (Lloyd-Max levels are
             // dim-only — no per-layer statistics baked in yet). Rotations
             // are per-layer: each Π_l is an SRHT matrix seeded by the
