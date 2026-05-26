@@ -76,7 +76,8 @@ struct AuraKLDIntegrationTests {
             print("baselineSmoke skipped: \(qwen3LocalPath) not found")
             return
         }
-        let trace = try await emitTrace(kvCache: .raw, scheme: nil)
+        let trace = try await emitTrace(
+            kvCache: .raw, scheme: nil, decodePath: .dequantMirror)
         // Self-KLD should be ~0 across positions (same logits both sides).
         let metrics = LogitsEmitter.compare(
             baseline: trace.logits, codec: trace.logits, tokenIds: trace.tokenIds)
@@ -113,6 +114,14 @@ struct AuraKLDIntegrationTests {
         #expect(metrics.sameTopFraction > 0.40, "\(sameTopMsg)")
         #expect(metrics.meanKld < 1.5, "\(meanKldMsg)")
     }
+
+    // TODO(#152): Re-enable when Ops.auraFlashSdpa integration bug is
+    // fixed. First wiring attempt produced mean_kld=14.3 / same_top=0%
+    // on aura4v4 (vs dequant-mirror's 1.24 / 47.5%) so the call site
+    // has a bug somewhere in (q-rotation convention, grid layout,
+    // sinks/has_sinks handling). Wrapper exists in Ops.swift; the
+    // model-layer call site (Qwen3Layer.forward) currently downgrades
+    // `.compressed` to `.dequantMirror` silently.
 
     @Test("AURA aura8v4 — TQ+ production recipe (high-bit K, aggressive V)")
     func aura8v4() async throws {
@@ -194,11 +203,13 @@ struct AuraKLDIntegrationTests {
     /// with the given scheme), emit per-position logits over the
     /// sample prompt for both, and aggregate the KLD.
     private func runKLDComparison(
-        scheme: AURAScheme
+        scheme: AURAScheme, decodePath: AURADecodePath = .dequantMirror
     ) async throws -> KLDivergence.AggregateMetrics {
-        let baselineTrace = try await emitTrace(kvCache: .raw, scheme: nil)
+        let baselineTrace = try await emitTrace(
+            kvCache: .raw, scheme: nil, decodePath: .dequantMirror)
         let codecTrace = try await emitTrace(
-            kvCache: .auraQuantized(scheme: scheme), scheme: scheme)
+            kvCache: .auraQuantized(scheme: scheme), scheme: scheme,
+            decodePath: decodePath)
         let tokenIds = baselineTrace.tokenIds
         return LogitsEmitter.compare(
             baseline: baselineTrace.logits,
@@ -217,14 +228,13 @@ struct AuraKLDIntegrationTests {
     /// runs — a 0.6B 4-bit model is small but two side-by-side
     /// instances would still cost ~600 MB.
     private func emitTrace(
-        kvCache: KVCacheKind, scheme: AURAScheme?
+        kvCache: KVCacheKind, scheme: AURAScheme?,
+        decodePath: AURADecodePath
     ) async throws -> Trace {
         var optsBuilder = LoadOptions()
         optsBuilder.prewarm = false
         optsBuilder.kvCache = kvCache
-        // dequantMirror = the only AURA path actually wired in main today;
-        // the compressed flash kernels exist but the wrapper falls back.
-        optsBuilder.auraDecodePath = .dequantMirror
+        optsBuilder.auraDecodePath = decodePath
         let opts = optsBuilder
         let m = try await ModelLoadLock.shared.loadSerially {
             try await Model.load(qwen3LocalPath, options: opts)

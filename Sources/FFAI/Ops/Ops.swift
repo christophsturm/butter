@@ -4738,6 +4738,189 @@ public enum Ops {
     ///   * `x.dtype == rotation.dtype` (gemv requires matched dtypes —
     ///     the caller is expected to keep an activation-dtype copy of
     ///     the rotation alongside the f32 copy required by `auraEncode`)
+    /// AURA flash-SDPA (compressed decode). Walks the packed K + V
+    /// buffers directly — no dequant-to-mirror — saving a per-decode
+    /// `nKVHeads × maxSeq × headDim` materialisation. At Qwen3-1.7B /
+    /// maxSeq=32K that's ~1.8 GB of working-buffer reads eliminated per
+    /// decode step.
+    ///
+    /// Caller must:
+    ///   - have already applied Π to `q` (matches the existing
+    ///     `dequantMirror` decode path — Π applied to Q before SDPA so
+    ///     scores cancel; Π^T applied to the output before oProj).
+    ///   - confirm `supportsFlashSdpa(scheme:headDim:)` is true; this
+    ///     wrapper only covers the metaltile flash variants currently
+    ///     emitted: (kb=4, vb=2) and (kb=4, vb=4) × d ∈ {64, 128}.
+    ///   - own + pass a `sinks` tensor of shape `[nQHeads]` (zeroed +
+    ///     `hasSinks=false` gives a no-op attention-sink path).
+    ///
+    /// The kernel takes `q_rot` as fp32; this wrapper casts on the
+    /// caller's behalf into a scratch buffer if needed. Output dtype
+    /// is the model's activation dtype.
+    public static func auraFlashSdpa(
+        q: Tensor, sinks: Tensor,
+        kPacked: Tensor, kNorms: Tensor, kCodebook: Tensor,
+        vPacked: Tensor, vNorms: Tensor, vCodebook: Tensor,
+        into out: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        kPackedWidth: Int, vPackedWidth: Int,
+        liveLength: Int,
+        keyBits: Int, valueBits: Int,
+        hasSinks: Bool = false, windowSize: Int = 0,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            nQHeads % nKVHeads == 0,
+            "Ops.auraFlashSdpa: nQHeads (\(nQHeads)) must be divisible by nKVHeads (\(nKVHeads))")
+        precondition(
+            kPacked.dtype == .u32 && vPacked.dtype == .u32,
+            "Ops.auraFlashSdpa: packed K/V must be u32")
+        precondition(
+            kNorms.dtype == .f32 && vNorms.dtype == .f32
+                && kCodebook.dtype == .f32 && vCodebook.dtype == .f32,
+            "Ops.auraFlashSdpa: norms + codebooks must be f32")
+        precondition(
+            sinks.dtype == .f32,
+            "Ops.auraFlashSdpa: sinks must be f32")
+
+        // Cast Q to fp32 if needed; the flash kernel pins q_rot dtype.
+        let qF32: Tensor
+        if q.dtype == .f32 {
+            qF32 = q
+        } else {
+            let scratch = Tensor.empty(
+                shape: q.shape, dtype: .f32, device: .shared)
+            castToF32(q, into: scratch, on: cmd)
+            qF32 = scratch
+        }
+
+        let dim = UInt32(headDim)
+        let kpw = UInt32(kPackedWidth)
+        let vpw = UInt32(vPackedWidth)
+        let tokens = UInt32(liveLength)
+        let repeatCount = UInt32(nQHeads / nKVHeads)
+        let numQ = UInt32(nQHeads)
+        let sinksFlag: UInt32 = hasSinks ? 1 : 0
+        let win = UInt32(windowSize)
+
+        // Grid invariant from `aura_flash_sdpa.rs`: one simdgroup per
+        // Q head. grid = [32, nQHeads, 1], tg = [32, 1, 1].
+        let grid = MTLSize(width: 32, height: nQHeads, depth: 1)
+        let tg = MTLSize(width: 32, height: 1, depth: 1)
+
+        switch (keyBits, valueBits, headDim, out.dtype) {
+        case (4, 2, 128, .f32):
+            MetalTileKernels.aura_flash_sdpa_kb4_vb2_d128_f32(
+                q_rot: qF32.buffer, q_rotOffset: qF32.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, repeat_count: repeatCount, num_q_heads: numQ,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 2, 128, .f16):
+            MetalTileKernels.aura_flash_sdpa_kb4_vb2_d128_f16(
+                q_rot: qF32.buffer, q_rotOffset: qF32.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, repeat_count: repeatCount, num_q_heads: numQ,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 2, 128, .bf16):
+            MetalTileKernels.aura_flash_sdpa_kb4_vb2_d128_bf16(
+                q_rot: qF32.buffer, q_rotOffset: qF32.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, repeat_count: repeatCount, num_q_heads: numQ,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 4, 128, .f32):
+            MetalTileKernels.aura_flash_sdpa_kb4_vb4_d128_f32(
+                q_rot: qF32.buffer, q_rotOffset: qF32.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, repeat_count: repeatCount, num_q_heads: numQ,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 4, 128, .f16):
+            MetalTileKernels.aura_flash_sdpa_kb4_vb4_d128_f16(
+                q_rot: qF32.buffer, q_rotOffset: qF32.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, repeat_count: repeatCount, num_q_heads: numQ,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 4, 128, .bf16):
+            MetalTileKernels.aura_flash_sdpa_kb4_vb4_d128_bf16(
+                q_rot: qF32.buffer, q_rotOffset: qF32.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, repeat_count: repeatCount, num_q_heads: numQ,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            preconditionFailure(
+                "Ops.auraFlashSdpa: unsupported (keyBits=\(keyBits), "
+                    + "valueBits=\(valueBits), headDim=\(headDim), "
+                    + "dtype=\(out.dtype)). Caller must check "
+                    + "supportsFlashSdpa(scheme:headDim:dtype:) first.")
+        }
+    }
+
+    /// Predicate for the `auraFlashSdpa` supported-scheme set. Returns
+    /// true when the metaltile flash kernel exists for this combo.
+    public static func supportsAuraFlashSdpa(
+        keyBits: Int, valueBits: Int, headDim: Int, dtype: DType
+    ) -> Bool {
+        guard [DType.f32, .f16, .bf16].contains(dtype) else { return false }
+        // d=64 metaltile kernels exist but FFAI side hasn't wired their
+        // Ops dispatch yet — gate to d=128 (Qwen3 / Llama-3 family).
+        guard headDim == 128 else { return false }
+        if keyBits == 4 && (valueBits == 2 || valueBits == 4) { return true }
+        return false
+    }
+
     public static func auraRotatePerHead(
         _ x: Tensor, rotation: Tensor,
         nHeads: Int, headDim: Int,

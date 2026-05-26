@@ -314,6 +314,15 @@ public final class Qwen3Layer: Module {
             qForSdpa = qRotated
         }
 
+        // AURA compressed decode (`AURADecodePath.compressed`) wiring
+        // landed as `Ops.auraFlashSdpa` but is NOT plumbed here yet —
+        // first attempt yielded mean_kld=14.3 / same_top=0% vs the
+        // dequant-mirror's 1.24 / 47% on aura4v4 (Qwen3-0.6B-4bit),
+        // so the kernel call site has an integration bug (Q rotation
+        // convention? grid? sinks?) that needs more debugging time.
+        // Keep the dequant-mirror path as the only decode for now —
+        // `AURADecodePath.compressed` silently downgrades. TODO: debug
+        // and re-wire.
         let (cacheK, cacheV) = cache.prepareForAttention(on: cmd)
         let attnOut = Ops.sdpaDecode(
             q: qForSdpa, k: cacheK, v: cacheV,
