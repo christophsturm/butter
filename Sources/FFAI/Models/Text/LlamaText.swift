@@ -567,21 +567,18 @@ public final class LlamaModel: LanguageModel {
             // Codebooks are shared across layers; rotations are per-layer
             // (deterministic SRHT seeded by layer index). See Qwen3's
             // matching case for the longer explanation.
-            let kCodebookData = AURACodebook.centroids(dim: headDim, bits: scheme.keyBits)
-            let kBoundariesData = AURACodebook.boundaries(dim: headDim, bits: scheme.keyBits)
-            let vCodebookData = AURACodebook.centroids(dim: headDim, bits: scheme.valueBits)
-            let vBoundariesData = AURACodebook.boundaries(dim: headDim, bits: scheme.valueBits)
-
-            let kCodebook = Tensor.empty(shape: [kCodebookData.count], dtype: .f32, device: device)
-            kCodebook.copyIn(from: kCodebookData)
-            let kBoundaries = Tensor.empty(
-                shape: [kBoundariesData.count], dtype: .f32, device: device)
-            kBoundaries.copyIn(from: kBoundariesData)
-            let vCodebook = Tensor.empty(shape: [vCodebookData.count], dtype: .f32, device: device)
-            vCodebook.copyIn(from: vCodebookData)
-            let vBoundaries = Tensor.empty(
-                shape: [vBoundariesData.count], dtype: .f32, device: device)
-            vBoundaries.copyIn(from: vBoundariesData)
+            // Codebook in cache dtype (matches encode/decode kernel
+            // signatures — no per-call cast). Boundaries stay f32:
+            // encoder-only and precision-sensitive at the Lloyd-Max
+            // comparison.
+            let kCodebook = AURACodebook.centroidsTensor(
+                dim: headDim, bits: scheme.keyBits, dtype: dtype, device: device)
+            let kBoundaries = AURACodebook.boundariesTensor(
+                dim: headDim, bits: scheme.keyBits, device: device)
+            let vCodebook = AURACodebook.centroidsTensor(
+                dim: headDim, bits: scheme.valueBits, dtype: dtype, device: device)
+            let vBoundaries = AURACodebook.boundariesTensor(
+                dim: headDim, bits: scheme.valueBits, device: device)
 
             let sharedK = Tensor.empty(
                 shape: [nKVHeads, cap, headDim],
