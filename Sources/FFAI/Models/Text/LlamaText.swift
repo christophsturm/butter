@@ -556,10 +556,14 @@ public final class LlamaModel: LanguageModel {
         case .auraQuantized(let requestedScheme):
             // Auto-asymmetric policy: bump K to 8-bit when GQA ≥ 6.
             // Mirrors canonical TQ+'s TURBO_AUTO_ASYMMETRIC behavior.
-            // Disable via FFAI_AURA_AUTO_ASYM=0.
+            // **Opt-in** — default OFF; set `FFAI_AURA_AUTO_ASYM=1` to
+            // enable. A per-load `LoadOptions` flag will replace the
+            // env knob in a follow-up.
             let gqaFactor = nHeads / max(nKVHeads, 1)
-            let scheme = AURAScheme.autoAsymmetric(
-                requested: requestedScheme, gqaFactor: gqaFactor)
+            let scheme: AURAScheme = AURAScheme.autoAsymmetricOptedIn
+                ? AURAScheme.autoAsymmetric(
+                    requested: requestedScheme, gqaFactor: gqaFactor)
+                : requestedScheme
             // Codebooks are shared across layers; rotations are per-layer
             // (deterministic SRHT seeded by layer index). See Qwen3's
             // matching case for the longer explanation.

@@ -91,7 +91,13 @@ public struct AURAScheme: Sendable, Equatable, Hashable {
     ///   - If `gqaFactor ≥ 6` and `requested.keyBits == 8`, return
     ///     `requested` unchanged (already protected).
     ///
-    /// Disable via env: `FFAI_AURA_AUTO_ASYM=0`.
+    /// Pure resolver — always applies the policy when conditions are
+    /// met. **The policy itself is not opt-in here**; the opt-in lives
+    /// at the call site (model loaders gate this on
+    /// `FFAI_AURA_AUTO_ASYM=1`, and a per-load `LoadOptions` flag will
+    /// replace the env knob in a follow-up). Tests + future API
+    /// callers that want the canonical TQ+ behaviour can invoke this
+    /// directly without env coupling.
     ///
     /// Canonical-source mapping: TURBO_AUTO_ASYMMETRIC in
     /// `~/local_llms/llama.cpp/src/llama-kv-cache.cpp`. Threshold = 6
@@ -99,16 +105,17 @@ public struct AURAScheme: Sendable, Equatable, Hashable {
     public static func autoAsymmetric(
         requested: AURAScheme, gqaFactor: Int
     ) -> AURAScheme {
-        if !autoAsymmetricEnabled { return requested }
         if gqaFactor < 6 { return requested }
         if requested.keyBits >= 8 { return requested }
         return AURAScheme(keyBits: 8, valueBits: requested.valueBits)
     }
 
-    /// Read once at module load — `FFAI_AURA_AUTO_ASYM=0` disables the
-    /// policy. Default is ON, matching canonical TQ+.
-    private static let autoAsymmetricEnabled: Bool = {
-        ProcessInfo.processInfo.environment["FFAI_AURA_AUTO_ASYM"] != "0"
+    /// True when the caller has opted into the auto-asymmetric policy
+    /// via `FFAI_AURA_AUTO_ASYM=1`. Read once at module load. Default
+    /// OFF — Eric's "no magic by default" stance: the caller must
+    /// explicitly request the policy.
+    public static let autoAsymmetricOptedIn: Bool = {
+        ProcessInfo.processInfo.environment["FFAI_AURA_AUTO_ASYM"] == "1"
     }()
 
     /// Parse a CLI / config string. Accepts:
