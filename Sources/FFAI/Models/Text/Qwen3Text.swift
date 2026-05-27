@@ -314,21 +314,58 @@ public final class Qwen3Layer: Module {
             qForSdpa = qRotated
         }
 
-        // AURA compressed decode (`AURADecodePath.compressed`) wiring
-        // landed as `Ops.auraFlashSdpa` but is NOT plumbed here yet —
-        // first attempt yielded mean_kld=14.3 / same_top=0% vs the
-        // dequant-mirror's 1.24 / 47% on aura4v4 (Qwen3-0.6B-4bit),
-        // so the kernel call site has an integration bug (Q rotation
-        // convention? grid? sinks?) that needs more debugging time.
-        // Keep the dequant-mirror path as the only decode for now —
-        // `AURADecodePath.compressed` silently downgrades. TODO: debug
-        // and re-wire.
-        let (cacheK, cacheV) = cache.prepareForAttention(on: cmd)
-        let attnOut = Ops.sdpaDecode(
-            q: qForSdpa, k: cacheK, v: cacheV,
-            nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-            nKV: cache.length, kvStride: cache.maxSeq,
-            scale: scale, on: cmd)
+        // Decode path selection:
+        //   • `.compressed` (default) — score Q directly against the
+        //     packed K codes via `aura_flash_sdpa`. V is dequanted per
+        //     tile on chip; no maxSeq-sized mirror is materialised.
+        //     `kvStride = maxSeq` (NOT `length`) — the per-head row
+        //     stride is the allocated cache stride, not the live row
+        //     count. Passing `length` aliases reads across head
+        //     boundaries (metaltile#203).
+        //   • `.dequantMirror` — fully dequant the cache via
+        //     `prepareForAttention` and run the standard sdpaDecode.
+        //     Same quality as compressed, gives back the memory win.
+        // Non-AURA caches always take the dequantMirror branch.
+        let attnOut: Tensor
+        if let auraCache = cache as? AURAQuantizedKVCache,
+            auraCache.decodePath == .compressed,
+            Ops.supportsAuraFlashSdpa(
+                keyBits: auraCache.scheme.keyBits,
+                valueBits: auraCache.scheme.valueBits,
+                headDim: headDim, dtype: h.dtype)
+        {
+            let outTensor = Tensor.empty(
+                shape: [nHeads, headDim], dtype: h.dtype, device: device)
+            // Qwen3 dense has no attention sinks — the kernel gates the
+            // sinks load on `hasSinks=false`, but the wrapper still
+            // requires an f32 buffer to satisfy the dtype precondition.
+            let sinksScratch = Tensor.empty(
+                shape: [nHeads], dtype: .f32, device: device)
+            Ops.auraFlashSdpa(
+                q: qForSdpa, sinks: sinksScratch,
+                kPacked: auraCache.kPacked, kNorms: auraCache.kNorms,
+                kCodebook: auraCache.kCodebook,
+                vPacked: auraCache.vPacked, vNorms: auraCache.vNorms,
+                vCodebook: auraCache.vCodebook,
+                into: outTensor,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                kPackedWidth: auraCache.kPackedWidth,
+                vPackedWidth: auraCache.vPackedWidth,
+                liveLength: auraCache.length, kvStride: auraCache.maxSeq,
+                keyBits: auraCache.scheme.keyBits,
+                valueBits: auraCache.scheme.valueBits,
+                scale: scale,
+                hasSinks: false, windowSize: 0,
+                on: cmd)
+            attnOut = outTensor
+        } else {
+            let (cacheK, cacheV) = cache.prepareForAttention(on: cmd)
+            attnOut = Ops.sdpaDecode(
+                q: qForSdpa, k: cacheK, v: cacheV,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                nKV: cache.length, kvStride: cache.maxSeq,
+                scale: scale, on: cmd)
+        }
 
         let attnReadyForOProj: Tensor
         if let auraCache = cache as? AURAQuantizedKVCache {

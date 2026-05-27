@@ -4773,6 +4773,7 @@ public enum Ops {
         kPackedWidth: Int, vPackedWidth: Int,
         liveLength: Int, kvStride: Int,
         keyBits: Int, valueBits: Int,
+        scale: Float,
         hasSinks: Bool = false, windowSize: Int = 0,
         on cmd: MTLCommandBuffer
     ) {
@@ -4793,16 +4794,27 @@ public enum Ops {
             sinks.dtype == .f32,
             "Ops.auraFlashSdpa: sinks must be f32")
 
-        // Cast Q to fp32 if needed; the flash kernel pins q_rot dtype.
-        let qF32: Tensor
+        // The flash kernel's contract (aura_flash_sdpa.rs header):
+        // `q_rot` is WHT-rotated AND **pre-scaled** by the caller. The
+        // kernel computes `(Q · centroid) * k_norm` with no internal
+        // scale — caller must bake the softmax scale (1/√headDim) into
+        // Q before dispatch. We always allocate a scratch + scale here
+        // so callers get the `sdpaDecode`-equivalent API contract.
+        let qF32 = Tensor.empty(
+            shape: q.shape, dtype: .f32, device: .shared)
         if q.dtype == .f32 {
-            qF32 = q
+            Ops.copy(q, into: qF32, on: cmd)
         } else {
-            let scratch = Tensor.empty(
-                shape: q.shape, dtype: .f32, device: .shared)
-            castToF32(q, into: scratch, on: cmd)
-            qF32 = scratch
+            castToF32(q, into: qF32, on: cmd)
         }
+        // Pre-scale Q in place by `scale`. Allocate a same-shape f32
+        // buffer filled with the scale value and use the existing
+        // element-wise mul kernel — no new metaltile op required.
+        let scaleBuf = Tensor.empty(
+            shape: q.shape, dtype: .f32, device: .shared)
+        let scaleArr = [Float](repeating: scale, count: q.elementCount)
+        scaleBuf.copyIn(from: scaleArr)
+        _ = Ops.mul(qF32, scaleBuf, on: cmd, into: qF32)
 
         let dim = UInt32(headDim)
         let kpw = UInt32(kPackedWidth)

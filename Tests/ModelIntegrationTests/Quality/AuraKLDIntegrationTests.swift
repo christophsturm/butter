@@ -115,13 +115,57 @@ struct AuraKLDIntegrationTests {
         #expect(metrics.meanKld < 1.5, "\(meanKldMsg)")
     }
 
-    // TODO(#152): Re-enable when Ops.auraFlashSdpa integration bug is
-    // fixed. First wiring attempt produced mean_kld=14.3 / same_top=0%
-    // on aura4v4 (vs dequant-mirror's 1.24 / 47.5%) so the call site
-    // has a bug somewhere in (q-rotation convention, grid layout,
-    // sinks/has_sinks handling). Wrapper exists in Ops.swift; the
-    // model-layer call site (Qwen3Layer.forward) currently downgrades
-    // `.compressed` to `.dequantMirror` silently.
+    @Test("AURA aura4v4 COMPRESSED flash decode — matches dequant-mirror quality")
+    func aura4v4Compressed() async throws {
+        guard FileManager.default.fileExists(atPath: qwen3LocalPath) else {
+            print("aura4v4 compressed skipped: \(qwen3LocalPath) not found")
+            return
+        }
+        let metrics = try await runKLDComparison(
+            scheme: .default, decodePath: .compressed)
+        print(
+            KLDivergence.summaryLine(
+                label: "aura4v4 compressed (flash)", metrics: metrics))
+        // Compressed flash should match dequant-mirror quality exactly
+        // (same codec, just different decode dispatch). Floors mirror
+        // aura4v4VsBaseline since the math is identical — a regression
+        // here means the flash kernel diverged from the dequant ref.
+        let sameTopStr = String(format: "%.4f", metrics.sameTopFraction)
+        let meanKldStr = String(format: "%.4f", metrics.meanKld)
+        #expect(
+            metrics.sameTopFraction > 0.40,
+            "compressed flash same_top \(sameTopStr) below dequant-mirror floor 0.40")
+        #expect(
+            metrics.meanKld < 1.5,
+            "compressed flash mean_kld \(meanKldStr) above dequant-mirror ceiling 1.5")
+    }
+
+    @Test("AURA aura4v2 COMPRESSED flash decode — production recipe via flash")
+    func aura4v2Compressed() async throws {
+        guard FileManager.default.fileExists(atPath: qwen3LocalPath) else {
+            print("aura4v2 compressed skipped: \(qwen3LocalPath) not found")
+            return
+        }
+        let metrics = try await runKLDComparison(
+            scheme: AURAScheme(keyBits: 4, valueBits: 2), decodePath: .compressed)
+        print(
+            KLDivergence.summaryLine(
+                label: "aura4v2 compressed (flash)", metrics: metrics))
+        // Flash kernel shows a small residual gap vs dequant-mirror at
+        // 2-bit V (compressed same_top ≈ 0.31 vs dequant-mirror's 0.43;
+        // mean_kld 2.05 vs 1.93). aura4v4 matches dequant-mirror
+        // exactly so the gap is in the 2-bit-V code path of
+        // `aura_flash_sdpa.rs`, not the wiring. P1c per-group fp8
+        // scale is the canonical fix.
+        let sameTopStr = String(format: "%.4f", metrics.sameTopFraction)
+        let meanKldStr = String(format: "%.4f", metrics.meanKld)
+        #expect(
+            metrics.sameTopFraction > 0.25,
+            "compressed flash same_top \(sameTopStr) below 0.25 — regression beyond known 2-bit-V gap")
+        #expect(
+            metrics.meanKld < 3.0,
+            "compressed flash mean_kld \(meanKldStr) above aggressive-V ceiling 3.0")
+    }
 
     @Test("AURA aura8v4 — TQ+ production recipe (high-bit K, aggressive V)")
     func aura8v4() async throws {
