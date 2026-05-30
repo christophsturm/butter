@@ -101,19 +101,19 @@ public final class LFM2ConvCache: LayerCacheProtocol, @unchecked Sendable {
 
 // ─── Variants ────────────────────────────────────────────────────────
 
-/// LFM2 (original, 65536-vocab) greedy default — conservative and
-/// deterministic. Shared by both the dense and MoE variants as their
-/// static default; `loadLFM2` swaps in `lfm25DefaultGenerationParameters`
-/// for the LFM2.5 collection. Integration tests pass an explicit
-/// `temperature: 0`, so they stay deterministic regardless of this value.
+/// LFM2 (original, 65536-vocab) recommended sampling defaults from
+/// LiquidAI's model card: temperature 0.3, min-p 0.15, repetition-penalty
+/// 1.05. Shared by both the dense and MoE variants as their static default;
+/// `loadLFM2` swaps in `lfm25DefaultGenerationParameters` for the LFM2.5
+/// collection (which recommends top-p instead of min-p).
 let lfm2DefaultGenerationParameters = GenerationParameters(
     maxTokens: 256,
     prefillStepSize: 1024,
-    temperature: 0.0,
+    temperature: 0.3,
     topP: 1.0,
     topK: 0,
-    minP: 0.0,
-    repetitionPenalty: 1.0
+    minP: 0.15,
+    repetitionPenalty: 1.05
 )
 
 /// LFM2.5 recommended sampling defaults (LiquidAI model card): temperature

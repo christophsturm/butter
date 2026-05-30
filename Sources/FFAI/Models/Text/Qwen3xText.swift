@@ -147,14 +147,17 @@ enum Qwen35LayerKind: Equatable {
 public struct Qwen35Hybrid: Qwen35Variant {
     public static let availableCapabilities: Set<Capability> = [.textIn, .textOut]
 
-    /// Qwen3.5 ships both base + instruction-tuned checkpoints. Greedy
-    /// by default keeps the integration suite deterministic.
+    /// Qwen3.5 / 3.6 recommended sampling defaults from the Qwen model card
+    /// (thinking mode, general tasks): temperature 1.0, top-p 0.95,
+    /// top-k 20, min-p 0.0, presence-penalty 0.0, repetition-penalty 1.0.
+    /// (The card lists separate coding / non-thinking recipes; this is the
+    /// general-purpose thinking default.)
     public static let defaultGenerationParameters = GenerationParameters(
         maxTokens: 256,
         prefillStepSize: 1024,
-        temperature: 0.0,
-        topP: 1.0,
-        topK: 0,
+        temperature: 1.0,
+        topP: 0.95,
+        topK: 20,
         minP: 0.0,
         repetitionPenalty: 1.0
     )
@@ -3040,9 +3043,19 @@ public final class Qwen35Model: LanguageModel {
         memcpy(tokenBuf.contents(), &tid, 4)
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
 
+        // `InspectTap` is a no-op unless FFAI_INSPECT is set (single bool
+        // compare per boundary); under `ffai inspect --layer-trace` it
+        // prints per-layer min/max/nan/inf + first values, committing the
+        // work buffer to make `h` resident before each readback — which
+        // composes with the committing-layer discipline below (GDN /
+        // MoE-bearing layers commit `workCmd` mid-stack).
+        let tap = InspectTap.fromEnvironment
+
         // The embedding + layers run on internal buffers — never `cmd`.
         var workCmd = device.makeCommandBuffer()
         var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
+        workCmd = tap.dumpLayerBoundary(
+            h, label: "embed", layer: -1, cmd: workCmd, device: device)
 
         for (i, layer) in layers.enumerated() {
             h = layer.decode(
@@ -3056,6 +3069,8 @@ public final class Qwen35Model: LanguageModel {
             default: committed = false
             }
             if committed { workCmd = device.makeCommandBuffer() }
+            workCmd = tap.dumpLayerBoundary(
+                h, label: "layer_out", layer: i, cmd: workCmd, device: device)
         }
 
         // If the last layer was a non-committing attention layer with a

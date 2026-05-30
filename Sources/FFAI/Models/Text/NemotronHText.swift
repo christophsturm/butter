@@ -124,13 +124,14 @@ enum NemotronHLayerKind: Equatable {
 public struct NemotronHHybrid: NemotronHVariant {
     public static let availableCapabilities: Set<Capability> = [.textIn, .textOut]
 
-    /// NemotronH ships both `-Base` and `-Instruct` checkpoints. Greedy
-    /// by default keeps the integration suite deterministic.
+    /// Nemotron-H recommended sampling defaults (NVIDIA reasoning-mode
+    /// card): temperature 0.6, top-p 0.95. (Non-reasoning instruct mode
+    /// recommends greedy; we default to the reasoning-mode sampling.)
     public static let defaultGenerationParameters = GenerationParameters(
         maxTokens: 256,
         prefillStepSize: 256,
-        temperature: 0.0,
-        topP: 1.0,
+        temperature: 0.6,
+        topP: 0.95,
         topK: 0,
         minP: 0.0,
         repetitionPenalty: 1.0
@@ -1172,20 +1173,33 @@ public final class NemotronHModel: LanguageModel {
         memcpy(tokenBuf.contents(), &tid, 4)
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
 
+        // `InspectTap` is a no-op unless FFAI_INSPECT is set (single bool
+        // compare per boundary); under `ffai inspect --layer-trace` it
+        // prints per-layer min/max/nan/inf + first values, committing the
+        // work buffer to make `h` resident before each readback — which
+        // composes with the committing-layer discipline below. When
+        // inactive it returns the supplied buffer unchanged.
+        let tap = InspectTap.fromEnvironment
+
         // Without any MoE layer, the entire forward queues onto `cmd`
         // exactly like before (the workCmd path needs an internal
         // commit per committing-layer transition). Pick the cheaper
         // path per checkpoint.
         let hasCommittingLayer = layerKinds.contains(.moe)
         if !hasCommittingLayer {
-            var h = embedTokens(tokenTensor, on: cmd).reshaped(to: [hidden])
+            var workCmd = cmd
+            var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
+            workCmd = tap.dumpLayerBoundary(
+                h, label: "embed", layer: -1, cmd: workCmd, device: device)
             for (i, layer) in layers.enumerated() {
                 h = layer.decode(
                     h, position: position, cache: caches[i],
-                    cmd: cmd, device: device)
+                    cmd: workCmd, device: device)
+                workCmd = tap.dumpLayerBoundary(
+                    h, label: "layer_out", layer: i, cmd: workCmd, device: device)
             }
-            let normed = finalNorm(h, on: cmd)
-            return lmHead(normed, on: cmd)
+            let normed = finalNorm(h, on: workCmd)
+            return lmHead(normed, on: workCmd)
         }
 
         // MoE-bearing checkpoint: run every layer on a private buffer
@@ -1193,6 +1207,8 @@ public final class NemotronHModel: LanguageModel {
         // the work buffer after each layer that commits.
         var workCmd = device.makeCommandBuffer()
         var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
+        workCmd = tap.dumpLayerBoundary(
+            h, label: "embed", layer: -1, cmd: workCmd, device: device)
         for (i, layer) in layers.enumerated() {
             h = layer.decode(
                 h, position: position, cache: caches[i],
@@ -1203,6 +1219,8 @@ public final class NemotronHModel: LanguageModel {
             if layerKinds[i] == .moe {
                 workCmd = device.makeCommandBuffer()
             }
+            workCmd = tap.dumpLayerBoundary(
+                h, label: "layer_out", layer: i, cmd: workCmd, device: device)
         }
         // Final embedding → norm + lm_head on the caller's pristine
         // `cmd`. `h` is resident (the work buffer either committed via

@@ -67,15 +67,15 @@ public struct GPTOSSMoEVariant: GPTOSSVariant, ReasoningCapable {
         .low, .medium, .high,
     ]
 
-    /// GPT-OSS-20B greedy defaults — keeps the integration suite
-    /// deterministic. 2048-token prefill chunk matches mlx-swift-lm's
-    /// audited optimum (pure-attention model, no SSM bottleneck).
-    /// Reasoning defaults to `.none` (disabled until the caller
-    /// explicitly opts in) per the FFAI convention.
+    /// GPT-OSS recommended sampling defaults (OpenAI): temperature 1.0,
+    /// top-p 1.0, top-k disabled. 2048-token prefill chunk matches
+    /// mlx-swift-lm's audited optimum (pure-attention model, no SSM
+    /// bottleneck). Reasoning defaults to `.none` (disabled until the
+    /// caller explicitly opts in) per the FFAI convention.
     public static let defaultGenerationParameters = GenerationParameters(
         maxTokens: 256,
         prefillStepSize: 2048,
-        temperature: 0.0,
+        temperature: 1.0,
         topP: 1.0,
         topK: 0,
         minP: 0.0,
@@ -882,6 +882,14 @@ public final class GPTOSSModel: LanguageModel {
         memcpy(tokenBuf.contents(), &tid, 4)
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
 
+        // `InspectTap` is a no-op unless FFAI_INSPECT is set (single bool
+        // compare per boundary); under `ffai inspect --layer-trace` it
+        // prints per-layer min/max/nan/inf + first values, committing the
+        // work buffer to make `h` resident before each readback. Each
+        // GPT-OSS layer already commits its own buffer, so the per-layer
+        // tap runs on a fresh buffer after the decode.
+        let tap = InspectTap.fromEnvironment
+
         // Embedding runs on an internal buffer — never `cmd`. Commit it
         // so `h` is resident before layer 0's host-side input RMSNorm
         // reads it.
@@ -889,6 +897,10 @@ public final class GPTOSSModel: LanguageModel {
         var h = embedTokens(tokenTensor, on: embedCmd).reshaped(to: [hidden])
         embedCmd.commit()
         embedCmd.waitUntilCompleted()
+        if tap.active {
+            _ = tap.dumpLayerBoundary(
+                h, label: "embed", layer: -1, cmd: device.makeCommandBuffer(), device: device)
+        }
 
         for (i, layer) in layers.enumerated() {
             guard let kv = caches[i] as? any KVCacheProtocol else {
@@ -903,6 +915,11 @@ public final class GPTOSSModel: LanguageModel {
             h = layer.decode(
                 h, position: position, cache: kv,
                 cmd: layerCmd, device: device)
+            // The layer committed `layerCmd`; tap on a fresh buffer.
+            if tap.active {
+                _ = tap.dumpLayerBoundary(
+                    h, label: "layer_out", layer: i, cmd: device.makeCommandBuffer(), device: device)
+            }
         }
 
         // `h` is resident (the last layer committed). The final RMSNorm

@@ -40,13 +40,13 @@ struct Granite4TextVariantTests {
 
     /// Granite-4 ships base + instruction-tuned checkpoints. Greedy by
     /// default keeps the integration suite deterministic.
-    @Test("Granite4Hybrid default generation parameters are greedy")
+    @Test("Granite4Hybrid default generation parameters match the IBM card")
     func defaultGenerationParameters() {
         let p = Granite4Hybrid.defaultGenerationParameters
         #expect(p.maxTokens > 0)
-        #expect(p.temperature == 0.0)
-        #expect(p.topP == 1.0)
-        #expect(p.topK == 0)
+        #expect(p.temperature == 0.6)
+        #expect(p.topP == 0.9)
+        #expect(p.topK == 50)
     }
 
     // ─── Forward MoE-commit path (was GraniteMoeHybridForwardTests) ─────────

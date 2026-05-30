@@ -37,12 +37,12 @@ struct FalconH1TextTests {
 
     /// FalconH1 ships `-Instruct` chat-tuned checkpoints. Greedy by
     /// default keeps integration tests deterministic.
-    @Test("FalconH1Hybrid default generation parameters are greedy")
+    @Test("FalconH1Hybrid default generation parameters match the TII card")
     func defaultGenerationParameters() {
         let p = FalconH1Hybrid.defaultGenerationParameters
         #expect(p.maxTokens > 0)
-        #expect(p.temperature == 0.0)
-        #expect(p.topP == 1.0)
+        #expect(p.temperature == 0.1)
+        #expect(p.topP == 0.95)
         #expect(p.topK == 0)
     }
 }

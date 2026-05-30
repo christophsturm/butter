@@ -40,13 +40,13 @@ struct Qwen35HybridTests {
 
     /// Qwen 3.5 ships base + instruction-tuned checkpoints. Greedy by
     /// default keeps the integration suite deterministic.
-    @Test("Qwen35Hybrid default generation parameters are greedy")
+    @Test("Qwen35Hybrid default generation parameters match the Qwen card")
     func defaultGenerationParameters() {
         let p = Qwen35Hybrid.defaultGenerationParameters
         #expect(p.maxTokens > 0)
-        #expect(p.temperature == 0.0)
-        #expect(p.topP == 1.0)
-        #expect(p.topK == 0)
+        #expect(p.temperature == 1.0)
+        #expect(p.topP == 0.95)
+        #expect(p.topK == 20)
         #expect((p.prefillStepSize ?? 0) >= 256)
     }
 }

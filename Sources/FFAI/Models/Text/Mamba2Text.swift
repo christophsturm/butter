@@ -35,17 +35,19 @@ import Metal
 public struct Mamba2Dense: Mamba2Variant {
     public static let availableCapabilities: Set<Capability> = [.textIn, .textOut]
 
-    /// Mamba 2 defaults. Greedy by default (the published checkpoints
-    /// are base-LM only — no chat tuning yet). Prefill step size is a
-    /// non-op until chunked-prefill ships.
+    /// Mamba 2 defaults. The published checkpoints are base-LM only (no
+    /// official sampling rec), so these follow the upstream `mamba`
+    /// generate example: temperature 0.7, top-p 0.9, repetition-penalty
+    /// 1.2 (base SSMs loop without a repetition penalty). Prefill step
+    /// size is a non-op until chunked-prefill ships.
     public static let defaultGenerationParameters = GenerationParameters(
         maxTokens: 256,
         prefillStepSize: 256,
-        temperature: 0.0,
-        topP: 1.0,
+        temperature: 0.7,
+        topP: 0.9,
         topK: 0,
         minP: 0.0,
-        repetitionPenalty: 1.0
+        repetitionPenalty: 1.2
     )
 
     public static func loadModel(
@@ -396,16 +398,29 @@ public final class Mamba2Model: LanguageModel {
         var tid = UInt32(tokenId)
         memcpy(tokenBuf.contents(), &tid, 4)
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
-        var h = embedTokens(tokenTensor, on: cmd).reshaped(to: [hidden])
+
+        // `InspectTap` is a no-op unless FFAI_INSPECT is set (single bool
+        // compare per boundary); under `ffai inspect --layer-trace` it
+        // prints per-layer min/max/nan/inf + first values, committing the
+        // work buffer to make `h` resident before each readback. When
+        // inactive it returns the supplied `cmd` unchanged, so the layer
+        // stack runs on the caller's buffer exactly as before.
+        let tap = InspectTap.fromEnvironment
+        var workCmd = cmd
+        var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
+        workCmd = tap.dumpLayerBoundary(
+            h, label: "embed", layer: -1, cmd: workCmd, device: device)
 
         for (i, layer) in layers.enumerated() {
             h = layer.forward(
                 h, cache: caches[i] as! Mamba2LayerCache,
-                cmd: cmd, device: device)
+                cmd: workCmd, device: device)
+            workCmd = tap.dumpLayerBoundary(
+                h, label: "layer_out", layer: i, cmd: workCmd, device: device)
         }
 
-        let normed = finalNorm(h, on: cmd)
-        return lmHead(normed, on: cmd)
+        let normed = finalNorm(h, on: workCmd)
+        return lmHead(normed, on: workCmd)
     }
 
     // `forward`, `forwardSample`, `forwardSampleCategorical` come from

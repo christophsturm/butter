@@ -34,14 +34,13 @@ import Metal
 public struct FalconH1Hybrid: FalconH1Variant {
     public static let availableCapabilities: Set<Capability> = [.textIn, .textOut]
 
-    /// FalconH1 ships chat-tuned `-Instruct` checkpoints. Greedy by
-    /// default keeps the integration suite deterministic; users can
-    /// override temperature/top-p as usual.
+    /// Falcon-H1 recommended defaults (TII deployment docs): temperature
+    /// 0.1 (higher values degrade quality), top-p 0.95.
     public static let defaultGenerationParameters = GenerationParameters(
         maxTokens: 256,
         prefillStepSize: 256,
-        temperature: 0.0,
-        topP: 1.0,
+        temperature: 0.1,
+        topP: 0.95,
         topK: 0,
         minP: 0.0,
         repetitionPenalty: 1.0
@@ -820,16 +819,27 @@ public final class FalconH1Model: LanguageModel {
         var tid = UInt32(tokenId)
         memcpy(tokenBuf.contents(), &tid, 4)
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
-        var h = embedTokens(tokenTensor, on: cmd).reshaped(to: [hidden])
+
+        // `InspectTap` is a no-op unless FFAI_INSPECT is set (single bool
+        // compare per boundary); under `ffai inspect --layer-trace` it
+        // prints per-layer min/max/nan/inf + first values, committing the
+        // work buffer to make `h` resident before each readback.
+        let tap = InspectTap.fromEnvironment
+        var workCmd = cmd
+        var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
+        workCmd = tap.dumpLayerBoundary(
+            h, label: "embed", layer: -1, cmd: workCmd, device: device)
 
         for (i, layer) in layers.enumerated() {
             h = layer.decode(
                 h, position: position, cache: caches[i],
-                cmd: cmd, device: device)
+                cmd: workCmd, device: device)
+            workCmd = tap.dumpLayerBoundary(
+                h, label: "layer_out", layer: i, cmd: workCmd, device: device)
         }
 
-        let normed = finalNorm(h, on: cmd)
-        return lmHead(normed, on: cmd)
+        let normed = finalNorm(h, on: workCmd)
+        return lmHead(normed, on: workCmd)
     }
 
     /// Multi-token forward — prefill fast path. Loops

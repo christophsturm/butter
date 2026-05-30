@@ -52,13 +52,13 @@ enum JambaLayerKind: Equatable {
 public struct JambaHybrid: JambaVariant {
     public static let availableCapabilities: Set<Capability> = [.textIn, .textOut]
 
-    /// Jamba ships both base + instruction-tuned checkpoints. Greedy by
-    /// default keeps the integration suite deterministic.
+    /// Jamba recommended sampling defaults (AI21 model card): temperature
+    /// 0.4, top-p 0.95.
     public static let defaultGenerationParameters = GenerationParameters(
         maxTokens: 256,
         prefillStepSize: 256,
-        temperature: 0.0,
-        topP: 1.0,
+        temperature: 0.4,
+        topP: 0.95,
         topK: 0,
         minP: 0.0,
         repetitionPenalty: 1.0
@@ -1195,9 +1195,18 @@ public final class JambaModel: LanguageModel {
         memcpy(tokenBuf.contents(), &tid, 4)
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
 
+        // `InspectTap` is a no-op unless FFAI_INSPECT is set (single bool
+        // compare per boundary); under `ffai inspect --layer-trace` it
+        // prints per-layer min/max/nan/inf + first values, committing the
+        // work buffer to make `h` resident before each readback — which
+        // composes with the committing-layer discipline below.
+        let tap = InspectTap.fromEnvironment
+
         // The embedding + layers run on internal buffers — never `cmd`.
         var workCmd = device.makeCommandBuffer()
         var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
+        workCmd = tap.dumpLayerBoundary(
+            h, label: "embed", layer: -1, cmd: workCmd, device: device)
 
         for (i, layer) in layers.enumerated() {
             h = layer.decode(
@@ -1211,6 +1220,8 @@ public final class JambaModel: LanguageModel {
             default: committed = false
             }
             if committed { workCmd = device.makeCommandBuffer() }
+            workCmd = tap.dumpLayerBoundary(
+                h, label: "layer_out", layer: i, cmd: workCmd, device: device)
         }
 
         // The last layer (index 27 on the published checkpoints) is a

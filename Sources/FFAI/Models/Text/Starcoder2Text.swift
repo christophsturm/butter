@@ -401,12 +401,21 @@ public final class Starcoder2Model: LanguageModel {
         caches: [any LayerCacheProtocol],
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
+        // `InspectTap` is a no-op unless FFAI_INSPECT is set (single bool
+        // compare per boundary). When enabled it runs the stack on a
+        // private work buffer and prints per-layer stats — see
+        // `Sources/FFAI/Telemetry/InspectTap.swift`.
+        let tap = InspectTap.fromEnvironment
+        var workCmd = tap.makeWorkCmd(from: cmd, device: device)
+
         let tokenBuf = device.makeBuffer(length: 4)
         var tid = UInt32(tokenId)
         memcpy(tokenBuf.contents(), &tid, 4)
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
 
-        var h = embedTokens(tokenTensor, on: cmd).reshaped(to: [hidden])
+        var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
+        workCmd = tap.dumpLayerBoundary(
+            h, label: "embed", layer: -1, cmd: workCmd, device: device)
 
         for (i, layer) in layers.enumerated() {
             guard let kv = caches[i] as? any KVCacheProtocol else {
@@ -414,7 +423,17 @@ public final class Starcoder2Model: LanguageModel {
                     "Starcoder2Model: expected a KV cache at layer \(i), got "
                         + "\(type(of: caches[i]))")
             }
-            h = layer.forward(h, position: position, cache: kv, cmd: cmd, device: device)
+            h = layer.forward(h, position: position, cache: kv, cmd: workCmd, device: device)
+            workCmd = tap.dumpLayerBoundary(
+                h, label: "layer_out", layer: i, cmd: workCmd, device: device)
+        }
+
+        // Flush the private work buffer when taps are active; the
+        // caller's `cmd` then carries no work (fast no-op). In
+        // production `workCmd === cmd` and this branch is skipped.
+        if tap.active {
+            workCmd.commit()
+            workCmd.waitUntilCompleted()
         }
 
         let normed = finalNorm(h, on: cmd)

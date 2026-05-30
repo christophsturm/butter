@@ -37,12 +37,13 @@ struct Mamba2TextTests {
 
     /// Mamba 2 checkpoints are base-LM only — no chat tuning. Greedy
     /// (temp 0) is the documented default.
-    @Test("Mamba2Dense default generation parameters are greedy")
+    @Test("Mamba2Dense default generation parameters match the upstream example")
     func defaultGenerationParameters() {
         let p = Mamba2Dense.defaultGenerationParameters
         #expect(p.maxTokens > 0)
-        #expect(p.temperature == 0.0)
-        #expect(p.topP == 1.0)
+        #expect(p.temperature == 0.7)
+        #expect(p.topP == 0.9)
         #expect(p.topK == 0)
+        #expect(p.repetitionPenalty == 1.2)
     }
 }
