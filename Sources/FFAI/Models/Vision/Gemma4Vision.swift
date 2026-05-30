@@ -151,7 +151,7 @@ final class Gemma4VLVisionBlock {
         cmd.commit()
         cmd.waitUntilCompleted()
 
-        let attn = cpuAttention(
+        let attn = attention(
             q: q, k: k, v: v, nTokens: nTokens,
             xPos: xPos, yPos: yPos, device: device)
 
@@ -190,18 +190,32 @@ final class Gemma4VLVisionBlock {
         return result
     }
 
-    /// CPU full bidirectional multi-head attention with per-head q / k
-    /// RMSNorm + multi-dimensional RoPE. `q` / `k` / `v` are token-major
-    /// `[nTokens, nHeads·headDim]` (q) / `[nTokens, nKVHeads·headDim]`
-    /// (k, v). Returns the context token-major `[nTokens, nHeads·headDim]`.
+    /// Full bidirectional multi-head attention with per-head q / k RMSNorm
+    /// + multi-dimensional vision RoPE — fully GPU-resident. `q` / `k` / `v`
+    /// are token-major `[nTokens, nHeads·headDim]` (q) / `[nTokens,
+    /// nKVHeads·headDim]` (k, v). Returns the context token-major
+    /// `[nTokens, nHeads·headDim]`.
     ///
-    /// Two-stage parallelization with `DispatchQueue.concurrentPerform`:
-    ///   1. Setup — per-token RMSNorm + M-RoPE: each token `t` writes to
-    ///      its own `qH[t*nHeads+h]` / `kH[t*nKVHeads+h]` / `vH[t*nKVHeads+h]`
-    ///      rows — disjoint across tokens, so race-free.
-    ///   2. Attention — per-(head, query-row): each `(head, i)` pair writes
-    ///      to a disjoint `[oBase, oBase + headDim)` output slice.
-    private func cpuAttention(
+    /// Pipeline (one command buffer, no host bounce):
+    ///   1. Per-head RMSNorm — `Ops.rmsNormRows` over `[nTokens·heads,
+    ///      headDim]` rows: q / k weighted by their per-head norm, v
+    ///      unweighted (a ones vector, eps = `rmsNormEps`).
+    ///   2. 2D vision RoPE — `Ops.rope2D` on q and k (token-major); the
+    ///      kernel's row/col split + rotate-half math is byte-identical to
+    ///      the previous CPU `applyRoPE` (verified against `rope_2d.rs`).
+    ///   3. Token-major → head-major transpose of k and v
+    ///      (`Ops.transposeTokensToHeads`) — the K/V layout
+    ///      `Ops.sdpaBidirectional` reads.
+    ///   4. `Ops.sdpaBidirectional` — full bidirectional GQA attention,
+    ///      scale 1.0 (the q_norm folds the 1/√d), baseKV 0, kvStride ==
+    ///      nTokens.
+    ///
+    /// The `ffai_sdpa_bidirectional_d{64,72,80,96}` kernels are GPU-correct
+    /// at this production geometry — see `sdpa_bidirectional_gpu_correctness
+    /// .rs` (incl. the 576×16×64 case) — with TPG 1024 / n_simd 32, so the
+    /// machine-freeze the earlier CPU `concurrentPerform` fallback worked
+    /// around (the 2026-05-27 GlmOcr bisect) no longer applies.
+    private func attention(
         q: Tensor, k: Tensor, v: Tensor, nTokens: Int,
         xPos: [Int], yPos: [Int],
         device: Device
@@ -209,147 +223,62 @@ final class Gemma4VLVisionBlock {
         let nHeads = cfg.numHeads
         let nKVHeads = cfg.numKVHeads
         let headDim = cfg.headDim
-        let qa = q.toFloatArray()
-        let ka = k.toFloatArray()
-        let va = v.toFloatArray()
-        let qStride = nHeads * headDim
-        let kvStride = nKVHeads * headDim
-        // The vision attention uses scale 1.0 (no 1/√d) — see the
-        // reference `gemma4EnsureFusedSDPA(..., scale: 1.0)`.
-        let scale: Float = 1.0
+        let dtype = q.dtype
 
-        // Precompute RMSNorm / RoPE parameters so closures capture only
-        // value types (no local funcs — avoids @Sendable capture warnings).
-        let qWeight = qNorm.weight.toFloatArray()
-        let kWeight = kNorm.weight.toFloatArray()
-        let qNormEps = qNorm.eps
-        let kNormEps = kNorm.eps
-        let rmsNormEps = cfg.rmsNormEps
-        let ropeTheta = cfg.ropeTheta
-        // Multi-dimensional RoPE constants.
-        let numDims = 2
-        let chPerDim = 2 * (headDim / (2 * numDims))
-        let halfPerDim = chPerDim / 2
-
-        // Stage 1: Pre-norm + RoPE every q / k / v head.
-        // Each token `t` writes only to rows `t*nHeads+h` / `t*nKVHeads+h`
-        // of qH / kH / vH — disjoint across tokens, so no synchronization
-        // is needed. Both the q-head loop and the kv-head loop are nested
-        // inside a single per-token iteration to keep the index space flat.
-        // `nonisolated(unsafe)`: each token writes disjoint slots.
-        nonisolated(unsafe) var qH = [[Float]](repeating: [], count: nTokens * nHeads)
-        nonisolated(unsafe) var kH = [[Float]](repeating: [], count: nTokens * nKVHeads)
-        nonisolated(unsafe) var vH = [[Float]](repeating: [], count: nTokens * nKVHeads)
-        DispatchQueue.concurrentPerform(iterations: nTokens) { t in
-            // Inline RMSNorm: normalise an `[headDim]` slice in place,
-            // optionally scaling by a per-dim weight vector.
-            func applyRMSNorm(_ x: inout [Float], weight: [Float]?, eps: Float) {
-                var ss: Float = 0
-                for d in 0 ..< headDim { ss += x[d] * x[d] }
-                let inv = 1.0 / (ss / Float(headDim) + eps).squareRoot()
-                for d in 0 ..< headDim {
-                    x[d] = x[d] * inv * (weight != nil ? weight![d] : 1.0)
-                }
-            }
-            // Inline multi-dimensional RoPE: head dim splits into a per-axis
-            // block (x then y); each block rotates by `position[axis]`.
-            func applyRoPE(_ x: inout [Float], xp: Int, yp: Int) {
-                for axis in 0 ..< numDims {
-                    let start = axis * chPerDim
-                    let pos = Float(axis == 0 ? xp : yp)
-                    for i in 0 ..< halfPerDim {
-                        let exponent = (2.0 / Float(chPerDim)) * Float(i)
-                        let timescale = pow(ropeTheta, exponent)
-                        let theta = pos / timescale
-                        let c = cos(theta)
-                        let s = sin(theta)
-                        let a = x[start + i]
-                        let b = x[start + halfPerDim + i]
-                        // rotate-half: out_lo = a·c − b·s, out_hi = b·c + a·s.
-                        x[start + i] = a * c - b * s
-                        x[start + halfPerDim + i] = b * c + a * s
-                    }
-                }
-            }
-            for h in 0 ..< nHeads {
-                var x = Array(qa[(t * qStride + h * headDim) ..< (t * qStride + (h + 1) * headDim)])
-                applyRMSNorm(&x, weight: qWeight, eps: qNormEps)
-                applyRoPE(&x, xp: xPos[t], yp: yPos[t])
-                qH[t * nHeads + h] = x
-            }
-            for h in 0 ..< nKVHeads {
-                var xk = Array(
-                    ka[(t * kvStride + h * headDim) ..< (t * kvStride + (h + 1) * headDim)])
-                applyRMSNorm(&xk, weight: kWeight, eps: kNormEps)
-                applyRoPE(&xk, xp: xPos[t], yp: yPos[t])
-                kH[t * nKVHeads + h] = xk
-                var xv = Array(
-                    va[(t * kvStride + h * headDim) ..< (t * kvStride + (h + 1) * headDim)])
-                applyRMSNorm(&xv, weight: nil, eps: rmsNormEps)
-                vH[t * nKVHeads + h] = xv
-            }
+        // Packed `[nTokens, 2]` u32 (row, col) positions for `rope2D`.
+        var posFlat = [UInt32](repeating: 0, count: nTokens * 2)
+        for t in 0 ..< nTokens {
+            posFlat[t * 2] = UInt32(xPos[t])
+            posFlat[t * 2 + 1] = UInt32(yPos[t])
         }
+        let positions = Tensor.empty(
+            shape: [nTokens * 2], dtype: .u32, device: device)
+        positions.copyIn(from: posFlat)
 
-        // Stage 2: Full bidirectional attention, GQA head mapping. Pure
-        // CPU per-(head, query) loop for correctness. The GPU path
-        // (`Ops.sdpaBidirectional` d=64) was tried and pinned the GPU
-        // at the GlmOcr production shape (nQuery=576, nQHeads=16) during
-        // the 2026-05-27 bisect; Gemma 4 E2B/E4B's vision tower uses
-        // the same d=64 kernel at similar-or-larger nTokens (4096+ at
-        // 1024×1024 input) — same class of pin risk until the kernel
-        // ships a paired GPU correctness test at production shape and
-        // a fix to its inner-loop / bounds-select arithmetic.
-        //
-        // CPU dispatch is `DispatchQueue.concurrentPerform` over
-        // (head · query) — same pattern Idefics3 / Mistral3 / FastVLM /
-        // GlmOcr use. Slow at 4096+ tokens (the bisect timing the GPU
-        // path was trying to fix), but safe: no machine reboot.
-        let headsPerGroup = nHeads / nKVHeads
-        let H = nHeads * headDim
-        var outFlat = [Float](repeating: 0, count: nTokens * H)
-        outFlat.withUnsafeMutableBufferPointer { outBuf in
-            nonisolated(unsafe) let outPtr = outBuf.baseAddress!
-            DispatchQueue.concurrentPerform(iterations: nHeads * nTokens) { work in
-                let head = work / nTokens
-                let i = work % nTokens
-                let kvHead = head / headsPerGroup
-                let qRow = qH[i * nHeads + head]
-                var scores = [Float](repeating: 0, count: nTokens)
-                var maxScore = -Float.greatestFiniteMagnitude
-                for j in 0 ..< nTokens {
-                    let kRow = kH[j * nKVHeads + kvHead]
-                    var dot: Float = 0
-                    for d in 0 ..< headDim { dot += qRow[d] * kRow[d] }
-                    let s = dot * scale
-                    scores[j] = s
-                    if s > maxScore { maxScore = s }
-                }
-                var sumExp: Float = 0
-                for j in 0 ..< nTokens {
-                    let e = exp(scores[j] - maxScore)
-                    scores[j] = e
-                    sumExp += e
-                }
-                let invSum = 1.0 / sumExp
-                let outBase = i * H + head * headDim
-                for d in 0 ..< headDim { outPtr[outBase + d] = 0 }
-                for j in 0 ..< nTokens {
-                    let w = scores[j] * invSum
-                    let vRow = vH[j * nKVHeads + kvHead]
-                    for d in 0 ..< headDim {
-                        outPtr[outBase + d] += w * vRow[d]
-                    }
-                }
-            }
-        }
-        // Result is row-major [nTokens, nHeads·headDim] = [nTokens, qStride] —
-        // byte-identical to what o_proj's GEMM consumes. Re-emit in the
-        // input dtype.
-        let result = Tensor.empty(
-            shape: [nTokens, qStride], dtype: q.dtype,
-            device: device)
-        ImagePreprocessing.copyFloats(outFlat, into: result)
-        return result
+        // Unweighted v-norm: a ones `[headDim]` weight in the activation
+        // dtype (the old CPU path passed `weight: nil`).
+        let onesWeight = Tensor.filled(
+            1.0, shape: [headDim], dtype: dtype, device: device)
+
+        let cmd = device.makeCommandBuffer()
+        // 1. Per-head RMSNorm (q / k weighted, v unweighted).
+        let qNormed = Ops.rmsNormRows(
+            q, weight: qNorm.weight, eps: qNorm.eps,
+            nRows: nTokens * nHeads, rowSize: headDim, on: cmd)
+        let kNormed = Ops.rmsNormRows(
+            k, weight: kNorm.weight, eps: kNorm.eps,
+            nRows: nTokens * nKVHeads, rowSize: headDim, on: cmd)
+        let vNormed = Ops.rmsNormRows(
+            v, weight: onesWeight, eps: cfg.rmsNormEps,
+            nRows: nTokens * nKVHeads, rowSize: headDim, on: cmd)
+        // 2. 2D vision RoPE on q and k (token-major).
+        let qRoped = Ops.rope2D(
+            qNormed, positions: positions,
+            nTokens: nTokens, nHeads: nHeads, headDim: headDim,
+            thetaBase: cfg.ropeTheta, on: cmd)
+        let kRoped = Ops.rope2D(
+            kNormed, positions: positions,
+            nTokens: nTokens, nHeads: nKVHeads, headDim: headDim,
+            thetaBase: cfg.ropeTheta, on: cmd)
+        // 3. Transpose k, v token-major → head-major for the SDPA contract.
+        let kHead = Ops.transposeTokensToHeads(
+            kRoped, nTokens: nTokens, nHeads: nKVHeads, headDim: headDim,
+            on: cmd)
+        let vHead = Ops.transposeTokensToHeads(
+            vNormed, nTokens: nTokens, nHeads: nKVHeads, headDim: headDim,
+            on: cmd)
+        // 4. Full bidirectional GQA attention. Vision uses scale 1.0 (the
+        //    q_norm already folds the 1/√d); baseKV 0, kvStride == nTokens.
+        let attnOut = Ops.sdpaBidirectional(
+            q: qRoped, k: kHead, v: vHead,
+            nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+            baseKV: 0, nQuery: nTokens, kvStride: nTokens,
+            scale: 1.0, on: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        // attnOut is `[nTokens, nHeads, headDim]` = `[nTokens, nHeads·headDim]`
+        // contiguous — byte-identical to what o_proj's GEMM consumes.
+        return attnOut.reshaped(to: [nTokens, nHeads * headDim])
     }
 
     /// Apply a `Linear` to every row of `[nTokens, *]` via `Ops.gemm`,
