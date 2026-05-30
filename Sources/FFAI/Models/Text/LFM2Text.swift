@@ -194,12 +194,12 @@ func lfm2LoadModel(
     // and the dense MLP (w1/w2/w3 or gate/up/down_proj). The conv1d
     // weight itself, the q/k layernorms, and operator/ffn norms remain
     // raw. The MoE variant additionally ships stacked
-    // `switch_mlp.{gate,up,down}_proj` quantized triplets; expert-wise
-    // sliced quantized loading is not yet wired into MoELayer — the
-    // quantized MoE path therefore surfaces a clear unsupportedConfig
-    // below, matching the Jamba / FalconH1 contract. Same FalconH1
-    // quantized-loader pattern: route every projection through
-    // `loadLinear` / `loadEmbedding` and leave the raw tensors alone.
+    // `switch_mlp.{gate,up,down}_proj` quantized triplets (loaded
+    // expert-wise via `sliceStackedExperts`) and a quantized router
+    // `feed_forward.gate` triplet (loaded via `loadLinear`); both
+    // quantized-MoE paths are fully wired. Same FalconH1 quantized-loader
+    // pattern: route every projection through `loadLinear` /
+    // `loadEmbedding` and leave the raw tensors alone.
     let quant = config.quantization
     let isQuantized = quant != nil
 
@@ -453,11 +453,20 @@ private func buildLFM2MoE(
     normTopKProb: Bool, useExpertBias: Bool,
     quantization: ModelConfig.QuantizationConfig?
 ) throws -> MoELayer {
-    // Router gate is small (one weight per expert per channel) and
-    // never quantized in the mlx-community conversions.
-    let gate = AnyLinear(
-        Linear(
-            weight: try weights.tensor(named: "\(p).feed_forward.gate.weight")))
+    // Router gate. Despite being small ([numExperts, hidden]), the
+    // mlx-community LFM2-MoE conversions DO quantize it — e.g.
+    // `mlx-community/LFM2-8B-A1B-4bit` ships `gate.weight` as packed
+    // U32 [32, 512] + `gate.scales` / `gate.biases` [32, 32] (8-bit
+    // affine, in=2048 → out=32, group_size=64). Loading that packed
+    // tensor as a plain `Linear` reads in_dim from the *packed* width
+    // (512) instead of the logical hidden (2048), so the router gemv
+    // mismatched at decode (`gemv: in_dim 512 vs 2048`). Route through
+    // `loadLinear` so the quantized triplet is detected + the bit-width
+    // derived; raw checkpoints (no `.scales`) still fall back to a plain
+    // `Linear`.
+    let gate = try loadLinear(
+        base: "\(p).feed_forward.gate", in: weights,
+        quantization: quantization)
 
     var gateProj: [AnyLinear] = []
     var upProj: [AnyLinear] = []
