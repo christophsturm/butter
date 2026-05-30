@@ -116,14 +116,6 @@ struct Qwen36TextIntegrationTests {
         let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
         print("Qwen3.6-27B decoded output: \(decoded)")
 
-        // KNOWN FAILURE (2026-05-27): the 27B-4bit checkpoint currently
-        // emits token 0 ("!") every step. Same Qwen3.5 engine produces
-        // coherent output on Qwen3.5-0.8B-4bit, so the regression is
-        // 27B-scale-specific (likely in the loader's handling of one
-        // of the 27B-specific config fields — wider hidden=5120,
-        // intermediate=17408, or 6:1 GQA). Suite stays enabled so the
-        // failure is visible in every bisect run rather than
-        // disappearing behind a skip-reason.
         expectCoherentOutput(
             result.generatedTokens,
             minTokens: 32,

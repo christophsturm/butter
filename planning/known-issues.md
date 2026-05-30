@@ -104,8 +104,8 @@ verified-shape gates now exclude the 27B shape from both fast paths —
 Env overrides `FFAI_NO_FUSED_QKV` / `FFAI_NO_FUSED_LM_HEAD` retained.
 
 **Confirmed 2026-05-29.** `Qwen36TextIntegrationTests` PASSED (123 s) in
-the full bisect — the fix holds. Remaining cleanup: delete the stale
-`KNOWN FAILURE (2026-05-27)` comment at `Qwen36TextIntegrationTests.swift:122-129`.
+the full bisect — the fix holds. **RESOLVED** — stale
+`KNOWN FAILURE (2026-05-27)` comment deleted from `Qwen36TextIntegrationTests.swift`.
 
 ## LFM2-MoE — router-shape mismatch CONFIRMED (MoE crashes; dense is fine)
 
