@@ -90,6 +90,18 @@ public struct ConvertOptions: Sendable {
     /// consumes `QuantizedLinear`.
     public var visionSpec: QuantSpec? = nil
 
+    /// Spec for MoE router gates — the small `[num_experts, hidden]`
+    /// projection that scores experts for top-k routing (keys ending in
+    /// `.gate.weight` / `.router.weight`: `feed_forward.gate`,
+    /// `block_sparse_moe.gate`, `mlp.gate`, …). `nil` (default) keeps
+    /// the router full-precision: quantizing it risks flipping discrete
+    /// top-k expert selections for a negligible memory saving (the gate
+    /// is tiny — e.g. 32×2048 ≈ 64K params), which is the standard
+    /// high-quality MoE-quant convention. Set (via `--router-bits`) to
+    /// quantize routers anyway, e.g. to mirror an upstream conversion
+    /// that quantized the gate (mlx-community ships some at 8-bit).
+    public var routerSpec: QuantSpec? = nil
+
     /// Original source identifier — HF repo id (`org/repo`) or local
     /// path — used to fill in the `base_model:` field of the emitted
     /// README.md model card and the human-readable conversion command.
@@ -153,6 +165,7 @@ public enum ConvertDriver {
         // need no validation here.
         let allSpecs: [QuantSpec?] = [
             options.bits, options.embeddingSpec, options.lmHeadSpec, options.visionSpec,
+            options.routerSpec,
         ]
         for spec in allSpecs {
             if case .bits(let b) = spec, !QuantSpec.supportedBits.contains(b) {
@@ -282,6 +295,18 @@ public enum ConvertDriver {
     /// the tensor falls through to pass-through (`nil`) rather than
     /// crashing the quantize kernel. `.fp16` / `.bf16` downcast applies
     /// to any tensor that the role rule matches, regardless of shape.
+    /// True when `key` names a MoE router/gate projection — the small
+    /// `[num_experts, hidden]` weight that scores experts for top-k
+    /// routing. Matches the exact `.gate.weight` / `.router.weight`
+    /// suffixes (`feed_forward.gate` in LFM2 / DeepSeek,
+    /// `block_sparse_moe.gate` in Mixtral, `mlp.gate` in Qwen MoE) and
+    /// deliberately does NOT match dense-MLP projections like
+    /// `.gate_proj.weight` / `.gate_up_proj.weight` (those end in
+    /// `proj.weight`, not `.gate.weight`).
+    static func isMoERouterKey(_ key: String) -> Bool {
+        key.hasSuffix(".gate.weight") || key.hasSuffix(".router.weight")
+    }
+
     private static func effectiveSpec(
         key: String, tensor: Tensor, options: ConvertOptions
     ) -> QuantSpec? {
@@ -302,6 +327,10 @@ public enum ConvertDriver {
             || key.contains("vision_tower.") || key.contains("vision_model.")
         {
             roleSpec = options.visionSpec
+        } else if isMoERouterKey(key) {
+            // MoE router gates default to full-precision (`routerSpec`
+            // nil → pass-through); the `--router-bits` flag opts in.
+            roleSpec = options.routerSpec
         } else {
             // The main `bits` is always non-nil; wrap as Optional for
             // uniform handling below.

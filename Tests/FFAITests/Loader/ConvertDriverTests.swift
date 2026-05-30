@@ -200,6 +200,114 @@ struct ConvertDriverTests {
         #expect(!outBundle.has("model.visual.blocks.0.attn.qkv.scales"))
     }
 
+    // ─── MoE router handling ────────────────────────────────────────
+
+    @Test("MoE router gate stays full-precision by default (routerSpec nil)")
+    func moeRouterSkippedByDefault() throws {
+        let dir = tempDir()
+        defer { cleanUp(dir) }
+
+        try writeSyntheticSource(
+            at: dir, outDim: 4, inDim: 64, includeMoERouter: true)
+
+        let destDir = dir.appendingPathComponent("out")
+        var opts = ConvertOptions()
+        opts.bits = .bits(4)  // main projections quantize…
+        try ConvertDriver.convert(sourceDir: dir, destDir: destDir, options: opts)
+
+        let outBundle = try SafeTensorsBundle(directory: destDir, device: .shared)
+
+        // Main projection IS quantized (control).
+        #expect(outBundle.has("model.layers.0.q_proj.scales"))
+
+        // Router gate passes through unchanged — no triplet, source dtype.
+        let gate = try outBundle.tensor(named: "model.layers.0.feed_forward.gate.weight")
+        #expect(
+            gate.dtype == .bf16,
+            "router gate should keep its bf16 source dtype, not pack to u32")
+        #expect(
+            !outBundle.has("model.layers.0.feed_forward.gate.scales"),
+            "router gate must not get a quantization triplet by default")
+    }
+
+    @Test("--router-bits opts the MoE router into quantization")
+    func moeRouterQuantizedWhenOptedIn() throws {
+        let dir = tempDir()
+        defer { cleanUp(dir) }
+
+        try writeSyntheticSource(
+            at: dir, outDim: 4, inDim: 64, includeMoERouter: true)
+
+        let destDir = dir.appendingPathComponent("out")
+        var opts = ConvertOptions()
+        opts.bits = .bits(4)
+        opts.routerSpec = .bits(8)  // mirror an upstream 8-bit router
+        try ConvertDriver.convert(sourceDir: dir, destDir: destDir, options: opts)
+
+        let outBundle = try SafeTensorsBundle(directory: destDir, device: .shared)
+
+        // Router gate now packed to an 8-bit triplet.
+        let gate = try outBundle.tensor(named: "model.layers.0.feed_forward.gate.weight")
+        #expect(gate.dtype == .u32)
+        let expected = QuantizedOpsValidation.packedUInt32Count(numel: 4 * 64, bits: 8)!
+        #expect(
+            gate.elementCount == expected,
+            "router should pack at 8-bit when --router-bits 8")
+        #expect(outBundle.has("model.layers.0.feed_forward.gate.scales"))
+    }
+
+    @Test("quantized router round-trips: loadLinear reads logical in_dim, not packed width")
+    func quantizedRouterLoadsViaLoadLinear() throws {
+        // Reproduces + guards the LFM2-MoE bug: a quantized router gate
+        // (e.g. mlx-community/LFM2-8B-A1B-4bit's `feed_forward.gate`,
+        // packed U32 whose column count is the *packed* width, not the
+        // logical hidden) must load as a `QuantizedLinear` so the gemv
+        // sees the logical in_dim. Loading it as a plain `Linear` read
+        // in_dim from the packed width and crashed (`in_dim 512 vs 2048`).
+        let dir = tempDir()
+        defer { cleanUp(dir) }
+
+        try writeSyntheticSource(
+            at: dir, outDim: 4, inDim: 64, includeMoERouter: true)
+
+        let destDir = dir.appendingPathComponent("out")
+        var opts = ConvertOptions()
+        opts.bits = .bits(4)
+        opts.routerSpec = .bits(8)  // produce a real quantized gate triplet
+        try ConvertDriver.convert(sourceDir: dir, destDir: destDir, options: opts)
+
+        let outBundle = try SafeTensorsBundle(directory: destDir, device: .shared)
+        let gate = try loadLinear(
+            base: "model.layers.0.feed_forward.gate", in: outBundle,
+            quantization: ModelConfig.QuantizationConfig(bits: 4, groupSize: 64))
+
+        let q = try #require(
+            gate.inner as? QuantizedLinear,
+            "quantized router must load as QuantizedLinear, not plain Linear")
+        #expect(q.bits == 8, "loadLinear should derive the router's 8-bit width from shapes")
+        // Logical in_dim = packed columns × (32 / bits). For 8-bit that's
+        // 16 packed cols × 4 = 64 — the original hidden, NOT the packed 16.
+        let packedCols = q.weight.shape[1]
+        let logicalInDim = packedCols * (32 / q.bits)
+        #expect(
+            logicalInDim == 64,
+            "router gemv must see logical in_dim 64, not packed width \(packedCols)")
+    }
+
+    @Test("isMoERouterKey matches router gates but not dense gate_proj")
+    func routerKeyMatcher() {
+        // Positive — exact `.gate.weight` / `.router.weight` suffixes.
+        #expect(ConvertDriver.isMoERouterKey("model.layers.0.feed_forward.gate.weight"))
+        #expect(ConvertDriver.isMoERouterKey("model.layers.3.block_sparse_moe.gate.weight"))
+        #expect(ConvertDriver.isMoERouterKey("model.layers.7.mlp.gate.weight"))
+        #expect(ConvertDriver.isMoERouterKey("model.layers.0.mlp.router.weight"))
+        // Negative — dense-MLP projections and attention weights.
+        #expect(!ConvertDriver.isMoERouterKey("model.layers.0.mlp.gate_proj.weight"))
+        #expect(!ConvertDriver.isMoERouterKey("model.layers.0.mlp.gate_up_proj.weight"))
+        #expect(!ConvertDriver.isMoERouterKey("model.layers.0.q_proj.weight"))
+        #expect(!ConvertDriver.isMoERouterKey("model.layers.0.feed_forward.gate.scales"))
+    }
+
     // ─── Helpers ────────────────────────────────────────────────────
 
     /// Build a minimum-viable HuggingFace-style source directory with
@@ -209,7 +317,8 @@ struct ConvertDriverTests {
     private func writeSyntheticSource(
         at dir: URL, outDim: Int, inDim: Int,
         includeEmbedding: Bool = false,
-        includeVisionTower: Bool = false
+        includeVisionTower: Bool = false,
+        includeMoERouter: Bool = false
     ) throws {
         let safetensors = dir.appendingPathComponent("model.safetensors")
         let writer = SafeTensorsWriter(url: safetensors)
@@ -238,6 +347,16 @@ struct ConvertDriverTests {
             try writer.append(
                 name: "model.visual.blocks.0.attn.qkv.weight",
                 dtype: .bf16, shape: [outDim, inDim], bytes: visionBytes)
+        }
+
+        if includeMoERouter {
+            // MoE router gate `[numExperts, hidden]`. `outDim` doubles as
+            // numExperts here; inDim=64 satisfies group_size alignment so
+            // the tensor WOULD be quantized if it weren't router-skipped.
+            let gateBytes = bf16Bytes((0 ..< outDim * inDim).map { Float($0) * 0.04 })
+            try writer.append(
+                name: "model.layers.0.feed_forward.gate.weight",
+                dtype: .bf16, shape: [outDim, inDim], bytes: gateBytes)
         }
 
         try writer.finalize()

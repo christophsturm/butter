@@ -107,6 +107,15 @@ struct ConvertCommand: AsyncParsableCommand {
                 + "tower that consumes QuantizedLinear."))
     var visionBits: QuantSpec?
 
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "Spec for MoE router gates (.gate / .router projections). Same accepted values as "
+                + "--bits. Omit (default) to keep routers full-precision — quantizing the router "
+                + "risks flipping top-k expert selection for negligible memory saving. Set to "
+                + "mirror an upstream conversion that quantized the gate (e.g. 8)."))
+    var routerBits: QuantSpec?
+
     @Option(name: .long, help: "Revision (branch/tag/commit) to download from HF. Default: main.")
     var revision: String = "main"
 
@@ -147,6 +156,7 @@ struct ConvertCommand: AsyncParsableCommand {
         opts.embeddingSpec = embeddingBits
         opts.lmHeadSpec = lmHeadBits
         opts.visionSpec = visionBits
+        opts.routerSpec = routerBits
         // The driver emits a README.md (HF model card) only when
         // sourceID is set; pass the user-supplied source verbatim so
         // the card's `base_model:` field and the example `ffai convert`
