@@ -761,50 +761,92 @@ public enum Ops {
         let epsBuf = device.makeBuffer(length: 4)
         memcpy(epsBuf.contents(), &epsValue, 4)
 
-        // Fast kernel needs TPG = n/4 with TPG a multiple of 32 and
-        // ≤ 1024. Anything outside that — too wide, too narrow, or not
-        // a 128-multiple — goes through the always-correct wide kernel.
-        let useWide = n > 4096 || !n.isMultiple(of: 128)
-        let tgWidth = useWide ? 1024 : n / 4
+        // Kernel selection by row width `n` (each kernel owns a different
+        // elements-per-thread ratio, so the wrong one corrupts the row):
+        //   • fast  (`mt_rms_norm`, TPG = n/4): n a multiple of 128, ≤ 4096
+        //     — hidden-width norms (the common case).
+        //   • small (`mt_rms_norm_small`, TPG = n/2): n a multiple of 64,
+        //     64 ≤ n ≤ 2048 — PER-HEAD norms (head_dim ∈ {64,128,192,256}).
+        //     This is the ONLY correct path when n isn't a multiple of 128
+        //     (e.g. head_dim 64): the wide kernel fixes TPG = 1024 / N =
+        //     4096 and reads 4096 slots per row, trashing a 64-wide row.
+        //   • wide  (`mt_rms_norm_wide`, TPG = 1024): everything else
+        //     (rows wider than 4096, or odd widths).
+        // `n` a multiple of 64 ⇒ n/2 a multiple of 32 (one full simdgroup),
+        // and n ≤ 2048 ⇒ TPG ≤ 1024 — both small-kernel invariants hold.
+        enum RmsKernel { case fast, small, wide }
+        let kernel: RmsKernel
+        let tgWidth: Int
+        if n.isMultiple(of: 128) && n <= 4096 {
+            kernel = .fast
+            tgWidth = n / 4
+        } else if n.isMultiple(of: 64) && n <= 2048 {
+            kernel = .small
+            tgWidth = n / 2
+        } else {
+            kernel = .wide
+            tgWidth = 1024
+        }
         let grid = MTLSize(width: nRows * tgWidth, height: 1, depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
-        switch (useWide, x.dtype) {
-        case (false, .f32):
+        switch (kernel, x.dtype) {
+        case (.fast, .f32):
             MetalTileKernels.mt_rms_norm_f32(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
-        case (false, .f16):
+        case (.fast, .f16):
             MetalTileKernels.mt_rms_norm_f16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
-        case (false, .bf16):
+        case (.fast, .bf16):
             MetalTileKernels.mt_rms_norm_bf16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
-        case (true, .f32):
+        case (.small, .f32):
+            MetalTileKernels.mt_rms_norm_small_f32(
+                x: x.buffer, xOffset: x.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                out: result.buffer, outOffset: result.offset,
+                eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.small, .f16):
+            MetalTileKernels.mt_rms_norm_small_f16(
+                x: x.buffer, xOffset: x.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                out: result.buffer, outOffset: result.offset,
+                eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.small, .bf16):
+            MetalTileKernels.mt_rms_norm_small_bf16(
+                x: x.buffer, xOffset: x.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                out: result.buffer, outOffset: result.offset,
+                eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.wide, .f32):
             MetalTileKernels.mt_rms_norm_wide_f32(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
-        case (true, .f16):
+        case (.wide, .f16):
             MetalTileKernels.mt_rms_norm_wide_f16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
-        case (true, .bf16):
+        case (.wide, .bf16):
             MetalTileKernels.mt_rms_norm_wide_bf16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
