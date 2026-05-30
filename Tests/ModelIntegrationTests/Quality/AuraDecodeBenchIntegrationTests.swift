@@ -239,29 +239,55 @@ struct AuraDecodeBenchIntegrationTests {
         let blockSizes = [32, 64, 128, 256]
         let kvLengths = benchKVLengths
         var results: [(kv: Int, bs: Int, tps: Double)] = []
+        // swift-testing captures stdout per-test-method and only flushes
+        // it on test return, so a long-running sweep produces zero
+        // visible output for tens of minutes. Mirror every cell line to
+        // a side-channel file (env-overridable) so progress is tail-able
+        // in real time: `tail -f $FFAI_AURA_BENCH_LOG`.
+        let logPath =
+            ProcessInfo.processInfo.environment["FFAI_AURA_BENCH_LOG"]
+                ?? "/tmp/ffai-aura-bench.log"
+        let logURL = URL(fileURLWithPath: logPath)
+        func emit(_ line: String) {
+            print(line)
+            if let data = (line + "\n").data(using: .utf8) {
+                if FileManager.default.fileExists(atPath: logPath),
+                    let handle = try? FileHandle(forWritingTo: logURL)
+                {
+                    defer { try? handle.close() }
+                    _ = try? handle.seekToEnd()
+                    try? handle.write(contentsOf: data)
+                } else {
+                    try? data.write(to: logURL, options: .atomic)
+                }
+            }
+        }
+        emit("\n=== blockSize sweep START — model=\(mp), KV=\(kvLengths), bs=\(blockSizes) ===")
         for kv in kvLengths {
             for bs in blockSizes {
                 AuraFlashScratchCache.blockSizeOverride = bs
+                let cellStart = Date()
                 let tps = try await runDecodeTpsBench(
                     modelPath: mp,
                     decodePath: .compressed, kvLength: kv,
                     nRuns: 3, nSteps: 24)
+                let cellSecs = Date().timeIntervalSince(cellStart)
                 results.append((kv, bs, tps))
-                print(
+                emit(
                     "[blockSize sweep] KV=\(kv)  bs=\(bs)  "
-                        + "compressed=\(String(format: "%.2f", tps)) tps")
+                        + "compressed=\(String(format: "%.2f", tps)) tps  "
+                        + "(cell \(String(format: "%.1f", cellSecs))s)")
             }
         }
         AuraFlashScratchCache.blockSizeOverride = nil
-        // Print a compact summary table at the end.
-        print("\n=== blockSize sweep summary (model=\(mp)) ===")
-        print("KV \\ bs    32       64      128      256")
+        emit("\n=== blockSize sweep summary (model=\(mp)) ===")
+        emit("KV \\ bs    32       64      128      256")
         for kv in kvLengths {
             let row =
                 results.filter { $0.kv == kv }
                 .map { String(format: "%7.2f", $0.tps) }
                 .joined(separator: " ")
-            print("KV=\(String(format: "%-5d", kv))  \(row)")
+            emit("KV=\(String(format: "%-5d", kv))  \(row)")
         }
     }
 
