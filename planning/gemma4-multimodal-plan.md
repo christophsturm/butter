@@ -53,6 +53,21 @@ Each new kernel ships a paired `*_gpu_correctness` test (metaltile) per the repo
 - **Phase 5 — integration tests.** `Tests/ModelIntegrationTests/Vision/Gemma4MultimodalIntegrationTests.swift`: load `mlx-community/gemma-4-e2b-4bit`, run (a) image+text (already works), (b) **audio+text** (a short speech clip → coherent response, `expectCoherentOutput`), (c) **video+text**. Use the **model's default params** (not greedy) per the new standard.
 - **Phase 6 — the other sizes.** E4B / 26B / 31B: confirm each loads; convert our own 4-bit (`ffai convert`, stacked experts for the MoE 26B) + upload to `ekryski/` only if no usable MLX export exists. One integration test each.
 
-## Notes
-- Promote new audio kernels under `metaltile-std/src/ffai/` with paired correctness tests; graduate per the repo's kernel workflow.
-- Reference: `transformers` `Gemma4` audio modeling (`Gemma4AudioEncoder` / Conformer) for exact clipped-linear + chunked-attention semantics — diff FFAI's MSL/host math against it.
+## Confirmed 2026-05-30 — fully de-risked, ready to build the encoder
+
+- **Kernels: ALL needed ops already exist** (regenerated off metaltile `dev` @ `dcbe860`, 411 ok). **No new metaltile branch required for pass 1.** Reuse: `Ops.conv2d` (SSCP subsampling), `Ops.audioConv1d` (depthwise conv module), `Ops.gemm` (attention scores / projections), `Ops.softmax`, `Ops.layerNorm` (SSCP channel norm), `Ops.rmsNormRows`, `Ops.silu`/`sigmoid`/`softplus`/`add`/`mul`, plus the mel front-end kernels `mel_spectrogram` / `mel_filterbank` / `mel_stft_window` / FFT. `clip`/`tanh`/relative-shift do on CPU (encoder-scale).
+- **Validation oracle ready:** `mlx-community/gemma-4-e2b-4bit` downloaded (3.4 GB, ungated) at `~/.cache/huggingface/hub/models--mlx-community--gemma-4-e2b-4bit`.
+- **Reference (port target):** `mlx_vlm/models/gemma4/audio.py` (509 lines, complete) at `~/Development/personal/ai/gemma4-benchmark/.venv/lib/python3.10/site-packages/mlx_vlm/models/gemma4/` — plus `vision.py::ClippableLinear`, `config.py::AudioConfig`, `processing_gemma4.py`, and `gemma4.py` (the `masked_scatter` splice). Mirror FFAI's `Gemma4VLVisionBlock` style (token-major rows, GPU GEMMs via `projectRows`, CPU attention).
+- **Exact algorithm** (from the reference):
+  - **ClippableLinear** = `clip(x, input_min, input_max)` → `linear` → `clip(y, output_min, output_max)`; 4 scalar bounds/tensor (±inf when unused).
+  - **SSCP**: 2× [zero-invalid → pad(1,1,1,1) → Conv2d(3×3, stride 2) → LayerNorm(channels) → ReLU], then flatten `F·C` → `input_proj_linear` → hidden. 128 mel bins → freq 128→64→32, `proj_input_dim = 32·32 = 1024` → 1024.
+  - **ConformerFeedForward** (macaron): `residual + 0.5 · post_norm(ff2(silu(ff1(pre_norm(clip(x))))))`.
+  - **AudioAttention**: ClippableLinear q/k/v/post (head_dim 128 = 1024/8) + `relative_k_proj` + `per_dim_scale` (softplus); `q_scale = d^-0.5/ln2`, `k_scale = ln(1+e)/ln2`; chunk into blocks (chunk 12, context = 12+13+0=25); sinusoidal **relative position embedding + relative-shift**; `logits = tanh(logits/50)·50`; mask by local causal-valid; softmax; `einsum bnuwc,bucnh→buwnh`; post.
+  - **ConformerLightConv1d**: `pre_norm` → `linear_start`(→2×) → GLU → causal-pad(k-1=4) → depthwise conv1d(k5) → clip → conv_norm → silu → linear_end → +residual.
+  - **ConformerBlock**: ff1 → [clip→norm_pre_attn→attn→clip→ +norm_post_attn] → zero-invalid → lconv1d → ff2 → clip → norm_out.
+  - **AudioEncoder**: SSCP → 12 blocks → `output_proj` (1024→1536, +bias). Then top-level `embed_audio.embedding_projection` (a **quantized** Linear) → text dim → `masked_scatter` at `audio_token_id` (258881).
+- **Mel front-end params** (`feature_extraction_gemma4`): 128 mels, 16 kHz, frame 20 ms (320), hop 10 ms (160), HTK preemphasis flavor, dither 0, mel_floor 1e-3. Wire FFAI's existing mel kernels with these.
+- **Tensor map** (per `audio_tower.layers.N.`): `feed_forward1/2.{pre_layer_norm,ffw_layer_1,ffw_layer_2,post_layer_norm}`, `self_attn.{q_proj,k_proj,v_proj,post}` (clipped: `.linear.weight` + `.input_min/max` + `.output_min/max`), `self_attn.relative_k_proj.weight`, `self_attn.per_dim_scale`, `lconv1d.{pre_layer_norm,linear_start,depthwise_conv1d,conv_norm,linear_end}`, `norm_{pre_attn,post_attn,out}`. Top: `audio_tower.subsample_conv_projection.{input_proj_linear,layer0/1.{conv,norm}}`, `audio_tower.output_proj.{weight,bias}`, `embed_audio.embedding_projection.{weight,scales,biases}`.
+
+## Validation approach
+Numerically diff FFAI's audio-tower output against `mlx_vlm` for the same mel input (dump mlx-vlm's `audio_tower(audio_features, mask)` to a fixture), iterating until within tolerance — THEN wire the splice + the coherence integration test. The chunked relative-shift attention is the piece most likely to need oracle-debugging; do it against the fixture, not blind.
