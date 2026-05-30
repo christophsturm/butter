@@ -1049,75 +1049,39 @@ final class GlmOcrVisionBlock {
             for d in 0 ..< hidden { V[tok * hidden + d] = qkv[vBase + d] }
         }
 
-        // Bidirectional multi-head attention — pure CPU per-head for
-        // correctness. mlx-community's GLM-OCR-4bit vision tower ships
-        // hidden=1024 / heads=16 → headDim=64 at nPatches=576 (24×24
-        // patches for the 336×336 input at patch=14). The GPU path
-        // (`Ops.sdpaBidirectional` d=64) was tried and pinned the GPU
-        // at this production shape during the 2026-05-27 bisect; the
-        // pre-PR-#14 `Ops.sdpaMulti(causal:false)` route had been
-        // dead-on-arrival since `sdpaMulti` rejects d=64 at its
-        // precondition (so this vision tower had never actually run
-        // its attention on a real image before the loader fix landed).
-        //
-        // CPU dispatch is `DispatchQueue.concurrentPerform` over (head ·
-        // query) — same pattern Idefics3 / Mistral3 / FastVLM use for
-        // their vision-tower attention CPU paths. ~576² · 16 · 64 ≈
-        // 340 M FLOPs per encoder block; the GLM-OCR ViT is small enough
-        // that this is dominated by the projection GEMMs that already
-        // run on GPU.
-        //
-        // GPU re-port: requires a paired GPU correctness test for
-        // `mt_sdpa_bidirectional_d64_*` at (nQHeads=16, nQuery=576,
-        // kvStride=576, f32) against a CPU oracle in metaltile-std, plus
-        // a fix to whatever in the kernel's bounds / reduction
-        // arithmetic pegs the GPU at that shape. Tracked in
-        // `planning/known-issues.md`.
-        var attn = [Float](repeating: 0, count: nPatches * hidden)
-        attn.withUnsafeMutableBufferPointer { attnBuf in
-            nonisolated(unsafe) let attnPtr = attnBuf.baseAddress!
-            Q.withUnsafeBufferPointer { qBuf in
-                K.withUnsafeBufferPointer { kBuf in
-                    V.withUnsafeBufferPointer { vBuf in
-                        nonisolated(unsafe) let qb = qBuf.baseAddress!
-                        nonisolated(unsafe) let kb = kBuf.baseAddress!
-                        nonisolated(unsafe) let vb = vBuf.baseAddress!
-                        DispatchQueue.concurrentPerform(iterations: numHeads * nPatches) { work in
-                            let head = work / nPatches
-                            let i = work % nPatches
-                            let hOff = head * headDim
-                            var scores = [Float](repeating: 0, count: nPatches)
-                            var maxScore = -Float.greatestFiniteMagnitude
-                            let qBase = i * hidden + hOff
-                            for j in 0 ..< nPatches {
-                                var dot: Float = 0
-                                let kBase = j * hidden + hOff
-                                for d in 0 ..< headDim { dot += qb[qBase + d] * kb[kBase + d] }
-                                let s = dot * scale
-                                scores[j] = s
-                                if s > maxScore { maxScore = s }
-                            }
-                            var sumExp: Float = 0
-                            for j in 0 ..< nPatches {
-                                let e = exp(scores[j] - maxScore)
-                                scores[j] = e
-                                sumExp += e
-                            }
-                            let invSum = 1.0 / sumExp
-                            let outBase = i * hidden + hOff
-                            for d in 0 ..< headDim { attnPtr[outBase + d] = 0 }
-                            for j in 0 ..< nPatches {
-                                let w = scores[j] * invSum
-                                let vBase = j * hidden + hOff
-                                for d in 0 ..< headDim {
-                                    attnPtr[outBase + d] += w * vb[vBase + d]
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Bidirectional multi-head attention on the GPU. mlx-community's
+        // GLM-OCR-4bit vision tower ships hidden=1024 / heads=16 →
+        // headDim=64 at nPatches=576 (24×24 patches for the 336×336 input
+        // at patch=14). This is exactly the d64 / nQuery=576 shape that
+        // pinned the GPU during the 2026-05-27 bisect — now covered by a
+        // production-shape GPU correctness test and proven freeze-free.
+        // Stage-2 attention on the GPU. Q/K/V are token-major
+        // `[nPatches, numHeads·headDim]`; `Ops.sdpaBidirectional` reads Q
+        // token-major and K/V head-major, so K/V transpose through
+        // `Ops.transposeTokensToHeads`. d64 is GPU-correct at this exact
+        // production shape (nQuery=576, 16 heads) — see
+        // `sdpa_bidirectional_gpu_correctness.rs` — with TPG 1024 / n_simd
+        // 32, so the 2026-05-27 machine-freeze no longer applies.
+        let qT = glmOcrFloatsToTensor(
+            Q, shape: [nPatches, numHeads, headDim], device: device)
+        let kT = glmOcrFloatsToTensor(
+            K, shape: [nPatches, numHeads, headDim], device: device)
+        let vT = glmOcrFloatsToTensor(
+            V, shape: [nPatches, numHeads, headDim], device: device)
+        let cmdAttn = device.makeCommandBuffer()
+        let kHead = Ops.transposeTokensToHeads(
+            kT, nTokens: nPatches, nHeads: numHeads, headDim: headDim, on: cmdAttn)
+        let vHead = Ops.transposeTokensToHeads(
+            vT, nTokens: nPatches, nHeads: numHeads, headDim: headDim, on: cmdAttn)
+        let attnT = Ops.sdpaBidirectional(
+            q: qT, k: kHead, v: vHead,
+            nQHeads: numHeads, nKVHeads: numHeads, headDim: headDim,
+            baseKV: 0, nQuery: nPatches, kvStride: nPatches,
+            scale: scale, on: cmdAttn)
+        cmdAttn.commit()
+        cmdAttn.waitUntilCompleted()
+        // [nPatches, numHeads, headDim] = [nPatches, hidden] contiguous.
+        let attn = attnT.toFloatArray()
 
         // Projection + bias on the GPU: [nPatches, hidden]
         let attnInT = glmOcrFloatsToTensor(
