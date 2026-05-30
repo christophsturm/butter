@@ -58,6 +58,14 @@ extension QuantSpec: ExpressibleByArgument {
     }
 }
 
+// `ExpertLayout` is a String-backed enum; parse from its raw value
+// (`stacked` / `per-expert`).
+extension ExpertLayout: ExpressibleByArgument {
+    public init?(argument: String) {
+        self.init(rawValue: argument)
+    }
+}
+
 struct ConvertCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "convert",
@@ -116,6 +124,22 @@ struct ConvertCommand: AsyncParsableCommand {
                 + "mirror an upstream conversion that quantized the gate (e.g. 8)."))
     var routerBits: QuantSpec?
 
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "MoE expert output layout: 'stacked' (default — gather per-expert weights into "
+                + "switch_mlp.<proj> [E,…] for fused expert-indexed dispatch) or 'per-expert' "
+                + "(keep the source experts.<e>.<proj> tensors)."))
+    var expertLayout: ExpertLayout = .stacked
+
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "Spec for MoE expert projections. Same accepted values as --bits. Omit to inherit "
+                + "--bits; set fp16 / bf16 to leave experts full-precision (experts hold most of "
+                + "a MoE's weight mass, so this is the big size/quality dial)."))
+    var expertBits: QuantSpec?
+
     @Option(name: .long, help: "Revision (branch/tag/commit) to download from HF. Default: main.")
     var revision: String = "main"
 
@@ -157,6 +181,8 @@ struct ConvertCommand: AsyncParsableCommand {
         opts.lmHeadSpec = lmHeadBits
         opts.visionSpec = visionBits
         opts.routerSpec = routerBits
+        opts.expertLayout = expertLayout
+        opts.expertSpec = expertBits
         // The driver emits a README.md (HF model card) only when
         // sourceID is set; pass the user-supplied source verbatim so
         // the card's `base_model:` field and the example `ffai convert`

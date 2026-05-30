@@ -129,10 +129,52 @@ Full API surface lands in **Phase 2** (with only `.textIn`/`.textOut` exercised)
 |---|---|---|
 | **safetensors** (fp16/bf16) | HF default. Header (JSON) + raw tensor bytes. mmap-friendly. | ✅ shipped |
 | **mlx-format** (quantized safetensors, **2/3/4/5/6/8-bit** affine) | Same file format; mlx-community quant layout (weight + scale + bias per group). 2-bit added Phase E (`dequant_gemv_int2` + `dequant_gather_int2` + `mt_qmm_mma_int2` in metaltile; `Ops.dequantGemv` / `dequantGather` / `dispatchQmmMma` dispatch arms in FFAI). | ✅ shipped |
-| **mixed per-role quantization** (`ffai convert --bits / --embedding-bits / --lm-head-bits / --vision-bits`) | Each role independently takes any of `2 / 3 / 4 / 5 / 6 / 8 / fp16 / bf16` via `QuantSpec`. Loader's per-tensor `deriveAffineQuantBits` reads each width from saved shape — no per-tensor `config.json` entries needed. | ✅ shipped |
-| **mixed per-LAYER quantization** | Different layers in the same role at different bit-widths (e.g. first 4 attention layers at 2-bit, rest at 4-bit). Needs a recipe-file format and per-layer dispatch — separate from per-role. | 🚧 planned (see `session-plan.md`) |
+| **mixed per-role quantization** (`ffai convert --bits / --embedding-bits / --lm-head-bits / --vision-bits / --router-bits / --expert-bits`) | Each role independently takes any of `2 / 3 / 4 / 5 / 6 / 8 / fp16 / bf16` via `QuantSpec`. Loader's per-tensor `deriveAffineQuantBits` reads each width from saved shape — no per-tensor `config.json` entries needed. MoE routers stay full-precision by default (`--router-bits` opts in); experts default to `--bits` (`--expert-bits fp16/bf16` leaves them raw). | ✅ shipped |
+| **MoE expert layout** (`ffai convert --expert-layout stacked\|per-expert`) | `stacked` (default) gathers per-expert `experts.<e>.{w1,w3,w2}` into one `switch_mlp.{gate,up,down}_proj` tensor `[E, out, …]` (mlx-lm `QuantizedSwitchLinear` layout → fused expert-indexed dispatch); `per-expert` preserves source tensors. Built on the `ConvertDriver` `ConversionStep` plan seam. | ✅ shipped |
+| **mixed per-LAYER quantization** | Different layers in the same role at different bit-widths (e.g. first 4 attention layers at 2-bit, rest at 4-bit). Needs a recipe-file format and per-layer dispatch — separate from per-role. | 🚧 planned (see § "Targeted & mixed quantization" below) |
+| **targeted per-expert / ablation quantization** | Compress specific experts differently from others, or drop experts entirely (ablation). Extends the `ConversionStep` plan. | 🚧 planned (see § "Targeted & mixed quantization" below) |
 | **gguf** | llama.cpp single-file format, embeds quant + tokenizer + per-arch name mapping. | 🚧 planned (see `session-plan.md`) |
 | **onnx** | Graph format, embedded weights. Wrong fit — would need a graph executor. | ❌ skipped (doesn't align with static-kernel approach) |
+
+---
+
+## Targeted & mixed quantization (planned)
+
+**Shipped today (the foundation):** per-role specs (`--bits / --embedding-bits / --lm-head-bits / --vision-bits / --router-bits / --expert-bits`), the `stacked` vs `per-expert` MoE layout, and the loader's per-tensor `deriveAffineQuantBits` (reads each width from the saved shape — so arbitrary mixed-width checkpoints already *load* with no per-tensor `config.json`). The gap is purely the **convert-side recipe**: a way to drive per-layer / per-expert / per-weight widths and ablation. All of the below extends the **`ConvertDriver.ConversionStep` plan seam** (`buildPlan` emits richer steps; the executors stay stable) — no loader changes needed for anything the shape can express.
+
+### 1. Recipe file format
+A `--recipe recipe.json` (or `.toml`) driving the planner. Resolution order per tensor: explicit recipe rule → per-role flag → `--bits` default. Sketch:
+```json
+{
+  "default": { "bits": 4 },
+  "rules": [
+    { "match": "model.layers.{0..3}.self_attn.*", "bits": 2 },
+    { "match": "*.embed_tokens", "bits": 8 },
+    { "match": "*.feed_forward.experts.*", "bits": 4, "layout": "stacked" },
+    { "match": "model.layers.{0..1}.feed_forward.experts.{0,5,9}", "bits": 8 },
+    { "match": "model.layers.*.feed_forward.experts.{12..19}", "action": "ablate" }
+  ]
+}
+```
+`match` is a glob with `{a,b}` set + `{lo..hi}` range expansion over the source keys; first matching rule wins. Validate every rule resolves to ≥1 tensor (warn on dead rules), and that ablation leaves the router consistent (see §3).
+
+### 2. Per-expert differential compression
+The stacked path already quantizes each expert independently before concatenating, so **per-expert widths are nearly free**: a new `ConversionStep.stackExpertsTargeted(outBase, [(expertKey, QuantSpec)])` lets each expert carry its own spec. The only constraint: a single stacked tensor can't mix bit-widths in one buffer (the kernel reads one `bits` per tensor). Two resolutions:
+- **Uniform-within-stack (simple):** all experts in a `switch_mlp.<proj>` share one width; differential compression is per-(layer,proj) not per-expert. Covers "later layers' experts at lower precision."
+- **Per-expert true mixing (full):** fall back to `per-expert` layout for any (layer,proj) whose experts disagree on width, so each expert is its own `QuantizedLinear` (already supported by the loader). The planner picks layout per group: stacked when uniform, per-expert when mixed. Recommended default.
+
+### 3. Expert ablation (dropping experts)
+Drop a subset of experts entirely (structured pruning). Requires coordinated edits:
+- **Weights:** omit the ablated experts from the stack → `switch_mlp.<proj>` becomes `[E', out, …]` with `E' < num_experts`.
+- **Router:** slice the `feed_forward.gate` rows to the kept experts → `[E', hidden]`, and rewrite `num_experts` (+ `num_experts_per_tok` clamp) + any `expert_bias` `[E']` in the output `config.json`.
+- **Selection policy:** by explicit index list, or by a usage signal (router-logit mass / activation-frequency profiled over a calibration set — heavy-hitter experts kept). The calibration profiler is the real work here; the weight/router/config surgery is mechanical.
+- **Invariant:** `num_experts_per_tok ≤ E'`. Tests: an ablated checkpoint loads, routes only over kept experts, and stays coherent above a diversity floor.
+
+### 4. Per-weight / sub-tensor targeting
+The far end: different group sizes or outlier-preserving schemes (KIVI/AWQ-style salient-channel carve-outs) within a single weight. Out of scope for the affine path; revisit if a non-uniform scheme lands in metaltile. Tracked here only so the recipe format reserves room (`"scheme": "affine" | "awq" | …`).
+
+### Build order
+(1) recipe parser + glob matcher + planner wiring (drives §1 + uniform-within-stack §2); (2) per-expert true-mixing layout auto-selection (§2 full); (3) ablation weight/router/config surgery with an explicit index list; (4) calibration profiler for usage-based ablation + salient-channel selection. Each step is independently shippable and testable against the existing `ConvertDriverTests` synthetic-checkpoint harness.
 
 ---
 

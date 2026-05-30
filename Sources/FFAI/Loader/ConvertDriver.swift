@@ -62,6 +62,15 @@ import Metal
 /// from the saved shapes via `deriveAffineQuantBits`, and the dtype
 /// is part of every tensor's safetensors header, so mixed checkpoints
 /// load correctly without per-tensor `config.json` entries.
+/// Output layout for MoE expert projections.
+public enum ExpertLayout: String, Sendable, CaseIterable {
+    /// Gather per-expert weights into one `switch_mlp.<proj>` tensor of
+    /// shape `[E, out, …]` (mlx-lm `QuantizedSwitchLinear` layout). Default.
+    case stacked
+    /// Keep the source per-expert `experts.<e>.<proj>` tensors as-is.
+    case perExpert = "per-expert"
+}
+
 public struct ConvertOptions: Sendable {
     /// Spec for the main linear projections (attention + MLP — i.e.
     /// q/k/v/o, gate/up/down, MoE experts). Default `.bits(4)`.
@@ -101,6 +110,22 @@ public struct ConvertOptions: Sendable {
     /// quantize routers anyway, e.g. to mirror an upstream conversion
     /// that quantized the gate (mlx-community ships some at 8-bit).
     public var routerSpec: QuantSpec? = nil
+
+    /// How MoE expert projections are written. `.stacked` (default)
+    /// gathers the per-expert `experts.<e>.{w1,w2,w3}` source tensors into
+    /// one stacked `switch_mlp.{gate,up,down}_proj` tensor of shape
+    /// `[E, out, …]` — mlx-lm's `QuantizedSwitchLinear` layout, which the
+    /// loader dispatches through a single fused expert-indexed kernel
+    /// (faster than 32 separate `Linear` calls). `.perExpert` preserves
+    /// the source per-expert tensors. Non-MoE checkpoints ignore this.
+    public var expertLayout: ExpertLayout = .stacked
+
+    /// Spec for MoE expert projections (`switch_mlp.*` / `experts.<e>.*`).
+    /// `nil` (default) inherits the main `bits`. Set to `.fp16` / `.bf16`
+    /// to leave experts full-precision (the experts hold most of a MoE's
+    /// weight mass, so this is the big size/quality dial), or to a
+    /// different width to quantize them apart from the dense path.
+    public var expertSpec: QuantSpec? = nil
 
     /// Original source identifier — HF repo id (`org/repo`) or local
     /// path — used to fill in the `base_model:` field of the emitted
@@ -165,7 +190,7 @@ public enum ConvertDriver {
         // need no validation here.
         let allSpecs: [QuantSpec?] = [
             options.bits, options.embeddingSpec, options.lmHeadSpec, options.visionSpec,
-            options.routerSpec,
+            options.routerSpec, options.expertSpec,
         ]
         for spec in allSpecs {
             if case .bits(let b) = spec, !QuantSpec.supportedBits.contains(b) {
@@ -194,62 +219,25 @@ public enum ConvertDriver {
         let outputURL = destDir.appendingPathComponent("model.safetensors")
         let writer = SafeTensorsWriter(url: outputURL)
 
-        // Process tensors in sorted key order (deterministic output).
+        // Build the conversion plan (sorted source keys → output steps),
+        // then execute it. The plan is the extensibility seam for future
+        // targeted / per-layer / per-expert / ablation recipes (see
+        // `planning/plan.md` § "Targeted & mixed quantization"): a richer
+        // planner emits new `ConversionStep` cases; the executors below
+        // stay the stable core.
         let allKeys = bundle.allKeys.sorted()
-
-        for key in allKeys {
-            let entry = try bundle.tensor(named: key)
-
-            switch effectiveSpec(key: key, tensor: entry, options: options) {
-            case .bits(let bits)?:
-                // ─── Quantize this weight ────────────────────────────
-                // Per-tensor bit-width — may differ from `options.bits`
-                // when an embedding / lm_head / vision override applied.
-                progress?("quantizing \(key) \(entry.shape) @ \(bits)bit")
-                let (packedBytes, scalesBytes, biasesBytes) = try quantizeTensor(
-                    entry, key: key, options: options, bits: bits, device: device)
-
-                // Output naming matches SafeTensorsBundle.quantizedTriplet's
-                // expectation: <base>.weight (u32) + .scales + .biases.
-                let base = String(key.dropLast(".weight".count))
-                let weightShape = packedShape(
-                    original: entry.shape, numel: entry.elementCount, bits: bits)
-                let groupShape = scalesShape(original: entry.shape, groupSize: options.groupSize)
-
-                try writer.append(
-                    name: "\(base).weight", dtype: .u32,
-                    shape: weightShape, bytes: packedBytes)
-                try writer.append(
-                    name: "\(base).scales", dtype: entry.dtype,
-                    shape: groupShape, bytes: scalesBytes)
-                try writer.append(
-                    name: "\(base).biases", dtype: entry.dtype,
-                    shape: groupShape, bytes: biasesBytes)
-
-            case .fp16?, .bf16?:
-                // ─── Downcast to a different float dtype ─────────────
-                // Used when a role explicitly opts for `.fp16` / `.bf16`
-                // (e.g. publish a bf16 checkpoint as fp16 for inference
-                // platforms that prefer it). 1D / norm / non-`.weight`
-                // tensors paired with the same role still go through here
-                // — the dtype on the OUT tensor is the role's target;
-                // shape is unchanged.
-                let targetDtype = effectiveSpec(key: key, tensor: entry, options: options)!
-                    .downcastDtype!
-                progress?(
-                    "downcasting \(key) \(entry.shape) → \(targetDtype.rawValue)")
-                let bytes = downcastBytes(from: entry, to: targetDtype)
-                try writer.append(
-                    name: key, dtype: targetDtype,
-                    shape: entry.shape, bytes: bytes)
-
-            case nil:
-                // ─── Pass through unchanged ──────────────────────────
-                progress?("copying   \(key) \(entry.shape)")
-                let bytes = rawBytes(from: entry)
-                try writer.append(
-                    name: key, dtype: entry.dtype,
-                    shape: entry.shape, bytes: bytes)
+        let plan = buildPlan(keys: allKeys, options: options)
+        for step in plan {
+            switch step {
+            case .single(let key):
+                try executeSingle(
+                    key: key, bundle: bundle, writer: writer,
+                    options: options, device: device, progress: progress)
+            case .stackExperts(let outBase, let expertKeys, let spec):
+                try executeStackExperts(
+                    outBase: outBase, expertWeightKeys: expertKeys, spec: spec,
+                    bundle: bundle, writer: writer, options: options,
+                    device: device, progress: progress)
             }
         }
 
@@ -307,6 +295,177 @@ public enum ConvertDriver {
         key.hasSuffix(".gate.weight") || key.hasSuffix(".router.weight")
     }
 
+    // ─── Conversion plan ─────────────────────────────────────────────
+
+    /// One output unit of a conversion. `buildPlan` turns the source keys
+    /// + options into a `[ConversionStep]`; the executors below realise it.
+    /// This is the extensibility seam for future targeted / per-layer /
+    /// per-expert / ablation recipes (planning/plan.md § "Targeted & mixed
+    /// quantization"): a richer planner emits new cases without disturbing
+    /// the execution core.
+    enum ConversionStep {
+        /// Quantize / downcast / pass-through one source tensor → same key.
+        case single(key: String)
+        /// Gather `expertWeightKeys` (one `.weight` per expert, in expert
+        /// order) for one (layer, projection) into a single stacked
+        /// `switch_mlp.<proj>` tensor under `outBase`. `spec` is the
+        /// resolved expert spec (`expertSpec ?? bits`).
+        case stackExperts(outBase: String, expertWeightKeys: [String], spec: QuantSpec)
+    }
+
+    /// Parse a per-expert MoE weight key
+    /// `<prefix>.experts.<e>.<wName>.weight` → the stacked output base
+    /// `<prefix>.switch_mlp.<proj>` + the expert index. `wName` ∈
+    /// {`w1`/`w3`/`w2`, `gate_proj`/`up_proj`/`down_proj`} maps to the
+    /// stacked `gate_proj` / `up_proj` / `down_proj` the loader's
+    /// `sliceStackedExperts` expects. Returns nil for any non-expert key.
+    static func parseExpertWeightKey(_ key: String) -> (stackedBase: String, expert: Int)? {
+        guard key.hasSuffix(".weight"), let r = key.range(of: ".experts.") else {
+            return nil
+        }
+        let prefix = String(key[..<r.lowerBound])  // <...>.feed_forward
+        let rest = String(key[r.upperBound...])  // <e>.<wName>.weight
+        let parts = rest.split(separator: ".")
+        guard parts.count == 3, let e = Int(parts[0]) else { return nil }
+        let proj: String
+        switch parts[1] {
+        case "w1", "gate_proj": proj = "gate_proj"
+        case "w3", "up_proj": proj = "up_proj"
+        case "w2", "down_proj": proj = "down_proj"
+        default: return nil
+        }
+        return ("\(prefix).switch_mlp.\(proj)", e)
+    }
+
+    /// Build the output plan from sorted source keys. In `.stacked` layout,
+    /// per-expert weights are grouped by `(layer, projection)` into one
+    /// `stackExperts` step each and everything else is a `single`. In
+    /// `.perExpert` layout every tensor is a `single` (experts pick up
+    /// `expertSpec` through `effectiveSpec`).
+    static func buildPlan(keys: [String], options: ConvertOptions) -> [ConversionStep] {
+        guard options.expertLayout == .stacked else {
+            return keys.map { .single(key: $0) }
+        }
+        var groups: [String: [(Int, String)]] = [:]
+        var consumed = Set<String>()
+        for key in keys {
+            if let (base, e) = parseExpertWeightKey(key) {
+                groups[base, default: []].append((e, key))
+                consumed.insert(key)
+            }
+        }
+        var steps: [ConversionStep] =
+            keys.filter { !consumed.contains($0) }.map { .single(key: $0) }
+        let spec = options.expertSpec ?? options.bits
+        for base in groups.keys.sorted() {
+            let ordered = groups[base]!.sorted { $0.0 < $1.0 }.map { $0.1 }
+            steps.append(
+                .stackExperts(outBase: base, expertWeightKeys: ordered, spec: spec))
+        }
+        return steps
+    }
+
+    // ─── Step executors ──────────────────────────────────────────────
+
+    /// Quantize / downcast / pass-through a single tensor — the original
+    /// per-tensor path, lifted out of the main loop.
+    private static func executeSingle(
+        key: String, bundle: SafeTensorsBundle, writer: SafeTensorsWriter,
+        options: ConvertOptions, device: Device,
+        progress: (@Sendable (String) -> Void)?
+    ) throws {
+        let entry = try bundle.tensor(named: key)
+        switch effectiveSpec(key: key, tensor: entry, options: options) {
+        case .bits(let bits)?:
+            // Per-tensor bit-width — may differ from `options.bits` when an
+            // embedding / lm_head / vision / expert override applied.
+            progress?("quantizing \(key) \(entry.shape) @ \(bits)bit")
+            let (packedBytes, scalesBytes, biasesBytes) = try quantizeTensor(
+                entry, key: key, options: options, bits: bits, device: device)
+            let base = String(key.dropLast(".weight".count))
+            let weightShape = packedShape(
+                original: entry.shape, numel: entry.elementCount, bits: bits)
+            let groupShape = scalesShape(original: entry.shape, groupSize: options.groupSize)
+            try writer.append(
+                name: "\(base).weight", dtype: .u32, shape: weightShape, bytes: packedBytes)
+            try writer.append(
+                name: "\(base).scales", dtype: entry.dtype, shape: groupShape, bytes: scalesBytes)
+            try writer.append(
+                name: "\(base).biases", dtype: entry.dtype, shape: groupShape, bytes: biasesBytes)
+
+        case .fp16?, .bf16?:
+            let targetDtype = effectiveSpec(key: key, tensor: entry, options: options)!
+                .downcastDtype!
+            progress?("downcasting \(key) \(entry.shape) → \(targetDtype.rawValue)")
+            let bytes = downcastBytes(from: entry, to: targetDtype)
+            try writer.append(name: key, dtype: targetDtype, shape: entry.shape, bytes: bytes)
+
+        case nil:
+            progress?("copying   \(key) \(entry.shape)")
+            let bytes = rawBytes(from: entry)
+            try writer.append(name: key, dtype: entry.dtype, shape: entry.shape, bytes: bytes)
+        }
+    }
+
+    /// Gather per-expert weights and emit one stacked `switch_mlp.<proj>`
+    /// tensor. Each expert is quantized/downcast independently, then the
+    /// per-expert byte blobs are concatenated along a new leading expert
+    /// axis — the row-major `[E, …]` layout `sliceStackedExperts` slices.
+    /// Quantized (`spec == .bits`) → `[E, out, packed]` u32 + `[E, out,
+    /// groups]` scales/biases. Downcast/raw (`.fp16`/`.bf16`) → `[E, out,
+    /// in]` weight only.
+    private static func executeStackExperts(
+        outBase: String, expertWeightKeys: [String], spec: QuantSpec,
+        bundle: SafeTensorsBundle, writer: SafeTensorsWriter,
+        options: ConvertOptions, device: Device,
+        progress: (@Sendable (String) -> Void)?
+    ) throws {
+        let numExperts = expertWeightKeys.count
+        let first = try bundle.tensor(named: expertWeightKeys[0])
+        precondition(first.shape.count == 2, "stackExperts: expert weight must be 2D")
+        let perExpertShape = first.shape  // [out, in]
+
+        switch spec {
+        case .bits(let bits):
+            progress?(
+                "stacking+quantizing \(outBase) "
+                    + "[\(numExperts), \(perExpertShape[0]), \(perExpertShape[1])] @ \(bits)bit")
+            var wData = Data(), sData = Data(), bData = Data()
+            for k in expertWeightKeys {
+                let t = try bundle.tensor(named: k)
+                let (p, s, b) = try quantizeTensor(
+                    t, key: k, options: options, bits: bits, device: device)
+                wData.append(p)
+                sData.append(s)
+                bData.append(b)
+            }
+            let pe = packedShape(
+                original: perExpertShape, numel: first.elementCount, bits: bits)  // [out, pCols]
+            let ge = scalesShape(original: perExpertShape, groupSize: options.groupSize)  // [out, gCols]
+            try writer.append(
+                name: "\(outBase).weight", dtype: .u32, shape: [numExperts] + pe, bytes: wData)
+            try writer.append(
+                name: "\(outBase).scales", dtype: first.dtype, shape: [numExperts] + ge,
+                bytes: sData)
+            try writer.append(
+                name: "\(outBase).biases", dtype: first.dtype, shape: [numExperts] + ge,
+                bytes: bData)
+
+        case .fp16, .bf16:
+            let target = spec.downcastDtype!
+            progress?(
+                "stacking \(outBase) "
+                    + "[\(numExperts), \(perExpertShape[0]), \(perExpertShape[1])] → \(target.rawValue)")
+            var wData = Data()
+            for k in expertWeightKeys {
+                wData.append(downcastBytes(from: try bundle.tensor(named: k), to: target))
+            }
+            try writer.append(
+                name: "\(outBase).weight", dtype: target,
+                shape: [numExperts] + perExpertShape, bytes: wData)
+        }
+    }
+
     private static func effectiveSpec(
         key: String, tensor: Tensor, options: ConvertOptions
     ) -> QuantSpec? {
@@ -331,6 +490,11 @@ public enum ConvertDriver {
             // MoE router gates default to full-precision (`routerSpec`
             // nil → pass-through); the `--router-bits` flag opts in.
             roleSpec = options.routerSpec
+        } else if parseExpertWeightKey(key) != nil {
+            // Per-expert MoE weight (reached only in `.perExpert` layout —
+            // in `.stacked` layout these are consumed by `stackExperts` and
+            // never hit `effectiveSpec`). `expertSpec` nil inherits `bits`.
+            roleSpec = options.expertSpec ?? options.bits
         } else {
             // The main `bits` is always non-nil; wrap as Optional for
             // uniform handling below.

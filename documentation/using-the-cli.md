@@ -167,7 +167,7 @@ ffai download --local-files-only mlx-community/Qwen3-1.7B-4bit
 
 `ffai convert` quantizes a bf16/fp16 HuggingFace checkpoint to MLX affine-quantized format (the same `.weight` + `.scales` + `.biases` triplet layout that `mlx-community/*-4bit` checkpoints use) and writes the result as a drop-in directory `Model.load(...)` can consume. The quantize work runs through FFAI's own `QuantizedOps.quantizeAffine` GPU kernel — there is **no dependency on Python, `mlx-lm`, or `mlx-vlm`** at conversion time.
 
-Specs are **per-tensor-class**. The main `--bits` flag controls the attention + MLP linear projections (the bulk of the model); `--embedding-bits`, `--lm-head-bits`, and `--vision-bits` independently override the spec for those specific roles. Each spec accepts any of:
+Specs are **per-tensor-class**. The main `--bits` flag controls the attention + MLP linear projections (the bulk of the model); `--embedding-bits`, `--lm-head-bits`, `--vision-bits`, `--router-bits`, and `--expert-bits` independently override the spec for those specific roles. Each spec accepts any of:
 
 | Value | Effect |
 |---|---|
@@ -176,6 +176,8 @@ Specs are **per-tensor-class**. The main `--bits` flag controls the attention + 
 | `bf16` / `bfloat16` | Downcast to bfloat16. No-op when the source is already bf16. |
 
 The `--*-bits` overrides are optional — omit one and that tensor keeps its source dtype (the mlx-lm convention for embeddings / lm_head / vision tower).
+
+**MoE models** get two extra controls. By default routers (the `feed_forward.gate` / `*.router` projection) stay **full-precision** — quantizing the gate risks flipping top-k expert selection for negligible memory saving — and `--router-bits` opts them in. Experts default to `--bits`; `--expert-bits fp16`/`bf16` leaves them full-precision (experts hold most of a MoE's weight mass, so this is the big size/quality dial). `--expert-layout` chooses how experts are written: **`stacked`** (default) gathers the per-expert `experts.<e>.{w1,w3,w2}` tensors into one `switch_mlp.{gate,up,down}_proj` tensor `[E, out, …]` (mlx-lm's `QuantizedSwitchLinear` layout — a single fused expert-indexed dispatch, faster than 32 separate calls), while `per-expert` preserves the source per-expert tensors.
 
 ```bash
 # Pull a bf16 repo, quantize to 4-bit, drop the result in
@@ -202,6 +204,16 @@ ffai convert <repo> --bits fp16
 
 # Mixed bit-widths + downcast: 3-bit text body, fp16 vision tower.
 ffai convert <vlm> --bits 3 --embedding-bits 3 --vision-bits fp16
+
+# MoE: 4-bit body + experts, router left full-precision (default),
+# experts written stacked (default) for fused dispatch.
+ffai convert LiquidAI/LFM2.5-8B-A1B --bits 4
+
+# MoE: keep experts full-precision, quantize only the dense body to 4-bit.
+ffai convert <moe> --bits 4 --expert-bits bf16
+
+# MoE: preserve the source per-expert tensor layout instead of stacking.
+ffai convert <moe> --bits 4 --expert-layout per-expert
 ```
 
 End-to-end on the SmolLM2-360M case: download → quantize → write → upload measures at **~1.4 seconds**.
@@ -217,6 +229,9 @@ End-to-end on the SmolLM2-360M case: download → quantize → write → upload 
 | `--embedding-bits` | — (skip) | Spec for the token embedding table — same accepted values as `--bits`. Omit to keep `embed_tokens.weight` in its source dtype (mlx-lm convention). |
 | `--lm-head-bits` | — (skip) | Spec for `lm_head.weight` when the checkpoint ships an untied head. Same accepted values as `--bits`. Tied-embedding models reuse the embedding triplet, so this knob only matters for untied heads (Qwen 3.6, some Gemma). |
 | `--vision-bits` | — (skip) | Spec for vision-tower weights (matches `.visual.*` / `vision_tower.*` / `vision_model.*` prefixes). Same accepted values as `--bits`. Default keeps the tower in its source dtype because FFAI's VL towers (Qwen 3-VL / 3.5-VL, Pixtral, SigLIP, Idefics3, MiniCPM-V, FastVLM) consume plain `Linear`, not `QuantizedLinear` — set a quantized value only when wiring a new tower that supports it; `fp16` / `bf16` are always safe. |
+| `--router-bits` | — (skip → full precision) | Spec for MoE router gates (`.gate` / `.router` projections). Same accepted values as `--bits`. Default keeps routers full-precision (quantizing the gate risks flipping top-k expert selection for negligible memory saving); set e.g. `8` to mirror an upstream conversion that quantized the gate. |
+| `--expert-bits` | — (inherit `--bits`) | Spec for MoE expert projections. Same accepted values as `--bits`. Omit to inherit `--bits`; set `fp16` / `bf16` to leave experts full-precision (the big size/quality dial — experts hold most of a MoE's weight mass). |
+| `--expert-layout` | `stacked` | How MoE experts are written. `stacked` gathers per-expert `experts.<e>.{w1,w3,w2}` into one `switch_mlp.{gate,up,down}_proj` tensor `[E, out, …]` (mlx-lm `QuantizedSwitchLinear` layout → fused expert-indexed dispatch). `per-expert` preserves the source per-expert tensors. |
 | `--revision` | `main` | HF revision (branch / tag / commit) to download. |
 
 Per-tensor mixing is loader-friendly: FFAI's `loadLinear` / `loadEmbedding` derive each weight's bit-width from its saved shape via `deriveAffineQuantBits`, so a checkpoint with 4-bit linears + 8-bit lm_head + fp16 vision loads correctly without per-tensor entries in `config.json`. The top-level `quantization.bits` written to `config.json` records `--bits`'s bit-width when it's quantized; a pure-downcast conversion writes no `quantization` block at all.

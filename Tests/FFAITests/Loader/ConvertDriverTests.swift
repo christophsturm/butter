@@ -308,6 +308,93 @@ struct ConvertDriverTests {
         #expect(!ConvertDriver.isMoERouterKey("model.layers.0.feed_forward.gate.scales"))
     }
 
+    // ─── MoE expert layout (stacked vs per-expert) ──────────────────
+
+    @Test("parseExpertWeightKey maps w1/w3/w2 + *_proj to stacked switch_mlp base")
+    func expertKeyParsing() {
+        func base(_ k: String) -> String? { ConvertDriver.parseExpertWeightKey(k)?.stackedBase }
+        func idx(_ k: String) -> Int? { ConvertDriver.parseExpertWeightKey(k)?.expert }
+        let p = "model.layers.2.feed_forward"
+        #expect(base("\(p).experts.0.w1.weight") == "\(p).switch_mlp.gate_proj")
+        #expect(base("\(p).experts.5.w3.weight") == "\(p).switch_mlp.up_proj")
+        #expect(base("\(p).experts.31.w2.weight") == "\(p).switch_mlp.down_proj")
+        #expect(base("\(p).experts.3.gate_proj.weight") == "\(p).switch_mlp.gate_proj")
+        #expect(idx("\(p).experts.7.w1.weight") == 7)
+        // Non-expert keys → nil.
+        #expect(ConvertDriver.parseExpertWeightKey("\(p).gate.weight") == nil)
+        #expect(ConvertDriver.parseExpertWeightKey("model.layers.0.q_proj.weight") == nil)
+        #expect(ConvertDriver.parseExpertWeightKey("\(p).experts.0.w1.scales") == nil)
+    }
+
+    @Test("stacked layout (default) gathers per-expert weights into switch_mlp.<proj>")
+    func stackedExpertConversion() throws {
+        let dir = tempDir()
+        defer { cleanUp(dir) }
+        let E = 4
+        try writeSyntheticSource(at: dir, outDim: 4, inDim: 64, moeExperts: E)
+
+        let destDir = dir.appendingPathComponent("out")
+        var opts = ConvertOptions()
+        opts.bits = .bits(4)  // default expertLayout == .stacked
+        try ConvertDriver.convert(sourceDir: dir, destDir: destDir, options: opts)
+
+        let out = try SafeTensorsBundle(directory: destDir, device: .shared)
+        let p = "model.layers.2.feed_forward"
+
+        // Stacked quantized triplet [E, out, packed] / [E, out, groups].
+        let w = try out.tensor(named: "\(p).switch_mlp.gate_proj.weight")
+        #expect(w.dtype == .u32)
+        let packedCols = QuantizedOpsValidation.packedUInt32Count(numel: 4 * 64, bits: 4)! / 4
+        #expect(w.shape == [E, 4, packedCols])
+        #expect(out.has("\(p).switch_mlp.gate_proj.scales"))
+        #expect(out.has("\(p).switch_mlp.up_proj.weight"))   // from w3
+        #expect(out.has("\(p).switch_mlp.down_proj.weight"))  // from w2
+        // The per-expert source tensors must NOT survive in stacked mode.
+        #expect(!out.has("\(p).experts.0.w1.weight"))
+        #expect(!out.has("\(p).experts.3.w2.weight"))
+    }
+
+    @Test("per-expert layout keeps experts.<e>.<proj> tensors (quantized)")
+    func perExpertLayoutConversion() throws {
+        let dir = tempDir()
+        defer { cleanUp(dir) }
+        try writeSyntheticSource(at: dir, outDim: 4, inDim: 64, moeExperts: 3)
+
+        let destDir = dir.appendingPathComponent("out")
+        var opts = ConvertOptions()
+        opts.bits = .bits(4)
+        opts.expertLayout = .perExpert
+        try ConvertDriver.convert(sourceDir: dir, destDir: destDir, options: opts)
+
+        let out = try SafeTensorsBundle(directory: destDir, device: .shared)
+        let p = "model.layers.2.feed_forward"
+        // Per-expert tensors preserved + quantized; no stacked tensor.
+        #expect(out.has("\(p).experts.0.w1.weight"))
+        #expect(out.has("\(p).experts.0.w1.scales"))
+        #expect(!out.has("\(p).switch_mlp.gate_proj.weight"))
+    }
+
+    @Test("--expert-bits bf16 leaves stacked experts full-precision (no triplet)")
+    func stackedExpertsFullPrecision() throws {
+        let dir = tempDir()
+        defer { cleanUp(dir) }
+        let E = 4
+        try writeSyntheticSource(at: dir, outDim: 4, inDim: 64, moeExperts: E)
+
+        let destDir = dir.appendingPathComponent("out")
+        var opts = ConvertOptions()
+        opts.bits = .bits(4)
+        opts.expertSpec = .bf16  // leave experts raw even though body is 4-bit
+        try ConvertDriver.convert(sourceDir: dir, destDir: destDir, options: opts)
+
+        let out = try SafeTensorsBundle(directory: destDir, device: .shared)
+        let p = "model.layers.2.feed_forward"
+        let w = try out.tensor(named: "\(p).switch_mlp.gate_proj.weight")
+        #expect(w.dtype == .bf16)
+        #expect(w.shape == [E, 4, 64])  // raw stacked [E, out, in]
+        #expect(!out.has("\(p).switch_mlp.gate_proj.scales"))
+    }
+
     // ─── Helpers ────────────────────────────────────────────────────
 
     /// Build a minimum-viable HuggingFace-style source directory with
@@ -318,7 +405,8 @@ struct ConvertDriverTests {
         at dir: URL, outDim: Int, inDim: Int,
         includeEmbedding: Bool = false,
         includeVisionTower: Bool = false,
-        includeMoERouter: Bool = false
+        includeMoERouter: Bool = false,
+        moeExperts: Int = 0
     ) throws {
         let safetensors = dir.appendingPathComponent("model.safetensors")
         let writer = SafeTensorsWriter(url: safetensors)
@@ -357,6 +445,18 @@ struct ConvertDriverTests {
             try writer.append(
                 name: "model.layers.0.feed_forward.gate.weight",
                 dtype: .bf16, shape: [outDim, inDim], bytes: gateBytes)
+        }
+
+        // Per-expert MoE weights at layer 2: experts.<e>.{w1,w3,w2}.weight,
+        // each [outDim, inDim] (kept quantizable: inDim divisible by 64).
+        for e in 0 ..< moeExperts {
+            for proj in ["w1", "w3", "w2"] {
+                let bytes = bf16Bytes(
+                    (0 ..< outDim * inDim).map { Float($0) * 0.001 + Float(e) * 0.01 })
+                try writer.append(
+                    name: "model.layers.2.feed_forward.experts.\(e).\(proj).weight",
+                    dtype: .bf16, shape: [outDim, inDim], bytes: bytes)
+            }
         }
 
         try writer.finalize()
