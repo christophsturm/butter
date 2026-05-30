@@ -20,6 +20,16 @@ import ArgumentParser
 import FFAI
 import Foundation
 
+/// How `--prompt` is fed to the model.
+enum GenerateMode: String, ExpressibleByArgument, CaseIterable {
+    /// Feed the prompt verbatim (base / completion models).
+    case raw
+    /// Wrap the prompt as a single user turn and render it through the
+    /// model's chat template (instruct / reasoning models). Required for
+    /// models like LFM2.5 that degenerate on raw input.
+    case chat
+}
+
 struct GenerateCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "generate",
@@ -31,6 +41,14 @@ struct GenerateCommand: AsyncParsableCommand {
 
     @Option(name: .shortAndLong, help: "Prompt to generate from.")
     var prompt: String = "Once upon a time"
+
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "How the prompt is fed to the model: 'raw' (default, verbatim — base/completion models) "
+                + "or 'chat' (wrap as a user turn through the model's chat template — instruct/"
+                + "reasoning models like LFM2.5, which degenerate on raw input)."))
+    var mode: GenerateMode = .raw
 
     @Option(name: .long, help: "Maximum tokens to generate. Defaults to the model family's value.")
     var maxTokens: Int?
@@ -119,9 +137,9 @@ struct GenerateCommand: AsyncParsableCommand {
     @Option(
         name: .long,
         help:
-            "Decoding mode: \"ar\" (autoregressive, default), \"diffusion\" (block-wise parallel), or \"self-spec\" (diffusion draft + AR verify). diffusion / self-spec require a Nemotron-Labs-Diffusion model."
+            "Decode algorithm: \"ar\" (autoregressive, default), \"diffusion\" (block-wise parallel), or \"self-spec\" (diffusion draft + AR verify). diffusion / self-spec require a Nemotron-Labs-Diffusion model."
     )
-    var mode: String = "ar"
+    var decodeMode: String = "ar"
 
     @Option(name: .long, help: "Block length for diffusion / self-spec decoding. Default 32.")
     var blockLength: Int = 32
@@ -236,7 +254,7 @@ struct GenerateCommand: AsyncParsableCommand {
 
         // Non-autoregressive modes — block-wise diffusion or linear
         // self-speculation (Nemotron-Labs-Diffusion only).
-        let genMode = mode.lowercased()
+        let genMode = decodeMode.lowercased()
         if genMode != "ar" {
             guard genMode == "diffusion" || genMode == "self-spec" || genMode == "selfspec"
             else {
@@ -322,11 +340,28 @@ struct GenerateCommand: AsyncParsableCommand {
         model: Model,
         params: GenerationParameters
     ) async throws -> GenerationResult {
+        // In chat mode, wrap the prompt as a single user turn and render it
+        // through the model's chat template. Fail early with a clear message
+        // if the model ships no template.
+        let chatMessages: [ChatMessage]? = {
+            mode == .chat ? [ChatMessage(role: .user, content: prompt)] : nil
+        }()
+        if mode == .chat && !model.supportsChatTemplate {
+            throw ValidationError(
+                "--mode chat requires a chat template, but \(self.model) ships none "
+                    + "(neither tokenizer_config.json nor a standalone chat_template.jinja). "
+                    + "Use --mode raw, or load an instruct model.")
+        }
+
         if streaming {
             var generated: [Int] = []
             var text = ""
             var stats: GenerationStats?
-            for try await chunk in model.generateStream(prompt: prompt, parameters: params) {
+            let stream =
+                try chatMessages != nil
+                ? model.generateStream(messages: chatMessages!, parameters: params)
+                : model.generateStream(prompt: prompt, parameters: params)
+            for try await chunk in stream {
                 if !chunk.text.isEmpty {
                     print(chunk.text, terminator: "")
                     fflush(stdout)
@@ -336,13 +371,21 @@ struct GenerateCommand: AsyncParsableCommand {
                 if let s = chunk.stats { stats = s }
             }
             print("")  // newline after the streamed text
+            let promptTokens =
+                chatMessages.flatMap { try? model.renderChatTemplate(messages: $0) }
+                ?? model.tokenizer.encode(text: prompt)
             return GenerationResult(
-                promptTokens: model.tokenizer.encode(text: prompt),
+                promptTokens: promptTokens,
                 generatedTokens: generated, text: text,
                 stats: stats!  // streamEndedWithoutFinalChunk would have thrown above
             )
         } else {
-            let result = try await model.generate(prompt: prompt, parameters: params)
+            let result: GenerationResult
+            if let messages = chatMessages {
+                result = try await model.generate(messages: messages, parameters: params)
+            } else {
+                result = try await model.generate(prompt: prompt, parameters: params)
+            }
             print(result.text)
             return result
         }

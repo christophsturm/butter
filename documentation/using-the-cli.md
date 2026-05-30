@@ -31,6 +31,14 @@ ffai generate -m mlx-community/Qwen3.5-0.8B-MLX-4bit -p "Once upon a time"
 
 `generate` is the default subcommand, so the `-m / -p` flags can be passed directly to `ffai` (`ffai -m … -p …` is equivalent to `ffai generate -m … -p …`).
 
+**Instruct / reasoning models need `--mode chat`.** By default `generate` feeds the prompt verbatim (`--mode raw`), which suits base / completion models. Instruct and reasoning models (e.g. `LFM2.5`, most `-Instruct` checkpoints) are trained on a chat template and degenerate on raw input — pass `--mode chat` to wrap the prompt as a user turn and render it through the model's chat template (loaded from `tokenizer_config.json` *or* a standalone `chat_template.jinja`):
+
+```bash
+ffai generate -m ekryski/LFM2.5-8B-A1B-4bit --mode chat -p "What is the capital of France?"
+```
+
+(The Nemotron-Diffusion decode-algorithm selector, formerly `--mode`, is now `--decode-mode ar|diffusion|self-spec`.)
+
 ## Subcommands
 
 | Subcommand | One-liner | More |
