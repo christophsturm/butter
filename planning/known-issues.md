@@ -213,6 +213,40 @@ special-token / chat-template edges are at risk. Fix: register
 `LlamaTokenizer` / `Qwen2Tokenizer` etc. are mapped. Surfaced 2026-05-28
 with the InternLM2 loader work.
 
+## LFM2.5 forward pass degenerate — real architecture bug (NOT quantization)
+
+Surfaced 2026-05-30 bringing up `LiquidAI/LFM2.5-8B-A1B`. FFAI loads it but
+greedy decode degenerates ("The history of the printing press began when
+*when when when … que que que*"); the top next-token after "The capital of
+France is" is " the" / " France" (context echo), not " Paris".
+
+**Not a quantization bug — isolated via A/B:**
+
+| Model | raw bf16 | 4-bit |
+|---|---|---|
+| LFM2-8B-A1B | ✅ coherent | ✅ coherent |
+| LFM2.5-8B-A1B | ❌ degenerate | ❌ degenerate |
+
+The **raw bf16 LFM2.5 degenerates identically** to the 4-bit, while raw bf16
+LFM2-8B-A1B is coherent. Same loader code path, same `Lfm2MoeForCausalLM`
+engine. **Ruled out:** rope_theta (loader correctly computes 5e6 — verified
+via debug print; nested `rope_parameters` cast works), tokenizer (encodes
+"The capital of France is" → correct ids), RMSNorm weight convention (LFM2.5
+operator/ffn norm means ~0.1–0.2, same as LFM2-8B — no centered-norm fold
+needed), and `config.json` is architecturally identical to LFM2-8B
+(same heads / kv-heads / experts / dense-layers / layer_types schedule /
+conv). The **"LFM2.5 is architecturally identical to LFM2" assumption is
+therefore wrong** — LFM2.5 is a much newer release (transformers 5.9 vs
+4.57) and has a hidden forward difference not expressed in the config.
+
+**Next diagnostics:** test mlx-community `LFM2.5-1.2B-Instruct` (is it
+LFM2.5-wide or 8B-MoE-specific?); compare per-layer activations vs an
+mlx-lm reference (`ffai inspect --layer-trace` / `--trace-layers`); check
+input-embedding scaling, attention scale, and any new LFM2.5 feature
+(QK-norm application, conv gating order). The crash-level per-expert
+quantized loader fix IS correct and committed; `LFM2TextIntegrationTests`
+LFM2.5 case is gated to load + config assertions until the forward fix lands.
+
 ## Downloader — Xet-backed HF repos 404 (`ffai download` / `convert` / `Model.load`)
 
 Surfaced 2026-05-29 adding `LiquidAI/LFM2.5-8B-A1B`. Its `model.safetensors`

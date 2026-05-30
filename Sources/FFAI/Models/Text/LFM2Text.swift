@@ -512,25 +512,25 @@ private func buildLFM2MoE(
             numExperts: numExperts, outDim: hidden, inDim: moeIntermediate,
             quantization: quantization)
     } else {
-        // Per-expert tensor layout (raw HF). No quantized per-expert
-        // checkpoint exists in our LFM2 test surface today.
+        // Per-expert tensor layout (`feed_forward.experts.<e>.{w1,w2,w3}` /
+        // `{gate,up,down}_proj`). Route each projection through
+        // `lfm2MLPLinear` so a quantized per-expert checkpoint loads as a
+        // `QuantizedLinear` (FFAI's own `ffai convert` of LiquidAI's raw
+        // LFM2.5-8B-A1B produces exactly this — per-expert weights packed
+        // at 4-bit). A plain `Linear` here would gemv the packed u32 weight
+        // with the wrong in_dim (logical hidden vs packed width). Raw
+        // checkpoints still load as a plain `Linear` via the same helper.
         gateProj.reserveCapacity(numExperts)
         upProj.reserveCapacity(numExperts)
         downProj.reserveCapacity(numExperts)
         for e in 0 ..< numExperts {
             let eb = "\(p).feed_forward.experts.\(e)"
             gateProj.append(
-                AnyLinear(
-                    Linear(
-                        weight: try lfm2MLPWeight(eb, "gate", in: weights))))
+                try lfm2MLPLinear(eb, "gate", in: weights, quantization: quantization))
             upProj.append(
-                AnyLinear(
-                    Linear(
-                        weight: try lfm2MLPWeight(eb, "up", in: weights))))
+                try lfm2MLPLinear(eb, "up", in: weights, quantization: quantization))
             downProj.append(
-                AnyLinear(
-                    Linear(
-                        weight: try lfm2MLPWeight(eb, "down", in: weights))))
+                try lfm2MLPLinear(eb, "down", in: weights, quantization: quantization))
         }
     }
 
@@ -557,39 +557,12 @@ private func buildLFM2MoE(
         router: router, hidden: hidden)
 }
 
-/// Read an LFM2 SwiGLU projection weight. LFM2 names them `w1` (gate) /
-/// `w3` (up) / `w2` (down); some conversions rename them to
-/// `gate_proj` / `up_proj` / `down_proj`. Accept either.
+/// Load an LFM2 SwiGLU projection (`w1`=gate / `w3`=up / `w2`=down, or the
+/// renamed `gate_proj` / `up_proj` / `down_proj`). Returns an `AnyLinear`
+/// wrapping a `QuantizedLinear` when a quantized triplet is present under
+/// either name, or a plain `Linear` otherwise — so both the dense MLP and
+/// per-expert MoE paths handle raw + quantized checkpoints uniformly.
 /// `which` ∈ {`gate`, `up`, `down`}.
-private func lfm2MLPWeight(
-    _ base: String, _ which: String,
-    in weights: SafeTensorsBundle
-) throws -> Tensor {
-    let wName: String
-    let projName: String
-    switch which {
-    case "gate":
-        wName = "w1"
-        projName = "gate_proj"
-    case "up":
-        wName = "w3"
-        projName = "up_proj"
-    case "down":
-        wName = "w2"
-        projName = "down_proj"
-    default: fatalError("lfm2MLPWeight: unknown projection '\(which)'")
-    }
-    if weights.has("\(base).\(wName).weight") {
-        return try weights.tensor(named: "\(base).\(wName).weight")
-    }
-    return try weights.tensor(named: "\(base).\(projName).weight")
-}
-
-/// Quantization-aware version of `lfm2MLPWeight` — returns an
-/// AnyLinear that may wrap a QuantizedLinear (if a quantized triplet
-/// is present under either the legacy `w*` or new `*_proj` name) or a
-/// plain Linear otherwise. Handles both naming conventions
-/// transparently. `which` ∈ {`gate`, `up`, `down`}.
 private func lfm2MLPLinear(
     _ base: String, _ which: String,
     in weights: SafeTensorsBundle,
