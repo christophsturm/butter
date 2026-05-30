@@ -178,10 +178,13 @@ struct Gemma4MultimodalIntegrationTests {
             "audio encoder grossly diverges from the reference (mean abs diff \(meanDiff))")
     }
 
-    /// Validate the magnitude-Mel front-end against the Gemma 4 feature
-    /// extractor (mlx-vlm) for the test sine. Mel is deterministic, so this
-    /// SHOULD match closely (a localization aid for the front-end). Skips
-    /// if the fixture is missing.
+    /// Validate the magnitude-Mel front-end against the transformers
+    /// `Gemma4AudioFeatureExtractor` for the test sine. The mel is
+    /// deterministic and FFAI now matches the reference bit-for-bit
+    /// (periodic-Hann window, HTK norm=None filterbank, magnitude STFT,
+    /// `pad_to_multiple_of=128` + mask-zeroing), so this is a strict gate.
+    /// Regenerate the fixture with
+    /// `gemma4-benchmark/dump_gemma4_sine_mel.py`. Skips if missing.
     @Test("mel front-end matches the Gemma 4 feature extractor on the test sine")
     func melFrontEndMatchesReference() throws {
         let oraclePath = "/tmp/gemma4_sine_mel_oracle.f32"
@@ -203,42 +206,38 @@ struct Gemma4MultimodalIntegrationTests {
             sumDiff += abs(got[i] - oracle[i])
         }
         print("mel max abs diff \(maxDiff), mean abs diff \(sumDiff / Float(n))")
-        // KNOWN-PENDING: the magnitude-Mel (sqrt-before-filterbank) is in
-        // place, but the spectrogram framing / window / HTK-filterbank
-        // construction is not yet calibrated to the transformers
-        // `Gemma4AudioFeatureExtractor` (the reference clusters ~-4.5 vs
-        // FFAI's floored bin-0). The audio ENCODER itself is validated
-        // (audioEncoderMatchesOracle, ~1% mean) by feeding the reference's
-        // own mel — this front-end calibration is the remaining gap before
-        // end-to-end audio→text. Diagnostic only; not a hard gate yet.
-        #expect(got.count == oracle.count)
+        // FFAI's CPU magnitude-Mel reproduces the reference feature
+        // extractor exactly up to f32 rounding (the NumPy cross-check is
+        // bit-exact; the small residual here is GPU-tensor round-trip /
+        // CPU-DFT vs np.fft.rfft float ordering). A tight bound catches any
+        // framing/window/filterbank regression.
+        #expect(
+            maxDiff < 5e-3,
+            "mel front-end diverges from the reference (max abs diff \(maxDiff))")
     }
 
-    // KNOWN-PENDING: audio → text generation.
+    // End-to-end audio → text: the full Gemma 4 audio pipeline (log-Mel
+    // front-end → Conformer/USM encoder → `embed_audio` projection → splice
+    // → text decode) on a real speech clip. Both halves are independently
+    // validated against the reference: the mel front-end is bit-exact
+    // (`melFrontEndMatchesReference`, max diff 3e-4) and the encoder tracks
+    // the mlx-vlm oracle to ~1 % mean (`audioEncoderMatchesOracle`). This
+    // closes the loop by asserting the decoded transcription is coherent
+    // and mentions the clip's spoken content.
     //
-    // The Gemma 4 audio encoder (Conformer / USM speech encoder + log-Mel
-    // front-end) is NOT yet numerically validated against the mlx-vlm
-    // oracle — the relative-shift attention index math, the SSCP conv
-    // output dims, and the power-vs-magnitude Mel are all marked
-    // `// VALIDATE:` in `Gemma4Audio.swift` / `Gemma4AudioFrontend.swift`.
-    // Until those are confirmed end-to-end, this test only asserts the
-    // generate path RUNS and returns *some* tokens; it does NOT assert the
-    // decoded text is coherent or content-correct. Once the encoder is
-    // validated + un-gated, replace the `generated.isEmpty` check with the
-    // `expectCoherentOutput(...)` + content assertion below.
+    // Gemma 4 wraps the audio soft-token run in `boa … eoa` markers
+    // (`boa_token_id` 256000, `audio_token_id` 258881, `eoa_token_id`
+    // 258883 — see mlx-vlm `processing_gemma4.py`): the prompt carries one
+    // `audioTokenId` placeholder per encoder frame, and `spliceMultimodal`
+    // replaces each with the matching audio embedding row.
     //
-    // Per `documentation/developing/adding-a-model.md`, generation uses the
-    // model's default sampling params (NOT greedy) — but the `VisionModel`
-    // multimodal generate path is currently greedy-only (`runGreedy`), the
-    // same surface the Gemma 4 vision integration test uses. The default
-    // params (temp / top-p / seed) become the contract once a sampling
-    // multimodal generate path lands; the seed is pinned here for when it
-    // does.
-    @Test(
-        "audio + text prompt — generates (KNOWN-PENDING coherence)",
-        .disabled(
-            "Gemma 4 audio encoder not yet numerically validated against the mlx-vlm oracle (see VALIDATE markers in Gemma4Audio.swift / Gemma4AudioFrontend.swift). Un-gate after validation.")
-    )
+    // The `VisionModel` multimodal generate path is greedy (`runGreedy`),
+    // the same surface the Gemma 4 vision integration test uses, so this is
+    // deterministic without a seed.
+    static let boaTokenId = 256000
+    static let eoaTokenId = 258883
+
+    @Test("audio + text prompt — transcribes the clean_001 speech clip coherently")
     func audioTextGeneration() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
             try await Model.load(Self.modelId)
@@ -246,36 +245,45 @@ struct Gemma4MultimodalIntegrationTests {
         let vlm = try #require(m.vlModel, "checkpoint is not a VLM")
         let audioTokenId = try #require(vlm.audioTokenId, "no audio token id")
 
-        // Encode the waveform first so we know exactly how many audio soft
-        // tokens to splice — the prompt must carry one `audioTokenId`
-        // placeholder per soft token (the interior of the `boa … eoa`
-        // span).
-        let waveform = Self.testWaveform()
+        // Real 16 kHz speech: "Sure, I can help you with that." (~1.85 s).
+        let waveform = try AudioTestHelpers.clean001Waveform()
+
+        // Encode first so we know how many audio soft tokens to splice; the
+        // prompt carries one `audioTokenId` per encoder frame inside the
+        // `boa … eoa` span.
         let audioTokens = try vlm.encodeAudio(waveform)
         let nAudioTokens = audioTokens.shape[0]
+        #expect(nAudioTokens > 0, "encoder produced no audio soft tokens")
 
-        let questionTokens = m.tokenizer.encode(
-            text: "<start_of_turn>user\nTranscribe this audio.<end_of_turn>\n"
-                + "<start_of_turn>model\n")
-        let promptTokens =
-            Array(repeating: audioTokenId, count: nAudioTokens) + questionTokens
+        // Build the chat prompt: a user turn whose content is the wrapped
+        // audio span followed by a transcription instruction.
+        let userPrefix = m.tokenizer.encode(text: "<start_of_turn>user\n")
+        let userSuffix = m.tokenizer.encode(
+            text: "\nTranscribe this audio.<end_of_turn>\n<start_of_turn>model\n")
+        let audioSpan =
+            [Self.boaTokenId]
+            + Array(repeating: audioTokenId, count: nAudioTokens)
+            + [Self.eoaTokenId]
+        let promptTokens = userPrefix + audioSpan + userSuffix
 
-        // Seed pinned for the eventual sampling path; the current greedy
-        // multimodal generate ignores it but the intent is documented.
-        let _ = m.defaultGenerationParameters.with {
-            $0.maxTokens = 64
-            $0.seed = 42
-        }
         let generated = try vlm.generate(
             promptTokens: promptTokens, audio: waveform,
             maxTokens: 64, eosTokenId: m.config.eosTokenId,
             eosTokenIds: m.config.eosTokenIds)
 
-        // KNOWN-PENDING: only assert the path runs and emits tokens. Swap
-        // for `expectCoherentOutput(generated, minTokens: 8, label: ...)`
-        // plus a transcription-content check once the encoder is validated.
-        #expect(!generated.isEmpty, "audio generate produced no tokens")
         let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
-        print("Gemma 4 audio (KNOWN-PENDING) generated: \(text)")
+        print("Gemma 4 audio → text: \(text)")
+
+        // Coherent (non-degenerate) decode — the audio path must not produce
+        // an empty / repetitive / first-step-EOS collapse.
+        expectCoherentOutput(
+            generated, minTokens: 4, maxConsecutiveRepeat: 6,
+            minUniqueRatio: 0.2, label: "gemma4-audio")
+        // Content gate: the transcription should reference the spoken phrase.
+        let lower = text.lowercased()
+        #expect(
+            lower.contains("sure") || lower.contains("help")
+                || lower.contains("can"),
+            "transcription did not reference the clip's spoken content: \(text)")
     }
 }

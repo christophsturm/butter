@@ -142,6 +142,19 @@ public protocol LanguageModel: Module {
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor
 
+    /// Embedding-input forward that additionally carries the token id to
+    /// use for any token-id-dependent per-position state — specifically
+    /// Gemma 4's Per-Layer Embeddings (PLE). `pleTokenId` is the real
+    /// token at text positions and `0` at multimodal placeholders, exactly
+    /// the reference's `mx.where(text_mask, input_ids, 0)`. Engines without
+    /// token-id-derived per-position state ignore it; the default
+    /// implementation drops it and calls the plain embedding-input forward.
+    func forward(
+        inputEmbedding: Tensor, position: Int, pleTokenId: Int?,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor
+
     /// Look up the raw `[hidden]` embedding row for a text token — the
     /// table gather *without* any family-specific post-scale (Gemma's
     /// embed-scale is applied inside `forward(inputEmbedding:...)`, not
@@ -178,6 +191,20 @@ extension LanguageModel {
         preconditionFailure(
             "\(type(of: self)) does not support embedding-input forward — "
                 + "check supportsEmbeddingInput before calling")
+    }
+
+    /// Default `forward(inputEmbedding:position:pleTokenId:...)`: drops the
+    /// PLE token id and delegates to the plain embedding-input forward.
+    /// Only Gemma 4 (PLE) overrides this; every other VL backbone has no
+    /// token-id-derived per-position state to recover on the splice path.
+    public func forward(
+        inputEmbedding: Tensor, position: Int, pleTokenId: Int?,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        forward(
+            inputEmbedding: inputEmbedding, position: position,
+            caches: caches, on: cmd, device: device)
     }
 
     /// Default `textEmbedding(...)`: traps. VL-target families provide a

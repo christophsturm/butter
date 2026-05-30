@@ -1824,17 +1824,36 @@ public final class Gemma4Model: LanguageModel {
     // ─── VLM embedding-input path ────────────────────────────────────
     //
     // Gemma 4 is a VL-target text backbone (Gemma4-VL wraps it). The
-    // splice supplies a `[hidden]` row directly — a vision-encoder token
-    // or a text-token embedding the VL model looked up. The forward
-    // mirrors `forward(tokenId:...)` minus the embedding gather; the
-    // `sqrt(hidden)` embed-scale is still applied here (image tokens in
-    // Gemma 4 are scaled the same way as text tokens, matching the
-    // Gemma 3 VL convention).
+    // splice supplies a `[hidden]` row directly — a vision/audio encoder
+    // soft token or a text-token embedding the VL model looked up.
     //
-    // Per-Layer Embeddings (Gemma4E) are token-id-derived and so cannot
-    // be computed for a vision token — the dense Gemma 4 VL variant
-    // carries no PLE, and a PLE-bearing variant simply runs its layers
-    // with a nil per-layer input on the splice path (coherence-first).
+    // CRITICAL — embed-scale placement. The reference
+    // (`mlx_vlm/models/gemma4/gemma4.py` `get_input_embeddings`) scales
+    // ONLY the text-token embeddings by `sqrt(hidden)`:
+    //
+    //     inputs_embeds = embed_tokens(input_ids) * embed_scale
+    //     inputs_embeds = masked_scatter(inputs_embeds, image_mask, image_features)
+    //     inputs_embeds = masked_scatter(inputs_embeds, audio_mask, audio_encodings)
+    //
+    // The `masked_scatter` OVERWRITES the scaled text rows at multimodal
+    // positions with the raw `embed_vision` / `embed_audio` output
+    // (`MultimodalEmbedder` = RMSNormNoScale → Linear; it bakes in NO
+    // scale). So multimodal soft tokens enter the backbone UNSCALED while
+    // text tokens are scaled. Unlike PaliGemma (which scales its image
+    // tokens), applying `embed_scale` to a Gemma 4 audio/vision row blows
+    // it up by `sqrt(hidden) ≈ 45×` and collapses generation to garbage.
+    //
+    // To honour that split with a per-row embedding stream (the splice
+    // can't tell the backbone which rows are text), Gemma 4 folds the
+    // text embed-scale into `textEmbedding(tokenId:)` and this forward
+    // does NOT re-scale — so spliced multimodal rows stay unscaled. The
+    // two overrides are always used together, so the convention is
+    // self-consistent even though it differs from the protocol default.
+    //
+    // Per-Layer Embeddings (Gemma4E): the reference derives the PLE from
+    // the token ids (multimodal positions use token 0). The splice path
+    // runs layers with a nil per-layer input (coherence-first) — the
+    // token-id decode that follows prefill restores full PLE.
 
     public var supportsEmbeddingInput: Bool { true }
 
@@ -1843,18 +1862,53 @@ public final class Gemma4Model: LanguageModel {
         caches: [any LayerCacheProtocol],
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
+        // No PLE token id available — delegate with `nil` (PLE skipped).
+        forward(
+            inputEmbedding: inputEmbedding, position: position,
+            pleTokenId: nil, caches: caches, on: cmd, device: device)
+    }
+
+    public func forward(
+        inputEmbedding: Tensor, position: Int, pleTokenId: Int?,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
         precondition(
             inputEmbedding.elementCount == hidden,
             "Gemma4Model.forward(inputEmbedding:): expected [\(hidden)], "
                 + "got \(inputEmbedding.shape)")
 
-        // Embedding-scale on a private buffer (mirrors the token path).
-        let prepCmd = device.makeCommandBuffer()
-        var h = Ops.mul(
-            inputEmbedding.reshaped(to: [hidden]), embedScale,
-            on: prepCmd)
-        prepCmd.commit()
-        prepCmd.waitUntilCompleted()
+        // NO embed-scale here: text rows arrive pre-scaled from
+        // `textEmbedding(tokenId:)` and multimodal soft tokens must stay
+        // unscaled (see the reference split above). `h` is the input row
+        // as-is.
+        var h = inputEmbedding.reshaped(to: [hidden])
+
+        // Per-Layer Embeddings (Gemma4E): the PLE has two inputs, and they
+        // take DIFFERENT sources at a multimodal position (per the reference
+        // `project_per_layer_inputs(h, get_per_layer_inputs(input_ids))`):
+        //   • `per_layer_model_projection(h)` projects the ACTUAL hidden row
+        //     `h` — the audio/vision soft token at multimodal positions, the
+        //     scaled text embedding at text positions.
+        //   • `embed_tokens_per_layer(input_ids)` looks up the per-layer
+        //     table with `input_ids` masked to `0` at multimodal positions
+        //     (the reference `where(text_mask, input_ids, 0)`).
+        // So we feed the real `h` to the projection and `pleTokenId` (0 for
+        // multimodal placeholders, the real token for text) to the table.
+        // Without a `pleTokenId` (legacy callers) PLE is skipped.
+        var perLayerInputs: Tensor? = nil
+        if let ple, let pleTokenId {
+            let prepCmd = device.makeCommandBuffer()
+            let tokenBuf = device.makeBuffer(length: 4)
+            var tid = UInt32(pleTokenId)
+            memcpy(tokenBuf.contents(), &tid, 4)
+            let tokenTensor = Tensor(
+                buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
+            perLayerInputs = ple.perLayerInputs(
+                tokenTensor: tokenTensor, h: h, on: prepCmd)
+            prepCmd.commit()
+            prepCmd.waitUntilCompleted()
+        }
 
         // Layers run on their own self-committing buffers; `cmd` is left
         // pristine for the final norm / head (same contract as the
@@ -1863,6 +1917,10 @@ public final class Gemma4Model: LanguageModel {
         var workCmd = device.makeCommandBuffer()
         var batchPending = false
         for (i, layer) in layers.enumerated() {
+            let pli: Tensor? = perLayerInputs.map { plis in
+                plis.slicedRows(start: i, count: 1)
+                    .reshaped(to: [params.hiddenSizePerLayerInput])
+            }
             if !layer.batchable && batchPending {
                 workCmd.commit()
                 workCmd.waitUntilCompleted()
@@ -1875,7 +1933,7 @@ public final class Gemma4Model: LanguageModel {
             let (newH, committed) = layer.forward(
                 h, position: position,
                 cache: caches[i] as! any KVCacheProtocol,
-                perLayerInput: nil, cmd: workCmd, device: device,
+                perLayerInput: pli, cmd: workCmd, device: device,
                 donorCache: donorCache)
             h = newH
             if committed {
@@ -1902,8 +1960,12 @@ public final class Gemma4Model: LanguageModel {
         return lmHead(normed, on: cmd)
     }
 
-    /// Raw embedding-table lookup for one text token — no embed-scale
-    /// (that is applied inside `forward(inputEmbedding:...)`).
+    /// Embedding-table lookup for one text token, WITH the `sqrt(hidden)`
+    /// embed-scale folded in. Gemma 4 scales text tokens but not the
+    /// spliced multimodal soft tokens (see the embed-scale note on
+    /// `forward(inputEmbedding:)`), and the per-row embedding stream can't
+    /// signal row type to the backbone — so the scale lives here, on the
+    /// text path only, and `forward(inputEmbedding:)` does not re-apply it.
     public func textEmbedding(tokenId: Int, device: Device) -> Tensor {
         let cmd = device.makeCommandBuffer()
         let tokenBuf = device.makeBuffer(length: 4)
@@ -1911,9 +1973,10 @@ public final class Gemma4Model: LanguageModel {
         memcpy(tokenBuf.contents(), &tid, 4)
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
         let embed = embedTokens(tokenTensor, on: cmd).reshaped(to: [hidden])
+        let scaled = Ops.mul(embed, embedScale, on: cmd)
         cmd.commit()
         cmd.waitUntilCompleted()
-        return embed
+        return scaled
     }
 }
 

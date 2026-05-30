@@ -451,6 +451,17 @@ public final class VisionModel: @unchecked Sendable {
             }
         }
 
+        // Multimodal-placeholder predicate — these positions get token id
+        // `0` for any token-id-derived per-position state (Gemma 4 PLE),
+        // matching the reference `where(text_mask, input_ids, 0)`. Every
+        // other position uses its real token id.
+        func pleTokenId(for tok: Int) -> Int {
+            if tok == imageTokenId { return 0 }
+            if let videoTokenId, tok == videoTokenId { return 0 }
+            if let audioTokenId, tok == audioTokenId { return 0 }
+            return tok
+        }
+
         // Prefill: forward every spliced embedding, keeping the argmax
         // of the final position as the first decoded token.
         var nextToken = 0
@@ -458,6 +469,7 @@ public final class VisionModel: @unchecked Sendable {
             let cmd = device.makeCommandBuffer()
             let logits = engine.forward(
                 inputEmbedding: embedding, position: pos,
+                pleTokenId: pleTokenId(for: promptTokens[pos]),
                 caches: caches, on: cmd, device: device)
             let outBuf = device.makeBuffer(length: 4)
             let outT = Tensor(buffer: outBuf, offset: 0, shape: [1], dtype: .u32)

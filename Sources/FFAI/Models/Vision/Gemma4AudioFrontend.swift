@@ -56,6 +56,14 @@ enum Gemma4AudioFrontend {
     /// STFT frame is centred at t=0 (reference `pad_left`,
     /// `time_padding='semicausal'`).
     static let padLeft = 160
+    /// The reference `__call__` pads the raw waveform length up to a
+    /// multiple of this before framing (`pad_to_multiple_of=128`, "optimal
+    /// TPU support"). Those trailing samples are zeros, marked invalid by
+    /// the frame mask and zeroed out of the final mel — but they shift the
+    /// frame count (and therefore the post-SSCP soft-token count) by up to
+    /// one frame, so FFAI must replicate the padding to match the reference
+    /// token geometry.
+    static let padToMultiple = 128
 
     /// Raw mono waveform (16 kHz `Float` samples) → log-Mel `[nFrames, 128]`
     /// plus a per-frame validity mask (`true` = valid, `false` = padding).
@@ -70,12 +78,28 @@ enum Gemma4AudioFrontend {
         let cfg = AudioFrontEndConfig.gemma4
         let nSamples = waveform.count
 
+        // ── `pad_to_multiple_of=128`: the reference `__call__` right-pads
+        // the raw waveform with silence up to a multiple of 128 samples
+        // BEFORE any framing. These samples are real zeros (not reflected),
+        // get marked invalid by the frame mask, and are zeroed out of the
+        // final mel — but they grow the frame count by up to one frame, so
+        // FFAI replicates the padding to keep the soft-token geometry
+        // aligned with the reference. `[0, nSamples)` stays the real region.
+        let paddedSamples =
+            ((nSamples + padToMultiple - 1) / padToMultiple) * padToMultiple
+
         // ── Semicausal pad: prepend `padLeft` zeros, no right reflection.
         // (Reference pads only on the left; the right side is handled by
         // the kernel reading zero-padded tail samples that the window —
         // zero beyond `frameLength` — multiplies out.)
         var padded = [Float](repeating: 0, count: padLeft)
         padded.append(contentsOf: waveform)
+        // Right-pad the real audio up to the 128-multiple length.
+        if paddedSamples > nSamples {
+            padded.append(
+                contentsOf: [Float](
+                    repeating: 0, count: paddedSamples - nSamples))
+        }
 
         // ── Frame count, mirroring the reference unfold. The reference
         // unfolds with `frame_size_for_unfold = frame_length + 1 = 321`
@@ -133,9 +157,16 @@ enum Gemma4AudioFrontend {
         // filterbank projection. The front-end runs once per clip (not a
         // hot path), so the O(nFrames·nFreq·nFFT) CPU DFT is fine; if a
         // magnitude-Mel kernel ever lands, swap it back in here.
+        //
+        // The accumulation runs in `Double`: the reference (`np.fft.rfft`)
+        // is an FFT, not a naive DFT, so it carries far less summation
+        // error. The sine's energy is concentrated near one bin, leaving
+        // most bins at ~`log(mel_floor)` where `log` amplifies tiny
+        // magnitude differences — single-precision accumulation there drifts
+        // ~0.1; `Double` brings the whole spectrum to f32-rounding agreement.
         let nFreq = cfg.nFreq
         let nFFT = fftLength
-        let angStep = -2.0 * Float.pi / Float(nFFT)
+        let angStep = -2.0 * Double.pi / Double(nFFT)
         let win = window  // length-nFFT window (captured by value)
         let pad = padded
         var melFlat = [Float](repeating: 0, count: nFrames * nMels)
@@ -146,28 +177,26 @@ enum Gemma4AudioFrontend {
             DispatchQueue.concurrentPerform(iterations: nFrames) { f in
                 let dst = UnsafeMutablePointer<Float>(bitPattern: outAddr)!
                 let base = f * hopLength
-                var mag = [Float](repeating: 0, count: nFreq)
+                var mag = [Double](repeating: 0, count: nFreq)
                 for k in 0 ..< nFreq {
-                    var re: Float = 0
-                    var im: Float = 0
-                    let a = angStep * Float(k)
+                    var re: Double = 0
+                    var im: Double = 0
+                    let a = angStep * Double(k)
                     for t in 0 ..< nFFT {
-                        let s = pad[base + t] * win[t]
-                        re += s * cos(a * Float(t))
-                        im += s * sin(a * Float(t))
+                        let s = Double(pad[base + t]) * Double(win[t])
+                        re += s * cos(a * Double(t))
+                        im += s * sin(a * Double(t))
                     }
                     mag[k] = (re * re + im * im).squareRoot()
                 }
                 for m in 0 ..< nMels {
-                    var acc: Float = 0
+                    var acc: Double = 0
                     let bb = m * nFreq
-                    for k in 0 ..< nFreq { acc += bank[bb + k] * mag[k] }
-                    dst[f * nMels + m] = Foundation.log(acc + melFloor)
+                    for k in 0 ..< nFreq { acc += Double(bank[bb + k]) * mag[k] }
+                    dst[f * nMels + m] = Float(Foundation.log(acc + Double(melFloor)))
                 }
             }
         }
-        let mel = ImagePreprocessing.makeTensor(
-            from: melFlat, shape: [nFrames, nMels], dtype: .f32, device: device)
         _ = winT  // (window tensor no longer needed for the CPU path)
 
         // ── Per-frame validity mask. Reference: a frame is valid when the
@@ -180,6 +209,18 @@ enum Gemma4AudioFrontend {
             let frameEnd = i * hopLength + unfoldSize - 1
             mask[i] = frameEnd >= padLeft && frameEnd < padLeft + nSamples
         }
+
+        // ── Zero the masked-out (padding) frames, matching the reference's
+        // `prepared_speech = speech * mask[..., None]`. The Conformer's SSCP
+        // conv reads raw mel values, so the tail frames must be hard zeros
+        // (not `log(mel_floor)`) for the boundary activations to match.
+        for i in 0 ..< nFrames where !mask[i] {
+            let base = i * nMels
+            for m in 0 ..< nMels { melFlat[base + m] = 0 }
+        }
+
+        let mel = ImagePreprocessing.makeTensor(
+            from: melFlat, shape: [nFrames, nMels], dtype: .f32, device: device)
 
         return (mel, mask)
     }

@@ -80,16 +80,30 @@ struct Gemma4VisionIntegrationTests {
         }
         let vlm = try #require(m.vlModel, "Gemma 4 VL checkpoint is not a VLM")
 
-        // Build an image+text prompt: a run of `imageTokenCount`
-        // <image_soft_token> placeholders followed by a text question.
+        // Build the Gemma 4 chat prompt with the image span INSIDE the
+        // user turn: `<bos><start_of_turn>user\n` + boi + <image>×N + eoi +
+        // `\nDescribe this image.<end_of_turn>\n<start_of_turn>model\n`.
         let imageTokenId = vlm.imageTokenId
-        let questionTokens = m.tokenizer.encode(
-            text: "<start_of_turn>user\nDescribe this image.<end_of_turn>\n"
-                + "<start_of_turn>model\n")
+        // Gemma 4 is BOS-critical (requiresLeadingBOS) and its tokenizer
+        // post-processor does NOT add one — the multimodal generate path
+        // doesn't auto-prepend it the way Generate.swift does, so the
+        // prompt carries an explicit leading <bos>.
+        let bos = try #require(
+            m.tokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
+        // Gemma 4 wraps the image soft-token run in begin/end-of-image
+        // markers (boi 255999, eoi 258882 — see mlx-vlm
+        // processing_gemma4.py `full_image_sequence`).
+        let boiTokenId = 255999
+        let eoiTokenId = 258882
+        let userPrefix = m.tokenizer.encode(text: "<start_of_turn>user\n")
+        let userSuffix = m.tokenizer.encode(
+            text: "\nDescribe this image.<end_of_turn>\n<start_of_turn>model\n")
+        let imageSpan =
+            [boiTokenId]
+            + Array(repeating: imageTokenId, count: vlm.imageTokenCount)
+            + [eoiTokenId]
         let promptTokens =
-            Array(
-                repeating: imageTokenId,
-                count: vlm.imageTokenCount) + questionTokens
+            [bos] + userPrefix + imageSpan + userSuffix
 
         // A real photograph — the golden-retriever fixture.
         let image = try VisionTestHelpers.dogImage()
