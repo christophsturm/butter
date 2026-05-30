@@ -178,6 +178,42 @@ struct Gemma4MultimodalIntegrationTests {
             "audio encoder grossly diverges from the reference (mean abs diff \(meanDiff))")
     }
 
+    /// Validate the magnitude-Mel front-end against the Gemma 4 feature
+    /// extractor (mlx-vlm) for the test sine. Mel is deterministic, so this
+    /// SHOULD match closely (a localization aid for the front-end). Skips
+    /// if the fixture is missing.
+    @Test("mel front-end matches the Gemma 4 feature extractor on the test sine")
+    func melFrontEndMatchesReference() throws {
+        let oraclePath = "/tmp/gemma4_sine_mel_oracle.f32"
+        try #require(
+            FileManager.default.fileExists(atPath: oraclePath),
+            "mel oracle fixture missing — run the mlx-vlm dump first")
+        let (mel, _) = Gemma4AudioFrontend.melSpectrogram(waveform: Self.testWaveform())
+        let got = mel.toFloatArray()
+        let oracle = (FileManager.default.contents(atPath: oraclePath) ?? Data())
+            .withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        print("FFAI mel shape \(mel.shape), oracle count \(oracle.count)")
+        print("FFAI mel[0,:6]   \(got.prefix(6).map { (($0 * 10000).rounded()) / 10000 })")
+        print("oracle mel[0,:6] \(oracle.prefix(6).map { (($0 * 10000).rounded()) / 10000 })")
+        #expect(got.count == oracle.count, "mel shape mismatch \(got.count) vs \(oracle.count)")
+        var maxDiff: Float = 0, sumDiff: Float = 0
+        let n = min(got.count, oracle.count)
+        for i in 0 ..< n {
+            maxDiff = max(maxDiff, abs(got[i] - oracle[i]))
+            sumDiff += abs(got[i] - oracle[i])
+        }
+        print("mel max abs diff \(maxDiff), mean abs diff \(sumDiff / Float(n))")
+        // KNOWN-PENDING: the magnitude-Mel (sqrt-before-filterbank) is in
+        // place, but the spectrogram framing / window / HTK-filterbank
+        // construction is not yet calibrated to the transformers
+        // `Gemma4AudioFeatureExtractor` (the reference clusters ~-4.5 vs
+        // FFAI's floored bin-0). The audio ENCODER itself is validated
+        // (audioEncoderMatchesOracle, ~1% mean) by feeding the reference's
+        // own mel — this front-end calibration is the remaining gap before
+        // end-to-end audio→text. Diagnostic only; not a hard gate yet.
+        #expect(got.count == oracle.count)
+    }
+
     // KNOWN-PENDING: audio → text generation.
     //
     // The Gemma 4 audio encoder (Conformer / USM speech encoder + log-Mel

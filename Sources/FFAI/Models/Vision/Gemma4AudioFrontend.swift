@@ -117,47 +117,58 @@ enum Gemma4AudioFrontend {
         let winT = Tensor.empty(shape: [fftLength], dtype: .f32, device: device)
         AudioPreprocessing.copyFloats(window, into: winT)
 
-        // ── HTK, norm=None Mel filterbank (Gemma 4 / HF).
+        // ── HTK, norm=None Mel filterbank (Gemma 4 / HF). `bank` is
+        // `[nMels, nFreq]` row-major (filter weight per (mel_bin, freq)).
         let bank = AudioPreprocessing.melFilterbank(cfg, norm: .none)
-        let melT = Tensor.empty(
-            shape: [cfg.nMels, cfg.nFreq], dtype: .f32, device: device)
-        AudioPreprocessing.copyFloats(bank, into: melT)
 
-        // ── Upload the padded waveform.
-        let audioT = Tensor.empty(
-            shape: [padded.count], dtype: .f32, device: device)
-        AudioPreprocessing.copyFloats(padded, into: audioT)
-
-        // ── Fused STFT + Mel + log on the GPU. We dispatch
-        // `Ops.melSpectrogram` directly rather than via
-        // `AudioPreprocessing.logMelSpectrogram`, because that helper
-        // hardcodes Whisper's symmetric reflect-pad (`nFFT/2` each side);
-        // Gemma 4's framing is semicausal (left-pad only, done above) so
-        // the waveform is already framed for the kernel here.
+        // ── STFT → MAGNITUDE Mel → log, on the CPU (per-frame parallel).
         //
-        // The kernel's `logEps` is added inside the log — set it to
-        // `mel_floor` so the kernel emits exactly `log(mel + mel_floor)`,
-        // matching the reference's `np.log(mel_spec + self.mel_floor)`.
-        //
-        // VALIDATE: the `mel_spectrogram` kernel projects the *power*
-        // spectrum (`re² + im²`) through the filterbank, then takes
-        // `log(mel_power + logEps)`. The Gemma 4 reference instead projects
-        // the *magnitude* spectrum (`np.abs(stft) = sqrt(power)`) through
-        // the filterbank, i.e. `log(magnitude @ mel + mel_floor)`. FFAI's
-        // shipped Mel kernels are power-spectrum only (`mel_spectrogram.rs`
-        // / `mel_filterbank.rs` both accumulate `re² + im²`), so this
-        // front-end emits a power-Mel log. The shape / framing / Mel
-        // geometry / mask match the reference exactly; the per-bin values
-        // differ by the magnitude-vs-power square. When a magnitude-Mel
-        // kernel lands (sqrt before the filterbank projection), swap it in
-        // here — the rest of this function is unchanged.
-        let cmd = device.makeCommandBuffer()
-        let mel = Ops.melSpectrogram(
-            audio: audioT, window: winT, melWeight: melT,
-            nFFT: fftLength, nMels: nMels, hopLength: hopLength,
-            nFrames: nFrames, logEps: melFloor, on: cmd)
-        cmd.commit()
-        cmd.waitUntilCompleted()
+        // FFAI's fused `mel_spectrogram` GPU kernel projects the *power*
+        // spectrum (`re² + im²`) through the filterbank; the Gemma 4
+        // reference projects the *magnitude* (`np.abs(stft) = sqrt(power)`),
+        // i.e. `log(magnitude @ mel + mel_floor)`. There is no magnitude-Mel
+        // kernel, so the magnitude DFT runs here on the CPU — a direct port
+        // of the kernel's per-(frame,freq) DFT (`re = Σ_t win[t]·x[f·hop+t]·
+        // cos(-2π·k·t/nFFT)`, `im = Σ … sin`) with a `sqrt` before the
+        // filterbank projection. The front-end runs once per clip (not a
+        // hot path), so the O(nFrames·nFreq·nFFT) CPU DFT is fine; if a
+        // magnitude-Mel kernel ever lands, swap it back in here.
+        let nFreq = cfg.nFreq
+        let nFFT = fftLength
+        let angStep = -2.0 * Float.pi / Float(nFFT)
+        let win = window  // length-nFFT window (captured by value)
+        let pad = padded
+        var melFlat = [Float](repeating: 0, count: nFrames * nMels)
+        melFlat.withUnsafeMutableBufferPointer { out in
+            let outBase = out.baseAddress!
+            // Each frame writes a disjoint `[f*nMels, (f+1)*nMels)` slice.
+            let outAddr = UInt(bitPattern: outBase)
+            DispatchQueue.concurrentPerform(iterations: nFrames) { f in
+                let dst = UnsafeMutablePointer<Float>(bitPattern: outAddr)!
+                let base = f * hopLength
+                var mag = [Float](repeating: 0, count: nFreq)
+                for k in 0 ..< nFreq {
+                    var re: Float = 0
+                    var im: Float = 0
+                    let a = angStep * Float(k)
+                    for t in 0 ..< nFFT {
+                        let s = pad[base + t] * win[t]
+                        re += s * cos(a * Float(t))
+                        im += s * sin(a * Float(t))
+                    }
+                    mag[k] = (re * re + im * im).squareRoot()
+                }
+                for m in 0 ..< nMels {
+                    var acc: Float = 0
+                    let bb = m * nFreq
+                    for k in 0 ..< nFreq { acc += bank[bb + k] * mag[k] }
+                    dst[f * nMels + m] = Foundation.log(acc + melFloor)
+                }
+            }
+        }
+        let mel = ImagePreprocessing.makeTensor(
+            from: melFlat, shape: [nFrames, nMels], dtype: .f32, device: device)
+        _ = winT  // (window tensor no longer needed for the CPU path)
 
         // ── Per-frame validity mask. Reference: a frame is valid when the
         // last sample of its analysis window is real audio. The window for
