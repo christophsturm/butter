@@ -174,26 +174,35 @@ final class Gemma4AudioClippableLinear {
     /// GEMM on the supplied command buffer; the caller commits. Clamps
     /// (rare — bounds default to ±inf) run on the CPU, which forces a
     /// commit+wait around the GEMM only when a finite bound is present.
+    /// `cmd` is `inout`: a CPU clamp forces a commit+wait (to read the
+    /// pending GEMM/activations back), which retires the caller's command
+    /// buffer. We replace it with a fresh one so the caller can keep
+    /// chaining ops + its own final commit stays valid (encoding on a
+    /// committed buffer traps). No clamp → the caller's `cmd` is reused
+    /// unchanged (the efficient path; bounds default to ±inf).
     func projectRows(
         _ x: Tensor, nRows: Int, outDim: Int,
-        on cmd: MTLCommandBuffer, device: Device
+        on cmd: inout MTLCommandBuffer, device: Device
     ) -> Tensor {
         var input = x
         if clampsInput {
             // Materialise the input clamp before the GEMM. The caller's
             // `cmd` may carry pending work that produced `x`; commit it so
-            // the CPU readback sees finished values.
+            // the CPU readback sees finished values, then refresh it.
             cmd.commit()
             cmd.waitUntilCompleted()
             input = gemma4AudioClampTensor(
                 x, min: inputMin, max: inputMax, device: device)
+            cmd = device.makeCommandBuffer()
         }
         let y = linear.callMany(input, t: nRows, on: cmd, device: device)
         if clampsOutput {
             cmd.commit()
             cmd.waitUntilCompleted()
-            return gemma4AudioClampTensor(
+            let clamped = gemma4AudioClampTensor(
                 y, min: outputMin, max: outputMax, device: device)
+            cmd = device.makeCommandBuffer()
+            return clamped
         }
         return y
     }
@@ -274,7 +283,7 @@ final class Gemma4ConformerFeedForward {
 
     /// `x` is token-major `[nTokens, hidden]`. Returns the same shape.
     func forward(
-        _ x: Tensor, nTokens: Int, on cmd: MTLCommandBuffer, device: Device
+        _ x: Tensor, nTokens: Int, on cmd: inout MTLCommandBuffer, device: Device
     ) -> Tensor {
         // residual = x; (clip x); pre_norm; ffw1; silu; ffw2; (clip);
         // post_norm; residual + out * residual_weight.
@@ -287,10 +296,10 @@ final class Gemma4ConformerFeedForward {
         _ = gradientClipping
         let normed = preNorm.normRows(x, nRows: nTokens, rowSize: hidden, on: cmd)
         let h1 = ffw1.projectRows(
-            normed, nRows: nTokens, outDim: intermediate, on: cmd, device: device)
+            normed, nRows: nTokens, outDim: intermediate, on: &cmd, device: device)
         let act = Ops.silu(h1, on: cmd)
         let h2 = ffw2.projectRows(
-            act, nRows: nTokens, outDim: hidden, on: cmd, device: device)
+            act, nRows: nTokens, outDim: hidden, on: &cmd, device: device)
         let post = postNorm.normRows(h2, nRows: nTokens, rowSize: hidden, on: cmd)
         // residual + out * residual_weight. Fold the scalar `residual_weight`
         // by multiplying with a tiled-scalar tensor (no GPU scalar-scale Op).
@@ -354,11 +363,11 @@ final class Gemma4ConformerLightConv1d {
         _ x: Tensor, nTokens: Int, device: Device
     ) -> Tensor {
         _ = gradientClipping  // gradient_clipping = 1e10 is an inference no-op.
-        let cmd = device.makeCommandBuffer()
+        var cmd = device.makeCommandBuffer()
         let normed = preNorm.normRows(x, nRows: nTokens, rowSize: hidden, on: cmd)
         // linear_start projects hidden → 2·hidden; split + GLU gate.
         let proj = linearStart.projectRows(
-            normed, nRows: nTokens, outDim: hidden * 2, on: cmd, device: device)
+            normed, nRows: nTokens, outDim: hidden * 2, on: &cmd, device: device)
         cmd.commit()
         cmd.waitUntilCompleted()
 
@@ -407,11 +416,11 @@ final class Gemma4ConformerLightConv1d {
 
         // clip → conv_norm → SiLU → linear_end, + residual. The clip is
         // gradient_clipping (1e10) — a no-op on inference (see the FFN).
-        let cmd2 = device.makeCommandBuffer()
+        var cmd2 = device.makeCommandBuffer()
         let cn = convNorm.normRows(convT, nRows: nTokens, rowSize: hidden, on: cmd2)
         let act = Ops.silu(cn, on: cmd2)
         let end = linearEnd.projectRows(
-            act, nRows: nTokens, outDim: hidden, on: cmd2, device: device)
+            act, nRows: nTokens, outDim: hidden, on: &cmd2, device: device)
         let out = Ops.add(end, x, on: cmd2)
         cmd2.commit()
         cmd2.waitUntilCompleted()
@@ -465,7 +474,7 @@ final class Gemma4ConformerBlock {
         _ = gradientClipping
         // ── feed_forward1 ──
         var cmd = device.makeCommandBuffer()
-        var h = feedForward1.forward(x, nTokens: nTokens, on: cmd, device: device)
+        var h = feedForward1.forward(x, nTokens: nTokens, on: &cmd, device: device)
 
         // ── attention sub-block (pre/post norm + residual) ──
         // residual = h; norm_pre_attn; attn; h = residual + norm_post_attn(attn).
@@ -496,8 +505,8 @@ final class Gemma4ConformerBlock {
         h = lightConv.forward(h, nTokens: nTokens, device: device)
 
         // ── feed_forward2 → norm_out ──
-        let cmd2 = device.makeCommandBuffer()
-        let ff2 = feedForward2.forward(h, nTokens: nTokens, on: cmd2, device: device)
+        var cmd2 = device.makeCommandBuffer()
+        let ff2 = feedForward2.forward(h, nTokens: nTokens, on: &cmd2, device: device)
         let out = normOut.normRows(ff2, nRows: nTokens, rowSize: hidden, on: cmd2)
         cmd2.commit()
         cmd2.waitUntilCompleted()
@@ -664,13 +673,13 @@ final class Gemma4AudioAttention {
         let qkvDim = numHeads * headDim
 
         // ── q/k/v projections (GPU GEMMs through the clippable linears) ──
-        let cmd = device.makeCommandBuffer()
+        var cmd = device.makeCommandBuffer()
         let qT = qProj.projectRows(
-            hiddenStates, nRows: nTokens, outDim: qkvDim, on: cmd, device: device)
+            hiddenStates, nRows: nTokens, outDim: qkvDim, on: &cmd, device: device)
         let kT = kProj.projectRows(
-            hiddenStates, nRows: nTokens, outDim: qkvDim, on: cmd, device: device)
+            hiddenStates, nRows: nTokens, outDim: qkvDim, on: &cmd, device: device)
         let vT = vProj.projectRows(
-            hiddenStates, nRows: nTokens, outDim: qkvDim, on: cmd, device: device)
+            hiddenStates, nRows: nTokens, outDim: qkvDim, on: &cmd, device: device)
         cmd.commit()
         cmd.waitUntilCompleted()
 
@@ -833,9 +842,9 @@ final class Gemma4AudioAttention {
         let contextT = ImagePreprocessing.makeTensor(
             from: outFlat, shape: [nTokens, H], dtype: hiddenStates.dtype,
             device: device)
-        let cmd2 = device.makeCommandBuffer()
+        var cmd2 = device.makeCommandBuffer()
         let projected = post.projectRows(
-            contextT, nRows: nTokens, outDim: hidden, on: cmd2, device: device)
+            contextT, nRows: nTokens, outDim: hidden, on: &cmd2, device: device)
         cmd2.commit()
         cmd2.waitUntilCompleted()
         return projected
