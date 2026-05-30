@@ -35,12 +35,14 @@ struct PhiTextTests {
         #expect(!Phi3Dense.availableCapabilities.contains(.imageIn))
     }
 
-    @Test("Phi3Dense default generation parameters mirror Llama dense")
+    @Test("Phi3Dense default generation parameters match the Phi card")
     func defaultGenerationParameters() {
         let p = Phi3Dense.defaultGenerationParameters
         #expect(p.maxTokens > 0)
-        #expect(p.temperature >= 0)
-        #expect(p.topP > 0 && p.topP <= 1.0)
+        #expect(p.temperature == 0.6)
+        #expect(p.topP == 1.0)
+        #expect(p.topK == 0)
+        #expect(p.repetitionPenalty == 1.0)
         #expect((p.prefillStepSize ?? 0) >= 256)
     }
 

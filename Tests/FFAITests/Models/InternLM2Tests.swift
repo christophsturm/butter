@@ -28,6 +28,17 @@ import Testing
 @Suite("InternLM2 Family Root")
 struct InternLM2RootTests {
 
+    @Test("InternLM2Dense default generation parameters match the Llama-shaped card")
+    func defaultGenerationParameters() {
+        // InternLM2Dense reuses LlamaDense.defaultGenerationParameters.
+        let p = InternLM2Dense.defaultGenerationParameters
+        #expect(p.maxTokens > 0)
+        #expect(p.temperature == 0.6)
+        #expect(p.topP == 1.0)
+        #expect(p.topK == 0)
+        #expect(p.repetitionPenalty == 1.0)
+    }
+
     @Test("modelTypes advertises the internlm2 label")
     func modelTypes() {
         #expect(InternLM2.modelTypes.contains("internlm2"))

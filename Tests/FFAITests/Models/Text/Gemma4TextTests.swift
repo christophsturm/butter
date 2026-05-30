@@ -45,15 +45,18 @@ struct Gemma4TextTests {
 
     /// All three variants share the protocol default — 4096-token
     /// prefill chunk per the Gemma 4 audit.
-    @Test("default generation parameters declare a Gemma-style prefill chunk")
+    @Test("Gemma4Dense default generation parameters match the Gemma card")
     func defaultGenerationParameters() {
         let dense = Gemma4Dense.defaultGenerationParameters
         let e = Gemma4E.defaultGenerationParameters
         let moe = Gemma4MoE.defaultGenerationParameters
+        // Gemma defaults: temperature 1.0, top-p 0.95, top-k 64.
         for p in [dense, e, moe] {
             #expect(p.maxTokens > 0)
-            #expect(p.temperature >= 0)
-            #expect(p.topP > 0 && p.topP <= 1.0)
+            #expect(p.temperature == 1.0)
+            #expect(p.topP == 0.95)
+            #expect(p.topK == 64)
+            #expect(p.repetitionPenalty == 1.0)
             // Audited family optimum for pure-attention backbone.
             #expect(p.prefillStepSize == 4096)
         }

@@ -35,14 +35,15 @@ struct Gemma2TextTests {
         #expect(!Gemma2Dense.availableCapabilities.contains(.imageIn))
     }
 
-    @Test("Gemma2Dense default generation parameters track Gemma family")
+    @Test("Gemma2Dense default generation parameters match the Gemma card")
     func defaultGenerationParameters() {
         // Gemma defaults: temperature 1.0, top-p 0.95, top-k 64.
         let p = Gemma2Dense.defaultGenerationParameters
         #expect(p.maxTokens > 0)
-        #expect(p.temperature >= 0)
-        #expect(p.topK >= 0)
-        #expect(p.topP > 0 && p.topP <= 1.0)
+        #expect(p.temperature == 1.0)
+        #expect(p.topP == 0.95)
+        #expect(p.topK == 64)
+        #expect(p.repetitionPenalty == 1.0)
     }
 
     /// HF's Gemma 2 schedules sliding attention on every layer EXCEPT

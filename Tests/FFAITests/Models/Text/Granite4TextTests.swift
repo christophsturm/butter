@@ -45,8 +45,9 @@ struct Granite4TextVariantTests {
         let p = Granite4Hybrid.defaultGenerationParameters
         #expect(p.maxTokens > 0)
         #expect(p.temperature == 0.6)
-        #expect(p.topP == 0.9)
-        #expect(p.topK == 50)
+        #expect(p.topP == 1.0)
+        #expect(p.topK == 0)
+        #expect(p.repetitionPenalty == 1.05)
     }
 
     // ─── Forward MoE-commit path (was GraniteMoeHybridForwardTests) ─────────

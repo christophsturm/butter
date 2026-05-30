@@ -26,6 +26,17 @@ import Testing
 @Suite("OLMo Family Root")
 struct OLMoRootTests {
 
+    @Test("OLMo2Dense default generation parameters match the Llama-shaped card")
+    func defaultGenerationParameters() {
+        // OLMo2Dense reuses LlamaDense.defaultGenerationParameters.
+        let p = OLMo2Dense.defaultGenerationParameters
+        #expect(p.maxTokens > 0)
+        #expect(p.temperature == 0.6)
+        #expect(p.topP == 1.0)
+        #expect(p.topK == 0)
+        #expect(p.repetitionPenalty == 1.0)
+    }
+
     @Test("modelTypes covers both olmo and olmo2")
     func modelTypes() {
         #expect(OLMo.modelTypes.contains("olmo"))

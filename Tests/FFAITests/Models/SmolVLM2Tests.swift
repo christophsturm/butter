@@ -45,11 +45,14 @@ struct SmolVLM2RootTests {
         #expect(caps.contains(.videoIn))
     }
 
-    @Test("SmolVLM2Dense.defaultGenerationParameters are sane")
-    func defaultGenParams() {
-        let gp = SmolVLM2Dense.defaultGenerationParameters
-        #expect(gp.maxTokens > 0)
-        #expect(gp.temperature >= 0)
+    @Test("SmolVLM2Dense default generation parameters match the model card")
+    func defaultGenerationParameters() {
+        let p = SmolVLM2Dense.defaultGenerationParameters
+        #expect(p.maxTokens > 0)
+        #expect(p.temperature == 0.0)
+        #expect(p.topP == 1.0)
+        #expect(p.topK == 0)
+        #expect(p.repetitionPenalty == 1.0)
     }
 
     @Test("SmolVLM2Error stringifies every case with its payload")

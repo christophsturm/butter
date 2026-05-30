@@ -44,11 +44,14 @@ struct Idefics3RootTests {
         #expect(caps.contains(.imageIn))
     }
 
-    @Test("Idefics3Dense defaultGenerationParameters are sane")
-    func defaultGenParams() {
-        let gp = Idefics3Dense.defaultGenerationParameters
-        #expect(gp.maxTokens > 0)
-        #expect(gp.temperature >= 0)
+    @Test("Idefics3Dense default generation parameters match the model card")
+    func defaultGenerationParameters() {
+        let p = Idefics3Dense.defaultGenerationParameters
+        #expect(p.maxTokens > 0)
+        #expect(p.temperature == 0.0)
+        #expect(p.topP == 1.0)
+        #expect(p.topK == 0)
+        #expect(p.repetitionPenalty == 1.0)
     }
 
     @Test("Idefics3Error stringifies every case with its payload")

@@ -36,6 +36,28 @@ import Testing
 @Suite("LFM2 Text Layer Schedule")
 struct LFM2LayerScheduleTests {
 
+    @Test("LFM2Dense default generation parameters match the LiquidAI card")
+    func defaultGenerationParameters() {
+        // LFM2Dense/LFM2MoE both default to lfm2DefaultGenerationParameters
+        // (LFM2 collection: temp 0.3 / min-p 0.15 / rep-pen 1.05). The
+        // LFM2.5 collection swaps to lfm25DefaultGenerationParameters
+        // (temp 0.2 / top-p 0.8) at load time, which must differ.
+        let p = LFM2Dense.defaultGenerationParameters
+        #expect(p.maxTokens > 0)
+        #expect(p.temperature == 0.3)
+        #expect(p.topP == 1.0)
+        #expect(p.topK == 0)
+        #expect(p.minP == 0.15)
+        #expect(p.repetitionPenalty == 1.05)
+
+        // LFM2.5 defaults are distinct (top-p sampling, lower temperature).
+        let p25 = lfm25DefaultGenerationParameters
+        #expect(p25.temperature == 0.2)
+        #expect(p25.topP == 0.8)
+        #expect(p25.minP == 0.0)
+        #expect(p25.repetitionPenalty == 1.05)
+    }
+
     @Test("layer_types drives the conv / attention schedule")
     func layerTypesSchedule() throws {
         let kinds = try lfm2LayerKinds(

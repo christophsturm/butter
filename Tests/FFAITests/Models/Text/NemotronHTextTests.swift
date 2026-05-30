@@ -29,6 +29,19 @@ import Testing
 @Suite("NemotronH Text Hybrid Layer Parsing + Dense MLP Layer")
 struct NemotronHTextTests {
 
+    // ─── Default generation parameters ───────────────────────────────
+
+    @Test("NemotronHHybrid default generation parameters match the NVIDIA card")
+    func defaultGenerationParameters() {
+        let p = NemotronHHybrid.defaultGenerationParameters
+        #expect(p.maxTokens > 0)
+        #expect(p.temperature == 0.6)
+        #expect(p.topP == 0.95)
+        #expect(p.topK == 0)
+        #expect(p.minP == 0.0)
+        #expect(p.repetitionPenalty == 1.0)
+    }
+
     // ─── Layer-kind parsing ──────────────────────────────────────────
 
     @Test("hybrid_override_pattern characters map to the right layer kind")

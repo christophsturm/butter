@@ -116,7 +116,8 @@ struct CapabilityTests {
         let supported = GPTOSSMoEVariant.supportedReasoningLevels
         #expect(supported == [.low, .medium, .high])
         #expect(GPTOSSMoEVariant.availableCapabilities.contains(.reasoningLevel))
-        #expect(GPTOSSMoEVariant.defaultGenerationParameters.reasoningLevel == .none)
+        // OpenAI's recommended default reasoning effort is Medium.
+        #expect(GPTOSSMoEVariant.defaultGenerationParameters.reasoningLevel == .medium)
     }
 
     @Test("GenerationParameters.reasoningLevel — defaults to nil")

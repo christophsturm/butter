@@ -64,15 +64,17 @@ struct GPTOSSTextVariantTests {
         #expect(ReasoningLevel.max.clamped(to: supported) == .high)
     }
 
-    @Test("default generation parameters declare 2048 prefill chunk + reasoning .none")
+    @Test("default generation parameters match the OpenAI card (temp 1.0, reasoning medium)")
     func defaultGenerationParameters() {
         let p = GPTOSSMoEVariant.defaultGenerationParameters
         #expect(p.maxTokens > 0)
-        #expect(p.temperature >= 0)
+        #expect(p.temperature == 1.0)
+        #expect(p.topP == 1.0)
+        #expect(p.topK == 0)
         // GPT-OSS audited optimum (matches mlx-swift-lm).
         #expect(p.prefillStepSize == 2048)
-        // Reasoning disabled until the caller explicitly opts in.
-        #expect(p.reasoningLevel == .none)
+        // OpenAI's recommended default reasoning effort is Medium.
+        #expect(p.reasoningLevel == .medium)
     }
 }
 

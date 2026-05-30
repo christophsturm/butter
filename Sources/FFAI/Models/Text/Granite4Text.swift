@@ -52,16 +52,16 @@ enum Granite4LayerKind: Equatable {
 public struct Granite4Hybrid: Granite4Variant {
     public static let availableCapabilities: Set<Capability> = [.textIn, .textOut]
 
-    /// Granite-4 recommended defaults (IBM generation_config): temperature
-    /// 0.6, top-p 0.9, top-k 50.
+    /// Granite-4 recommended defaults (IBM): temperature 0.6, top-p 1.0,
+    /// top-k 0, repetition-penalty 1.05.
     public static let defaultGenerationParameters = GenerationParameters(
         maxTokens: 256,
         prefillStepSize: 256,
         temperature: 0.6,
-        topP: 0.9,
-        topK: 50,
+        topP: 1.0,
+        topK: 0,
         minP: 0.0,
-        repetitionPenalty: 1.0
+        repetitionPenalty: 1.05
     )
 
     public static func loadModel(

@@ -37,14 +37,15 @@ struct Gemma3TextTests {
         #expect(!Gemma3Dense.availableCapabilities.contains(.imageIn))
     }
 
-    @Test("Gemma3Dense default generation parameters track Gemma family")
+    @Test("Gemma3Dense default generation parameters match the Gemma card")
     func defaultGenerationParameters() {
         // Gemma defaults: temperature 1.0, top-p 0.95, top-k 64.
         let p = Gemma3Dense.defaultGenerationParameters
         #expect(p.maxTokens > 0)
-        #expect(p.temperature >= 0)
-        #expect(p.topK >= 0)
-        #expect(p.topP > 0 && p.topP <= 1.0)
+        #expect(p.temperature == 1.0)
+        #expect(p.topP == 0.95)
+        #expect(p.topK == 64)
+        #expect(p.repetitionPenalty == 1.0)
     }
 
     /// Gemma 3's family default `sliding_window_pattern = 6` — every

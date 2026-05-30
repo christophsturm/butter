@@ -80,16 +80,10 @@ public struct GPTOSSMoEVariant: GPTOSSVariant, ReasoningCapable {
         topK: 0,
         minP: 0.0,
         repetitionPenalty: 1.0,
-        // `reasoningLevel: nil` — the field is `Optional<ReasoningLevel>`,
-        // so the bare `.none` literal previously inferred Optional's
-        // nil. The mechanical Swift 5.10 warning sweep wrongly qualified
-        // it as `ReasoningLevel.none` (the enum case, NOT nil), which
-        // wraps to `Optional.some(.none)` and breaks the
-        // `defaultGenerationParameters.reasoningLevel == .none` test.
-        // Write `nil` explicitly so the intent is unambiguous and the
-        // older toolchain doesn't surface its "assuming Optional.none"
-        // ambiguity warning.
-        reasoningLevel: nil
+        // GPT-OSS recommended default reasoning effort is Medium (OpenAI).
+        // The field is `Optional<ReasoningLevel>`; `.medium` wraps to
+        // `Optional.some(.medium)`.
+        reasoningLevel: .medium
     )
 
     public static func loadModel(
