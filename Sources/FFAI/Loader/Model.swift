@@ -1056,9 +1056,17 @@ public enum ModelRegistry {
             config: config, weights: weights,
             options: options, device: device
         )
+        // The LFM2.5 collection (128000-token vocab) ships its own
+        // recommended sampling defaults (temp 0.2 / top-p 0.8 /
+        // repetition-penalty 1.05, per LiquidAI). LFM2 (65536 vocab)
+        // keeps the conservative greedy default. Detected by vocab size
+        // since both load through the same `lfm2` / `lfm2_moe` variant.
+        let isLFM25 = config.vocabSize == 128_000
+        let defaults =
+            isLFM25 ? lfm25DefaultGenerationParameters : variant.defaultGenerationParameters
         return Loaded(
             engine: engine,
-            defaultGenerationParameters: variant.defaultGenerationParameters)
+            defaultGenerationParameters: defaults)
     }
 
     public static func loadNemotronDiffusion(

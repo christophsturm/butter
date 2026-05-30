@@ -101,9 +101,12 @@ public final class LFM2ConvCache: LayerCacheProtocol, @unchecked Sendable {
 
 // ─── Variants ────────────────────────────────────────────────────────
 
-/// LFM2 / LFM2.5 greedy defaults — keeps the integration suite
-/// deterministic. Shared by both the dense and MoE variants.
-private let lfm2DefaultGenerationParameters = GenerationParameters(
+/// LFM2 (original, 65536-vocab) greedy default — conservative and
+/// deterministic. Shared by both the dense and MoE variants as their
+/// static default; `loadLFM2` swaps in `lfm25DefaultGenerationParameters`
+/// for the LFM2.5 collection. Integration tests pass an explicit
+/// `temperature: 0`, so they stay deterministic regardless of this value.
+let lfm2DefaultGenerationParameters = GenerationParameters(
     maxTokens: 256,
     prefillStepSize: 1024,
     temperature: 0.0,
@@ -111,6 +114,21 @@ private let lfm2DefaultGenerationParameters = GenerationParameters(
     topK: 0,
     minP: 0.0,
     repetitionPenalty: 1.0
+)
+
+/// LFM2.5 recommended sampling defaults (LiquidAI model card): temperature
+/// 0.2, top-p 0.8, repetition-penalty 1.05. `loadLFM2` applies these to the
+/// LFM2.5 collection (detected by the 128000-token vocab) in place of the
+/// LFM2 greedy default. Integration tests still override `temperature: 0`
+/// for determinism.
+let lfm25DefaultGenerationParameters = GenerationParameters(
+    maxTokens: 256,
+    prefillStepSize: 1024,
+    temperature: 0.2,
+    topP: 0.8,
+    topK: 0,
+    minP: 0.0,
+    repetitionPenalty: 1.05
 )
 
 /// `Lfm2ForCausalLM` — dense SwiGLU FFN on every layer. Serves both the

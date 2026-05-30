@@ -131,6 +131,10 @@ struct LFM2TextIntegrationTests {
 
         #expect(m.lfm2 != nil)
         #expect(m.engine.headDim == 64)
+        // LFM2 (original, 65536 vocab) keeps the conservative greedy
+        // default — only the LFM2.5 collection gets the sampling defaults.
+        #expect(m.engine.vocab == 65_536)
+        #expect(m.defaultGenerationParameters.temperature == 0.0)
 
         if let l = m.lfm2 {
             // The MoE checkpoint carries at least one MoE feed-forward.
@@ -182,6 +186,12 @@ struct LFM2TextIntegrationTests {
         #expect(m.engine.headDim == 64)
         // Distinguishing feature vs LFM2-8B-A1B: the larger 128000 vocab.
         #expect(m.engine.vocab == 128_000)
+
+        // LFM2.5 ships LiquidAI's recommended sampling defaults
+        // (config-aware in loadLFM2, keyed on the 128000 vocab).
+        #expect(m.defaultGenerationParameters.temperature == 0.2)
+        #expect(m.defaultGenerationParameters.topP == 0.8)
+        #expect(m.defaultGenerationParameters.repetitionPenalty == 1.05)
 
         if let l = m.lfm2 {
             #expect(l.hasMoE)

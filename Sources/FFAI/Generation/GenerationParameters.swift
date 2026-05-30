@@ -19,12 +19,12 @@
 // property. `Model.defaultGenerationParameters` returns that default; the user
 // either uses it as-is, mutates fields on it, or constructs their own.
 //
-// The shipped greedy decode path consumes `maxTokens`, `stopOnEOS`, and
-// (in planned) `prefillStepSize`. Sampling fields (`temperature`, `topP`,
-// `topK`, `minP`, `repetitionPenalty`, `presencePenalty`) are wired through
-// the API surface today but only take effect once GPU sampling kernels land
-// — see planning/roadmap.md. Declaring them now keeps `GenerationParameters`
-// a stable surface so per-family defaults don't churn when sampling lands.
+// The decode path honors all of these. `Generate.driveGeneration` selects a
+// sampling path per call: `greedyGPU` (temperature 0, no filters — argmax
+// kernel), `gpuCategorical` (temperature > 0, no filters — GPU softmax +
+// categorical sample), or `cpuSample` (any of `topK` / `topP` / `minP` /
+// `repetitionPenalty` active — full-vocab readback + `Sampling.sample`).
+// `presencePenalty` and `seed` feed the same CPU sampling pipeline.
 
 import Foundation
 
@@ -53,11 +53,9 @@ public struct GenerationParameters: Sendable, Equatable {
     /// `Generate.driveGeneration` (the chunked-prefill path).
     public var prefillStepSize: Int?
 
-    // ─── Sampling (planned; no-op today on the greedy path) ──────────
+    // ─── Sampling ────────────────────────────────────────────────────
 
-    /// Softmax temperature. `0` = greedy argmax. Wired through but only
-    /// honored once GPU sampling kernels ship; the current decode path
-    /// is greedy regardless.
+    /// Softmax temperature. `0` = greedy argmax; `> 0` enables sampling.
     public var temperature: Float
 
     /// Nucleus sampling cutoff. `1.0` = disabled.
