@@ -3589,6 +3589,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .f16):
@@ -3600,6 +3601,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .bf16):
@@ -3611,6 +3613,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         // d96 — Phi-3-mini (3072 / 32). Dense-only like d64/d256/d512;
@@ -3657,6 +3660,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .f16):
@@ -3668,6 +3672,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .bf16):
@@ -3679,6 +3684,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         // d512 routes to the dedicated `ffai_sdpa_decode_d512_*` kernel.
