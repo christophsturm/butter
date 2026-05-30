@@ -1167,9 +1167,9 @@ final class Gemma4AudioEncoder: @unchecked Sendable {
         let nFrames = mel.shape[0]
         let inFeat = Gemma4AudioEncoder.melFeatureSize
 
-        // Treat the mel as a [T, F, C=1] feature map. Channel-last to
-        // match the reference (the conv weight is OIHW → we index it as
-        // [outCh, inCh, kh, kw]).
+        // Treat the mel as a [T, F, C=1] feature map (channel-last, like
+        // the reference). The conv weight is OHWI — `[outCh, kH, kW, inCh]`
+        // (mlx `Conv2d` layout, confirmed from the checkpoint).
         // Block 0: inCh=1, outCh=convChannels[0]. Block 1: inCh=
         // convChannels[0], outCh=convChannels[1].
         var curT = nFrames
@@ -1232,7 +1232,10 @@ final class Gemma4AudioEncoder: @unchecked Sendable {
                                 if iff < 0 || iff >= inCurF { continue }
                                 for ic in 0 ..< inCh {
                                     let inV = act[(it * inCurF + iff) * inCh + ic]
-                                    let wV = w[((oc * inCh + ic) * k + kh) * k + kw]
+                                    // mlx `Conv2d` weight is OHWI:
+                                    // [outCh, kH, kW, inCh] (confirmed from the
+                                    // checkpoint — layer0 is [128,3,3,1]).
+                                    let wV = w[((oc * k + kh) * k + kw) * inCh + ic]
                                     acc += inV * wV
                                 }
                             }

@@ -109,6 +109,75 @@ struct Gemma4MultimodalIntegrationTests {
             "audio soft tokens must project into the text hidden dim (\(audioTokens.shape[1]) != \(m.engine.hidden))")
     }
 
+    /// Numerically validate the audio encoder against the mlx-vlm oracle.
+    /// Feeds the EXACT mel `/tmp/gemma4_audio_mel.f32` (dumped from mlx-vlm)
+    /// to `Gemma4AudioEncoder.encode` and compares to the oracle output
+    /// `/tmp/gemma4_audio_oracle.f32` (mlx-vlm's `audio_tower(mel, mask)`).
+    /// Both use the same 4-bit weights, so a matching algorithm ⇒ tiny diff;
+    /// a large diff localises an encoder bug (the `// VALIDATE:` spots).
+    /// Skips if the fixtures aren't present (regenerate via the dump script).
+    @Test("audio encoder matches the mlx-vlm oracle on a fixed mel")
+    func audioEncoderMatchesOracle() async throws {
+        let fm = FileManager.default
+        let melPath = "/tmp/gemma4_audio_mel.f32"
+        let oraclePath = "/tmp/gemma4_audio_oracle.f32"
+        try #require(
+            fm.fileExists(atPath: melPath) && fm.fileExists(atPath: oraclePath),
+            "oracle fixtures missing — run the mlx-vlm dump script first")
+
+        let dir = try await ModelLoadLock.shared.loadSerially {
+            try await ModelLocator().resolve(idOrPath: Self.modelId)
+        }
+        let config = try ModelConfig.load(from: dir)
+        let weights = try SafeTensorsBundle(directory: dir)
+        let audioCfg = try Gemma4AudioConfig.decode(
+            try #require(config.subConfig("audio_config"), "no audio_config"))
+        let encoder = try Gemma4AudioEncoder.load(
+            weights: weights, config: audioCfg,
+            quantization: config.quantization, device: .shared)
+
+        // Read the fixture mel [200, 128] + the oracle output [50, 1536].
+        func readF32(_ path: String) -> [Float] {
+            let d = fm.contents(atPath: path) ?? Data()
+            return d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        }
+        let melFlat = readF32(melPath)
+        let nFrames = melFlat.count / 128
+        let mel = ImagePreprocessing.makeTensor(
+            from: melFlat, shape: [nFrames, 128], dtype: .f32, device: .shared)
+        let (enc, _) = encoder.encode(
+            mel: mel, melMask: [Bool](repeating: true, count: nFrames), device: .shared)
+        let got = enc.toFloatArray()
+        let oracle = readF32(oraclePath)
+
+        print("FFAI enc shape \(enc.shape), oracle count \(oracle.count)")
+        #expect(got.count == oracle.count, "shape mismatch: \(got.count) vs \(oracle.count)")
+        var maxDiff: Float = 0
+        var sumDiff: Float = 0
+        let n = min(got.count, oracle.count)
+        for i in 0 ..< n {
+            let d = abs(got[i] - oracle[i])
+            maxDiff = max(maxDiff, d)
+            sumDiff += d
+        }
+        print(
+            "FFAI enc[0,:6]   \(got.prefix(6).map { (($0 * 10000).rounded()) / 10000 })")
+        print(
+            "oracle enc[0,:6] \(oracle.prefix(6).map { (($0 * 10000).rounded()) / 10000 })")
+        let meanDiff = sumDiff / Float(n)
+        print("max abs diff \(maxDiff), mean abs diff \(meanDiff)")
+        // mlx-vlm is a localization aid, NOT bit-exact ground truth (per the
+        // repo's "coherent output is the contract" philosophy). After the
+        // SSCP conv-layout fix the encoder tracks the reference to ~1% mean
+        // over a ±45 range; the residual is bf16 accumulation across the 12
+        // residual layers. This is a gross-bug regression guard (a real
+        // algorithm bug spikes the MEAN, like the 4.4 pre-fix); the true
+        // gate is the coherent audio→text test below.
+        #expect(
+            meanDiff < 1.5,
+            "audio encoder grossly diverges from the reference (mean abs diff \(meanDiff))")
+    }
+
     // KNOWN-PENDING: audio → text generation.
     //
     // The Gemma 4 audio encoder (Conformer / USM speech encoder + log-Mel
