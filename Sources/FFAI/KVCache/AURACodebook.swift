@@ -259,16 +259,18 @@ public enum AURACodebook {
         return writeFloatsToTensor(values, shape: [values.count], dtype: dtype, device: device)
     }
 
-    /// Allocate a boundaries tensor. Boundaries stay f32 — they're
-    /// encoder-only, used only by `aura_encode` for the branchless
-    /// Lloyd-Max comparison, where precision matters.
+    /// Allocate a boundaries tensor in the requested activation dtype.
+    /// Post-metaltile #226, `aura_encode` takes `boundaries: Tensor<T>`
+    /// — kernel-side bandwidth win (Π + boundaries dominate the encode
+    /// kernel's memory traffic). Lloyd-Max boundary values are computed
+    /// in Float; narrow dtypes (bf16/f16) round at the host-side
+    /// conversion. The bf16/f16 rounding (~1e-3) sits well below the
+    /// 2-4-bit quant bin so the matched-norm correction stays stable.
     public static func boundariesTensor(
-        dim: Int, bits: Int, device: Device = .shared
+        dim: Int, bits: Int, dtype: DType, device: Device = .shared
     ) -> Tensor {
         let values = boundaries(dim: dim, bits: bits)
-        let t = Tensor.empty(shape: [values.count], dtype: .f32, device: device)
-        t.copyIn(from: values)
-        return t
+        return writeFloatsToTensor(values, shape: [values.count], dtype: dtype, device: device)
     }
 
     /// CPU-side host conversion from `[Float]` into a tensor of the

@@ -113,9 +113,9 @@ public final class AURAQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {
     /// `Tensor<T>` (matches the production C++ TQ+ fork pattern: fp16-
     /// stored norms / codebook, f32-at-use via cast-at-load).
     public let kCodebook: Tensor  // [2^keyBits]   dtype
-    public let kBoundaries: Tensor  // [2^keyBits-1] f32 — encoder-only Lloyd-Max thresholds
+    public let kBoundaries: Tensor  // [2^keyBits-1] dtype — Lloyd-Max thresholds (Tensor<T> per metaltile #226)
     public let vCodebook: Tensor  // [2^valueBits] dtype
-    public let vBoundaries: Tensor  // [2^valueBits-1] f32 — encoder-only
+    public let vBoundaries: Tensor  // [2^valueBits-1] dtype
 
     // Per-cache compressed storage.
     public let kPacked: Tensor  // [nKVHeads, maxSeq, kPackedWidth] u32
@@ -200,14 +200,15 @@ public final class AURAQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {
             kCodebook.dtype == dtype,
             "AURAQuantizedKVCache: K codebook dtype must match cache dtype \(dtype)")
         precondition(
-            kBoundaries.dtype == .f32,
-            "AURAQuantizedKVCache: K boundaries must be f32 (encoder-only)")
+            kBoundaries.dtype == dtype,
+            "AURAQuantizedKVCache: K boundaries dtype must match cache dtype \(dtype) "
+                + "— metaltile #226 unified rotation/boundaries to Tensor<T>")
         precondition(
             vCodebook.dtype == dtype,
             "AURAQuantizedKVCache: V codebook dtype must match cache dtype \(dtype)")
         precondition(
-            vBoundaries.dtype == .f32,
-            "AURAQuantizedKVCache: V boundaries must be f32 (encoder-only)")
+            vBoundaries.dtype == dtype,
+            "AURAQuantizedKVCache: V boundaries dtype must match cache dtype \(dtype)")
         precondition(
             sharedWorkingK.shape == [nKVHeads, maxSeq, headDim],
             "AURAQuantizedKVCache: sharedWorkingK shape mismatch")
@@ -406,8 +407,14 @@ public final class AURAQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {
                 buffer: norms.buffer,
                 offset: norms.offset + h * normBytesPerHead + pos * normByteSize,
                 shape: [1], dtype: dtype)
+            // metaltile #226: aura_encode now takes rotation+boundaries
+            // as Tensor<T>. Use the activation-dtype copy of Π
+            // (`rotationDtype`) instead of the legacy f32 `rotation`
+            // field — the f32 field is kept around for any future
+            // kernel that wants f32 rotations, but the encoder no
+            // longer does.
             Ops.auraEncode(
-                input: inputView, rotation: rotation,
+                input: inputView, rotation: rotationDtype,
                 boundaries: boundaries, codebook: codebook,
                 packedOut: packedView, normsOut: normsView,
                 rows: 1, dim: headDim, packedWidth: packedWidth, bits: bits,

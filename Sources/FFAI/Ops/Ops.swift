@@ -4422,14 +4422,17 @@ public enum Ops {
         on cmd: MTLCommandBuffer
     ) {
         precondition(
-            rotation.dtype == .f32 && boundaries.dtype == .f32,
-            "Ops.auraEncode: rotation/boundaries must be f32 "
-                + "(encoder-only, Π and Lloyd-Max precision-sensitive)")
+            rotation.dtype == input.dtype && boundaries.dtype == input.dtype,
+            "Ops.auraEncode: rotation/boundaries dtype must match input "
+                + "dtype (got rotation=\(rotation.dtype), "
+                + "boundaries=\(boundaries.dtype) vs input=\(input.dtype)) "
+                + "— metaltile #226 unified to Tensor<T>; the Π matrix "
+                + "dominates encoder bandwidth so narrowing it at f16/bf16 "
+                + "halves the dominant read")
         precondition(
             codebook.dtype == input.dtype,
             "Ops.auraEncode: codebook dtype must match input dtype "
-                + "(got \(codebook.dtype) vs \(input.dtype)) — post-AURA-"
-                + "dtype-unification the codebook is stored in cache dtype")
+                + "(got \(codebook.dtype) vs \(input.dtype))")
         precondition(packedOut.dtype == .u32, "Ops.auraEncode: packed_out must be u32")
         precondition(
             normsOut.dtype == input.dtype,

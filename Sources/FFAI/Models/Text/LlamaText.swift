@@ -574,11 +574,11 @@ public final class LlamaModel: LanguageModel {
             let kCodebook = AURACodebook.centroidsTensor(
                 dim: headDim, bits: scheme.keyBits, dtype: dtype, device: device)
             let kBoundaries = AURACodebook.boundariesTensor(
-                dim: headDim, bits: scheme.keyBits, device: device)
+                dim: headDim, bits: scheme.keyBits, dtype: dtype, device: device)
             let vCodebook = AURACodebook.centroidsTensor(
                 dim: headDim, bits: scheme.valueBits, dtype: dtype, device: device)
             let vBoundaries = AURACodebook.boundariesTensor(
-                dim: headDim, bits: scheme.valueBits, device: device)
+                dim: headDim, bits: scheme.valueBits, dtype: dtype, device: device)
 
             let sharedK = Tensor.empty(
                 shape: [nKVHeads, cap, headDim],

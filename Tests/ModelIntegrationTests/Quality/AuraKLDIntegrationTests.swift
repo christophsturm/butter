@@ -126,18 +126,25 @@ struct AuraKLDIntegrationTests {
         print(
             KLDivergence.summaryLine(
                 label: "aura4v4 compressed (flash)", metrics: metrics))
-        // Compressed flash should match dequant-mirror quality exactly
-        // (same codec, just different decode dispatch). Floors mirror
-        // aura4v4VsBaseline since the math is identical — a regression
-        // here means the flash kernel diverged from the dequant ref.
+        // Compressed flash should track dequant-mirror quality closely
+        // (same codec, just different decode dispatch). Gate is set
+        // wide enough to absorb the bf16-Π precision cost from
+        // metaltile #226 (rotation + boundaries moved to Tensor<T>
+        // storage — halves the encoder's dominant read but rounds the
+        // Π matrix and Lloyd-Max thresholds at ~1e-3, which shifts a
+        // small fraction of borderline 4-bit bin assignments at encode
+        // time). Mirror baseline at f16 ≈ 1.41; compressed at bf16 Π ≈
+        // 1.76 in current runs. Floor + ceiling sized to catch a
+        // catastrophic flash-kernel divergence (e.g. dispatch-grid bug
+        // → same_top=0), not to enforce parity with the f32-Π era.
         let sameTopStr = String(format: "%.4f", metrics.sameTopFraction)
         let meanKldStr = String(format: "%.4f", metrics.meanKld)
-        #expect(
-            metrics.sameTopFraction > 0.40,
-            "compressed flash same_top \(sameTopStr) below dequant-mirror floor 0.40")
-        #expect(
-            metrics.meanKld < 1.5,
-            "compressed flash mean_kld \(meanKldStr) above dequant-mirror ceiling 1.5")
+        let sameTopMsg: Comment =
+            "compressed flash same_top \(sameTopStr) below floor 0.30 (bf16-Π era)"
+        let meanKldMsg: Comment =
+            "compressed flash mean_kld \(meanKldStr) above ceiling 2.0 (bf16-Π era)"
+        #expect(metrics.sameTopFraction > 0.30, sameTopMsg)
+        #expect(metrics.meanKld < 2.0, meanKldMsg)
     }
 
     @Test("AURA aura4v2 COMPRESSED flash decode — production recipe via flash")

@@ -699,11 +699,11 @@ public final class Qwen3Model: LanguageModel {
             let kCodebook = AURACodebook.centroidsTensor(
                 dim: headDim, bits: scheme.keyBits, dtype: dtype, device: device)
             let kBoundaries = AURACodebook.boundariesTensor(
-                dim: headDim, bits: scheme.keyBits, device: device)
+                dim: headDim, bits: scheme.keyBits, dtype: dtype, device: device)
             let vCodebook = AURACodebook.centroidsTensor(
                 dim: headDim, bits: scheme.valueBits, dtype: dtype, device: device)
             let vBoundaries = AURACodebook.boundariesTensor(
-                dim: headDim, bits: scheme.valueBits, device: device)
+                dim: headDim, bits: scheme.valueBits, dtype: dtype, device: device)
 
             // Shared working buffers — same pattern as affineQuantized:
             // bulk-dequant target shared across all layers.
