@@ -163,4 +163,46 @@ struct LFM2TextIntegrationTests {
             label: "LFM2-8B-A1B MoE 4bit"
         )
     }
+
+    // LFM2.5-8B-A1B (`Lfm2MoeForCausalLM`) — same hybrid conv/attention +
+    // block-sparse MoE backbone as LFM2-8B-A1B, differing only in config:
+    // a larger vocab (128000 vs 65536), rope_theta 5e6, and an explicit
+    // `layer_types` schedule (which the loader already honors). No
+    // published quantized release exists, so this points at FFAI's own
+    // 4-bit conversion (`ekryski/LFM2.5-8B-A1B-4bit`, router kept
+    // full-precision). ~8B params — skipped unless already cached locally.
+    @Test("LFM2.5-8B-A1B load + greedy generate produces coherent output")
+    func loadAndGenerateLFM25MoE() async throws {
+        let modelId = "ekryski/LFM2.5-8B-A1B-4bit"
+        let prompt = "The history of the printing press began when"
+
+        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+
+        #expect(m.lfm2 != nil)
+        #expect(m.engine.headDim == 64)
+        // Distinguishing feature vs LFM2-8B-A1B: the larger 128000 vocab.
+        #expect(m.engine.vocab == 128_000)
+
+        if let l = m.lfm2 {
+            #expect(l.hasMoE)
+            let moeCount = l.layers.filter {
+                ($0 as? LFM2Layer)?.isMoELayer == true
+            }.count
+            #expect(moeCount > 0)
+            #expect(moeCount < l.layers.count)
+        }
+
+        let result = try await m.generate(
+            prompt: prompt,
+            parameters: GenerationParameters(maxTokens: 200, temperature: 0)
+        )
+        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        print("LFM2.5-8B-A1B decoded output: \(decoded)")
+
+        expectCoherentOutput(
+            result.generatedTokens,
+            minTokens: 32,
+            label: "LFM2.5-8B-A1B MoE 4bit"
+        )
+    }
 }

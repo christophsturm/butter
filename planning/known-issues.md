@@ -107,19 +107,25 @@ Env overrides `FFAI_NO_FUSED_QKV` / `FFAI_NO_FUSED_LM_HEAD` retained.
 the full bisect — the fix holds. **RESOLVED** — stale
 `KNOWN FAILURE (2026-05-27)` comment deleted from `Qwen36TextIntegrationTests.swift`.
 
-## LFM2-MoE — router-shape mismatch CONFIRMED (MoE crashes; dense is fine)
+## LFM2-MoE — quantized router loaded as plain Linear — RESOLVED 2026-05-29
 
-**Confirmed 2026-05-29 bisect.** `LFM2TextIntegrationTests`: the **dense
-LFM2-350M** case passes coherently (58 % diversity), but the **LFM2-MoE**
-case crashes — `Ops.swift:406: Precondition failed: gemv: in_dim mismatch
-512 vs 2048`. Quantized expert slicing works (`buildLFM2MoE` →
-`sliceStackedExperts`, `LFM2Text.swift:466-486`); the router is loaded as
-a plain `Linear` from `feed_forward.gate.weight` with no hidden(2048)→512
-projection, so the router gemv mismatches at decode. Fix: add the
-router-input projection LFM2-MoE actually uses (or correct the gate-weight
-orientation). Dense LFM2 is unaffected. (Stale comment at
-`LFM2Text.swift:198-200` still claims quantized MoE throws
-`unsupportedConfig` — no longer true.)
+**Was:** `LFM2TextIntegrationTests` LFM2-MoE case crashed —
+`Ops.swift:406: Precondition failed: gemv: in_dim mismatch 512 vs 2048`.
+**Root cause (the original "router-shape mismatch" framing was wrong):**
+`mlx-community/LFM2-8B-A1B-4bit` ships the router `feed_forward.gate` as
+an **8-bit quantized triplet** (`gate.weight` packed U32 `[32, 512]` +
+`gate.scales`/`gate.biases` `[32, 32]`; logical in=2048 → out=32,
+group_size 64). `buildLFM2MoE` loaded it as a plain `Linear` on the
+packed U32 tensor, so the gemv read in_dim from the packed width (512)
+instead of the logical hidden (2048). It is NOT a bad conversion — the
+gate is deliberately quantized at higher precision than the 4-bit body.
+**Fix:** route the gate through `loadLinear` so the quantized triplet is
+detected and the bit-width derived (commit on `ek/fix-all-the-things`);
+raw checkpoints still fall back to a plain `Linear`. Guarded by
+`ConvertDriverTests.quantizedRouterLoadsViaLoadLinear` (round-trip) +
+the LFM2-MoE integration test. Stale `unsupportedConfig` comment at
+`LFM2Text.swift:198-200` corrected. Separately, `ffai convert` now keeps
+MoE routers full-precision by default (`--router-bits` opts in).
 
 ## GPT-OSS-20B-4bit + Gemma4-31B-4bit degenerate output — newly surfaced (2026-05-29)
 
@@ -206,3 +212,24 @@ special-token / chat-template edges are at risk. Fix: register
 `InternLM2Tokenizer` against the SentencePiece/BPE handler where
 `LlamaTokenizer` / `Qwen2Tokenizer` etc. are mapped. Surfaced 2026-05-28
 with the InternLM2 loader work.
+
+## Downloader — Xet-backed HF repos 404 (`ffai download` / `convert` / `Model.load`)
+
+Surfaced 2026-05-29 adding `LiquidAI/LFM2.5-8B-A1B`. Its `model.safetensors`
+is **Xet-backed** (resolve redirects to `cas-bridge.xethub.hf.co`,
+`x-xet-hash` header); FFAI's runtime downloader (the `swift-huggingface`
+/ `swift-transformers` `HubClient.downloadSnapshot` path in
+`ModelDownloader.swift`) does not follow the Xet CAS redirect and fails
+with `Status 404: Entry not found`. HF has been migrating new repos to
+Xet by default, so this blocks `ffai download`, `ffai convert <repo>`
+(its `ModelLocator.resolve`), **and** `Model.load` on any Xet repo —
+including the `ekryski/*` conversions we upload (new uploads are
+Xet-backed too). **Workaround in use:** download via the `hf` CLI (native
+`hf_xet` support) into the HF cache, then point `ffai convert` at the
+local snapshot dir and pre-cache uploaded repos with `hf download` before
+the integration test loads them (`Model.load` hits cache, skips the
+network path). **Real fix (open):** `Package.swift` already bumps
+`swift-transformers` 1.3.0 → 1.3.3 (uncommitted, likely a prior Xet-fix
+attempt — resolve was still 1.3.2); confirm whether 1.3.3+ adds Xet
+support (or wire `hf_xet` / the CAS redirect into the download path),
+then drop the pre-cache workaround.

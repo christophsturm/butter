@@ -462,6 +462,9 @@ private let modelCatalog: [CatalogGroup] = [
                     "mlx-community/LFM2-8B-A1B-6bit",
                     "mlx-community/LFM2-8B-A1B-8bit",
                     "mlx-community/LFM2-8B-A1B-fp16",
+                    // FFAI conversion — router left full-precision (mlx-community
+                    // ships the 8B-A1B router quantized at 8-bit).
+                    "ekryski/LFM2-8B-A1B-4bit",
                     "mlx-community/LFM2-24B-A2B-4bit",
                     "mlx-community/LFM2.5-350M-bf16",
                     "mlx-community/LFM2.5-350M-6bit",
@@ -471,6 +474,10 @@ private let modelCatalog: [CatalogGroup] = [
                     "mlx-community/LFM2.5-1.2B-Instruct-5bit",
                     "mlx-community/LFM2.5-1.2B-Instruct-6bit",
                     "mlx-community/LFM2.5-1.2B-Instruct-8bit",
+                    // LFM2.5-8B-A1B (lfm2_moe; vocab 128000, rope_theta 5e6) —
+                    // original bf16 + FFAI 4-bit conversion (router full-precision).
+                    "LiquidAI/LFM2.5-8B-A1B",
+                    "ekryski/LFM2.5-8B-A1B-4bit",
                 ]),
             // Mamba 2 (dense SSM, no attention).
             CatalogEntry(
