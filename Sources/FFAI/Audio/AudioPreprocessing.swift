@@ -73,6 +73,27 @@ public struct AudioFrontEndConfig: Sendable {
     /// Whisper large-v3 uses 128 Mel bins (everything else identical).
     public static let whisperLargeV3 = AudioFrontEndConfig(
         sampleRate: 16_000, nFFT: 400, hopLength: 160, nMels: 128)
+
+    /// Gemma 4 audio front-end (USM-style): 16 kHz, 20 ms frame
+    /// (320 samples), 10 ms hop (160 samples), FFT length 512
+    /// (next pow2 ≥ 320), 128 Mel bins, `fMax = 8000 Hz`, HTK Mel scale.
+    /// Mirrors `transformers` `Gemma4AudioFeatureExtractor`
+    /// (`feature_extraction_gemma4.py`).
+    public static let gemma4 = AudioFrontEndConfig(
+        sampleRate: 16_000, nFFT: 512, hopLength: 160, nMels: 128,
+        fMin: 0, fMax: 8000)
+}
+
+/// Mel filterbank normalisation convention.
+public enum MelNorm: Sendable {
+    /// `librosa.filters.mel(norm="slaney")` — each triangle scaled by
+    /// `2 / (f_hi - f_lo)` so total filter energy is uniform. Whisper /
+    /// transformers Whisper feature extractor.
+    case slaney
+    /// `norm=None` — raw unit-peak triangles, no per-filter rescale.
+    /// `transformers` `mel_filter_bank(norm=None, mel_scale="htk")`,
+    /// which is what the Gemma 4 audio feature extractor uses.
+    case none
 }
 
 public enum AudioPreprocessing {
@@ -106,10 +127,15 @@ public enum AudioPreprocessing {
 
     /// Build a `[nMels, nFreq]` row-major Mel filterbank — the triangular
     /// projection from the linear power spectrum onto the Mel scale.
-    /// Slaney-normalised (each triangle scaled by `2 / (f_hi - f_lo)`),
-    /// matching `librosa.filters.mel(norm="slaney")` and the filterbank
-    /// baked into the Whisper / transformers feature extractors.
-    public static func melFilterbank(_ cfg: AudioFrontEndConfig) -> [Float] {
+    /// `norm` selects the per-filter scaling: `.slaney` (default) scales
+    /// each triangle by `2 / (f_hi - f_lo)` to match
+    /// `librosa.filters.mel(norm="slaney")` and the Whisper / transformers
+    /// Whisper feature extractor; `.none` leaves unit-peak triangles to
+    /// match `transformers` `mel_filter_bank(norm=None, mel_scale="htk")`
+    /// (the Gemma 4 audio feature extractor).
+    public static func melFilterbank(
+        _ cfg: AudioFrontEndConfig, norm: MelNorm = .slaney
+    ) -> [Float] {
         let nFreq = cfg.nFreq
         let fMax = cfg.fMax ?? Double(cfg.sampleRate) / 2.0
         // FFT bin centre frequencies (Hz): bin k → k * sr / nFFT.
@@ -132,8 +158,9 @@ public enum AudioPreprocessing {
             let lo = edgeHz[m]
             let ctr = edgeHz[m + 1]
             let hi = edgeHz[m + 2]
-            // Slaney normalisation — keeps total filter energy uniform.
-            let enorm = 2.0 / (hi - lo)
+            // Slaney normalisation keeps total filter energy uniform;
+            // `.none` leaves unit-peak triangles (Gemma 4 / HF htk).
+            let enorm = norm == .slaney ? 2.0 / (hi - lo) : 1.0
             for k in 0 ..< nFreq {
                 let f = fftFreqs[k]
                 // Rising edge lo→ctr, falling edge ctr→hi.
