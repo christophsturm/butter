@@ -1643,4 +1643,38 @@ struct OpsTests {
             }
         }
     }
+
+    @Test(
+        "transposeTokensToHeads f32 — [nTokens,nHeads,d] → [nHeads,nTokens,d] at production shape")
+    func transposeTokensToHeadsF32() {
+        autoreleasepool {
+            // SigLIP production shape: 576 patches, 16 heads, head_dim 64.
+            let nTokens = 576, nHeads = 16, headDim = 64
+            let count = nTokens * nHeads * headDim
+            var src = [Float](repeating: 0, count: count)
+            for i in 0 ..< count { src[i] = Float((i % 29) - 14) * 0.1 }
+            let x = Tensor.empty(shape: [nTokens, nHeads, headDim], dtype: .f32)
+            x.copyIn(from: src)
+            var out: Tensor!
+            runAndWait { cb in
+                out = Ops.transposeTokensToHeads(
+                    x, nTokens: nTokens, nHeads: nHeads, headDim: headDim,
+                    on: cb)
+            }
+            let got = out.toArray(as: Float.self)
+            #expect(out.shape == [nHeads, nTokens, headDim])
+            // CPU reference: out[(h*nTokens+t)*d + e] = src[(t*nHeads+h)*d + e].
+            var mismatches = 0
+            for t in 0 ..< nTokens {
+                for h in 0 ..< nHeads {
+                    for e in 0 ..< headDim {
+                        let inIdx = (t * nHeads + h) * headDim + e
+                        let outIdx = (h * nTokens + t) * headDim + e
+                        if got[outIdx] != src[inIdx] { mismatches += 1 }
+                    }
+                }
+            }
+            #expect(mismatches == 0, "\(mismatches) transposed elements mismatched")
+        }
+    }
 }

@@ -7011,6 +7011,66 @@ public enum Ops {
         return result
     }
 
+    /// Transpose Q/K/V from **token-major** `[nTokens, nHeads, headDim]`
+    /// (the layout a vision/audio tower's stage-1 norm + `rope2D` emit) to
+    /// **head-major** `[nHeads, nTokens, headDim]` — the K/V layout
+    /// `Ops.sdpaBidirectional` reads (`kv_slab = kvh * kv_stride *
+    /// head_dim`). Lets the whole attention pipeline stay GPU-resident
+    /// instead of bouncing K/V to the CPU for a re-pack.
+    ///
+    /// Wraps `ffai_transpose_th` (`transpose_th.rs` §"DISPATCH
+    /// INVARIANTS"): Grid3D, one thread per output element, grid
+    /// `[nTokens, nHeads, headDim]`. A pure element copy — no reduction
+    /// TPG, no freeze hazard.
+    public static func transposeTokensToHeads(
+        _ x: Tensor, nTokens: Int, nHeads: Int, headDim: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            x.elementCount == nTokens * nHeads * headDim,
+            "Ops.transposeTokensToHeads: x count \(x.elementCount) != "
+                + "nTokens*nHeads*headDim \(nTokens * nHeads * headDim) "
+                + "(transpose_th.rs)")
+        let result =
+            out ?? Tensor.empty(
+                shape: [nHeads, nTokens, headDim], dtype: x.dtype)
+        precondition(
+            result.elementCount == nTokens * nHeads * headDim,
+            "Ops.transposeTokensToHeads: out count \(result.elementCount) != "
+                + "\(nTokens * nHeads * headDim) (transpose_th.rs)")
+        // Grid3D: one thread per (token, head, d) output element. Same
+        // dispatch shape convention as `rope2D` (tpg [1,1,1]).
+        let grid = MTLSize(width: nTokens, height: nHeads, depth: headDim)
+        let tg = MTLSize(width: 1, height: 1, depth: 1)
+        let nt = UInt32(nTokens)
+        let nh = UInt32(nHeads)
+        let hd = UInt32(headDim)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.ffai_transpose_th_f32(
+                input: x.buffer, inputOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                n_tokens: nt, n_heads: nh, head_dim: hd,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_transpose_th_f16(
+                input: x.buffer, inputOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                n_tokens: nt, n_heads: nh, head_dim: hd,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_transpose_th_bf16(
+                input: x.buffer, inputOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                n_tokens: nt, n_heads: nh, head_dim: hd,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError(
+                "Ops.transposeTokensToHeads: unsupported dtype \(x.dtype)")
+        }
+        return result
+    }
+
     // ─── Audio front-end / vocoder ───────────────────────────────────
 
     /// Log-Mel spectrogram — the STT / audio-in front-end. Fuses the
