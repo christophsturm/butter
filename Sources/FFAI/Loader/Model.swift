@@ -274,10 +274,18 @@ public enum ModelRegistry {
                 let vlm = try Gemma4VL.load(
                     config: config, weights: weights,
                     options: options, device: device)
+                // Gate `.audioIn` / `.videoIn` on what the checkpoint
+                // actually wired: audio only when an audio tower loaded
+                // (`vlm.supportsAudio`), video only when the checkpoint
+                // declared a `video_token_id`. Text-only / vision-only
+                // Gemma 4 checkpoints report just `.imageIn`.
+                var caps = Capability.textOnly.union([.imageIn])
+                if vlm.supportsAudio { caps.insert(.audioIn) }
+                if vlm.videoTokenId != nil { caps.insert(.videoIn) }
                 return Loaded(
                     engine: vlm.engine,
                     defaultGenerationParameters: Gemma4Dense.defaultGenerationParameters,
-                    availableCapabilities: Capability.textOnly.union([.imageIn]),
+                    availableCapabilities: caps,
                     vlModel: vlm)
             }
             // FastVLM — Apple's FastViTHD vision tower + mlp2x_gelu projector

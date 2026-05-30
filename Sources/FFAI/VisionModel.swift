@@ -39,6 +39,8 @@ public enum VisionModelError: Error, CustomStringConvertible {
     case placeholderCountMismatch(expected: Int, found: Int)
     case videoTokenIdMissing(String)
     case videoPlaceholderCountMismatch(expected: Int, found: Int)
+    case audioUnsupported(String)
+    case audioPlaceholderCountMismatch(expected: Int, found: Int)
 
     public var description: String {
         switch self {
@@ -55,6 +57,15 @@ public enum VisionModelError: Error, CustomStringConvertible {
         case .videoPlaceholderCountMismatch(let expected, let found):
             return "VisionModel: prompt has \(found) video-placeholder tokens "
                 + "but the vision encoder produced \(expected) video tokens"
+        case .audioUnsupported(let family):
+            return "VisionModel: \(family) was built without an audio tower; "
+                + "generate(promptTokens:audio:...) needs the family loader to "
+                + "thread `audio_token_id` + an audioEncode hook through to "
+                + "VisionModel.init (the checkpoint lacks `audio_config` / "
+                + "`audio_tower.*`)"
+        case .audioPlaceholderCountMismatch(let expected, let found):
+            return "VisionModel: prompt has \(found) audio-placeholder tokens "
+                + "but the audio encoder produced \(expected) audio tokens"
         }
     }
 }
@@ -83,13 +94,30 @@ public final class VisionModel: @unchecked Sendable {
     /// projector pools the patch grid (Gemma 3 VL: 4096 patches → 256
     /// tokens) passes the pooled count explicitly.
     public let imageTokenCount: Int
+    /// Token id the chat template emits as an audio placeholder
+    /// (`<audio_soft_token>`, id 258881 on Gemma 4). Each occurrence is
+    /// replaced by one of the audio soft tokens emitted by `audioEncode`.
+    /// `nil` for VLMs without an audio tower.
+    public let audioTokenId: Int?
+    /// Audio encode hook: a raw 16 kHz mono waveform → audio soft tokens
+    /// `[nAudioTokens, hidden]` already projected into the text hidden dim
+    /// (front-end → audio encoder → multi-modal embedder). `nil` for VLMs
+    /// without an audio tower. Family-supplied so `VisionModel` stays
+    /// decoupled from the Gemma 4 audio types.
+    public let audioEncode: (@Sendable (_ waveform: [Float], _ device: Device) -> Tensor)?
+
+    /// Whether this VLM wired an audio tower — true exactly when both an
+    /// `audioTokenId` and an `audioEncode` hook are present.
+    public var supportsAudio: Bool { audioTokenId != nil && audioEncode != nil }
 
     public init(
         visionEncoder: VisionEncoder, engine: any LanguageModel,
         imageTokenId: Int,
         videoTokenId: Int? = nil,
         normalization: ImageNormalization,
-        imageTokenCount: Int? = nil
+        imageTokenCount: Int? = nil,
+        audioTokenId: Int? = nil,
+        audioEncode: (@Sendable (_ waveform: [Float], _ device: Device) -> Tensor)? = nil
     ) throws {
         guard engine.supportsEmbeddingInput else {
             throw VisionModelError.engineLacksEmbeddingInput(String(describing: type(of: engine)))
@@ -100,6 +128,8 @@ public final class VisionModel: @unchecked Sendable {
         self.videoTokenId = videoTokenId
         self.normalization = normalization
         self.imageTokenCount = imageTokenCount ?? visionEncoder.config.numPatches
+        self.audioTokenId = audioTokenId
+        self.audioEncode = audioEncode
     }
 
     // ─── Cross-modal splice ──────────────────────────────────────────
@@ -187,6 +217,20 @@ public final class VisionModel: @unchecked Sendable {
         return try visionEncoder.encode(frames: pixels, device: device)
     }
 
+    /// Encode a raw 16 kHz mono waveform into audio soft tokens in the
+    /// text hidden dim (front-end → audio encoder → multi-modal embedder).
+    /// Throws `VisionModelError.audioUnsupported` for VLMs that didn't wire
+    /// an audio tower.
+    public func encodeAudio(
+        _ waveform: [Float], device: Device = .shared
+    ) throws -> Tensor {
+        guard let audioEncode else {
+            throw VisionModelError.audioUnsupported(
+                String(describing: type(of: engine)))
+        }
+        return audioEncode(waveform, device)
+    }
+
     /// Cross-modal splice driver — builds the embedding stream by
     /// walking `promptTokens` and substituting vision-encoder rows at
     /// each image-placeholder / video-placeholder position. The image
@@ -196,6 +240,7 @@ public final class VisionModel: @unchecked Sendable {
         promptTokens: [Int],
         imageTokens: Tensor?,
         videoTokens: Tensor?,
+        audioTokens: Tensor? = nil,
         device: Device
     ) throws -> [Tensor] {
         let hidden = engine.hidden
@@ -218,6 +263,17 @@ public final class VisionModel: @unchecked Sendable {
             throw VisionModelError.videoPlaceholderCountMismatch(
                 expected: videoVisionRows, found: videoPlaceholderCount)
         }
+        let audioPlaceholderCount: Int
+        if let audioTokenId {
+            audioPlaceholderCount = promptTokens.filter { $0 == audioTokenId }.count
+        } else {
+            audioPlaceholderCount = 0
+        }
+        let audioRows = audioTokens?.shape[0] ?? 0
+        guard audioPlaceholderCount == audioRows else {
+            throw VisionModelError.audioPlaceholderCountMismatch(
+                expected: audioRows, found: audioPlaceholderCount)
+        }
         if let imageTokens {
             precondition(
                 imageTokens.shape == [imageVisionRows, hidden],
@@ -230,8 +286,14 @@ public final class VisionModel: @unchecked Sendable {
                 "VisionModel.splice: video tokens \(videoTokens.shape) "
                     + "≠ [\(videoVisionRows), \(hidden)]")
         }
-        // Byte stride for slicing a single [hidden] row out of the
-        // vision token buffer — same for image and video.
+        if let audioTokens {
+            precondition(
+                audioTokens.shape == [audioRows, hidden],
+                "VisionModel.splice: audio tokens \(audioTokens.shape) "
+                    + "≠ [\(audioRows), \(hidden)]")
+        }
+        // Byte stride for slicing a single [hidden] row out of a modality
+        // token buffer — same for image, video, and audio.
         let imageRowBytes =
             imageTokens.map {
                 hidden * $0.dtype.byteSize
@@ -240,13 +302,20 @@ public final class VisionModel: @unchecked Sendable {
             videoTokens.map {
                 hidden * $0.dtype.byteSize
             } ?? 0
+        let audioRowBytes =
+            audioTokens.map {
+                hidden * $0.dtype.byteSize
+            } ?? 0
 
         var stream: [Tensor] = []
         stream.reserveCapacity(promptTokens.count)
         var imageCursor = 0
         var videoCursor = 0
+        var audioCursor = 0
         for tok in promptTokens {
             if tok == imageTokenId, let imageTokens {
+                // VALIDATE: image splice index — each `imageTokenId` slot
+                // takes the next vision-encoder row in order.
                 let row = Tensor(
                     buffer: imageTokens.buffer,
                     offset: imageTokens.offset + imageCursor * imageRowBytes,
@@ -260,6 +329,17 @@ public final class VisionModel: @unchecked Sendable {
                     shape: [hidden], dtype: videoTokens.dtype)
                 stream.append(row)
                 videoCursor += 1
+            } else if let audioTokenId, tok == audioTokenId, let audioTokens {
+                // VALIDATE: audio splice index — each `audioTokenId` slot
+                // (the `boa … eoa` span's interior) takes the next audio
+                // soft-token row in order. Mirrors the reference
+                // `masked_scatter` at `audio_token_id` positions.
+                let row = Tensor(
+                    buffer: audioTokens.buffer,
+                    offset: audioTokens.offset + audioCursor * audioRowBytes,
+                    shape: [hidden], dtype: audioTokens.dtype)
+                stream.append(row)
+                audioCursor += 1
             } else {
                 stream.append(engine.textEmbedding(tokenId: tok, device: device))
             }
@@ -287,7 +367,7 @@ public final class VisionModel: @unchecked Sendable {
         let imageTokens = image.map { encodeImage($0, device: device) }
         return try runGreedy(
             promptTokens: promptTokens,
-            imageTokens: imageTokens, videoTokens: nil,
+            imageTokens: imageTokens, videoTokens: nil, audioTokens: nil,
             maxTokens: maxTokens, eosTokenId: eosTokenId,
             eosTokenIds: eosTokenIds, device: device)
     }
@@ -318,7 +398,27 @@ public final class VisionModel: @unchecked Sendable {
         let videoTokens = try encodeVideo(videoFrames, device: device)
         return try runGreedy(
             promptTokens: promptTokens,
-            imageTokens: nil, videoTokens: videoTokens,
+            imageTokens: nil, videoTokens: videoTokens, audioTokens: nil,
+            maxTokens: maxTokens, eosTokenId: eosTokenId,
+            eosTokenIds: eosTokenIds, device: device)
+    }
+
+    /// Greedy multi-modal generation with an audio prompt. `waveform` is a
+    /// raw 16 kHz mono signal; the audio front-end + encoder + multi-modal
+    /// embedder turn it into audio soft tokens, and the splice substitutes
+    /// one soft-token row at every `audioTokenId` placeholder (the interior
+    /// of the `boa … eoa` span). Throws `VisionModelError.audioUnsupported`
+    /// for VLMs without an audio tower.
+    public func generate(
+        promptTokens: [Int], audio waveform: [Float],
+        maxTokens: Int, eosTokenId: Int?,
+        eosTokenIds: [Int] = [],
+        device: Device = .shared
+    ) throws -> [Int] {
+        let audioTokens = try encodeAudio(waveform, device: device)
+        return try runGreedy(
+            promptTokens: promptTokens,
+            imageTokens: nil, videoTokens: nil, audioTokens: audioTokens,
             maxTokens: maxTokens, eosTokenId: eosTokenId,
             eosTokenIds: eosTokenIds, device: device)
     }
@@ -329,7 +429,7 @@ public final class VisionModel: @unchecked Sendable {
     /// flow to the legacy `generate(promptTokens:image:...)` path.
     private func runGreedy(
         promptTokens: [Int],
-        imageTokens: Tensor?, videoTokens: Tensor?,
+        imageTokens: Tensor?, videoTokens: Tensor?, audioTokens: Tensor?,
         maxTokens: Int, eosTokenId: Int?,
         eosTokenIds: [Int],
         device: Device
@@ -338,10 +438,11 @@ public final class VisionModel: @unchecked Sendable {
 
         // Build the prefill embedding stream.
         let stream: [Tensor]
-        if imageTokens != nil || videoTokens != nil {
+        if imageTokens != nil || videoTokens != nil || audioTokens != nil {
             stream = try spliceMultimodal(
                 promptTokens: promptTokens,
                 imageTokens: imageTokens, videoTokens: videoTokens,
+                audioTokens: audioTokens,
                 device: device)
         } else {
             // Text-only prompt — every position is a text-token embedding.

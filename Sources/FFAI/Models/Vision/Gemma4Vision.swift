@@ -802,6 +802,35 @@ final class Gemma4VLComposedEncoder: VisionEncoder {
     override func encode(image: Tensor, device: Device = .shared) -> Tensor {
         tower.encode(image: image, device: device)
     }
+
+    /// Video path: run every frame through the same Gemma 4 vision tower
+    /// and concatenate the per-frame soft tokens into one
+    /// `[nFrames · tokensPerImage, textHidden]` run. Gemma 4 has no bespoke
+    /// temporal-patch fold — a video is a temporally-ordered sequence of
+    /// images, each contributing `tokensPerImage` soft tokens, spliced at
+    /// the prompt's `video_token_id` placeholders in frame order.
+    override func encode(
+        frames: [Tensor], device: Device = .shared
+    ) throws -> Tensor {
+        precondition(
+            !frames.isEmpty,
+            "Gemma4VLComposedEncoder.encode(frames:): expected ≥ 1 frame")
+        let textHidden = tower.textHidden
+        let perFrame = tower.tokensPerImage
+        // VALIDATE: video soft-token count = nFrames · tokensPerImage, in
+        // frame order; the prompt must carry exactly that many
+        // `video_token_id` placeholders (one per soft token).
+        var flat = [Float]()
+        flat.reserveCapacity(frames.count * perFrame * textHidden)
+        for frame in frames {
+            let soft = tower.encode(image: frame, device: device)
+            flat.append(contentsOf: soft.toFloatArray())
+        }
+        return ImagePreprocessing.makeTensor(
+            from: flat,
+            shape: [frames.count * perFrame, textHidden],
+            dtype: tower.dtype, device: device)
+    }
 }
 
 // ─── Gemma 4 VL family orchestrator ──────────────────────────────────
@@ -843,10 +872,22 @@ final class Gemma4VLComposedEncoder: VisionEncoder {
 public enum Gemma4VL {
     /// `image_token_id` default for Gemma 4 VL checkpoints.
     public static let defaultImageTokenId = 262_144
+    /// `audio_token_id` default — the `<audio_soft_token>` placeholder id
+    /// (mlx-vlm `config.audio_token_id`). Only consulted when the
+    /// checkpoint carries an audio tower.
+    public static let defaultAudioTokenId = 258_881
+    /// `video_token_id` default — the `<video_soft_token>` placeholder id.
+    /// Gemma 4 has no bespoke temporal fold: a video is a sequence of
+    /// frames, each run through the vision tower, spliced at these slots.
+    public static let defaultVideoTokenId = 258_884
 
     /// Build a `VisionModel` from a `Gemma4ForConditionalGeneration`
     /// checkpoint: the Gemma 4 vision tower + multi-modal embedder +
-    /// Gemma 4 text backbone, joined by the cross-modal splice.
+    /// Gemma 4 text backbone, joined by the cross-modal splice. When the
+    /// checkpoint also carries an `audio_config` + `audio_tower.*`, the
+    /// audio tower + `embed_audio` projection are loaded and the audio
+    /// path is wired; otherwise the audio members are left `nil` so
+    /// text-only / vision-only Gemma 4 checkpoints load unchanged.
     public static func load(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
@@ -874,10 +915,59 @@ public enum Gemma4VL {
         let imageTokenId =
             config.int("image_token_id")
             ?? config.int("image_token_index") ?? defaultImageTokenId
+
+        // ── Audio tower + multi-modal embedder (optional) ──
+        // Only load when the checkpoint declares an `audio_config` AND
+        // ships `audio_tower.*` tensors. Text-only / vision-only Gemma 4
+        // checkpoints have neither, so the audio members stay `nil` and
+        // those checkpoints load exactly as before.
+        let hasAudioTower =
+            weights.has("audio_tower.output_proj.weight")
+            || weights.has("model.audio_tower.output_proj.weight")
+        var audioTokenId: Int? = nil
+        var audioEncode:
+            (@Sendable (_ waveform: [Float], _ device: Device) -> Tensor)? = nil
+        if let audioConfigRaw = config.subConfig("audio_config"), hasAudioTower {
+            let audioConfig = try Gemma4AudioConfig.decode(audioConfigRaw)
+            let audioEncoder = try Gemma4AudioEncoder.load(
+                weights: weights, config: audioConfig,
+                quantization: config.quantization, device: device)
+            // `embed_audio` projects the encoder's `[nFrames, output_proj_dims]`
+            // soft tokens (1536 on E2B) into the text hidden dim. The
+            // RMSNormNoScale eps matches the audio config.
+            let embedAudio = try Gemma4AudioEmbedder.load(
+                weights: weights, embeddingDim: audioConfig.outputProjDims,
+                normEps: audioConfig.rmsNormEps, dtype: textEngine.dtype,
+                quantization: config.quantization)
+            audioTokenId =
+                config.int("audio_token_id")
+                ?? config.int("audio_token_index") ?? defaultAudioTokenId
+            // The audio encode hook: waveform → log-Mel front-end → audio
+            // encoder → multi-modal embedder. Mirrors the reference
+            // `audio_tower(...)` then `embed_audio(...)`.
+            audioEncode = { waveform, dev in
+                let (mel, mask) = Gemma4AudioFrontend.melSpectrogram(
+                    waveform: waveform, device: dev)
+                let (encodings, _) = audioEncoder.encode(
+                    mel: mel, melMask: mask, device: dev)
+                return embedAudio.embed(encodings, device: dev)
+            }
+        }
+
+        // ── Video placeholder id ──
+        // Wire a `videoTokenId` only when the checkpoint declares one. The
+        // composed encoder's `encode(frames:)` reuses the vision tower, so
+        // video works as soon as the prompt carries the placeholders.
+        let videoTokenId =
+            config.int("video_token_id") ?? config.int("video_token_index")
+
         return try VisionModel(
             visionEncoder: vision.asVisionEncoder(),
             engine: textEngine, imageTokenId: imageTokenId,
+            videoTokenId: videoTokenId,
             normalization: .siglip,
-            imageTokenCount: vision.tokensPerImage)
+            imageTokenCount: vision.tokensPerImage,
+            audioTokenId: audioTokenId,
+            audioEncode: audioEncode)
     }
 }

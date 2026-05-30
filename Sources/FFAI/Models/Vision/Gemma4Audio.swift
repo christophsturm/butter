@@ -846,7 +846,12 @@ final class Gemma4AudioAttention {
 /// tensors and turns a mel spectrogram into audio soft tokens in the
 /// text hidden dim. Public contract — other code depends on the
 /// `load` / `encode` signatures, so don't change them.
-final class Gemma4AudioEncoder {
+// `@unchecked Sendable`: all stored state is immutable `let` (config,
+// weight tensors, the Conformer block stack, the precomputed mask) set
+// once at load and never mutated — the encoder is read-only during
+// `encode`. Same rationale as `Gemma4VLVisionModel`. Needed so the audio
+// encode hook (`@Sendable` closure on `VisionModel`) can capture it.
+final class Gemma4AudioEncoder: @unchecked Sendable {
     let config: Gemma4AudioConfig
     /// SSCP subsampling: two Conv2d(3×3, stride 2) + LayerNorm + ReLU
     /// blocks, then a flatten + input-projection linear.
@@ -1291,5 +1296,83 @@ final class Gemma4AudioEncoder {
         }
         return ImagePreprocessing.makeTensor(
             from: flat, shape: [nOut, outDim], dtype: x.dtype, device: device)
+    }
+}
+
+/// Multi-modal embedder for the audio path (`embed_audio`). Mirrors the
+/// reference `MultimodalEmbedder`: an unweighted RMSNorm (`RMSNormNoScale`,
+/// `embedding_pre_projection_norm`) over each audio soft token followed by
+/// a linear projection (`embedding_projection`) from the encoder's output
+/// width (`output_proj_dims`, 1536 on E2B) into the text hidden dim. The
+/// projection may be quantized in 4-bit checkpoints, so it is held as an
+/// `AnyLinear` loaded through `loadLinear` — exactly the same pattern as
+/// the vision tower's `embedderProjection`.
+///
+/// `@unchecked Sendable`: the projection + scalar config are immutable
+/// `let` set once at load; needed so the audio encode hook can capture it.
+final class Gemma4AudioEmbedder: @unchecked Sendable {
+    /// `embedding_projection` — `[textHidden, embeddingDim]` (quantized in
+    /// 4-bit checkpoints, loaded via `loadLinear`).
+    let projection: AnyLinear
+    /// The no-scale pre-projection norm's epsilon (the norm is unweighted).
+    let normEps: Float
+    /// Encoder output width feeding the projection (`output_proj_dims`).
+    let embeddingDim: Int
+    let dtype: DType
+
+    init(
+        projection: AnyLinear, normEps: Float, embeddingDim: Int, dtype: DType
+    ) {
+        self.projection = projection
+        self.normEps = normEps
+        self.embeddingDim = embeddingDim
+        self.dtype = dtype
+    }
+
+    /// Load `embed_audio.embedding_projection.{weight,scales,biases}` from
+    /// the checkpoint. Probes both the bare and `model.`-namespaced
+    /// prefixes (VLM conversions may carry either).
+    static func load(
+        weights: SafeTensorsBundle, embeddingDim: Int, normEps: Float,
+        dtype: DType, quantization: ModelConfig.QuantizationConfig?
+    ) throws -> Gemma4AudioEmbedder {
+        let ea =
+            weights.has("embed_audio.embedding_projection.weight")
+            ? weights.prefixed("embed_audio.")
+            : weights.prefixed("model.embed_audio.")
+        let projection = try loadLinear(
+            base: "embedding_projection", in: ea, quantization: quantization)
+        return Gemma4AudioEmbedder(
+            projection: projection, normEps: normEps,
+            embeddingDim: embeddingDim, dtype: dtype)
+    }
+
+    /// RMSNorm-no-scale each `[nTokens, embeddingDim]` audio soft token,
+    /// then project into the text hidden dim. Returns `[nTokens, textHidden]`.
+    /// Mirrors `Gemma4VLVisionModel.embed`.
+    func embed(_ encodings: Tensor, device: Device) -> Tensor {
+        let nTokens = encodings.shape[0]
+        let dim = embeddingDim
+        let src = encodings.toFloatArray()
+        // Unweighted RMSNorm — the embedder's pre-projection norm has no
+        // learned scale.
+        var normed = [Float](repeating: 0, count: nTokens * dim)
+        for t in 0 ..< nTokens {
+            var ss: Float = 0
+            for d in 0 ..< dim { ss += src[t * dim + d] * src[t * dim + d] }
+            let inv = 1.0 / (ss / Float(dim) + normEps).squareRoot()
+            for d in 0 ..< dim { normed[t * dim + d] = src[t * dim + d] * inv }
+        }
+        let normedT = ImagePreprocessing.makeTensor(
+            from: normed, shape: [nTokens, dim], dtype: dtype, device: device)
+
+        let cmd = device.makeCommandBuffer()
+        // `callMany` handles a QuantizedLinear from a 4-bit checkpoint via
+        // the dequant-gemm path.
+        let projected = projection.callMany(
+            normedT, t: nTokens, on: cmd, device: device)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return projected
     }
 }
