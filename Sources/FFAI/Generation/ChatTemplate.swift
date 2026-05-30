@@ -144,7 +144,12 @@ extension Model {
         messages: [ChatMessage],
         options: ChatTemplateOptions = .init()
     ) throws -> [Int] {
-        guard tokenizer.hasChatTemplate else {
+        // Prefer the tokenizer's built-in template (from
+        // tokenizer_config.json); fall back to a standalone
+        // `chat_template.jinja` shipped alongside the model, passed as a
+        // literal override. One of the two must exist.
+        let standalone = standaloneChatTemplate
+        guard tokenizer.hasChatTemplate || standalone != nil else {
             throw ChatTemplateError.noTemplateOnTokenizer
         }
         var additional: [String: any Sendable] = options.extraContext
@@ -156,7 +161,7 @@ extension Model {
         do {
             return try tokenizer.applyChatTemplate(
                 messages: templateMessages,
-                chatTemplate: nil,
+                chatTemplate: standalone.map { ChatTemplateArgument.literal($0) },
                 addGenerationPrompt: options.addGenerationPrompt,
                 truncation: options.truncation,
                 maxLength: options.maxLength,

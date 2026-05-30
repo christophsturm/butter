@@ -169,16 +169,20 @@ struct LFM2TextIntegrationTests {
     }
 
     // LFM2.5-8B-A1B (`Lfm2MoeForCausalLM`) — same hybrid conv/attention +
-    // block-sparse MoE backbone as LFM2-8B-A1B, differing only in config:
-    // a larger vocab (128000 vs 65536), rope_theta 5e6, and an explicit
-    // `layer_types` schedule (which the loader already honors). No
-    // published quantized release exists, so this points at FFAI's own
-    // 4-bit conversion (`ekryski/LFM2.5-8B-A1B-4bit`, router kept
-    // full-precision). ~8B params — skipped unless already cached locally.
-    @Test("LFM2.5-8B-A1B load + greedy generate produces coherent output")
+    // block-sparse MoE backbone as LFM2-8B-A1B, differing in config (vocab
+    // 128000 vs 65536, rope_theta 5e6) AND in training: LFM2.5-8B-A1B is an
+    // INSTRUCT / reasoning model that requires its chat template, whereas
+    // LFM2-8B-A1B is a base model. The template ships as a standalone
+    // `chat_template.jinja` (not a `tokenizer_config.json` field), so this
+    // exercises `Model.standaloneChatTemplate` + `generate(messages:)` —
+    // feeding a RAW prompt instead degenerates (the model echoes context),
+    // which is correct instruct-model behaviour, not a forward bug. Points
+    // at FFAI's own 4-bit stacked-expert conversion
+    // (`ekryski/LFM2.5-8B-A1B-4bit`, router + embed full-precision). ~8B
+    // params — skipped unless already cached locally.
+    @Test("LFM2.5-8B-A1B chat-templated generation produces coherent output")
     func loadAndGenerateLFM25MoE() async throws {
         let modelId = "ekryski/LFM2.5-8B-A1B-4bit"
-        let prompt = "The history of the printing press began when"
 
         let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
 
@@ -193,6 +197,10 @@ struct LFM2TextIntegrationTests {
         #expect(m.defaultGenerationParameters.topP == 0.8)
         #expect(m.defaultGenerationParameters.repetitionPenalty == 1.05)
 
+        // The chat template is the standalone `chat_template.jinja` (not in
+        // tokenizer_config.json) — loaded via `Model.standaloneChatTemplate`.
+        #expect(m.supportsChatTemplate)
+
         if let l = m.lfm2 {
             #expect(l.hasMoE)
             let moeCount = l.layers.filter {
@@ -202,23 +210,19 @@ struct LFM2TextIntegrationTests {
             #expect(moeCount < l.layers.count)
         }
 
+        // Chat-formatted via the standalone template; greedy for
+        // determinism. The model reasons (`<think>…`) then answers.
         let result = try await m.generate(
-            prompt: prompt,
+            messages: [ChatMessage(role: .user, content: "What is the capital of France?")],
             parameters: GenerationParameters(maxTokens: 200, temperature: 0)
         )
         let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
         print("LFM2.5-8B-A1B decoded output: \(decoded)")
 
-        // KNOWN ISSUE — LFM2.5 forward pass is degenerate in FFAI. The raw
-        // bf16 LiquidAI/LFM2.5-8B-A1B degenerates identically (greedy: "when
-        // when when… que que"), while raw bf16 LFM2-8B-A1B is coherent — so
-        // this is a real LFM2.5-specific architecture bug, NOT quantization
-        // (ruled out: rope_theta reads 5e6, tokenizer + norm convention match
-        // LFM2-8B, config is architecturally identical). See
-        // planning/known-issues.md "LFM2.5 forward pass degenerate". The
-        // loader / per-expert-quant fix / config / recommended-defaults all
-        // verify above; coherence is gated on the forward-bug fix. Restore
-        // `expectCoherentOutput` here once it lands.
-        #expect(result.generatedTokens.count > 0, "LFM2.5 should generate without crashing")
+        expectCoherentOutput(
+            result.generatedTokens, minTokens: 32, label: "LFM2.5-8B-A1B chat")
+        #expect(
+            decoded.lowercased().contains("paris"),
+            "LFM2.5 should answer the France-capital question with 'Paris'")
     }
 }

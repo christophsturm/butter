@@ -1096,6 +1096,27 @@ public final class Model: @unchecked Sendable {
     public let modelDirectory: URL
     public let availableCapabilities: Set<Capability>
 
+    /// The model's chat template, when it ships as a standalone
+    /// `chat_template.jinja` file (the newer HF convention) rather than a
+    /// `chat_template` field inside `tokenizer_config.json` (which
+    /// swift-transformers loads into the tokenizer itself). `nil` when the
+    /// tokenizer already carries a template or no `.jinja` file is present.
+    /// `renderChatTemplate` passes this as a literal override so instruct /
+    /// reasoning models that only ship the standalone file (e.g.
+    /// LiquidAI/LFM2.5) still format correctly through `generate(messages:)`.
+    public var standaloneChatTemplate: String? {
+        guard !tokenizer.hasChatTemplate else { return nil }
+        let url = modelDirectory.appendingPathComponent("chat_template.jinja")
+        return try? String(contentsOf: url, encoding: .utf8)
+    }
+
+    /// True when chat-formatted generation is available — either the
+    /// tokenizer carries a template or a standalone `chat_template.jinja`
+    /// was found alongside the model.
+    public var supportsChatTemplate: Bool {
+        tokenizer.hasChatTemplate || standaloneChatTemplate != nil
+    }
+
     /// The `LoadOptions` this model was loaded with. Retained so the
     /// memory-management path (`makeManagedCaches`) can honor
     /// `maxContextLength` / `preallocateKVCache` / `initialKVCacheCapacity`
