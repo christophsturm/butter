@@ -1061,8 +1061,16 @@ public final class LFM2Model: LanguageModel {
         memcpy(tokenBuf.contents(), &tid, 4)
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
 
+        // `InspectTap` is a no-op unless FFAI_INSPECT is set (single bool
+        // compare per boundary); under `ffai inspect --layer-trace` it
+        // prints per-layer min/max/nan/inf + first values, committing the
+        // work buffer to make `h` resident before each readback — which
+        // composes with the committing-layer discipline below.
+        let tap = InspectTap.fromEnvironment
         var workCmd = device.makeCommandBuffer()
         var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
+        workCmd = tap.dumpLayerBoundary(
+            h, label: "embed", layer: -1, cmd: workCmd, device: device)
 
         for (i, layer) in layers.enumerated() {
             h = layer.decode(
@@ -1071,6 +1079,8 @@ public final class LFM2Model: LanguageModel {
             if let l = layer as? LFM2Layer, l.commitsCommandBuffer {
                 workCmd = device.makeCommandBuffer()
             }
+            workCmd = tap.dumpLayerBoundary(
+                h, label: "layer_out", layer: i, cmd: workCmd, device: device)
         }
 
         // After a committing layer `workCmd` is fresh + empty and `h` is
