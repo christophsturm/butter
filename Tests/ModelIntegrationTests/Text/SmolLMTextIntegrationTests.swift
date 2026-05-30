@@ -43,7 +43,7 @@ struct SmolLMTextIntegrationTests {
         // nKVHeads=5, headDim=64.
         let result = try await m.generate(
             prompt: "Once upon a time, in a quiet village",
-            parameters: GenerationParameters(maxTokens: 200, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = 200; $0.seed = 42 }
         )
         expectCoherentOutput(
             result.generatedTokens,
@@ -65,7 +65,7 @@ struct SmolLMTextIntegrationTests {
         #expect(m.engine.headDim == 64)
         let result = try await m.generate(
             prompt: "Once upon a time, in a quiet village",
-            parameters: GenerationParameters(maxTokens: 200, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = 200; $0.seed = 42 }
         )
         expectCoherentOutput(
             result.generatedTokens,
@@ -83,7 +83,7 @@ struct SmolLMTextIntegrationTests {
         #expect(m.engine.hidden == 2048)
         let result = try await m.generate(
             prompt: "Once upon a time, in a quiet village",
-            parameters: GenerationParameters(maxTokens: 200, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = 200; $0.seed = 42 }
         )
         expectCoherentOutput(
             result.generatedTokens,

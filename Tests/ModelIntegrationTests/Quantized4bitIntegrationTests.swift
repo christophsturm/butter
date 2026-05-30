@@ -53,7 +53,7 @@ struct Quantized4bitIntegrationTests {
 
         let result = try await m.generate(
             prompt: prompt,
-            parameters: GenerationParameters(maxTokens: maxTokens, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = maxTokens; $0.seed = 42; $0.repetitionPenalty = 1.5 }
         )
         #expect(result.tokensPerSecond > 0)
         expectCoherentOutput(result.generatedTokens, label: "Qwen3 1.7B 4-bit")

@@ -103,7 +103,7 @@ struct LFM2TextIntegrationTests {
         // ── End-to-end greedy generation ──────────────────────────────
         let result = try await m.generate(
             prompt: prompt,
-            parameters: GenerationParameters(maxTokens: 200, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = 200; $0.seed = 42 }
         )
         #expect(result.tokensPerSecond > 0)
 
@@ -131,10 +131,11 @@ struct LFM2TextIntegrationTests {
 
         #expect(m.lfm2 != nil)
         #expect(m.engine.headDim == 64)
-        // LFM2 (original, 65536 vocab) keeps the conservative greedy
-        // default — only the LFM2.5 collection gets the sampling defaults.
+        // LFM2 (original, 65536 vocab) gets LiquidAI's LFM2 card defaults
+        // (temp 0.3 / min-p 0.15); the LFM2.5 collection gets its own.
         #expect(m.engine.vocab == 65_536)
-        #expect(m.defaultGenerationParameters.temperature == 0.0)
+        #expect(m.defaultGenerationParameters.temperature == 0.3)
+        #expect(m.defaultGenerationParameters.minP == 0.15)
 
         if let l = m.lfm2 {
             // The MoE checkpoint carries at least one MoE feed-forward.
@@ -156,7 +157,7 @@ struct LFM2TextIntegrationTests {
 
         let result = try await m.generate(
             prompt: prompt,
-            parameters: GenerationParameters(maxTokens: 200, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = 200; $0.seed = 42 }
         )
         let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
         print("LFM2-8B-A1B decoded output: \(decoded)")

@@ -80,7 +80,7 @@ struct Gemma3TextIntegrationTests {
         // papers/gemma3-coherence-investigation-2026-05-19.md.
         let result = try await m.generate(
             prompt: prompt,
-            parameters: GenerationParameters(maxTokens: maxTokens, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = maxTokens; $0.seed = 42 }
         )
         #expect(result.tokensPerSecond > 0)
         expectCoherentOutput(

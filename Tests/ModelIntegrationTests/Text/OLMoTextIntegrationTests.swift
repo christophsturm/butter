@@ -73,7 +73,7 @@ struct OLMoTextIntegrationTests {
 
         let result = try await m.generate(
             prompt: "Once upon a time, in a quiet village",
-            parameters: GenerationParameters(maxTokens: 200, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = 200; $0.seed = 42 }
         )
         #expect(result.tokensPerSecond > 0)
         expectCoherentOutput(

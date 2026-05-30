@@ -82,7 +82,7 @@ struct Mamba2TextIntegrationTests {
         // over the longer window.
         let result = try await m.generate(
             prompt: "The quick brown fox jumps over the",
-            parameters: GenerationParameters(maxTokens: 64, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = 64; $0.seed = 42 }
         )
         #expect(result.tokensPerSecond > 0)
         expectCoherentOutput(

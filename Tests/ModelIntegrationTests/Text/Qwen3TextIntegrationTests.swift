@@ -60,7 +60,7 @@ struct Qwen3TextIntegrationTests {
         // path through the full per-token forward.
         let result = try await m.generate(
             prompt: prompt,
-            parameters: GenerationParameters(maxTokens: maxTokens, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = maxTokens; $0.seed = 42; $0.repetitionPenalty = 1.5 }
         )
         #expect(result.tokensPerSecond > 0)
         expectCoherentOutput(

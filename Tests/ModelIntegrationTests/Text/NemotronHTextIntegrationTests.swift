@@ -115,7 +115,7 @@ struct NemotronHTextIntegrationTests {
         // ── End-to-end greedy generation ──────────────────────────────
         let result = try await m.generate(
             prompt: prompt,
-            parameters: GenerationParameters(maxTokens: 200, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = 200; $0.seed = 42 }
         )
         #expect(result.tokensPerSecond > 0)
 

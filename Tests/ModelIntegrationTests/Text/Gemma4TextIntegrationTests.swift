@@ -106,7 +106,7 @@ struct Gemma4TextIntegrationTests {
         // kernel (no host readback).
         let result = try await m.generate(
             prompt: prompt,
-            parameters: GenerationParameters(maxTokens: maxTokens, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = maxTokens; $0.seed = 42 }
         )
         print("Gemma 4 E2B decoded: \"\(prompt)\(result.text)\"")
         #expect(result.tokensPerSecond > 0)
@@ -136,7 +136,7 @@ struct Gemma4TextIntegrationTests {
 
         let result = try await m.generate(
             prompt: prompt,
-            parameters: GenerationParameters(maxTokens: 200, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = 200; $0.seed = 42 }
         )
         expectCoherentOutput(
             result.generatedTokens,
@@ -166,7 +166,7 @@ struct Gemma4TextIntegrationTests {
 
         let result = try await m.generate(
             prompt: prompt,
-            parameters: GenerationParameters(maxTokens: 200, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = 200; $0.seed = 42 }
         )
         #expect(result.tokensPerSecond > 0)
         expectCoherentOutput(

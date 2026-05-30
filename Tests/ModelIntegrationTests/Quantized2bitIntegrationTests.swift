@@ -80,7 +80,7 @@ struct Quantized2bitIntegrationTests {
         // requested token count without NaN/Inf in throughput stats.
         let result = try await m.generate(
             prompt: prompt,
-            parameters: GenerationParameters(maxTokens: maxTokens, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = maxTokens; $0.seed = 42; $0.repetitionPenalty = 1.5 }
         )
         #expect(result.tokensPerSecond > 0)
         #expect(result.generatedTokens.count == maxTokens)

@@ -52,7 +52,7 @@ struct DeepSeekR1DistillTextIntegrationTests {
 
         let result = try await m.generate(
             prompt: prompt,
-            parameters: GenerationParameters(maxTokens: maxTokens, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = maxTokens; $0.seed = 42 }
         )
         #expect(result.tokensPerSecond > 0)
         expectCoherentOutput(
@@ -88,7 +88,7 @@ struct DeepSeekR1DistillTextIntegrationTests {
 
         let result = try await m.generate(
             prompt: prompt,
-            parameters: GenerationParameters(maxTokens: maxTokens, temperature: 0)
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = maxTokens; $0.seed = 42 }
         )
         #expect(result.tokensPerSecond > 0)
         // R1-Distill-Qwen-1.5B is widely documented to collapse into a
