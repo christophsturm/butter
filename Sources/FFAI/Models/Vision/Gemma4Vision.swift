@@ -481,27 +481,37 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
     /// normalized NCHW tensor `[1, 3, side, side]` where `side =
     /// gridSide · patchSize`. Returns `[tokensPerImage, textHidden]`.
     func encode(image: Tensor, device: Device) -> Tensor {
-        let side = gridSide
-        let nPatches = side * side
+        // The Gemma 4 image processor is variable-resolution (aspect-ratio
+        // preserving): `image` is NCHW `[1, 3, H, W]` (or `[3, H, W]`) with
+        // H, W each a multiple of `patchSize · poolingKernelSize`. Derive
+        // the (possibly non-square) patch grid from the image dimensions
+        // rather than assuming the fixed square `gridSide`.
+        let shp = image.shape
+        let imgH = shp[shp.count - 2]
+        let imgW = shp[shp.count - 1]
+        let p = cfg.patchSize
+        let gridH = imgH / p
+        let gridW = imgW / p
+        let nPatches = gridH * gridW
 
         // ── Patch unfold + embed ──
-        let unfolded = unfoldPatches(image: image)
+        let unfolded = unfoldPatches(image: image, gridH: gridH, gridW: gridW)
         let cmd = device.makeCommandBuffer()
         var h = Ops.gemm(
             weight: patchEmbedWeight, input: unfolded,
             nRows: nPatches, on: cmd)
         // Add the learned 2D position embedding (x + y axis lookups).
-        let posEmb = positionEmbedding()
+        let posEmb = positionEmbedding(gridH: gridH, gridW: gridW)
         h = Ops.add(h, posEmb, on: cmd)
         cmd.commit()
         cmd.waitUntilCompleted()
 
-        // ── Per-patch grid coordinates ──
+        // ── Per-patch grid coordinates (row-major over gridH × gridW) ──
         var xPos = [Int](repeating: 0, count: nPatches)
         var yPos = [Int](repeating: 0, count: nPatches)
-        for y in 0 ..< side {
-            for x in 0 ..< side {
-                let idx = y * side + x
+        for y in 0 ..< gridH {
+            for x in 0 ..< gridW {
+                let idx = y * gridW + x
                 xPos[idx] = x
                 yPos[idx] = y
             }
@@ -515,7 +525,7 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
         }
 
         // ── Attention pooling → soft tokens, then multi-modal embed ──
-        let pooled = pool(h, device: device)
+        let pooled = pool(h, gridH: gridH, gridW: gridW, device: device)
         return embed(pooled, device: device)
     }
 
@@ -530,15 +540,16 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
     /// tensor. Each row holds one `3 · patch · patch` patch after the
     /// reference's `2·(x − 0.5)` re-centring; row order is raster
     /// `(patchRow, patchCol)`.
-    private func unfoldPatches(image: Tensor) -> Tensor {
-        let side = gridSide
+    private func unfoldPatches(image: Tensor, gridH: Int, gridW: Int) -> Tensor {
         let p = cfg.patchSize
         let pix = image.toFloatArray()  // [3, H, W]
-        let imgSide = side * p
-        var rows = [Float](repeating: 0, count: side * side * patchDimPadded)
-        for pr in 0 ..< side {
-            for pc in 0 ..< side {
-                let patch = pr * side + pc
+        let imgH = gridH * p
+        let imgW = gridW * p
+        let nPatches = gridH * gridW
+        var rows = [Float](repeating: 0, count: nPatches * patchDimPadded)
+        for pr in 0 ..< gridH {
+            for pc in 0 ..< gridW {
+                let patch = pr * gridW + pc
                 var col = 0
                 // Layout: (channel, py, px) — matches the reference's
                 // `(0,2,4,3,5,1)` transpose then channel-major flatten.
@@ -547,7 +558,7 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
                     for px in 0 ..< p {
                         let xx = pc * p + px
                         for ch in 0 ..< 3 {
-                            let v = pix[(ch * imgSide + yy) * imgSide + xx]
+                            let v = pix[(ch * imgH + yy) * imgW + xx]
                             // Re-centre: 2·(v − 0.5).
                             rows[patch * patchDimPadded + col] = 2 * (v - 0.5)
                             col += 1
@@ -557,7 +568,7 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
             }
         }
         return ImagePreprocessing.makeTensor(
-            from: rows, shape: [side * side, patchDimPadded],
+            from: rows, shape: [nPatches, patchDimPadded],
             dtype: dtype, device: .shared)
     }
 
@@ -566,16 +577,16 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
     /// Build the per-patch learned 2D position embedding `[nPatches,
     /// hidden]` — the x-axis table indexed by the patch column plus the
     /// y-axis table indexed by the patch row.
-    private func positionEmbedding() -> Tensor {
-        let side = gridSide
+    private func positionEmbedding(gridH: Int, gridW: Int) -> Tensor {
         let hidden = cfg.hidden
         let tableX = posTableX.toFloatArray()
         let tableY = posTableY.toFloatArray()
         let posSize = cfg.positionEmbeddingSize
-        var dst = [Float](repeating: 0, count: side * side * hidden)
-        for pr in 0 ..< side {
-            for pc in 0 ..< side {
-                let patch = pr * side + pc
+        let nPatches = gridH * gridW
+        var dst = [Float](repeating: 0, count: nPatches * hidden)
+        for pr in 0 ..< gridH {
+            for pc in 0 ..< gridW {
+                let patch = pr * gridW + pc
                 let xi = min(posSize - 1, pc)
                 let yi = min(posSize - 1, pr)
                 for d in 0 ..< hidden {
@@ -585,7 +596,7 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
             }
         }
         return ImagePreprocessing.makeTensor(
-            from: dst, shape: [side * side, hidden], dtype: dtype,
+            from: dst, shape: [nPatches, hidden], dtype: dtype,
             device: .shared)
     }
 
@@ -596,27 +607,27 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
     /// `poolingKernelSize × poolingKernelSize` neighbourhood, then scale
     /// by `sqrt(hidden)` and apply the optional standardization affine.
     /// Returns `[tokensPerImage, hidden]`.
-    private func pool(_ h: Tensor, device: Device) -> Tensor {
-        let side = gridSide
+    private func pool(_ h: Tensor, gridH: Int, gridW: Int, device: Device) -> Tensor {
         let k = cfg.poolingKernelSize
-        let softSide = side / k
+        let softH = gridH / k
+        let softW = gridW / k
         let hidden = cfg.hidden
         let src = h.toFloatArray()
         let kArea = Float(k * k)
         let rootHidden = Float(Double(hidden).squareRoot())
-        var pooled = [Float](repeating: 0, count: softSide * softSide * hidden)
+        var pooled = [Float](repeating: 0, count: softH * softW * hidden)
         let stdB = stdBias?.toFloatArray()
         let stdS = stdScale?.toFloatArray()
-        for sy in 0 ..< softSide {
-            for sx in 0 ..< softSide {
-                let outBase = (sy * softSide + sx) * hidden
+        for sy in 0 ..< softH {
+            for sx in 0 ..< softW {
+                let outBase = (sy * softW + sx) * hidden
                 for c in 0 ..< hidden {
                     var acc: Float = 0
                     for dy in 0 ..< k {
                         for dx in 0 ..< k {
                             let py = sy * k + dy
                             let px = sx * k + dx
-                            acc += src[(py * side + px) * hidden + c]
+                            acc += src[(py * gridW + px) * hidden + c]
                         }
                     }
                     var val = (acc / kArea) * rootHidden
@@ -628,7 +639,7 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
             }
         }
         let out = Tensor.empty(
-            shape: [softSide * softSide, hidden],
+            shape: [softH * softW, hidden],
             dtype: dtype, device: device)
         ImagePreprocessing.copyFloats(pooled, into: out)
         return out
