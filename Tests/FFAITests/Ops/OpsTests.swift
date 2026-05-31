@@ -1644,6 +1644,25 @@ struct OpsTests {
         }
     }
 
+    @Test("clampScalar f32 — out[i] = min(max(x[i], lo), hi)")
+    func clampScalarF32() {
+        autoreleasepool {
+            let x = Tensor.empty(shape: [6], dtype: .f32)
+            x.copyIn(from: [Float(-10), -6.375, 0, 3, 6.312, 20])
+            var out: Tensor!
+            runAndWait { cb in
+                out = Ops.clampScalar(x, lo: -6.375, hi: 6.312, on: cb)
+            }
+            let got = out.toArray(as: Float.self)
+            let expected: [Float] = [-6.375, -6.375, 0, 3, 6.312, 6.312]
+            for i in 0 ..< got.count {
+                #expect(
+                    abs(got[i] - expected[i]) < 1e-5,
+                    "idx \(i): got \(got[i]) expected \(expected[i])")
+            }
+        }
+    }
+
     @Test(
         "transposeTokensToHeads f32 — [nTokens,nHeads,d] → [nHeads,nTokens,d] at production shape")
     func transposeTokensToHeadsF32() {

@@ -81,6 +81,32 @@ struct Gemma4VLVisionConfig {
     }
 }
 
+/// Per-projection scalar clamp bounds for a Gemma 4 clipped linear
+/// (`Gemma4ClippableLinear`, `use_clipped_linears=True`). Each projection
+/// clamps its input to `[inputMin, inputMax]` and its output to
+/// `[outputMin, outputMax]` — scalar bounds baked into the checkpoint
+/// (`*.input_min` / `*.input_max` / `*.output_min` / `*.output_max`).
+struct Gemma4VisionClip {
+    let inputMin: Float
+    let inputMax: Float
+    let outputMin: Float
+    let outputMax: Float
+}
+
+/// The seven clipped-linear bound sets for one vision block. `nil` entries
+/// fall back to a plain (unclamped) projection — a checkpoint that doesn't
+/// ship clip bounds therefore behaves exactly as before.
+struct Gemma4VisionBlockClips {
+    var q: Gemma4VisionClip?
+    var k: Gemma4VisionClip?
+    var v: Gemma4VisionClip?
+    var o: Gemma4VisionClip?
+    var gate: Gemma4VisionClip?
+    var up: Gemma4VisionClip?
+    var down: Gemma4VisionClip?
+    static let none = Gemma4VisionBlockClips()
+}
+
 /// One Gemma 4 vision block: GemmaRMSNorm → RoPE MHA + q/k/v norms →
 /// GemmaRMSNorm + residual, GemmaRMSNorm → SwiGLU MLP → GemmaRMSNorm +
 /// residual. Held as plain weight tensors; the forward runs CPU
@@ -97,6 +123,8 @@ final class Gemma4VLVisionBlock {
     let qNorm: RMSNorm
     let kNorm: RMSNorm
     let gate, up, down: Linear
+    /// Optional per-projection clamp bounds (Gemma 4 clipped linears).
+    let clips: Gemma4VisionBlockClips
     let cfg: Gemma4VLVisionConfig
     /// SwiGLU intermediate rounded up to the GEMM K-tile width.
     let paddedIntermediate: Int
@@ -106,6 +134,7 @@ final class Gemma4VLVisionBlock {
         postFFNorm: RMSNorm, qProj: Linear, kProj: Linear, vProj: Linear,
         oProj: Linear, qNorm: RMSNorm, kNorm: RMSNorm,
         gate: Linear, up: Linear, down: Linear,
+        clips: Gemma4VisionBlockClips = .none,
         paddedIntermediate: Int, cfg: Gemma4VLVisionConfig
     ) {
         self.inputNorm = inputNorm
@@ -121,6 +150,7 @@ final class Gemma4VLVisionBlock {
         self.gate = gate
         self.up = up
         self.down = down
+        self.clips = clips
         self.paddedIntermediate = paddedIntermediate
         self.cfg = cfg
     }
@@ -139,14 +169,14 @@ final class Gemma4VLVisionBlock {
             h, weight: inputNorm.weight,
             eps: inputNorm.eps, nRows: nTokens,
             rowSize: hidden, on: cmd)
-        let q = projectRows(
-            qProj, normed, nTokens: nTokens,
+        let q = projectClipped(
+            qProj, normed, clip: clips.q, nTokens: nTokens,
             outDim: cfg.numHeads * cfg.headDim, on: cmd)
-        let k = projectRows(
-            kProj, normed, nTokens: nTokens,
+        let k = projectClipped(
+            kProj, normed, clip: clips.k, nTokens: nTokens,
             outDim: cfg.numKVHeads * cfg.headDim, on: cmd)
-        let v = projectRows(
-            vProj, normed, nTokens: nTokens,
+        let v = projectClipped(
+            vProj, normed, clip: clips.v, nTokens: nTokens,
             outDim: cfg.numKVHeads * cfg.headDim, on: cmd)
         cmd.commit()
         cmd.waitUntilCompleted()
@@ -157,8 +187,8 @@ final class Gemma4VLVisionBlock {
 
         // ── Residual + MLP sub-block ──
         let cmd2 = device.makeCommandBuffer()
-        let attnProj = projectRows(
-            oProj, attn, nTokens: nTokens,
+        let attnProj = projectClipped(
+            oProj, attn, clip: clips.o, nTokens: nTokens,
             outDim: hidden, on: cmd2)
         let postAttn = Ops.rmsNormRows(
             attnProj, weight: postAttnNorm.weight,
@@ -169,16 +199,16 @@ final class Gemma4VLVisionBlock {
             afterAttn, weight: preFFNorm.weight,
             eps: preFFNorm.eps, nRows: nTokens,
             rowSize: hidden, on: cmd2)
-        let g = projectRows(
-            gate, preFF, nTokens: nTokens,
+        let g = projectClipped(
+            gate, preFF, clip: clips.gate, nTokens: nTokens,
             outDim: paddedIntermediate, on: cmd2)
-        let u = projectRows(
-            up, preFF, nTokens: nTokens,
+        let u = projectClipped(
+            up, preFF, clip: clips.up, nTokens: nTokens,
             outDim: paddedIntermediate, on: cmd2)
         let act = Ops.gelu(g, on: cmd2)
         let gated = Ops.mul(act, u, on: cmd2)
-        let d = projectRows(
-            down, gated, nTokens: nTokens,
+        let d = projectClipped(
+            down, gated, clip: clips.down, nTokens: nTokens,
             outDim: hidden, on: cmd2)
         let postFF = Ops.rmsNormRows(
             d, weight: postFFNorm.weight,
@@ -279,6 +309,28 @@ final class Gemma4VLVisionBlock {
         // attnOut is `[nTokens, nHeads, headDim]` = `[nTokens, nHeads·headDim]`
         // contiguous — byte-identical to what o_proj's GEMM consumes.
         return attnOut.reshaped(to: [nTokens, nHeads * headDim])
+    }
+
+    /// Apply a `Gemma4ClippableLinear`: clamp the input to its scalar
+    /// `[inputMin, inputMax]`, project, then clamp the output to
+    /// `[outputMin, outputMax]` — all GPU-resident on `cmd`. A `nil` clip
+    /// falls back to the plain `projectRows` (unclamped). The reference's
+    /// `use_clipped_linears` is on for the Gemma 4 vision tower; without
+    /// the clamps the (large) pre-pool activations diverge.
+    private func projectClipped(
+        _ linear: Linear, _ x: Tensor, clip: Gemma4VisionClip?,
+        nTokens: Int, outDim: Int, on cmd: MTLCommandBuffer
+    ) -> Tensor {
+        guard let clip else {
+            return projectRows(
+                linear, x, nTokens: nTokens, outDim: outDim, on: cmd)
+        }
+        let inClamped = Ops.clampScalar(
+            x, lo: clip.inputMin, hi: clip.inputMax, on: cmd)
+        let y = projectRows(
+            linear, inClamped, nTokens: nTokens, outDim: outDim, on: cmd)
+        return Ops.clampScalar(
+            y, lo: clip.outputMin, hi: clip.outputMax, on: cmd)
     }
 
     /// Apply a `Linear` to every row of `[nTokens, *]` via `Ops.gemm`,
@@ -419,6 +471,30 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
                     weight: try vt.tensor(named: "\(p).\(name).weight"),
                     eps: cfg.rmsNormEps)
             }
+            // Gemma 4 `Gemma4ClippableLinear` scalar clamp bounds. Presence
+            // of `*.input_min` signals a clipped linear; absent → nil (plain
+            // projection). All four bounds are 1-element tensors.
+            func clipFor(_ name: String) -> Gemma4VisionClip? {
+                guard
+                    let inMin = try? vt.tensor(named: "\(p).\(name).input_min"),
+                    let inMax = try? vt.tensor(named: "\(p).\(name).input_max"),
+                    let outMin = try? vt.tensor(named: "\(p).\(name).output_min"),
+                    let outMax = try? vt.tensor(named: "\(p).\(name).output_max")
+                else { return nil }
+                return Gemma4VisionClip(
+                    inputMin: inMin.toFloatArray()[0],
+                    inputMax: inMax.toFloatArray()[0],
+                    outputMin: outMin.toFloatArray()[0],
+                    outputMax: outMax.toFloatArray()[0])
+            }
+            let clips = Gemma4VisionBlockClips(
+                q: clipFor("self_attn.q_proj"),
+                k: clipFor("self_attn.k_proj"),
+                v: clipFor("self_attn.v_proj"),
+                o: clipFor("self_attn.o_proj"),
+                gate: clipFor("mlp.gate_proj"),
+                up: clipFor("mlp.up_proj"),
+                down: clipFor("mlp.down_proj"))
             let gate = try lin("mlp.gate_proj")
             let up = try lin("mlp.up_proj")
             let down = try lin("mlp.down_proj")
@@ -441,6 +517,7 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
                             down.weight, toCols: paddedIntermediate,
                             device: device),
                         bias: down.bias),
+                    clips: clips,
                     paddedIntermediate: paddedIntermediate, cfg: cfg))
         }
 

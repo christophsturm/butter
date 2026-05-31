@@ -7113,6 +7113,52 @@ public enum Ops {
         return result
     }
 
+    /// Element-wise scalar clamp `out[i] = min(max(x[i], lo), hi)` — the
+    /// per-projection input/output clamp Gemma 4's `Gemma4ClippableLinear`
+    /// applies (`use_clipped_linears=True`; bounds are scalars baked into
+    /// the checkpoint). Keeps the vision/audio attention GPU-resident
+    /// instead of bouncing each projection to the CPU for the clamp. Wraps
+    /// `ffai_clamp_scalar` (`clamp_scalar.rs` §"DISPATCH INVARIANTS"):
+    /// Grid3D, one thread per element. `lo <= hi` (caller-enforced).
+    public static func clampScalar(
+        _ x: Tensor, lo: Float, hi: Float,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        let result = out ?? Tensor.empty(shape: x.shape, dtype: x.dtype)
+        let n = x.elementCount
+        var loV = lo
+        var hiV = hi
+        let loBuf = device.makeBuffer(length: 4)
+        memcpy(loBuf.contents(), &loV, 4)
+        let hiBuf = device.makeBuffer(length: 4)
+        memcpy(hiBuf.contents(), &hiV, 4)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: 1, height: 1, depth: 1)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.ffai_clamp_scalar_f32(
+                input: x.buffer, inputOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                lo: loBuf, hi: hiBuf,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_clamp_scalar_f16(
+                input: x.buffer, inputOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                lo: loBuf, hi: hiBuf,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_clamp_scalar_bf16(
+                input: x.buffer, inputOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                lo: loBuf, hi: hiBuf,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.clampScalar: unsupported dtype \(x.dtype)")
+        }
+        return result
+    }
+
     // ─── Audio front-end / vocoder ───────────────────────────────────
 
     /// Log-Mel spectrogram — the STT / audio-in front-end. Fuses the
