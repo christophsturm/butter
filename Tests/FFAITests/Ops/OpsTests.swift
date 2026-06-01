@@ -2261,6 +2261,188 @@ struct OpsTests {
         }
     }
 
+    @Test("adain1d — GPU matches a CPU instance-norm + affine reference")
+    func adain1dF32() {
+        autoreleasepool {
+            let rows = 5, length = 7
+            let eps: Float = 1e-5
+            let x = (0 ..< rows * length).map { Float(($0 * 3 + 1) % 19) / 19 - 0.4 }
+            let gamma = (0 ..< rows).map { Float($0 + 1) * 0.3 }
+            let beta = (0 ..< rows).map { Float($0) * 0.1 - 0.2 }
+
+            var expected = [Float](repeating: 0, count: rows * length)
+            for r in 0 ..< rows {
+                var s: Float = 0, sq: Float = 0
+                for t in 0 ..< length { let v = x[r * length + t]; s += v; sq += v * v }
+                let mean = s / Float(length)
+                let varr = sq / Float(length) - mean * mean
+                let inv = 1 / (varr + eps).squareRoot()
+                for t in 0 ..< length {
+                    expected[r * length + t] = (x[r * length + t] - mean) * inv * gamma[r] + beta[r]
+                }
+            }
+            let xT = Tensor.empty(shape: [rows, length], dtype: .f32); xT.copyIn(from: x)
+            let gT = Tensor.empty(shape: [rows], dtype: .f32); gT.copyIn(from: gamma)
+            let bT = Tensor.empty(shape: [rows], dtype: .f32); bT.copyIn(from: beta)
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.adain1d(xT, gamma: gT, beta: bT, rows: rows, length: length, eps: eps, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            var maxDiff: Float = 0
+            for i in 0 ..< expected.count { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-4, "adain1d diverges (max \(maxDiff))")
+        }
+    }
+
+    @Test("lstm — GPU full-sequence matches a CPU nn.LSTM reference (forward)")
+    func lstmF32() {
+        autoreleasepool {
+            let seqLen = 5, inputDim = 3, hidden = 4
+            func ramp(_ n: Int, _ seed: Int, _ amp: Float) -> [Float] {
+                (0 ..< n).map { (Float(($0 * 7 + seed) % 11) / 11 - 0.5) * amp }
+            }
+            let x = ramp(seqLen * inputDim, 1, 1.0)
+            let wIH = ramp(4 * hidden * inputDim, 2, 0.6)  // gate order i,f,g,o
+            let wHH = ramp(4 * hidden * hidden, 3, 0.5)
+            let bias = ramp(4 * hidden, 4, 0.3)
+
+            func sig(_ v: Float) -> Float { 1 / (1 + Foundation.exp(-v)) }
+            var h = [Float](repeating: 0, count: hidden)
+            var c = [Float](repeating: 0, count: hidden)
+            var expected = [Float](repeating: 0, count: seqLen * hidden)
+            for t in 0 ..< seqLen {
+                var g = [Float](repeating: 0, count: 4 * hidden)
+                for r in 0 ..< 4 * hidden {
+                    var acc = bias[r]
+                    for d in 0 ..< inputDim { acc += wIH[r * inputDim + d] * x[t * inputDim + d] }
+                    for d in 0 ..< hidden { acc += wHH[r * hidden + d] * h[d] }
+                    g[r] = acc
+                }
+                var hn = [Float](repeating: 0, count: hidden)
+                for j in 0 ..< hidden {
+                    let ig = sig(g[0 * hidden + j])
+                    let fg = sig(g[1 * hidden + j])
+                    let gg = Foundation.tanh(g[2 * hidden + j])
+                    let og = sig(g[3 * hidden + j])
+                    c[j] = fg * c[j] + ig * gg
+                    hn[j] = og * Foundation.tanh(c[j])
+                }
+                h = hn
+                for j in 0 ..< hidden { expected[t * hidden + j] = h[j] }
+            }
+            let xT = Tensor.empty(shape: [seqLen, inputDim], dtype: .f32); xT.copyIn(from: x)
+            let wihT = Tensor.empty(shape: [4 * hidden, inputDim], dtype: .f32); wihT.copyIn(from: wIH)
+            let whhT = Tensor.empty(shape: [4 * hidden, hidden], dtype: .f32); whhT.copyIn(from: wHH)
+            let bT = Tensor.empty(shape: [4 * hidden], dtype: .f32); bT.copyIn(from: bias)
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.lstm(
+                    x: xT, wIH: wihT, wHH: whhT, bias: bT,
+                    seqLen: seqLen, inputDim: inputDim, hidden: hidden, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            var maxDiff: Float = 0
+            for i in 0 ..< expected.count { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-4, "lstm diverges from nn.LSTM oracle (max \(maxDiff))")
+        }
+    }
+
+    @Test("conv1dDilated — GPU matches a CPU dilated NCL conv reference (OIK)")
+    func conv1dDilatedF32() {
+        autoreleasepool {
+            let (batch, inCh, inLen, outCh) = (1, 3, 12, 4)
+            let (k, stride, pad, dilation) = (3, 1, 2, 2)  // 'same'-ish dilated
+            let outLen = (inLen + 2 * pad - dilation * (k - 1) - 1) / stride + 1
+            func ramp(_ n: Int, _ s: Int) -> [Float] { (0 ..< n).map { Float(($0 * 5 + s) % 13) / 13 - 0.4 } }
+            let input = ramp(batch * inCh * inLen, 1)
+            let weight = ramp(outCh * inCh * k, 2)  // OIK
+            let bias = ramp(outCh, 3)
+
+            var expected = [Float](repeating: 0, count: batch * outCh * outLen)
+            for n in 0 ..< batch {
+                for oc in 0 ..< outCh {
+                    for op in 0 ..< outLen {
+                        var acc = bias[oc]
+                        for ic in 0 ..< inCh {
+                            for kx in 0 ..< k {
+                                let p = op * stride + kx * dilation
+                                guard p >= pad && p < pad + inLen else { continue }
+                                let ix = p - pad
+                                acc += input[(n * inCh + ic) * inLen + ix] * weight[(oc * inCh + ic) * k + kx]
+                            }
+                        }
+                        expected[(n * outCh + oc) * outLen + op] = acc
+                    }
+                }
+            }
+            let inT = Tensor.empty(shape: [batch, inCh, inLen], dtype: .f32); inT.copyIn(from: input)
+            let wT = Tensor.empty(shape: [outCh, inCh, k], dtype: .f32); wT.copyIn(from: weight)
+            let bT = Tensor.empty(shape: [outCh], dtype: .f32); bT.copyIn(from: bias)
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.conv1dDilated(
+                    inT, weight: wT, bias: bT, batch: batch, inCh: inCh, inLen: inLen,
+                    outCh: outCh, k: k, stride: stride, pad: pad, dilation: dilation, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            #expect(outT.shape == [batch, outCh, outLen])
+            var maxDiff: Float = 0
+            for i in 0 ..< expected.count { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-4, "conv1dDilated diverges (max \(maxDiff))")
+        }
+    }
+
+    @Test("conv1dTranspose — GPU matches a CPU ConvTranspose1d NCL reference (IOK)")
+    func conv1dTransposeF32() {
+        autoreleasepool {
+            let (batch, inCh, inLen, outCh) = (1, 3, 6, 2)
+            let (k, stride, pad, dilation, outPad) = (4, 2, 1, 1, 0)
+            let outLen = (inLen - 1) * stride - 2 * pad + dilation * (k - 1) + outPad + 1
+            func ramp(_ n: Int, _ s: Int) -> [Float] { (0 ..< n).map { Float(($0 * 7 + s) % 17) / 17 - 0.4 } }
+            let input = ramp(batch * inCh * inLen, 1)
+            let weight = ramp(inCh * outCh * k, 2)  // IOK
+            let bias = ramp(outCh, 3)
+
+            var expected = [Float](repeating: 0, count: batch * outCh * outLen)
+            for n in 0 ..< batch {
+                for oc in 0 ..< outCh {
+                    for op in 0 ..< outLen {
+                        var acc = bias[oc]
+                        let opp = op + pad
+                        for ic in 0 ..< inCh {
+                            for kx in 0 ..< k {
+                                let tap = kx * dilation
+                                guard opp >= tap else { continue }
+                                let num = opp - tap
+                                guard num % stride == 0 else { continue }
+                                let ip = num / stride
+                                guard ip < inLen else { continue }
+                                acc += input[(n * inCh + ic) * inLen + ip]
+                                    * weight[(ic * outCh + oc) * k + kx]
+                            }
+                        }
+                        expected[(n * outCh + oc) * outLen + op] = acc
+                    }
+                }
+            }
+            let inT = Tensor.empty(shape: [batch, inCh, inLen], dtype: .f32); inT.copyIn(from: input)
+            let wT = Tensor.empty(shape: [inCh, outCh, k], dtype: .f32); wT.copyIn(from: weight)
+            let bT = Tensor.empty(shape: [outCh], dtype: .f32); bT.copyIn(from: bias)
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.conv1dTranspose(
+                    inT, weight: wT, bias: bT, batch: batch, inCh: inCh, inLen: inLen,
+                    outCh: outCh, outLen: outLen, k: k, stride: stride, pad: pad, dilation: dilation, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            #expect(outT.shape == [batch, outCh, outLen])
+            var maxDiff: Float = 0
+            for i in 0 ..< expected.count { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-4, "conv1dTranspose diverges (max \(maxDiff))")
+        }
+    }
+
     @Test("depthwiseConv2dNHWC — GPU matches a CPU NHWC reference (3×3 s1 pad1)")
     func depthwiseConv2dNHWC() {
         autoreleasepool {

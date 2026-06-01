@@ -8054,6 +8054,267 @@ public enum Ops {
         return result
     }
 
+    // ─── TTS / vocoder building blocks ───────────────────────────────
+
+    /// Adaptive Instance Normalization 1D — instance-normalize each `[rows,
+    /// length]` row over the time axis, then apply a per-row affine:
+    /// `out[r,t] = gamma[r]·(x[r,t] − μ_r)/sqrt(σ²_r + eps) + beta[r]`. A
+    /// "row" is one `(batch, channel)` line of a `[B, C, T]` map (`rows =
+    /// B·C`). The style-conditioning op StyleTTS2-family TTS decoders apply;
+    /// the caller folds any `(1 + γ)` convention into `gamma`. Wraps `adain1d`
+    /// (`adain1d.rs`): Reduction, one threadgroup per row, TPG = 1024.
+    public static func adain1d(
+        _ x: Tensor, gamma: Tensor, beta: Tensor,
+        rows: Int, length: Int, eps: Float = 1e-5,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            x.elementCount == rows * length,
+            "Ops.adain1d: x must be [rows,length] = \(rows * length) (got \(x.elementCount))")
+        precondition(
+            gamma.elementCount == rows && beta.elementCount == rows,
+            "Ops.adain1d: gamma/beta must be [rows] = \(rows)")
+        precondition(
+            gamma.dtype == x.dtype && beta.dtype == x.dtype,
+            "Ops.adain1d: gamma/beta must share x's dtype")
+        let result = out ?? Tensor.empty(shape: [rows, length], dtype: x.dtype)
+        let epsT = Tensor.empty(shape: [1], dtype: .f32)
+        epsT.copyIn(from: [eps])
+        // Reduction: one threadgroup per row, TPG = 1024 (the kernel strides
+        // over `length`, so any multiple of 32 reduces correctly; 1024 matches
+        // the validated dispatch). NOT elementwiseGrid (freeze bug).
+        let tpg = 1024
+        let grid = MTLSize(width: rows * tpg, height: 1, depth: 1)
+        let tg = MTLSize(width: tpg, height: 1, depth: 1)
+        let len = UInt32(length)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.adain1d_f32(
+                x: x.buffer, xOffset: x.offset,
+                gamma: gamma.buffer, gammaOffset: gamma.offset,
+                beta: beta.buffer, betaOffset: beta.offset,
+                out: result.buffer, outOffset: result.offset,
+                eps_buf: epsT.buffer, eps_bufOffset: epsT.offset,
+                length: len, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.adain1d_f16(
+                x: x.buffer, xOffset: x.offset,
+                gamma: gamma.buffer, gammaOffset: gamma.offset,
+                beta: beta.buffer, betaOffset: beta.offset,
+                out: result.buffer, outOffset: result.offset,
+                eps_buf: epsT.buffer, eps_bufOffset: epsT.offset,
+                length: len, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.adain1d_bf16(
+                x: x.buffer, xOffset: x.offset,
+                gamma: gamma.buffer, gammaOffset: gamma.offset,
+                beta: beta.buffer, betaOffset: beta.offset,
+                out: result.buffer, outOffset: result.offset,
+                eps_buf: epsT.buffer, eps_bufOffset: epsT.offset,
+                length: len, gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.adain1d: unsupported dtype \(x.dtype)")
+        }
+        return result
+    }
+
+    /// Full-sequence GPU LSTM — runs the whole recurrence in one dispatch
+    /// (one threadgroup, thread `j` owns hidden unit `j`, state in
+    /// threadgroup memory across timesteps). PyTorch `nn.LSTM` cell, gate
+    /// order **i, f, g, o**, `bias = b_ih + b_hh` precombined. Wraps
+    /// `ffai_lstm` (`lstm.rs`): Reduction, ONE threadgroup, TPG =
+    /// `ceil(hidden/32)·32` (so `hidden ≤ 1024`).
+    ///
+    /// `reverse` walks `t` backward. A **bidirectional** LSTM is two calls
+    /// sharing one `out` of width `outStride = 2·hidden`: forward
+    /// `outOffset = 0`, backward `outOffset = hidden, reverse: true`. A plain
+    /// LSTM leaves `outStride = nil` (→ `hidden`), `outOffset = 0`.
+    ///
+    /// Layouts: x `[seqLen, inputDim]`; wIH `[4·hidden, inputDim]`; wHH
+    /// `[4·hidden, hidden]`; bias **f32** `[4·hidden]`; out `[seqLen, outStride]`.
+    public static func lstm(
+        x: Tensor, wIH: Tensor, wHH: Tensor, bias: Tensor,
+        seqLen: Int, inputDim: Int, hidden: Int,
+        reverse: Bool = false, outStride: Int? = nil, outOffset: Int = 0,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        let stride = outStride ?? hidden
+        precondition(
+            hidden > 0 && hidden <= 1024,
+            "Ops.lstm: hidden (\(hidden)) must be in [1, 1024] — one-threadgroup kernel")
+        precondition(
+            x.elementCount == seqLen * inputDim,
+            "Ops.lstm: x must be [seqLen,inputDim] = \(seqLen * inputDim)")
+        precondition(
+            wIH.elementCount == 4 * hidden * inputDim && wHH.elementCount == 4 * hidden * hidden,
+            "Ops.lstm: wIH [4h,inputDim] / wHH [4h,h] shape mismatch")
+        precondition(
+            bias.dtype == .f32 && bias.elementCount == 4 * hidden,
+            "Ops.lstm: bias must be f32 [4·hidden] = \(4 * hidden)")
+        precondition(
+            outOffset + hidden <= stride,
+            "Ops.lstm: outOffset (\(outOffset)) + hidden (\(hidden)) exceeds outStride (\(stride))")
+        let result = out ?? Tensor.empty(shape: [seqLen, stride], dtype: x.dtype)
+        // ONE threadgroup, TPG = ceil(hidden/32)·32 (lstm.rs invariants).
+        let tpg = ((hidden + 31) / 32) * 32
+        let grid = MTLSize(width: tpg, height: 1, depth: 1)
+        let tg = MTLSize(width: tpg, height: 1, depth: 1)
+        let (sl, idim, h, rev, os, oo) = (
+            UInt32(seqLen), UInt32(inputDim), UInt32(hidden),
+            UInt32(reverse ? 1 : 0), UInt32(stride), UInt32(outOffset))
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.ffai_lstm_f32(
+                x: x.buffer, xOffset: x.offset, w_ih: wIH.buffer, w_ihOffset: wIH.offset,
+                w_hh: wHH.buffer, w_hhOffset: wHH.offset, bias: bias.buffer, biasOffset: bias.offset,
+                out: result.buffer, outOffset: result.offset,
+                seq_len: sl, input_dim: idim, hidden: h, reverse: rev,
+                out_stride: os, out_offset: oo, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_lstm_f16(
+                x: x.buffer, xOffset: x.offset, w_ih: wIH.buffer, w_ihOffset: wIH.offset,
+                w_hh: wHH.buffer, w_hhOffset: wHH.offset, bias: bias.buffer, biasOffset: bias.offset,
+                out: result.buffer, outOffset: result.offset,
+                seq_len: sl, input_dim: idim, hidden: h, reverse: rev,
+                out_stride: os, out_offset: oo, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_lstm_bf16(
+                x: x.buffer, xOffset: x.offset, w_ih: wIH.buffer, w_ihOffset: wIH.offset,
+                w_hh: wHH.buffer, w_hhOffset: wHH.offset, bias: bias.buffer, biasOffset: bias.offset,
+                out: result.buffer, outOffset: result.offset,
+                seq_len: sl, input_dim: idim, hidden: h, reverse: rev,
+                out_stride: os, out_offset: oo, gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.lstm: unsupported dtype \(x.dtype)")
+        }
+        return result
+    }
+
+    /// Dilated 1D convolution (NCL) — the conv inside a HiFi-GAN MRF
+    /// ResBlock. `weight` is **OIK** `[outCh, inCh, k]`, `bias` `[outCh]`;
+    /// `out_len = (inLen + 2·pad − dilation·(k−1) − 1)/stride + 1`. Wraps
+    /// `conv1d_dilated`: Grid3D one-thread-per-output, fp32 accumulation.
+    public static func conv1dDilated(
+        _ input: Tensor, weight: Tensor, bias: Tensor,
+        batch: Int, inCh: Int, inLen: Int, outCh: Int,
+        k: Int, stride: Int = 1, pad: Int = 0, dilation: Int = 1,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            input.elementCount == batch * inCh * inLen,
+            "Ops.conv1dDilated: input must be [B,inCh,inLen] = \(batch * inCh * inLen)")
+        precondition(
+            weight.elementCount == outCh * inCh * k && bias.elementCount == outCh,
+            "Ops.conv1dDilated: weight [outCh,inCh,k] / bias [outCh] shape mismatch")
+        let outLen = (inLen + 2 * pad - dilation * (k - 1) - 1) / stride + 1
+        precondition(outLen > 0, "Ops.conv1dDilated: degenerate out_len \(outLen)")
+        let result = out ?? Tensor.empty(shape: [batch, outCh, outLen], dtype: input.dtype)
+        let (grid, tg) = elementwiseGrid(batch * outCh * outLen)
+        conv1dDispatch(
+            transposed: false, input: input, weight: weight, bias: bias, out: result,
+            batch: batch, inCh: inCh, inLen: inLen, outCh: outCh, outLen: outLen,
+            k: k, stride: stride, pad: pad, dilation: dilation, grid: grid, tg: tg, on: cmd)
+        return result
+    }
+
+    /// Transposed (fractionally-strided / upsampling) 1D convolution (NCL) —
+    /// the per-stage upsampler in a HiFi-GAN-style vocoder. `weight` is
+    /// **IOK** `[inCh, outCh, k]`, `bias` `[outCh]`. The caller passes
+    /// `outLen` (it depends on `output_padding`): `out_len = (inLen − 1)·stride
+    /// − 2·pad + dilation·(k−1) + output_padding + 1`. Wraps `conv1d_transpose`.
+    public static func conv1dTranspose(
+        _ input: Tensor, weight: Tensor, bias: Tensor,
+        batch: Int, inCh: Int, inLen: Int, outCh: Int, outLen: Int,
+        k: Int, stride: Int = 1, pad: Int = 0, dilation: Int = 1,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            input.elementCount == batch * inCh * inLen,
+            "Ops.conv1dTranspose: input must be [B,inCh,inLen] = \(batch * inCh * inLen)")
+        precondition(
+            weight.elementCount == inCh * outCh * k && bias.elementCount == outCh,
+            "Ops.conv1dTranspose: weight [inCh,outCh,k] (IOK) / bias [outCh] shape mismatch")
+        precondition(outLen > 0, "Ops.conv1dTranspose: out_len must be positive")
+        let result = out ?? Tensor.empty(shape: [batch, outCh, outLen], dtype: input.dtype)
+        let (grid, tg) = elementwiseGrid(batch * outCh * outLen)
+        conv1dDispatch(
+            transposed: true, input: input, weight: weight, bias: bias, out: result,
+            batch: batch, inCh: inCh, inLen: inLen, outCh: outCh, outLen: outLen,
+            k: k, stride: stride, pad: pad, dilation: dilation, grid: grid, tg: tg, on: cmd)
+        return result
+    }
+
+    /// Shared per-dtype dispatch for ``conv1dDilated`` / ``conv1dTranspose``
+    /// (identical signatures; only the kernel + weight layout differ).
+    private static func conv1dDispatch(
+        transposed: Bool, input: Tensor, weight: Tensor, bias: Tensor, out: Tensor,
+        batch: Int, inCh: Int, inLen: Int, outCh: Int, outLen: Int,
+        k: Int, stride: Int, pad: Int, dilation: Int,
+        grid: MTLSize, tg: MTLSize, on cmd: MTLCommandBuffer
+    ) {
+        let (b, ic, il, oc, ol) = (
+            UInt32(batch), UInt32(inCh), UInt32(inLen), UInt32(outCh), UInt32(outLen))
+        let (kk, st, pd, dl) = (UInt32(k), UInt32(stride), UInt32(pad), UInt32(dilation))
+        switch (transposed, input.dtype) {
+        case (false, .f32):
+            MetalTileKernels.conv1d_dilated_f32(
+                input: input.buffer, inputOffset: input.offset,
+                weight: weight.buffer, weightOffset: weight.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                out: out.buffer, outOffset: out.offset,
+                batch: b, in_ch: ic, in_len: il, out_ch: oc, out_len: ol,
+                k: kk, stride: st, pad: pd, dilation: dl,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (false, .f16):
+            MetalTileKernels.conv1d_dilated_f16(
+                input: input.buffer, inputOffset: input.offset,
+                weight: weight.buffer, weightOffset: weight.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                out: out.buffer, outOffset: out.offset,
+                batch: b, in_ch: ic, in_len: il, out_ch: oc, out_len: ol,
+                k: kk, stride: st, pad: pd, dilation: dl,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (false, .bf16):
+            MetalTileKernels.conv1d_dilated_bf16(
+                input: input.buffer, inputOffset: input.offset,
+                weight: weight.buffer, weightOffset: weight.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                out: out.buffer, outOffset: out.offset,
+                batch: b, in_ch: ic, in_len: il, out_ch: oc, out_len: ol,
+                k: kk, stride: st, pad: pd, dilation: dl,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (true, .f32):
+            MetalTileKernels.conv1d_transpose_f32(
+                input: input.buffer, inputOffset: input.offset,
+                weight: weight.buffer, weightOffset: weight.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                out: out.buffer, outOffset: out.offset,
+                batch: b, in_ch: ic, in_len: il, out_ch: oc, out_len: ol,
+                k: kk, stride: st, pad: pd, dilation: dl,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (true, .f16):
+            MetalTileKernels.conv1d_transpose_f16(
+                input: input.buffer, inputOffset: input.offset,
+                weight: weight.buffer, weightOffset: weight.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                out: out.buffer, outOffset: out.offset,
+                batch: b, in_ch: ic, in_len: il, out_ch: oc, out_len: ol,
+                k: kk, stride: st, pad: pd, dilation: dl,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (true, .bf16):
+            MetalTileKernels.conv1d_transpose_bf16(
+                input: input.buffer, inputOffset: input.offset,
+                weight: weight.buffer, weightOffset: weight.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                out: out.buffer, outOffset: out.offset,
+                batch: b, in_ch: ic, in_len: il, out_ch: oc, out_len: ol,
+                k: kk, stride: st, pad: pd, dilation: dl,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.conv1d: unsupported dtype \(input.dtype)")
+        }
+    }
+
     /// Wide-stride multi-channel 1D convolution — the STT audio patch
     /// embedding. Dense, strided, NCL layout (PyTorch `nn.Conv1d`).
     /// Wraps `audio_conv1d_{f32,f16,bf16}`.
