@@ -1714,6 +1714,67 @@ struct OpsTests {
         }
     }
 
+    @Test("resizeNormalize f32 bicubic — Catmull-Rom (a=-0.75) resize + normalize → NCHW")
+    func resizeNormalizeBicubicF32() {
+        autoreleasepool {
+            // Down-scale (the smart_resize regime bicubic targets): 8×6 → 5×4.
+            let (sw, sh, tw, th) = (8, 6, 5, 4)
+            let mean: (Float, Float, Float) = (0.5, 0.45, 0.4)
+            let std: (Float, Float, Float) = (0.5, 0.5, 0.5)
+            var px = [Float](repeating: 0, count: sh * sw * 3)
+            for i in 0 ..< px.count { px[i] = Float(i % 17) / 17.0 }
+            let img = RGBImage(width: sw, height: sh, pixels: px)
+            let out = MediaUtils.resizeNormalize(
+                img, targetW: tw, targetH: th,
+                normalization: ImageNormalization(mean: mean, std: std),
+                mode: .bicubic)
+            #expect(out.shape == [1, 3, th, tw])
+            let got = out.toArray(as: Float.self)
+
+            // CPU bicubic reference — mirrors resize_normalize.rs `cpu_ref_bicubic`
+            // exactly (a = -0.75, 4×4 tap, half-pixel sampling, edge clamp).
+            let a: Float = -0.75
+            func cubic(_ d: Float) -> Float {
+                let ad = abs(d)
+                if ad <= 1 { return (a + 2) * ad * ad * ad - (a + 3) * ad * ad + 1 }
+                if ad < 2 { return a * ad * ad * ad - 5 * a * ad * ad + 8 * a * ad - 4 * a }
+                return 0
+            }
+            func clampi(_ v: Int, _ hi: Int) -> Int { max(0, min(hi, v)) }
+            let m = [mean.0, mean.1, mean.2]
+            let s = [std.0, std.1, std.2]
+            let scaleX = Float(sw) / Float(tw)
+            let scaleY = Float(sh) / Float(th)
+            var maxDiff: Float = 0
+            for oy in 0 ..< th {
+                let sy = (Float(oy) + 0.5) * scaleY - 0.5
+                let fy = sy.rounded(.down)
+                for ox in 0 ..< tw {
+                    let sx = (Float(ox) + 0.5) * scaleX - 0.5
+                    let fx = sx.rounded(.down)
+                    for c in 0 ..< 3 {
+                        var acc: Float = 0
+                        for j in 0 ..< 4 {
+                            let yj = Int(fy) + j - 1
+                            let wy = cubic(sy - (fy + Float(j - 1)))
+                            let yu = clampi(yj, sh - 1)
+                            for i in 0 ..< 4 {
+                                let xi = Int(fx) + i - 1
+                                let wx = cubic(sx - (fx + Float(i - 1)))
+                                let xu = clampi(xi, sw - 1)
+                                acc += wy * wx * px[(yu * sw + xu) * 3 + c]
+                            }
+                        }
+                        let v = (acc - m[c]) / s[c]
+                        let idx = (c * th + oy) * tw + ox
+                        maxDiff = max(maxDiff, abs(got[idx] - v))
+                    }
+                }
+            }
+            #expect(maxDiff < 1e-4, "resizeNormalize bicubic diverges (max \(maxDiff))")
+        }
+    }
+
     @Test(
         "transposeTokensToHeads f32 — [nTokens,nHeads,d] → [nHeads,nTokens,d] at production shape")
     func transposeTokensToHeadsF32() {

@@ -1046,9 +1046,12 @@ final class Qwen25VLComposedEncoder: VisionEncoder {
         else {
             return nil
         }
+        // Bicubic: smart_resize routinely down-scales multi-MP photos to a
+        // few hundred px/side; bicubic keeps text + fine detail bilinear softens.
         return MediaUtils.resizeNormalize(
             image, targetW: tw, targetH: th,
-            normalization: .clip, dtype: tower.dtype, device: device)
+            normalization: .clip, dtype: tower.dtype,
+            mode: .bicubic, device: device)
     }
 
     /// Run the Qwen 2.5-VL vision tower on a single preprocessed image.

@@ -7396,18 +7396,30 @@ public enum Ops {
         return result
     }
 
-    /// Fused bilinear resize + per-channel normalize + interleaved→NCHW —
-    /// the one GPU op a VL image preprocess needs. `src` is an interleaved
-    /// `[srcH·srcW·3]` image (RGB, typically `[0,1]`); returns the planar
-    /// NCHW `[3, targetH, targetW]` tensor `(v − mean[c]) / std[c]`. Wraps
-    /// `ffai_resize_normalize` (`resize_normalize.rs` §"DISPATCH
-    /// INVARIANTS"): Grid3D, one thread per output element, align_corners
-    /// = false half-pixel sampling. Replaces the CPU triple-loop resize +
-    /// normalize.
+    /// Interpolation filter for `resizeNormalize`. Bilinear (2×2 tap) is the
+    /// cheap default; bicubic (4×4 Catmull-Rom tap) preserves more edge
+    /// detail when down-scaling by a large factor — the native-resolution
+    /// `smart_resize` path, where a 4K photo collapses to a few hundred
+    /// pixels per side and bilinear visibly softens text / fine structure.
+    public enum ResizeInterpolation: Sendable {
+        case bilinear
+        case bicubic
+    }
+
+    /// Fused resize + per-channel normalize + interleaved→NCHW — the one GPU
+    /// op a VL image preprocess needs. `src` is an interleaved `[srcH·srcW·3]`
+    /// image (RGB, typically `[0,1]`); returns the planar NCHW
+    /// `[3, targetH, targetW]` tensor `(v − mean[c]) / std[c]`. `mode` picks
+    /// the interpolation kernel: `.bilinear` wraps `ffai_resize_normalize`,
+    /// `.bicubic` wraps `ffai_resize_normalize_bicubic` (both
+    /// `resize_normalize.rs` §"DISPATCH INVARIANTS"): Grid3D, one thread per
+    /// output element, align_corners = false half-pixel sampling. Replaces
+    /// the CPU triple-loop resize + normalize.
     public static func resizeNormalize(
         _ src: Tensor, srcW: Int, srcH: Int,
         targetW: Int, targetH: Int,
         mean: (Float, Float, Float), std: (Float, Float, Float),
+        mode: ResizeInterpolation = .bilinear,
         on cmd: MTLCommandBuffer, into out: Tensor? = nil
     ) -> Tensor {
         precondition(
@@ -7435,23 +7447,44 @@ public enum Ops {
         let thB = u32Buf(targetH)
         let grid = MTLSize(width: targetW, height: targetH, depth: 3)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
-        switch src.dtype {
-        case .f32:
+        switch (mode, src.dtype) {
+        case (.bilinear, .f32):
             MetalTileKernels.ffai_resize_normalize_f32(
                 input: src.buffer, inputOffset: src.offset,
                 mean: meanBuf, std: stdBuf,
                 out: result.buffer, outOffset: result.offset,
                 src_w: swB, src_h: shB, target_w: twB, target_h: thB,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
-        case .f16:
+        case (.bilinear, .f16):
             MetalTileKernels.ffai_resize_normalize_f16(
                 input: src.buffer, inputOffset: src.offset,
                 mean: meanBuf, std: stdBuf,
                 out: result.buffer, outOffset: result.offset,
                 src_w: swB, src_h: shB, target_w: twB, target_h: thB,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
-        case .bf16:
+        case (.bilinear, .bf16):
             MetalTileKernels.ffai_resize_normalize_bf16(
+                input: src.buffer, inputOffset: src.offset,
+                mean: meanBuf, std: stdBuf,
+                out: result.buffer, outOffset: result.offset,
+                src_w: swB, src_h: shB, target_w: twB, target_h: thB,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.bicubic, .f32):
+            MetalTileKernels.ffai_resize_normalize_bicubic_f32(
+                input: src.buffer, inputOffset: src.offset,
+                mean: meanBuf, std: stdBuf,
+                out: result.buffer, outOffset: result.offset,
+                src_w: swB, src_h: shB, target_w: twB, target_h: thB,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.bicubic, .f16):
+            MetalTileKernels.ffai_resize_normalize_bicubic_f16(
+                input: src.buffer, inputOffset: src.offset,
+                mean: meanBuf, std: stdBuf,
+                out: result.buffer, outOffset: result.offset,
+                src_w: swB, src_h: shB, target_w: twB, target_h: thB,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.bicubic, .bf16):
+            MetalTileKernels.ffai_resize_normalize_bicubic_bf16(
                 input: src.buffer, inputOffset: src.offset,
                 mean: meanBuf, std: stdBuf,
                 out: result.buffer, outOffset: result.offset,

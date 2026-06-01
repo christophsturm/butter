@@ -29,11 +29,13 @@ public enum MediaUtils {
 
     // ─── Resize + normalize (GPU) ────────────────────────────────────
 
-    /// GPU bilinear resize + per-channel normalize → planar NCHW
-    /// `[1, 3, targetH, targetW]`, via the fused `ffai_resize_normalize`
+    /// GPU resize + per-channel normalize → planar NCHW
+    /// `[1, 3, targetH, targetW]`, via the fused `ffai_resize_normalize{,_bicubic}`
     /// kernel (`Ops.resizeNormalize`). Replaces the CPU triple-loop in
     /// `ImagePreprocessing.resize` + `preprocess`. `align_corners = false`
-    /// half-pixel sampling (the HF / transformers convention).
+    /// half-pixel sampling (the HF / transformers convention). `mode` selects
+    /// the interpolation filter — `.bilinear` (default) or `.bicubic` for the
+    /// down-scaling-heavy native-resolution `smart_resize` path.
     ///
     /// `RGBImage.pixels` are interleaved RGB in `[0, 1]`; `normalization`
     /// supplies the per-channel `(mean, std)` (use `ImageNormalization(
@@ -42,6 +44,7 @@ public enum MediaUtils {
     public static func resizeNormalize(
         _ image: RGBImage, targetW: Int, targetH: Int,
         normalization: ImageNormalization, dtype: DType = .f32,
+        mode: Ops.ResizeInterpolation = .bilinear,
         device: Device = .shared
     ) -> Tensor {
         precondition(
@@ -57,7 +60,8 @@ public enum MediaUtils {
         let out = Ops.resizeNormalize(
             src, srcW: image.width, srcH: image.height,
             targetW: targetW, targetH: targetH,
-            mean: normalization.mean, std: normalization.std, on: cmd)
+            mean: normalization.mean, std: normalization.std,
+            mode: mode, on: cmd)
         cmd.commit()
         cmd.waitUntilCompleted()
         // [3, targetH, targetW] → NCHW [1, 3, targetH, targetW].
