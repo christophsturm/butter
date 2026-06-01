@@ -35,7 +35,7 @@ import Testing
 /// the whole suite stays skipped.
 private let gemma4MultimodalCacheAvailable: Bool = {
     let cache =
-        ("~/.cache/huggingface/hub/models--mlx-community--gemma-4-e2b-4bit"
+        ("~/.cache/huggingface/hub/models--mlx-community--gemma-4-e2b-it-4bit"
             as NSString)
         .expandingTildeInPath
     return FileManager.default.fileExists(atPath: cache)
@@ -50,7 +50,7 @@ private let gemma4MultimodalCacheAvailable: Bool = {
 )
 struct Gemma4MultimodalIntegrationTests {
 
-    static let modelId = "mlx-community/gemma-4-e2b-4bit"
+    static let modelId = "mlx-community/gemma-4-e2b-it-4bit"
 
     /// Synthesize a short 16 kHz mono test waveform: a 0.5 s, 440 Hz sine
     /// at moderate amplitude. The audio encoder is not yet numerically
