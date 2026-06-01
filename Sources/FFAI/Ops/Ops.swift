@@ -7700,6 +7700,214 @@ public enum Ops {
         return result
     }
 
+    // ─── Vision / video preprocessing ────────────────────────────────
+
+    /// NHWC `k_h × k_w` average pool with stride/pad — the downsample the
+    /// Gemma 4 / tile VL towers apply to the patch grid before the projector.
+    /// `count_include_pad = false` (torch/Gemma default): edge windows divide
+    /// by their real tap count. Wraps `avg_pool2d_nhwc`
+    /// (`avg_pool2d_nhwc.rs`): Grid3D one-thread-per-output, channel-last
+    /// `[B, H, W, C]`. `outH = (inH + 2·pad − kH)/stride + 1` (kW → outW).
+    public static func avgPool2dNHWC(
+        _ input: Tensor, batch: Int, inH: Int, inW: Int, channels: Int,
+        kH: Int, kW: Int, stride: Int, pad: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            input.elementCount == batch * inH * inW * channels,
+            "Ops.avgPool2dNHWC: input must be [B,H,W,C] = "
+                + "\(batch * inH * inW * channels) (got \(input.elementCount))")
+        precondition(stride > 0 && kH > 0 && kW > 0, "Ops.avgPool2dNHWC: kernel/stride must be positive")
+        let outH = (inH + 2 * pad - kH) / stride + 1
+        let outW = (inW + 2 * pad - kW) / stride + 1
+        let result = out ?? Tensor.empty(shape: [batch, outH, outW, channels], dtype: input.dtype)
+        let (grid, tg) = elementwiseGrid(batch * outH * outW * channels)
+        let (b, c, ih, iw) = (UInt32(batch), UInt32(channels), UInt32(inH), UInt32(inW))
+        let (oh, ow) = (UInt32(outH), UInt32(outW))
+        let (kh, kw, st, pd) = (UInt32(kH), UInt32(kW), UInt32(stride), UInt32(pad))
+        switch input.dtype {
+        case .f32:
+            MetalTileKernels.avg_pool2d_nhwc_f32(
+                input: input.buffer, inputOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                batch: b, ch: c, in_h: ih, in_w: iw, out_h: oh, out_w: ow,
+                k_h: kh, k_w: kw, stride: st, pad: pd,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.avg_pool2d_nhwc_f16(
+                input: input.buffer, inputOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                batch: b, ch: c, in_h: ih, in_w: iw, out_h: oh, out_w: ow,
+                k_h: kh, k_w: kw, stride: st, pad: pd,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.avg_pool2d_nhwc_bf16(
+                input: input.buffer, inputOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                batch: b, ch: c, in_h: ih, in_w: iw, out_h: oh, out_w: ow,
+                k_h: kh, k_w: kw, stride: st, pad: pd,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.avgPool2dNHWC: unsupported dtype \(input.dtype)")
+        }
+        return result
+    }
+
+    /// Patch im2col — unfold an NCHW image into one row per non-overlapping
+    /// `patch × patch` block, flattened `(c, py, px)`, ready for the
+    /// patch-embed GEMM. `out[patch, (c·p + py)·p + px] = input[c, pr·p + py,
+    /// pc·p + px]`, patch grid `(H/p) × (W/p)`. Wraps `im2col_patch`
+    /// (`im2col_patch.rs`): Grid3D one-thread-per-output, stride == patch,
+    /// no padding. Returns `[nPatches, channels·p·p]`.
+    public static func im2colPatch(
+        _ input: Tensor, channels: Int, inH: Int, inW: Int, patch: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            patch > 0 && inH % patch == 0 && inW % patch == 0,
+            "Ops.im2colPatch: in_h/in_w (\(inH)/\(inW)) must be multiples of patch \(patch)")
+        precondition(
+            input.elementCount == channels * inH * inW,
+            "Ops.im2colPatch: input must be NCHW [C,H,W] = "
+                + "\(channels * inH * inW) (got \(input.elementCount))")
+        let gridW = inW / patch
+        let gridH = inH / patch
+        let nPatches = gridH * gridW
+        let patchDim = channels * patch * patch
+        let result = out ?? Tensor.empty(shape: [nPatches, patchDim], dtype: input.dtype)
+        let (grid, tg) = elementwiseGrid(nPatches * patchDim)
+        let (c, ih, iw, p, gw) =
+            (UInt32(channels), UInt32(inH), UInt32(inW), UInt32(patch), UInt32(gridW))
+        switch input.dtype {
+        case .f32:
+            MetalTileKernels.im2col_patch_f32(
+                input: input.buffer, inputOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                channels: c, in_h: ih, in_w: iw, patch: p, grid_w: gw,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.im2col_patch_f16(
+                input: input.buffer, inputOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                channels: c, in_h: ih, in_w: iw, patch: p, grid_w: gw,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.im2col_patch_bf16(
+                input: input.buffer, inputOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                channels: c, in_h: ih, in_w: iw, patch: p, grid_w: gw,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.im2colPatch: unsupported dtype \(input.dtype)")
+        }
+        return result
+    }
+
+    /// Factorized 2D position-embedding add — `out[patch, d] = tokens[patch,
+    /// d] + posX[col·hidden + d] + posY[row·hidden + d]`, `col = patch %
+    /// gridW`, `row = patch / gridW`. The Gemma 4 vision post-patch-embed
+    /// step. `posX` `[gridW, hidden]` / `posY` `[gridH, hidden]` are f32
+    /// (caller resolution-matches the learned tables first). Wraps
+    /// `pos_emb_2d_add` (Grid3D one-thread-per-output).
+    public static func posEmb2dAdd(
+        tokens: Tensor, posX: Tensor, posY: Tensor,
+        hidden: Int, gridW: Int, gridH: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        let nPatches = gridH * gridW
+        precondition(
+            tokens.elementCount == nPatches * hidden,
+            "Ops.posEmb2dAdd: tokens must be [nPatches,hidden] = "
+                + "\(nPatches * hidden) (got \(tokens.elementCount))")
+        precondition(
+            posX.dtype == .f32 && posX.elementCount == gridW * hidden,
+            "Ops.posEmb2dAdd: posX must be f32 [gridW,hidden] = \(gridW * hidden)")
+        precondition(
+            posY.dtype == .f32 && posY.elementCount == gridH * hidden,
+            "Ops.posEmb2dAdd: posY must be f32 [gridH,hidden] = \(gridH * hidden)")
+        let result = out ?? Tensor.empty(shape: [nPatches, hidden], dtype: tokens.dtype)
+        let (grid, tg) = elementwiseGrid(nPatches * hidden)
+        let (h, gw) = (UInt32(hidden), UInt32(gridW))
+        switch tokens.dtype {
+        case .f32:
+            MetalTileKernels.pos_emb_2d_add_f32(
+                tokens: tokens.buffer, tokensOffset: tokens.offset,
+                pos_x: posX.buffer, pos_xOffset: posX.offset,
+                pos_y: posY.buffer, pos_yOffset: posY.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: h, grid_w: gw, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.pos_emb_2d_add_f16(
+                tokens: tokens.buffer, tokensOffset: tokens.offset,
+                pos_x: posX.buffer, pos_xOffset: posX.offset,
+                pos_y: posY.buffer, pos_yOffset: posY.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: h, grid_w: gw, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.pos_emb_2d_add_bf16(
+                tokens: tokens.buffer, tokensOffset: tokens.offset,
+                pos_x: posX.buffer, pos_xOffset: posX.offset,
+                pos_y: posY.buffer, pos_yOffset: posY.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: h, grid_w: gw, gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.posEmb2dAdd: unsupported dtype \(tokens.dtype)")
+        }
+        return result
+    }
+
+    /// Luma down-scale + frame-difference (SAD) — the video motion-gating
+    /// primitive. Box-averages a `ds × ds` block of each RGB frame to one
+    /// BT.601 luma value and writes `|luma₀ − luma₁|`; summing the
+    /// `[outH, outW]` output gives a cheap global motion score to gate the
+    /// vision tower on. Wraps `frame_diff_luma` (Grid3D one-thread-per-cell).
+    /// Frames are interleaved RGB `[inH, inW, 3]`; `outH = inH/ds`,
+    /// `outW = inW/ds` (caller sizes so they divide).
+    public static func frameDiffLuma(
+        frame0: Tensor, frame1: Tensor, inH: Int, inW: Int, ds: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(ds > 0, "Ops.frameDiffLuma: ds must be positive")
+        precondition(
+            frame0.elementCount == inH * inW * 3 && frame1.elementCount == inH * inW * 3,
+            "Ops.frameDiffLuma: frames must be interleaved RGB [inH,inW,3] = "
+                + "\(inH * inW * 3)")
+        precondition(
+            frame0.dtype == frame1.dtype,
+            "Ops.frameDiffLuma: frame0/frame1 must share dtype")
+        let outH = inH / ds
+        let outW = inW / ds
+        let result = out ?? Tensor.empty(shape: [outH, outW], dtype: frame0.dtype)
+        let (grid, tg) = elementwiseGrid(outH * outW)
+        let (iw, oh, ow, d) = (UInt32(inW), UInt32(outH), UInt32(outW), UInt32(ds))
+        switch frame0.dtype {
+        case .f32:
+            MetalTileKernels.frame_diff_luma_f32(
+                frame0: frame0.buffer, frame0Offset: frame0.offset,
+                frame1: frame1.buffer, frame1Offset: frame1.offset,
+                out: result.buffer, outOffset: result.offset,
+                in_w: iw, out_h: oh, out_w: ow, ds: d,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.frame_diff_luma_f16(
+                frame0: frame0.buffer, frame0Offset: frame0.offset,
+                frame1: frame1.buffer, frame1Offset: frame1.offset,
+                out: result.buffer, outOffset: result.offset,
+                in_w: iw, out_h: oh, out_w: ow, ds: d,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.frame_diff_luma_bf16(
+                frame0: frame0.buffer, frame0Offset: frame0.offset,
+                frame1: frame1.buffer, frame1Offset: frame1.offset,
+                out: result.buffer, outOffset: result.offset,
+                in_w: iw, out_h: oh, out_w: ow, ds: d,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.frameDiffLuma: unsupported dtype \(frame0.dtype)")
+        }
+        return result
+    }
+
     // ─── Audio front-end / vocoder ───────────────────────────────────
 
     /// Log-Mel spectrogram — the STT / audio-in front-end. Fuses the

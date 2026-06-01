@@ -2101,6 +2101,166 @@ struct OpsTests {
         }
     }
 
+    @Test("avgPool2dNHWC — GPU matches a CPU NHWC reference (2×2 s2, count_include_pad=false)")
+    func avgPool2dNHWCF32() {
+        autoreleasepool {
+            let (batch, inH, inW, ch) = (2, 5, 4, 3)
+            let (kH, kW, stride, pad) = (2, 2, 2, 1)  // pad → edge windows divide by real taps
+            let outH = (inH + 2 * pad - kH) / stride + 1
+            let outW = (inW + 2 * pad - kW) / stride + 1
+            let input = (0 ..< batch * inH * inW * ch).map { Float(($0 * 3 + 1) % 19) / 19 }
+
+            var expected = [Float](repeating: 0, count: batch * outH * outW * ch)
+            for n in 0 ..< batch {
+                for oh in 0 ..< outH {
+                    for ow in 0 ..< outW {
+                        for c in 0 ..< ch {
+                            var acc: Float = 0
+                            var count: Float = 0
+                            for ky in 0 ..< kH {
+                                let ph = oh * stride + ky
+                                guard ph >= pad && ph < pad + inH else { continue }
+                                let ih = ph - pad
+                                for kx in 0 ..< kW {
+                                    let pw = ow * stride + kx
+                                    guard pw >= pad && pw < pad + inW else { continue }
+                                    let iw = pw - pad
+                                    acc += input[((n * inH + ih) * inW + iw) * ch + c]
+                                    count += 1
+                                }
+                            }
+                            let v = count > 0 ? acc / count : 0
+                            expected[((n * outH + oh) * outW + ow) * ch + c] = v
+                        }
+                    }
+                }
+            }
+            let inT = Tensor.empty(shape: [batch, inH, inW, ch], dtype: .f32); inT.copyIn(from: input)
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.avgPool2dNHWC(
+                    inT, batch: batch, inH: inH, inW: inW, channels: ch,
+                    kH: kH, kW: kW, stride: stride, pad: pad, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            var maxDiff: Float = 0
+            for i in 0 ..< expected.count { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-5, "avgPool2dNHWC diverges (max \(maxDiff))")
+        }
+    }
+
+    @Test("im2colPatch — GPU matches a CPU NCHW unfold reference")
+    func im2colPatchF32() {
+        autoreleasepool {
+            let (channels, patch) = (3, 2)
+            let (gridH, gridW) = (3, 4)
+            let (inH, inW) = (gridH * patch, gridW * patch)
+            let nPatches = gridH * gridW
+            let patchDim = channels * patch * patch
+            let input = (0 ..< channels * inH * inW).map { Float(($0 * 5 + 2) % 23) / 23 }
+
+            var expected = [Float](repeating: 0, count: nPatches * patchDim)
+            for pr in 0 ..< gridH {
+                for pc in 0 ..< gridW {
+                    let p = pr * gridW + pc
+                    for c in 0 ..< channels {
+                        for py in 0 ..< patch {
+                            for px in 0 ..< patch {
+                                let col = (c * patch + py) * patch + px
+                                let inY = pr * patch + py
+                                let inX = pc * patch + px
+                                expected[p * patchDim + col] = input[(c * inH + inY) * inW + inX]
+                            }
+                        }
+                    }
+                }
+            }
+            let inT = Tensor.empty(shape: [channels, inH, inW], dtype: .f32); inT.copyIn(from: input)
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.im2colPatch(inT, channels: channels, inH: inH, inW: inW, patch: patch, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            #expect(outT.shape == [nPatches, patchDim])
+            var maxDiff: Float = 0
+            for i in 0 ..< expected.count { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-6, "im2colPatch diverges (max \(maxDiff))")
+        }
+    }
+
+    @Test("posEmb2dAdd — GPU matches a CPU factorized 2D pos-emb reference")
+    func posEmb2dAddF32() {
+        autoreleasepool {
+            let (hidden, gridW, gridH) = (8, 4, 3)
+            let nPatches = gridH * gridW
+            let tokens = (0 ..< nPatches * hidden).map { Float(($0 * 7) % 17) / 17 - 0.5 }
+            let posX = (0 ..< gridW * hidden).map { Float(($0 * 3) % 11) / 11 }
+            let posY = (0 ..< gridH * hidden).map { Float(($0 * 5) % 13) / 13 }
+
+            var expected = [Float](repeating: 0, count: nPatches * hidden)
+            for patch in 0 ..< nPatches {
+                let col = patch % gridW
+                let row = patch / gridW
+                for d in 0 ..< hidden {
+                    expected[patch * hidden + d] =
+                        tokens[patch * hidden + d] + posX[col * hidden + d] + posY[row * hidden + d]
+                }
+            }
+            let tokT = Tensor.empty(shape: [nPatches, hidden], dtype: .f32); tokT.copyIn(from: tokens)
+            let pxT = Tensor.empty(shape: [gridW, hidden], dtype: .f32); pxT.copyIn(from: posX)
+            let pyT = Tensor.empty(shape: [gridH, hidden], dtype: .f32); pyT.copyIn(from: posY)
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.posEmb2dAdd(
+                    tokens: tokT, posX: pxT, posY: pyT,
+                    hidden: hidden, gridW: gridW, gridH: gridH, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            var maxDiff: Float = 0
+            for i in 0 ..< expected.count { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-6, "posEmb2dAdd diverges (max \(maxDiff))")
+        }
+    }
+
+    @Test("frameDiffLuma — GPU matches a CPU BT.601 luma SAD reference")
+    func frameDiffLumaF32() {
+        autoreleasepool {
+            let (inH, inW, ds) = (8, 6, 2)
+            let outH = inH / ds, outW = inW / ds
+            let frame0 = (0 ..< inH * inW * 3).map { Float(($0 * 3 + 1) % 29) / 29 }
+            let frame1 = (0 ..< inH * inW * 3).map { Float(($0 * 5 + 7) % 31) / 31 }
+            let (wr, wg, wb): (Float, Float, Float) = (0.299, 0.587, 0.114)
+
+            var expected = [Float](repeating: 0, count: outH * outW)
+            let inv = 1 / Float(ds * ds)
+            for oy in 0 ..< outH {
+                for ox in 0 ..< outW {
+                    var s0: Float = 0
+                    var s1: Float = 0
+                    for dy in 0 ..< ds {
+                        for dx in 0 ..< ds {
+                            let p = ((oy * ds + dy) * inW + (ox * ds + dx)) * 3
+                            s0 += wr * frame0[p] + wg * frame0[p + 1] + wb * frame0[p + 2]
+                            s1 += wr * frame1[p] + wg * frame1[p + 1] + wb * frame1[p + 2]
+                        }
+                    }
+                    expected[oy * outW + ox] = abs(s0 * inv - s1 * inv)
+                }
+            }
+            let f0 = Tensor.empty(shape: [inH, inW, 3], dtype: .f32); f0.copyIn(from: frame0)
+            let f1 = Tensor.empty(shape: [inH, inW, 3], dtype: .f32); f1.copyIn(from: frame1)
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.frameDiffLuma(frame0: f0, frame1: f1, inH: inH, inW: inW, ds: ds, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            #expect(outT.shape == [outH, outW])
+            var maxDiff: Float = 0
+            for i in 0 ..< expected.count { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-5, "frameDiffLuma diverges (max \(maxDiff))")
+        }
+    }
+
     @Test("depthwiseConv2dNHWC — GPU matches a CPU NHWC reference (3×3 s1 pad1)")
     func depthwiseConv2dNHWC() {
         autoreleasepool {
