@@ -628,7 +628,7 @@ public final class Qwen3ASRModel: @unchecked Sendable {
         ).toFloatArray()
 
         // CPU bidirectional multi-head attention (no causal mask).
-        let attnCtx = cpuBidirectionalAttention(
+        let attnCtx = attention(
             qa: qa, ka: ka, va: va,
             seqLen: seqLen, nHeads: layer.nHeads,
             headDim: layer.headDim, scale: layer.scale,
@@ -691,14 +691,61 @@ public final class Qwen3ASRModel: @unchecked Sendable {
         return out.toFloatArray()
     }
 
-    /// CPU multi-head self-attention (bidirectional — no causal mask).
-    /// Returns a `[seqLen, hidden]` Tensor.
+    /// Bidirectional multi-head self-attention (no causal mask) → a
+    /// `[seqLen, hidden]` Tensor. Runs on the **GPU** for head dims a kernel
+    /// covers (`Ops.sdpaMulti(causal:false)` at 128/256, else
+    /// `Ops.sdpaBidirectional`); falls back to the parallel CPU loop for any
+    /// uncovered dim. `qa`/`ka`/`va` are frame-major `[seqLen, nHeads·headDim]`.
+    private func attention(
+        qa: [Float], ka: [Float], va: [Float],
+        seqLen: Int, nHeads: Int, headDim: Int, scale: Float,
+        device: Device
+    ) -> Tensor {
+        let H = nHeads * headDim
+        let isMultiDim = headDim == 128 || headDim == 256
+        let isBidirDim = OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(headDim)
+        guard isMultiDim || isBidirDim else {
+            return cpuBidirectionalAttention(
+                qa: qa, ka: ka, va: va, seqLen: seqLen, nHeads: nHeads,
+                headDim: headDim, scale: scale, device: device)
+        }
+        let qT = Tensor.empty(shape: [seqLen, H], dtype: dtype, device: device)
+        AudioPreprocessing.copyFloats(qa, into: qT)
+        let kT = Tensor.empty(shape: [seqLen, H], dtype: dtype, device: device)
+        AudioPreprocessing.copyFloats(ka, into: kT)
+        let vT = Tensor.empty(shape: [seqLen, H], dtype: dtype, device: device)
+        AudioPreprocessing.copyFloats(va, into: vT)
+        let cmd = device.makeCommandBuffer()
+        let kHead = Ops.transposeTokensToHeads(
+            kT, nTokens: seqLen, nHeads: nHeads, headDim: headDim, on: cmd)
+        let vHead = Ops.transposeTokensToHeads(
+            vT, nTokens: seqLen, nHeads: nHeads, headDim: headDim, on: cmd)
+        let qReshaped = qT.reshaped(to: [seqLen, nHeads, headDim])
+        let attn: Tensor
+        if isMultiDim {
+            attn = Ops.sdpaMulti(
+                q: qReshaped, k: kHead, v: vHead,
+                nQHeads: nHeads, nKVHeads: nHeads, headDim: headDim,
+                baseKV: 0, nQuery: seqLen, kvStride: seqLen,
+                causal: false, scale: scale, on: cmd)
+        } else {
+            attn = Ops.sdpaBidirectional(
+                q: qReshaped, k: kHead, v: vHead,
+                nQHeads: nHeads, nKVHeads: nHeads, headDim: headDim,
+                baseKV: 0, nQuery: seqLen, kvStride: seqLen,
+                scale: scale, on: cmd)
+        }
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return attn.reshaped(to: [seqLen, H])
+    }
+
+    /// CPU fallback for `attention` (head dims no SDPA kernel covers).
     ///
     /// Fans the `(head, query-row)` index space across CPU cores with
     /// `DispatchQueue.concurrentPerform`. Each iteration writes to a
     /// disjoint `[oBase, oBase + headDim)` output slice — race-free by
-    /// construction. Mirrors the parallelization of
-    /// `AudioEncoderLayer.cpuAttention`.
+    /// construction.
     private func cpuBidirectionalAttention(
         qa: [Float], ka: [Float], va: [Float],
         seqLen: Int, nHeads: Int, headDim: Int, scale: Float,
