@@ -7,9 +7,6 @@
 > [`gemma4-multimodal-plan.md`](gemma4-multimodal-plan.md) (Gemma 4 specifics,
 > now done end-to-end) and [`architecture.md`](architecture.md).
 
-> Filename note: requested as `mulit-modal-support.md`; created with the
-> corrected spelling `multi-modal-support.md`.
-
 ---
 
 ## 1. Current state (what works / what doesn't)
@@ -32,7 +29,14 @@
   buffered `[Int]`; the VLM path does NOT route through `Generate`'s streaming.
   (Blocked on the engine exposing a public *embedding-prefill* entry point — see
   the TODO at `VisionModel.swift` `generate` doc.)
-- **VLM is greedy-only** — no sampling/temperature on the multi-modal path.
+- **VLM is greedy-only — and IGNORES generation parameters (a correctness
+  bug, not just a missing feature).** `runGreedy` decodes via `Ops.argmax`
+  every step (`VisionModel.swift:~485`), so EVERY VLM / Gemma 4 multimodal
+  generation (image / audio / video → text) discards the model-card defaults
+  (temperature / top-p / top-k / seed) that the text path respects. Models
+  should respect their `defaultGenerationParameters` by default, including on
+  the multimodal path. This is fixed by routing the VLM decode through
+  `Generate` (§7a) — the same change that unlocks streaming.
 - **Multiple modalities per call** — `spliceMultimodal` / `runGreedy` already
   accept image+video+audio tokens *simultaneously*, but the three public
   `generate(...)` methods each pass only ONE (the other two `nil`). So no
@@ -58,8 +62,18 @@
    input size and resize/pad/tile internally. FFAI matches this — the user
    never pre-sizes, and we never throw "unsupported size". The fix for quality
    is implementing each model's *real* processor, not adding size errors.
-2. **On-the-fly preprocessing.** Resize/normalize/patchify as part of inference;
-   it's negligible vs the forward pass. No GPU resize / no pre-baking needed.
+2. **On-the-fly preprocessing — but it must still be optimized.** Doing
+   resize/normalize/patchify as part of inference is the right shape (no
+   pre-baking). For *single-shot* inference the cost is dwarfed by the forward
+   pass, so it's not a latency problem TODAY. BUT the current helpers are
+   **single-threaded CPU and unoptimized** (`ImagePreprocessing.resize` is a
+   scalar triple `for`-loop; the Gemma 4 patch-unfold / pool / embedder and the
+   audio magnitude-mel front-end are CPU `toFloatArray` loops / a CPU DFT). At
+   **real-time / streaming video fps** these CPU passes become a per-frame tax
+   on the hot path. So: parallelize (`DispatchQueue.concurrentPerform`) at
+   minimum, and **move resize/normalize/patchify + the mel front-end onto the
+   GPU** (an `Ops.resizeBilinear` / GPU normalize, a magnitude-mel kernel) so
+   the whole pre→tower→LLM path is GPU-resident. See §12.
 3. **AVFoundation over ffmpeg (for now).** FFAI targets Apple Silicon;
    AVFoundation is already used for audio, is hardware-accelerated, and avoids a
    heavy native dep. Revisit ffmpeg only for formats AVFoundation can't decode
@@ -173,15 +187,50 @@ encoder state; for true real-time STT, the `voxtral_realtime` family is the
 purpose-built target. Output streams via 7a.
 
 ### 7c. Streaming VIDEO + real-time loop (largest)
-Continuous frames (file or camera) → VLM → streaming text. The hard problems:
-- **Context growth**: re-encoding all frames every step is O(n²). Need a
-  sliding window of recent frames + KV-cache continuation (don't re-prefill).
-- **Frame-rate decoupling**: capture at 30 fps, sample to model fps, drop
-  backpressure frames.
+Continuous frames (file or camera) → VLM → streaming text.
+
+**Avoiding O(n²) — the key technique is KV-cache continuation, NOT
+re-prefilling.** The naive loop re-encodes the whole frame history each step →
+O(n²). Instead, treat the video as one growing token stream:
+- Encode each **new** frame's patches through the vision tower **once**, append
+  its soft tokens to the running KV cache, and decode forward. Old frames are
+  never re-encoded and their attention K/V are already cached → **per-frame cost
+  is O(window)**, not O(history).
+- A **sliding window** evicts the oldest frames' tokens (rotating-eviction KV
+  cache — the same machinery the text sliding-window models use) so the context
+  + per-step cost stay bounded no matter how long the stream runs.
+- So the steady-state cost per processed frame ≈ one tower encode + a bounded
+  attention over the window. The expensive, unavoidable part is **the vision
+  tower encode per processed frame**.
+
+**Can we beat 1–2 fps? Yes — but not by running the tower at 30 fps.** The tower
+encode is the floor; you don't need it on every frame. Strategy (this is what I
+would do, and your instinct is right):
+1. **Capture at 30 fps, process adaptively at ~1–5 fps.** Buffer the camera at
+   native fps; sample frames for the tower. A model understands a scene from a
+   few fps — 30 fps of *tower* work is wasted.
+2. **Drop redundant frames by motion / scene-change.** Cheap frame-diff (downscaled
+   luma SAD) → only encode keyframes where the scene changed; hold the last
+   tokens otherwise. Static scenes cost ~0; action scenes get more frames.
+3. **Batch frames through the tower.** Multiple sampled frames in one set of
+   GEMMs/attention dispatches amortizes launch overhead (the vision attention is
+   already GPU after the migration).
+4. **Shrink the per-frame tower cost** — smaller frame resolution (fewer
+   patches), and GPU-optimize the still-CPU tower stages (Gemma 4 patch-unfold /
+   pool / embedder) per §12.
+5. **Backpressure**: if the tower can't keep up, drop frames (never queue
+   unboundedly) so latency stays flat.
+
+Realistic target: real-time *interaction* at 30 fps **capture** with **2–8 fps
+effective tower throughput** (adaptive, motion-gated) — which is plenty for
+"describe what the camera sees" while staying real-time. True 30 fps *tower*
+processing is neither needed nor achievable for a real VLM tower; the win is
+smart sampling + KV continuation + a GPU-resident pipeline.
+
 - **Temporal prompt management**: timestamps + frame markers maintained as the
   window slides.
 
-Depends on 7a (+ the KV-cache/spec-decode work already in the plan).
+Depends on 7a (+ the rotating-eviction KV cache, already in the plan).
 
 ---
 
@@ -215,15 +264,46 @@ stream output once §7a lands.
 
 1. **Resolution/processor AUDIT + docs** (§3) — cheap, high value, prevents
    silent quality loss; informs the Qwen rollout.
-2. **Qwen2-VL native-resolution processor** (§3/§4) — highest-impact faithful
+2. **VLM respects generation params** (§7a / §1) — route `runGreedy` through
+   `Generate` so the multimodal path samples per `defaultGenerationParameters`
+   instead of always-argmax. Correctness fix; also the prerequisite for VLM
+   streaming output. Do early.
+3. **Qwen2-VL native-resolution processor** (§3/§4) — highest-impact faithful
    fix (3 models). Same `preprocessImage`-hook pattern as Gemma 4.
-3. **Combined multi-modal `generate`** (§8) — small; unlocks audio+video.
-4. **Core `MediaDecoding`** (§5) — mp4/mov + audio + frame-sampling-with-timestamps.
-5. **VLM streaming output** (§7a) — needs the engine embedding-prefill API.
-6. **CLI raw-input commands** (§9).
-7. **Streaming audio input** (§7b) + **camera source** (§6).
-8. **Real-time video loop** (§7c) — depends on 5 + KV-cache work.
-9. *(Later)* ffmpeg/VLCKit backend for AVI/MKV if demanded.
+4. **Combined multi-modal `generate`** (§8) — small; unlocks audio+video.
+5. **Core `MediaDecoding`** (§5) — mp4/mov + audio + frame-sampling-with-timestamps.
+6. **GPU + parallel preprocessing** (§12) — needed before real-time fps.
+7. **VLM streaming output** (§7a) — builds on #2.
+8. **CLI raw-input commands** (§9).
+9. **Streaming audio input** (§7b) + **camera source** (§6).
+10. **Real-time video loop** (§7c) — depends on #7 + rotating-eviction KV cache.
+11. *(Later)* ffmpeg/VLCKit backend for AVI/MKV if demanded.
+
+---
+
+## 12. Preprocessing performance (GPU + parallelize)
+
+The preprocessing/front-end helpers are currently **single-threaded CPU and
+unoptimized**. Fine for single-shot latency, but a per-frame tax for real-time
+video and just wasteful. To make the whole pre→tower→LLM path GPU-resident:
+- **`ImagePreprocessing.resize`** — scalar triple loop (`ImagePreprocessing.swift`
+  `resize`). Parallelize now (`concurrentPerform`); GPU later (an
+  `Ops.resizeBilinear` sampling kernel, or `MPSImageScale`).
+- **normalize + NCHW pack** — CPU loop in `preprocess`; fold into a GPU
+  normalize/transpose (or the resize kernel's output).
+- **Gemma 4 vision tower CPU stages** — patch-unfold, attention-pooling, and the
+  multimodal-embedder RMSNorm still run on CPU via `toFloatArray` loops
+  (`Gemma4Vision.swift`). GPU these (unfold → a gather/copy kernel; pool → an
+  avg-pool kernel; embed RMSNorm → `Ops.rmsNormRows`).
+- **Gemma 4 audio magnitude-mel front-end** — a CPU DFT (`Gemma4AudioFrontend.swift`).
+  Add a **magnitude-mel GPU kernel** (the existing `Ops.melSpectrogram` is
+  power-only); big win for long clips and streaming audio.
+- **AVFoundation decode** is already hardware-accelerated; the CPU cost there is
+  only the `CMSampleBuffer`/`CGImage` → `RGBImage` copy — keep it tight (avoid
+  extra allocations per frame in the streaming loop).
+
+Each gets a correctness test (GPU vs the CPU reference) like the kernel work
+already landed. Sequenced before the real-time video loop (#10).
 
 ---
 
