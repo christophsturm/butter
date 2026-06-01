@@ -98,15 +98,18 @@ struct Gemma4VisionIntegrationTests {
         let userPrefix = m.tokenizer.encode(text: "<start_of_turn>user\n")
         let userSuffix = m.tokenizer.encode(
             text: "\nDescribe this image.<end_of_turn>\n<start_of_turn>model\n")
+
+        // A real photograph — the golden-retriever fixture. Gemma 4's image
+        // processor is variable-resolution, so encode first to learn the
+        // exact soft-token count and size the placeholder run to match.
+        let image = try VisionTestHelpers.dogImage()
+        let nImageTokens = vlm.encodeImage(image).shape[0]
         let imageSpan =
             [boiTokenId]
-            + Array(repeating: imageTokenId, count: vlm.imageTokenCount)
+            + Array(repeating: imageTokenId, count: nImageTokens)
             + [eoiTokenId]
         let promptTokens =
             [bos] + userPrefix + imageSpan + userSuffix
-
-        // A real photograph — the golden-retriever fixture.
-        let image = try VisionTestHelpers.dogImage()
 
         let generated = try vlm.generate(
             promptTokens: promptTokens, image: image,

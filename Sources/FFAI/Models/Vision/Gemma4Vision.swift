@@ -609,6 +609,41 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
         return embed(pooled, device: device)
     }
 
+    /// Aspect-ratio-preserving target `(height, width)` for the
+    /// variable-resolution image processor: the largest dims that (1)
+    /// produce at most `maxPatches` patches at `patchSize`, and (2) are
+    /// divisible by `poolingKernelSize · patchSize`. Mirrors the reference
+    /// `get_aspect_ratio_preserving_size` (`image_processing_pil_gemma4`).
+    func aspectPreservingSize(width: Int, height: Int) -> (h: Int, w: Int) {
+        let patch = cfg.patchSize
+        let pool = cfg.poolingKernelSize
+        let maxPatches = cfg.defaultOutputLength * pool * pool
+        let sideMult = pool * patch
+        let targetPx = Double(maxPatches * patch * patch)
+        let factor = (targetPx / Double(width * height)).squareRoot()
+        var th =
+            Int((factor * Double(height) / Double(sideMult)).rounded(.down))
+            * sideMult
+        var tw =
+            Int((factor * Double(width) / Double(sideMult)).rounded(.down))
+            * sideMult
+        // Degenerate-aspect clamps (reference): a dim that rounds to 0 is
+        // pinned to one `sideMult` block, the other capped at `maxSide`.
+        let maxSide = (maxPatches / (pool * pool)) * sideMult
+        if th == 0 {
+            th = sideMult
+            tw = min(
+                Int((Double(width) / Double(height)).rounded(.down)) * sideMult,
+                maxSide)
+        } else if tw == 0 {
+            tw = sideMult
+            th = min(
+                Int((Double(height) / Double(width)).rounded(.down)) * sideMult,
+                maxSide)
+        }
+        return (h: th, w: tw)
+    }
+
     /// Present the tower as a `VisionEncoder` so `VisionModel` accepts it.
     func asVisionEncoder() -> VisionEncoder {
         Gemma4VLComposedEncoder(tower: self)
@@ -815,6 +850,23 @@ final class Gemma4VLComposedEncoder: VisionEncoder {
             positionEmbedding: placeholderW, layers: [],
             postLayerNorm: placeholderNorm,
             projection: nil, dtype: tower.dtype)
+    }
+
+    /// Gemma 4's variable-resolution image processor: aspect-ratio-
+    /// preserving resize to dims divisible by `patchSize · poolingKernel`,
+    /// then rescale to `[0, 1]` ONLY (no mean/std — the tower's patch
+    /// unfold re-centres via `2·(v − 0.5)`; `RGBImage` pixels are already
+    /// `[0, 1]`). The resulting non-square `[1, 3, H, W]` tensor drives the
+    /// tower's variable soft-token count.
+    override func preprocessImage(
+        _ image: RGBImage, device: Device = .shared
+    ) -> Tensor? {
+        let (th, tw) = tower.aspectPreservingSize(
+            width: image.width, height: image.height)
+        let identity = ImageNormalization(mean: (0, 0, 0), std: (1, 1, 1))
+        return ImagePreprocessing.preprocess(
+            image, targetW: tw, targetH: th, normalization: identity,
+            dtype: tower.dtype, device: device)
     }
 
     /// Run the Gemma 4 vision tower. Returns

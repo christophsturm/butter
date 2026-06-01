@@ -183,8 +183,13 @@ public final class VisionModel: @unchecked Sendable {
         return stream
     }
 
-    /// Encode an image into vision tokens in the text hidden dim.
+    /// Encode an image into vision tokens in the text hidden dim. A vision
+    /// tower may supply its own preprocessing (Gemma 4's variable-resolution
+    /// processor); otherwise the generic fixed-square preprocess is used.
     public func encodeImage(_ image: RGBImage, device: Device = .shared) -> Tensor {
+        if let pixels = visionEncoder.preprocessImage(image, device: device) {
+            return visionEncoder.encode(image: pixels, device: device)
+        }
         let cfg = visionEncoder.config
         let pixels = ImagePreprocessing.preprocess(
             image, targetW: cfg.imageSize, targetH: cfg.imageSize,

@@ -515,6 +515,18 @@ public class VisionEncoder: Module {
         return out
     }
 
+    /// Optional family-specific preprocessing from a raw `RGBImage` to the
+    /// NCHW pixel tensor `encode(image:)` consumes. Returns `nil` to fall
+    /// back to the generic fixed-square `ImagePreprocessing.preprocess`
+    /// (`VisionModel.encodeImage`). Gemma 4 overrides this for its
+    /// variable-resolution / aspect-ratio-preserving image processor, which
+    /// produces a non-square `[1, 3, H, W]` tensor.
+    public func preprocessImage(
+        _ image: RGBImage, device: Device = .shared
+    ) -> Tensor? {
+        nil
+    }
+
     /// Encode a preprocessed image into patch-token embeddings in the
     /// text hidden dim.
     ///
