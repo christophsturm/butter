@@ -173,22 +173,13 @@ struct Gemma4VisionIntegrationTests {
         }
         let meanDiff = sumDiff / Float(n)
         print("vision tower mean abs diff \(meanDiff), max \(maxDiff)")
-        // STRUCTURAL GATE (passes): the variable-resolution refactor
-        // produces the correct 266-token grid for the dog's 42×57 patch
-        // layout — the count + shape match the reference exactly.
-        //
-        // KNOWN-PENDING numerical gate: the tower's q/k/v/o + gate/up/down
-        // are `Gemma4ClippableLinear` (`use_clipped_linears: True`) — each
-        // clamps its input/output to per-linear `input_min/max` +
-        // `output_min/max` loaded from the checkpoint. FFAI's vision block
-        // still uses plain `Linear`, so the unclamped activations diverge
-        // (mean ≈ 0.70). Applying the audio-encoder `ClippableLinear`
-        // pattern to the vision block closes this; until then the numeric
-        // comparison is diagnostic only.
-        if meanDiff >= 0.15 {
-            print(
-                "KNOWN-PENDING: vision tower numeric gap (mean \(meanDiff)) — "
-                    + "clipped-linears not yet applied to the vision block.")
-        }
+        // The variable-resolution tower now matches the mlx-vlm oracle:
+        // correct 266-token grid AND numerically faithful (per-block
+        // correlation 1.0 against the reference after the RMSNorm fold fix +
+        // clipped-linears). A small residual remains from the 4-bit
+        // quantized weights + bf16 accumulation over 16 blocks.
+        #expect(
+            meanDiff < 0.05,
+            "vision tower diverges from the oracle (mean \(meanDiff))")
     }
 }

@@ -458,12 +458,15 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
                     ?? (try? vt.tensor(named: "\(p).\(name).bias"))
                 return Linear(weight: w, bias: b)
             }
-            // The four per-block norms are GemmaRMSNorm — fold the +1.
+            // The four per-block norms apply the weight DIRECTLY — the
+            // Gemma 4 VISION tower's RMSNorm is `normed * weight`, NOT the
+            // text tower's `(1 + weight)` fold (reference `vision.py`
+            // RMSNorm: "weight applied directly"; `VisionRMSNorm`:
+            // `normed * weight`). Folding +1 here over-scaled every block
+            // and drove the per-block drift vs the mlx-vlm oracle.
             func gemmaNorm(_ name: String) throws -> RMSNorm {
                 let raw = try vt.tensor(named: "\(p).\(name).weight")
-                return RMSNorm(
-                    weight: foldGemmaRMSNormWeight(raw),
-                    eps: cfg.rmsNormEps)
+                return RMSNorm(weight: raw, eps: cfg.rmsNormEps)
             }
             // The q / k head norms are plain (weighted, no +1) RMSNorms.
             func headNorm(_ name: String) throws -> RMSNorm {
