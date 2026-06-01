@@ -97,7 +97,7 @@ There is **zero** smart-resize / tiling / pan-and-scan anywhere in
 
 | Model | Modality | Reference processor | Native | Patch | Token count | FFAI today | Verdict |
 |---|---|---|---|---|---|---|---|
-| **Qwen2-VL** | img+vid | native `smart_resize` (min/max-pixels, aspect) | any | 14, merge 2 | variable | fixed 28×28→392² (`Qwen2Vision.swift:334` "fixed-grid for now") | ❌ distorts+truncates |
+| **Qwen2-VL** | img+vid | native `smart_resize` (min/max-pixels, aspect) | any | 14, merge 2 | variable | ✅ native `smart_resize` → variable `(gridH,gridW)` (`MediaUtils.smartResize` + non-square tower) | ✅ faithful (geometry-verified; e2e blocked on a pre-existing quant crash, #7) |
 | **Qwen2.5-VL** | img+vid | native `smart_resize` | any | 14, merge 2 | variable | fixed 28×28→392² (`Qwen25Vision.swift:446,545`) | ❌ distorts+truncates |
 | **Qwen3-VL** | img+vid | native `smart_resize` | any | 16, merge 2 | variable | fixed 32×32² (`Qwen3Vision.swift:342`) | ❌ distorts+truncates |
 | **Qwen3.5-VL** | img+vid | native `smart_resize` | any | 16, merge 2 | variable | fixed grid (Qwen3 tower, `Qwen3xVision.swift:147`) | ❌ distorts+truncates |
@@ -325,10 +325,24 @@ lands.
    path). The preprocessing base is now GPU. *(Folding `ImagePreprocessing`/
    `AudioPreprocessing` fully into `MediaUtils` + wiring it into every model's
    preprocess happens incrementally with #4.)*
-4. ⏳ **`smart_resize` native-resolution processors** (§3) — on the K1/K2 base:
-   fixes **Qwen2/2.5/3/3.5-VL** (4 models) + **GLM-OCR** + (aspect-cap)
-   **Pixtral/Mistral3**. Highest-impact resolution win; `preprocessImage`-hook
-   pattern + geometry unit tests + mlx-vlm oracle validation.
+4. ⏳ **`smart_resize` native-resolution processors** (§3) — on the K1/K2 base.
+   Shared geometry helper **`MediaUtils.smartResize`** (+ `SmartResizeBounds`,
+   10 unit tests) landed first.
+   - ✅ **Qwen2-VL** (template) — tower made non-square-aware
+     (`runForward`/`unfoldPatches`/`ropeTables`/`mergeReorderedPositions` thread
+     `(gridH,gridW)`; `gridDims` derives the grid per-image), `preprocessImage`
+     override smartResizes + GPU resize/normalizes, `smartResizeGrid` sizes the
+     placeholder run. Geometry unit tests pass; full unit gate green (1718).
+     ⚠️ **e2e content (dog/cat) blocked** by a *pre-existing* quantized-weight
+     crash unrelated to resolution — `Linear.init` hits `u32` weight + `f16`
+     bias on the `Qwen2-VL-2B-Instruct-4bit` forward (`Layers.swift:59`);
+     tracked for the vision bisect (#7 / NU.5). Geometry is the tighter signal
+     until that's fixed.
+   - ⏳ **Qwen2.5/3/3.5-VL** — same non-square refactor (patch-16/factor-32 for
+     v3+); apply the Qwen2-VL template per tower. Blocked on the same quant
+     crash for e2e validation.
+   - ⏳ **GLM-OCR** (in-tree smart_resize; encode already aspect-correct) +
+     (aspect-cap) **Pixtral/Mistral3** `preprocessImage` overrides.
 5. ⏳ **Tile/slice-splitting processors** (§3) — MiniCPM-V, Idefics3, SmolVLM2,
    LFM2-VL (tiles + thumbnail, encode-per-tile, concat) + FastVLM letterbox.
 6. ⏳ **Combined multi-modal `generate`** (§8) — small; unlocks audio+video.
