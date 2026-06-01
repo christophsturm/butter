@@ -185,4 +185,57 @@ struct Gemma4VisionIntegrationTests {
             meanDiff < 0.05,
             "vision tower diverges from the oracle (mean \(meanDiff))")
     }
+
+    /// End-to-end video → text on the bundled `cat.mp4`. Gemma 4 has no
+    /// temporal-patch fold — a video is a sequence of images, each run
+    /// through the (variable-resolution) vision tower and wrapped per the
+    /// reference's prompt format: `{mm:ss} <boi>{video_token × n}<eoi>`,
+    /// frames space-joined (transformers `processing_gemma4.py`). Note the
+    /// IMAGE markers (boi/eoi) wrap the frames but the placeholders are the
+    /// `video_token` (258884).
+    @Test("video + text prompt — identifies the cat in the cat video")
+    func videoTextGeneration() async throws {
+        let m = try await ModelLoadLock.shared.loadSerially {
+            try await Model.load(Self.modelId)
+        }
+        let vlm = try #require(m.vlModel, "Gemma 4 VL checkpoint is not a VLM")
+        let videoTokenId = try #require(vlm.videoTokenId, "no video token id")
+
+        // A handful of evenly-sampled frames from the cat video.
+        let frames = try VisionTestHelpers.catVideoFrames(maxFrames: 4)
+        // All frames share the video's resolution, so they pool to the same
+        // soft-token count; encode one (same variable-resolution processor
+        // as the image path) to size each frame's placeholder run.
+        let perFrame = vlm.encodeImage(frames[0]).shape[0]
+
+        let bos = try #require(
+            m.tokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
+        let boiTokenId = 255999
+        let eoiTokenId = 258882
+        let userPrefix = m.tokenizer.encode(text: "<start_of_turn>user\n")
+        let userSuffix = m.tokenizer.encode(
+            text: "\nWhat animal is in this video?<end_of_turn>\n"
+                + "<start_of_turn>model\n")
+        var videoSpan: [Int] = []
+        for i in 0 ..< frames.count {
+            videoSpan += m.tokenizer.encode(text: "00:0\(i) ")
+            videoSpan += [boiTokenId]
+            videoSpan += Array(repeating: videoTokenId, count: perFrame)
+            videoSpan += [eoiTokenId]
+            videoSpan += m.tokenizer.encode(text: " ")
+        }
+        let promptTokens = [bos] + userPrefix + videoSpan + userSuffix
+
+        let generated = try vlm.generate(
+            promptTokens: promptTokens, videoFrames: frames,
+            maxTokens: 160, eosTokenId: m.config.eosTokenId,
+            eosTokenIds: m.config.eosTokenIds)
+        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        print("Gemma 4 video → text: \(text)")
+
+        expectCoherentOutput(generated, minTokens: 4, label: "gemma4-video")
+        #expect(
+            text.lowercased().contains("cat"),
+            "video caption should mention a cat — got: \(text)")
+    }
 }
