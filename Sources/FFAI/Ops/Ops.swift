@@ -3778,6 +3778,106 @@ public enum Ops {
         return result
     }
 
+    /// Single-query decode SDPA with a **per-head learned attention sink read
+    /// from a `[nQHeads]` f32 buffer** — the GPT-OSS variant. The sink is a
+    /// virtual key with score `sink[qHead]` and value 0: it adds
+    /// `exp(sink[qHead] − globalMax)` to the softmax denominator but nothing
+    /// to the output, so a confidently-attending head can down-weight every
+    /// real key. Mathematically identical to the old host-side online-softmax
+    /// rescale, but folded into one GPU dispatch — no readback, no second
+    /// command buffer. Wraps `ffai_sdpa_decode_sink_buf`
+    /// (`sdpa_decode_sink_buf.rs` §"DISPATCH INVARIANTS"): Reduction, TPG =
+    /// 1024, one threadgroup per q-head, bounds-masked for any
+    /// `head_dim % 4 == 0, ≤ 128` (covers d64 + d128 in one kernel).
+    ///
+    /// Dense full attention is `sinkEnd = windowStart = 0`. A sliding window
+    /// of width `W` is `sinkEnd = 0, windowStart = max(0, nKV − W)` (attends
+    /// `[windowStart, nKV)`); a leading sink-token range is `[0, sinkEnd)`.
+    public static func sdpaDecodeSink(
+        q: Tensor, k: Tensor, v: Tensor, sink: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        nKV: Int, kvStride: Int,
+        scale: Float, on cmd: MTLCommandBuffer,
+        sinkEnd: Int = 0, windowStart: Int = 0,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        // Geometry contract (sdpa_decode_sink_buf.rs §"DISPATCH INVARIANTS").
+        // The kernel packs 4 elements per lane across 32 lanes, so
+        // head_dim ≤ 128 and a multiple of 4; one threadgroup per q-head at
+        // TPG = 1024 — never elementwiseGrid (the canonical freeze bug).
+        precondition(
+            headDim > 0 && headDim % 4 == 0 && headDim <= 128,
+            "Ops.sdpaDecodeSink: head_dim must be a multiple of 4 in [4, 128] "
+                + "(got \(headDim)) — sdpa_decode_sink_buf.rs packs 4 elt/lane × 32 lanes")
+        precondition(
+            sink.dtype == .f32 && sink.elementCount == nQHeads,
+            "Ops.sdpaDecodeSink: sink must be f32 [\(nQHeads)] (got "
+                + "\(sink.dtype) \(sink.elementCount)) — sdpa_decode_sink_buf.rs loads sink[qHead]")
+        precondition(
+            nQHeads > 0 && nKVHeads > 0 && nQHeads % nKVHeads == 0,
+            "Ops.sdpaDecodeSink: nQHeads (\(nQHeads)) must be a positive multiple "
+                + "of nKVHeads (\(nKVHeads))")
+        precondition(
+            nKV >= 0 && nKV <= kvStride,
+            "Ops.sdpaDecodeSink: nKV (\(nKV)) must be in [0, kvStride \(kvStride)] "
+                + "— kernel would read past the cache")
+        precondition(
+            sinkEnd >= 0 && windowStart >= sinkEnd && windowStart <= nKV,
+            "Ops.sdpaDecodeSink: need 0 ≤ sinkEnd (\(sinkEnd)) ≤ windowStart "
+                + "(\(windowStart)) ≤ nKV (\(nKV)) — sdpa_decode_sink_buf.rs invariant")
+        let result = out ?? Tensor.empty(shape: [nQHeads, headDim], dtype: q.dtype)
+        let headsPerGroup = nQHeads / nKVHeads
+        // One threadgroup per q-head; 1024 threads (32 simdgroups) sliced by
+        // Metal from a 1D grid of nQHeads · 1024 (tgid_x = q-head).
+        let threadsPerGroup = 1024
+        let grid = MTLSize(width: nQHeads * threadsPerGroup, height: 1, depth: 1)
+        let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+        switch q.dtype {
+        case .f32:
+            MetalTileKernels.ffai_sdpa_decode_sink_buf_f32(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                sink: sink.buffer, sinkOffset: sink.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                heads_per_group: UInt32(headsPerGroup),
+                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
+                scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_sdpa_decode_sink_buf_f16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                sink: sink.buffer, sinkOffset: sink.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                heads_per_group: UInt32(headsPerGroup),
+                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
+                scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_sdpa_decode_sink_buf_bf16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                sink: sink.buffer, sinkOffset: sink.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                heads_per_group: UInt32(headsPerGroup),
+                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
+                scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.sdpaDecodeSink: unsupported dtype \(q.dtype)")
+        }
+        return result
+    }
+
     /// Two-pass Flash-Decoding SDPA. Pass 1 partitions the KV cache
     /// into `blocks` even tiles and writes a per-block partial
     /// `(O, max, lse)` triple; pass 2 merges them with the log-sum-exp

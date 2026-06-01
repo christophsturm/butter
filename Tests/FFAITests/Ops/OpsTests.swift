@@ -651,6 +651,70 @@ struct OpsTests {
         }
     }
 
+    @Test("sdpaDecodeSink f32 — per-head learned sink folds into the softmax denom (d64 GQA)")
+    func sdpaDecodeSinkF32() {
+        autoreleasepool {
+            // GPT-OSS decode shape: d64, GQA (4 q-heads → 2 kv-heads).
+            let D = 64
+            let nQHeads = 4
+            let nKVHeads = 2
+            let headsPerGroup = nQHeads / nKVHeads
+            let nKV = 5
+            let kvStride = 8  // capacity > nKV so stale rows must be ignored
+            let scale = 1.0 / Float(Double(D).squareRoot())
+
+            func ramp(_ n: Int, _ seed: Int, _ amp: Float) -> [Float] {
+                (0 ..< n).map { (Float(($0 + seed) % 11) - 5) * amp / 11 }
+            }
+            let qData = ramp(nQHeads * D, 3, 1.2)
+            let kData = ramp(nKVHeads * kvStride * D, 7, 0.9)
+            let vData = ramp(nKVHeads * kvStride * D, 5, 0.7)
+            let sinkData: [Float] = [0.4, -0.7, 1.1, 0.0]  // per q-head logits
+
+            let q = Tensor.empty(shape: [nQHeads, D], dtype: .f32); q.copyIn(from: qData)
+            let k = Tensor.empty(shape: [nKVHeads, kvStride, D], dtype: .f32); k.copyIn(from: kData)
+            let v = Tensor.empty(shape: [nKVHeads, kvStride, D], dtype: .f32); v.copyIn(from: vData)
+            let sink = Tensor.empty(shape: [nQHeads], dtype: .f32); sink.copyIn(from: sinkData)
+
+            var out: Tensor!
+            runAndWait { cb in
+                out = Ops.sdpaDecodeSink(
+                    q: q, k: k, v: v, sink: sink,
+                    nQHeads: nQHeads, nKVHeads: nKVHeads, headDim: D,
+                    nKV: nKV, kvStride: kvStride, scale: scale, on: cb)
+            }
+            let got = out.toArray(as: Float.self)
+
+            // CPU oracle — mirrors sdpa_decode_sink_buf.rs: the sink is a
+            // virtual key (score sink[qh], value 0) included in the global
+            // max + denominator. Dense path (sinkEnd = windowStart = 0).
+            var maxDiff: Float = 0
+            for qh in 0 ..< nQHeads {
+                let kvh = qh / headsPerGroup
+                var scores = [Float](repeating: 0, count: nKV)
+                for t in 0 ..< nKV {
+                    var dot: Float = 0
+                    for d in 0 ..< D {
+                        dot += qData[qh * D + d] * kData[(kvh * kvStride + t) * D + d]
+                    }
+                    scores[t] = dot * scale
+                }
+                let gMax = max(scores.max() ?? 0, sinkData[qh])
+                var denom = Foundation.exp(sinkData[qh] - gMax)
+                for t in 0 ..< nKV { denom += Foundation.exp(scores[t] - gMax) }
+                for d in 0 ..< D {
+                    var acc: Float = 0
+                    for t in 0 ..< nKV {
+                        acc += Foundation.exp(scores[t] - gMax) * vData[(kvh * kvStride + t) * D + d]
+                    }
+                    let expected = acc / denom
+                    maxDiff = max(maxDiff, abs(got[qh * D + d] - expected))
+                }
+            }
+            #expect(maxDiff < 1e-4, "sdpaDecodeSink diverges from oracle (max \(maxDiff))")
+        }
+    }
+
     @Test("sdpaDecode f32 — sinkEnd + windowStart skip the masked range")
     func sdpaSlidingWindowAndSinks() {
         autoreleasepool {

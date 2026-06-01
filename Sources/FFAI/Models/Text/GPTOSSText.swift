@@ -420,6 +420,10 @@ public final class GPTOSSAttention: Module {
     let qProj, kProj, vProj, oProj: GPTOSSBiasedLinear
     /// Learned per-head sink logits, `[nHeads]`, host-resident.
     let sinks: [Float]
+    /// Same logits as a resident `[nHeads]` f32 GPU buffer, built once at
+    /// load — fed straight to `Ops.sdpaDecodeSink` so the sink fold runs
+    /// in-kernel (no per-token host readback / online softmax).
+    let sinkTensor: Tensor
     let kind: GPTOSSAttentionKind
     let nHeads, nKVHeads, headDim: Int
     let ropeTheta: Float
@@ -438,6 +442,9 @@ public final class GPTOSSAttention: Module {
         self.vProj = vProj
         self.oProj = oProj
         self.sinks = sinks
+        let st = Tensor.empty(shape: [sinks.count], dtype: .f32)
+        st.copyIn(from: sinks)
+        self.sinkTensor = st
         self.kind = kind
         self.nHeads = nHeads
         self.nKVHeads = nKVHeads
@@ -485,123 +492,34 @@ public final class GPTOSSAttention: Module {
             vFlat: v.reshaped(to: [nKVHeads, headDim]), on: cmd)
 
         let nKV = cache.length
-        // AURA stores K/V Π-rotated — rotate Q in; the same rotated Q
-        // feeds the host-side sink correction (its dot products run
-        // against the Π-rotated cached K) and the output is un-rotated
-        // before o_proj below. No-op for raw / affine.
+        // AURA stores K/V Π-rotated — rotate Q in to match; the in-kernel
+        // dot products run against the Π-rotated cached K, and the output is
+        // un-rotated before o_proj below. No-op for raw / affine.
         let qForSdpa = auraRotatedQuery(
             qRot.reshaped(to: [nHeads, headDim]), cache: cache,
             nHeads: nHeads, headDim: headDim, on: cmd)
         let (cacheK, cacheV) = cache.prepareForAttention(on: cmd)
-        let attnOut = Ops.sdpaDecode(
-            q: qForSdpa, k: cacheK, v: cacheV,
+        // GPU decode SDPA with the per-head learned sink folded into the
+        // softmax denominator in-kernel (sdpaDecodeSink). This replaces the
+        // old commit → host readback (rotated Q + live K) → CPU online-
+        // softmax per-head correction → second command buffer: the sink fold
+        // is mathematically identical but now one dispatch on `cmd`, so
+        // decode no longer syncs the GPU mid-layer. Sliding-window layers are
+        // already capped by the ring-buffer cache (`nKV ≤ slidingWindow`), so
+        // attention is dense over [0, nKV) — sinkEnd = windowStart = 0.
+        let attnOut = Ops.sdpaDecodeSink(
+            q: qForSdpa, k: cacheK, v: cacheV, sink: sinkTensor,
             nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
             nKV: nKV, kvStride: cache.capacity,
             scale: scale, on: cmd)
 
-        // Commit so the host can read the rotated Q + the K cache for
-        // the sink correction below.
-        cmd.commit()
-        cmd.waitUntilCompleted()
-
-        // ── Host phase: per-head sink-correction factor ───────────────
-        // For each query head h, recover the softmax max `M_h` and sum
-        // `Z_h` over the nKV attended positions, then scale the SDPA
-        // output by  Z_h / (Z_h + exp(sink_h - M_h)).  See the file
-        // header for the derivation. K cache layout: [nKVHeads, maxSeq,
-        // headDim]; query head h maps to kv head h / headsPerGroup.
-        //
-        // Only the LIVE [0, nKV) slice of each kv head is read back —
-        // never the full maxSeq-capacity buffer (which can be 100k+
-        // positions; copying it every token would dwarf the kernel).
-        let qHost = readGPTOSSFloats(qForSdpa.reshaped(to: [nHeads * headDim]))  // Π-rotated for AURA
-        let headsPerGroup = nHeads / nKVHeads
-        // Per-kv-head live K slice [nKV, headDim], read once and reused
-        // across the headsPerGroup query heads that share it.
-        // `nonisolated(unsafe)`: read-only inside the per-head concurrent
-        // closure below; populated serially here first.
-        nonisolated(unsafe) var kLive = [[Float]](repeating: [], count: nKVHeads)
-        if nKV > 0 {
-            for kvHead in 0 ..< nKVHeads {
-                // kBuffer is [nKVHeads, maxSeq, headDim]; slice head
-                // kvHead, then its first nKV timesteps.
-                let headSlab = cacheK
-                    .slicedRows(start: kvHead, count: 1)
-                    .reshaped(to: [cache.capacity, headDim])
-                    .slicedRows(start: 0, count: nKV)
-                kLive[kvHead] = readGPTOSSFloats(headSlab)
-            }
-        }
-
-        // Online softmax over the nKV positions (initial running max =
-        // sinks[h]; sink term folded in after the loop). Single pass
-        // over the dot products — the previous implementation iterated
-        // twice (once for the max, once for the sum of exp), doubling
-        // the per-head FLOPs at long contexts. Each head's work is
-        // independent (writes factors[h] only) so the head loop is
-        // parallelised across (head) work items.
-        var factors = [Float](repeating: 1, count: nHeads)
-        // Bind every self-borrowed value to a local before crossing the
-        // `@Sendable` boundary — otherwise the closure captures `self`
-        // (an actor-isolated GPTOSSAttention) just to read scalar
-        // properties like `headDim` / `scale` / `sinks`. The bindings
-        // themselves are Sendable (Int, Float, [Float]) so no
-        // `nonisolated(unsafe)` qualifier is needed; only the raw
-        // `fPtr` pointer write needs it.
-        let sinksLocal = sinks
-        let headDimLocal = headDim
-        let scaleLocal = scale
-        factors.withUnsafeMutableBufferPointer { fBuf in
-            nonisolated(unsafe) let fPtr = fBuf.baseAddress!
-            DispatchQueue.concurrentPerform(iterations: nHeads) { h in
-                let kvHead = h / headsPerGroup
-                let qBase = h * headDimLocal
-                let kHead = kLive[kvHead]
-                var m = sinksLocal[h]
-                var z: Float = 0
-                for t in 0 ..< nKV {
-                    let kBase = t * headDimLocal
-                    var dot: Float = 0
-                    for d in 0 ..< headDimLocal {
-                        dot += qHost[qBase + d] * kHead[kBase + d]
-                    }
-                    let s = dot * scaleLocal
-                    if s > m {
-                        // Renormalise the running sum to the new max.
-                        z = z * Foundation.exp(m - s)
-                        m = s
-                    }
-                    z += Foundation.exp(s - m)
-                }
-                let sinkTerm = Foundation.exp(sinksLocal[h] - m)
-                // O' = O · Z / (Z + exp(sink - M)). Z > 0 whenever nKV > 0.
-                fPtr[h] = z / (z + sinkTerm)
-            }
-        }
-
-        // ── GPU phase 2: rescale O per-head, then o_proj ──────────────
-        let phase2 = device.makeCommandBuffer()
-        // Broadcast the per-head scalar across each head's headDim slice.
-        let factorTensor = Tensor.empty(
-            shape: [nHeads * headDim],
-            dtype: attnOut.dtype, device: device)
-        var factorFlat = [Float](repeating: 0, count: nHeads * headDim)
-        for h in 0 ..< nHeads {
-            for d in 0 ..< headDim { factorFlat[h * headDim + d] = factors[h] }
-        }
-        writeGPTOSSFloats(factorFlat, into: factorTensor)
-        let corrected = Ops.mul(
-            attnOut.reshaped(to: [nHeads * headDim]),
-            factorTensor, on: phase2)
-        // Un-rotate out of AURA's Π space before o_proj. The per-head
-        // sink factor is a scalar, so it commutes with Πᵀ — un-rotating
-        // after the rescale is equivalent. No-op for raw / affine.
+        // Un-rotate out of AURA's Π space, then o_proj — all still on `cmd`.
         let result = oProj(
             auraUnrotatedOutput(
-                corrected, cache: cache, nHeads: nHeads, headDim: headDim, on: phase2),
-            on: phase2)
-        phase2.commit()
-        phase2.waitUntilCompleted()
+                attnOut, cache: cache, nHeads: nHeads, headDim: headDim, on: cmd),
+            on: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
         return result
     }
 }
