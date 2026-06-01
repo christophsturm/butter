@@ -62,25 +62,27 @@
    input size and resize/pad/tile internally. FFAI matches this — the user
    never pre-sizes, and we never throw "unsupported size". The fix for quality
    is implementing each model's *real* processor, not adding size errors.
-2. **On-the-fly preprocessing — but it must still be optimized.** Doing
-   resize/normalize/patchify as part of inference is the right shape (no
-   pre-baking). For *single-shot* inference the cost is dwarfed by the forward
-   pass, so it's not a latency problem TODAY. BUT the current helpers are
-   **single-threaded CPU and unoptimized** (`ImagePreprocessing.resize` is a
-   scalar triple `for`-loop; the Gemma 4 patch-unfold / pool / embedder and the
-   audio magnitude-mel front-end are CPU `toFloatArray` loops / a CPU DFT). At
-   **real-time / streaming video fps** these CPU passes become a per-frame tax
-   on the hot path. So: parallelize (`DispatchQueue.concurrentPerform`) at
-   minimum, and **move resize/normalize/patchify + the mel front-end onto the
-   GPU** (an `Ops.resizeBilinear` / GPU normalize, a magnitude-mel kernel) so
-   the whole pre→tower→LLM path is GPU-resident. See §12.
+2. **GPU / parallel is MANDATORY, not a follow-up.** On-the-fly preprocessing
+   is the right shape, but it must be **optimized from the start** — every new
+   media op (resize, normalize, patchify, pool, mel) ships **GPU-kernel-backed
+   (or at minimum `concurrentPerform`-parallelized)**, never a scalar CPU loop.
+   Today's helpers are single-threaded CPU (`ImagePreprocessing.resize` triple
+   `for`; Gemma 4 patch-unfold / pool / embedder; the audio magnitude-mel CPU
+   DFT) — these become a per-frame tax at real-time fps and are the **kernel
+   backlog in §12**. When a needed kernel is missing, **write the kernel**
+   (metaltile, with a paired GPU-correctness test) rather than falling back to
+   CPU. Goal: a fully GPU-resident decode→preprocess→tower→LLM path.
 3. **AVFoundation over ffmpeg (for now).** FFAI targets Apple Silicon;
    AVFoundation is already used for audio, is hardware-accelerated, and avoids a
    heavy native dep. Revisit ffmpeg only for formats AVFoundation can't decode
    (MKV, some AVI codecs) or true cross-platform (Linux).
-4. **Source-level, tested helpers.** Preprocessing/decode live in `Sources/FFAI`
-   with their own unit tests; the *same* helpers are used by the models AND by
-   the integration tests (no test-only decode path that drifts from production).
+4. **One consolidated `MediaUtils` module, tested.** All media I/O +
+   preprocessing — `smart_resize`, tile-splitting, GPU resize/normalize,
+   AVFoundation decode (image/audio/video), camera/mic capture — lives in a
+   single `Sources/FFAI/Media/MediaUtils.swift` (folding in / superseding the
+   scattered `ImagePreprocessing` + `AudioPreprocessing` over time). The *same*
+   module is used by the models AND the integration tests (no test-only decode
+   path that drifts from production); each op gets a unit test.
 
 ---
 
@@ -143,33 +145,36 @@ tile-splitting (4 models) are the two reusable helpers to build (§4) — each
 covers a whole family. Highest-impact first build: **Qwen `smart_resize`** (4
 models) using the Gemma 4 `preprocessImage`-hook pattern.
 
-*(Cells are the starting hypothesis; the audit confirms each against the
-reference image/video/feature processor.)* Highest-impact fix after Gemma 4:
-**Qwen2-VL native-resolution** processor (3 models share it).
+---
+
+## 4. `MediaUtils` — the consolidated module (build + test)
+
+One module — **`Sources/FFAI/Media/MediaUtils.swift`** — owns all media I/O +
+preprocessing, GPU/parallel-first (§2.2), with unit tests, reused by models AND
+integration tests. It folds in / supersedes the scattered `ImagePreprocessing`
++ `AudioPreprocessing` over time. Contents:
+- **Resize / normalize** — GPU bilinear resize + GPU normalize/NCHW (the kernels
+  in §12); `concurrentPerform` as the interim until each kernel lands.
+- **Resolution processors** (the `preprocessImage` implementations the audit
+  demands): `smart_resize` (native, aspect-preserving, ≤ min/max-pixel bounds),
+  `tileSplit` (sub-images + global thumbnail), `letterboxSquare`, and the
+  existing Gemma 4 aspect-ratio variant. Each gets a **pure geometry unit test**
+  like `Gemma4VisionGeometryTests` (fast, no model).
+- **Decode** (AVFoundation) — §5.
+- **Capture** (camera/mic) — §6.
+
+Integration tests per modality per model use the real `MediaUtils` path (the
+Gemma 4 image/audio/video integration tests are the template).
 
 ---
 
-## 4. Source-level helpers (build + test)
+## 5. Media decode in `MediaUtils` (AVFoundation) — files + formats
 
-Centralize in `Sources/FFAI` with unit tests; reuse from models + integration
-tests:
-- `ImagePreprocessing`: keep `resize` (bilinear) + `preprocess`; add the
-  per-model processor variants the audit demands (aspect-ratio-preserving /
-  letterbox-pad / tile-split / native-resolution smart-resize). Each gets a
-  geometry unit test like `Gemma4VisionGeometryTests` (pure, fast, no model).
-- A small **`MediaDecoding`** module (AVFoundation) — see §5.
-- Integration tests per modality per model use the real helpers (the Gemma 4
-  image/audio/video integration tests are the template).
-
----
-
-## 5. Media decode in core (AVFoundation) — files + formats
-
-Add an AVFoundation-backed decode API to **core** (not just tests):
-- `MediaDecoding.image(url:) -> RGBImage` (still images: png/jpeg/heic/…).
-- `MediaDecoding.audio(url:targetRate:) -> [Float]` (wrap existing
+AVFoundation-backed decode in **core** (not just tests), under `MediaUtils`:
+- `MediaUtils.decodeImage(url:) -> RGBImage` (png/jpeg/heic/…).
+- `MediaUtils.decodeAudio(url:targetRate:) -> [Float]` (wrap existing
   `loadWaveform`).
-- `MediaDecoding.videoFrames(url:fps:maxFrames:) -> [(RGBImage, timestampSec)]`
+- `MediaUtils.decodeVideoFrames(url:fps:maxFrames:) -> [(RGBImage, timestampSec)]`
   via `AVAssetImageGenerator` (sampling) or `AVAssetReader` (full decode). Must
   also surface **timestamps** (Gemma 4 video prompts need `mm:ss`).
 
@@ -291,60 +296,69 @@ pre-size:
 - `ffai generate --video clip.mp4 --prompt "..." [--fps 1 --max-frames 8]`
 - `ffai generate --audio speech.wav --prompt "Transcribe this."`
 - `ffai generate --camera --prompt "Describe what you see" --stream` (needs §6+§7)
-Decode via the §5 core `MediaDecoding`; preprocess via the model's processor;
-stream output once §7a lands.
+Decode + preprocess via the core `MediaUtils` (§4/§5); stream output once §7a
+lands.
 
 ---
 
 ## 10. Prioritized roadmap
 
-1. **Resolution/processor AUDIT + docs** (§3) — cheap, high value, prevents
-   silent quality loss; informs the Qwen rollout.
-2. **VLM respects generation params** (§7a / §1) — route `runGreedy` through
+> Living list — **update status here as each item lands** (`✅ DONE` /
+> `🔨 IN PROGRESS` / `⏳`). Every item ships GPU/parallel (§2.2, §12), never a
+> CPU fallback.
+
+1. ✅ **DONE** — **Resolution/processor AUDIT + docs** (§3). 7 distort, 4
+   incomplete, 4 faithful; audio fine. Results table in §3; tasks #29/#30 filed.
+2. ⏳ **VLM respects generation params** (§7a / §1) — route `runGreedy` through
    `Generate` so the multimodal path samples per `defaultGenerationParameters`
-   instead of always-argmax. Correctness fix; also the prerequisite for VLM
-   streaming output. Do early.
-3. **`smart_resize` native-resolution helper** (§3/§4) — highest-impact: one
-   helper fixes **Qwen2/2.5/3/3.5-VL** (4 models, currently force-squared) and
-   self-contains **GLM-OCR**; the aspect-cap variant fixes **Pixtral + Mistral3**.
-   Same `preprocessImage`-hook pattern as Gemma 4.
-4. **Tile/slice-splitting helper** (§3/§4) — fixes the 4 incomplete tile models
-   (MiniCPM-V, Idefics3, SmolVLM2, LFM2-VL) — cut into tiles + global thumbnail,
-   encode per tile, concat. Plus FastVLM letterbox-pad (cheap).
-5. **Combined multi-modal `generate`** (§8) — small; unlocks audio+video.
-6. **Core `MediaDecoding`** (§5) — mp4/mov + audio + frame-sampling-with-timestamps.
-7. **GPU + parallel preprocessing** (§12) — needed before real-time fps.
-8. **VLM streaming output** (§7a) — builds on #2.
-9. **CLI raw-input commands** (§9).
-10. **Streaming audio input** (§7b) + **camera source** (§6).
-11. **Real-time video loop** (§7c) — depends on #8 + rotating-eviction KV cache.
-12. *(Later)* ffmpeg/VLCKit backend for AVI/MKV if demanded.
+   instead of always-argmax. **Correctness fix** (affects every VLM today,
+   incl. the Gemma 4 paths just shipped) + the prerequisite for VLM streaming.
+   **Do first** — no kernels, self-contained.
+3. ⏳ **`MediaUtils` foundation + K1/K2 kernels** (§4, §12) — create
+   `Media/MediaUtils.swift`; write the **GPU `resize_bilinear` (K1)** +
+   **normalize→NCHW (K2)** kernels (metaltile + correctness tests) so the
+   preprocessing base is GPU from the start. Everything below builds on this.
+4. ⏳ **`smart_resize` native-resolution processors** (§3) — on the K1/K2 base:
+   fixes **Qwen2/2.5/3/3.5-VL** (4 models) + **GLM-OCR** + (aspect-cap)
+   **Pixtral/Mistral3**. Highest-impact resolution win; `preprocessImage`-hook
+   pattern + geometry unit tests + mlx-vlm oracle validation.
+5. ⏳ **Tile/slice-splitting processors** (§3) — MiniCPM-V, Idefics3, SmolVLM2,
+   LFM2-VL (tiles + thumbnail, encode-per-tile, concat) + FastVLM letterbox.
+6. ⏳ **Combined multi-modal `generate`** (§8) — small; unlocks audio+video.
+7. ⏳ **`MediaUtils` decode** (§5) — AVFoundation mp4/mov + audio +
+   frame-sampling-with-timestamps in core.
+8. ⏳ **Finish the GPU preprocessing backlog** (§12, K3–K6) — magnitude-mel
+   kernel + GPU the Gemma 4 unfold/pool/pos-emb/embed stages.
+9. ⏳ **VLM streaming output** (§7a) — builds on #2.
+10. ⏳ **CLI raw-input commands** (§9).
+11. ⏳ **Streaming audio input** (§7b) + **camera source** (§6, + K7 motion-diff).
+12. ⏳ **Real-time video loop** (§7c) — depends on #9 + rotating-eviction KV cache.
+13. ⏳ *(Later)* ffmpeg/VLCKit backend for AVI/MKV if demanded.
 
 ---
 
-## 12. Preprocessing performance (GPU + parallelize)
+## 12. Kernel backlog (GPU/parallel — write these, don't CPU-fall-back)
 
-The preprocessing/front-end helpers are currently **single-threaded CPU and
-unoptimized**. Fine for single-shot latency, but a per-frame tax for real-time
-video and just wasteful. To make the whole pre→tower→LLM path GPU-resident:
-- **`ImagePreprocessing.resize`** — scalar triple loop (`ImagePreprocessing.swift`
-  `resize`). Parallelize now (`concurrentPerform`); GPU later (an
-  `Ops.resizeBilinear` sampling kernel, or `MPSImageScale`).
-- **normalize + NCHW pack** — CPU loop in `preprocess`; fold into a GPU
-  normalize/transpose (or the resize kernel's output).
-- **Gemma 4 vision tower CPU stages** — patch-unfold, attention-pooling, and the
-  multimodal-embedder RMSNorm still run on CPU via `toFloatArray` loops
-  (`Gemma4Vision.swift`). GPU these (unfold → a gather/copy kernel; pool → an
-  avg-pool kernel; embed RMSNorm → `Ops.rmsNormRows`).
-- **Gemma 4 audio magnitude-mel front-end** — a CPU DFT (`Gemma4AudioFrontend.swift`).
-  Add a **magnitude-mel GPU kernel** (the existing `Ops.melSpectrogram` is
-  power-only); big win for long clips and streaming audio.
-- **AVFoundation decode** is already hardware-accelerated; the CPU cost there is
-  only the `CMSampleBuffer`/`CGImage` → `RGBImage` copy — keep it tight (avoid
-  extra allocations per frame in the streaming loop).
+Per §2.2, every media op must be GPU-kernel-backed (or `concurrentPerform`).
+This is the **backlog of missing kernels** — each is `metaltile` work with a
+paired GPU-correctness test (the transpose / clamp kernels are the template),
+then an `Ops.*` wrapper + `OpsTests`. Drawn from by the features that need them.
 
-Each gets a correctness test (GPU vs the CPU reference) like the kernel work
-already landed. Sequenced before the real-time video loop (#10).
+| # | Kernel | Replaces (CPU today) | Needed by |
+|---|---|---|---|
+| K1 | **`resize_bilinear`** (+ optional bicubic) | `ImagePreprocessing.resize` scalar triple-loop | every image/video preprocess; `smart_resize`/tiling (#29/#30) |
+| K2 | **normalize + interleaved→NCHW pack** | `preprocess` CPU loop | every preprocess (fold into K1's output) |
+| K3 | **`magnitude_mel`** (sqrt before filterbank) | Gemma 4 audio CPU DFT (`Gemma4AudioFrontend`) | Gemma 4 audio; streaming audio (the existing `mel_spectrogram` is power-only) |
+| K4 | **avg-pool (kxk grid)** | Gemma 4 vision `pool` CPU loop | Gemma 4 vision tower; tile models |
+| K5 | **patch-unfold / im2col gather** | Gemma 4 `unfoldPatches` CPU loop | Gemma 4 + any patch-embed tower |
+| K6 | **2D position-embedding gather/add** | Gemma 4 `positionEmbedding` CPU loop | Gemma 4 vision |
+| K7 | **luma down-scale + frame-diff (SAD)** | — (new) | real-time video motion-gating (§7c) |
+
+Notes: the multimodal-embedder RMSNorm already has `Ops.rmsNormRows` (just wire
+it). AVFoundation decode is hardware-accelerated; keep the `CGImage→RGBImage`
+copy allocation-free in the streaming loop. **K1/K2 are the foundation** (used
+by every model) — build them with the `smart_resize` work (#3). **K3** unblocks
+fast/streaming audio. **K4–K6** finish making the Gemma 4 tower fully GPU.
 
 ---
 
