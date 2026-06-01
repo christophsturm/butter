@@ -1828,4 +1828,71 @@ struct OpsTests {
                 "sdpaBidirectionalRelPos GPU diverges from CPU reference (max |Δ| \(maxDiff))")
         }
     }
+
+    @Test("depthwiseConv2dNHWC — GPU matches a CPU NHWC reference (3×3 s1 pad1)")
+    func depthwiseConv2dNHWC() {
+        autoreleasepool {
+            let batch = 1, ch = 4, inH = 8, inW = 8
+            let kH = 3, kW = 3, stride = 1, pad = 1, dilation = 1
+            let outH = (inH + 2 * pad - dilation * (kH - 1) - 1) / stride + 1
+            let outW = (inW + 2 * pad - dilation * (kW - 1) - 1) / stride + 1
+
+            func ramp(_ n: Int, _ period: Int, _ amp: Float) -> [Float] {
+                (0 ..< n).map { (Float($0 % period) / Float(period) - 0.5) * amp }
+            }
+            let input = ramp(batch * inH * inW * ch, 13, 6.0)
+            let weight = ramp(ch * kH * kW, 11, 4.0)
+            let bias = ramp(ch, 5, 2.0)
+
+            // CPU NHWC reference.
+            var expected = [Float](repeating: 0, count: batch * outH * outW * ch)
+            for n in 0 ..< batch {
+                for oh in 0 ..< outH {
+                    for ow in 0 ..< outW {
+                        for c in 0 ..< ch {
+                            var acc = bias[c]
+                            for ky in 0 ..< kH {
+                                let ph = oh * stride + ky * dilation
+                                if ph < pad || ph >= pad + inH { continue }
+                                let ih = ph - pad
+                                for kx in 0 ..< kW {
+                                    let pw = ow * stride + kx * dilation
+                                    if pw < pad || pw >= pad + inW { continue }
+                                    let iw = pw - pad
+                                    let inIdx = ((n * inH + ih) * inW + iw) * ch + c
+                                    let wIdx = (c * kH + ky) * kW + kx
+                                    acc += input[inIdx] * weight[wIdx]
+                                }
+                            }
+                            expected[((n * outH + oh) * outW + ow) * ch + c] = acc
+                        }
+                    }
+                }
+            }
+
+            let inT = Tensor.empty(shape: [batch, inH, inW, ch], dtype: .f32)
+            inT.copyIn(from: input)
+            let wT = Tensor.empty(shape: [ch, kH, kW], dtype: .f32)
+            wT.copyIn(from: weight)
+            let bT = Tensor.empty(shape: [ch], dtype: .f32)
+            bT.copyIn(from: bias)
+
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.depthwiseConv2dNHWC(
+                    input: inT, weight: wT, bias: bT,
+                    batch: batch, channels: ch, inH: inH, inW: inW,
+                    kH: kH, kW: kW, stride: stride, padding: pad, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            #expect(got.count == expected.count)
+            var maxDiff: Float = 0
+            for i in 0 ..< min(got.count, expected.count) {
+                maxDiff = max(maxDiff, abs(got[i] - expected[i]))
+            }
+            #expect(
+                maxDiff < 1e-4,
+                "depthwiseConv2dNHWC GPU diverges from CPU reference (max |Δ| \(maxDiff))")
+        }
+    }
 }

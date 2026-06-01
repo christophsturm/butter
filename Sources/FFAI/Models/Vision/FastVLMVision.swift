@@ -163,13 +163,17 @@ struct FoldedBN {
 
 // ─── NHWC convolution helpers ─────────────────────────────────────────
 
-/// CPU depthwise convolution in NHWC format.
-/// Weight layout: [outC, kH, kW, 1] OHWI (depthwise: inC_per_group = 1).
-/// Applies `padding` on all sides (same-padding when padding = (kH-1)/2).
-/// Parallelized over batch × channel using DispatchQueue.concurrentPerform.
+/// Depthwise convolution in NHWC format — **GPU-backed** via
+/// `Ops.depthwiseConv2dNHWC` (the `depthwise_conv2d_nhwc` metaltile kernel).
+/// Weight layout: [outC, kH, kW, 1] OHWI (depthwise: inC_per_group = 1) ==
+/// `[C, kH, kW]` flat. Applies `padding` on all sides (same-padding when
+/// padding = (kH-1)/2).
 ///
-/// Used for all depthwise (groups = channels) convolutions in FastViTHD,
-/// since FFAI's Ops.conv2d is NCHW-only and doesn't support grouped conv.
+/// Same `[Float] → … → [Float]` signature as before so the FastViTHD call
+/// sites are unchanged; the per-call `[Float]→Tensor→GPU→[Float]`
+/// round-trip mirrors `pointwiseConvNHWC` (FastVLM keeps its feature
+/// pyramid in host arrays). Replaces the prior CPU `concurrentPerform`
+/// loop — `Ops.conv2d` is NCHW-only, hence the dedicated NHWC kernel.
 private func depthwiseConvNHWC(
     _ input: [Float], w: [Float], bias: [Float]?,
     B: Int, H: Int, W: Int, C: Int,
@@ -177,43 +181,21 @@ private func depthwiseConvNHWC(
 ) -> ([Float], Int, Int) {
     let outH = (H + 2 * padding - kH) / stride + 1
     let outW = (W + 2 * padding - kW) / stride + 1
-    var output = [Float](repeating: 0, count: B * outH * outW * C)
-    let totalWork = B * C
-    output.withUnsafeMutableBufferPointer { outBuf in
-        nonisolated(unsafe) let outPtr = outBuf.baseAddress!
-        input.withUnsafeBufferPointer { inBuf in
-            w.withUnsafeBufferPointer { wBuf in
-                nonisolated(unsafe) let inPtr = inBuf.baseAddress!
-                nonisolated(unsafe) let wPtr = wBuf.baseAddress!
-                DispatchQueue.concurrentPerform(iterations: totalWork) { work in
-                    let b = work / C
-                    let c = work % C
-                    for oh in 0 ..< outH {
-                        for ow in 0 ..< outW {
-                            var acc: Float = 0
-                            let ih0 = oh * stride - padding
-                            let iw0 = ow * stride - padding
-                            for ky in 0 ..< kH {
-                                let ih = ih0 + ky
-                                if ih < 0 || ih >= H { continue }
-                                for kx in 0 ..< kW {
-                                    let iw = iw0 + kx
-                                    if iw < 0 || iw >= W { continue }
-                                    let inIdx = ((b * H + ih) * W + iw) * C + c
-                                    // Weight is OHWI depthwise: [c, ky, kx, 0]
-                                    let wIdx = (c * kH + ky) * kW + kx
-                                    acc += inPtr[inIdx] * wPtr[wIdx]
-                                }
-                            }
-                            let outIdx = ((b * outH + oh) * outW + ow) * C + c
-                            outPtr[outIdx] = acc + (bias?[c] ?? 0)
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return (output, outH, outW)
+    let device = Device.shared
+    let inT = floatToTensor(input, shape: [B, H, W, C], dtype: .f32, device: device)
+    let wT = floatToTensor(w, shape: [C, kH, kW], dtype: .f32, device: device)
+    // The kernel always adds a bias; pass zeros when the conv has none.
+    let biasT = floatToTensor(
+        bias ?? [Float](repeating: 0, count: C), shape: [C],
+        dtype: .f32, device: device)
+    let cmd = device.makeCommandBuffer()
+    let outT = Ops.depthwiseConv2dNHWC(
+        input: inT, weight: wT, bias: biasT,
+        batch: B, channels: C, inH: H, inW: W,
+        kH: kH, kW: kW, stride: stride, padding: padding, on: cmd)
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    return (outT.toFloatArray(), outH, outW)
 }
 
 /// CPU pointwise (1×1) convolution as matrix-multiply, GPU-accelerated.

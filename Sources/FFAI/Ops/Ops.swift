@@ -6945,6 +6945,85 @@ public enum Ops {
         return result
     }
 
+    /// NHWC depthwise 2D convolution (`groups == channels`). Each output
+    /// channel convolves only its own input channel with a `kH × kW`
+    /// filter. Channel-last to match the FastVLM / FastViTHD (MobileCLIP)
+    /// stem (replaces its CPU `concurrentPerform` depthwise loop).
+    ///
+    /// Layouts: `input` NHWC `[batch, inH, inW, channels]`; `weight`
+    /// depthwise `[channels, kH, kW]` (in-ch-per-group 1, squeezed);
+    /// `bias` `[channels]`; `out` NHWC `[batch, outH, outW, channels]`.
+    /// Same-padding when `padding = (k − 1) / 2`. Backed by
+    /// `metaltile-std/src/ffai/depthwise_conv2d_nhwc.rs` — Grid3D, one
+    /// thread per output element, dispatched flat.
+    public static func depthwiseConv2dNHWC(
+        input: Tensor, weight: Tensor, bias: Tensor,
+        batch: Int, channels: Int, inH: Int, inW: Int,
+        kH: Int, kW: Int, stride: Int, padding: Int, dilation: Int = 1,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            input.dtype == weight.dtype && weight.dtype == bias.dtype,
+            "Ops.depthwiseConv2dNHWC: input/weight/bias dtype mismatch")
+        precondition(stride > 0, "Ops.depthwiseConv2dNHWC: stride must be positive")
+        precondition(
+            bias.elementCount == channels,
+            "Ops.depthwiseConv2dNHWC: bias \(bias.elementCount) != channels \(channels)")
+        precondition(
+            weight.elementCount == channels * kH * kW,
+            "Ops.depthwiseConv2dNHWC: weight \(weight.elementCount) != "
+                + "channels·kH·kW \(channels * kH * kW)")
+        precondition(
+            input.elementCount == batch * inH * inW * channels,
+            "Ops.depthwiseConv2dNHWC: input \(input.elementCount) != "
+                + "batch·inH·inW·channels \(batch * inH * inW * channels)")
+        let outH = (inH + 2 * padding - dilation * (kH - 1) - 1) / stride + 1
+        let outW = (inW + 2 * padding - dilation * (kW - 1) - 1) / stride + 1
+        precondition(
+            outH > 0 && outW > 0,
+            "Ops.depthwiseConv2dNHWC: degenerate output \(outH)x\(outW)")
+        let result =
+            out ?? Tensor.empty(shape: [batch, outH, outW, channels], dtype: input.dtype)
+        let totalThreads = batch * outH * outW * channels
+        let (grid, tg) = elementwiseGrid(totalThreads)
+        let b = UInt32(batch), ch = UInt32(channels)
+        let ih = UInt32(inH), iw = UInt32(inW), oh = UInt32(outH), ow = UInt32(outW)
+        let kh = UInt32(kH), kw = UInt32(kW)
+        let st = UInt32(stride), pd = UInt32(padding), dl = UInt32(dilation)
+        switch input.dtype {
+        case .f32:
+            MetalTileKernels.depthwise_conv2d_nhwc_f32(
+                input: input.buffer, inputOffset: input.offset,
+                weight: weight.buffer, weightOffset: weight.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                out: result.buffer, outOffset: result.offset,
+                batch: b, ch: ch, in_h: ih, in_w: iw, out_h: oh, out_w: ow,
+                k_h: kh, k_w: kw, stride: st, pad: pd, dilation: dl,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.depthwise_conv2d_nhwc_f16(
+                input: input.buffer, inputOffset: input.offset,
+                weight: weight.buffer, weightOffset: weight.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                out: result.buffer, outOffset: result.offset,
+                batch: b, ch: ch, in_h: ih, in_w: iw, out_h: oh, out_w: ow,
+                k_h: kh, k_w: kw, stride: st, pad: pd, dilation: dl,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.depthwise_conv2d_nhwc_bf16(
+                input: input.buffer, inputOffset: input.offset,
+                weight: weight.buffer, weightOffset: weight.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                out: result.buffer, outOffset: result.offset,
+                batch: b, ch: ch, in_h: ih, in_w: iw, out_h: oh, out_w: ow,
+                k_h: kh, k_w: kw, stride: st, pad: pd, dilation: dl,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.depthwiseConv2dNHWC: unsupported dtype \(input.dtype)")
+        }
+        return result
+    }
+
     // ─── Vision: patch_embed ─────────────────────────────────────────
 
     /// Fused image-unfold + linear-projection patch embedding for vision
