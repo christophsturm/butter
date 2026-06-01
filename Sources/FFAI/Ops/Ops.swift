@@ -4262,6 +4262,86 @@ public enum Ops {
         return result
     }
 
+    /// Bidirectional multi-/grouped-query SDPA at **head_dim == 128** with
+    /// an additive **relative-position bias** on the scores — the variant
+    /// the Conformer / GraniteSpeech-style acoustic encoders need. For
+    /// (query `i` at absolute position `baseKV + i`, key `j`), the score is
+    /// `scale·(Qᵢ·Kⱼ) + bias[head, (j + relZero) − (baseKV + i)]` before the
+    /// (bidirectional) softmax. `bias` is a per-head `[nQHeads, relLen]` f32
+    /// vector indexed by relative offset; pick `relZero = baseKV + nQuery −
+    /// 1` and `relLen = baseKV + 2·nQuery − 1` so every reachable offset is
+    /// covered (the index clamps into `[0, relLen)` for safety).
+    ///
+    /// Q / `out` layout `[nQuery, nQHeads, 128]`; K / V layout
+    /// `[nKVHeads, kvStride, 128]`. Same TPG=1024 reduction dispatch as
+    /// `sdpaBidirectional` (one threadgroup per `(query, q_head)`).
+    public static func sdpaBidirectionalRelPos(
+        q: Tensor, k: Tensor, v: Tensor, bias: Tensor,
+        nQHeads: Int, nKVHeads: Int,
+        baseKV: Int, nQuery: Int, kvStride: Int,
+        relZero: Int, relLen: Int,
+        scale: Float,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        let headDim = 128
+        precondition(
+            nQHeads % nKVHeads == 0,
+            "Ops.sdpaBidirectionalRelPos: nQHeads \(nQHeads) not a multiple "
+                + "of nKVHeads \(nKVHeads)")
+        precondition(
+            bias.dtype == .f32 && bias.elementCount == nQHeads * relLen,
+            "Ops.sdpaBidirectionalRelPos: bias must be f32 [nQHeads·relLen] "
+                + "(\(nQHeads * relLen)), got \(bias.dtype) count \(bias.elementCount)")
+        precondition(
+            relZero >= 0 && relLen > 0,
+            "Ops.sdpaBidirectionalRelPos: relZero/relLen must be non-negative")
+        let headsPerGroup = nQHeads / nKVHeads
+        let result = out ?? Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: q.dtype)
+        // TPG = 1024 (32 simdgroups × 32 lanes), one threadgroup per
+        // (query, q_head) — same reduction geometry as sdpaBidirectional.
+        let threadsPerGroup = 1024
+        let grid = MTLSize(width: nQHeads * nQuery * threadsPerGroup, height: 1, depth: 1)
+        let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+        let hd = UInt32(headDim)
+        let nqh = UInt32(nQHeads)
+        let bkv = UInt32(baseKV)
+        let nq = UInt32(nQuery)
+        let kvs = UInt32(kvStride)
+        let hpg = UInt32(headsPerGroup)
+        let rz = UInt32(relZero)
+        let rl = UInt32(relLen)
+        switch q.dtype {
+        case .f32:
+            MetalTileKernels.ffai_sdpa_bidirectional_d128_relpos_f32(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, bias: bias.buffer, biasOffset: bias.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
+                kv_stride: kvs, heads_per_group: hpg, rel_zero: rz, rel_len: rl,
+                scale: scale, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_sdpa_bidirectional_d128_relpos_f16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, bias: bias.buffer, biasOffset: bias.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
+                kv_stride: kvs, heads_per_group: hpg, rel_zero: rz, rel_len: rl,
+                scale: scale, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_sdpa_bidirectional_d128_relpos_bf16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, bias: bias.buffer, biasOffset: bias.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
+                kv_stride: kvs, heads_per_group: hpg, rel_zero: rz, rel_len: rl,
+                scale: scale, gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.sdpaBidirectionalRelPos: unsupported dtype \(q.dtype)")
+        }
+        return result
+    }
+
     // MARK: - AURA
 
     /// AURA fused encode for `rows` flat vectors of length `dim`.

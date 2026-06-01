@@ -1747,4 +1747,85 @@ struct OpsTests {
             #expect(mismatches == 0, "\(mismatches) transposed elements mismatched")
         }
     }
+
+    @Test("sdpaBidirectionalRelPos — GPU matches a CPU naive reference (d128)")
+    func sdpaBidirectionalRelPos() {
+        autoreleasepool {
+            // Conformer-style encoder self-attention: MHA, base_kv=0,
+            // nQuery=nKv=L, headDim=128, per-head additive relpos bias.
+            let headDim = 128
+            let nQHeads = 4, nKVHeads = 4
+            let baseKV = 0, nQuery = 20
+            let kvStride = baseKV + nQuery
+            let relZero = baseKV + nQuery - 1
+            let relLen = baseKV + 2 * nQuery - 1
+            let scale = 1.0 / Float(Double(headDim).squareRoot())
+            let gqa = nQHeads / nKVHeads
+            let nKV = baseKV + nQuery
+
+            func ramp(_ n: Int, _ step: Float, _ start: Float) -> [Float] {
+                (0 ..< n).map { (start + Float($0) * step).truncatingRemainder(dividingBy: 2.0) - 1.0 }
+            }
+            let q = ramp(nQuery * nQHeads * headDim, 0.013, -0.4)
+            let k = ramp(nKVHeads * kvStride * headDim, 0.011, -0.5)
+            let v = ramp(nKVHeads * kvStride * headDim, 0.007, -0.3)
+            let bias = (0 ..< nQHeads * relLen).map { (Float($0 % 7) - 3.0) * 0.05 }
+
+            // CPU naive reference (mirrors the metaltile oracle):
+            // softmax_j( scale·Qᵢ·Kⱼ + bias[h, (j+relZero)-(baseKV+i)] )·Vⱼ.
+            var expected = [Float](repeating: 0, count: nQuery * nQHeads * headDim)
+            for r in 0 ..< nQuery {
+                let qAbs = baseKV + r
+                for qh in 0 ..< nQHeads {
+                    let kvh = qh / gqa
+                    let qOff = (r * nQHeads + qh) * headDim
+                    let kvSlab = kvh * kvStride * headDim
+                    var scores = [Float](repeating: 0, count: nKV)
+                    for t in 0 ..< nKV {
+                        let kOff = kvSlab + t * headDim
+                        var dot: Float = 0
+                        for d in 0 ..< headDim { dot += q[qOff + d] * k[kOff + d] }
+                        let rel = min(max(0, t + relZero - qAbs), relLen - 1)
+                        scores[t] = dot * scale + bias[qh * relLen + rel]
+                    }
+                    let m = scores.max() ?? 0
+                    var sum: Float = 0
+                    for t in 0 ..< nKV { scores[t] = exp(scores[t] - m); sum += scores[t] }
+                    let inv = sum > 0 ? 1 / sum : 0
+                    for d in 0 ..< headDim {
+                        var acc: Float = 0
+                        for t in 0 ..< nKV { acc += scores[t] * inv * v[kvSlab + t * headDim + d] }
+                        expected[qOff + d] = acc
+                    }
+                }
+            }
+
+            let qT = Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: .f32)
+            qT.copyIn(from: q)
+            let kT = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            kT.copyIn(from: k)
+            let vT = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            vT.copyIn(from: v)
+            let biasT = Tensor.empty(shape: [nQHeads, relLen], dtype: .f32)
+            biasT.copyIn(from: bias)
+
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.sdpaBidirectionalRelPos(
+                    q: qT, k: kT, v: vT, bias: biasT,
+                    nQHeads: nQHeads, nKVHeads: nKVHeads,
+                    baseKV: baseKV, nQuery: nQuery, kvStride: kvStride,
+                    relZero: relZero, relLen: relLen, scale: scale, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            #expect(got.count == expected.count)
+            var maxDiff: Float = 0
+            for i in 0 ..< min(got.count, expected.count) {
+                maxDiff = max(maxDiff, abs(got[i] - expected[i]))
+            }
+            #expect(
+                maxDiff < 1e-3,
+                "sdpaBidirectionalRelPos GPU diverges from CPU reference (max |Δ| \(maxDiff))")
+        }
+    }
 }
