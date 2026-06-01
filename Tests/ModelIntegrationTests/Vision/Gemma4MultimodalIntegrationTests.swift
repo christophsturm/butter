@@ -256,7 +256,12 @@ struct Gemma4MultimodalIntegrationTests {
         #expect(nAudioTokens > 0, "encoder produced no audio soft tokens")
 
         // Build the chat prompt: a user turn whose content is the wrapped
-        // audio span followed by a transcription instruction.
+        // audio span followed by a transcription instruction. Gemma 4 is
+        // BOS-critical and the multimodal generate path doesn't auto-prepend
+        // one — the prompt carries an explicit leading <bos> (the image path
+        // needs this too).
+        let bos = try #require(
+            m.tokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
         let userPrefix = m.tokenizer.encode(text: "<start_of_turn>user\n")
         let userSuffix = m.tokenizer.encode(
             text: "\nTranscribe this audio.<end_of_turn>\n<start_of_turn>model\n")
@@ -264,7 +269,7 @@ struct Gemma4MultimodalIntegrationTests {
             [Self.boaTokenId]
             + Array(repeating: audioTokenId, count: nAudioTokens)
             + [Self.eoaTokenId]
-        let promptTokens = userPrefix + audioSpan + userSuffix
+        let promptTokens = [bos] + userPrefix + audioSpan + userSuffix
 
         let generated = try vlm.generate(
             promptTokens: promptTokens, audio: waveform,
