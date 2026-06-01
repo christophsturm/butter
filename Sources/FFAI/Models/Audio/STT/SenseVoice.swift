@@ -457,7 +457,7 @@ public final class SenseVoiceModel: @unchecked Sendable {
         let fsmnMemory = fsmn(layer, v: va, nRows: nRows)
 
         // Bidirectional multi-head attention over the V-derived context.
-        let ctx = cpuAttention(
+        let ctx = attention(
             qa: qa, ka: ka, va: va, nRows: nRows,
             heads: layer.heads, headDim: layer.headDim,
             scale: layer.scale, device: device)
@@ -540,6 +540,61 @@ public final class SenseVoiceModel: @unchecked Sendable {
     /// disjoint `[oBase, oBase + headDim)` output slice — race-free by
     /// construction. Mirrors the parallelization of
     /// `AudioEncoderLayer.cpuAttention`.
+    /// Bidirectional multi-head attention over the SAN-M block's Q/K/V
+    /// (plain MHA — the FSMN memory is added separately by the caller).
+    /// Runs on the **GPU** for the head dims a kernel covers: SenseVoice's
+    /// head_dim is 128 (hidden 512 / 4 heads) → `Ops.sdpaMulti(causal:
+    /// false)`; the smaller bidirectional dims route to
+    /// `Ops.sdpaBidirectional`. Falls back to the parallel CPU loop for any
+    /// uncovered head dim. `qa`/`ka`/`va` are frame-major
+    /// `[nRows, heads·headDim]`.
+    private func attention(
+        qa: [Float], ka: [Float], va: [Float],
+        nRows: Int, heads: Int, headDim: Int,
+        scale: Float, device: Device
+    ) -> Tensor {
+        let stride = heads * headDim
+        let isMultiDim = headDim == 128 || headDim == 256
+        let isBidirDim = OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(headDim)
+        guard isMultiDim || isBidirDim else {
+            return cpuAttention(
+                qa: qa, ka: ka, va: va, nRows: nRows, heads: heads,
+                headDim: headDim, scale: scale, device: device)
+        }
+        // Upload Q/K/V frame-major; transpose K/V to head-major for the
+        // SDPA contract (Q stays frame-major / `[nRows, heads, headDim]`).
+        let qT = Tensor.empty(shape: [nRows, stride], dtype: dtype, device: device)
+        AudioPreprocessing.copyFloats(qa, into: qT)
+        let kT = Tensor.empty(shape: [nRows, stride], dtype: dtype, device: device)
+        AudioPreprocessing.copyFloats(ka, into: kT)
+        let vT = Tensor.empty(shape: [nRows, stride], dtype: dtype, device: device)
+        AudioPreprocessing.copyFloats(va, into: vT)
+        let cmd = device.makeCommandBuffer()
+        let kHead = Ops.transposeTokensToHeads(
+            kT, nTokens: nRows, nHeads: heads, headDim: headDim, on: cmd)
+        let vHead = Ops.transposeTokensToHeads(
+            vT, nTokens: nRows, nHeads: heads, headDim: headDim, on: cmd)
+        let qReshaped = qT.reshaped(to: [nRows, heads, headDim])
+        let attn: Tensor
+        if isMultiDim {
+            attn = Ops.sdpaMulti(
+                q: qReshaped, k: kHead, v: vHead,
+                nQHeads: heads, nKVHeads: heads, headDim: headDim,
+                baseKV: 0, nQuery: nRows, kvStride: nRows,
+                causal: false, scale: scale, on: cmd)
+        } else {
+            attn = Ops.sdpaBidirectional(
+                q: qReshaped, k: kHead, v: vHead,
+                nQHeads: heads, nKVHeads: heads, headDim: headDim,
+                baseKV: 0, nQuery: nRows, kvStride: nRows,
+                scale: scale, on: cmd)
+        }
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return attn.reshaped(to: [nRows, stride])
+    }
+
+    /// CPU fallback for `attention` (head dims no SDPA kernel covers).
     private func cpuAttention(
         qa: [Float], ka: [Float], va: [Float],
         nRows: Int, heads: Int, headDim: Int,
