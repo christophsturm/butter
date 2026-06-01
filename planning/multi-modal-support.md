@@ -84,28 +84,64 @@
 
 ---
 
-## 3. Per-model resolution / processor AUDIT (to produce)
+## 3. Per-model resolution / processor AUDIT (results, 2026-05-31)
 
-Build a table — one row per VL + audio model — and document it (in
-`documentation/` + a capability table). This surfaces every model silently
-distorting input and feeds the SmolVLM/Qwen rollout.
+Audited every VL/audio model's input handling against the mlx-vlm reference.
+**Only Gemma 4 overrides `preprocessImage`** — every other VLM routes through
+the shared `VisionModel.encodeImage` → generic **fixed-square**
+`preprocess(targetW: imageSize, targetH: imageSize)` (`VisionModel.swift:189-197`).
+There is **zero** smart-resize / tiling / pan-and-scan anywhere in
+`Sources/FFAI/Vision/`. Worst offenders first:
 
-| Model | Modality | Reference processor | Native sizes | FFAI today | Faithful? |
-|---|---|---|---|---|---|
-| Gemma 4 VL | image/video | aspect-ratio variable (≤ maxPatches, ×48) | any | variable ✅ | ✅ |
-| Gemma 4 audio | audio | 16 kHz mel, USM Conformer | 16 kHz | ✅ | ✅ |
-| Qwen2-VL | image/video | **native resolution** (smart-resize) | any | **fixed square** | ❌ distorts |
-| Qwen2.5-VL | image/video | native resolution + windows | any | **fixed square** | ❌ distorts |
-| Qwen3-VL | image/video | native resolution | any | **fixed square** | ❌ distorts |
-| SmolVLM2 | image | SigLIP fixed + image splitting | 384 tiles | fixed square | ⚠️ verify tiling |
-| Idefics3 | image | SigLIP 364 + splitting | 364 tiles | fixed square | ⚠️ verify tiling |
-| PaliGemma | image | SigLIP fixed 224/448 | fixed | fixed square | likely ✅ |
-| Pixtral | image | native-ish | any | fixed square | ❌ verify |
-| MiniCPM-V | image | tiling / slices | tiles | fixed square | ⚠️ |
-| Mistral3 | image | Pixtral-style | any | fixed square | ⚠️ |
-| FastVLM | image | fixed | fixed | fixed square | likely ✅ |
-| GLM-OCR | image | fixed 336 | fixed | fixed square | likely ✅ |
-| Whisper / Parakeet / … | audio | 16 kHz log-mel | 16 kHz | ✅ (verify mel) | ⚠️ |
+| Model | Modality | Reference processor | Native | Patch | Token count | FFAI today | Verdict |
+|---|---|---|---|---|---|---|---|
+| **Qwen2-VL** | img+vid | native `smart_resize` (min/max-pixels, aspect) | any | 14, merge 2 | variable | fixed 28×28→392² (`Qwen2Vision.swift:334` "fixed-grid for now") | ❌ distorts+truncates |
+| **Qwen2.5-VL** | img+vid | native `smart_resize` | any | 14, merge 2 | variable | fixed 28×28→392² (`Qwen25Vision.swift:446,545`) | ❌ distorts+truncates |
+| **Qwen3-VL** | img+vid | native `smart_resize` | any | 16, merge 2 | variable | fixed 32×32² (`Qwen3Vision.swift:342`) | ❌ distorts+truncates |
+| **Qwen3.5-VL** | img+vid | native `smart_resize` | any | 16, merge 2 | variable | fixed grid (Qwen3 tower, `Qwen3xVision.swift:147`) | ❌ distorts+truncates |
+| **Pixtral** | image | native aspect (longest-edge cap) | ≤1024 | 16 | variable | fixed 336² (`PixtralVision.swift:104`) | ❌ distorts+truncates |
+| **Mistral3** | image | native aspect (Pixtral-style) | ≤1540 | 16, merge 2 | variable | fixed `imageSize²` (`Mistral3Vision.swift:329,341`) | ❌ distorts+truncates |
+| **FastVLM** | image | pad-to-square (letterbox) then resize | 1024 | conv ÷4 | fixed | plain square resize, no pad (`FastVLMVision.swift:49`) | ❌ mild (lost aspect) |
+| **MiniCPM-V** | img+vid | tile/slice split (`scale_res 448` + grid) | 448/slice | 14 | post-merge | single square, no slicing (`MiniCPMVVision.swift:648,685`) | ⚠️ incomplete |
+| **Idefics3** | image | tile split (`do_image_splitting` + thumbnail) | 364/tile | 14, shuffle 2 | 169/tile × N | single 364², no split (`Idefics3Vision.swift:51`) | ⚠️ incomplete |
+| **SmolVLM2** | img+vid | tile split + thumbnail | 512/tile | 16, shuffle 4 | 64/tile × N | single 512², no split (`SmolVLM2Vision.swift:54`) | ⚠️ incomplete |
+| **LFM2-VL** | image | tile split (`tile 512`, ≤256 tokens) | 512/tile | 16, unshuffle | ≤256 pooled | single square, no tiling (`LFM2Vision.swift:62`) | ⚠️ incomplete |
+| **GLM-OCR** | image | native `smart_resize` (Qwen family) | any | 16, merge 2 | variable | aspect-preserving at encode (`GlmOcrVision.swift:745`); but **caller must pre-resize** | ✅ encode-faithful (⚠️ no in-tree smart_resize) |
+| **PaliGemma** | image | fixed-square SigLIP | 224/448/896 | 14 | fixed | fixed square (`PaligemmaVision.swift:733`) | ✅ faithful |
+| **NemotronH** | image | fixed-square SigLIP | config | config | fixed | fixed square (`NemotronHVision.swift:54`) | ✅ faithful |
+| **Gemma 4 VL** | img+vid | aspect-ratio variable | any | 16 | variable | overrides `preprocessImage` → `[1,3,H,W]` | ✅ faithful (reference row) |
+
+**Audio** — all 16 kHz, standard log-mel/FBANK, nothing unusual: Whisper (80/128
+bins), Parakeet (NeMo 128), Qwen3-ASR (128), SenseVoice (Kaldi FBANK→LFR 80),
+GLM-ASR (128), Gemma 4 audio (USM, done). No action.
+
+**Net:** **7 distort** (Qwen ×4 + Pixtral + Mistral3 force native/aspect into a
+square = highest impact; FastVLM mild), **4 incomplete** (tile/slice models run
+single-tile → lose detail on large/non-square images), **4 faithful**
+(PaliGemma, NemotronH, GLM-OCR, Gemma 4). Audio uniformly fine.
+
+### Faithful-fix per family
+- **Qwen2/2.5/3/3.5-VL** — replace the `defaultGridSide` constant with
+  `smart_resize` (round H,W to `patch·merge` under min/max-pixel bounds) →
+  feed the native grid into the already-variable `encode(frames:)` temporal
+  unfold; facade must report the *runtime* merged token count.
+- **Pixtral / Mistral3** — override `preprocessImage`: aspect-preserving resize
+  to longest-edge cap (336 / 1540) rounded to `patch·merge`, emit `[1,3,H,W]`;
+  thread `image_sizes` through (encoder already has a per-image `numPatches`).
+- **MiniCPM-V / Idefics3 / SmolVLM2 / LFM2-VL** — implement
+  `do_image_splitting`/slicing: cut into tiles + a global thumbnail, run the
+  existing single-tile encoder per tile, concat tokens (pixel-shuffle is already
+  per-tile correct). Today they emit exactly one tile's worth.
+- **FastVLM** — add letterbox pad-to-square (`expand2square`) before the resize
+  via a `preprocessImage` override. Cheap.
+- **GLM-OCR** — add an in-tree `smart_resize` so the path is self-contained
+  (encode is already aspect-correct).
+- **PaliGemma / NemotronH / Gemma 4** — no change.
+
+The native-resolution `smart_resize` (Qwen + GLM-OCR + Pixtral/Mistral3) and the
+tile-splitting (4 models) are the two reusable helpers to build (§4) — each
+covers a whole family. Highest-impact first build: **Qwen `smart_resize`** (4
+models) using the Gemma 4 `preprocessImage`-hook pattern.
 
 *(Cells are the starting hypothesis; the audit confirms each against the
 reference image/video/feature processor.)* Highest-impact fix after Gemma 4:
@@ -268,16 +304,21 @@ stream output once §7a lands.
    `Generate` so the multimodal path samples per `defaultGenerationParameters`
    instead of always-argmax. Correctness fix; also the prerequisite for VLM
    streaming output. Do early.
-3. **Qwen2-VL native-resolution processor** (§3/§4) — highest-impact faithful
-   fix (3 models). Same `preprocessImage`-hook pattern as Gemma 4.
-4. **Combined multi-modal `generate`** (§8) — small; unlocks audio+video.
-5. **Core `MediaDecoding`** (§5) — mp4/mov + audio + frame-sampling-with-timestamps.
-6. **GPU + parallel preprocessing** (§12) — needed before real-time fps.
-7. **VLM streaming output** (§7a) — builds on #2.
-8. **CLI raw-input commands** (§9).
-9. **Streaming audio input** (§7b) + **camera source** (§6).
-10. **Real-time video loop** (§7c) — depends on #7 + rotating-eviction KV cache.
-11. *(Later)* ffmpeg/VLCKit backend for AVI/MKV if demanded.
+3. **`smart_resize` native-resolution helper** (§3/§4) — highest-impact: one
+   helper fixes **Qwen2/2.5/3/3.5-VL** (4 models, currently force-squared) and
+   self-contains **GLM-OCR**; the aspect-cap variant fixes **Pixtral + Mistral3**.
+   Same `preprocessImage`-hook pattern as Gemma 4.
+4. **Tile/slice-splitting helper** (§3/§4) — fixes the 4 incomplete tile models
+   (MiniCPM-V, Idefics3, SmolVLM2, LFM2-VL) — cut into tiles + global thumbnail,
+   encode per tile, concat. Plus FastVLM letterbox-pad (cheap).
+5. **Combined multi-modal `generate`** (§8) — small; unlocks audio+video.
+6. **Core `MediaDecoding`** (§5) — mp4/mov + audio + frame-sampling-with-timestamps.
+7. **GPU + parallel preprocessing** (§12) — needed before real-time fps.
+8. **VLM streaming output** (§7a) — builds on #2.
+9. **CLI raw-input commands** (§9).
+10. **Streaming audio input** (§7b) + **camera source** (§6).
+11. **Real-time video loop** (§7c) — depends on #8 + rotating-eviction KV cache.
+12. *(Later)* ffmpeg/VLCKit backend for AVI/MKV if demanded.
 
 ---
 
