@@ -126,7 +126,7 @@ final class Qwen3VLVisionBlock {
         cmd.commit()
         cmd.waitUntilCompleted()
 
-        let attn = cpuAttention(
+        let attn = attention(
             qkv: qkvOut, nTokens: nTokens,
             cosTable: cosTable, sinTable: sinTable,
             device: device)
@@ -154,8 +154,85 @@ final class Qwen3VLVisionBlock {
         return result
     }
 
-    /// CPU full bidirectional multi-head attention with M-RoPE. `qkv` is
-    /// the fused `[nTokens, 3·hidden]` projection. Returns the context
+    /// Full bidirectional multi-head attention with M-RoPE on the **GPU**
+    /// `sdpaBidirectional` kernel (mirrors the Qwen2-VL migration). `qkv` is
+    /// the fused `[nTokens, 3·hidden]` projection; returns the context
+    /// token-major `[nTokens, hidden]`.
+    ///
+    /// Cheap M-RoPE stays on CPU (`O(n·d)`, preserves the exact validated
+    /// table numerics); the `O(n²·d)` attention runs on GPU. Falls back to
+    /// the parallel CPU attention if the head dim is not one the kernel
+    /// supports (32/64/72/80/96).
+    private func attention(
+        qkv: Tensor, nTokens: Int,
+        cosTable: [Float], sinTable: [Float],
+        device: Device
+    ) -> Tensor {
+        let nHeads = cfg.numHeads
+        let headDim = cfg.headDim
+        let hidden = cfg.hidden
+        guard OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(headDim) else {
+            return cpuAttention(
+                qkv: qkv, nTokens: nTokens,
+                cosTable: cosTable, sinTable: sinTable, device: device)
+        }
+        let half = headDim / 2
+        let qkvA = qkv.toFloatArray()
+
+        // Stage 1 (CPU): split per head + M-RoPE → token-major q/k/v.
+        nonisolated(unsafe) var qTok = [Float](repeating: 0, count: nTokens * hidden)
+        nonisolated(unsafe) var kTok = [Float](repeating: 0, count: nTokens * hidden)
+        nonisolated(unsafe) var vTok = [Float](repeating: 0, count: nTokens * hidden)
+        qkvA.withUnsafeBufferPointer { srcBuf in
+            nonisolated(unsafe) let s = srcBuf.baseAddress!
+            DispatchQueue.concurrentPerform(iterations: nHeads * nTokens) { work in
+                let head = work / nTokens
+                let t = work % nTokens
+                let hOff = head * headDim
+                let qBase = t * 3 * hidden + hOff
+                let kBase = t * 3 * hidden + hidden + hOff
+                let vBase = t * 3 * hidden + 2 * hidden + hOff
+                let cb = t * headDim
+                let dst = t * hidden + hOff
+                for d in 0 ..< headDim {
+                    let c = cosTable[cb + d]
+                    let sn = sinTable[cb + d]
+                    let qRot = d < half ? -s[qBase + d + half] : s[qBase + d - half]
+                    let kRot = d < half ? -s[kBase + d + half] : s[kBase + d - half]
+                    qTok[dst + d] = s[qBase + d] * c + qRot * sn
+                    kTok[dst + d] = s[kBase + d] * c + kRot * sn
+                    vTok[dst + d] = s[vBase + d]
+                }
+            }
+        }
+
+        // Stage 2 (GPU): bidirectional MHA via sdpaBidirectional.
+        let qT = Tensor.empty(shape: [nTokens, hidden], dtype: qkv.dtype, device: device)
+        let kT = Tensor.empty(shape: [nTokens, hidden], dtype: qkv.dtype, device: device)
+        let vT = Tensor.empty(shape: [nTokens, hidden], dtype: qkv.dtype, device: device)
+        ImagePreprocessing.copyFloats(qTok, into: qT)
+        ImagePreprocessing.copyFloats(kTok, into: kT)
+        ImagePreprocessing.copyFloats(vTok, into: vT)
+
+        let cmd = device.makeCommandBuffer()
+        let kHead = Ops.transposeTokensToHeads(
+            kT, nTokens: nTokens, nHeads: nHeads, headDim: headDim, on: cmd)
+        let vHead = Ops.transposeTokensToHeads(
+            vT, nTokens: nTokens, nHeads: nHeads, headDim: headDim, on: cmd)
+        let scale = 1.0 / Float(Double(headDim).squareRoot())
+        let attnOut = Ops.sdpaBidirectional(
+            q: qT, k: kHead, v: vHead,
+            nQHeads: nHeads, nKVHeads: nHeads, headDim: headDim,
+            baseKV: 0, nQuery: nTokens, kvStride: nTokens,
+            scale: scale, on: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return attnOut.reshaped(to: [nTokens, hidden])
+    }
+
+    /// CPU full bidirectional multi-head attention with M-RoPE (fallback
+    /// for head dims the GPU SDPA kernel doesn't support). `qkv` is the
+    /// fused `[nTokens, 3·hidden]` projection. Returns the context
     /// token-major `[nTokens, hidden]`.
     ///
     /// Two-stage parallelization with `DispatchQueue.concurrentPerform`:
