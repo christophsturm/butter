@@ -610,16 +610,29 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
     }
 
     /// Aspect-ratio-preserving target `(height, width)` for the
-    /// variable-resolution image processor: the largest dims that (1)
-    /// produce at most `maxPatches` patches at `patchSize`, and (2) are
-    /// divisible by `poolingKernelSize · patchSize`. Mirrors the reference
-    /// `get_aspect_ratio_preserving_size` (`image_processing_pil_gemma4`).
+    /// variable-resolution image processor (instance form — pulls the
+    /// geometry from `cfg`).
     func aspectPreservingSize(width: Int, height: Int) -> (h: Int, w: Int) {
-        let patch = cfg.patchSize
-        let pool = cfg.poolingKernelSize
-        let maxPatches = cfg.defaultOutputLength * pool * pool
-        let sideMult = pool * patch
-        let targetPx = Double(maxPatches * patch * patch)
+        Gemma4VLVisionModel.aspectPreservingSize(
+            width: width, height: height,
+            patchSize: cfg.patchSize, poolingKernelSize: cfg.poolingKernelSize,
+            maxSoftTokens: cfg.defaultOutputLength)
+    }
+
+    /// Aspect-ratio-preserving target `(height, width)`: the largest dims
+    /// that (1) produce at most `maxPatches = maxSoftTokens · pool²` patches
+    /// at `patchSize`, and (2) are divisible by `pool · patchSize`. Mirrors
+    /// the reference `get_aspect_ratio_preserving_size`
+    /// (`image_processing_pil_gemma4`). Pure geometry — `static` so it is
+    /// unit-testable across aspect ratios without a loaded tower.
+    static func aspectPreservingSize(
+        width: Int, height: Int,
+        patchSize: Int, poolingKernelSize: Int, maxSoftTokens: Int
+    ) -> (h: Int, w: Int) {
+        let pool = poolingKernelSize
+        let maxPatches = maxSoftTokens * pool * pool
+        let sideMult = pool * patchSize
+        let targetPx = Double(maxPatches * patchSize * patchSize)
         let factor = (targetPx / Double(width * height)).squareRoot()
         var th =
             Int((factor * Double(height) / Double(sideMult)).rounded(.down))
@@ -876,11 +889,16 @@ final class Gemma4VLComposedEncoder: VisionEncoder {
     }
 
     /// Video path: run every frame through the same Gemma 4 vision tower
-    /// and concatenate the per-frame soft tokens into one
-    /// `[nFrames · tokensPerImage, textHidden]` run. Gemma 4 has no bespoke
-    /// temporal-patch fold — a video is a temporally-ordered sequence of
-    /// images, each contributing `tokensPerImage` soft tokens, spliced at
-    /// the prompt's `video_token_id` placeholders in frame order.
+    /// and concatenate the per-frame soft tokens in frame order. Gemma 4 has
+    /// no bespoke temporal-patch fold — a video is a temporally-ordered
+    /// sequence of images, each contributing its (variable-resolution) soft
+    /// tokens, spliced at the prompt's `video_token_id` placeholders.
+    ///
+    /// Each frame's soft-token count is VARIABLE (the aspect-ratio-
+    /// preserving processor), so the total is summed from the actual
+    /// per-frame encodes rather than assuming a fixed `tokensPerImage`. The
+    /// prompt must carry exactly `Σ per-frame counts` placeholders (the
+    /// caller learns this by encoding first).
     override func encode(
         frames: [Tensor], device: Device = .shared
     ) throws -> Tensor {
@@ -888,19 +906,16 @@ final class Gemma4VLComposedEncoder: VisionEncoder {
             !frames.isEmpty,
             "Gemma4VLComposedEncoder.encode(frames:): expected ≥ 1 frame")
         let textHidden = tower.textHidden
-        let perFrame = tower.tokensPerImage
-        // VALIDATE: video soft-token count = nFrames · tokensPerImage, in
-        // frame order; the prompt must carry exactly that many
-        // `video_token_id` placeholders (one per soft token).
         var flat = [Float]()
-        flat.reserveCapacity(frames.count * perFrame * textHidden)
+        var totalTokens = 0
         for frame in frames {
             let soft = tower.encode(image: frame, device: device)
+            totalTokens += soft.shape[0]
             flat.append(contentsOf: soft.toFloatArray())
         }
         return ImagePreprocessing.makeTensor(
             from: flat,
-            shape: [frames.count * perFrame, textHidden],
+            shape: [totalTokens, textHidden],
             dtype: tower.dtype, device: device)
     }
 }

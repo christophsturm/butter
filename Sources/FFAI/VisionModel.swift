@@ -214,10 +214,13 @@ public final class VisionModel: @unchecked Sendable {
             "VisionModel.encodeVideo: expected at least one frame")
         let cfg = visionEncoder.config
         let pixels: [Tensor] = frames.map { frame in
-            ImagePreprocessing.preprocess(
-                frame, targetW: cfg.imageSize, targetH: cfg.imageSize,
-                normalization: normalization, dtype: visionEncoder.dtype,
-                device: device)
+            // Honour a family-specific processor (Gemma 4's variable
+            // resolution) per frame; otherwise the generic fixed square.
+            visionEncoder.preprocessImage(frame, device: device)
+                ?? ImagePreprocessing.preprocess(
+                    frame, targetW: cfg.imageSize, targetH: cfg.imageSize,
+                    normalization: normalization, dtype: visionEncoder.dtype,
+                    device: device)
         }
         return try visionEncoder.encode(frames: pixels, device: device)
     }
