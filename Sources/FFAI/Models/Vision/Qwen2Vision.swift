@@ -125,7 +125,7 @@ final class Qwen2VLVisionBlock {
         cmd.commit()
         cmd.waitUntilCompleted()
 
-        let attn = cpuAttention(
+        let attn = attention(
             qkv: qkvOut, nTokens: nTokens,
             cosTable: cosTable, sinTable: sinTable,
             device: device)
@@ -153,17 +153,26 @@ final class Qwen2VLVisionBlock {
         return result
     }
 
-    /// CPU full bidirectional multi-head attention with M-RoPE. `qkv` is
-    /// the fused `[nTokens, 3·hidden]` projection. Returns the context
-    /// token-major `[nTokens, hidden]`.
+    /// Full bidirectional multi-head attention with M-RoPE on the **GPU**
+    /// `sdpaBidirectional` kernel. `qkv` is the fused `[nTokens, 3·hidden]`
+    /// projection. Returns the context token-major `[nTokens, hidden]`.
     ///
-    /// Two-stage parallelization with `DispatchQueue.concurrentPerform`:
-    ///   1. Setup — M-RoPE: each `(head, token)` pair writes its own
-    ///      `qH[head*nTokens+t]` / `kH[head*nTokens+t]` / `vH[head*nTokens+t]`
-    ///      row — disjoint, race-free.
-    ///   2. Attention — per `(head, query-row)`: writes to a disjoint
-    ///      `[oBase, oBase + headDim)` output slice.
-    private func cpuAttention(
+    /// Hybrid CPU→GPU split (mirrors the Gemma 4 vision migration, #23):
+    ///   1. **CPU (cheap, `O(n·d)`):** split q/k/v per head and apply Qwen's
+    ///      M-RoPE from the precomputed `cos`/`sin` tables
+    ///      (`out[d] = x[d]·cos − x[d±half]·sin`, GPT-NeoX rotate-half),
+    ///      producing token-major q/k/v `[nTokens, nHeads·headDim]`. Kept on
+    ///      CPU so the rope numerics stay byte-identical to the validated
+    ///      table build; it is negligible next to the attention.
+    ///   2. **GPU (`O(n²·d)`, the former CPU pin):** transpose k/v
+    ///      token-major → head-major (`Ops.transposeTokensToHeads`), then
+    ///      `Ops.sdpaBidirectional` (MHA, `nKVHeads == nQHeads`), scale
+    ///      `1/√headDim`, baseKV 0, `kvStride == nTokens`. The
+    ///      `ffai_sdpa_bidirectional_d80_*` kernel is GPU-correct at this
+    ///      production geometry (`sdpa_bidirectional_gpu_correctness.rs`),
+    ///      so the native-resolution grid (thousands of patches) no longer
+    ///      pins the cores.
+    private func attention(
         qkv: Tensor, nTokens: Int,
         cosTable: [Float], sinTable: [Float],
         device: Device
@@ -171,84 +180,63 @@ final class Qwen2VLVisionBlock {
         let nHeads = cfg.numHeads
         let headDim = cfg.headDim
         let hidden = cfg.hidden
-        let qkvA = qkv.toFloatArray()
-        var out = [Float](repeating: 0, count: nTokens * hidden)
-        let scale = 1.0 / Float(Double(headDim).squareRoot())
         let half = headDim / 2
+        let qkvA = qkv.toFloatArray()
 
-        // Stage 1: Extract and RoPE every (head, token) slice.
-        // Index layout: qH[head * nTokens + t] — each (head, t) pair owns
-        // its slot, so concurrent writes are race-free.
-        // `nonisolated(unsafe)`: disjoint indices, no aliasing.
-        nonisolated(unsafe) var qH = [[Float]](repeating: [], count: nHeads * nTokens)
-        nonisolated(unsafe) var kH = [[Float]](repeating: [], count: nHeads * nTokens)
-        nonisolated(unsafe) var vH = [[Float]](repeating: [], count: nHeads * nTokens)
-        DispatchQueue.concurrentPerform(iterations: nHeads * nTokens) { work in
-            let head = work / nTokens
-            let t = work % nTokens
-            let hOff = head * headDim
-            let base = t * 3 * hidden
-            var q = Array(qkvA[(base + hOff) ..< (base + hOff + headDim)])
-            var k = Array(qkvA[(base + hidden + hOff) ..< (base + hidden + hOff + headDim)])
-            let v = Array(qkvA[(base + 2 * hidden + hOff) ..< (base + 2 * hidden + hOff + headDim)])
-            // Apply M-RoPE inline. Qwen's rotate-half scheme:
-            // out[d] = x[d]·cos − x[d±half]·sin. Defined inside the
-            // closure to avoid @Sendable capture warnings.
-            func applyRope(_ x: inout [Float], tok: Int) {
-                let cb = tok * headDim
-                for d in 0 ..< headDim {
-                    let rotated = d < half ? -x[d + half] : x[d - half]
-                    let c = cosTable[cb + d]
-                    let s = sinTable[cb + d]
-                    x[d] = x[d] * c + rotated * s
-                }
-            }
-            applyRope(&q, tok: t)
-            applyRope(&k, tok: t)
-            qH[head * nTokens + t] = q
-            kH[head * nTokens + t] = k
-            vH[head * nTokens + t] = v
-        }
-
-        // Stage 2: Full attention — every token attends to every token.
-        // Each (head, i) writes to a disjoint [oBase, oBase+headDim) slice.
-        out.withUnsafeMutableBufferPointer { outBuf in
-            nonisolated(unsafe) let outPtr = outBuf.baseAddress!
+        // ── Stage 1 (CPU): split per head + M-RoPE → token-major q/k/v ──
+        // Each (head, token) owns a disjoint `[dst, dst+headDim)` slot, so
+        // the concurrent writes are race-free. `nonisolated(unsafe)`: the
+        // index math guarantees no aliasing.
+        nonisolated(unsafe) var qTok = [Float](repeating: 0, count: nTokens * hidden)
+        nonisolated(unsafe) var kTok = [Float](repeating: 0, count: nTokens * hidden)
+        nonisolated(unsafe) var vTok = [Float](repeating: 0, count: nTokens * hidden)
+        qkvA.withUnsafeBufferPointer { srcBuf in
+            nonisolated(unsafe) let s = srcBuf.baseAddress!
             DispatchQueue.concurrentPerform(iterations: nHeads * nTokens) { work in
                 let head = work / nTokens
-                let i = work % nTokens
+                let t = work % nTokens
                 let hOff = head * headDim
-                var scores = [Float](repeating: 0, count: nTokens)
-                var maxS = -Float.greatestFiniteMagnitude
-                for j in 0 ..< nTokens {
-                    var dot: Float = 0
-                    let qVec = qH[head * nTokens + i]
-                    let kVec = kH[head * nTokens + j]
-                    for d in 0 ..< headDim { dot += qVec[d] * kVec[d] }
-                    let s = dot * scale
-                    scores[j] = s
-                    if s > maxS { maxS = s }
-                }
-                var sum: Float = 0
-                for j in 0 ..< nTokens {
-                    let e = exp(scores[j] - maxS)
-                    scores[j] = e
-                    sum += e
-                }
-                let inv = sum > 0 ? 1 / sum : 0
-                let oBase = i * hidden + hOff
-                for j in 0 ..< nTokens {
-                    let w = scores[j] * inv
-                    let vVec = vH[head * nTokens + j]
-                    for d in 0 ..< headDim { outPtr[oBase + d] += w * vVec[d] }
+                let qBase = t * 3 * hidden + hOff
+                let kBase = t * 3 * hidden + hidden + hOff
+                let vBase = t * 3 * hidden + 2 * hidden + hOff
+                let cb = t * headDim
+                let dst = t * hidden + hOff
+                for d in 0 ..< headDim {
+                    let c = cosTable[cb + d]
+                    let sn = sinTable[cb + d]
+                    // Rotate-half within the head's headDim slice.
+                    let qRot = d < half ? -s[qBase + d + half] : s[qBase + d - half]
+                    let kRot = d < half ? -s[kBase + d + half] : s[kBase + d - half]
+                    qTok[dst + d] = s[qBase + d] * c + qRot * sn
+                    kTok[dst + d] = s[kBase + d] * c + kRot * sn
+                    vTok[dst + d] = s[vBase + d]
                 }
             }
         }
-        let result = Tensor.empty(
-            shape: [nTokens, hidden], dtype: qkv.dtype,
-            device: device)
-        ImagePreprocessing.copyFloats(out, into: result)
-        return result
+
+        // ── Stage 2 (GPU): bidirectional MHA via sdpaBidirectional ──
+        let qT = Tensor.empty(shape: [nTokens, hidden], dtype: qkv.dtype, device: device)
+        let kT = Tensor.empty(shape: [nTokens, hidden], dtype: qkv.dtype, device: device)
+        let vT = Tensor.empty(shape: [nTokens, hidden], dtype: qkv.dtype, device: device)
+        ImagePreprocessing.copyFloats(qTok, into: qT)
+        ImagePreprocessing.copyFloats(kTok, into: kT)
+        ImagePreprocessing.copyFloats(vTok, into: vT)
+
+        let cmd = device.makeCommandBuffer()
+        let kHead = Ops.transposeTokensToHeads(
+            kT, nTokens: nTokens, nHeads: nHeads, headDim: headDim, on: cmd)
+        let vHead = Ops.transposeTokensToHeads(
+            vT, nTokens: nTokens, nHeads: nHeads, headDim: headDim, on: cmd)
+        let scale = 1.0 / Float(Double(headDim).squareRoot())
+        let attnOut = Ops.sdpaBidirectional(
+            q: qT, k: kHead, v: vHead,
+            nQHeads: nHeads, nKVHeads: nHeads, headDim: headDim,
+            baseKV: 0, nQuery: nTokens, kvStride: nTokens,
+            scale: scale, on: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        // `[nTokens, nHeads, headDim]` contiguous == `[nTokens, hidden]`.
+        return attnOut.reshaped(to: [nTokens, hidden])
     }
 
     /// Apply a `Linear` to every row of `[nTokens, *]` via `Ops.gemm`,
@@ -362,7 +350,8 @@ final class Qwen2VLVisionModel: @unchecked Sendable {
 
     static func load(
         visionConfig: ModelConfig, textHidden: Int,
-        weights: SafeTensorsBundle, dtype: DType, device: Device
+        weights: SafeTensorsBundle, dtype: DType,
+        quantization: ModelConfig.QuantizationConfig?, device: Device
     ) throws -> Qwen2VLVisionModel {
         let cfg = try Qwen2VLVisionConfig.decode(visionConfig)
 
@@ -387,10 +376,14 @@ final class Qwen2VLVisionModel: @unchecked Sendable {
         blocks.reserveCapacity(cfg.depth)
         for i in 0 ..< cfg.depth {
             let p = "blocks.\(i)"
+            // Dequantize at load: the 4-/8-bit Qwen2-VL conversions quantize
+            // the ViT linears too, but the block holds plain `Linear` fields
+            // driving `Ops.gemm` on `.weight`, so a packed u32 weight must be
+            // materialized to a float weight here.
             func lin(_ name: String) throws -> Linear {
-                let w = try weights.tensor(named: "\(p).\(name).weight")
-                let b = try? weights.tensor(named: "\(p).\(name).bias")
-                return Linear(weight: w, bias: b)
+                try loadDequantizedLinear(
+                    base: "\(p).\(name)", in: weights,
+                    quantization: quantization, dtype: dtype, device: device)
             }
             // Qwen2-VL blocks use LayerNorm (weight + bias).
             func norm(_ name: String) throws -> LayerNorm {
@@ -420,9 +413,9 @@ final class Qwen2VLVisionModel: @unchecked Sendable {
             bias: try weights.tensor(named: "merger.ln_q.bias"),
             eps: cfg.layerNormEps)
         func mergerLin(_ idx: Int) throws -> Linear {
-            let w = try weights.tensor(named: "merger.mlp.\(idx).weight")
-            let b = try? weights.tensor(named: "merger.mlp.\(idx).bias")
-            return Linear(weight: w, bias: b)
+            try loadDequantizedLinear(
+                base: "merger.mlp.\(idx)", in: weights,
+                quantization: quantization, dtype: dtype, device: device)
         }
         let mergerFC1 = try mergerLin(0)
         let mergerFC2 = try mergerLin(2)

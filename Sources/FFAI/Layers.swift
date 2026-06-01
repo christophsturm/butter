@@ -407,6 +407,92 @@ public func loadLinear(
     return AnyLinear(Linear(weight: weight, bias: bias))
 }
 
+/// Cast a float tensor (f32/f16/bf16) to `target` dtype via a host
+/// round-trip. No-op when already matching. Used to align quant
+/// scales/biases with a dequant output dtype.
+private func castFloatTensor(
+    _ t: Tensor, to target: DType, device: Device
+) -> Tensor {
+    if t.dtype == target { return t }
+    let floats = t.toFloatArray()
+    let out = Tensor.empty(shape: t.shape, dtype: target, device: device)
+    switch target {
+    case .f32: out.copyIn(from: floats)
+    case .f16: out.copyIn(from: floats.map { Float16($0) })
+    case .bf16:
+        out.copyIn(
+            from: floats.map { v -> UInt16 in
+                let bits = v.bitPattern
+                let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
+                return UInt16(rounded >> 16)
+            })
+    default:
+        preconditionFailure("castFloatTensor: unsupported target dtype \(target)")
+    }
+    return out
+}
+
+/// Load `<base>.weight` as a plain float `Tensor`, **dequantizing** a
+/// packed affine weight to `dtype` when the checkpoint stored the linear
+/// quantized (MLX `(weight, scales, biases)` triplet). Returns the raw
+/// stored tensor unchanged for a non-quantized checkpoint.
+///
+/// This is for the towers that hold plain `Linear` fields and drive
+/// `Ops.gemm` / `Ops.gemv` directly on `.weight` (the vision ViTs:
+/// Qwen2/2.5/3/3.5-VL). Those checkpoints' 4-/8-bit conversions quantize
+/// the ViT too, so a `u32`-packed weight would otherwise reach `Linear`
+/// and the GEMM would read packed bytes as floats. Vision towers are
+/// small, so the one-time dequant is negligible. (LLM backbones use the
+/// quantized `gemv` path via `loadLinear`/`AnyLinear` instead and never
+/// hit this.)
+public func loadDequantizedWeight(
+    base: String, in bundle: SafeTensorsBundle,
+    quantization: ModelConfig.QuantizationConfig?,
+    dtype: DType, device: Device
+) throws -> Tensor {
+    guard let q = quantization, bundle.isQuantized(base) else {
+        return try bundle.tensor(named: "\(base).weight")
+    }
+    let t = try bundle.quantizedTriplet(base)
+    let bits = deriveAffineQuantBits(
+        weightPackedCols: t.weight.shape[t.weight.shape.count - 1],
+        scaleCols: t.scales.shape[t.scales.shape.count - 1],
+        groupSize: q.groupSize)
+    let outFeatures = t.weight.shape[0]
+    let inFeatures = t.scales.shape[t.scales.shape.count - 1] * q.groupSize
+    // `dequantizeAffine` requires scales/biases dtype == the out dtype.
+    let scales = castFloatTensor(t.scales, to: dtype, device: device)
+    let qbiases = castFloatTensor(t.biases, to: dtype, device: device)
+    let weight = Tensor.empty(
+        shape: [outFeatures, inFeatures], dtype: dtype, device: device)
+    let cmd = device.makeCommandBuffer()
+    QuantizedOps.dequantizeAffine(
+        weight: t.weight, scales: scales, biases: qbiases,
+        into: weight, bits: bits, groupSize: q.groupSize, on: cmd)
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    return weight
+}
+
+/// `loadDequantizedWeight` wrapped in a plain `Linear`, carrying through
+/// the optional layer bias (e.g. the Qwen QKV additive bias) unchanged.
+/// The fix for the `Qwen2-VL-*-Instruct-4bit` ViT crash where a `u32`
+/// packed weight + `f16` bias reached `Linear.init`.
+public func loadDequantizedLinear(
+    base: String, in bundle: SafeTensorsBundle,
+    quantization: ModelConfig.QuantizationConfig?,
+    dtype: DType, device: Device
+) throws -> Linear {
+    let weight = try loadDequantizedWeight(
+        base: base, in: bundle, quantization: quantization,
+        dtype: dtype, device: device)
+    let bias =
+        bundle.has("\(base).bias")
+        ? try bundle.tensor(named: "\(base).bias")
+        : nil
+    return Linear(weight: weight, bias: bias)
+}
+
 /// Slice a stacked `[numExperts, outDim, inDim]` expert tensor at
 /// `<base>.weight` into `numExperts` per-expert `AnyLinear`s. Handles
 /// both raw and mlx-quantized stacks:

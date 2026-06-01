@@ -110,7 +110,8 @@ public enum Qwen2VL {
         let visionWeights = weights.prefixed("vision_tower.")
         let vision = try Qwen2VLVisionModel.load(
             visionConfig: visionConfig, textHidden: textEngine.hidden,
-            weights: visionWeights, dtype: textEngine.dtype, device: device)
+            weights: visionWeights, dtype: textEngine.dtype,
+            quantization: config.quantization, device: device)
 
         let imageTokenId = config.int("image_token_id") ?? defaultImageTokenId
         let videoTokenId = config.int("video_token_id") ?? defaultVideoTokenId
