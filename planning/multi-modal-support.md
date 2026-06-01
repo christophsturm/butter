@@ -317,10 +317,14 @@ lands.
    Gemma 4 image/audio/video integration tests pass with sampled defaults +
    seed 42 (dog / "sure i can help you with that" / cat). *(Full streaming
    output — routing through `Generate.generateStream` — is still §7a / #9.)*
-3. ⏳ **`MediaUtils` foundation + K1/K2 kernels** (§4, §12) — create
-   `Media/MediaUtils.swift`; write the **GPU `resize_bilinear` (K1)** +
-   **normalize→NCHW (K2)** kernels (metaltile + correctness tests) so the
-   preprocessing base is GPU from the start. Everything below builds on this.
+3. ✅ **DONE** — **`MediaUtils` foundation + K1/K2 kernels**. Wrote the fused
+   **`ffai_resize_normalize`** kernel (bilinear resize + per-channel normalize
+   + interleaved→NCHW, runtime dims, K1+K2 in one Grid3D dispatch; metaltile
+   oracle test max|Δ| 2.4e-7). Added `Ops.resizeNormalize` + OpsTest and
+   `Sources/FFAI/Media/MediaUtils.swift` (`resizeNormalize(RGBImage,…)` GPU
+   path). The preprocessing base is now GPU. *(Folding `ImagePreprocessing`/
+   `AudioPreprocessing` fully into `MediaUtils` + wiring it into every model's
+   preprocess happens incrementally with #4.)*
 4. ⏳ **`smart_resize` native-resolution processors** (§3) — on the K1/K2 base:
    fixes **Qwen2/2.5/3/3.5-VL** (4 models) + **GLM-OCR** + (aspect-cap)
    **Pixtral/Mistral3**. Highest-impact resolution win; `preprocessImage`-hook

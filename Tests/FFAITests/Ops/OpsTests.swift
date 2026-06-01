@@ -1663,6 +1663,57 @@ struct OpsTests {
         }
     }
 
+    @Test("resizeNormalize f32 — bilinear resize + per-channel normalize → NCHW")
+    func resizeNormalizeF32() {
+        autoreleasepool {
+            let (sw, sh, tw, th) = (4, 3, 6, 5)
+            let mean: (Float, Float, Float) = (0.5, 0.45, 0.4)
+            let std: (Float, Float, Float) = (0.5, 0.5, 0.5)
+            var px = [Float](repeating: 0, count: sh * sw * 3)
+            for i in 0 ..< px.count { px[i] = Float(i % 13) / 13.0 }
+            let img = RGBImage(width: sw, height: sh, pixels: px)
+            let out = MediaUtils.resizeNormalize(
+                img, targetW: tw, targetH: th,
+                normalization: ImageNormalization(mean: mean, std: std))
+            #expect(out.shape == [1, 3, th, tw])
+            let got = out.toArray(as: Float.self)
+
+            // CPU bilinear reference (align_corners=false), planar NCHW.
+            let m = [mean.0, mean.1, mean.2]
+            let s = [std.0, std.1, std.2]
+            let scaleX = Float(sw) / Float(tw)
+            let scaleY = Float(sh) / Float(th)
+            func clampf(_ v: Float, _ hi: Float) -> Float { max(0, min(hi, v)) }
+            var maxDiff: Float = 0
+            for oy in 0 ..< th {
+                let syc = clampf((Float(oy) + 0.5) * scaleY - 0.5, Float(sh - 1))
+                let y0 = syc.rounded(.down)
+                let wy = syc - y0
+                let y0i = Int(y0)
+                let y1i = Int(clampf(y0 + 1, Float(sh - 1)))
+                for ox in 0 ..< tw {
+                    let sxc = clampf((Float(ox) + 0.5) * scaleX - 0.5, Float(sw - 1))
+                    let x0 = sxc.rounded(.down)
+                    let wx = sxc - x0
+                    let x0i = Int(x0)
+                    let x1i = Int(clampf(x0 + 1, Float(sw - 1)))
+                    for c in 0 ..< 3 {
+                        let p00 = px[(y0i * sw + x0i) * 3 + c]
+                        let p01 = px[(y0i * sw + x1i) * 3 + c]
+                        let p10 = px[(y1i * sw + x0i) * 3 + c]
+                        let p11 = px[(y1i * sw + x1i) * 3 + c]
+                        let top = p00 * (1 - wx) + p01 * wx
+                        let bot = p10 * (1 - wx) + p11 * wx
+                        let v = (top * (1 - wy) + bot * wy - m[c]) / s[c]
+                        let idx = (c * th + oy) * tw + ox
+                        maxDiff = max(maxDiff, abs(got[idx] - v))
+                    }
+                }
+            }
+            #expect(maxDiff < 1e-4, "resizeNormalize diverges (max \(maxDiff))")
+        }
+    }
+
     @Test(
         "transposeTokensToHeads f32 — [nTokens,nHeads,d] → [nHeads,nTokens,d] at production shape")
     func transposeTokensToHeadsF32() {

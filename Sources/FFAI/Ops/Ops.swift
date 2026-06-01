@@ -7159,6 +7159,73 @@ public enum Ops {
         return result
     }
 
+    /// Fused bilinear resize + per-channel normalize + interleaved→NCHW —
+    /// the one GPU op a VL image preprocess needs. `src` is an interleaved
+    /// `[srcH·srcW·3]` image (RGB, typically `[0,1]`); returns the planar
+    /// NCHW `[3, targetH, targetW]` tensor `(v − mean[c]) / std[c]`. Wraps
+    /// `ffai_resize_normalize` (`resize_normalize.rs` §"DISPATCH
+    /// INVARIANTS"): Grid3D, one thread per output element, align_corners
+    /// = false half-pixel sampling. Replaces the CPU triple-loop resize +
+    /// normalize.
+    public static func resizeNormalize(
+        _ src: Tensor, srcW: Int, srcH: Int,
+        targetW: Int, targetH: Int,
+        mean: (Float, Float, Float), std: (Float, Float, Float),
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            src.elementCount == srcH * srcW * 3,
+            "Ops.resizeNormalize: src count \(src.elementCount) != "
+                + "srcH·srcW·3 \(srcH * srcW * 3) (resize_normalize.rs)")
+        let result =
+            out ?? Tensor.empty(
+                shape: [3, targetH, targetW], dtype: src.dtype)
+        func u32Buf(_ v: Int) -> MTLBuffer {
+            let b = device.makeBuffer(length: 4)
+            var u = UInt32(v)
+            memcpy(b.contents(), &u, 4)
+            return b
+        }
+        let meanBuf = device.makeBuffer(length: 12)
+        var meanArr = [mean.0, mean.1, mean.2]
+        memcpy(meanBuf.contents(), &meanArr, 12)
+        let stdBuf = device.makeBuffer(length: 12)
+        var stdArr = [std.0, std.1, std.2]
+        memcpy(stdBuf.contents(), &stdArr, 12)
+        let swB = u32Buf(srcW)
+        let shB = u32Buf(srcH)
+        let twB = u32Buf(targetW)
+        let thB = u32Buf(targetH)
+        let grid = MTLSize(width: targetW, height: targetH, depth: 3)
+        let tg = MTLSize(width: 1, height: 1, depth: 1)
+        switch src.dtype {
+        case .f32:
+            MetalTileKernels.ffai_resize_normalize_f32(
+                input: src.buffer, inputOffset: src.offset,
+                mean: meanBuf, std: stdBuf,
+                out: result.buffer, outOffset: result.offset,
+                src_w: swB, src_h: shB, target_w: twB, target_h: thB,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_resize_normalize_f16(
+                input: src.buffer, inputOffset: src.offset,
+                mean: meanBuf, std: stdBuf,
+                out: result.buffer, outOffset: result.offset,
+                src_w: swB, src_h: shB, target_w: twB, target_h: thB,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_resize_normalize_bf16(
+                input: src.buffer, inputOffset: src.offset,
+                mean: meanBuf, std: stdBuf,
+                out: result.buffer, outOffset: result.offset,
+                src_w: swB, src_h: shB, target_w: twB, target_h: thB,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.resizeNormalize: unsupported dtype \(src.dtype)")
+        }
+        return result
+    }
+
     // ─── Audio front-end / vocoder ───────────────────────────────────
 
     /// Log-Mel spectrogram — the STT / audio-in front-end. Fuses the
