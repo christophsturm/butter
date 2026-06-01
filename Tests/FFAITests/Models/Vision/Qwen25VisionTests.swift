@@ -111,3 +111,73 @@ struct Qwen25VisionConfigTests {
         #expect(parsed.fullattBlockIndexes.isEmpty)
     }
 }
+
+// Offline geometry tests for the Qwen2.5-VL native-resolution (`smartResize`)
+// path: the placeholder-count helper (`smartResizeGrid`) and the
+// tensor-shape → patch-grid derivation (`gridDims`). No GPU / model load —
+// validates the variable-resolution geometry that replaced the fixed 392²
+// square grid (and the simultaneous merge-block-order unfold fix).
+@Suite("Qwen25 Vision native resolution")
+struct Qwen25VisionSmartResizeTests {
+
+    /// Standard Qwen2.5-VL vision config (patch-14, merge-2 → factor 28).
+    private func config() throws -> Qwen25VLVisionConfig {
+        try Qwen25VLVisionConfig.decode(
+            ModelConfig(
+                architecture: nil, modelType: nil,
+                raw: [
+                    "depth": 32, "hidden_size": 1280, "out_hidden_size": 2048,
+                    "num_heads": 16, "patch_size": 14,
+                    "spatial_merge_size": 2, "temporal_patch_size": 2,
+                    "window_size": 112, "fullatt_block_indexes": [7, 15, 23, 31],
+                ]))
+    }
+
+    @Test("legacy square resolution → 28×28 grid, 196 merged tokens")
+    func squareGrid() throws {
+        let cfg = try config()
+        let g = try Qwen25VLVisionModel.smartResizeGrid(
+            width: 392, height: 392, cfg: cfg)
+        #expect(g.gridH == 28 && g.gridW == 28)
+        #expect(g.mergedTokens == 196)
+    }
+
+    @Test("landscape image → non-square grid, aspect preserved")
+    func landscapeGrid() throws {
+        let cfg = try config()
+        // 1024×768 → smartResize (756, 1036) → grid 54×74.
+        let g = try Qwen25VLVisionModel.smartResizeGrid(
+            width: 1024, height: 768, cfg: cfg)
+        #expect(g.gridH == 54 && g.gridW == 74)
+        #expect(g.mergedTokens == 27 * 37)  // 999
+    }
+
+    @Test("portrait image → transposed non-square grid")
+    func portraitGrid() throws {
+        let cfg = try config()
+        let g = try Qwen25VLVisionModel.smartResizeGrid(
+            width: 768, height: 1024, cfg: cfg)
+        #expect(g.gridH == 74 && g.gridW == 54)
+        #expect(g.mergedTokens == 37 * 27)
+    }
+
+    @Test("gridDims derives the patch grid from a preprocessed tensor")
+    func gridDimsFromTensor() throws {
+        let cfg = try config()
+        // [1, 3, 56, 84] (H=56, W=84) → grid (4, 6).
+        let pixels = [Float](repeating: 0, count: 1 * 3 * 56 * 84)
+        let t = ImagePreprocessing.makeTensor(
+            from: pixels, shape: [1, 3, 56, 84], dtype: .f32, device: .shared)
+        let (gridH, gridW) = Qwen25VLVisionModel.gridDims(for: t, cfg: cfg)
+        #expect(gridH == 4 && gridW == 6)
+    }
+
+    @Test("extreme aspect ratio is rejected (unsupported size)")
+    func extremeAspectRejected() throws {
+        let cfg = try config()
+        #expect(throws: MediaUtils.SmartResizeError.self) {
+            _ = try Qwen25VLVisionModel.smartResizeGrid(
+                width: 6000, height: 28, cfg: cfg)
+        }
+    }
+}

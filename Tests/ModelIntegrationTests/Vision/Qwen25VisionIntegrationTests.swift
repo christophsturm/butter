@@ -92,21 +92,25 @@ struct Qwen25VisionIntegrationTests {
         }
         let vlm = try #require(m.vlModel, "Qwen 2.5-VL checkpoint is not a VLM")
 
-        // Build an image+text prompt: a run of `imageTokenCount`
-        // <|image_pad|> placeholders wrapped in vision-start / vision-end
-        // markers, followed by a text question. Qwen's chat template
-        // normally expands the placeholder; here we assemble it directly.
-        let imageTokenId = vlm.imageTokenId
-        let questionTokens = m.tokenizer.encode(
-            text: "<|im_start|>user\nDescribe this image.<|im_end|>\n"
-                + "<|im_start|>assistant\n")
-        let promptTokens =
-            Array(
-                repeating: imageTokenId,
-                count: vlm.imageTokenCount) + questionTokens
-
         // A real photograph — the golden-retriever fixture.
         let image = try VisionTestHelpers.dogImage()
+
+        // Native-resolution preprocessing makes the merged-token count
+        // depend on the image's aspect ratio (the `smartResize` grid), so
+        // size the placeholder run from the actual encoder output. The
+        // `<|image_pad|>` run is wrapped in vision-start / vision-end markers
+        // inside the user turn — Qwen's real chat layout.
+        let imageTokenId = vlm.imageTokenId
+        let nImageTokens = vlm.encodeImage(image).shape[0]
+        let preTokens = m.tokenizer.encode(
+            text: "<|im_start|>user\n<|vision_start|>")
+        let postTokens = m.tokenizer.encode(
+            text: "<|vision_end|>Describe this image.<|im_end|>\n"
+                + "<|im_start|>assistant\n")
+        let promptTokens =
+            preTokens
+            + Array(repeating: imageTokenId, count: nImageTokens)
+            + postTokens
 
         let generated = try vlm.generate(
             promptTokens: promptTokens, image: image,
@@ -151,13 +155,14 @@ struct Qwen25VisionIntegrationTests {
         // Pull `frameCount` evenly-spaced frames from cat.mp4.
         let frames = try VisionTestHelpers.catVideoFrames(maxFrames: Self.frameCount)
 
-        // The merged-token-per-temporal-patch count is the same as one
-        // image's merged token count — the vision tower repeats the
-        // spatial grid per temporal patch. With `temporal_patch_size`
-        // = 2 and 8 frames, the splice substitutes 4 × `imageTokenCount`
-        // rows.
+        // The merged-token-per-temporal-patch count equals one frame's
+        // native `smartResize` merged-token count (gridT=1); read it from
+        // the encoder so the count tracks the frames' actual resolution.
+        // With `temporal_patch_size` = 2 and 8 frames, the splice
+        // substitutes 4 × that per-frame count of rows.
         let temporalPatchSize = 2
-        let videoTokenCount = (frames.count / temporalPatchSize) * vlm.imageTokenCount
+        let perFrameTokens = vlm.encodeImage(frames[0]).shape[0]
+        let videoTokenCount = (frames.count / temporalPatchSize) * perFrameTokens
 
         // Build the standard Qwen 2.5-VL video prompt:
         //   <|im_start|>user\n<|vision_start|><|video_pad|>...<|vision_end|>What's in this video?<|im_end|>\n

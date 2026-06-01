@@ -420,6 +420,52 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
         return mod == 0 ? frameCount : frameCount + (tp - mod)
     }
 
+    /// Derive the patch grid `(gridH, gridW)` from a preprocessed NCHW
+    /// pixel tensor `[1, C, H, W]`: `gridH = H/patch`, `gridW = W/patch`.
+    /// Both must be whole and divisible by `spatialMergeSize` — the
+    /// `smartResize` processor guarantees this (sides multiples of
+    /// `patch · merge`).
+    static func gridDims(
+        for image: Tensor, cfg: Qwen25VLVisionConfig
+    ) -> (gridH: Int, gridW: Int) {
+        precondition(
+            image.shape.count == 4 && image.shape[0] == 1
+                && image.shape[1] == cfg.inChannels,
+            "Qwen25VL.encode: expected [1,\(cfg.inChannels),H,W], got \(image.shape)")
+        let h = image.shape[2]
+        let w = image.shape[3]
+        let p = cfg.patchSize
+        let m = cfg.spatialMergeSize
+        precondition(
+            h % (p * m) == 0 && w % (p * m) == 0,
+            "Qwen25VL.encode: H=\(h) W=\(w) must be multiples of "
+                + "patch·merge=\(p * m) (use MediaUtils.smartResize)")
+        return (h / p, w / p)
+    }
+
+    /// Standard Qwen-family `smartResize` bounds for this config
+    /// (`factor = patch · merge`, HF default token budget).
+    static func smartResizeBounds(
+        cfg: Qwen25VLVisionConfig
+    ) -> MediaUtils.SmartResizeBounds {
+        MediaUtils.SmartResizeBounds.qwen(
+            patchSize: cfg.patchSize, mergeSize: cfg.spatialMergeSize)
+    }
+
+    /// The native `(gridH, gridW)` patch grid `smartResize` selects for an
+    /// image of the given pixel dims, plus the merged vision-token count it
+    /// yields. Lets a caller size the placeholder run before encoding.
+    static func smartResizeGrid(
+        width: Int, height: Int, cfg: Qwen25VLVisionConfig
+    ) throws -> (gridH: Int, gridW: Int, mergedTokens: Int) {
+        let (th, tw) = try MediaUtils.smartResize(
+            height: height, width: width, bounds: smartResizeBounds(cfg: cfg))
+        let gridH = th / cfg.patchSize
+        let gridW = tw / cfg.patchSize
+        let m = cfg.spatialMergeSize
+        return (gridH, gridW, (gridH / m) * (gridW / m))
+    }
+
     init(
         cfg: Qwen25VLVisionConfig, patchEmbedWeight: Tensor,
         patchDimPadded: Int,
@@ -447,7 +493,8 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
 
     static func load(
         visionConfig: ModelConfig, textHidden: Int,
-        weights: SafeTensorsBundle, dtype: DType, device: Device
+        weights: SafeTensorsBundle, dtype: DType,
+        quantization: ModelConfig.QuantizationConfig?, device: Device
     ) throws -> Qwen25VLVisionModel {
         let cfg = try Qwen25VLVisionConfig.decode(visionConfig)
 
@@ -478,10 +525,14 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
         blocks.reserveCapacity(cfg.depth)
         for i in 0 ..< cfg.depth {
             let p = "blocks.\(i)"
+            // Dequantize at load: the 4-/8-bit conversions quantize the ViT
+            // linears too, but the block holds plain `Linear` fields driving
+            // `Ops.gemm` on `.weight`, so a packed u32 weight must be
+            // materialized to a float weight here.
             func lin(_ name: String) throws -> Linear {
-                let w = try weights.tensor(named: "\(p).\(name).weight")
-                let b = try? weights.tensor(named: "\(p).\(name).bias")
-                return Linear(weight: w, bias: b)
+                try loadDequantizedLinear(
+                    base: "\(p).\(name)", in: weights,
+                    quantization: quantization, dtype: dtype, device: device)
             }
             func norm(_ name: String) throws -> RMSNorm {
                 RMSNorm(
@@ -506,9 +557,9 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
             weight: try weights.tensor(named: "merger.ln_q.weight"),
             eps: cfg.rmsNormEps)
         func mergerLin(_ idx: Int) throws -> Linear {
-            let w = try weights.tensor(named: "merger.mlp.\(idx).weight")
-            let b = try? weights.tensor(named: "merger.mlp.\(idx).bias")
-            return Linear(weight: w, bias: b)
+            try loadDequantizedLinear(
+                base: "merger.mlp.\(idx)", in: weights,
+                quantization: quantization, dtype: dtype, device: device)
         }
         let mergerFC1 = try mergerLin(0)
         let mergerFC2 = try mergerLin(2)
@@ -521,16 +572,19 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
     }
 
     /// Run the full vision forward on a preprocessed image. `image` is a
-    /// normalized NCHW tensor `[1, inChannels, side, side]` where
-    /// `side = gridSide · patchSize`. Returns `[mergedTokenCount,
-    /// textHidden]`.
+    /// normalized NCHW tensor `[1, inChannels, H, W]` at the native
+    /// `smartResize` resolution (`H`, `W` multiples of `patch · merge`, not
+    /// necessarily square); the grid `(H/patch, W/patch)` is derived from
+    /// the tensor. Returns `[mergedTokenCount, textHidden]`.
     func encode(image: Tensor, device: Device) -> Tensor {
         // Single-image path: gridT = 1, the unfold copies the same frame
         // `temporal_patch_size` times in the temporal axis. Reuse the
         // multi-frame path so all the temporal-aware bookkeeping
         // (M-RoPE, window groups, merger) goes through one code path.
+        let (gridH, gridW) = Self.gridDims(for: image, cfg: cfg)
         return runForward(
             framePixels: [image.toFloatArray()], gridT: 1,
+            gridH: gridH, gridW: gridW,
             framePadIndices: nil, device: device)
     }
 
@@ -541,19 +595,21 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
     /// `patchify` path). Returns `[mergedTokenCount, textHidden]` where
     /// `mergedTokenCount = (T/tp) · gridSide² / mergeUnit`.
     ///
-    /// Precondition: every frame must share `[1, inChannels, side, side]`
-    /// with `side = gridSide · patchSize` — the encoder is fixed-grid for
-    /// now (dynamic resolution is a later pass).
+    /// Precondition: every frame shares one native NCHW shape
+    /// `[1, inChannels, H, W]` (the caller resizes all frames to the same
+    /// `smartResize` target); the grid `(H/patch, W/patch)` is derived from
+    /// frame 0.
     func encode(frames: [Tensor], device: Device) -> Tensor {
         precondition(
             !frames.isEmpty,
             "Qwen25VL.encode(frames:): expected at least one frame")
-        let side = gridSide * cfg.patchSize
+        let (gridH, gridW) = Self.gridDims(for: frames[0], cfg: cfg)
         for (i, frame) in frames.enumerated() {
             precondition(
-                frame.shape == [1, cfg.inChannels, side, side],
+                frame.shape == frames[0].shape,
                 "Qwen25VL.encode(frames:): frame[\(i)] shape \(frame.shape) "
-                    + "!= [1,\(cfg.inChannels),\(side),\(side)]")
+                    + "!= frame[0] \(frames[0].shape) (all frames must share "
+                    + "one resolution)")
         }
 
         // Pad frame count up to a multiple of `temporal_patch_size` by
@@ -571,6 +627,7 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
         let gridT = paddedT / tp
         return runForward(
             framePixels: framePixels, gridT: gridT,
+            gridH: gridH, gridW: gridW,
             framePadIndices: nil, device: device)
     }
 
@@ -580,14 +637,16 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
     /// number of temporal patches the unfold will produce.
     private func runForward(
         framePixels: [[Float]], gridT: Int,
+        gridH: Int, gridW: Int,
         framePadIndices: [Int]?,
         device: Device
     ) -> Tensor {
-        let side = gridSide
-        let nPatches = gridT * side * side
+        let nPatches = gridT * gridH * gridW
 
         // ── Patch unfold + embed ──
-        let unfolded = unfoldPatches(framePixels: framePixels, gridT: gridT)
+        let unfolded = unfoldPatches(
+            framePixels: framePixels, gridT: gridT,
+            gridH: gridH, gridW: gridW)
         let cmd = device.makeCommandBuffer()
         var h = Ops.gemm(
             weight: patchEmbedWeight, input: unfolded,
@@ -596,8 +655,10 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
         cmd.waitUntilCompleted()
 
         // ── M-RoPE tables + window groups ──
-        let (cosTable, sinTable) = ropeTables(gridT: gridT)
-        let windowGroups = windowAttentionGroups(gridT: gridT)
+        let (cosTable, sinTable) = ropeTables(
+            gridT: gridT, gridH: gridH, gridW: gridW)
+        let windowGroups = windowAttentionGroups(
+            gridT: gridT, gridH: gridH, gridW: gridW)
         let fullGroup = [Array(0 ..< nPatches)]
 
         // ── Block stack ──
@@ -629,42 +690,59 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
     /// `tP · C · py · px` patch flattened in `(temporal, channel, py, px)`
     /// order, matching the flattened patch-embed weight's column layout.
     ///
-    /// Row order is `(t, patchRow, patchCol)` — frames are blocked
-    /// together so the merger's reshape `[nPatches/mergeUnit,
-    /// mergeUnit·hidden]` lines up with one temporal patch group of
-    /// spatial neighbourhoods.
-    private func unfoldPatches(framePixels: [[Float]], gridT: Int) -> Tensor {
-        let side = gridSide
+    /// Row order is `(tGroup, mergeBlockRow, mergeBlockCol, intraRow,
+    /// intraCol)` — temporal patches are blocked together and each run of
+    /// `m²` rows is one 2×2 spatial neighbourhood, so the merger's reshape
+    /// `[nPatches/mergeUnit, mergeUnit·hidden]`, the window grouping, and
+    /// the M-RoPE position table all line up. (Previously this emitted
+    /// plain row-major raster, which disagreed with the merge-block layout
+    /// the other three stages assume — every token past index 1 was pooled
+    /// / positioned / windowed against the wrong patch. Now matches the
+    /// validated Qwen2-VL unfold.)
+    private func unfoldPatches(
+        framePixels: [[Float]], gridT: Int, gridH: Int, gridW: Int
+    ) -> Tensor {
         let p = cfg.patchSize
         let c = cfg.inChannels
         let tp = cfg.temporalPatchSize
-        let imgSide = side * p
-        let nPatches = gridT * side * side
+        let m = cfg.spatialMergeSize
+        let mergeBlocksH = gridH / m
+        let mergeBlocksW = gridW / m
+        let imgH = gridH * p
+        let imgW = gridW * p
+        let nPatches = gridT * gridH * gridW
 
         // Rows are zero-padded to `patchDimPadded`; the trailing
         // columns pair with the patch-embed weight's zero-pad columns.
         var rows = [Float](repeating: 0, count: nPatches * patchDimPadded)
         // Image fast path: a single frame replicated `tp` times.
         let isImage = framePixels.count == 1
+        var patch = 0
         for tGroup in 0 ..< gridT {
-            for pr in 0 ..< side {
-                for pc in 0 ..< side {
-                    let patch = ((tGroup * side) + pr) * side + pc
-                    var col = 0
-                    // Layout: (temporal, channel, py, px).
-                    for tWithin in 0 ..< tp {
-                        let frameIdx = isImage ? 0 : tGroup * tp + tWithin
-                        let pix = framePixels[frameIdx]
-                        for ch in 0 ..< c {
-                            for py in 0 ..< p {
-                                let yy = pr * p + py
-                                for px in 0 ..< p {
-                                    let xx = pc * p + px
-                                    let v = pix[(ch * imgSide + yy) * imgSide + xx]
-                                    rows[patch * patchDimPadded + col] = v
-                                    col += 1
+            for br in 0 ..< mergeBlocksH {
+                for bc in 0 ..< mergeBlocksW {
+                    for ir in 0 ..< m {
+                        for ic in 0 ..< m {
+                            let pr = br * m + ir
+                            let pc = bc * m + ic
+                            var col = 0
+                            // Layout: (temporal, channel, py, px).
+                            for tWithin in 0 ..< tp {
+                                let frameIdx = isImage ? 0 : tGroup * tp + tWithin
+                                let pix = framePixels[frameIdx]
+                                for ch in 0 ..< c {
+                                    for py in 0 ..< p {
+                                        let yy = pr * p + py
+                                        for px in 0 ..< p {
+                                            let xx = pc * p + px
+                                            let v = pix[(ch * imgH + yy) * imgW + xx]
+                                            rows[patch * patchDimPadded + col] = v
+                                            col += 1
+                                        }
+                                    }
                                 }
                             }
+                            patch += 1
                         }
                     }
                 }
@@ -686,9 +764,10 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
     /// temporal axis is carried by the M-RoPE 3-section split in the
     /// text decoder, not by the vision tower's rotary table (the
     /// reference vision tower only rotates over (h, w)).
-    private func ropeTables(gridT: Int) -> (cos: [Float], sin: [Float]) {
-        let side = gridSide
-        let nPatches = gridT * side * side
+    private func ropeTables(
+        gridT: Int, gridH: Int, gridW: Int
+    ) -> (cos: [Float], sin: [Float]) {
+        let nPatches = gridT * gridH * gridW
         let headDim = cfg.headDim
         let half = headDim / 2  // height half | width half
         let quarter = half / 2  // distinct rotary frequencies
@@ -701,8 +780,8 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
         // merge-size blocks. The same per-frame table is tiled `gridT`
         // times along the temporal axis (the reference vision tower's
         // rotary embedding only depends on spatial position).
-        let (hPos, wPos) = mergeReorderedPositions()
-        let perFrame = side * side
+        let (hPos, wPos) = mergeReorderedPositions(gridH: gridH, gridW: gridW)
+        let perFrame = gridH * gridW
 
         var cosT = [Float](repeating: 0, count: nPatches * headDim)
         var sinT = [Float](repeating: 0, count: nPatches * headDim)
@@ -730,15 +809,17 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
     /// Per-patch `(h, w)` grid coordinates within one frame, reordered
     /// into the merge-size block layout the reference's `rot_pos_emb`
     /// produces.
-    private func mergeReorderedPositions() -> (h: [Int], w: [Int]) {
-        let side = gridSide
+    private func mergeReorderedPositions(
+        gridH: Int, gridW: Int
+    ) -> (h: [Int], w: [Int]) {
         let m = cfg.spatialMergeSize
-        let blocks = side / m
-        var hPos = [Int](repeating: 0, count: side * side)
-        var wPos = [Int](repeating: 0, count: side * side)
+        let mergeBlocksH = gridH / m
+        let mergeBlocksW = gridW / m
+        var hPos = [Int](repeating: 0, count: gridH * gridW)
+        var wPos = [Int](repeating: 0, count: gridH * gridW)
         var idx = 0
-        for br in 0 ..< blocks {
-            for bc in 0 ..< blocks {
+        for br in 0 ..< mergeBlocksH {
+            for bc in 0 ..< mergeBlocksW {
                 for ir in 0 ..< m {
                     for ic in 0 ..< m {
                         hPos[idx] = br * m + ir
@@ -756,23 +837,31 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
     /// temporal patch is a `gridSide × gridSide` block of merge-units —
     /// window groups are per-frame (matching the reference, which keeps
     /// windowed attention strictly within one temporal patch).
-    private func windowAttentionGroups(gridT: Int) -> [[Int]] {
-        let side = gridSide
+    private func windowAttentionGroups(
+        gridT: Int, gridH: Int, gridW: Int
+    ) -> [[Int]] {
         let m = cfg.spatialMergeSize
-        let mergeBlocks = side / m  // llm grid side
+        // LLM (merged) grid dims — windows tile this grid, with separate
+        // row/column extents for a non-square image.
+        let mergeBlocksH = gridH / m
+        let mergeBlocksW = gridW / m
         // window in units of merge-blocks.
         let winBlocks = max(1, cfg.windowSize / (m * cfg.patchSize))
-        let nWin = (mergeBlocks + winBlocks - 1) / winBlocks
-        let perFrame = side * side
+        let nWinH = (mergeBlocksH + winBlocks - 1) / winBlocks
+        let nWinW = (mergeBlocksW + winBlocks - 1) / winBlocks
+        let perFrame = gridH * gridW
         var groups: [[Int]] = []
         for tIdx in 0 ..< gridT {
             let tBase = tIdx * perFrame
-            for wr in 0 ..< nWin {
-                for wc in 0 ..< nWin {
+            for wr in 0 ..< nWinH {
+                for wc in 0 ..< nWinW {
                     var group: [Int] = []
-                    for lbr in (wr * winBlocks) ..< min((wr + 1) * winBlocks, mergeBlocks) {
-                        for lbc in (wc * winBlocks) ..< min((wc + 1) * winBlocks, mergeBlocks) {
-                            let blockBase = tBase + (lbr * mergeBlocks + lbc) * m * m
+                    for lbr in (wr * winBlocks) ..< min((wr + 1) * winBlocks, mergeBlocksH) {
+                        for lbc in (wc * winBlocks) ..< min((wc + 1) * winBlocks, mergeBlocksW) {
+                            // Row stride is the number of block-columns
+                            // (`mergeBlocksW`), not a square side — each
+                            // merge-block owns `m²` consecutive token slots.
+                            let blockBase = tBase + (lbr * mergeBlocksW + lbc) * m * m
                             for k in 0 ..< (m * m) { group.append(blockBase + k) }
                         }
                     }
@@ -869,6 +958,27 @@ final class Qwen25VLComposedEncoder: VisionEncoder {
             positionEmbedding: placeholderW, layers: [],
             postLayerNorm: tower.mergerNorm.asLayerNorm(),
             projection: nil, dtype: tower.dtype)
+    }
+
+    /// Native-resolution preprocessing: `smartResize` the raw image to the
+    /// largest aspect-preserving grid under Qwen2.5-VL's token budget (sides
+    /// a multiple of `patch · merge`), then GPU bilinear-resize + CLIP-
+    /// normalize → NCHW `[1, 3, H, W]`. Replaces the old fixed 392² square.
+    /// Falls back to the generic fixed square (`nil`) only for a degenerate
+    /// aspect ratio `smartResize` rejects (> 200:1).
+    override func preprocessImage(
+        _ image: RGBImage, device: Device = .shared
+    ) -> Tensor? {
+        guard
+            let (th, tw) = try? MediaUtils.smartResize(
+                height: image.height, width: image.width,
+                bounds: Qwen25VLVisionModel.smartResizeBounds(cfg: tower.cfg))
+        else {
+            return nil
+        }
+        return MediaUtils.resizeNormalize(
+            image, targetW: tw, targetH: th,
+            normalization: .clip, dtype: tower.dtype, device: device)
     }
 
     /// Run the Qwen 2.5-VL vision tower on a single preprocessed image.

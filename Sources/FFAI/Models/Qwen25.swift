@@ -98,13 +98,15 @@ public enum Qwen25VL {
             config: config, weights: textWeights, options: options, device: device)
 
         // ── Vision tower ──
-        // Vision weights are under `vision_tower.*` and (per the
-        // checkpoint's `skip_vision` quantization flag) are not
-        // quantized — plain f16 / bf16 tensors.
+        // Vision weights are under `vision_tower.*`. The common conversions
+        // set `skip_vision`, so the ViT is plain f16 / bf16 — but pass the
+        // quantization config anyway; `loadDequantizedLinear` dequantizes
+        // per-tensor only if a checkpoint did quantize the tower.
         let visionWeights = weights.prefixed("vision_tower.")
         let vision = try Qwen25VLVisionModel.load(
             visionConfig: visionConfig, textHidden: textEngine.hidden,
-            weights: visionWeights, dtype: textEngine.dtype, device: device)
+            weights: visionWeights, dtype: textEngine.dtype,
+            quantization: config.quantization, device: device)
 
         let imageTokenId = config.int("image_token_id") ?? defaultImageTokenId
         let videoTokenId = config.int("video_token_id") ?? defaultVideoTokenId
