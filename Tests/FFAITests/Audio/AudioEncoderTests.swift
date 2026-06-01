@@ -139,6 +139,31 @@ struct AudioEncoderTests {
         }
     }
 
+    @Test("encode — head_dim 64 routes attention through the GPU SDPA path")
+    func encodeGPUAttentionPath() {
+        autoreleasepool {
+            // hidden 128 / 2 heads → head_dim 64 (a real Whisper dim) ∈ the
+            // sdpaBidirectionalSupportedHeadDims set, so the encoder block's
+            // attention runs on the GPU `Ops.sdpaBidirectional` kernel
+            // (not the CPU fallback). Confirms the wiring produces a valid,
+            // non-degenerate forward — the per-element GPU↔CPU agreement is
+            // covered by the sdpaBidirectional gpu_correctness / Ops tests.
+            #expect(OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(64))
+            let enc = makeEncoder(
+                nMels: 8, hidden: 128, intermediate: 256,
+                nLayers: 2, nHeads: 2, maxAudioCtx: 64)
+            let nFrames = 40
+            let mel = randTensor([8, nFrames], scale: 1.0, seed: 300)
+            let out = enc.encode(mel: mel, melFrameMajor: false)
+            // Stride-2 conv: nAudioCtx = (40 + 2 - 3)/2 + 1 = 20.
+            #expect(out.shape == [20, 128])
+            let vals = out.toArray(as: Float.self)
+            #expect(vals.allSatisfy { $0.isFinite })
+            let variance = vals.map { $0 * $0 }.reduce(0, +) / Float(vals.count)
+            #expect(variance > 1e-6)
+        }
+    }
+
     @Test("encode — frame-major mel is transposed internally")
     func encodeFrameMajor() {
         autoreleasepool {

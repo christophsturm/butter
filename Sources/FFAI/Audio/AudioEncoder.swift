@@ -128,15 +128,12 @@ public final class AudioEncoderLayer: Module {
     }
 
     /// Forward `[nFrames, hidden]` frame activations through one encoder
-    /// block. The GEMM-heavy projections + norms run on the GPU queued
-    /// on `cmd`; the bidirectional attention core runs on the CPU.
-    ///
-    /// The CPU attention core mirrors `VisionEncoder` — `ffai_sdpa_multi`
-    /// is head-dim-128-only and Whisper encoders use head dims 64 / 80 /
-    /// 96 / … . Audio frame counts are modest (≤ 1500), so a CPU
-    /// O(nFrames²·headDim) attention per head is cheap next to the GPU
-    /// projection GEMMs and unambiguously correct. A head-dim-agnostic
-    /// audio SDPA kernel is a later performance pass.
+    /// block. Fully GPU-resident when the head dim is one the
+    /// `sdpaBidirectional` kernel supports (Whisper-family encoders use
+    /// 64 / 80 / 96, all supported): the bidirectional attention core runs
+    /// on the GPU on the same command buffer as the projection GEMMs (no
+    /// CPU readback). Unsupported head dims fall back to the parallel CPU
+    /// attention (still correct).
     func forward(
         _ h: Tensor, nFrames: Int, device: Device,
         on cmd: MTLCommandBuffer
@@ -150,32 +147,51 @@ public final class AudioEncoderLayer: Module {
         let k = projectRows(kProj, normed, nRows: nFrames, on: cmd)
         let v = projectRows(vProj, normed, nRows: nFrames, on: cmd)
 
-        // Flush the projection GEMMs so their results are CPU-readable.
-        cmd.commit()
-        cmd.waitUntilCompleted()
-
-        let attnFlat = cpuAttention(
-            q: q, k: k, v: v, nFrames: nFrames,
-            device: device)
+        // Audio self-attention is plain bidirectional MHA (no RoPE, no
+        // mask), so it maps straight onto the GPU `sdpaBidirectional`
+        // kernel — q stays frame-major, k/v transpose to head-major. The
+        // MLP sub-block then continues on the SAME command buffer, so the
+        // whole block is one GPU submission for supported head dims.
+        let attnFlat: Tensor
+        let mlpCmd: MTLCommandBuffer
+        if OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(headDim) {
+            let kHead = Ops.transposeTokensToHeads(
+                k, nTokens: nFrames, nHeads: nHeads, headDim: headDim, on: cmd)
+            let vHead = Ops.transposeTokensToHeads(
+                v, nTokens: nFrames, nHeads: nHeads, headDim: headDim, on: cmd)
+            attnFlat = Ops.sdpaBidirectional(
+                q: q, k: kHead, v: vHead,
+                nQHeads: nHeads, nKVHeads: nHeads, headDim: headDim,
+                baseKV: 0, nQuery: nFrames, kvStride: nFrames,
+                scale: scale, on: cmd
+            ).reshaped(to: [nFrames, nHeads * headDim])
+            mlpCmd = cmd
+        } else {
+            // Flush the projection GEMMs so their results are CPU-readable.
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            attnFlat = cpuAttention(
+                q: q, k: k, v: v, nFrames: nFrames, device: device)
+            mlpCmd = device.makeCommandBuffer()
+        }
 
         // ── Residual + MLP sub-block ──
-        let cmd2 = device.makeCommandBuffer()
-        let attnProj = projectRows(oProj, attnFlat, nRows: nFrames, on: cmd2)
-        let postAttn = Ops.add(h, attnProj, on: cmd2)
+        let attnProj = projectRows(oProj, attnFlat, nRows: nFrames, on: mlpCmd)
+        let postAttn = Ops.add(h, attnProj, on: mlpCmd)
         let normed2 = Ops.layerNorm(
             postAttn, weight: layerNorm2.weight,
             bias: layerNorm2.bias, eps: layerNorm2.eps,
-            nRows: nFrames, rowSize: hidden, on: cmd2)
+            nRows: nFrames, rowSize: hidden, on: mlpCmd)
         let ff1 = projectRows(
             fc1, normed2, nRows: nFrames,
-            outDim: intermediate, on: cmd2)
-        let act = Ops.gelu(ff1, on: cmd2)
+            outDim: intermediate, on: mlpCmd)
+        let act = Ops.gelu(ff1, on: mlpCmd)
         let ff2 = projectRows(
             fc2, act, nRows: nFrames, outDim: hidden,
-            on: cmd2)
-        let result = Ops.add(postAttn, ff2, on: cmd2)
-        cmd2.commit()
-        cmd2.waitUntilCompleted()
+            on: mlpCmd)
+        let result = Ops.add(postAttn, ff2, on: mlpCmd)
+        mlpCmd.commit()
+        mlpCmd.waitUntilCompleted()
         return result
     }
 
