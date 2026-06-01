@@ -790,6 +790,68 @@ public final class LlamaModel: LanguageModel {
         return applyLogitsScaling(lmHead(normed, on: cmd), on: cmd, device: device)
     }
 
+    /// Batched embedding-input prefill — the VLM-prefill fast path. This
+    /// is `forwardMulti(tokenIds:...)` minus the embedding gather: the
+    /// `[seqLen, hidden]` residual block is supplied directly (spliced
+    /// text-token + vision-token rows). Runs the chunk through
+    /// `LlamaLayer.forwardMulti` (one `Ops.sdpaMulti(causal: true)` per
+    /// layer + batched projections) and returns the **tail-position
+    /// logits** — collapsing the legacy ~seqLen serial per-position
+    /// dispatches into one command buffer. The biggest VLM-prefill win on
+    /// native-resolution images, where one image is ~1000 placeholder
+    /// tokens.
+    ///
+    /// `pleTokenIds` is ignored — Llama / Qwen 2 have no Per-Layer
+    /// Embeddings. Falls back to the per-position embedding loop on the
+    /// same shapes the token-id `forwardMulti` does (AURA caches' π-rotated
+    /// layout, or `headDim != 128` where `ffai_sdpa_multi` has no kernel).
+    public func forwardMulti(
+        inputEmbeddings: Tensor, startingAt position: Int,
+        pleTokenIds: [Int]?,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let n = inputEmbeddings.shape.first ?? 0
+        precondition(
+            n > 0 && inputEmbeddings.shape == [n, hidden],
+            "LlamaModel.forwardMulti(inputEmbeddings:): expected "
+                + "[seqLen, \(hidden)], got \(inputEmbeddings.shape)")
+
+        // Same fast-path gating as the token-id `forwardMulti`: the chunked
+        // SDPA path doesn't implement AURA's π-rotated K/V, and
+        // `ffai_sdpa_multi` is head_dim-128 only. Fall back to the
+        // per-position embedding forward (queued on `cmd`, single commit).
+        let hasAura = caches.contains { $0 is AURAQuantizedKVCache }
+        if hasAura || headDim != 128 {
+            var logits: Tensor!
+            for i in 0 ..< n {
+                let row = inputEmbeddings
+                    .slicedRows(start: i, count: 1)
+                    .reshaped(to: [hidden])
+                logits = forward(
+                    inputEmbedding: row, position: position + i,
+                    caches: caches, on: cmd, device: device)
+            }
+            return logits
+        }
+
+        // Layers — each runs its chunked forward over [N, hidden]. No
+        // embedding gather: the block IS the residual stream.
+        var h = inputEmbeddings
+        for (i, layer) in layers.enumerated() {
+            h = layer.forwardMulti(
+                h, startingAt: position,
+                cache: caches[i] as! any KVCacheProtocol,
+                cmd: cmd, device: device)
+        }
+
+        // Final norm + LM head on the LAST row only — only the tail logits
+        // are sampled.
+        let tail = h.slicedRows(start: n - 1, count: 1).reshaped(to: [hidden])
+        let normed = finalNorm(tail, on: cmd)
+        return applyLogitsScaling(lmHead(normed, on: cmd), on: cmd, device: device)
+    }
+
     /// Raw embedding-table lookup for one text token — the text-token
     /// half of the VLM splice stream.
     public func textEmbedding(tokenId: Int, device: Device) -> Tensor {

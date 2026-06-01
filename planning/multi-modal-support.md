@@ -221,6 +221,23 @@ KV-state) so `Generate.generateStream` can take over the decode loop. Also lets
 VLMs reuse **sampling** (temperature/top-p) instead of greedy-only. Unblocks
 streaming captions/transcripts.
 
+> ✅ **Batched embedding-prefill entry point landed** (the prerequisite above).
+> `LanguageModel.forwardMulti(inputEmbeddings:startingAt:pleTokenIds:…)` prefills
+> a contiguous `[seqLen, hidden]` spliced stream and returns the tail logits.
+> `LlamaModel` (Qwen 2 / 2.5 VL backbone) overrides it with the fused
+> `LlamaLayer.forwardMulti` path — one `Ops.sdpaMulti(causal: true)` per layer +
+> batched projections — collapsing the old **one-command-buffer-per-position**
+> prefill (~1000 serial GPU dispatches per native-resolution image) into a few.
+> Default impl = the legacy per-position loop (PLE-preserving via the
+> per-position `pleTokenIds`; Gemma 4 keeps its placeholder→0 mapping). The
+> Gemma 4 image suite still produces the identical Golden-Retriever caption;
+> numerics are guarded bit-for-bit by `EmbeddingPrefillIntegrationTests`
+> (head_dim-128 Qwen 2.5 1.5B — same backbone shape as Qwen 2-VL 2B — batched
+> tail logits == per-position). `VisionModel.runSampled` now prefills through it
+> in `prefillStepSize` chunks. Remaining for full 7a: route the decode loop
+> through `Generate.generateStream`. *(Qwen 2-VL e2e wall-time confirmation is
+> still gated behind the #7 quant-load crash, independent of this change.)*
+
 ### 7b. Streaming audio INPUT
 Chunked waveform ingest → incremental mel + encoder. For Conformer/USM
 (Gemma 4) and Whisper-style encoders this means a sliding window + cached

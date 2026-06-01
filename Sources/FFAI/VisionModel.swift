@@ -492,25 +492,47 @@ public final class VisionModel: @unchecked Sendable {
         // far), mirroring `Generate.driveGeneration`.
         var tokenHistory = promptTokens
 
-        // Prefill: forward every spliced embedding to build the KV cache.
-        // Only the FINAL position's logits matter — sample the first decoded
-        // token from them via the shared `Sampling.sample` (handles
-        // temperature 0 → greedy, plus top-k / top-p / min-p / rep-penalty).
+        // Prefill: BATCHED. Assemble the spliced stream into a contiguous
+        // `[seqLen, hidden]` block and feed it to the engine's batched
+        // embedding-prefill (`forwardMulti(inputEmbeddings:)`) in
+        // `prefillStepSize`-sized chunks. Backbones with a batched layer
+        // path (Llama / Qwen 2 VL) collapse each chunk into one
+        // `Ops.sdpaMulti(causal: true)` per layer — turning the old
+        // ~seqLen serial dispatches (each a commit + host-sync) into a
+        // handful. With native-resolution preprocessing one image is ~1000
+        // placeholder tokens, so this is the dominant prefill cost. Only
+        // the FINAL position's logits matter — `forwardMulti` returns the
+        // chunk tail, so the last chunk yields the first decoded token's
+        // logits, sampled via the shared `Sampling.sample` (temperature 0 →
+        // greedy, plus top-k / top-p / min-p / rep-penalty).
+        let embeddingBlock = assembleEmbeddingBlock(stream, device: device)
+        // Per-position token ids for Gemma 4 PLE: real id at text positions,
+        // `0` at multimodal placeholders. Engines without PLE ignore it.
+        let plePositionIds = promptTokens.map { pleTokenId(for: $0) }
+
         var nextToken = 0
-        let lastPos = stream.count - 1
-        for (pos, embedding) in stream.enumerated() {
+        let seqLen = stream.count
+        let chunkSize = max(
+            1, params.prefillStepSize ?? engine.defaultPrefillStepSize)
+        var prefillPos = 0
+        while prefillPos < seqLen {
+            let end = min(prefillPos + chunkSize, seqLen)
+            let rows = end - prefillPos
+            let chunkBlock = embeddingBlock.slicedRows(start: prefillPos, count: rows)
+            let chunkPLE = Array(plePositionIds[prefillPos ..< end])
             let cmd = device.makeCommandBuffer()
-            let logits = engine.forward(
-                inputEmbedding: embedding, position: pos,
-                pleTokenId: pleTokenId(for: promptTokens[pos]),
+            let logits = engine.forwardMulti(
+                inputEmbeddings: chunkBlock, startingAt: prefillPos,
+                pleTokenIds: chunkPLE,
                 caches: caches, on: cmd, device: device)
             cmd.commit()
             cmd.waitUntilCompleted()
-            if pos == lastPos {
+            if end == seqLen {
                 nextToken = Sampling.sample(
                     logits, parameters: params, rng: &rng,
                     tokenHistory: tokenHistory)
             }
+            prefillPos = end
         }
 
         // Decode: token-id forward from the prefill tail, sampling each step
@@ -539,5 +561,37 @@ public final class VisionModel: @unchecked Sendable {
             pos += 1
         }
         return generated
+    }
+
+    /// Pack the spliced embedding stream — one `[hidden]` row per prompt
+    /// position (text-token embeddings + vision / audio soft tokens) — into
+    /// one contiguous `[seqLen, hidden]` block for the engine's batched
+    /// embedding-prefill.
+    ///
+    /// CPU memcpy: every source row is already host-valid — `textEmbedding`
+    /// and the vision / audio encoders each commit + wait before returning,
+    /// so the splice rows' backing buffers hold completed GPU output. The
+    /// assembled block (shared-storage `MTLBuffer`) is then read by the
+    /// prefill command buffer committed afterwards, so the writes are
+    /// visible to the GPU. All rows must share the stream's dtype.
+    private func assembleEmbeddingBlock(
+        _ stream: [Tensor], device: Device
+    ) -> Tensor {
+        precondition(!stream.isEmpty, "assembleEmbeddingBlock: empty stream")
+        let hidden = engine.hidden
+        let dtype = stream[0].dtype
+        let rowBytes = hidden * dtype.byteSize
+        let block = Tensor.empty(
+            shape: [stream.count, hidden], dtype: dtype, device: device)
+        let dstBase = block.buffer.contents().advanced(by: block.offset)
+        for (i, row) in stream.enumerated() {
+            precondition(
+                row.elementCount == hidden && row.dtype == dtype,
+                "assembleEmbeddingBlock: row \(i) is \(row.shape) "
+                    + "(\(row.dtype)), expected [\(hidden)] (\(dtype))")
+            let src = row.buffer.contents().advanced(by: row.offset)
+            memcpy(dstBase.advanced(by: i * rowBytes), src, rowBytes)
+        }
+        return block
     }
 }

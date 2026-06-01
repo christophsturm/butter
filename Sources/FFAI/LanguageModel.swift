@@ -155,6 +155,38 @@ public protocol LanguageModel: Module {
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor
 
+    /// Batched embedding-input prefill — the VLM analogue of
+    /// `forwardMulti(tokenIds:...)`. Processes `inputEmbeddings.shape[0]`
+    /// positions `[position, position + seqLen)` in one logical call,
+    /// filling each cache, and returns the logits at the **last** position
+    /// only (the prefill tail — the only thing the VLM prefill samples).
+    ///
+    /// `inputEmbeddings` is a contiguous `[seqLen, hidden]` block: the
+    /// spliced prompt-embedding stream (text-token rows + vision / audio
+    /// soft tokens) a `VisionModel` assembles. `pleTokenIds`, when non-nil,
+    /// carries the per-position token id for token-id-derived per-position
+    /// state (Gemma 4 PLE) — the real token at text positions, `0` at
+    /// multimodal placeholders, the batched form of the single-position
+    /// `pleTokenId`. Its count must equal `seqLen`; engines without such
+    /// state ignore it.
+    ///
+    /// The default implementation loops the single-position
+    /// `forward(inputEmbedding:position:pleTokenId:...)` — one
+    /// self-committing command buffer per position, exactly the legacy
+    /// per-position VLM prefill (correct for every VL family,
+    /// PLE-preserving, flat peak memory). Backbones with a batched layer
+    /// path (Llama / Qwen 2 VL) override it to fuse the chunk into one
+    /// `Ops.sdpaMulti(causal: true)` per layer, collapsing ~seqLen serial
+    /// GPU dispatches into one — the VLM-prefill win on native-resolution
+    /// images. The returned logits are valid once `cmd` completes (and
+    /// after any internal commits the default path performs).
+    func forwardMulti(
+        inputEmbeddings: Tensor, startingAt position: Int,
+        pleTokenIds: [Int]?,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor
+
     /// Look up the raw `[hidden]` embedding row for a text token — the
     /// table gather *without* any family-specific post-scale (Gemma's
     /// embed-scale is applied inside `forward(inputEmbedding:...)`, not
@@ -205,6 +237,48 @@ extension LanguageModel {
         forward(
             inputEmbedding: inputEmbedding, position: position,
             caches: caches, on: cmd, device: device)
+    }
+
+    /// Default `forwardMulti(inputEmbeddings:...)`: loops the
+    /// single-position embedding forward, one self-committing command
+    /// buffer per position, threading each position's `pleTokenId`. This
+    /// is the legacy per-position VLM prefill verbatim — correct for every
+    /// VL family, PLE-preserving, and flat in peak memory (only one
+    /// position's logits are live at a time, unlike accumulating N
+    /// `lm_head` outputs on a single deferred command buffer). The passed
+    /// `cmd` is left untouched; the returned logits are already valid.
+    /// Llama / Qwen 2 VL override this with the batched-attention fast path.
+    public func forwardMulti(
+        inputEmbeddings: Tensor, startingAt position: Int,
+        pleTokenIds: [Int]?,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let seqLen = inputEmbeddings.shape.first ?? 0
+        precondition(
+            seqLen > 0 && inputEmbeddings.shape == [seqLen, hidden],
+            "forwardMulti(inputEmbeddings:): expected [seqLen, \(hidden)], "
+                + "got \(inputEmbeddings.shape)")
+        if let pleTokenIds {
+            precondition(
+                pleTokenIds.count == seqLen,
+                "forwardMulti(inputEmbeddings:): pleTokenIds count "
+                    + "\(pleTokenIds.count) ≠ seqLen \(seqLen)")
+        }
+        var logits: Tensor!
+        for i in 0 ..< seqLen {
+            let row = inputEmbeddings
+                .slicedRows(start: i, count: 1)
+                .reshaped(to: [hidden])
+            let stepCmd = device.makeCommandBuffer()
+            logits = forward(
+                inputEmbedding: row, position: position + i,
+                pleTokenId: pleTokenIds?[i],
+                caches: caches, on: stepCmd, device: device)
+            stepCmd.commit()
+            stepCmd.waitUntilCompleted()
+        }
+        return logits
     }
 
     /// Default `textEmbedding(...)`: traps. VL-target families provide a
