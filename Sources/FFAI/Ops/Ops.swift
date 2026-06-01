@@ -4342,6 +4342,84 @@ public enum Ops {
         return result
     }
 
+    /// **Windowed** (block-diagonal) bidirectional SDPA at **head_dim 80**
+    /// (Qwen2.5-VL). Each query attends only the keys in its own contiguous
+    /// window `[segStart[i], segStart[i] + segLen[i])` of the K/V sequence,
+    /// instead of the full range — the variant the Qwen2.5-VL windowed
+    /// blocks and the MiniCPM-V resampler need. The caller must permute
+    /// q/k/v into window-contiguous order so each window is one slice, and
+    /// pass per-query `segStart` / `segLen` (`u32 [nQuery]`).
+    ///
+    /// Q / `out` layout `[nQuery, nQHeads, 80]`; K / V layout
+    /// `[nKVHeads, kvStride, 80]`. Same TPG=1024 reduction dispatch as
+    /// `sdpaBidirectional`.
+    public static func sdpaBidirectionalWindowed(
+        q: Tensor, k: Tensor, v: Tensor,
+        segStart: Tensor, segLen: Tensor,
+        nQHeads: Int, nKVHeads: Int,
+        nQuery: Int, kvStride: Int,
+        scale: Float,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        let headDim = 80
+        precondition(
+            nQHeads % nKVHeads == 0,
+            "Ops.sdpaBidirectionalWindowed: nQHeads \(nQHeads) not a multiple "
+                + "of nKVHeads \(nKVHeads)")
+        precondition(
+            segStart.dtype == .u32 && segStart.elementCount == nQuery,
+            "Ops.sdpaBidirectionalWindowed: segStart must be u32 [nQuery] (\(nQuery))")
+        precondition(
+            segLen.dtype == .u32 && segLen.elementCount == nQuery,
+            "Ops.sdpaBidirectionalWindowed: segLen must be u32 [nQuery] (\(nQuery))")
+        let headsPerGroup = nQHeads / nKVHeads
+        let result = out ?? Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: q.dtype)
+        let threadsPerGroup = 1024
+        let grid = MTLSize(width: nQHeads * nQuery * threadsPerGroup, height: 1, depth: 1)
+        let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+        let hd = UInt32(headDim)
+        let nqh = UInt32(nQHeads)
+        let nq = UInt32(nQuery)
+        let kvs = UInt32(kvStride)
+        let hpg = UInt32(headsPerGroup)
+        switch q.dtype {
+        case .f32:
+            MetalTileKernels.ffai_sdpa_bidirectional_windowed_d80_f32(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                seg_start: segStart.buffer, seg_startOffset: segStart.offset,
+                seg_len: segLen.buffer, seg_lenOffset: segLen.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: hd, n_q_heads: nqh, n_query: nq, kv_stride: kvs,
+                heads_per_group: hpg, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_sdpa_bidirectional_windowed_d80_f16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                seg_start: segStart.buffer, seg_startOffset: segStart.offset,
+                seg_len: segLen.buffer, seg_lenOffset: segLen.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: hd, n_q_heads: nqh, n_query: nq, kv_stride: kvs,
+                heads_per_group: hpg, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_sdpa_bidirectional_windowed_d80_bf16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                seg_start: segStart.buffer, seg_startOffset: segStart.offset,
+                seg_len: segLen.buffer, seg_lenOffset: segLen.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: hd, n_q_heads: nqh, n_query: nq, kv_stride: kvs,
+                heads_per_group: hpg, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.sdpaBidirectionalWindowed: unsupported dtype \(q.dtype)")
+        }
+        return result
+    }
+
     // MARK: - AURA
 
     /// AURA fused encode for `rows` flat vectors of length `dim`.

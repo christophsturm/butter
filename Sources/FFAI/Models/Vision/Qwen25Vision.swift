@@ -240,25 +240,18 @@ final class Qwen25VLVisionBlock {
             vH[head * nTokens + t] = v
         }
 
-        // Stage 2: Attention. The full-attention blocks (caller passes a
-        // single group spanning every token — `fullattBlockIndexes`) used
-        // to run through the GPU `Ops.sdpaBidirectional` kernel; the
-        // windowed blocks always kept the parallel CPU loop.
-        //
-        // GUARD: Qwen 2.5-VL's full-attention head_dim is 80 (ragged
-        // variant). That kernel hasn't been validated at this production
-        // shape (nTokens grows with image resolution; the same class of
-        // kernel at d=64 / nQuery=576 pinned the GPU on GlmOcr during
-        // the 2026-05-27 bisect). Default to the CPU fallback until a
-        // paired GPU correctness test for `mt_sdpa_bidirectional_d80_*`
-        // at the Qwen 2.5-VL shape lands in metaltile-std; opt back in
-        // for benchmarking via `FFAI_QWEN25VL_GPU_SDPA=1`.
+        // Stage 2: Attention — GPU.
+        //   • Full-attention blocks (`fullattBlockIndexes`, one group over
+        //     every token) → dense `Ops.sdpaBidirectional`. d80 dense is
+        //     validated at production image resolution by Qwen2-VL (same
+        //     kernel + dims, e2e coherent caption), so it's no longer gated.
+        //   • Windowed blocks (the bulk: 28/32) → the windowed kernel below.
+        // The CPU loop remains only as a fallback for head dims neither
+        // kernel covers.
         let isFullAttention =
             windowGroups.count == 1
             && windowGroups[0].count == nTokens
-        let useGPUSDPA =
-            ProcessInfo.processInfo.environment["FFAI_QWEN25VL_GPU_SDPA"] != nil
-        if useGPUSDPA && isFullAttention
+        if isFullAttention
             && OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(headDim)
         {
             // GPU path. qH/kH/vH are already laid out as
@@ -308,6 +301,83 @@ final class Qwen25VLVisionBlock {
                 shape: [nTokens, hidden], dtype: qkv.dtype,
                 device: device)
             ImagePreprocessing.copyFloats(outFlat, into: result)
+            return result
+        }
+
+        // GPU windowed path — the windowed-attention blocks (the bulk:
+        // 28/32 for Qwen 2.5-VL). Permute tokens into window-contiguous
+        // order so each window is one `[seg_start, seg_len)` slice, run the
+        // windowed SDPA kernel, then scatter the context back to original
+        // order. d80 only (the kernel's head dim); other dims → CPU.
+        if headDim == 80 {
+            // Window permutation: new-order index → old token index; each
+            // window group occupies a contiguous run and every token in it
+            // carries that run's (offset, size).
+            var perm = [Int]()
+            perm.reserveCapacity(nTokens)
+            var segStart = [UInt32](repeating: 0, count: nTokens)
+            var segLen = [UInt32](repeating: 0, count: nTokens)
+            for group in windowGroups {
+                let off = perm.count
+                let sz = group.count
+                for oldT in group {
+                    segStart[perm.count] = UInt32(off)
+                    segLen[perm.count] = UInt32(sz)
+                    perm.append(oldT)
+                }
+            }
+            // Permuted q (token-major) + k/v (head-major) from the
+            // already-RoPE'd qH/kH/vH.
+            var qPerm = [Float](repeating: 0, count: nTokens * nHeads * headDim)
+            var kPerm = [Float](repeating: 0, count: nHeads * nTokens * headDim)
+            var vPerm = [Float](repeating: 0, count: nHeads * nTokens * headDim)
+            for newIdx in 0 ..< nTokens {
+                let oldT = perm[newIdx]
+                for head in 0 ..< nHeads {
+                    let qRow = qH[head * nTokens + oldT]
+                    let kRow = kH[head * nTokens + oldT]
+                    let vRow = vH[head * nTokens + oldT]
+                    let qDst = (newIdx * nHeads + head) * headDim
+                    let kvDst = (head * nTokens + newIdx) * headDim
+                    for d in 0 ..< headDim {
+                        qPerm[qDst + d] = qRow[d]
+                        kPerm[kvDst + d] = kRow[d]
+                        vPerm[kvDst + d] = vRow[d]
+                    }
+                }
+            }
+            let qT = Tensor.empty(shape: [nTokens, nHeads, headDim], dtype: .f32, device: device)
+            ImagePreprocessing.copyFloats(qPerm, into: qT)
+            let kT = Tensor.empty(shape: [nHeads, nTokens, headDim], dtype: .f32, device: device)
+            ImagePreprocessing.copyFloats(kPerm, into: kT)
+            let vT = Tensor.empty(shape: [nHeads, nTokens, headDim], dtype: .f32, device: device)
+            ImagePreprocessing.copyFloats(vPerm, into: vT)
+            let ssT = Tensor.empty(shape: [nTokens], dtype: .u32, device: device)
+            ssT.copyIn(from: segStart)
+            let slT = Tensor.empty(shape: [nTokens], dtype: .u32, device: device)
+            slT.copyIn(from: segLen)
+            let cmd = device.makeCommandBuffer()
+            let outT = Ops.sdpaBidirectionalWindowed(
+                q: qT, k: kT, v: vT, segStart: ssT, segLen: slT,
+                nQHeads: nHeads, nKVHeads: nHeads,
+                nQuery: nTokens, kvStride: nTokens, scale: scale, on: cmd)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            let outFlat = outT.toFloatArray()
+            // Scatter the per-window context back to original token order,
+            // token-major `[nTokens, hidden]`.
+            var ctx = [Float](repeating: 0, count: nTokens * hidden)
+            for newIdx in 0 ..< nTokens {
+                let oldT = perm[newIdx]
+                for head in 0 ..< nHeads {
+                    let src = (newIdx * nHeads + head) * headDim
+                    let dst = oldT * hidden + head * headDim
+                    for d in 0 ..< headDim { ctx[dst + d] = outFlat[src + d] }
+                }
+            }
+            let result = Tensor.empty(
+                shape: [nTokens, hidden], dtype: qkv.dtype, device: device)
+            ImagePreprocessing.copyFloats(ctx, into: result)
             return result
         }
 

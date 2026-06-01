@@ -1895,4 +1895,93 @@ struct OpsTests {
                 "depthwiseConv2dNHWC GPU diverges from CPU reference (max |Δ| \(maxDiff))")
         }
     }
+
+    @Test("sdpaBidirectionalWindowed — GPU matches a CPU windowed reference (d80)")
+    func sdpaBidirectionalWindowed() {
+        autoreleasepool {
+            // MHA, head_dim 80, ragged windows (last short) to exercise the
+            // non-uniform case Qwen2.5-VL's native-resolution grid produces.
+            let headDim = 80
+            let nQHeads = 4, nKVHeads = 4
+            let nQuery = 20, win = 8
+            let kvStride = nQuery
+            let scale = 1.0 / Float(Double(headDim).squareRoot())
+            let gqa = nQHeads / nKVHeads
+
+            // Window partition: [0,8),[8,16),[16,20).
+            var segStart = [UInt32](repeating: 0, count: nQuery)
+            var segLen = [UInt32](repeating: 0, count: nQuery)
+            for i in 0 ..< nQuery {
+                let ws = (i / win) * win
+                let we = min(ws + win, nQuery)
+                segStart[i] = UInt32(ws)
+                segLen[i] = UInt32(we - ws)
+            }
+
+            func ramp(_ n: Int, _ step: Float, _ start: Float) -> [Float] {
+                (0 ..< n).map { (start + Float($0) * step).truncatingRemainder(dividingBy: 2.0) - 1.0 }
+            }
+            let q = ramp(nQuery * nQHeads * headDim, 0.013, -0.4)
+            let k = ramp(nKVHeads * kvStride * headDim, 0.011, -0.5)
+            let v = ramp(nKVHeads * kvStride * headDim, 0.007, -0.3)
+
+            // CPU windowed reference: each query softmaxes over its window.
+            var expected = [Float](repeating: 0, count: nQuery * nQHeads * headDim)
+            for r in 0 ..< nQuery {
+                let ws = Int(segStart[r])
+                let we = ws + Int(segLen[r])
+                for qh in 0 ..< nQHeads {
+                    let kvh = qh / gqa
+                    let qOff = (r * nQHeads + qh) * headDim
+                    let kvSlab = kvh * kvStride * headDim
+                    var scores = [Float](repeating: 0, count: we - ws)
+                    for (idx, t) in (ws ..< we).enumerated() {
+                        let kOff = kvSlab + t * headDim
+                        var dot: Float = 0
+                        for d in 0 ..< headDim { dot += q[qOff + d] * k[kOff + d] }
+                        scores[idx] = dot * scale
+                    }
+                    let m = scores.max() ?? 0
+                    var sum: Float = 0
+                    for i in scores.indices { scores[i] = exp(scores[i] - m); sum += scores[i] }
+                    let inv = sum > 0 ? 1 / sum : 0
+                    for d in 0 ..< headDim {
+                        var acc: Float = 0
+                        for (idx, t) in (ws ..< we).enumerated() {
+                            acc += scores[idx] * inv * v[kvSlab + t * headDim + d]
+                        }
+                        expected[qOff + d] = acc
+                    }
+                }
+            }
+
+            let qT = Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: .f32)
+            qT.copyIn(from: q)
+            let kT = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            kT.copyIn(from: k)
+            let vT = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            vT.copyIn(from: v)
+            let ssT = Tensor.empty(shape: [nQuery], dtype: .u32)
+            ssT.copyIn(from: segStart)
+            let slT = Tensor.empty(shape: [nQuery], dtype: .u32)
+            slT.copyIn(from: segLen)
+
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.sdpaBidirectionalWindowed(
+                    q: qT, k: kT, v: vT, segStart: ssT, segLen: slT,
+                    nQHeads: nQHeads, nKVHeads: nKVHeads,
+                    nQuery: nQuery, kvStride: kvStride, scale: scale, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            #expect(got.count == expected.count)
+            var maxDiff: Float = 0
+            for i in 0 ..< min(got.count, expected.count) {
+                maxDiff = max(maxDiff, abs(got[i] - expected[i]))
+            }
+            #expect(
+                maxDiff < 1e-3,
+                "sdpaBidirectionalWindowed GPU diverges from CPU reference (max |Δ| \(maxDiff))")
+        }
+    }
 }
