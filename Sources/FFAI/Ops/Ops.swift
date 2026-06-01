@@ -4442,6 +4442,110 @@ public enum Ops {
         return result
     }
 
+    /// Conformer **content-dependent** relative-position SDPA at **head_dim
+    /// == 128** — the ESPnet / Transformer-XL `RelPositionMultiHeadedAttention`
+    /// the Conformer acoustic encoders use (GraniteSpeech, LFMAudio, …). Where
+    /// ``sdpaBidirectionalRelPos`` adds a learned *scalar* `bias[head, rel]`,
+    /// here the position term is a per-distance embedding **vector**
+    /// `relEmb[dist]` (dim 128) dotted with the query. For (query `i` at
+    /// absolute position `baseKV + i`, key `j`) the score is
+    /// `scale·( (Qᵢ + uₕ)·Kⱼ + (Qᵢ + vₕ)·relEmb[dist(i,j)] )` before the
+    /// bidirectional softmax — the ESPnet `matrix_ac + matrix_bd`
+    /// decomposition, with `uₕ`/`vₕ` the per-head content / position biases
+    /// (`pos_bias_u` / `pos_bias_v`). `dist(i,j) = (j + relZero) − (baseKV + i)`
+    /// clamped into `[0, relLen)` — same indexing as ``sdpaBidirectionalRelPos``,
+    /// so pick `relZero = baseKV + nQuery − 1`, `relLen = baseKV + 2·nQuery − 1`.
+    /// GraniteSpeech is the `u = v = 0` special case — pass zero bias buffers.
+    ///
+    /// Q / `out` layout `[nQuery, nQHeads, 128]`; K / V `[nKVHeads, kvStride,
+    /// 128]`; `relEmb` `[relLen, 128]` f32 (shared across heads); `posBiasU` /
+    /// `posBiasV` `[nQHeads, 128]` f32. Same TPG=1024 reduction dispatch as
+    /// ``sdpaBidirectional`` (one threadgroup per `(query, q_head)`).
+    public static func sdpaRelPosConformer(
+        q: Tensor, k: Tensor, v: Tensor,
+        relEmb: Tensor, posBiasU: Tensor, posBiasV: Tensor,
+        nQHeads: Int, nKVHeads: Int,
+        baseKV: Int, nQuery: Int, kvStride: Int,
+        relZero: Int, relLen: Int,
+        scale: Float,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        let headDim = 128
+        precondition(
+            nQHeads % nKVHeads == 0,
+            "Ops.sdpaRelPosConformer: nQHeads \(nQHeads) not a multiple "
+                + "of nKVHeads \(nKVHeads)")
+        precondition(
+            relEmb.dtype == .f32 && relEmb.elementCount == relLen * headDim,
+            "Ops.sdpaRelPosConformer: relEmb must be f32 [relLen·128] "
+                + "(\(relLen * headDim)), got \(relEmb.dtype) count \(relEmb.elementCount)")
+        precondition(
+            posBiasU.dtype == .f32 && posBiasU.elementCount == nQHeads * headDim,
+            "Ops.sdpaRelPosConformer: posBiasU must be f32 [nQHeads·128] "
+                + "(\(nQHeads * headDim)), got \(posBiasU.dtype) count \(posBiasU.elementCount)")
+        precondition(
+            posBiasV.dtype == .f32 && posBiasV.elementCount == nQHeads * headDim,
+            "Ops.sdpaRelPosConformer: posBiasV must be f32 [nQHeads·128] "
+                + "(\(nQHeads * headDim)), got \(posBiasV.dtype) count \(posBiasV.elementCount)")
+        precondition(
+            relZero >= 0 && relLen > 0,
+            "Ops.sdpaRelPosConformer: relZero/relLen must be non-negative")
+        let headsPerGroup = nQHeads / nKVHeads
+        let result = out ?? Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: q.dtype)
+        // TPG = 1024, one threadgroup per (query, q_head) — same reduction
+        // geometry as sdpaBidirectional (sdpa_rel_pos_conformer.rs invariants).
+        let threadsPerGroup = 1024
+        let grid = MTLSize(width: nQHeads * nQuery * threadsPerGroup, height: 1, depth: 1)
+        let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+        let hd = UInt32(headDim)
+        let nqh = UInt32(nQHeads)
+        let bkv = UInt32(baseKV)
+        let nq = UInt32(nQuery)
+        let kvs = UInt32(kvStride)
+        let hpg = UInt32(headsPerGroup)
+        let rz = UInt32(relZero)
+        let rl = UInt32(relLen)
+        switch q.dtype {
+        case .f32:
+            MetalTileKernels.ffai_sdpa_rel_pos_conformer_d128_f32(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                rel_emb: relEmb.buffer, rel_embOffset: relEmb.offset,
+                pos_bias_u: posBiasU.buffer, pos_bias_uOffset: posBiasU.offset,
+                pos_bias_v: posBiasV.buffer, pos_bias_vOffset: posBiasV.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
+                kv_stride: kvs, heads_per_group: hpg, rel_zero: rz, rel_len: rl,
+                scale: scale, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_sdpa_rel_pos_conformer_d128_f16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                rel_emb: relEmb.buffer, rel_embOffset: relEmb.offset,
+                pos_bias_u: posBiasU.buffer, pos_bias_uOffset: posBiasU.offset,
+                pos_bias_v: posBiasV.buffer, pos_bias_vOffset: posBiasV.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
+                kv_stride: kvs, heads_per_group: hpg, rel_zero: rz, rel_len: rl,
+                scale: scale, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_sdpa_rel_pos_conformer_d128_bf16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                rel_emb: relEmb.buffer, rel_embOffset: relEmb.offset,
+                pos_bias_u: posBiasU.buffer, pos_bias_uOffset: posBiasU.offset,
+                pos_bias_v: posBiasV.buffer, pos_bias_vOffset: posBiasV.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
+                kv_stride: kvs, heads_per_group: hpg, rel_zero: rz, rel_len: rl,
+                scale: scale, gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.sdpaRelPosConformer: unsupported dtype \(q.dtype)")
+        }
+        return result
+    }
+
     /// **Windowed** (block-diagonal) bidirectional SDPA at **head_dim 80**
     /// (Qwen2.5-VL). Each query attends only the keys in its own contiguous
     /// window `[segStart[i], segStart[i] + segLen[i])` of the K/V sequence,
@@ -7673,6 +7777,71 @@ public enum Ops {
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.melSpectrogram: unsupported dtype \(audio.dtype)")
+        }
+        return result
+    }
+
+    /// **Magnitude** log-Mel spectrogram — identical to ``melSpectrogram``
+    /// except the filterbank projects the STFT **magnitude** `|stft| =
+    /// sqrt(re² + im²)` rather than the power `re² + im²`. This is the
+    /// Gemma 4 / `np.abs(stft)` convention (`log(magnitude @ mel + floor)`),
+    /// vs. the Whisper-style power-Mel. Wraps `mel_spectrogram_magnitude`.
+    ///
+    /// Inputs / output / dispatch are byte-for-byte the same as
+    /// ``melSpectrogram`` — see that doc for the layout + DISPATCH
+    /// INVARIANTS (Grid3D one-thread-per-output, `nFreq == nFFT/2 + 1`,
+    /// caller pre-pads so `nSamples >= (nFrames-1)*hop + nFFT`).
+    public static func melSpectrogramMagnitude(
+        audio: Tensor, window: Tensor, melWeight: Tensor,
+        nFFT: Int, nMels: Int, hopLength: Int,
+        nFrames: Int, logEps: Float = 1e-10,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            audio.dtype == window.dtype && audio.dtype == melWeight.dtype,
+            "Ops.melSpectrogramMagnitude: audio/window/melWeight must share dtype")
+        precondition(
+            audio.dtype == .f32 || audio.dtype == .f16,
+            "Ops.melSpectrogramMagnitude: dtype must be f32 or f16")
+        let nFreq = nFFT / 2 + 1
+        precondition(
+            window.elementCount == nFFT,
+            "Ops.melSpectrogramMagnitude: window must be [nFFT=\(nFFT)] "
+                + "(ffai/mel_spectrogram.rs)")
+        precondition(
+            melWeight.elementCount == nMels * nFreq,
+            "Ops.melSpectrogramMagnitude: melWeight must be [nMels, nFreq] "
+                + "= [\(nMels), \(nFreq)] (ffai/mel_spectrogram.rs)")
+        precondition(
+            audio.elementCount >= (nFrames - 1) * hopLength + nFFT,
+            "Ops.melSpectrogramMagnitude: audio too short — kernel does no "
+                + "bounds check on the frame walk; pre-pad so "
+                + "nSamples >= (nFrames-1)*hop + nFFT (ffai/mel_spectrogram.rs)")
+        let result = out ?? Tensor.empty(shape: [nFrames, nMels], dtype: audio.dtype)
+        let (grid, tg) = elementwiseGrid(nFrames * nMels)
+        switch audio.dtype {
+        case .f32:
+            MetalTileKernels.mel_spectrogram_magnitude_f32(
+                audio: audio.buffer, audioOffset: audio.offset,
+                window: window.buffer, windowOffset: window.offset,
+                mel_weight: melWeight.buffer, mel_weightOffset: melWeight.offset,
+                out: result.buffer, outOffset: result.offset,
+                n_fft: UInt32(nFFT), n_freq: UInt32(nFreq),
+                n_mels: UInt32(nMels), hop_length: UInt32(hopLength),
+                log_eps: logEps,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mel_spectrogram_magnitude_f16(
+                audio: audio.buffer, audioOffset: audio.offset,
+                window: window.buffer, windowOffset: window.offset,
+                mel_weight: melWeight.buffer, mel_weightOffset: melWeight.offset,
+                out: result.buffer, outOffset: result.offset,
+                n_fft: UInt32(nFFT), n_freq: UInt32(nFreq),
+                n_mels: UInt32(nMels), hop_length: UInt32(hopLength),
+                log_eps: logEps,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.melSpectrogramMagnitude: unsupported dtype \(audio.dtype)")
         }
         return result
     }

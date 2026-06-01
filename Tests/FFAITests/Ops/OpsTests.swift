@@ -1954,6 +1954,153 @@ struct OpsTests {
         }
     }
 
+    @Test("sdpaRelPosConformer — GPU matches a CPU ESPnet rel-pos reference (d128)")
+    func sdpaRelPosConformer() {
+        autoreleasepool {
+            // ESPnet RelPositionMultiHeadedAttention: score =
+            // scale·( (Qᵢ+uₕ)·Kⱼ + (Qᵢ+vₕ)·relEmb[dist] ), bidirectional softmax.
+            let headDim = 128
+            let nQHeads = 4, nKVHeads = 2  // exercise GQA fan-out
+            let baseKV = 0, nQuery = 12
+            let kvStride = baseKV + nQuery
+            let relZero = baseKV + nQuery - 1
+            let relLen = baseKV + 2 * nQuery - 1
+            let scale = 1.0 / Float(Double(headDim).squareRoot())
+            let gqa = nQHeads / nKVHeads
+            let nKV = baseKV + nQuery
+
+            func ramp(_ n: Int, _ step: Float, _ start: Float) -> [Float] {
+                (0 ..< n).map { (start + Float($0) * step).truncatingRemainder(dividingBy: 2.0) - 1.0 }
+            }
+            let q = ramp(nQuery * nQHeads * headDim, 0.013, -0.4)
+            let k = ramp(nKVHeads * kvStride * headDim, 0.011, -0.5)
+            let v = ramp(nKVHeads * kvStride * headDim, 0.007, -0.3)
+            let relEmb = ramp(relLen * headDim, 0.005, -0.2)
+            let posBiasU = ramp(nQHeads * headDim, 0.009, -0.1)
+            let posBiasV = ramp(nQHeads * headDim, 0.006, 0.15)
+
+            // CPU naive reference (mirrors sdpa_rel_pos_conformer.rs):
+            // matrix_ac = (Q+u)·K, matrix_bd = (Q+v)·relEmb[dist].
+            var expected = [Float](repeating: 0, count: nQuery * nQHeads * headDim)
+            for r in 0 ..< nQuery {
+                let qAbs = baseKV + r
+                for qh in 0 ..< nQHeads {
+                    let kvh = qh / gqa
+                    let qOff = (r * nQHeads + qh) * headDim
+                    let uOff = qh * headDim
+                    let kvSlab = kvh * kvStride * headDim
+                    var scores = [Float](repeating: 0, count: nKV)
+                    for t in 0 ..< nKV {
+                        let kOff = kvSlab + t * headDim
+                        let rel = min(max(0, t + relZero - qAbs), relLen - 1)
+                        let rOff = rel * headDim
+                        var ac: Float = 0
+                        var bd: Float = 0
+                        for d in 0 ..< headDim {
+                            ac += (q[qOff + d] + posBiasU[uOff + d]) * k[kOff + d]
+                            bd += (q[qOff + d] + posBiasV[uOff + d]) * relEmb[rOff + d]
+                        }
+                        scores[t] = scale * (ac + bd)
+                    }
+                    let m = scores.max() ?? 0
+                    var sum: Float = 0
+                    for t in 0 ..< nKV { scores[t] = exp(scores[t] - m); sum += scores[t] }
+                    let inv = sum > 0 ? 1 / sum : 0
+                    for d in 0 ..< headDim {
+                        var acc: Float = 0
+                        for t in 0 ..< nKV { acc += scores[t] * inv * v[kvSlab + t * headDim + d] }
+                        expected[qOff + d] = acc
+                    }
+                }
+            }
+
+            let qT = Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: .f32); qT.copyIn(from: q)
+            let kT = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32); kT.copyIn(from: k)
+            let vT = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32); vT.copyIn(from: v)
+            let relT = Tensor.empty(shape: [relLen, headDim], dtype: .f32); relT.copyIn(from: relEmb)
+            let uT = Tensor.empty(shape: [nQHeads, headDim], dtype: .f32); uT.copyIn(from: posBiasU)
+            let vbT = Tensor.empty(shape: [nQHeads, headDim], dtype: .f32); vbT.copyIn(from: posBiasV)
+
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.sdpaRelPosConformer(
+                    q: qT, k: kT, v: vT,
+                    relEmb: relT, posBiasU: uT, posBiasV: vbT,
+                    nQHeads: nQHeads, nKVHeads: nKVHeads,
+                    baseKV: baseKV, nQuery: nQuery, kvStride: kvStride,
+                    relZero: relZero, relLen: relLen, scale: scale, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            #expect(got.count == expected.count)
+            var maxDiff: Float = 0
+            for i in 0 ..< min(got.count, expected.count) {
+                maxDiff = max(maxDiff, abs(got[i] - expected[i]))
+            }
+            #expect(
+                maxDiff < 1e-3,
+                "sdpaRelPosConformer GPU diverges from CPU reference (max |Δ| \(maxDiff))")
+        }
+    }
+
+    @Test("melSpectrogramMagnitude — GPU matches a CPU magnitude-DFT reference")
+    func melSpectrogramMagnitudeF32() {
+        autoreleasepool {
+            // Small STFT: nFFT=8 → nFreq=5, hop=2, 3 mel bins, 4 frames.
+            let nFFT = 8, nFreq = nFFT / 2 + 1, nMels = 3, hop = 2, nFrames = 4
+            let logEps: Float = 1e-3
+            let nSamples = (nFrames - 1) * hop + nFFT  // exact pre-pad
+
+            func ramp(_ n: Int, _ seed: Int, _ amp: Float) -> [Float] {
+                (0 ..< n).map { Float(($0 * 7 + seed) % 13) / 13 * amp - amp / 2 }
+            }
+            let audio = ramp(nSamples, 1, 1.0)
+            // Periodic Hann window.
+            let window = (0 ..< nFFT).map {
+                0.5 - 0.5 * Foundation.cos(2 * Float.pi * Float($0) / Float(nFFT))
+            }
+            let melW = ramp(nMels * nFreq, 4, 0.5).map { abs($0) + 0.05 }  // non-negative filterbank
+
+            // CPU oracle — MAGNITUDE DFT: mag[k] = sqrt(re²+im²), then
+            // log(mel @ mag + eps).
+            var expected = [Float](repeating: 0, count: nFrames * nMels)
+            for f in 0 ..< nFrames {
+                let base = f * hop
+                var mag = [Float](repeating: 0, count: nFreq)
+                for kbin in 0 ..< nFreq {
+                    var re: Float = 0, im: Float = 0
+                    let a = -2 * Float.pi * Float(kbin) / Float(nFFT)
+                    for t in 0 ..< nFFT {
+                        let s = audio[base + t] * window[t]
+                        re += s * Foundation.cos(a * Float(t))
+                        im += s * Foundation.sin(a * Float(t))
+                    }
+                    mag[kbin] = (re * re + im * im).squareRoot()
+                }
+                for m in 0 ..< nMels {
+                    var acc: Float = 0
+                    for kbin in 0 ..< nFreq { acc += melW[m * nFreq + kbin] * mag[kbin] }
+                    expected[f * nMels + m] = Foundation.log(acc + logEps)
+                }
+            }
+
+            let audioT = Tensor.empty(shape: [nSamples], dtype: .f32); audioT.copyIn(from: audio)
+            let winT = Tensor.empty(shape: [nFFT], dtype: .f32); winT.copyIn(from: window)
+            let melT = Tensor.empty(shape: [nMels, nFreq], dtype: .f32); melT.copyIn(from: melW)
+
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.melSpectrogramMagnitude(
+                    audio: audioT, window: winT, melWeight: melT,
+                    nFFT: nFFT, nMels: nMels, hopLength: hop,
+                    nFrames: nFrames, logEps: logEps, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            var maxDiff: Float = 0
+            for i in 0 ..< expected.count { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-3, "melSpectrogramMagnitude diverges from CPU oracle (max \(maxDiff))")
+        }
+    }
+
     @Test("depthwiseConv2dNHWC — GPU matches a CPU NHWC reference (3×3 s1 pad1)")
     func depthwiseConv2dNHWC() {
         autoreleasepool {
