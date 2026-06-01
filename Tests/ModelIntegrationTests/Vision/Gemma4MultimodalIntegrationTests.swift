@@ -273,7 +273,9 @@ struct Gemma4MultimodalIntegrationTests {
 
         let generated = try vlm.generate(
             promptTokens: promptTokens, audio: waveform,
-            maxTokens: 64, eosTokenId: m.config.eosTokenId,
+            maxTokens: 64,
+            parameters: m.defaultGenerationParameters.with { $0.seed = 42 },
+            eosTokenId: m.config.eosTokenId,
             eosTokenIds: m.config.eosTokenIds)
 
         let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)

@@ -368,15 +368,17 @@ public final class VisionModel: @unchecked Sendable {
     /// engine grows a public embedding-prefill entry point.
     public func generate(
         promptTokens: [Int], image: RGBImage?,
-        maxTokens: Int, eosTokenId: Int?,
+        maxTokens: Int, parameters: GenerationParameters? = nil,
+        eosTokenId: Int?,
         eosTokenIds: [Int] = [],
         device: Device = .shared
     ) throws -> [Int] {
         let imageTokens = image.map { encodeImage($0, device: device) }
-        return try runGreedy(
+        return try runSampled(
             promptTokens: promptTokens,
             imageTokens: imageTokens, videoTokens: nil, audioTokens: nil,
-            maxTokens: maxTokens, eosTokenId: eosTokenId,
+            maxTokens: maxTokens, parameters: parameters,
+            eosTokenId: eosTokenId,
             eosTokenIds: eosTokenIds, device: device)
     }
 
@@ -395,7 +397,8 @@ public final class VisionModel: @unchecked Sendable {
     /// `<|video_pad|>` placeholders.
     public func generate(
         promptTokens: [Int], videoFrames: [RGBImage],
-        maxTokens: Int, eosTokenId: Int?,
+        maxTokens: Int, parameters: GenerationParameters? = nil,
+        eosTokenId: Int?,
         eosTokenIds: [Int] = [],
         device: Device = .shared
     ) throws -> [Int] {
@@ -404,10 +407,11 @@ public final class VisionModel: @unchecked Sendable {
                 String(describing: type(of: visionEncoder)))
         }
         let videoTokens = try encodeVideo(videoFrames, device: device)
-        return try runGreedy(
+        return try runSampled(
             promptTokens: promptTokens,
             imageTokens: nil, videoTokens: videoTokens, audioTokens: nil,
-            maxTokens: maxTokens, eosTokenId: eosTokenId,
+            maxTokens: maxTokens, parameters: parameters,
+            eosTokenId: eosTokenId,
             eosTokenIds: eosTokenIds, device: device)
     }
 
@@ -419,29 +423,43 @@ public final class VisionModel: @unchecked Sendable {
     /// for VLMs without an audio tower.
     public func generate(
         promptTokens: [Int], audio waveform: [Float],
-        maxTokens: Int, eosTokenId: Int?,
+        maxTokens: Int, parameters: GenerationParameters? = nil,
+        eosTokenId: Int?,
         eosTokenIds: [Int] = [],
         device: Device = .shared
     ) throws -> [Int] {
         let audioTokens = try encodeAudio(waveform, device: device)
-        return try runGreedy(
+        return try runSampled(
             promptTokens: promptTokens,
             imageTokens: nil, videoTokens: nil, audioTokens: audioTokens,
-            maxTokens: maxTokens, eosTokenId: eosTokenId,
+            maxTokens: maxTokens, parameters: parameters,
+            eosTokenId: eosTokenId,
             eosTokenIds: eosTokenIds, device: device)
     }
 
-    /// Shared greedy-decode driver — builds the prefill embedding
-    /// stream (with optional pre-encoded image / video tokens), runs
-    /// prefill, then decodes tokens one at a time. Identical control
-    /// flow to the legacy `generate(promptTokens:image:...)` path.
-    private func runGreedy(
+    /// Shared multimodal decode driver — builds the prefill embedding
+    /// stream (with optional pre-encoded image / video / audio tokens),
+    /// runs prefill to fill the KV cache, then decodes one token at a time,
+    /// **sampling each step per `parameters`** via the same
+    /// `Sampling.sample` the text path uses (not hard-wired argmax).
+    private func runSampled(
         promptTokens: [Int],
         imageTokens: Tensor?, videoTokens: Tensor?, audioTokens: Tensor?,
-        maxTokens: Int, eosTokenId: Int?,
+        maxTokens: Int, parameters: GenerationParameters?,
+        eosTokenId: Int?,
         eosTokenIds: [Int],
         device: Device
     ) throws -> [Int] {
+        // Respect the caller's generation parameters (temperature / top-p /
+        // top-k / min-p / repetition-penalty / seed). Default — when a
+        // caller passes none — is deterministic greedy (temperature 0), but
+        // the real call paths (tests, `Model`/CLI) pass the model's
+        // `defaultGenerationParameters`. The same `Sampling.sample` the
+        // text path uses drives every step, so the multimodal decode is no
+        // longer hard-wired to argmax.
+        let params =
+            parameters ?? GenerationParameters().with { $0.temperature = 0 }
+        var rng = params.makeRNG()
         let caches = engine.makeLayerCaches(device: device)
 
         // Build the prefill embedding stream.
@@ -470,26 +488,33 @@ public final class VisionModel: @unchecked Sendable {
             return tok
         }
 
-        // Prefill: forward every spliced embedding, keeping the argmax
-        // of the final position as the first decoded token.
+        // `tokenHistory` feeds the repetition penalty (prompt + decoded so
+        // far), mirroring `Generate.driveGeneration`.
+        var tokenHistory = promptTokens
+
+        // Prefill: forward every spliced embedding to build the KV cache.
+        // Only the FINAL position's logits matter — sample the first decoded
+        // token from them via the shared `Sampling.sample` (handles
+        // temperature 0 → greedy, plus top-k / top-p / min-p / rep-penalty).
         var nextToken = 0
+        let lastPos = stream.count - 1
         for (pos, embedding) in stream.enumerated() {
             let cmd = device.makeCommandBuffer()
             let logits = engine.forward(
                 inputEmbedding: embedding, position: pos,
                 pleTokenId: pleTokenId(for: promptTokens[pos]),
                 caches: caches, on: cmd, device: device)
-            let outBuf = device.makeBuffer(length: 4)
-            let outT = Tensor(buffer: outBuf, offset: 0, shape: [1], dtype: .u32)
-            Ops.argmax(logits, into: outT, on: cmd)
             cmd.commit()
             cmd.waitUntilCompleted()
-            nextToken = Int(
-                outBuf.contents()
-                    .bindMemory(to: UInt32.self, capacity: 1).pointee)
+            if pos == lastPos {
+                nextToken = Sampling.sample(
+                    logits, parameters: params, rng: &rng,
+                    tokenHistory: tokenHistory)
+            }
         }
 
-        // Decode: ordinary token-id forward from the prefill tail.
+        // Decode: token-id forward from the prefill tail, sampling each step
+        // per the generation parameters (not hard-wired argmax).
         // Stop on any EOS — Gemma 3+ etc. publish `eos_token_id` as a
         // list; the caller passes both `eosTokenId` (back-compat single
         // id) and the optional `eosTokenIds` list.
@@ -500,9 +525,17 @@ public final class VisionModel: @unchecked Sendable {
         for _ in 0 ..< maxTokens {
             if stopSet.contains(nextToken) { break }
             generated.append(nextToken)
+            tokenHistory.append(nextToken)
             let prior = nextToken
-            nextToken = engine.forwardSample(
-                tokenId: prior, position: pos, caches: caches, device: device)
+            let cmd = device.makeCommandBuffer()
+            let logits = engine.forward(
+                tokenId: prior, position: pos,
+                caches: caches, on: cmd, device: device)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            nextToken = Sampling.sample(
+                logits, parameters: params, rng: &rng,
+                tokenHistory: tokenHistory)
             pos += 1
         }
         return generated

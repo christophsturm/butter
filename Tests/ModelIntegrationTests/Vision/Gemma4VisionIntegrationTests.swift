@@ -113,7 +113,9 @@ struct Gemma4VisionIntegrationTests {
 
         let generated = try vlm.generate(
             promptTokens: promptTokens, image: image,
-            maxTokens: 200, eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
+            maxTokens: 200,
+            parameters: m.defaultGenerationParameters.with { $0.seed = 42 },
+            eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
 
         // Coherence first, then the content check: the caption should
         // mention a dog.
@@ -228,7 +230,9 @@ struct Gemma4VisionIntegrationTests {
 
         let generated = try vlm.generate(
             promptTokens: promptTokens, videoFrames: frames,
-            maxTokens: 160, eosTokenId: m.config.eosTokenId,
+            maxTokens: 160,
+            parameters: m.defaultGenerationParameters.with { $0.seed = 42 },
+            eosTokenId: m.config.eosTokenId,
             eosTokenIds: m.config.eosTokenIds)
         let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("Gemma 4 video → text: \(text)")

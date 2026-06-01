@@ -309,11 +309,14 @@ lands.
 
 1. ✅ **DONE** — **Resolution/processor AUDIT + docs** (§3). 7 distort, 4
    incomplete, 4 faithful; audio fine. Results table in §3; tasks #29/#30 filed.
-2. ⏳ **VLM respects generation params** (§7a / §1) — route `runGreedy` through
-   `Generate` so the multimodal path samples per `defaultGenerationParameters`
-   instead of always-argmax. **Correctness fix** (affects every VLM today,
-   incl. the Gemma 4 paths just shipped) + the prerequisite for VLM streaming.
-   **Do first** — no kernels, self-contained.
+2. ✅ **DONE** — **VLM respects generation params**. `runGreedy` → `runSampled`:
+   the multimodal decode now samples every step via the shared
+   `Sampling.sample` (temperature / top-p / top-k / min-p / rep-penalty / seed),
+   not hard-wired argmax. `generate(...)` gained an optional `parameters:`
+   (nil → deterministic greedy; real callers pass `defaultGenerationParameters`).
+   Gemma 4 image/audio/video integration tests pass with sampled defaults +
+   seed 42 (dog / "sure i can help you with that" / cat). *(Full streaming
+   output — routing through `Generate.generateStream` — is still §7a / #9.)*
 3. ⏳ **`MediaUtils` foundation + K1/K2 kernels** (§4, §12) — create
    `Media/MediaUtils.swift`; write the **GPU `resize_bilinear` (K1)** +
    **normalize→NCHW (K2)** kernels (metaltile + correctness tests) so the
