@@ -97,7 +97,7 @@ There is **zero** smart-resize / tiling / pan-and-scan anywhere in
 
 | Model | Modality | Reference processor | Native | Patch | Token count | FFAI today | Verdict |
 |---|---|---|---|---|---|---|---|
-| **Qwen2-VL** | img+vid | native `smart_resize` (min/max-pixels, aspect) | any | 14, merge 2 | variable | ✅ native `smart_resize` → variable `(gridH,gridW)` (`MediaUtils.smartResize` + non-square tower) | ✅ faithful (geometry-verified; e2e blocked on a pre-existing quant crash, #7) |
+| **Qwen2-VL** | img+vid | native `smart_resize` (min/max-pixels, aspect) | any | 14, merge 2 | variable | ✅ native `smart_resize` → variable `(gridH,gridW)` (`MediaUtils.smartResize` + non-square tower, GPU attention) | ✅ faithful — **e2e validated** (4bit image test: accurate native-res caption) |
 | **Qwen2.5-VL** | img+vid | native `smart_resize` | any | 14, merge 2 | variable | fixed 28×28→392² (`Qwen25Vision.swift:446,545`) | ❌ distorts+truncates |
 | **Qwen3-VL** | img+vid | native `smart_resize` | any | 16, merge 2 | variable | fixed 32×32² (`Qwen3Vision.swift:342`) | ❌ distorts+truncates |
 | **Qwen3.5-VL** | img+vid | native `smart_resize` | any | 16, merge 2 | variable | fixed grid (Qwen3 tower, `Qwen3xVision.swift:147`) | ❌ distorts+truncates |
@@ -328,16 +328,22 @@ lands.
 4. ⏳ **`smart_resize` native-resolution processors** (§3) — on the K1/K2 base.
    Shared geometry helper **`MediaUtils.smartResize`** (+ `SmartResizeBounds`,
    10 unit tests) landed first.
-   - ✅ **Qwen2-VL** (template) — tower made non-square-aware
+   - ✅ **Qwen2-VL** (template) — **validated e2e**. Tower made non-square-aware
      (`runForward`/`unfoldPatches`/`ropeTables`/`mergeReorderedPositions` thread
      `(gridH,gridW)`; `gridDims` derives the grid per-image), `preprocessImage`
      override smartResizes + GPU resize/normalizes, `smartResizeGrid` sizes the
-     placeholder run. Geometry unit tests pass; full unit gate green (1718).
-     ⚠️ **e2e content (dog/cat) blocked** by a *pre-existing* quantized-weight
-     crash unrelated to resolution — `Linear.init` hits `u32` weight + `f16`
-     bias on the `Qwen2-VL-2B-Instruct-4bit` forward (`Layers.swift:59`);
-     tracked for the vision bisect (#7 / NU.5). Geometry is the tighter signal
-     until that's fixed.
+     placeholder run. Geometry unit tests + full unit gate green (1718); the
+     `Qwen2-VL-2B-Instruct-4bit` image integration test passes with an accurate
+     native-resolution caption ("a golden retriever dog standing on a
+     sidewalk … white buildings … residential area"). Two blockers fixed along
+     the way: (a) the quantized **ViT** crash — `loadDequantizedLinear`
+     dequantizes packed affine weights at load (the tower holds plain `Linear`
+     fields); (b) CPU-attention pin — vision attention now runs on the GPU
+     `sdpaBidirectional` d80 kernel (#24 template applied). ⚠️ **Perf follow-up:**
+     native resolution raises the placeholder count (~196 → ~1000), and
+     `VisionModel.runSampled` prefills one position per command buffer, so
+     prefill is now the wall-time cost (~580s) — batched embedding prefill is
+     flagged as a separate VLM perf task.
    - ⏳ **Qwen2.5/3/3.5-VL** — same non-square refactor (patch-16/factor-32 for
      v3+); apply the Qwen2-VL template per tower. Blocked on the same quant
      crash for e2e validation.
