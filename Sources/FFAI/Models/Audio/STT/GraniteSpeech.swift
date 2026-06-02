@@ -265,6 +265,11 @@ private func batchMatVec(
     _ w: [Float], _ xRows: [[Float]], _ b: [Float]? = nil,
     outDim: Int, inDim: Int
 ) -> [[Float]] {
+    // GPU port (flag-gated): the encoder/projector's heavy matmuls run on the
+    // GPU; the surrounding O(d) work stays on CPU. See `GraniteSpeechGPU`.
+    if GraniteSpeechGPU.matmulOnGPU {
+        return gpuBatchMatVec(w, xRows, b, outDim: outDim, inDim: inDim)
+    }
     let n = xRows.count
     // `nonisolated(unsafe)`: each `concurrentPerform` iteration writes a
     // distinct `out[row]`; disjoint indices, no aliasing.
@@ -787,12 +792,14 @@ private func batchNorm1d(
 }
 
 /// Conformer feed-forward block: preNorm → up → silu → down, residual scaled by 0.5.
-/// Feature flags for the in-progress GraniteSpeech CPU→GPU encoder port.
-/// Each module is validated against the CPU baseline before its flag flips on
-/// by default; until then the CPU path ships and the GPU path is opt-in.
+/// Feature flag for the GraniteSpeech CPU→GPU encoder/projector port. Routes
+/// the batched matmuls (the O(d²) cost: FF up/down, attn Q/KV/out projections,
+/// conv 1×1, input_linear, and the QFormer projector's projections) through
+/// `Ops.gemm`. The cheap O(d) work (norms, GLU, depthwise conv, batchnorm,
+/// attention softmax) stays on CPU. Validated against the CPU baseline by the
+/// encoder-parity test before flipping on by default.
 enum GraniteSpeechGPU {
-    /// Route the conformer feed-forward module through GPU Ops.
-    nonisolated(unsafe) static var ffOnGPU = false
+    nonisolated(unsafe) static var matmulOnGPU = false
 }
 
 /// Upload row-major `[[Float]]` `[n, cols]` to a GPU f32 tensor `[n, cols]`.
@@ -817,56 +824,57 @@ private func tensorToRows(_ t: Tensor, rows: Int, cols: Int) -> [[Float]] {
     return out
 }
 
-/// GPU port of `conformerFF` — `0.5·down(silu(up(LN(x)))) + x`. Same math as
-/// the CPU path (validated against it); selected by `GraniteSpeechGPU.ffOnGPU`.
-private func conformerFFGPU(
-    _ x: [[Float]], w: GraniteSpeechEncoderWeights.LayerWeights,
-    isFF1: Bool, cfg: GraniteSpeechConfig.EncoderConfig
+/// GPU batched matmul `[n, inDim] · Wᵀ (+bias) → [n, outDim]` via `Ops.gemm`.
+/// One dispatch over all rows; the host↔GPU copies are dwarfed by the GEMM.
+/// Weight `w` is row-major `[outDim, inDim]` (the CPU `batchMatVec` layout).
+private func gpuBatchMatVec(
+    _ w: [Float], _ xRows: [[Float]], _ b: [Float]?, outDim: Int, inDim: Int
 ) -> [[Float]] {
-    let hiddenDim = cfg.hiddenDim
-    let ffDim = hiddenDim * cfg.feedforwardMult
-    let T = x.count
+    let n = xRows.count
     let device = Device.shared
-    let (preNormW, preNormB, upW, upB, downW, downB) =
-        isFF1
-        ? (w.ff1PreNormW, w.ff1PreNormB, w.ff1UpW, w.ff1UpB, w.ff1DownW, w.ff1DownB)
-        : (w.ff2PreNormW, w.ff2PreNormB, w.ff2UpW, w.ff2UpB, w.ff2DownW, w.ff2DownB)
-
-    func vec(_ a: [Float]) -> Tensor {
-        let t = Tensor.empty(shape: [a.count], dtype: .f32, device: device)
-        t.copyIn(from: a)
-        return t
-    }
-    func mat(_ a: [Float], _ outDim: Int, _ inDim: Int) -> Tensor {
-        let t = Tensor.empty(shape: [outDim, inDim], dtype: .f32, device: device)
-        t.copyIn(from: a)
-        return t
-    }
-
     let cmd = device.makeCommandBuffer()
-    let xT = rowsToTensor(x, cols: hiddenDim, device: device)
-    let normed = Ops.layerNorm(
-        xT, weight: vec(preNormW), bias: vec(preNormB), eps: 1e-5,
-        nRows: T, rowSize: hiddenDim, on: cmd)
-    let up = Linear(weight: mat(upW, ffDim, hiddenDim), bias: vec(upB))
-        .callMany(normed, t: T, on: cmd)
-    let act = Ops.silu(up, on: cmd)
-    let down = Linear(weight: mat(downW, hiddenDim, ffDim), bias: vec(downB))
-        .callMany(act, t: T, on: cmd)
-    // Residual: 0.5·ff(x) + x.
-    let res = Ops.add(scalarMul(down, scalar: 0.5, device: device, on: cmd), xT, on: cmd)
+    // `Ops.gemm` requires K (inDim) to be a multiple of 16 (the K-tile width).
+    // Pad input columns + weight columns with zeros to the next multiple; the
+    // zeros contribute nothing to each dot product, so the result is exact.
+    let kPad = ((inDim + 15) / 16) * 16
+    var xFlat = [Float](repeating: 0, count: n * kPad)
+    for r in 0 ..< n {
+        let dst = r * kPad
+        let row = xRows[r]
+        for j in 0 ..< inDim { xFlat[dst + j] = row[j] }
+    }
+    let xT = Tensor.empty(shape: [n, kPad], dtype: .f32, device: device)
+    xT.copyIn(from: xFlat)
+    let wT = Tensor.empty(shape: [outDim, kPad], dtype: .f32, device: device)
+    if kPad == inDim {
+        wT.copyIn(from: w)
+    } else {
+        var wPad = [Float](repeating: 0, count: outDim * kPad)
+        for o in 0 ..< outDim {
+            let src = o * inDim
+            let dst = o * kPad
+            for j in 0 ..< inDim { wPad[dst + j] = w[src + j] }
+        }
+        wT.copyIn(from: wPad)
+    }
+    let bias: Tensor?
+    if let b {
+        let bT = Tensor.empty(shape: [outDim], dtype: .f32, device: device)
+        bT.copyIn(from: b)
+        bias = bT
+    } else {
+        bias = nil
+    }
+    let y = Linear(weight: wT, bias: bias).callMany(xT, t: n, on: cmd)
     cmd.commit()
     cmd.waitUntilCompleted()
-    return tensorToRows(res, rows: T, cols: hiddenDim)
+    return tensorToRows(y, rows: n, cols: outDim)
 }
 
 private func conformerFF(
     _ x: [[Float]], w: GraniteSpeechEncoderWeights.LayerWeights,
     isFF1: Bool, cfg: GraniteSpeechConfig.EncoderConfig
 ) -> [[Float]] {
-    if GraniteSpeechGPU.ffOnGPU {
-        return conformerFFGPU(x, w: w, isFF1: isFF1, cfg: cfg)
-    }
     let ffDim = cfg.hiddenDim * cfg.feedforwardMult
     let (preNormW, preNormB, upW, upB, downW, downB): ([Float], [Float], [Float], [Float], [Float], [Float])
     if isFF1 {
