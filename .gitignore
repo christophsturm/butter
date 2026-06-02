@@ -2,6 +2,7 @@
 .claude/
 .build/
 .swiftpm/
+tmp/
 DerivedData/
 *.xcodeproj
 Package.resolved
