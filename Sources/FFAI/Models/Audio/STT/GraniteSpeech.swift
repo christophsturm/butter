@@ -799,7 +799,13 @@ private func batchNorm1d(
 /// attention softmax) stays on CPU. Validated against the CPU baseline by the
 /// encoder-parity test before flipping on by default.
 enum GraniteSpeechGPU {
-    nonisolated(unsafe) static var matmulOnGPU = false
+    /// Route the QFormer projector's batched matmuls through `Ops.gemm`
+    /// (validated vs CPU, max|Δ| ~6e-6).
+    nonisolated(unsafe) static var matmulOnGPU = true
+    /// All-GPU **resident** conformer encoder (`runEncoderGPU`) — activation
+    /// stays a GPU tensor across the forward, one sync. Validated vs the CPU
+    /// encoder (max|Δ| ~8.6e-6 at the single-block test shape).
+    nonisolated(unsafe) static var residentEncoder = true
 }
 
 /// Upload row-major `[[Float]]` `[n, cols]` to a GPU f32 tensor `[n, cols]`.
@@ -1203,10 +1209,243 @@ private func buildAttnDists(contextSize: Int, maxPosEmb: Int) -> [[Int32]] {
     return dists
 }
 
+/// All-GPU **resident** conformer encoder (task #44): the activation stays a
+/// GPU `Tensor [T, hiddenDim]` across the whole forward — FF, blockwise rel-pos
+/// attention, conv, post-norm — in one command buffer, one sync at the end (a
+/// second brief sync only for the one-time mid-layer softmax residual, whose
+/// K=outputDim isn't a gemm-friendly width). Mirrors the CPU `runEncoder`;
+/// validated against it via the `GS_GPU_PARITY` harness. Gated behind
+/// `GraniteSpeechGPU.residentEncoder` (default off) until parity is confirmed.
+func runEncoderGPU(_ input: [[Float]], weights: GraniteSpeechEncoderWeights) -> [[Float]] {
+    let cfg = weights.cfg
+    let T = input.count
+    let device = Device.shared
+    let hidden = cfg.hiddenDim
+    let H = cfg.numHeads
+    let Dh = cfg.dimHead
+    let inner = H * Dh
+    let C = cfg.contextSize
+    let relLen = 2 * cfg.maxPosEmb + 1
+    let scale = pow(Float(Dh), -0.5)
+
+    // ── upload / op helpers (one command buffer) ──
+    func vecT(_ a: [Float]) -> Tensor {
+        let t = Tensor.empty(shape: [a.count], dtype: .f32, device: device)
+        t.copyIn(from: a)
+        return t
+    }
+    func matT(_ a: [Float], _ outD: Int, _ inD: Int) -> Tensor {
+        let t = Tensor.empty(shape: [outD, inD], dtype: .f32, device: device)
+        t.copyIn(from: a)
+        return t
+    }
+    func rowSlice(_ t: Tensor, _ start: Int, _ n: Int, _ cols: Int) -> Tensor {
+        Tensor(
+            buffer: t.buffer, offset: t.offset + start * cols * 4,
+            shape: [n, cols], dtype: t.dtype)
+    }
+    // Resident matmul `[rows, inD] · Wᵀ (+bias) → [rows, outD]`. Encoder K's are
+    // all multiples of 16, so no padding needed on this path.
+    func mm(
+        _ x: Tensor, _ w: [Float], _ b: [Float]?, _ outD: Int, _ inD: Int, _ rows: Int,
+        on cmd: MTLCommandBuffer
+    ) -> Tensor {
+        Linear(weight: matT(w, outD, inD), bias: b.map(vecT)).callMany(x, t: rows, on: cmd)
+    }
+    func ln(
+        _ x: Tensor, _ w: [Float], _ b: [Float], _ rows: Int, _ dim: Int,
+        on cmd: MTLCommandBuffer
+    ) -> Tensor {
+        Ops.layerNorm(
+            x, weight: vecT(w), bias: vecT(b), eps: 1e-5, nRows: rows, rowSize: dim, on: cmd)
+    }
+
+    func ff(
+        _ h: Tensor, _ w: GraniteSpeechEncoderWeights.LayerWeights, isFF1: Bool,
+        on cmd: MTLCommandBuffer
+    ) -> Tensor {
+        let ffDim = hidden * cfg.feedforwardMult
+        let (pnW, pnB, upW, upB, dnW, dnB) =
+            isFF1
+            ? (w.ff1PreNormW, w.ff1PreNormB, w.ff1UpW, w.ff1UpB, w.ff1DownW, w.ff1DownB)
+            : (w.ff2PreNormW, w.ff2PreNormB, w.ff2UpW, w.ff2UpB, w.ff2DownW, w.ff2DownB)
+        let normed = ln(h, pnW, pnB, T, hidden, on: cmd)
+        var up = mm(normed, upW, upB, ffDim, hidden, T, on: cmd)
+        up = Ops.silu(up, on: cmd)
+        let down = mm(up, dnW, dnB, hidden, ffDim, T, on: cmd)
+        return Ops.add(scalarMul(down, scalar: 0.5, device: device, on: cmd), h, on: cmd)
+    }
+
+    func attn(
+        _ h: Tensor, _ w: GraniteSpeechEncoderWeights.LayerWeights, on cmd: MTLCommandBuffer
+    ) -> Tensor {
+        let normed = ln(h, w.attnPreNormW, w.attnPreNormB, T, hidden, on: cmd)
+        let q = mm(normed, w.attnToQW, nil, inner, hidden, T, on: cmd)
+        // Split the fused KV weight into contiguous K/V halves → two matmuls
+        // (avoids a strided column-slice of a [T, 2·inner] activation).
+        let kW = Array(w.attnToKVW[0 ..< inner * hidden])
+        let vW = Array(w.attnToKVW[inner * hidden ..< 2 * inner * hidden])
+        let k = mm(normed, kW, nil, inner, hidden, T, on: cmd)
+        let v = mm(normed, vW, nil, inner, hidden, T, on: cmd)
+        // Row-reversed rel-pos table + zero u/v bias (same mapping as the CPU
+        // GPU path; pinned by sdpaRelPosConformerGraniteMapping).
+        var flipped = [Float](repeating: 0, count: relLen * Dh)
+        for r in 0 ..< relLen {
+            let s = (relLen - 1 - r) * Dh
+            let d = r * Dh
+            for dd in 0 ..< Dh { flipped[d + dd] = w.attnRelPosW[s + dd] }
+        }
+        let relT = matT(flipped, relLen, Dh)
+        let zeroBias = vecT([Float](repeating: 0, count: H * Dh))
+        // h holds the attn input x; per block, add the out-projection into the
+        // block's rows → x + Σ_block outProj (blocks are row-disjoint).
+        let numBlocks = (T + C - 1) / C
+        for b in 0 ..< numBlocks {
+            let start = b * C
+            let blockLen = min(C, T - start)
+            let qB = rowSlice(q, start, blockLen, inner)
+            let kBh = Ops.transposeTokensToHeads(
+                rowSlice(k, start, blockLen, inner), nTokens: blockLen, nHeads: H, headDim: Dh,
+                on: cmd)
+            let vBh = Ops.transposeTokensToHeads(
+                rowSlice(v, start, blockLen, inner), nTokens: blockLen, nHeads: H, headDim: Dh,
+                on: cmd)
+            let attnOut = Ops.sdpaRelPosConformer(
+                q: qB, k: kBh, v: vBh, relEmb: relT, posBiasU: zeroBias, posBiasV: zeroBias,
+                nQHeads: H, nKVHeads: H, baseKV: 0, nQuery: blockLen, kvStride: blockLen,
+                relZero: cfg.maxPosEmb, relLen: relLen, scale: scale, on: cmd)
+            let outProj = mm(
+                attnOut.reshaped(to: [blockLen, inner]), w.attnToOutW, w.attnToOutB, hidden,
+                inner, blockLen, on: cmd)
+            let hSlice = rowSlice(h, start, blockLen, hidden)
+            _ = Ops.add(hSlice, outProj, on: cmd, into: hSlice)
+        }
+        return h
+    }
+
+    func conv(
+        _ h: Tensor, _ w: GraniteSpeechEncoderWeights.LayerWeights, on cmd: MTLCommandBuffer
+    ) -> Tensor {
+        let innerConv = hidden * cfg.convExpansionFactor
+        let k = cfg.convKernelSize
+        let normed = ln(h, w.convNormW, w.convNormB, T, hidden, on: cmd)
+        // up conv (1×1): split weight/bias into signal + gate halves → GLU.
+        let sigW = Array(w.convUpW[0 ..< innerConv * hidden])
+        let gateW = Array(w.convUpW[innerConv * hidden ..< 2 * innerConv * hidden])
+        let sigB = Array(w.convUpB[0 ..< innerConv])
+        let gateB = Array(w.convUpB[innerConv ..< 2 * innerConv])
+        let sig = mm(normed, sigW, sigB, innerConv, hidden, T, on: cmd)
+        let gate = mm(normed, gateW, gateB, innerConv, hidden, T, on: cmd)
+        let gated = Ops.mul(sig, Ops.sigmoid(gate, on: cmd), on: cmd)
+        // Depthwise conv1d as NHWC [1,1,T,innerConv], k=1×kernelSize. Transpose
+        // the weight tap-major [k, c] → channel-major [c, k] for the kernel.
+        var dwW = [Float](repeating: 0, count: innerConv * k)
+        for kx in 0 ..< k {
+            for c in 0 ..< innerConv { dwW[c * k + kx] = w.convDepthW[kx * innerConv + c] }
+        }
+        // `depthwiseConv2dNHWC`'s single `padding` pads BOTH axes, so pre-pad the
+        // time (W) axis ourselves (k-1 total, symmetric for odd k) and call with
+        // padding:0 — otherwise the size-1 H axis would be padded too.
+        let pad = k / 2
+        let padded = Tensor.empty(
+            shape: [1, 1, T + 2 * pad, innerConv], dtype: .f32, device: device)
+        padded.zero()
+        let mid = Tensor(
+            buffer: padded.buffer, offset: padded.offset + pad * innerConv * 4,
+            shape: [T, innerConv], dtype: .f32)
+        _ = Ops.add(mid, gated, on: cmd, into: mid)
+        let dw = Ops.depthwiseConv2dNHWC(
+            input: padded,
+            weight: matT(dwW, innerConv, k), bias: vecT([Float](repeating: 0, count: innerConv)),
+            batch: 1, channels: innerConv, inH: 1, inW: T + 2 * pad, kH: 1, kW: k, stride: 1,
+            padding: 0, on: cmd
+        ).reshaped(to: [T, innerConv])
+        // BatchNorm (inference) folded to per-channel affine, tiled to [T, inner].
+        var scaleTile = [Float](repeating: 0, count: T * innerConv)
+        var shiftTile = [Float](repeating: 0, count: T * innerConv)
+        for c in 0 ..< innerConv {
+            let s = w.convBnW[c] / (w.convBnVar[c] + 1e-5).squareRoot()
+            let sh = w.convBnB[c] - w.convBnMean[c] * s
+            for t in 0 ..< T {
+                scaleTile[t * innerConv + c] = s
+                shiftTile[t * innerConv + c] = sh
+            }
+        }
+        var bn = Ops.add(
+            Ops.mul(dw, matT(scaleTile, T, innerConv), on: cmd),
+            matT(shiftTile, T, innerConv), on: cmd)
+        bn = Ops.silu(bn, on: cmd)
+        let out = mm(bn, w.convDownW, w.convDownB, hidden, innerConv, T, on: cmd)
+        return Ops.add(h, out, on: cmd)
+    }
+
+    // ── forward ──
+    let cmd0 = device.makeCommandBuffer()
+    var h = mm(
+        rowsToTensor(input, cols: cfg.inputDim, device: device),
+        weights.inputW, weights.inputB, hidden, cfg.inputDim, T, on: cmd0)
+    let halfLayers = cfg.numLayers / 2
+    var cmd = cmd0
+    for (idx, layer) in weights.layers.enumerated() {
+        h = ff(h, layer, isFF1: true, on: cmd)
+        h = attn(h, layer, on: cmd)
+        h = conv(h, layer, on: cmd)
+        h = ff(h, layer, isFF1: false, on: cmd)
+        h = ln(h, layer.postNormW, layer.postNormB, T, hidden, on: cmd)
+
+        if idx + 1 == halfLayers {
+            // One-time mid-layer softmax residual. outMid's K = outputDim (348)
+            // isn't a gemm-friendly width and softmax must be over exactly 348,
+            // so bridge this single step on CPU (commit → sync → CPU → new buffer).
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            var hRows = tensorToRows(h, rows: T, cols: hidden)
+            let xMid = batchMatVecCPU(
+                weights.outW, hRows, weights.outB, outDim: cfg.outputDim, inDim: hidden)
+            var softMid = xMid
+            for t in 0 ..< T { softMid[t] = softmax(xMid[t]) }
+            let midProj = batchMatVecCPU(
+                weights.outMidW, softMid, weights.outMidB, outDim: hidden, inDim: cfg.outputDim)
+            for t in 0 ..< T { for d in 0 ..< hidden { hRows[t][d] += midProj[t][d] } }
+            cmd = device.makeCommandBuffer()
+            h = rowsToTensor(hRows, cols: hidden, device: device)
+        }
+    }
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    return tensorToRows(h, rows: T, cols: hidden)
+}
+
+/// CPU batched matmul that ignores the GPU routing flag — used by the resident
+/// encoder's one-time mid-layer residual bridge so it can't recurse onto GPU.
+private func batchMatVecCPU(
+    _ w: [Float], _ xRows: [[Float]], _ b: [Float]?, outDim: Int, inDim: Int
+) -> [[Float]] {
+    let n = xRows.count
+    nonisolated(unsafe) var out = [[Float]](
+        repeating: [Float](repeating: 0, count: outDim), count: n)
+    DispatchQueue.concurrentPerform(iterations: n) { row in
+        let x = xRows[row]
+        var y = [Float](repeating: 0, count: outDim)
+        for i in 0 ..< outDim {
+            var acc: Float = 0
+            let base = i * inDim
+            for j in 0 ..< inDim { acc += w[base + j] * x[j] }
+            y[i] = acc
+        }
+        if let bias = b { for i in 0 ..< outDim { y[i] += bias[i] } }
+        out[row] = y
+    }
+    return out
+}
+
 /// Run the full CTC Conformer encoder.
 /// Input: [[Float]] shape [T, inputDim=160].
 /// Output: [[Float]] shape [T, hiddenDim].
 func runEncoder(_ input: [[Float]], weights: GraniteSpeechEncoderWeights) -> [[Float]] {
+    if GraniteSpeechGPU.residentEncoder {
+        return runEncoderGPU(input, weights: weights)
+    }
     let cfg = weights.cfg
     let T = input.count
 
