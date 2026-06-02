@@ -683,6 +683,23 @@ public enum ModelRegistry {
                 options: options, device: device)
         }
 
+        // DeepSeek V4 — hybrid full / CSA / HCA attention over a
+        // 43-layer MoE backbone with MLA latent KV, Lightning Indexer
+        // top-k sparse routing, and `sqrtsoftplus` MoE gating. The
+        // safetensors forward path is WIP; the GGUF loader is a separate
+        // parallel path (see `DeepSeekV4Variant.loadModelFromGGUF`).
+        // Routes through its own family file.
+        if let arch = config.architecture, DeepSeekV4.architectures.contains(arch) {
+            return try loadDeepSeekV4(
+                config: config, weights: weights,
+                options: options, device: device)
+        }
+        if let mt = config.modelType, DeepSeekV4.modelTypes.contains(mt) {
+            return try loadDeepSeekV4(
+                config: config, weights: weights,
+                options: options, device: device)
+        }
+
         // GPT-OSS — a mixture-of-experts transformer with an alternating
         // sliding/full attention schedule, learned per-head attention
         // sinks, and bias-corrected projections. Routes through its own
@@ -898,6 +915,31 @@ public enum ModelRegistry {
         return Loaded(
             engine: engine,
             defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
+
+    /// DeepSeek V4 family loader. Mirrors the other `load<Family>`
+    /// helpers, but the safetensors forward path is still WIP — the
+    /// variant's `loadModel` always raises
+    /// `DeepSeekV4Error.notYetImplemented` today, so this helper
+    /// resolves the variant, attempts the load, and surfaces that error
+    /// in ONE place (rather than the duplicated dispatch sites).
+    ///
+    /// NOTE: `DeepSeekV4Model` does not yet conform to `LanguageModel`
+    /// (forward is WIP), so it cannot be wrapped in a `Loaded` yet. The
+    /// `loadModel` call above throws before we get here; the trailing
+    /// throw keeps control flow well-formed and documents the gap. Once
+    /// `DeepSeekV4Model: LanguageModel` lands, replace the trailing
+    /// throw with the standard `return Loaded(engine:...)` wrap.
+    public static func loadDeepSeekV4(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try DeepSeekV4.variant(for: config)
+        _ = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        throw DeepSeekV4Error.notYetImplemented("DeepSeekV4 Loaded wrapping")
     }
 
     public static func loadGPTOSS(
