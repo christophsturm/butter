@@ -1745,7 +1745,10 @@ public final class GraniteSpeechModel: Module {
         let emb = embedTokens(tidTensor, on: cmd)
         cmd.commit()
         cmd.waitUntilCompleted()
-        return emb.toArray(as: Float.self)
+        // `toFloatArray()` (dtype-aware), NOT `toArray(as: Float.self)` (raw
+        // f32 reinterpret): a quantized embedding dequant-gathers to the scales'
+        // dtype (f16), so a raw 4-byte read would over-read the buffer (SIGBUS).
+        return emb.toFloatArray()
     }
 
     /// Copy CPU [Float] into a Tensor (handles f32/f16/bf16 output dtype).
