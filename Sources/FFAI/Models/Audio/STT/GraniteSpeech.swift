@@ -804,8 +804,10 @@ enum GraniteSpeechGPU {
     nonisolated(unsafe) static var matmulOnGPU = true
     /// All-GPU **resident** conformer encoder (`runEncoderGPU`) — activation
     /// stays a GPU tensor across the forward, one sync. Validated vs the CPU
-    /// encoder (max|Δ| ~8.6e-6 at the single-block test shape).
+    /// encoder (max|Δ| ~8.6e-6 single-block, ~7.9e-6 multi-block).
     nonisolated(unsafe) static var residentEncoder = true
+    /// All-GPU **resident** QFormer projector (`runProjectorGPU`).
+    nonisolated(unsafe) static var residentProjector = true
 }
 
 /// Upload row-major `[[Float]]` `[n, cols]` to a GPU f32 tensor `[n, cols]`.
@@ -1662,7 +1664,124 @@ private func qformerLayer(
 /// in the LM's hidden space.
 /// encoderOut: [[Float]] shape [T, hiddenDim]
 /// Returns [[Float]] shape [numAudioTokens, lmHiddenSize]
+/// All-GPU **resident** QFormer projector (task #45). The query activation
+/// stays a GPU tensor through every QFormer layer (self-attn → cross-attn →
+/// FFN, all on GPU; head_dim 64 uses `Ops.sdpaBidirectional`), one command
+/// buffer, one sync. Mirrors the CPU `runProjector`; validated against it via
+/// `GS_GPU_PARITY`. Gated behind `GraniteSpeechGPU.residentProjector`.
+func runProjectorGPU(_ encoderOut: [[Float]], weights: GraniteSpeechProjectorWeights) -> [[Float]] {
+    let cfg = weights.cfg
+    let pcfg = cfg.projectorConfig
+    let T = encoderOut.count
+    let ws = cfg.windowSize
+    let nQ = cfg.numQueriesPerWindow
+    let hs = pcfg.hiddenSize
+    let ehs = pcfg.encoderHiddenSize
+    let H = pcfg.numAttentionHeads
+    let headDim = hs / H
+    let eps = pcfg.layerNormEps
+    let device = Device.shared
+    let nBlocks = (T + ws - 1) / ws
+
+    // Pad encoder output to a whole number of windows (CPU, pre-upload).
+    var paddedFlat = [Float](repeating: 0, count: nBlocks * ws * ehs)
+    for t in 0 ..< T {
+        let row = encoderOut[t]
+        let dst = t * ehs
+        for d in 0 ..< ehs { paddedFlat[dst + d] = row[d] }
+    }
+
+    func vecT(_ a: [Float]) -> Tensor {
+        let t = Tensor.empty(shape: [a.count], dtype: .f32, device: device)
+        t.copyIn(from: a)
+        return t
+    }
+    func matT(_ a: [Float], _ o: Int, _ i: Int) -> Tensor {
+        let t = Tensor.empty(shape: [o, i], dtype: .f32, device: device)
+        t.copyIn(from: a)
+        return t
+    }
+    func mm(
+        _ x: Tensor, _ w: [Float], _ b: [Float]?, _ o: Int, _ i: Int, _ rows: Int,
+        on cmd: MTLCommandBuffer
+    ) -> Tensor {
+        Linear(weight: matT(w, o, i), bias: b.map(vecT)).callMany(x, t: rows, on: cmd)
+    }
+    func ln(
+        _ x: Tensor, _ w: [Float], _ b: [Float], _ rows: Int, on cmd: MTLCommandBuffer
+    ) -> Tensor {
+        Ops.layerNorm(
+            x, weight: vecT(w), bias: vecT(b), eps: eps, nRows: rows, rowSize: hs, on: cmd)
+    }
+    func mha(
+        _ queries: Tensor, _ kv: Tensor, _ L: Int, _ M: Int, _ kvDim: Int,
+        _ qW: [Float], _ qB: [Float], _ kW: [Float], _ kB: [Float], _ vW: [Float], _ vB: [Float],
+        on cmd: MTLCommandBuffer
+    ) -> Tensor {
+        let q = mm(queries, qW, qB, hs, hs, L, on: cmd)
+        let k = mm(kv, kW, kB, hs, kvDim, M, on: cmd)
+        let v = mm(kv, vW, vB, hs, kvDim, M, on: cmd)
+        let kh = Ops.transposeTokensToHeads(k, nTokens: M, nHeads: H, headDim: headDim, on: cmd)
+        let vh = Ops.transposeTokensToHeads(v, nTokens: M, nHeads: H, headDim: headDim, on: cmd)
+        let out = Ops.sdpaBidirectional(
+            q: q, k: kh, v: vh, nQHeads: H, nKVHeads: H, headDim: headDim,
+            baseKV: 0, nQuery: L, kvStride: M, scale: pow(Float(headDim), -0.5), on: cmd)
+        return out.reshaped(to: [L, hs])
+    }
+
+    let cmd = device.makeCommandBuffer()
+    // Initial query LN (shared across windows).
+    var baseQ = [Float](repeating: 0, count: nQ * hs)
+    for i in 0 ..< nQ * hs { baseQ[i] = weights.query[i] }
+    let qNormed = ln(matT(baseQ, nQ, hs), weights.qfLnW, weights.qfLnB, nQ, on: cmd)
+    let paddedT = Tensor.empty(shape: [nBlocks * ws, ehs], dtype: .f32, device: device)
+    paddedT.copyIn(from: paddedFlat)
+
+    let allQ = Tensor.empty(shape: [nBlocks * nQ, hs], dtype: .f32, device: device)
+    allQ.zero()
+    for b in 0 ..< nBlocks {
+        let window = Tensor(
+            buffer: paddedT.buffer, offset: paddedT.offset + b * ws * ehs * 4,
+            shape: [ws, ehs], dtype: .f32)
+        var h = qNormed
+        for lw in weights.layers {
+            // self-attention
+            let sa = mha(
+                h, h, nQ, nQ, hs, lw.saQW, lw.saQB, lw.saKW, lw.saKB, lw.saVW, lw.saVB, on: cmd)
+            let saDense = mm(sa, lw.saOutDenseW, lw.saOutDenseB, hs, hs, nQ, on: cmd)
+            let afterSA = ln(Ops.add(h, saDense, on: cmd), lw.saOutLnW, lw.saOutLnB, nQ, on: cmd)
+            // cross-attention (kv = window)
+            let ca = mha(
+                afterSA, window, nQ, ws, ehs, lw.caQW, lw.caQB, lw.caKW, lw.caKB, lw.caVW,
+                lw.caVB, on: cmd)
+            let caDense = mm(ca, lw.caOutDenseW, lw.caOutDenseB, hs, hs, nQ, on: cmd)
+            let afterCA = ln(
+                Ops.add(afterSA, caDense, on: cmd), lw.caOutLnW, lw.caOutLnB, nQ, on: cmd)
+            // FFN
+            var ffn = mm(afterCA, lw.intDenseW, lw.intDenseB, pcfg.intermediateSize, hs, nQ, on: cmd)
+            ffn = Ops.gelu(ffn, on: cmd)
+            let ffnOut = mm(
+                ffn, lw.outDenseW, lw.outDenseB, hs, pcfg.intermediateSize, nQ, on: cmd)
+            h = ln(Ops.add(afterCA, ffnOut, on: cmd), lw.outLnW, lw.outLnB, nQ, on: cmd)
+        }
+        let dst = Tensor(
+            buffer: allQ.buffer, offset: allQ.offset + b * nQ * hs * 4,
+            shape: [nQ, hs], dtype: .f32)
+        _ = Ops.add(dst, h, on: cmd, into: dst)
+    }
+    // Final projection to LM hidden size.
+    let lmHidden = cfg.textConfig.hiddenSize
+    let outT = mm(allQ, weights.linearW, weights.linearB, lmHidden, hs, nBlocks * nQ, on: cmd)
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    let flat = outT.toFloatArray()
+    return (0 ..< nBlocks * nQ).map { i in Array(flat[i * lmHidden ..< (i + 1) * lmHidden]) }
+}
+
 func runProjector(_ encoderOut: [[Float]], weights: GraniteSpeechProjectorWeights) -> [[Float]] {
+    if GraniteSpeechGPU.residentProjector {
+        return runProjectorGPU(encoderOut, weights: weights)
+    }
     let cfg = weights.cfg
     let T = encoderOut.count
     let ws = cfg.windowSize
