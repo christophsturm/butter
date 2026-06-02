@@ -2042,6 +2042,127 @@ struct OpsTests {
         }
     }
 
+    @Test("sdpaRelPosConformer — row-reversed table + zero bias reproduces a GraniteSpeech block")
+    func sdpaRelPosConformerGraniteMapping() {
+        autoreleasepool {
+            // GraniteSpeech's conformer scores are scale·( qᵢ·kⱼ +
+            // qᵢ·relEmb[(i−j)+maxPos] ) with bidirectional softmax — ESPnet
+            // rel-pos WITHOUT the u/v content biases, and with the OPPOSITE
+            // distance sign to the kernel (which indexes j−i+relZero). The
+            // GPU path therefore feeds a ROW-REVERSED embedding table and
+            // relZero = maxPos with zero u/v biases. This pins that the
+            // mapping reproduces the GraniteSpeech formula exactly, so the
+            // encoder wiring in GraniteSpeech.swift is provably equivalent
+            // to the CPU path it replaces.
+            let H = 2, C = 8, Dh = 128
+            let maxPos = C  // ≥ contextSize, mirroring the real config
+            let relLen = 2 * maxPos + 1
+            let scale = 1.0 / Float(Double(Dh).squareRoot())
+
+            func ramp(_ n: Int, _ step: Float, _ start: Float) -> [Float] {
+                (0 ..< n).map {
+                    (start + Float($0) * step).truncatingRemainder(dividingBy: 2.0) - 1.0
+                }
+            }
+            // Head-major blocks [H][C][Dh], as conformerAttn extracts them.
+            func block(_ seed: Float) -> [[[Float]]] {
+                var b = [[[Float]]](
+                    repeating: [[Float]](repeating: [Float](repeating: 0, count: Dh), count: C),
+                    count: H)
+                var n: Float = seed
+                for h in 0 ..< H {
+                    for t in 0 ..< C {
+                        for d in 0 ..< Dh {
+                            b[h][t][d] = (n * 0.013).truncatingRemainder(dividingBy: 2.0) - 1.0
+                            n += 1
+                        }
+                    }
+                }
+                return b
+            }
+            let qB = block(3), kB = block(17), vB = block(29)
+            let relPosW = ramp(relLen * Dh, 0.004, -0.25)  // [relLen, Dh] granite table
+
+            // ── CPU GraniteSpeech reference ──
+            var expected = [[[Float]]](
+                repeating: [[Float]](repeating: [Float](repeating: 0, count: Dh), count: C),
+                count: H)
+            for h in 0 ..< H {
+                for i in 0 ..< C {
+                    var scores = [Float](repeating: 0, count: C)
+                    for j in 0 ..< C {
+                        var ac: Float = 0, bd: Float = 0
+                        let dist = (i - j) + maxPos
+                        let rOff = dist * Dh
+                        for d in 0 ..< Dh {
+                            ac += qB[h][i][d] * kB[h][j][d]
+                            bd += qB[h][i][d] * relPosW[rOff + d]
+                        }
+                        scores[j] = scale * (ac + bd)
+                    }
+                    let m = scores.max() ?? 0
+                    var sum: Float = 0
+                    for j in 0 ..< C { scores[j] = exp(scores[j] - m); sum += scores[j] }
+                    let inv = sum > 0 ? 1 / sum : 0
+                    for d in 0 ..< Dh {
+                        var acc: Float = 0
+                        for j in 0 ..< C { acc += scores[j] * inv * vB[h][j][d] }
+                        expected[h][i][d] = acc
+                    }
+                }
+            }
+
+            // ── GPU via row-reversed table + zero u/v bias ──
+            let device = Device.shared
+            var qFlat = [Float](repeating: 0, count: C * H * Dh)  // [C, H, Dh]
+            var kFlat = [Float](repeating: 0, count: H * C * Dh)  // [H, C, Dh]
+            var vFlat = [Float](repeating: 0, count: H * C * Dh)
+            for h in 0 ..< H {
+                for t in 0 ..< C {
+                    let qDst = (t * H + h) * Dh, kvDst = (h * C + t) * Dh
+                    for d in 0 ..< Dh {
+                        qFlat[qDst + d] = qB[h][t][d]
+                        kFlat[kvDst + d] = kB[h][t][d]
+                        vFlat[kvDst + d] = vB[h][t][d]
+                    }
+                }
+            }
+            var flipped = [Float](repeating: 0, count: relLen * Dh)
+            for r in 0 ..< relLen {
+                let src = (relLen - 1 - r) * Dh, dst = r * Dh
+                for d in 0 ..< Dh { flipped[dst + d] = relPosW[src + d] }
+            }
+            let qT = Tensor.empty(shape: [C, H, Dh], dtype: .f32, device: device); qT.copyIn(from: qFlat)
+            let kT = Tensor.empty(shape: [H, C, Dh], dtype: .f32, device: device); kT.copyIn(from: kFlat)
+            let vT = Tensor.empty(shape: [H, C, Dh], dtype: .f32, device: device); vT.copyIn(from: vFlat)
+            let relT = Tensor.empty(shape: [relLen, Dh], dtype: .f32, device: device)
+            relT.copyIn(from: flipped)
+            let zeroT = Tensor.empty(shape: [H, Dh], dtype: .f32, device: device)
+            zeroT.copyIn(from: [Float](repeating: 0, count: H * Dh))
+
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.sdpaRelPosConformer(
+                    q: qT, k: kT, v: vT, relEmb: relT, posBiasU: zeroT, posBiasV: zeroT,
+                    nQHeads: H, nKVHeads: H, baseKV: 0, nQuery: C, kvStride: C,
+                    relZero: maxPos, relLen: relLen, scale: scale, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)  // [C, H, Dh]
+            var maxDiff: Float = 0
+            for t in 0 ..< C {
+                for h in 0 ..< H {
+                    let src = (t * H + h) * Dh
+                    for d in 0 ..< Dh {
+                        maxDiff = max(maxDiff, abs(got[src + d] - expected[h][t][d]))
+                    }
+                }
+            }
+            #expect(
+                maxDiff < 1e-3,
+                "GraniteSpeech rel-pos mapping diverges from CPU (max |Δ| \(maxDiff))")
+        }
+    }
+
     @Test("melSpectrogramMagnitude — GPU matches a CPU magnitude-DFT reference")
     func melSpectrogramMagnitudeF32() {
         autoreleasepool {
@@ -2418,7 +2539,8 @@ struct OpsTests {
                                 guard num % stride == 0 else { continue }
                                 let ip = num / stride
                                 guard ip < inLen else { continue }
-                                acc += input[(n * inCh + ic) * inLen + ip]
+                                acc +=
+                                    input[(n * inCh + ic) * inLen + ip]
                                     * weight[(ic * outCh + oc) * k + kx]
                             }
                         }

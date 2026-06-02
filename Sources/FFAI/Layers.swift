@@ -646,6 +646,16 @@ public final class AnyEmbedding: Module {
 
     public func parameters() -> [(String, Tensor)] { inner.parameters() }
 
+    /// The float dtype activations flow in — i.e. the embedding's *output*
+    /// dtype. For a quantized embedding the packed `weight` is `u32`, so the
+    /// activation dtype is the quant scales' (float) dtype; a plain embedding
+    /// uses its weight dtype. Callers building activation buffers must use
+    /// this, never `weight.dtype`, or they crash on quantized checkpoints.
+    public var activationDtype: DType {
+        if let q = inner as? QuantizedEmbedding { return q.scales.dtype }
+        return weight.dtype
+    }
+
     public func callAsFunction(_ tokenIds: Tensor, on cmd: MTLCommandBuffer) -> Tensor {
         forward(tokenIds, cmd)
     }

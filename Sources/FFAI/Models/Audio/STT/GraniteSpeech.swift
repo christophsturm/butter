@@ -847,6 +847,37 @@ private func conformerAttn(
     // Output accumulator [T, innerDim]
     var outRows = [[Float]](repeating: [Float](repeating: 0, count: innerDim), count: T)
 
+    // GPU rel-pos attention setup. The `sdpa_rel_pos_conformer` kernel indexes
+    // its embedding table with the mirror-image distance (`key − query +
+    // relZero`) of GraniteSpeech's (`query − key + maxPosEmb`), so the GPU
+    // path feeds a ROW-REVERSED table with `relZero = maxPosEmb` and zero u/v
+    // biases (GraniteSpeech has none). Eligible only when `maxPosEmb ≥
+    // contextSize` (always true for the shipped 512/200 config) so the flipped
+    // index stays in range; built once and reused across full blocks. The
+    // padded last block keeps the CPU path — the kernel has no padding mask.
+    let relLen = 2 * cfg.maxPosEmb + 1
+    let gpuRelPos = cfg.maxPosEmb >= C
+    let relFlippedT: Tensor? =
+        gpuRelPos
+        ? {
+            var flipped = [Float](repeating: 0, count: relLen * Dh)
+            for r in 0 ..< relLen {
+                let src = (relLen - 1 - r) * Dh
+                let dst = r * Dh
+                for d in 0 ..< Dh { flipped[dst + d] = w.attnRelPosW[src + d] }
+            }
+            let t = Tensor.empty(shape: [relLen, Dh], dtype: .f32, device: Device.shared)
+            t.copyIn(from: flipped)
+            return t
+        }() : nil
+    let zeroBiasT: Tensor? =
+        gpuRelPos
+        ? {
+            let t = Tensor.empty(shape: [H, Dh], dtype: .f32, device: Device.shared)
+            t.copyIn(from: [Float](repeating: 0, count: H * Dh))
+            return t
+        }() : nil
+
     // Process each block independently
     for b in 0 ..< numBlocks {
         let start = b * C
@@ -886,48 +917,64 @@ private func conformerAttn(
         // QFormer MHA below (16 × 64) already runs on GPU.
         // `nonisolated(unsafe)`: each `concurrentPerform` head writes a
         // disjoint `headOuts[h]`.
-        nonisolated(unsafe) var headOuts = [[[Float]]](
-            repeating: [[Float]](repeating: [Float](repeating: 0, count: Dh), count: C), count: H)
-        DispatchQueue.concurrentPerform(iterations: H) { h in
-            // Dot-product scores [C, C]: q[h][i] · k[h][j] * scale
-            var scores = [[Float]](repeating: [Float](repeating: 0, count: C), count: C)
-            for i in 0 ..< C {
-                for j in 0 ..< C {
-                    var dot: Float = 0
-                    for d in 0 ..< Dh { dot += qBlock[h][i][d] * kBlock[h][j][d] }
-                    scores[i][j] = dot * scale
-                }
-            }
-            // Add relative position bias: posAttn[i][j] = q[i] · relEmb[dist(i,j)] * scale
-            for i in 0 ..< C {
-                for j in 0 ..< C {
-                    let distIdx = Int(attnDists[i][j])  // already clamped+shifted
-                    var posDot: Float = 0
-                    // relPosEmb: [2*maxPosEmb+1, dimHead] — look up row distIdx
-                    let relBase = distIdx * Dh
-                    for d in 0 ..< Dh { posDot += qBlock[h][i][d] * w.attnRelPosW[relBase + d] }
-                    scores[i][j] += posDot * scale
-                }
-            }
-            // Mask padding tokens in the last block
-            if isLast && remainder > 0 {
+        let headOuts: [[[Float]]]
+        if validLen == C, let relFlippedT, let zeroBiasT {
+            // Full block → GPU relative-position SDPA (sdpa_rel_pos_conformer,
+            // d128). Provably equivalent to the CPU branch below; the
+            // table-flip mapping is pinned by `sdpaRelPosConformerGraniteMapping`
+            // in OpsTests.
+            headOuts = conformerBlockAttnGPU(
+                qBlock: qBlock, kBlock: kBlock, vBlock: vBlock,
+                relEmbFlipped: relFlippedT, zeroBias: zeroBiasT,
+                H: H, C: C, Dh: Dh, relZero: cfg.maxPosEmb, relLen: relLen,
+                scale: scale, device: Device.shared)
+        } else {
+            // Padded last block (or maxPosEmb < contextSize) → CPU path, which
+            // masks the padding columns the kernel cannot.
+            nonisolated(unsafe) var cpuOuts = [[[Float]]](
+                repeating: [[Float]](repeating: [Float](repeating: 0, count: Dh), count: C), count: H)
+            DispatchQueue.concurrentPerform(iterations: H) { h in
+                // Dot-product scores [C, C]: q[h][i] · k[h][j] * scale
+                var scores = [[Float]](repeating: [Float](repeating: 0, count: C), count: C)
                 for i in 0 ..< C {
                     for j in 0 ..< C {
-                        let rowValid = i < validLen
-                        let colValid = j < validLen
-                        if !rowValid || !colValid { scores[i][j] = -1e9 }
+                        var dot: Float = 0
+                        for d in 0 ..< Dh { dot += qBlock[h][i][d] * kBlock[h][j][d] }
+                        scores[i][j] = dot * scale
+                    }
+                }
+                // Add relative position bias: posAttn[i][j] = q[i] · relEmb[dist(i,j)] * scale
+                for i in 0 ..< C {
+                    for j in 0 ..< C {
+                        let distIdx = Int(attnDists[i][j])  // already clamped+shifted
+                        var posDot: Float = 0
+                        // relPosEmb: [2*maxPosEmb+1, dimHead] — look up row distIdx
+                        let relBase = distIdx * Dh
+                        for d in 0 ..< Dh { posDot += qBlock[h][i][d] * w.attnRelPosW[relBase + d] }
+                        scores[i][j] += posDot * scale
+                    }
+                }
+                // Mask padding tokens in the last block
+                if isLast && remainder > 0 {
+                    for i in 0 ..< C {
+                        for j in 0 ..< C {
+                            let rowValid = i < validLen
+                            let colValid = j < validLen
+                            if !rowValid || !colValid { scores[i][j] = -1e9 }
+                        }
+                    }
+                }
+                // Softmax per row then attend
+                for i in 0 ..< C {
+                    let w_i = softmax(scores[i])
+                    for d in 0 ..< Dh {
+                        var acc: Float = 0
+                        for j in 0 ..< C { acc += w_i[j] * vBlock[h][j][d] }
+                        cpuOuts[h][i][d] = acc
                     }
                 }
             }
-            // Softmax per row then attend
-            for i in 0 ..< C {
-                let w_i = softmax(scores[i])
-                for d in 0 ..< Dh {
-                    var acc: Float = 0
-                    for j in 0 ..< C { acc += w_i[j] * vBlock[h][j][d] }
-                    headOuts[h][i][d] = acc
-                }
-            }
+            headOuts = cpuOuts
         }
 
         // Concatenate heads → [validLen, innerDim], apply to_out
@@ -947,6 +994,60 @@ private func conformerAttn(
     // Residual (output of attn + original x)
     for t in 0 ..< T { for d in 0 ..< cfg.hiddenDim { outRows[t][d] += x[t][d] } }
     return outRows
+}
+
+/// GPU relative-position conformer attention for one **full** block (no
+/// padding mask). Maps GraniteSpeech's bias-free ESPnet formula
+/// `scale·( qᵢ·kⱼ + qᵢ·relEmb[(i−j)+maxPos] )` onto `Ops.sdpaRelPosConformer`,
+/// whose distance convention is the mirror image (`j−i+relZero`): the caller
+/// passes a row-reversed embedding table with `relZero = maxPos` and zero u/v
+/// content/position biases. Equivalence to the CPU path is pinned by
+/// `sdpaRelPosConformerGraniteMapping` in OpsTests. Returns `headOuts[H][C][Dh]`.
+private func conformerBlockAttnGPU(
+    qBlock: [[[Float]]], kBlock: [[[Float]]], vBlock: [[[Float]]],
+    relEmbFlipped: Tensor, zeroBias: Tensor,
+    H: Int, C: Int, Dh: Int, relZero: Int, relLen: Int,
+    scale: Float, device: Device
+) -> [[[Float]]] {
+    // q → [C, H, Dh] (query-major); k, v → [H, C, Dh] (head-major), matching
+    // the kernel's `[nQuery, nHeads, Dh]` / `[nKVHeads, kvStride, Dh]` contract.
+    var qFlat = [Float](repeating: 0, count: C * H * Dh)
+    var kFlat = [Float](repeating: 0, count: H * C * Dh)
+    var vFlat = [Float](repeating: 0, count: H * C * Dh)
+    for h in 0 ..< H {
+        for t in 0 ..< C {
+            let qDst = (t * H + h) * Dh
+            let kvDst = (h * C + t) * Dh
+            for d in 0 ..< Dh {
+                qFlat[qDst + d] = qBlock[h][t][d]
+                kFlat[kvDst + d] = kBlock[h][t][d]
+                vFlat[kvDst + d] = vBlock[h][t][d]
+            }
+        }
+    }
+    let qT = Tensor.empty(shape: [C, H, Dh], dtype: .f32, device: device)
+    qT.copyIn(from: qFlat)
+    let kT = Tensor.empty(shape: [H, C, Dh], dtype: .f32, device: device)
+    kT.copyIn(from: kFlat)
+    let vT = Tensor.empty(shape: [H, C, Dh], dtype: .f32, device: device)
+    vT.copyIn(from: vFlat)
+    let cmd = device.makeCommandBuffer()
+    let outT = Ops.sdpaRelPosConformer(
+        q: qT, k: kT, v: vT, relEmb: relEmbFlipped, posBiasU: zeroBias, posBiasV: zeroBias,
+        nQHeads: H, nKVHeads: H, baseKV: 0, nQuery: C, kvStride: C,
+        relZero: relZero, relLen: relLen, scale: scale, on: cmd)
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    let out = outT.toFloatArray()  // [C, H, Dh]
+    var headOuts = [[[Float]]](
+        repeating: [[Float]](repeating: [Float](repeating: 0, count: Dh), count: C), count: H)
+    for t in 0 ..< C {
+        for h in 0 ..< H {
+            let src = (t * H + h) * Dh
+            for d in 0 ..< Dh { headOuts[h][t][d] = out[src + d] }
+        }
+    }
+    return headOuts
 }
 
 /// Conformer conv module.
@@ -1578,7 +1679,9 @@ public final class GraniteSpeechModel: Module {
         }
 
         // 5. Run prefill (process all prompt tokens sequentially, feeding embeddings)
-        let dtype = embedTokens.weight.dtype
+        // `activationDtype` (not `weight.dtype`) — quantized embeddings pack the
+        // weight as u32, so the float compute dtype comes from the quant scales.
+        let dtype = embedTokens.activationDtype
         let caches = makeLMCaches()
         var lastLogits = Tensor.empty(shape: [config.textConfig.vocabSize], dtype: dtype)
 
@@ -1717,7 +1820,9 @@ public final class GraniteSpeechModel: Module {
     /// Create fresh KV caches for one inference session.
     private func makeLMCaches() -> [any LayerCacheProtocol] {
         let maxSeq = config.textConfig.maxPositionEmbeddings
-        let dtype = embedTokens.weight.dtype
+        // Quantized embeddings pack `weight` as u32 — use the float activation
+        // dtype (quant scales' dtype) so the KV cache holds floats, not u32.
+        let dtype = embedTokens.activationDtype
         let nKVHeads = config.textConfig.numKeyValueHeads
         let headDim = config.textConfig.hiddenSize / config.textConfig.numAttentionHeads
         return (0 ..< config.textConfig.numHiddenLayers).map { _ in
