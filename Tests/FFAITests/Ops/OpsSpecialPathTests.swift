@@ -471,6 +471,163 @@ struct OpsSpecialPathTests {
         }
     }
 
+    @Test("moeDownWeightedSum6 f32 — fused six GEMVs match CPU reference")
+    func moeDownWeightedSum6F32() {
+        autoreleasepool {
+            runMoeDownWeightedSum6Reference(dtype: .f32)
+        }
+    }
+
+    @Test("moeDownWeightedSum6 f16 — fused six GEMVs match CPU reference")
+    func moeDownWeightedSum6F16() {
+        autoreleasepool {
+            runMoeDownWeightedSum6Reference(dtype: .f16)
+        }
+    }
+
+    @Test("moeDownWeightedSum6 f16 — matches unfused GPU chain")
+    func moeDownWeightedSum6F16MatchesUnfusedGpuChain() {
+        autoreleasepool {
+            runMoeDownWeightedSum6AgainstUnfused(dtype: .f16, m: 8, k: 2048)
+        }
+    }
+
+    private func runMoeDownWeightedSum6Reference(dtype: DType) {
+        let m = 3
+        let k = 5
+        let weightsHost: [Float] = [0.5, -0.75, 0.125, 1.5, -0.25, 0.875]
+        let baseHost: [Float] = [1.0, -2.0, 0.5]
+
+        var downRefs: [[Float]] = []
+        var innerRefs: [[Float]] = []
+        var downs: [Tensor] = []
+        var inners: [Tensor] = []
+
+        for slot in 0 ..< 6 {
+            let downHost = (0 ..< (m * k)).map { idx -> Float in
+                let row = idx / k
+                let col = idx % k
+                return Float((slot + 1) * (row + 1) - (col + 1)) * 0.125
+            }
+            let innerHost = (0 ..< k).map { col -> Float in
+                Float((slot + 2) * (col + 1)) * 0.0625 - Float(slot) * 0.05
+            }
+            downRefs.append(dtype == .f16 ? downHost.map { Float(Float16($0)) } : downHost)
+            innerRefs.append(dtype == .f16 ? innerHost.map { Float(Float16($0)) } : innerHost)
+
+            let down = Tensor.empty(shape: [m, k], dtype: dtype)
+            let inner = Tensor.empty(shape: [k], dtype: dtype)
+            if dtype == .f16 {
+                down.copyIn(from: downHost.map { Float16($0) })
+                inner.copyIn(from: innerHost.map { Float16($0) })
+            } else {
+                down.copyIn(from: downHost)
+                inner.copyIn(from: innerHost)
+            }
+            downs.append(down)
+            inners.append(inner)
+        }
+
+        let weights = Tensor.empty(shape: [6], dtype: .f32)
+        weights.copyIn(from: weightsHost)
+
+        let accum = Tensor.empty(shape: [m], dtype: dtype)
+        if dtype == .f16 {
+            accum.copyIn(from: baseHost.map { Float16($0) })
+        } else {
+            accum.copyIn(from: baseHost)
+        }
+
+        var expected = dtype == .f16 ? baseHost.map { Float(Float16($0)) } : baseHost
+        for row in 0 ..< m {
+            for slot in 0 ..< 6 {
+                var dot = Float(0)
+                for col in 0 ..< k {
+                    dot += downRefs[slot][row * k + col] * innerRefs[slot][col]
+                }
+                expected[row] += weightsHost[slot] * dot
+            }
+        }
+
+        runAndWait { cb in
+            Ops.moeDownWeightedSum6(downs: downs, inners: inners, weights: weights, accum: accum, on: cb)
+        }
+
+        let got: [Float] = dtype == .f16
+            ? accum.toArray(as: Float16.self).map { Float($0) }
+            : accum.toArray(as: Float.self)
+        let tolerance: Float = dtype == .f16 ? 2e-2 : 1e-4
+        for row in 0 ..< m {
+            #expect(abs(got[row] - expected[row]) < tolerance, "row \(row): got \(got[row]), expected \(expected[row])")
+        }
+    }
+
+    private func runMoeDownWeightedSum6AgainstUnfused(dtype: DType, m: Int, k: Int) {
+        let weightsHost: [Float] = [0.5, -0.75, 0.125, 1.5, -0.25, 0.875]
+        let baseHost = (0 ..< m).map { Float($0 % 7) * 0.125 - 0.25 }
+        var downs: [Tensor] = []
+        var inners: [Tensor] = []
+        for slot in 0 ..< 6 {
+            let downHost = (0 ..< (m * k)).map { idx -> Float in
+                let row = idx / k
+                let col = idx % k
+                return Float(((slot + 3) * (row + 5) + (col % 29)) % 31 - 15) * 0.2
+            }
+            let innerHost = (0 ..< k).map { col -> Float in
+                Float(((slot + 1) * (col % 37)) % 23 - 11) * 0.2
+            }
+            let down = Tensor.empty(shape: [m, k], dtype: dtype)
+            let inner = Tensor.empty(shape: [k], dtype: dtype)
+            if dtype == .f16 {
+                down.copyIn(from: downHost.map { Float16($0) })
+                inner.copyIn(from: innerHost.map { Float16($0) })
+            } else {
+                down.copyIn(from: downHost)
+                inner.copyIn(from: innerHost)
+            }
+            downs.append(down)
+            inners.append(inner)
+        }
+
+        let weights = Tensor.empty(shape: [6], dtype: .f32)
+        weights.copyIn(from: weightsHost)
+        let accumFused = Tensor.empty(shape: [m], dtype: dtype)
+        let accumRef = Tensor.empty(shape: [m], dtype: dtype)
+        if dtype == .f16 {
+            let base = baseHost.map { Float16($0) }
+            accumFused.copyIn(from: base)
+            accumRef.copyIn(from: base)
+        } else {
+            accumFused.copyIn(from: baseHost)
+            accumRef.copyIn(from: baseHost)
+        }
+
+        runAndWait { cb in
+            for slot in 0 ..< 6 {
+                let expertOut = Ops.gemv(weight: downs[slot], input: inners[slot], on: cb)
+                let wT = Tensor.filled(weightsHost[slot], shape: [m], dtype: dtype)
+                let scaled = Ops.mul(expertOut, wT, on: cb)
+                _ = Ops.add(accumRef, scaled, on: cb, into: accumRef)
+            }
+            Ops.moeDownWeightedSum6(
+                downs: downs, inners: inners, weights: weights, accum: accumFused, on: cb)
+        }
+
+        let got: [Float]
+        let ref: [Float]
+        if dtype == .f16 {
+            got = accumFused.toArray(as: Float16.self).map { Float($0) }
+            ref = accumRef.toArray(as: Float16.self).map { Float($0) }
+        } else {
+            got = accumFused.toArray(as: Float.self)
+            ref = accumRef.toArray(as: Float.self)
+        }
+        let tolerance: Float = dtype == .f16 ? 1e-1 : 1e-4
+        for row in 0 ..< m {
+            #expect(abs(got[row] - ref[row]) < tolerance, "row \(row): fused \(got[row]), ref \(ref[row])")
+        }
+    }
+
     // MARK: - sdpaDecode2Pass
 
     @Test("sdpaDecode2Pass f32 — blocks=32 matches single-pass sdpaDecode")
