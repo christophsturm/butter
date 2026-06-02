@@ -33,9 +33,9 @@ let package = Package(
         // Hugging Face Hub client for model snapshot download/cache.
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
         // Tokenizer loading (AutoTokenizer.from(modelFolder:)).
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
         // CLI argument parsing for ffai.
-        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.0"),
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.8.1"),
     ],
     targets: [
         // Pre-compiled Metal kernels + Swift dispatch wrappers.
