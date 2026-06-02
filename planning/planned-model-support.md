@@ -35,6 +35,7 @@ We should add support for the following model families:
 - Deepseek V3.2 - use https://huggingface.co/deepseek-ai/DeepSeek-V3.2 as reference
 - Deepseek V4 Flash - use https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash as reference
 - Cohere A Plus - use https://huggingface.co/CohereLabs/command-a-plus-05-2026-w4a4 as a reference
+- Step 3.7 - use https://huggingface.co/stepfun-ai/Step-3.7-Flash as a reference (text + vision model)
 - Tencent Hy3 - use https://huggingface.co/tencent/Hy3-preview as a reference
 - Tencent Hy2 - use https://huggingface.co/tencent/Hy-MT2-1.8B as our reference and test model. They have other model sizes including an MoE https://huggingface.co/tencent/Hy-MT2-30B-A3B. We should support them all.
 - LFM2 24B - use https://huggingface.co/LiquidAI/LFM2-24B-A2B as a reference
