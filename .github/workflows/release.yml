@@ -60,7 +60,7 @@ jobs:
   test:
     if: github.repository_owner == 'thewafflehaus'
     name: Test before tag (Apple Silicon)
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 45
     defaults:
       run:

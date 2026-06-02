@@ -25,14 +25,14 @@ jobs:
   format-check:
     if: github.repository_owner == 'thewafflehaus'
     name: swift-format lint
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Ensure swift-format is available
-        # macos-latest ships an Xcode toolchain that bundles swift-format
+        # macos-26 ships an Xcode toolchain that bundles swift-format
         # (resolved via `xcrun swift-format`). Fall back to Homebrew if
         # for any reason the toolchain doesn't carry it.
         run: |
