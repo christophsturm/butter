@@ -193,6 +193,11 @@ public final class KokoroModel: @unchecked Sendable {
     public let vocoder: KokoroVocoder
     /// The phoneme→id table from the checkpoint's `config.json` `vocab`.
     public let phonemeVocab: [String: Int]
+    /// Acoustic-stack weights (PLBERT + text/duration encoders + predictor +
+    /// decoder + generator). `nil` when built config-only (vocoder tests).
+    let acoustic: KokoroWeights?
+    /// Snapshot directory — used to resolve per-voice style packs lazily.
+    let directory: URL?
     let dtype: DType
     /// Currently-active voice name (mutates via `setVoice(_:)`).
     /// Defaults to `Kokoro.defaultVoice` at init.
@@ -200,11 +205,14 @@ public final class KokoroModel: @unchecked Sendable {
 
     public init(
         config: KokoroConfig, vocoder: KokoroVocoder,
-        phonemeVocab: [String: Int], dtype: DType
+        phonemeVocab: [String: Int], dtype: DType,
+        acoustic: KokoroWeights? = nil, directory: URL? = nil
     ) {
         self.config = config
         self.vocoder = vocoder
         self.phonemeVocab = phonemeVocab
+        self.acoustic = acoustic
+        self.directory = directory
         self.dtype = dtype
         self.currentVoice = KokoroModel.defaultVoice
     }
@@ -284,11 +292,45 @@ public final class KokoroModel: @unchecked Sendable {
     /// wired (see the scope note at the top of this file).
     public func synthesize(
         phonemeIds: [Int],
+        speed: Float = 1.0,
         device: Device = .shared
     ) throws -> Tensor {
-        _ = phonemeIds
-        _ = device
-        throw KokoroError.acousticFrontEndUnavailable
+        guard let acoustic, let dir = directory else {
+            throw KokoroError.acousticFrontEndUnavailable
+        }
+        // Per-voice style pack: [N, 1, 256] indexed by phoneme count. Split
+        // into the predictor (prosody, second 128) and decoder (acoustic,
+        // first 128) halves.
+        let voiceURL = dir.appendingPathComponent("voices/\(currentVoice).safetensors")
+        let vb = try SafeTensorsBundle(directory: voiceURL.deletingLastPathComponent())
+        let key = (try? vb.tensor(named: currentVoice)) != nil ? currentVoice : "\(currentVoice).weight"
+        let voice = ((try? vb.tensor(named: key))?.toFloatArray()) ?? []
+        let row = min(max(phonemeIds.count - 1, 0), max(voice.count / 256 - 1, 0))
+        let refS = Array(voice[(row * 256) ..< (row * 256 + 256)])
+        let sDec = Array(refS[0 ..< 128])
+        let sPred = Array(refS[128 ..< 256])
+
+        let plbert = KokoroPLBert(w: acoustic)
+        let dEn = acoustic.bertEncode(plbert.encode(phonemeIds))  // [L, 512]
+        let asr = acoustic.textEncode(phonemeIds)  // [L, 512]
+        let (dur, f0, n, _) = acoustic.predict(dEn: dEn, style: sPred, speed: speed)
+        // Length-regulate the acoustic features by the predicted durations.
+        var asrAligned = [[Float]]()
+        for (i, r) in asr.enumerated() { for _ in 0 ..< dur[min(i, dur.count - 1)] { asrAligned.append(r) } }
+        let (re, im) = acoustic.decode(
+            asr: asrAligned, f0: f0, n: n, style: sDec, vocoder: vocoder)
+        let nFreq = vocoder.nFFT / 2 + 1
+        let frames = re.count
+        var reFlat = [Float](repeating: 0, count: frames * nFreq)
+        var imFlat = reFlat
+        for t in 0 ..< frames {
+            for k in 0 ..< nFreq { reFlat[t * nFreq + k] = re[t][k]; imFlat[t * nFreq + k] = im[t][k] }
+        }
+        let reT = Tensor.empty(shape: [frames, nFreq], dtype: .f32, device: device)
+        reT.copyIn(from: reFlat)
+        let imT = Tensor.empty(shape: [frames, nFreq], dtype: .f32, device: device)
+        imT.copyIn(from: imFlat)
+        return vocoder.synthesize(specRe: reT, specIm: imT, device: device)
     }
 }
 
@@ -316,7 +358,13 @@ extension KokoroModel {
         }
         // The phoneme vocabulary lives inline in config.json.
         let phonemeVocab = (config.raw["vocab"] as? [String: Int]) ?? [:]
-        return build(config: kc, phonemeVocab: phonemeVocab, device: device)
+        let vocoder = KokoroVocoder(
+            nFFT: kc.istftNFFT, hopLength: kc.istftHop, dtype: .f32, device: device)
+        // Acoustic stack: read the model safetensors when present.
+        let acoustic = (try? SafeTensorsBundle(directory: directory)).map { KokoroWeights(bundle: $0) }
+        return KokoroModel(
+            config: kc, vocoder: vocoder, phonemeVocab: phonemeVocab, dtype: .f32,
+            acoustic: acoustic, directory: directory)
     }
 
     /// Assemble a `KokoroModel` from a decoded config. Factored out so

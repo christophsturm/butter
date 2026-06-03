@@ -42,8 +42,10 @@ import Metal
 /// Thin CPU weight reader over the Kokoro safetensors bundle: pulls tensors
 /// to `[Float]` and reconstructs weight-normalized conv weights `(g, v) →
 /// g·v/‖v‖` (StyleTTS2 stores every conv as a `weight_g`/`weight_v` pair).
-struct KokoroWeights {
+public struct KokoroWeights {
     let bundle: SafeTensorsBundle
+
+    public init(bundle: SafeTensorsBundle) { self.bundle = bundle }
 
     /// A plain float tensor by key.
     func vec(_ name: String) -> [Float] {
