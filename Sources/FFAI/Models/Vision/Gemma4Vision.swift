@@ -574,9 +574,9 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
         let gridW = imgW / p
         let nPatches = gridH * gridW
 
-        // ── Patch unfold + embed ──
-        let unfolded = unfoldPatches(image: image, gridH: gridH, gridW: gridW)
+        // ── Patch unfold + embed ── (unfold → GEMM → posEmb, one cmd buffer)
         let cmd = device.makeCommandBuffer()
+        let unfolded = unfoldPatches(image: image, gridH: gridH, gridW: gridW, on: cmd)
         var h = Ops.gemm(
             weight: patchEmbedWeight, input: unfolded,
             nRows: nPatches, on: cmd)
@@ -671,36 +671,29 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
     /// tensor. Each row holds one `3 · patch · patch` patch after the
     /// reference's `2·(x − 0.5)` re-centring; row order is raster
     /// `(patchRow, patchCol)`.
-    private func unfoldPatches(image: Tensor, gridH: Int, gridW: Int) -> Tensor {
+    private func unfoldPatches(
+        image: Tensor, gridH: Int, gridW: Int, on cmd: MTLCommandBuffer
+    ) -> Tensor {
         let p = cfg.patchSize
-        let pix = image.toFloatArray()  // [3, H, W]
         let imgH = gridH * p
         let imgW = gridW * p
-        let nPatches = gridH * gridW
-        var rows = [Float](repeating: 0, count: nPatches * patchDimPadded)
-        for pr in 0 ..< gridH {
-            for pc in 0 ..< gridW {
-                let patch = pr * gridW + pc
-                var col = 0
-                // Layout: (channel, py, px) — matches the reference's
-                // `(0,2,4,3,5,1)` transpose then channel-major flatten.
-                for py in 0 ..< p {
-                    let yy = pr * p + py
-                    for px in 0 ..< p {
-                        let xx = pc * p + px
-                        for ch in 0 ..< 3 {
-                            let v = pix[(ch * imgH + yy) * imgW + xx]
-                            // Re-centre: 2·(v − 0.5).
-                            rows[patch * patchDimPadded + col] = 2 * (v - 0.5)
-                            col += 1
-                        }
-                    }
-                }
-            }
+        // GPU patch unfold: channel-interleaved `(py, px, c)` columns, the
+        // reference `2·(x − 0.5)` re-centre, zero-padded to `patchDimPadded`.
+        // The kernel's output dtype follows its input and feeds the patch-
+        // embed GEMM (weight `dtype`), so present a `dtype` image — a cheap
+        // cold-path cast if the preprocessed pixels arrived in another
+        // precision.
+        let img: Tensor
+        if image.dtype == dtype {
+            img = image
+        } else {
+            img = ImagePreprocessing.makeTensor(
+                from: image.toFloatArray(), shape: [3, imgH, imgW],
+                dtype: dtype, device: .shared)
         }
-        return ImagePreprocessing.makeTensor(
-            from: rows, shape: [nPatches, patchDimPadded],
-            dtype: dtype, device: .shared)
+        return Ops.im2colPatchInterleaved(
+            img, channels: 3, inH: imgH, inW: imgW, patch: p,
+            patchDimPadded: patchDimPadded, scale: 2.0, bias: -1.0, on: cmd)
     }
 
     // ── Position embedding ──

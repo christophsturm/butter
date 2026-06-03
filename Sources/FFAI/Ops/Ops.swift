@@ -7831,6 +7831,134 @@ public enum Ops {
         return result
     }
 
+    /// Channel-interleaved patch im2col — the Gemma 4 patch unfold. Columns
+    /// are flattened `(py, px, c)` (channel innermost), each pixel re-mapped
+    /// `scale·x + bias` (Gemma 4 normalizes with `2·(x − 0.5)` → `scale = 2`,
+    /// `bias = -1`), and the row zero-padded out to `patchDimPadded` (a GEMM
+    /// K-tile multiple ≥ `channels·patch·patch`). Wraps
+    /// `ffai_im2col_patch_interleaved` (`im2col_patch_interleaved.rs`):
+    /// Grid3D, one thread per output. Input NCHW `[channels, inH, inW]`;
+    /// returns `[nPatches, patchDimPadded]` ready for the patch-embed GEMM.
+    public static func im2colPatchInterleaved(
+        _ input: Tensor, channels: Int, inH: Int, inW: Int, patch: Int,
+        patchDimPadded: Int, scale: Float, bias: Float,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            patch > 0 && inH % patch == 0 && inW % patch == 0,
+            "Ops.im2colPatchInterleaved: inH/inW (\(inH)/\(inW)) must be multiples of patch \(patch)")
+        precondition(
+            input.elementCount == channels * inH * inW,
+            "Ops.im2colPatchInterleaved: input must be NCHW [C,H,W] = "
+                + "\(channels * inH * inW) (got \(input.elementCount))")
+        precondition(
+            patchDimPadded >= channels * patch * patch,
+            "Ops.im2colPatchInterleaved: patchDimPadded \(patchDimPadded) < "
+                + "channels·patch·patch \(channels * patch * patch)")
+        let gridW = inW / patch
+        let gridH = inH / patch
+        let nPatches = gridH * gridW
+        let result =
+            out ?? Tensor.empty(shape: [nPatches, patchDimPadded], dtype: input.dtype)
+        let (grid, tg) = elementwiseGrid(nPatches * patchDimPadded)
+        let (c, ih, iw, p, gw, pdp) = (
+            UInt32(channels), UInt32(inH), UInt32(inW), UInt32(patch),
+            UInt32(gridW), UInt32(patchDimPadded)
+        )
+        switch input.dtype {
+        case .f32:
+            MetalTileKernels.ffai_im2col_patch_interleaved_f32(
+                input: input.buffer, inputOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                channels: c, in_h: ih, in_w: iw, patch: p, grid_w: gw,
+                patch_dim_padded: pdp, scale: scale, bias: bias,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_im2col_patch_interleaved_f16(
+                input: input.buffer, inputOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                channels: c, in_h: ih, in_w: iw, patch: p, grid_w: gw,
+                patch_dim_padded: pdp, scale: scale, bias: bias,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_im2col_patch_interleaved_bf16(
+                input: input.buffer, inputOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                channels: c, in_h: ih, in_w: iw, patch: p, grid_w: gw,
+                patch_dim_padded: pdp, scale: scale, bias: bias,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.im2colPatchInterleaved: unsupported dtype \(input.dtype)")
+        }
+        return result
+    }
+
+    /// Qwen-VL patch unfold — the temporal-group + spatial-merge-block patch
+    /// raster Qwen2/2.5/3-VL towers use, columns flattened `(t, c, py, px)`.
+    /// `frames` is a contiguous `[nFrames, channels, imgSide, imgSide]` buffer
+    /// (`nFrames = isImage ? 1 : gridT·temporalPatch`; a still image reuses
+    /// its one frame for every temporal slot). Rows are zero-padded to
+    /// `patchDimPadded`. Wraps `ffai_patch_unfold_qwen` (`patch_unfold_qwen.rs`):
+    /// Grid3D, one thread per output. Returns `[nPatches, patchDimPadded]`,
+    /// `nPatches = gridT·side·side`, `side = mergeBlocks·merge`.
+    public static func patchUnfoldQwen(
+        frames: Tensor, channels: Int, patch: Int, temporalPatch: Int,
+        merge: Int, mergeBlocks: Int, imgSide: Int, gridT: Int,
+        patchDimPadded: Int, isImage: Bool,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        let side = mergeBlocks * merge
+        precondition(
+            imgSide == side * patch,
+            "Ops.patchUnfoldQwen: imgSide \(imgSide) != mergeBlocks·merge·patch "
+                + "\(side * patch)")
+        let nFrames = isImage ? 1 : gridT * temporalPatch
+        precondition(
+            frames.elementCount == nFrames * channels * imgSide * imgSide,
+            "Ops.patchUnfoldQwen: frames must be [nFrames,channels,imgSide,imgSide] = "
+                + "\(nFrames * channels * imgSide * imgSide) (got \(frames.elementCount))")
+        precondition(
+            patchDimPadded >= temporalPatch * channels * patch * patch,
+            "Ops.patchUnfoldQwen: patchDimPadded \(patchDimPadded) < "
+                + "temporalPatch·channels·patch·patch "
+                + "\(temporalPatch * channels * patch * patch)")
+        let nPatches = gridT * side * side
+        let result =
+            out ?? Tensor.empty(shape: [nPatches, patchDimPadded], dtype: frames.dtype)
+        let (grid, tg) = elementwiseGrid(nPatches * patchDimPadded)
+        let (c, p, tp, m, mb, isz, pdp, isImg) = (
+            UInt32(channels), UInt32(patch), UInt32(temporalPatch), UInt32(merge),
+            UInt32(mergeBlocks), UInt32(imgSide), UInt32(patchDimPadded),
+            UInt32(isImage ? 1 : 0)
+        )
+        switch frames.dtype {
+        case .f32:
+            MetalTileKernels.ffai_patch_unfold_qwen_f32(
+                frames: frames.buffer, framesOffset: frames.offset,
+                out: result.buffer, outOffset: result.offset,
+                channels: c, patch: p, temporal_patch: tp, merge: m,
+                merge_blocks: mb, img_side: isz, patch_dim_padded: pdp,
+                is_image: isImg, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_patch_unfold_qwen_f16(
+                frames: frames.buffer, framesOffset: frames.offset,
+                out: result.buffer, outOffset: result.offset,
+                channels: c, patch: p, temporal_patch: tp, merge: m,
+                merge_blocks: mb, img_side: isz, patch_dim_padded: pdp,
+                is_image: isImg, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_patch_unfold_qwen_bf16(
+                frames: frames.buffer, framesOffset: frames.offset,
+                out: result.buffer, outOffset: result.offset,
+                channels: c, patch: p, temporal_patch: tp, merge: m,
+                merge_blocks: mb, img_side: isz, patch_dim_padded: pdp,
+                is_image: isImg, gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.patchUnfoldQwen: unsupported dtype \(frames.dtype)")
+        }
+        return result
+    }
+
     /// Factorized 2D position-embedding add — `out[patch, d] = tokens[patch,
     /// d] + posX[col·hidden + d] + posY[row·hidden + d]`, `col = patch %
     /// gridW`, `row = patch / gridW`. The Gemma 4 vision post-patch-embed

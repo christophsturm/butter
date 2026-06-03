@@ -47,6 +47,108 @@ struct OpsTests {
         }
     }
 
+    @Test("im2colPatchInterleaved f32 — Gemma4 (py,px,c) unfold + affine + pad")
+    func im2colPatchInterleavedF32() {
+        autoreleasepool {
+            let channels = 2, patch = 2, gridH = 1, gridW = 2
+            let inH = gridH * patch, inW = gridW * patch
+            let padded = 10  // real_dim = 8, two zero-pad columns
+            let scale: Float = 2, bias: Float = -1
+            var inData = [Float](repeating: 0, count: channels * inH * inW)
+            for i in 0 ..< inData.count { inData[i] = Float(i) * 0.1 }
+            let input = Tensor.empty(shape: [channels, inH, inW], dtype: .f32)
+            input.copyIn(from: inData)
+            // CPU oracle: channel-innermost columns, affine re-map, zero pad.
+            let nPatches = gridH * gridW
+            var expected = [Float](repeating: 0, count: nPatches * padded)
+            for pr in 0 ..< gridH {
+                for pc in 0 ..< gridW {
+                    let pIdx = pr * gridW + pc
+                    for py in 0 ..< patch {
+                        for px in 0 ..< patch {
+                            for c in 0 ..< channels {
+                                let col = (py * patch + px) * channels + c
+                                let v = inData[(c * inH + pr * patch + py) * inW + pc * patch + px]
+                                expected[pIdx * padded + col] = v * scale + bias
+                            }
+                        }
+                    }
+                }
+            }
+            var out: Tensor!
+            runAndWait { cb in
+                out = Ops.im2colPatchInterleaved(
+                    input, channels: channels, inH: inH, inW: inW, patch: patch,
+                    patchDimPadded: padded, scale: scale, bias: bias, on: cb)
+            }
+            let got = out.toArray(as: Float.self)
+            #expect(got.count == expected.count)
+            for i in 0 ..< expected.count { #expect(abs(got[i] - expected[i]) < 1e-4) }
+        }
+    }
+
+    @Test("patchUnfoldQwen f32 — temporal + merge-block raster, (t,c,py,px) cols")
+    func patchUnfoldQwenF32() {
+        autoreleasepool {
+            let channels = 2, patch = 2, tp = 2, merge = 2, mergeBlocks = 1
+            let side = mergeBlocks * merge
+            let imgSide = side * patch
+            let gridT = 1
+            let isImage = true
+            let padded = 18  // real_dim = tp*c*p*p = 16, two zero-pad columns
+            let nFrames = isImage ? 1 : gridT * tp
+            var frames = [Float](repeating: 0, count: nFrames * channels * imgSide * imgSide)
+            for i in 0 ..< frames.count { frames[i] = Float(i) * 0.05 }
+            let framesT = Tensor.empty(
+                shape: [nFrames, channels, imgSide, imgSide], dtype: .f32)
+            framesT.copyIn(from: frames)
+            // CPU oracle: mirrors Qwen unfoldPatches exactly.
+            let nPatches = gridT * side * side
+            let frameStride = channels * imgSide * imgSide
+            var expected = [Float](repeating: 0, count: nPatches * padded)
+            var pIdx = 0
+            for tg in 0 ..< gridT {
+                for br in 0 ..< mergeBlocks {
+                    for bc in 0 ..< mergeBlocks {
+                        for ir in 0 ..< merge {
+                            for ic in 0 ..< merge {
+                                let pr = br * merge + ir
+                                let pc = bc * merge + ic
+                                var col = 0
+                                for tw in 0 ..< tp {
+                                    let fi = isImage ? 0 : tg * tp + tw
+                                    for c in 0 ..< channels {
+                                        for py in 0 ..< patch {
+                                            for px in 0 ..< patch {
+                                                let v = frames[
+                                                    fi * frameStride
+                                                        + (c * imgSide + pr * patch + py) * imgSide
+                                                        + pc * patch + px]
+                                                expected[pIdx * padded + col] = v
+                                                col += 1
+                                            }
+                                        }
+                                    }
+                                }
+                                pIdx += 1
+                            }
+                        }
+                    }
+                }
+            }
+            var out: Tensor!
+            runAndWait { cb in
+                out = Ops.patchUnfoldQwen(
+                    frames: framesT, channels: channels, patch: patch, temporalPatch: tp,
+                    merge: merge, mergeBlocks: mergeBlocks, imgSide: imgSide, gridT: gridT,
+                    patchDimPadded: padded, isImage: isImage, on: cb)
+            }
+            let got = out.toArray(as: Float.self)
+            #expect(got.count == expected.count)
+            for i in 0 ..< expected.count { #expect(abs(got[i] - expected[i]) < 1e-4) }
+        }
+    }
+
     @Test("silu f32 — out[i] = x / (1 + exp(-x))")
     func siluF32() {
         autoreleasepool {
