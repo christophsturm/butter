@@ -673,8 +673,14 @@ public final class GGUFTensorBundle: @unchecked Sendable {
         gatherCacheLock.unlock()
 
         let qsPtr = s.qs.contents().assumingMemoryBound(to: UInt32.self)
-        let dPtr = s.d.contents().assumingMemoryBound(to: Float.self)
-        let qsU8 = qsPtr.withMemoryRebound(to: UInt8.self, capacity: effCap * nBlocksPerExpert * 64) { $0 }
+        // `nonisolated(unsafe)`: these pool pointers are captured by the
+        // `concurrentPerform` @Sendable closure below. Each iteration writes a
+        // disjoint slot range (base0 = slot * nBlocksPerExpert), so the writes
+        // never alias — the captures are data-race-free. The modifier asserts
+        // that to the compiler (Swift 6.1's region analysis can't prove it; 6.3
+        // can, so this is a no-op there).
+        nonisolated(unsafe) let dPtr = s.d.contents().assumingMemoryBound(to: Float.self)
+        nonisolated(unsafe) let qsU8 = qsPtr.withMemoryRebound(to: UInt8.self, capacity: effCap * nBlocksPerExpert * 64) { $0 }
         let blkBytes = GGUFDequant.iq2_xxsBlockBytes
         // Parallel OVER experts (not blocks-within-expert): each expert's
         // ~32k cold mmap blocks page-fault off the 86GB file; issuing many
@@ -771,10 +777,13 @@ public final class GGUFTensorBundle: @unchecked Sendable {
         gatherCacheLock.unlock()
 
         let qsPtr = s.qs.contents().assumingMemoryBound(to: UInt32.self)
-        let scPtr = s.scales.contents().assumingMemoryBound(to: UInt8.self)
-        let dPtr = s.d.contents().assumingMemoryBound(to: Float.self)
-        let dminPtr = s.dmin.contents().assumingMemoryBound(to: Float.self)
-        let qsU8 = qsPtr.withMemoryRebound(to: UInt8.self, capacity: effCap * nBlocksPerExpert * 64) { $0 }
+        // `nonisolated(unsafe)`: disjoint-slot writes captured by the
+        // `concurrentPerform` @Sendable closure — race-free (see the IQ2_XXS
+        // sibling above for the full rationale).
+        nonisolated(unsafe) let scPtr = s.scales.contents().assumingMemoryBound(to: UInt8.self)
+        nonisolated(unsafe) let dPtr = s.d.contents().assumingMemoryBound(to: Float.self)
+        nonisolated(unsafe) let dminPtr = s.dmin.contents().assumingMemoryBound(to: Float.self)
+        nonisolated(unsafe) let qsU8 = qsPtr.withMemoryRebound(to: UInt8.self, capacity: effCap * nBlocksPerExpert * 64) { $0 }
         let blkBytes = GGUFDequant.q2_KBlockBytes
         // Parallel OVER experts — see residentGatherIQ2XXS rationale (NVMe
         // queue depth for the cold mmap page-faults).
