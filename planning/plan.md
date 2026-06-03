@@ -866,6 +866,18 @@ Each sub-phase = one or more PRs + integration test + doc update. Sub-phases lan
   Drafter implementation is the remaining work.
 - **Variant B**: companion EAGLE-style assistant draft +
   `AssistantDraftRegistry`.
+- **Gemma 4 Omni drafter** (`gemma4_unified_assistant`,
+  `google/gemma-4-12B-it-assistant`) — wire it into the spec-decode path.
+  The checkpoint is already loaded + quantized + registered (the typed
+  `Gemma4OmniDrafter.load(...)`; `ModelRegistry` raises
+  `draftModelNotGeneratable` so it never runs as a standalone generator;
+  it's listed under "Gemma 4 Omni Drafter" in `ffai models`). Remaining
+  work is the EAGLE draft loop conditioned on the **Gemma 4 Omni 12B**
+  target: the target-hidden fusion (`pre_projection`, 2·3840→1024), the
+  centroid head (`centroids`, 1024→2048 + top-32 `centroid_intermediate_top_k`),
+  `post_projection`/`masked_embedding`, `shared_kv_states` reuse from the
+  target's KV cache (`num_kv_shared_layers=4`), a `Drafter` /
+  `SpeculativeVerifier` implementation, and a `--draft-model` CLI flag.
 
 ### 8.8 — Tree attention (spec 014, phase 1: K=2 root branches)
 

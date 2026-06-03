@@ -640,6 +640,32 @@ private let modelCatalog: [CatalogGroup] = [
                     "mlx-community/gemma-4-31b-it-4bit",
                     "mlx-community/gemma-4-31b-it-8bit",
                 ]),
+            // Gemma 4 Omni (encoder-free) — raw-patch image + raw-640-frame
+            // audio + per-frame video projected straight into the Gemma 4
+            // text backbone (no ViT / Conformer encoder). The 12B is the
+            // smallest published checkpoint; the multimodal projectors stay
+            // bf16 through `ffai convert` (default `--vision-bits` /
+            // `--audio-bits`).
+            CatalogEntry(
+                family: "Gemma 4 Omni", modelType: "gemma4_unified (+ vision/audio embedder)",
+                summary:
+                    "Encoder-free omni: raw-patch image + raw-640-frame audio + per-frame "
+                    + "video, projected via RMSNorm+Linear embedders onto the Gemma 4 backbone.",
+                repos: [
+                    "ekryski/gemma-4-12B-it-mlx-4bit",
+                ]),
+            // Gemma 4 Omni drafter (EAGLE/MTP) — a 0.4B speculative-decoding
+            // draft model for the omni 12B. Loads + quantizes + lists here,
+            // but cannot generate standalone (it drafts from the target's
+            // hidden state). Spec-decode wiring is tracked as Phase 8.7.
+            CatalogEntry(
+                family: "Gemma 4 Omni Drafter", modelType: "gemma4_unified_assistant",
+                summary:
+                    "EAGLE/MTP speculative-decoding drafter for Gemma 4 Omni 12B (target-hidden "
+                    + "fusion + centroid head). Spec-decode loop: Phase 8.7.",
+                repos: [
+                    "ekryski/gemma-4-12B-it-assistant-mlx-4bit",
+                ]),
             // FastVLM (LlavaQwen2).
             CatalogEntry(
                 family: "FastVLM", modelType: "llava_qwen2",

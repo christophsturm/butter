@@ -26,6 +26,13 @@ public enum ModelError: Error, CustomStringConvertible {
     case unsupportedModelType(String)
     case capabilityNotAvailable(Capability)
     case visionModelNotIntegrated(String)
+    /// A speculative-decoding draft / assistant model (e.g. the Gemma 4
+    /// Omni `gemma4_unified_assistant` EAGLE drafter) was loaded as a
+    /// standalone generation model. It cannot generate on its own — it
+    /// drafts tokens conditioned on the target model's hidden state, which
+    /// the target then verifies. Wiring it into the spec-decode path is
+    /// tracked as Phase 8.7.
+    case draftModelNotGeneratable(String)
     /// The model's weights + a minimal KV cache exceed the wired-memory
     /// budget — it can't run at any usable context on this machine /
     /// budget. Raised by the over-allocation guard (`MemoryBudget`).
@@ -48,6 +55,13 @@ public enum ModelError: Error, CustomStringConvertible {
                 + "a checkpoint loader. Load the text-only checkpoint, or "
                 + "compose a VisionModel directly from VisionEncoder + the text "
                 + "engine."
+        case .draftModelNotGeneratable(let a):
+            return "Speculative-decoding draft model '\(a)' cannot generate "
+                + "standalone — it is an EAGLE/MTP drafter that predicts tokens "
+                + "from the target model's hidden state for the target to verify. "
+                + "Load the target model (e.g. the Gemma 4 Omni 12B), or use the "
+                + "typed `Gemma4OmniDrafter.load(...)` for spec-decode wiring "
+                + "(Phase 8.7)."
         case .insufficientMemory(_, _, let detail):
             return "Insufficient memory: \(detail)"
         case .wiredLimitTooHigh(let requested, let safeMax, let reserve):
@@ -279,6 +293,28 @@ public enum ModelRegistry {
                 // (`vlm.supportsAudio`), video only when the checkpoint
                 // declared a `video_token_id`. Text-only / vision-only
                 // Gemma 4 checkpoints report just `.imageIn`.
+                var caps = Capability.textOnly.union([.imageIn])
+                if vlm.supportsAudio { caps.insert(.audioIn) }
+                if vlm.videoTokenId != nil { caps.insert(.videoIn) }
+                return Loaded(
+                    engine: vlm.engine,
+                    defaultGenerationParameters: Gemma4Dense.defaultGenerationParameters,
+                    availableCapabilities: caps,
+                    vlModel: vlm)
+            }
+            // Gemma 4 Omni (encoder-free) — raw-patch image + raw-640-frame
+            // audio + per-frame video projected straight into the Gemma 4
+            // text backbone (no ViT / Conformer encoder). model_type
+            // `gemma4_unified`; arch `Gemma4UnifiedForConditionalGeneration`.
+            if config.architecture == "Gemma4UnifiedForConditionalGeneration"
+                || config.modelType == "gemma4_unified"
+            {
+                let vlm = try Gemma4Omni.load(
+                    config: config, weights: weights,
+                    options: options, device: device)
+                // Always text + image; audio only when `embed_audio` loaded
+                // (`vlm.supportsAudio`), video only when a `video_token_id`
+                // is wired (always, for the omni — it ships one).
                 var caps = Capability.textOnly.union([.imageIn])
                 if vlm.supportsAudio { caps.insert(.audioIn) }
                 if vlm.videoTokenId != nil { caps.insert(.videoIn) }
@@ -662,6 +698,18 @@ public enum ModelRegistry {
             return try loadGemma3(
                 config: config, weights: weights,
                 options: options, device: device)
+        }
+        // Gemma 4 Omni drafter (`gemma4_unified_assistant`) — an EAGLE/MTP
+        // speculative-decoding draft model. It loads + quantizes + lists in
+        // `ffai models`, but cannot generate standalone (it needs the
+        // target's hidden state), so reject it here with an actionable error
+        // rather than handing back a model that emits garbage. The typed
+        // `Gemma4OmniDrafter.load(...)` is for tests + the Phase 8.7 draft loop.
+        if let arch = config.architecture, Gemma4.drafterArchitectures.contains(arch) {
+            throw ModelError.draftModelNotGeneratable(arch)
+        }
+        if let mt = config.modelType, Gemma4.drafterModelTypes.contains(mt) {
+            throw ModelError.draftModelNotGeneratable(mt)
         }
         // Gemma 4 — dense / PLE (E2B, E4B) / MoE (26B-A4B). All three
         // ship under the `gemma4` model_type; the family file picks the
