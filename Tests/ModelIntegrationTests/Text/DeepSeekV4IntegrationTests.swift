@@ -28,7 +28,7 @@
 // family dispatcher.
 //
 // Skipped at CI time — gated on the model being staged at
-// `$FFAI_DSV4_GGUF_PATH` (default `~/models/ds4-model`).
+// `$FFAI_DSV4_GGUF_PATH` (default `~/models/deepseek-v4-flash`).
 
 import Foundation
 import Testing
@@ -42,7 +42,7 @@ struct DeepSeekV4IntegrationTests {
     private var modelPath: String? {
         let env =
             ProcessInfo.processInfo.environment["FFAI_DSV4_GGUF_PATH"]
-            ?? NSString("~/models/ds4-model").expandingTildeInPath
+            ?? NSString("~/models/deepseek-v4-flash").expandingTildeInPath
         guard FileManager.default.fileExists(atPath: env) else { return nil }
         return env
     }
