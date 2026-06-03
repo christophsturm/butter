@@ -4,6 +4,47 @@ Open bugs + rough notes from the model-family port. Each entry carries
 enough context to pick up cold. Resolved-work history lives in
 `planning/session-plan.md` / `plan.md`, not here.
 
+## GPU LSTM (`ffai_lstm`) — context-dependent NaN in the full Kokoro chain
+
+**Symptom.** With the Kokoro front-end wired to run its LSTMs on the GPU
+(`KokoroFrontEndGPU.biLstmGPU` → `Ops.lstm`), the full `synthesize`
+chain produces an all-NaN waveform — first NaN is the `predictor.shared`
+biLSTM output at T≈65. The CPU `KokoroMath.biLSTM` on the **identical**
+input (`dAligned`, range ±2.27) is finite; proven with a side-by-side
+diagnostic (`shGPUnan=true` / `shCPUnan=false`).
+
+**Why it's not numerical.** `predictor.shared` weights are bounded
+(absmax ≈ 1.26) and an LSTM cell is mathematically bounded
+(`|c_new| ≤ |c_old| + 1`, gates ∈ [0,1], tanh ∈ [-1,1]) — so a correct
+LSTM **cannot** emit NaN from finite, bounded input. The NaN must be a
+kernel/resource fault (uninitialised threadgroup/buffer read), not
+overflow.
+
+**Why it's elusive.** The kernel is correct **in isolation**: two
+regression tests at the real shape (hidden 256 = 8 simdgroups, seqLen 65)
+both pass — `lstmLongSeqHidden256` (plain) and
+`lstmBidirectionalSharedOutput` (the exact `outStride`/`outOffset`/
+`reverse` shared-output pattern `biLstmGPU` uses), each 12–16 repeated
+dispatches, finite + bit-deterministic + matching the CPU oracle. The
+NaN only appears **after the full chain's many prior GPU dispatches**
+(PLBERT 12 layers + bert/text encoders + per-block decoder/generator
+work) — a context/state interaction, possibly metaltile buffer-pool
+aliasing or a Metal threadgroup-memory hazard that needs that much prior
+GPU traffic to surface. Not reproducible standalone, so not yet bisectable.
+
+**Mitigation in place.** Kokoro's front-end LSTMs (text_encoder /
+durationEncoder / predictor.lstm / shared) run on the **CPU** — negligible
+at L ≤ ~70. Everything matrix-heavy (PLBERT, convs, F0/N AdaIN curves, the
+whole decoder + generator) stays GPU-resident; full GPU chain output is
+then identical to the verified CPU path (energy 75.23).
+
+**To re-enable.** Find an isolation repro (replay the exact failing
+`predictor.shared` input+weights captured from a full-chain run; or stress
+hundreds of back-to-back `Ops.lstm` dispatches interleaved with gemm/sdpa
+to churn the buffer pool), then bisect lstm.rs (threadgroup `h`/`c` init +
+barriers — they look correct on inspection) or the FFAI Tensor buffer
+pool. Re-point `biLstmGPU` back to `Ops.lstm` once fixed.
+
 ## GPU pin — vision / audio bidirectional SDPA at production shape
 
 **Symptom.** Some VLM / audio runs peg the GPU at 100 % and never

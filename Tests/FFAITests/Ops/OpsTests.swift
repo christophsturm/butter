@@ -2469,6 +2469,101 @@ struct OpsTests {
         }
     }
 
+    // Real Kokoro `predictor.shared` shape (hidden 256 = 8 simdgroups, long
+    // sequence): exercises the cross-simdgroup threadgroup-memory hand-off the
+    // short test (hidden 4, seqLen 5) never hits. Checks determinism across
+    // repeated dispatches (a race would vary or NaN) + a CPU oracle.
+    @Test("lstm — hidden 256 / seqLen 65 is finite, deterministic, matches CPU")
+    func lstmLongSeqHidden256() {
+        autoreleasepool {
+            let seqLen = 65, inputDim = 640, hidden = 256
+            func ramp(_ n: Int, _ seed: Int, _ amp: Float) -> [Float] {
+                (0 ..< n).map { (Float(($0 * 13 + seed) % 23) / 23 - 0.5) * amp }
+            }
+            let x = ramp(seqLen * inputDim, 1, 2.0)
+            let wIH = ramp(4 * hidden * inputDim, 2, 0.3)
+            let wHH = ramp(4 * hidden * hidden, 3, 0.3)
+            let bias = ramp(4 * hidden, 4, 0.2)
+            func sig(_ v: Float) -> Float { 1 / (1 + Foundation.exp(-v)) }
+            var h = [Float](repeating: 0, count: hidden), c = [Float](repeating: 0, count: hidden)
+            var expected = [Float](repeating: 0, count: seqLen * hidden)
+            for t in 0 ..< seqLen {
+                var g = [Float](repeating: 0, count: 4 * hidden)
+                for r in 0 ..< 4 * hidden {
+                    var acc = bias[r]
+                    for d in 0 ..< inputDim { acc += wIH[r * inputDim + d] * x[t * inputDim + d] }
+                    for d in 0 ..< hidden { acc += wHH[r * hidden + d] * h[d] }
+                    g[r] = acc
+                }
+                for j in 0 ..< hidden {
+                    c[j] = sig(g[hidden + j]) * c[j] + sig(g[j]) * Foundation.tanh(g[2 * hidden + j])
+                    h[j] = sig(g[3 * hidden + j]) * Foundation.tanh(c[j])
+                }
+                for j in 0 ..< hidden { expected[t * hidden + j] = h[j] }
+            }
+            let xT = Tensor.empty(shape: [seqLen, inputDim], dtype: .f32); xT.copyIn(from: x)
+            let wihT = Tensor.empty(shape: [4 * hidden, inputDim], dtype: .f32); wihT.copyIn(from: wIH)
+            let whhT = Tensor.empty(shape: [4 * hidden, hidden], dtype: .f32); whhT.copyIn(from: wHH)
+            let bT = Tensor.empty(shape: [4 * hidden], dtype: .f32); bT.copyIn(from: bias)
+            var first: [Float]? = nil
+            for run in 0 ..< 12 {
+                var outT: Tensor!
+                runAndWait { cmd in
+                    outT = Ops.lstm(x: xT, wIH: wihT, wHH: whhT, bias: bT,
+                        seqLen: seqLen, inputDim: inputDim, hidden: hidden, on: cmd)
+                }
+                let got = outT.toArray(as: Float.self)
+                #expect(got.allSatisfy { $0.isFinite }, "lstm run \(run): non-finite output")
+                var maxDiff: Float = 0
+                for i in 0 ..< expected.count { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+                #expect(maxDiff < 1e-3, "lstm run \(run): diverges from CPU oracle (max \(maxDiff))")
+                if let f = first {
+                    var rd: Float = 0
+                    for i in 0 ..< got.count { rd = max(rd, abs(got[i] - f[i])) }
+                    #expect(rd == 0, "lstm run \(run): non-deterministic vs run 0 (max \(rd)) — race")
+                } else { first = got }
+            }
+        }
+    }
+
+    // The biLSTM shared-output pattern (two dispatches into one buffer via
+    // outStride/outOffset, one reverse) at the real Kokoro shape — what
+    // KokoroFrontEndGPU.biLstmGPU does. The plain-LSTM test above never
+    // exercises the outOffset/reverse path or the shared `out` buffer.
+    @Test("lstm — bidirectional shared-output (outOffset/reverse) is finite + deterministic")
+    func lstmBidirectionalSharedOutput() {
+        autoreleasepool {
+            let seqLen = 65, inputDim = 640, hidden = 256
+            func ramp(_ n: Int, _ s: Int, _ a: Float) -> [Float] {
+                (0 ..< n).map { (Float(($0 * 13 + s) % 23) / 23 - 0.5) * a }
+            }
+            let x = ramp(seqLen * inputDim, 1, 2.0)
+            let wihF = ramp(4 * hidden * inputDim, 2, 0.3), whhF = ramp(4 * hidden * hidden, 3, 0.3), bF = ramp(4 * hidden, 4, 0.2)
+            let wihR = ramp(4 * hidden * inputDim, 5, 0.3), whhR = ramp(4 * hidden * hidden, 6, 0.3), bR = ramp(4 * hidden, 7, 0.2)
+            let xT = Tensor.empty(shape: [seqLen, inputDim], dtype: .f32); xT.copyIn(from: x)
+            func t2(_ a: [Float], _ s: [Int]) -> Tensor { let t = Tensor.empty(shape: s, dtype: .f32); t.copyIn(from: a); return t }
+            let (wihFT, whhFT, bFT) = (t2(wihF, [4 * hidden, inputDim]), t2(whhF, [4 * hidden, hidden]), t2(bF, [4 * hidden]))
+            let (wihRT, whhRT, bRT) = (t2(wihR, [4 * hidden, inputDim]), t2(whhR, [4 * hidden, hidden]), t2(bR, [4 * hidden]))
+            var first: [Float]? = nil
+            for run in 0 ..< 16 {
+                let out = Tensor.empty(shape: [seqLen, 2 * hidden], dtype: .f32)
+                runAndWait { cmd in
+                    _ = Ops.lstm(x: xT, wIH: wihFT, wHH: whhFT, bias: bFT, seqLen: seqLen, inputDim: inputDim,
+                        hidden: hidden, reverse: false, outStride: 2 * hidden, outOffset: 0, on: cmd, into: out)
+                    _ = Ops.lstm(x: xT, wIH: wihRT, wHH: whhRT, bias: bRT, seqLen: seqLen, inputDim: inputDim,
+                        hidden: hidden, reverse: true, outStride: 2 * hidden, outOffset: hidden, on: cmd, into: out)
+                }
+                let got = out.toArray(as: Float.self)
+                #expect(got.allSatisfy { $0.isFinite }, "biLSTM run \(run): non-finite output")
+                if let f = first {
+                    var rd: Float = 0
+                    for i in 0 ..< got.count { rd = max(rd, abs(got[i] - f[i])) }
+                    #expect(rd == 0, "biLSTM run \(run): non-deterministic vs run 0 (max \(rd)) — race in the shared-output path")
+                } else { first = got }
+            }
+        }
+    }
+
     @Test("conv1dDilated — GPU matches a CPU dilated NCL conv reference (OIK)")
     func conv1dDilatedF32() {
         autoreleasepool {
