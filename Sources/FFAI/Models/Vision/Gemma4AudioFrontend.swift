@@ -145,59 +145,39 @@ enum Gemma4AudioFrontend {
         // `[nMels, nFreq]` row-major (filter weight per (mel_bin, freq)).
         let bank = AudioPreprocessing.melFilterbank(cfg, norm: .none)
 
-        // ── STFT → MAGNITUDE Mel → log, on the CPU (per-frame parallel).
+        // ── STFT → MAGNITUDE Mel → log, on the GPU.
         //
-        // FFAI's fused `mel_spectrogram` GPU kernel projects the *power*
-        // spectrum (`re² + im²`) through the filterbank; the Gemma 4
-        // reference projects the *magnitude* (`np.abs(stft) = sqrt(power)`),
-        // i.e. `log(magnitude @ mel + mel_floor)`. There is no magnitude-Mel
-        // kernel, so the magnitude DFT runs here on the CPU — a direct port
-        // of the kernel's per-(frame,freq) DFT (`re = Σ_t win[t]·x[f·hop+t]·
-        // cos(-2π·k·t/nFFT)`, `im = Σ … sin`) with a `sqrt` before the
-        // filterbank projection. The front-end runs once per clip (not a
-        // hot path), so the O(nFrames·nFreq·nFFT) CPU DFT is fine; if a
-        // magnitude-Mel kernel ever lands, swap it back in here.
+        // FFAI's fused *power*-Mel `Ops.melSpectrogram` (Whisper) projects
+        // `re² + im²`; the Gemma 4 reference projects the *magnitude*
+        // (`np.abs(stft) = sqrt(power)`), i.e. `log(magnitude @ mel +
+        // mel_floor)`. `Ops.melSpectrogramMagnitude` is that magnitude
+        // variant: one dispatch does the per-(frame,freq) DFT
+        // (`re = Σ_t win[t]·x[f·hop+t]·cos(-2π·k·t/nFFT)`, `im = Σ … sin`),
+        // the `sqrt`, the `[nMels, nFreq]` filterbank projection, and
+        // `log(· + mel_floor)` — identical math to the previous CPU port.
         //
-        // The accumulation runs in `Double`: the reference (`np.fft.rfft`)
-        // is an FFT, not a naive DFT, so it carries far less summation
-        // error. The sine's energy is concentrated near one bin, leaving
-        // most bins at ~`log(mel_floor)` where `log` amplifies tiny
-        // magnitude differences — single-precision accumulation there drifts
-        // ~0.1; `Double` brings the whole spectrum to f32-rounding agreement.
+        // Precision note: the kernel accumulates the DFT in f32 (Metal has
+        // no f64), where the earlier CPU port used `Double` because the
+        // log-floor bins (most of a near-tonal spectrum) amplify tiny
+        // magnitude differences and single precision drifts ~0.1 there.
+        // The swap was re-validated against the Gemma 4 audio→text
+        // integration test (coherent output preserved); the conformer
+        // tolerates the f32 spectrum.
         let nFreq = cfg.nFreq
-        let nFFT = fftLength
-        let angStep = -2.0 * Double.pi / Double(nFFT)
-        let win = window  // length-nFFT window (captured by value)
-        let pad = padded
-        var melFlat = [Float](repeating: 0, count: nFrames * nMels)
-        melFlat.withUnsafeMutableBufferPointer { out in
-            let outBase = out.baseAddress!
-            // Each frame writes a disjoint `[f*nMels, (f+1)*nMels)` slice.
-            let outAddr = UInt(bitPattern: outBase)
-            DispatchQueue.concurrentPerform(iterations: nFrames) { f in
-                let dst = UnsafeMutablePointer<Float>(bitPattern: outAddr)!
-                let base = f * hopLength
-                var mag = [Double](repeating: 0, count: nFreq)
-                for k in 0 ..< nFreq {
-                    var re: Double = 0
-                    var im: Double = 0
-                    let a = angStep * Double(k)
-                    for t in 0 ..< nFFT {
-                        let s = Double(pad[base + t]) * Double(win[t])
-                        re += s * cos(a * Double(t))
-                        im += s * sin(a * Double(t))
-                    }
-                    mag[k] = (re * re + im * im).squareRoot()
-                }
-                for m in 0 ..< nMels {
-                    var acc: Double = 0
-                    let bb = m * nFreq
-                    for k in 0 ..< nFreq { acc += Double(bank[bb + k]) * mag[k] }
-                    dst[f * nMels + m] = Float(Foundation.log(acc + Double(melFloor)))
-                }
-            }
-        }
-        _ = winT  // (window tensor no longer needed for the CPU path)
+        let audioT = Tensor.empty(
+            shape: [padded.count], dtype: .f32, device: device)
+        AudioPreprocessing.copyFloats(padded, into: audioT)
+        let bankT = Tensor.empty(
+            shape: [nMels, nFreq], dtype: .f32, device: device)
+        AudioPreprocessing.copyFloats(bank, into: bankT)
+        let cmd = device.makeCommandBuffer()
+        let melGPU = Ops.melSpectrogramMagnitude(
+            audio: audioT, window: winT, melWeight: bankT,
+            nFFT: fftLength, nMels: nMels, hopLength: hopLength,
+            nFrames: nFrames, logEps: melFloor, on: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        var melFlat = melGPU.toFloatArray()
 
         // ── Per-frame validity mask. Reference: a frame is valid when the
         // last sample of its analysis window is real audio. The window for
