@@ -322,10 +322,20 @@ public final class KokoroModel: @unchecked Sendable {
         // StyleTTS2 wraps the phoneme ids with a leading/trailing pad token
         // (id 0) — the BOS/EOS the encoders + aligner were trained with.
         let ids = [0] + phonemeIds + [0]
-        let plbert = KokoroPLBert(w: acoustic)
-        let dEn = acoustic.bertEncode(plbert.encode(ids))  // [L, 512]
-        let asr = acoustic.textEncode(ids)  // [L, 512]
-        let (dur, f0, n, _) = acoustic.predict(dEn: dEn, style: sPred, speed: speed)
+        // GPU front-end (PLBERT → bert_encoder → text_encoder → predictor) when
+        // available; the CPU path is the reference.
+        let dEn: [[Float]]
+        let asr: [[Float]]
+        let dur: [Int], f0: [Float], n: [Float]
+        if let gw = gpuWeights {
+            dEn = acoustic.bertEncodeGPU(acoustic.plbertEncodeGPU(ids, gw: gw), gw: gw)
+            asr = acoustic.textEncodeGPU(ids, gw: gw)
+            (dur, f0, n, _) = acoustic.predictGPU(dEn: dEn, style: sPred, speed: speed, gw: gw)
+        } else {
+            dEn = acoustic.bertEncode(KokoroPLBert(w: acoustic).encode(ids))
+            asr = acoustic.textEncode(ids)
+            (dur, f0, n, _) = acoustic.predict(dEn: dEn, style: sPred, speed: speed)
+        }
         // Length-regulate the acoustic features by the predicted durations.
         var asrAligned = [[Float]]()
         for (i, r) in asr.enumerated() { for _ in 0 ..< dur[min(i, dur.count - 1)] { asrAligned.append(r) } }

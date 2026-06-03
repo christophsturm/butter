@@ -108,6 +108,34 @@ final class KokoroGPUWeights {
         return t
     }
 
+    /// A plain tensor by key with an explicit shape (cached).
+    func vecT(_ name: String, shape: [Int]) -> Tensor {
+        upload("\(name).V", w.vec(name), shape: shape)
+    }
+
+    /// A `[rows, dim]` tile of a `[dim]` bias key (the `Ops.gemm` bias-add
+    /// idiom — gemm has no bias). Cached per (name, rows).
+    func biasTile(_ name: String, rows: Int, dim: Int) -> Tensor {
+        let key = "\(name).BT\(rows)"
+        if let t = cache[key] { return t }
+        let b = w.vec(name)
+        var tiled = [Float](repeating: 0, count: rows * dim)
+        for r in 0 ..< rows { for c in 0 ..< dim { tiled[r * dim + c] = b.isEmpty ? 0 : b[c] } }
+        return upload(key, tiled, shape: [rows, dim])
+    }
+
+    /// Combined LSTM bias `b_ih + b_hh` as f32 `[4·hidden]` (what `Ops.lstm`
+    /// wants). `base` is the PyTorch LSTM key prefix, `suffix` e.g. "l0" or
+    /// "l0_reverse".
+    func lstmBias(_ base: String, _ suffix: String, hidden H: Int) -> Tensor {
+        let key = "\(base).lb.\(suffix)"
+        if let t = cache[key] { return t }
+        let bih = w.vec("\(base).bias_ih_\(suffix)")
+        let bhh = w.vec("\(base).bias_hh_\(suffix)")
+        let combined = (0 ..< 4 * H).map { (bih.isEmpty ? 0 : bih[$0]) + (bhh.isEmpty ? 0 : bhh[$0]) }
+        return upload(key, combined, shape: [4 * H])
+    }
+
     /// AdaIN affine for a `[C]`-channel feature map: `gamma = 1 + fc(style)[:C]`,
     /// `beta = fc(style)[C:]`, computed on the CPU (the `fc` is tiny — `[2C,128]
     /// · [128]`) and uploaded as two `[C]` tensors. The kernel folds `(1+γ)`
@@ -362,7 +390,7 @@ extension KokoroWeights {
     /// conv2`, residual `(x + shortcut)/√2` with optional ×2 up-sample +
     /// 1×1 shortcut. Channels-first `[C, T]`. Self-managed command buffer
     /// (commits + materialises its result).
-    private func adainResBlkGPU(
+    func adainResBlkGPU(
         _ x: Tensor, base: String, inC: Int, outC: Int, upsample: Bool, length T: Int,
         style: [Float], gw: KokoroGPUWeights, device: Device
     ) -> Tensor {

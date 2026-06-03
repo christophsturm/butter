@@ -127,6 +127,49 @@ struct KokoroIntegrationTests {
         print("Kokoro full-chain: \(samples.count) samples, energy=\(energy), distinct=\(distinct)")
     }
 
+    @Test("front-end — GPU PLBERT matches the CPU reference")
+    func plbertGPUParity() async throws {
+        let dir = try await ModelLoadLock.shared.loadSerially {
+            try await ModelLocator().resolve(idOrPath: "mlx-community/Kokoro-82M-bf16")
+        }
+        let model = try KokoroModel.load(directory: dir)
+        let acoustic = try #require(model.acoustic, "no acoustic weights")
+        let ids = [0] + model.phonemeIds(for: "hɛlˈoʊ wˈɜːld") + [0]
+        let cpu = KokoroPLBert(w: acoustic).encode(ids)  // [L, 768]
+        let gw = KokoroGPUWeights(acoustic)
+        let gpu = acoustic.plbertEncodeGPU(ids, gw: gw)
+        try #require(gpu.count == cpu.count && gpu.first?.count == cpu.first?.count, "shape differs")
+        var mx: Float = 0, den: Float = 1e-9
+        for i in 0 ..< cpu.count {
+            for j in 0 ..< cpu[i].count { mx = max(mx, abs(gpu[i][j] - cpu[i][j])); den = max(den, abs(cpu[i][j])) }
+        }
+        print("PLBERT GPU↔CPU parity: max=\(mx) scale=\(den)")
+        #expect(mx / den < 1e-2, "PLBERT diverges (max \(mx), scale \(den))")
+
+        func cmp(_ g: [[Float]], _ c: [[Float]], _ tag: String, tol: Float = 1e-2) {
+            var m: Float = 0, d: Float = 1e-9
+            for i in 0 ..< c.count { for j in 0 ..< c[i].count { m = max(m, abs(g[i][j] - c[i][j])); d = max(d, abs(c[i][j])) } }
+            print("\(tag) GPU↔CPU parity: max=\(m) scale=\(d)")
+            #expect(m / d < tol, "\(tag) diverges (max \(m), scale \(d))")
+        }
+        // bert_encoder 768→512.
+        cmp(acoustic.bertEncodeGPU(cpu, gw: gw), acoustic.bertEncode(cpu), "bert_encoder")
+        // text_encoder (independent of PLBERT).
+        cmp(acoustic.textEncodeGPU(ids, gw: gw), acoustic.textEncode(ids), "text_encoder")
+
+        // Predictor: durations (must match exactly) + F0/N curves.
+        let dEn = acoustic.bertEncode(cpu)  // [L, 512]
+        let vf = try SafeTensorsFile(url: dir.appendingPathComponent("voices/af_heart.safetensors"))
+        let voice = ((try? vf.tensor(named: "voice"))?.toFloatArray()) ?? []
+        let row = min(max(ids.count - 3, 0), voice.count / 256 - 1)  // ids has +2 BOS/EOS
+        let sPred = Array(voice[(row * 256 + 128) ..< (row * 256 + 256)])
+        let (durC, f0C, nC, _) = acoustic.predict(dEn: dEn, style: sPred, speed: 1.0)
+        let (durG, f0G, nG, _) = acoustic.predictGPU(dEn: dEn, style: sPred, speed: 1.0, gw: gw)
+        #expect(durG == durC, "durations differ: GPU \(durG) vs CPU \(durC)")
+        cmp([f0G], [f0C], "predictor.F0", tol: 2e-2)
+        cmp([nG], [nC], "predictor.N", tol: 2e-2)
+    }
+
     @Test("generator — GPU matches the CPU iSTFTNet reference (re/im parity)")
     func generatorGPUParity() async throws {
         let dir = try await ModelLoadLock.shared.loadSerially {
