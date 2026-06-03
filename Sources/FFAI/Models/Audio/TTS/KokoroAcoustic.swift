@@ -149,6 +149,58 @@ struct KokoroPLBert {
     }
 }
 
+// ─── bert_encoder + acoustic text encoder ────────────────────────────
+
+extension KokoroWeights {
+    /// `bert_encoder` — projects PLBERT features 768 → 512.
+    func bertEncode(_ h: [[Float]]) -> [[Float]] {
+        KokoroMath.linear(
+            h, weight: vec("bert_encoder.weight"), bias: vec("bert_encoder.bias"),
+            outDim: 512, inDim: 768)
+    }
+
+    /// Weight-norm `Conv1d` over an `[L, Cin]` sequence → `[L, Cout]`.
+    /// `pad` is symmetric (StyleTTS2 uses `same` padding, `k/2`).
+    func conv1dSeq(_ x: [[Float]], base: String, pad: Int, dilation: Int = 1) -> [[Float]] {
+        let (w, sh) = convWeight(base)
+        let (cOut, cIn, _) = (sh[0], sh[1], sh[2])
+        let L = x.count
+        // [L, Cin] → channels-first flat [Cin, L].
+        var xf = [Float](repeating: 0, count: cIn * L)
+        for t in 0 ..< L { for c in 0 ..< cIn { xf[c * L + t] = x[t][c] } }
+        let (yf, ysh) = AudioMath.conv1d(
+            x: xf, xShape: [1, cIn, L], weight: w, wShape: sh, bias: convBias(base),
+            stride: 1, padding: pad, dilation: dilation, groups: 1)
+        let lOut = ysh[2]
+        var out = [[Float]](repeating: [Float](repeating: 0, count: cOut), count: lOut)
+        for c in 0 ..< cOut { for t in 0 ..< lOut { out[t][c] = yf[c * lOut + t] } }
+        return out
+    }
+
+    /// Acoustic `text_encoder`: phoneme embedding → 3× (weight-norm conv k5 +
+    /// channel-LayerNorm + LeakyReLU) → BiLSTM → `[L, 512]`.
+    func textEncode(_ ids: [Int]) -> [[Float]] {
+        let embW = vec("text_encoder.embedding.weight")  // [178, 512]
+        var h = [[Float]](repeating: [Float](repeating: 0, count: 512), count: ids.count)
+        for i in ids.indices { for d in 0 ..< 512 { h[i][d] = embW[ids[i] * 512 + d] } }
+        for layer in 0 ..< 3 {
+            h = conv1dSeq(h, base: "text_encoder.cnn.\(layer).0", pad: 2)
+            KokoroMath.channelLayerNorm(
+                &h, gamma: vec("text_encoder.cnn.\(layer).1.gamma"),
+                beta: vec("text_encoder.cnn.\(layer).1.beta"))
+            KokoroMath.leakyReLU(&h)
+        }
+        return KokoroMath.biLSTM(
+            h,
+            wihF: vec("text_encoder.lstm.weight_ih_l0"), whhF: vec("text_encoder.lstm.weight_hh_l0"),
+            bihF: vec("text_encoder.lstm.bias_ih_l0"), bhhF: vec("text_encoder.lstm.bias_hh_l0"),
+            wihR: vec("text_encoder.lstm.weight_ih_l0_reverse"),
+            whhR: vec("text_encoder.lstm.weight_hh_l0_reverse"),
+            bihR: vec("text_encoder.lstm.bias_ih_l0_reverse"),
+            bhhR: vec("text_encoder.lstm.bias_hh_l0_reverse"), inDim: 512, hidden: 256)
+    }
+}
+
 // ─── Small CPU math helpers (acoustic front-end is tiny, run once) ────
 
 enum KokoroMath {
@@ -196,6 +248,62 @@ enum KokoroMath {
             let v = x[i]
             x[i] = 0.5 * v * (1 + tanhf(c * (v + 0.044715 * v * v * v)))
         }
+    }
+
+    /// LeakyReLU in-place.
+    static func leakyReLU(_ x: inout [[Float]], slope: Float = 0.2) {
+        for i in x.indices { for j in x[i].indices where x[i][j] < 0 { x[i][j] *= slope } }
+    }
+
+    /// LayerNorm1d over the channel dim of a `[L, C]` sequence (StyleTTS2's
+    /// `LayerNorm` that transposes channels-last, normalizes, transposes back).
+    static func channelLayerNorm(_ x: inout [[Float]], gamma: [Float], beta: [Float]) {
+        for i in x.indices { layerNorm(&x[i], weight: gamma, bias: beta, eps: 1e-5) }
+    }
+
+    /// One LSTM direction over `seq` `[L, inDim]`. `wih [4H,inDim]`, `whh
+    /// [4H,H]`, gate order i,f,g,o (PyTorch). Returns `[L, H]`.
+    static func lstmDir(
+        _ seq: [[Float]], wih: [Float], whh: [Float], bih: [Float], bhh: [Float],
+        inDim: Int, hidden H: Int, reverse: Bool
+    ) -> [[Float]] {
+        let L = seq.count
+        var out = [[Float]](repeating: [Float](repeating: 0, count: H), count: L)
+        var h = [Float](repeating: 0, count: H)
+        var c = [Float](repeating: 0, count: H)
+        for step in 0 ..< L {
+            let t = reverse ? L - 1 - step : step
+            let x = seq[t]
+            var g = [Float](repeating: 0, count: 4 * H)
+            for o in 0 ..< 4 * H {
+                var acc = bih[o] + bhh[o]
+                let ib = o * inDim
+                for k in 0 ..< inDim { acc += wih[ib + k] * x[k] }
+                let hb = o * H
+                for k in 0 ..< H { acc += whh[hb + k] * h[k] }
+                g[o] = acc
+            }
+            for j in 0 ..< H {
+                let ig = 1 / (1 + expf(-g[j]))
+                let fg = 1 / (1 + expf(-g[H + j]))
+                let gg = tanhf(g[2 * H + j])
+                let og = 1 / (1 + expf(-g[3 * H + j]))
+                c[j] = fg * c[j] + ig * gg
+                h[j] = og * tanhf(c[j])
+            }
+            out[t] = h
+        }
+        return out
+    }
+
+    /// Bidirectional LSTM: forward ⊕ reverse → `[L, 2H]`.
+    static func biLSTM(
+        _ seq: [[Float]], wihF: [Float], whhF: [Float], bihF: [Float], bhhF: [Float],
+        wihR: [Float], whhR: [Float], bihR: [Float], bhhR: [Float], inDim: Int, hidden H: Int
+    ) -> [[Float]] {
+        let f = lstmDir(seq, wih: wihF, whh: whhF, bih: bihF, bhh: bhhF, inDim: inDim, hidden: H, reverse: false)
+        let r = lstmDir(seq, wih: wihR, whh: whhR, bih: bihR, bhh: bhhR, inDim: inDim, hidden: H, reverse: true)
+        return (0 ..< seq.count).map { f[$0] + r[$0] }
     }
 
     /// Bidirectional multi-head self-attention. `q/k/v` are `[L, heads·dim]`.
