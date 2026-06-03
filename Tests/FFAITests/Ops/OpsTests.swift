@@ -2565,6 +2565,72 @@ struct OpsTests {
         }
     }
 
+    @Test("leakyReLU — GPU matches a CPU leaky rectifier (slope 0.2)")
+    func leakyReLUF32() {
+        autoreleasepool {
+            let n = 257
+            let slope: Float = 0.2
+            let x = (0 ..< n).map { Float($0 - 128) * 0.1 }
+            let expected = x.map { $0 > 0 ? $0 : slope * $0 }
+            let xT = Tensor.empty(shape: [n], dtype: .f32); xT.copyIn(from: x)
+            var outT: Tensor!
+            runAndWait { cmd in outT = Ops.leakyReLU(xT, slope: slope, on: cmd) }
+            let got = outT.toArray(as: Float.self)
+            var maxDiff: Float = 0
+            for i in 0 ..< n { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-5, "leakyReLU diverges (max \(maxDiff))")
+        }
+    }
+
+    @Test("snake — GPU matches a CPU snake reference (per-channel alpha)")
+    func snakeF32() {
+        autoreleasepool {
+            let channels = 5, length = 37
+            let alpha = (0 ..< channels).map { Float(0.5) + 0.3 * Float($0) }
+            let x = (0 ..< channels * length).map { (Float($0 % 19) / 19 - 0.5) * 3 }
+            var expected = [Float](repeating: 0, count: channels * length)
+            for i in 0 ..< channels * length {
+                let a = alpha[i / length]
+                let s = sin(a * x[i])
+                expected[i] = x[i] + (1 / (a + 1e-9)) * s * s
+            }
+            let xT = Tensor.empty(shape: [channels, length], dtype: .f32); xT.copyIn(from: x)
+            let aT = Tensor.empty(shape: [channels], dtype: .f32); aT.copyIn(from: alpha)
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.snake(xT, alpha: aT, channels: channels, length: length, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            var maxDiff: Float = 0
+            for i in 0 ..< channels * length { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-4, "snake diverges (max \(maxDiff))")
+        }
+    }
+
+    @Test("upsampleNearest1d — GPU matches a CPU nearest ×2 reference")
+    func upsampleNearest1dF32() {
+        autoreleasepool {
+            let channels = 6, inLen = 29, factor = 2
+            let outLen = inLen * factor
+            let x = (0 ..< channels * inLen).map { Float($0 % 23) / 23 - 0.5 }
+            var expected = [Float](repeating: 0, count: channels * outLen)
+            for i in 0 ..< channels * outLen {
+                let c = i / outLen, t = (i % outLen) / factor
+                expected[i] = x[c * inLen + t]
+            }
+            let xT = Tensor.empty(shape: [channels, inLen], dtype: .f32); xT.copyIn(from: x)
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.upsampleNearest1d(xT, channels: channels, inLen: inLen, factor: factor, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            #expect(outT.shape == [channels, outLen])
+            var maxDiff: Float = 0
+            for i in 0 ..< channels * outLen { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-5, "upsampleNearest1d diverges (max \(maxDiff))")
+        }
+    }
+
     @Test("depthwiseConv2dNHWC — GPU matches a CPU NHWC reference (3×3 s1 pad1)")
     func depthwiseConv2dNHWC() {
         autoreleasepool {

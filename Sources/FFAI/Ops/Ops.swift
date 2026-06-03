@@ -8244,6 +8244,118 @@ public enum Ops {
         return result
     }
 
+    /// Element-wise Leaky ReLU `out[i] = x[i] > 0 ? x[i] : slope·x[i]` — the
+    /// StyleTTS2 / Kokoro decoder + generator activation (slope varies per
+    /// call site: 0.2 in AdaIN res-blocks, 0.1 / 0.01 in the generator).
+    /// Wraps `ffai_leaky_relu` (Grid3D, one thread per element). `slope` is a
+    /// runtime scalar so one PSO serves every slope.
+    public static func leakyReLU(
+        _ x: Tensor, slope: Float,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        let result = out ?? Tensor.empty(shape: x.shape, dtype: x.dtype)
+        precondition(
+            result.elementCount == x.elementCount,
+            "Ops.leakyReLU: out must match x element count")
+        let slopeT = Tensor.empty(shape: [1], dtype: .f32)
+        slopeT.copyIn(from: [slope])
+        let (grid, tg) = elementwiseGrid(x.elementCount)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.ffai_leaky_relu_f32(
+                input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
+                slope: slopeT.buffer, slopeOffset: slopeT.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_leaky_relu_f16(
+                input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
+                slope: slopeT.buffer, slopeOffset: slopeT.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_leaky_relu_bf16(
+                input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
+                slope: slopeT.buffer, slopeOffset: slopeT.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.leakyReLU: unsupported dtype \(x.dtype)")
+        }
+        return result
+    }
+
+    /// Snake activation `out[c,t] = x[c,t] + (1/α_c)·sin²(α_c·x[c,t])` over a
+    /// channels-first `[channels, length]` map with a learnable per-channel
+    /// `alpha` `[channels]` — the iSTFTNet / BigVGAN periodic activation.
+    /// Wraps `ffai_snake1d` (Grid3D, one thread per element).
+    public static func snake(
+        _ x: Tensor, alpha: Tensor, channels: Int, length: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            x.elementCount == channels * length,
+            "Ops.snake: x must be [channels,length] = \(channels * length)")
+        precondition(
+            alpha.elementCount == channels && alpha.dtype == x.dtype,
+            "Ops.snake: alpha must be [channels] sharing x's dtype")
+        let result = out ?? Tensor.empty(shape: [channels, length], dtype: x.dtype)
+        let (grid, tg) = elementwiseGrid(channels * length)
+        let len = UInt32(length)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.ffai_snake1d_f32(
+                input: x.buffer, inputOffset: x.offset, alpha: alpha.buffer, alphaOffset: alpha.offset,
+                out: result.buffer, outOffset: result.offset, length: len,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_snake1d_f16(
+                input: x.buffer, inputOffset: x.offset, alpha: alpha.buffer, alphaOffset: alpha.offset,
+                out: result.buffer, outOffset: result.offset, length: len,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_snake1d_bf16(
+                input: x.buffer, inputOffset: x.offset, alpha: alpha.buffer, alphaOffset: alpha.offset,
+                out: result.buffer, outOffset: result.offset, length: len,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.snake: unsupported dtype \(x.dtype)")
+        }
+        return result
+    }
+
+    /// Nearest-neighbour 1-D up-sample `[channels, inLen] → [channels,
+    /// factor·inLen]` (channels-first) — the StyleTTS2 `AdainResBlk1d`
+    /// shortcut + F0/N predictor up-sampler. Wraps `ffai_upsample_nearest1d`
+    /// (Grid3D, one thread per OUTPUT element, pure gather).
+    public static func upsampleNearest1d(
+        _ x: Tensor, channels: Int, inLen: Int, factor: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            x.elementCount == channels * inLen,
+            "Ops.upsampleNearest1d: x must be [channels,inLen] = \(channels * inLen)")
+        precondition(factor >= 1, "Ops.upsampleNearest1d: factor must be >= 1")
+        let outLen = inLen * factor
+        let result = out ?? Tensor.empty(shape: [channels, outLen], dtype: x.dtype)
+        let (grid, tg) = elementwiseGrid(channels * outLen)
+        let (il, f) = (UInt32(inLen), UInt32(factor))
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.ffai_upsample_nearest1d_f32(
+                input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
+                in_len: il, factor: f, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_upsample_nearest1d_f16(
+                input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
+                in_len: il, factor: f, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_upsample_nearest1d_bf16(
+                input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
+                in_len: il, factor: f, gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.upsampleNearest1d: unsupported dtype \(x.dtype)")
+        }
+        return result
+    }
+
     /// Shared per-dtype dispatch for ``conv1dDilated`` / ``conv1dTranspose``
     /// (identical signatures; only the kernel + weight layout differ).
     private static func conv1dDispatch(
