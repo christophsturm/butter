@@ -7903,33 +7903,34 @@ public enum Ops {
     /// `nPatches = gridT·side·side`, `side = mergeBlocks·merge`.
     public static func patchUnfoldQwen(
         frames: Tensor, channels: Int, patch: Int, temporalPatch: Int,
-        merge: Int, mergeBlocks: Int, imgSide: Int, gridT: Int,
-        patchDimPadded: Int, isImage: Bool,
+        merge: Int, mergeBlocksH: Int, mergeBlocksW: Int, imgH: Int, imgW: Int,
+        gridT: Int, patchDimPadded: Int, isImage: Bool,
         on cmd: MTLCommandBuffer, into out: Tensor? = nil
     ) -> Tensor {
-        let side = mergeBlocks * merge
+        let gridH = mergeBlocksH * merge
+        let gridW = mergeBlocksW * merge
         precondition(
-            imgSide == side * patch,
-            "Ops.patchUnfoldQwen: imgSide \(imgSide) != mergeBlocks·merge·patch "
-                + "\(side * patch)")
+            imgH == gridH * patch && imgW == gridW * patch,
+            "Ops.patchUnfoldQwen: imgH/imgW (\(imgH)/\(imgW)) != "
+                + "mergeBlocks·merge·patch (\(gridH * patch)/\(gridW * patch))")
         let nFrames = isImage ? 1 : gridT * temporalPatch
         precondition(
-            frames.elementCount == nFrames * channels * imgSide * imgSide,
-            "Ops.patchUnfoldQwen: frames must be [nFrames,channels,imgSide,imgSide] = "
-                + "\(nFrames * channels * imgSide * imgSide) (got \(frames.elementCount))")
+            frames.elementCount == nFrames * channels * imgH * imgW,
+            "Ops.patchUnfoldQwen: frames must be [nFrames,channels,imgH,imgW] = "
+                + "\(nFrames * channels * imgH * imgW) (got \(frames.elementCount))")
         precondition(
             patchDimPadded >= temporalPatch * channels * patch * patch,
             "Ops.patchUnfoldQwen: patchDimPadded \(patchDimPadded) < "
                 + "temporalPatch·channels·patch·patch "
                 + "\(temporalPatch * channels * patch * patch)")
-        let nPatches = gridT * side * side
+        let nPatches = gridT * gridH * gridW
         let result =
             out ?? Tensor.empty(shape: [nPatches, patchDimPadded], dtype: frames.dtype)
         let (grid, tg) = elementwiseGrid(nPatches * patchDimPadded)
-        let (c, p, tp, m, mb, isz, pdp, isImg) = (
+        let (c, p, tp, m, mbh, mbw, ih, iw, pdp, isImg) = (
             UInt32(channels), UInt32(patch), UInt32(temporalPatch), UInt32(merge),
-            UInt32(mergeBlocks), UInt32(imgSide), UInt32(patchDimPadded),
-            UInt32(isImage ? 1 : 0)
+            UInt32(mergeBlocksH), UInt32(mergeBlocksW), UInt32(imgH), UInt32(imgW),
+            UInt32(patchDimPadded), UInt32(isImage ? 1 : 0)
         )
         switch frames.dtype {
         case .f32:
@@ -7937,22 +7938,25 @@ public enum Ops {
                 frames: frames.buffer, framesOffset: frames.offset,
                 out: result.buffer, outOffset: result.offset,
                 channels: c, patch: p, temporal_patch: tp, merge: m,
-                merge_blocks: mb, img_side: isz, patch_dim_padded: pdp,
-                is_image: isImg, gridSize: grid, threadgroupSize: tg, on: cmd)
+                merge_blocks_h: mbh, merge_blocks_w: mbw, img_h: ih, img_w: iw,
+                patch_dim_padded: pdp, is_image: isImg,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
             MetalTileKernels.ffai_patch_unfold_qwen_f16(
                 frames: frames.buffer, framesOffset: frames.offset,
                 out: result.buffer, outOffset: result.offset,
                 channels: c, patch: p, temporal_patch: tp, merge: m,
-                merge_blocks: mb, img_side: isz, patch_dim_padded: pdp,
-                is_image: isImg, gridSize: grid, threadgroupSize: tg, on: cmd)
+                merge_blocks_h: mbh, merge_blocks_w: mbw, img_h: ih, img_w: iw,
+                patch_dim_padded: pdp, is_image: isImg,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
             MetalTileKernels.ffai_patch_unfold_qwen_bf16(
                 frames: frames.buffer, framesOffset: frames.offset,
                 out: result.buffer, outOffset: result.offset,
                 channels: c, patch: p, temporal_patch: tp, merge: m,
-                merge_blocks: mb, img_side: isz, patch_dim_padded: pdp,
-                is_image: isImg, gridSize: grid, threadgroupSize: tg, on: cmd)
+                merge_blocks_h: mbh, merge_blocks_w: mbw, img_h: ih, img_w: iw,
+                patch_dim_padded: pdp, is_image: isImg,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.patchUnfoldQwen: unsupported dtype \(frames.dtype)")
         }

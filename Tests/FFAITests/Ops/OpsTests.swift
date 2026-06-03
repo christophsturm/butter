@@ -140,7 +140,8 @@ struct OpsTests {
             runAndWait { cb in
                 out = Ops.patchUnfoldQwen(
                     frames: framesT, channels: channels, patch: patch, temporalPatch: tp,
-                    merge: merge, mergeBlocks: mergeBlocks, imgSide: imgSide, gridT: gridT,
+                    merge: merge, mergeBlocksH: mergeBlocks, mergeBlocksW: mergeBlocks,
+                    imgH: imgSide, imgW: imgSide, gridT: gridT,
                     patchDimPadded: padded, isImage: isImage, on: cb)
             }
             let got = out.toArray(as: Float.self)

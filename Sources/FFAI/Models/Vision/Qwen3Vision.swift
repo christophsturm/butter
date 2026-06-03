@@ -569,9 +569,9 @@ final class Qwen3VLVisionModel: @unchecked Sendable {
         let side = gridSide
         let nPatches = gridT * side * side
 
-        // ── Patch unfold + embed ──
-        let unfolded = unfoldPatches(framePixels: framePixels, gridT: gridT)
+        // ── Patch unfold + embed ── (unfold → GEMM on one cmd buffer)
         let cmd = device.makeCommandBuffer()
+        let unfolded = unfoldPatches(framePixels: framePixels, gridT: gridT, on: cmd)
         var h = Ops.gemm(
             weight: patchEmbedWeight, input: unfolded,
             nRows: nPatches, on: cmd)
@@ -620,7 +620,9 @@ final class Qwen3VLVisionModel: @unchecked Sendable {
     /// intraCol)` — temporal patches are blocked together so the merger's
     /// reshape lines up with one temporal patch group of spatial
     /// neighbourhoods.
-    private func unfoldPatches(framePixels: [[Float]], gridT: Int) -> Tensor {
+    private func unfoldPatches(
+        framePixels: [[Float]], gridT: Int, on cmd: MTLCommandBuffer
+    ) -> Tensor {
         let side = gridSide
         let p = cfg.patchSize
         let c = cfg.inChannels
@@ -628,47 +630,20 @@ final class Qwen3VLVisionModel: @unchecked Sendable {
         let m = cfg.spatialMergeSize
         let mergeBlocks = side / m
         let imgSide = side * p
-        let nPatches = gridT * side * side
-        // Image fast path: a single frame replicated `tp` times.
+        // Image fast path: a single frame reused for every temporal slot.
         let isImage = framePixels.count == 1
-
-        var rows = [Float](repeating: 0, count: nPatches * patchDimPadded)
-
-        // Outer loop: temporal groups, then merge-block raster.
-        var patch = 0
-        for tGroup in 0 ..< gridT {
-            for br in 0 ..< mergeBlocks {
-                for bc in 0 ..< mergeBlocks {
-                    for ir in 0 ..< m {
-                        for ic in 0 ..< m {
-                            let pr = br * m + ir
-                            let pc = bc * m + ic
-                            var col = 0
-                            // Layout: (temporal, channel, py, px).
-                            for tWithin in 0 ..< tp {
-                                let frameIdx = isImage ? 0 : tGroup * tp + tWithin
-                                let pix = framePixels[frameIdx]
-                                for ch in 0 ..< c {
-                                    for py in 0 ..< p {
-                                        let yy = pr * p + py
-                                        for px in 0 ..< p {
-                                            let xx = pc * p + px
-                                            let v = pix[(ch * imgSide + yy) * imgSide + xx]
-                                            rows[patch * patchDimPadded + col] = v
-                                            col += 1
-                                        }
-                                    }
-                                }
-                            }
-                            patch += 1
-                        }
-                    }
-                }
-            }
-        }
-        return ImagePreprocessing.makeTensor(
-            from: rows, shape: [nPatches, patchDimPadded],
+        // Concatenate the per-frame pixel buffers into one
+        // `[nFrames, c, imgSide, imgSide]` tensor for the GPU unfold; the
+        // kernel emits the merge-block raster + `(t, c, py, px)` columns.
+        let flat = framePixels.flatMap { $0 }
+        let framesT = ImagePreprocessing.makeTensor(
+            from: flat, shape: [framePixels.count, c, imgSide, imgSide],
             dtype: dtype, device: .shared)
+        return Ops.patchUnfoldQwen(
+            frames: framesT, channels: c, patch: p, temporalPatch: tp,
+            merge: m, mergeBlocksH: mergeBlocks, mergeBlocksW: mergeBlocks,
+            imgH: imgSide, imgW: imgSide, gridT: gridT,
+            patchDimPadded: patchDimPadded, isImage: isImage, on: cmd)
     }
 
     // ── Position embedding ──
