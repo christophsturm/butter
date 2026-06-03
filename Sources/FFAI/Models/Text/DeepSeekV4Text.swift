@@ -2161,27 +2161,6 @@ struct PrefillError: Error, CustomStringConvertible {
     var description: String { message }
 }
 
-/// System-wide free memory as a percentage (free+inactive vs hw.memsize), or
-/// nil if the mach query fails. Used by the prefill freeze guard.
-func ffaiSystemFreePercent() -> Double? {
-    var total: UInt64 = 0
-    var sz = MemoryLayout<UInt64>.size
-    if sysctlbyname("hw.memsize", &total, &sz, nil, 0) != 0 || total == 0 { return nil }
-    var stats = vm_statistics64_data_t()
-    var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
-    let kr = withUnsafeMutablePointer(to: &stats) { ptr -> kern_return_t in
-        ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
-            host_statistics64(mach_host_self(), HOST_VM_INFO64, intPtr, &count)
-        }
-    }
-    guard kr == KERN_SUCCESS else { return nil }
-    var pageSize: UInt64 = 16384
-    var psz = MemoryLayout<UInt64>.size
-    _ = sysctlbyname("hw.pagesize", &pageSize, &psz, nil, 0)
-    let freeBytes = (UInt64(stats.free_count) + UInt64(stats.inactive_count)) * pageSize
-    return Double(freeBytes) / Double(total) * 100.0
-}
-
 extension DeepSeekV4Model {
     /// One-time guard: have we pre-warmed the expert tensors into page cache?
     nonisolated(unsafe) static var dsv4Prewarmed = false
@@ -2268,7 +2247,7 @@ extension DeepSeekV4Model {
             // freezes near ~8-10% free; bailing with a throw lets the OS
             // reclaim instead of the app-quit-monitor freeze. Override the
             // floor via FFAI_MEM_FLOOR_PCT, disable with =0.
-            if let freePct = ffaiSystemFreePercent() {
+            if let freePct = MemorySnapshot.systemFreePercent() {
                 let floor = Double(ProcessInfo.processInfo.environment["FFAI_MEM_FLOOR_PCT"].flatMap { Int($0) } ?? 12)
                 if floor > 0 && freePct < floor {
                     throw PrefillError(

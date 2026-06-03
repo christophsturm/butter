@@ -48,6 +48,31 @@ public struct MemorySnapshot: Sendable, Equatable {
             timestamp: Date()
         )
     }
+
+    /// System-wide free memory as a percentage of `hw.memsize`
+    /// (`free + inactive` pages), or `nil` if the mach query fails.
+    /// Process-independent — used by loaders / prefill freeze-guards to
+    /// bail before the machine pages to death. The single source for
+    /// "how much headroom does the box have right now".
+    public static func systemFreePercent() -> Double? {
+        var total: UInt64 = 0
+        var sz = MemoryLayout<UInt64>.size
+        if sysctlbyname("hw.memsize", &total, &sz, nil, 0) != 0 || total == 0 { return nil }
+        var stats = vm_statistics64_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &stats) { ptr -> kern_return_t in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, intPtr, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        var pageSize: UInt64 = 16384
+        var psz = MemoryLayout<UInt64>.size
+        _ = sysctlbyname("hw.pagesize", &pageSize, &psz, nil, 0)
+        let freeBytes = (UInt64(stats.free_count) + UInt64(stats.inactive_count)) * pageSize
+        return Double(freeBytes) / Double(total) * 100.0
+    }
 }
 
 /// Aggregates phase-boundary snapshots + per-token peak samples for one
