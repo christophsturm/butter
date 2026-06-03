@@ -15,7 +15,7 @@
 // DeepSeek V4 text backbone — DSv4-Flash / DSv4-Pro decoder config +
 // variants.
 //
-// **Status:** WIP scaffold. This file declares the static shape — the
+// **Status:** Scaffold. This file declares the static shape — the
 // `DeepSeekV4TextConfig` decoder, the two variants (`DeepSeekV4Flash`,
 // `DeepSeekV4Pro`), and the `DeepSeekV4Model` placeholder — so the
 // loader can identify a DSv4 checkpoint (safetensors or GGUF) and

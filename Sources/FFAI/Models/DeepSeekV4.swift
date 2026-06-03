@@ -31,7 +31,7 @@
 //   - `DeepSeekV4Pro`   — same arch, ~1.6T / 49B active.
 //   - `DeepSeekV4Model` — full LanguageModel decoder.
 //
-// **Status:** WIP. Family scaffold + config decoder + loader hook are
+// **Status:** Family scaffold + config decoder + loader hook are
 // in place so a safetensors `DeepSeek-V4-Flash` checkpoint is
 // identified end-to-end via the standard `Model.load` dispatch; the
 // forward path is stubbed and raises
@@ -158,7 +158,7 @@ public enum DeepSeekV4Error: Error, CustomStringConvertible {
         case .unsupportedQuantType(let t, let tensor):
             return "DeepSeekV4: GGUF quant '\(t)' for tensor '\(tensor)' not yet supported"
         case .notYetImplemented(let what):
-            return "DeepSeekV4: \(what) — WIP, not yet implemented"
+            return "DeepSeekV4: \(what) — not yet implemented"
         }
     }
 }

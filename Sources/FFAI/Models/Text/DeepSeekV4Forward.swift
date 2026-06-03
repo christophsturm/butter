@@ -211,7 +211,8 @@ extension DeepSeekV4Model {
     /// the K/Q tail rotation, `dsv4SdpaDecodeD512Sink` for the
     /// MQA attention with attn_sinks).
     ///
-    /// Known-incorrect details (WIP) — these matter for numerical
+    /// Known-incorrect details (deferred to follow-ups) — these matter
+    /// for numerical
     /// correctness but not for "does the dispatch chain compile and
     /// run without NaN?":
     /// - Per-head Q-norm (eps-only, no learnable weight) is **skipped**
@@ -1269,7 +1270,7 @@ extension DeepSeekV4Model {
     /// + output mHC head + output norm + LM head. Returns the logits
     /// vector `[vocab]`.
     ///
-    /// **WIP**: CSA / HCA forward paths aren't implemented yet, so
+    /// **Note:** CSA / HCA forward paths aren't implemented yet, so
     /// `forwardFullAttnSubblock` is used on ALL layers regardless of
     /// `compress_ratio`. The output is dispatch-correct but the
     /// numerics for CSA/HCA layers are wrong (they should run the

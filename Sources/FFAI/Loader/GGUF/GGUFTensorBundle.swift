@@ -28,7 +28,7 @@ import QuartzCore
 // dispatcher can take either format is future work, deferred until the
 // DSv4 forward path lands.
 //
-// **Status:** WIP scaffold. The reader (header + KV + tensor-info
+// **Status:** The reader (header + KV + tensor-info
 // table) is fully implemented in `GGUFReader.swift` and works end-to-
 // end on real DeepSeek-V4-Flash IQ2_XXS GGUFs. `tensor(named:)` decodes
 // the on-disk bytes into the GPU-resident split that metaltile's GGUF

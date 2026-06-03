@@ -19,7 +19,7 @@ struct Dsv4BenchCommand: ParsableCommand {
     )
 
     @Option(name: .shortAndLong, help: "Directory containing the DSv4 GGUF (or the .gguf file itself).")
-    var model: String = NSString("~/models/ds4-model").expandingTildeInPath
+    var model: String = NSString("~/models/deepseek-v4-flash").expandingTildeInPath
 
     @Option(name: .shortAndLong, help: "Number of decode tokens to time.")
     var tokens: Int = 8
