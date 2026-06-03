@@ -68,18 +68,18 @@ public enum Perplexity {
     /// reads them back to CPU once per step. Cost is one extra readback
     /// per token vs greedy; acceptable for offline evaluation.
     public static func compute(
-        model: Model,
+        model: some QualityScorable,
         tokens: [Int],
         device: Device = .shared
     ) -> Result {
         precondition(
             tokens.count >= 2,
             "Perplexity.compute requires at least 2 tokens (one context + one target)")
-        let caches = model.engine.makeLayerCaches(maxSeq: nil, device: device)
+        let caches = model.makeScoringCaches(device: device)
         var nll = 0.0
         var scored = 0
         for t in 0 ..< (tokens.count - 1) {
-            let logits = model.engine.forward(
+            let logits = model.scoringForward(
                 tokenId: tokens[t], position: t,
                 caches: caches, device: device)
             let target = tokens[t + 1]
@@ -105,24 +105,24 @@ public enum Perplexity {
     /// the same checkpoint as `reference` against the quantized
     /// variant as `candidate`.
     public static func klDivergence(
-        reference: Model,
-        candidate: Model,
+        reference: some QualityScorable,
+        candidate: some QualityScorable,
         tokens: [Int],
         device: Device = .shared
     ) -> KLDResult {
         precondition(
             tokens.count >= 2,
             "klDivergence requires at least 2 tokens")
-        let refCaches = reference.engine.makeLayerCaches(maxSeq: nil, device: device)
-        let candCaches = candidate.engine.makeLayerCaches(maxSeq: nil, device: device)
+        let refCaches = reference.makeScoringCaches(device: device)
+        let candCaches = candidate.makeScoringCaches(device: device)
 
         var totalKL = 0.0
         var scored = 0
         for t in 0 ..< (tokens.count - 1) {
-            let refLogits = reference.engine.forward(
+            let refLogits = reference.scoringForward(
                 tokenId: tokens[t], position: t,
                 caches: refCaches, device: device)
-            let candLogits = candidate.engine.forward(
+            let candLogits = candidate.scoringForward(
                 tokenId: tokens[t], position: t,
                 caches: candCaches, device: device)
             // Skip positions where vocab sizes mismatch (defensive — KL
