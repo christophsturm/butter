@@ -208,7 +208,52 @@ FFAI's bench path is not pinned today. Proposed:
 - Optionally a guard that warns (or refuses) if a quality bench is invoked from a
   debug build, so we never publish debug-speed numbers by accident.
 
-## 8. Settled vs open
+## 8. Usage — how to run
+
+Quality metrics run through the `ffai bench` CLI. PPL and KLD work **today**;
+the `FFAI_TELEMETRY` live-capture flag and NIAH are the follow-ups this design
+adds the surface for.
+
+**Perplexity** (WikiText-2 forced-decode) — works today:
+
+```bash
+# debug (slow — quick smoke only)
+ffai bench --method wikitext2 --model <hf-repo-or-local-path>
+
+# release — use this for real numbers (see §7)
+swift run -c release ffai bench --method wikitext2 \
+    --model <hf-repo-or-local-path> \
+    --wikitext2-max-tokens 4096            # corpus token cap (default 2048)
+```
+
+**KL-divergence** vs a full-precision reference — works today. Pass the bf16
+(unquantized) variant of the same architecture as `--ref-model`:
+
+```bash
+swift run -c release ffai bench --method wikitext2 \
+    --model     <quantized-repo-or-path> \
+    --ref-model <bf16-reference-repo-or-path>
+# emits Gen PPL + Gen KLD columns into ./benchmarks (override with --report-dir)
+```
+
+**Telemetry flag surface** (the new on/off gates; default off, zero cost when
+unset) — the env var `InspectTap` parses, consumed by the live-capture
+follow-up:
+
+```bash
+FFAI_TELEMETRY=ppl,kld   ffai <generate|serve> ...   # capture PPL + KLD live
+FFAI_TELEMETRY=ppl       ffai <generate|serve> ...   # perplexity only
+# unset → nothing captured, no overhead (mirrors FFAI_INSPECT / FFAI_INSPECT_LAYERS)
+```
+
+**NIAH** (needle-in-a-haystack retrieval) — *target*; lands as a follow-up
+(`Telemetry/NIAH.swift`) over the same contract:
+
+```bash
+swift run -c release ffai bench --method niah --model <long-ctx-repo>
+```
+
+## 9. Settled vs open
 
 **Settled (this discussion):**
 - **One tap.** `InspectTap` is the single capture point; no separate quality
@@ -230,7 +275,7 @@ FFAI's bench path is not pinned today. Proposed:
    the existing `--ref-model` flag)?
 5. **Release-bench enforcement** — warn vs hard-refuse on debug builds.
 
-## 9. Rough migration
+## 10. Rough migration
 
 1. Add `Telemetry/QualityScorable.swift` (protocol) + `extension Model: QualityScorable`.
 2. Move `Stats/Perplexity.swift` → `Telemetry/Perplexity.swift`, re-type
