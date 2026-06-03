@@ -201,6 +201,163 @@ extension KokoroWeights {
     }
 }
 
+// ─── Prosody predictor (durations + F0/N) ────────────────────────────
+
+extension KokoroWeights {
+    /// AdaIN1d: instance-norm `[L, C]` over time per channel, then
+    /// StyleTTS2 affine `(1+γ)·norm + β`, with `[γ,β] = fc(style)`.
+    func adaIN1d(_ x: [[Float]], style: [Float], fcBase: String, channels C: Int) -> [[Float]] {
+        let gb = KokoroMath.linear([style], weight: vec("\(fcBase).weight"), bias: vec("\(fcBase).bias"),
+            outDim: 2 * C, inDim: style.count)[0]
+        let L = x.count
+        var out = x
+        for c in 0 ..< C {
+            var mean: Float = 0
+            for t in 0 ..< L { mean += x[t][c] }
+            mean /= Float(L)
+            var v: Float = 0
+            for t in 0 ..< L { let d = x[t][c] - mean; v += d * d }
+            let inv = 1 / (v / Float(L) + 1e-5).squareRoot()
+            let g = gb[c], b = gb[C + c]
+            for t in 0 ..< L { out[t][c] = (1 + g) * ((x[t][c] - mean) * inv) + b }
+        }
+        return out
+    }
+
+    /// AdainResBlk1d: `norm1→act→[pool]→conv1→norm2→act→conv2`, residual
+    /// `(x + shortcut)/√2`. `pool` (weight-norm convT, when present)
+    /// up-samples ×2; `conv1x1` adapts channels on the shortcut.
+    func adainResBlk(
+        _ x: [[Float]], style: [Float], base: String, inC: Int, outC: Int,
+        upsample: Bool
+    ) -> [[Float]] {
+        var h = adaIN1d(x, style: style, fcBase: "\(base).norm1.fc", channels: inC)
+        KokoroMath.leakyReLU(&h)
+        if upsample { h = convTransposeUp2(h, base: "\(base).pool", channels: inC) }
+        h = conv1dSeq(h, base: "\(base).conv1", pad: 1)
+        h = adaIN1d(h, style: style, fcBase: "\(base).norm2.fc", channels: outC)
+        KokoroMath.leakyReLU(&h)
+        h = conv1dSeq(h, base: "\(base).conv2", pad: 1)
+        // Shortcut: optional 1×1 conv + optional ×2 upsample.
+        var sc = x
+        if upsample { sc = upsampleNearest2(sc) }
+        if has("\(base).conv1x1.weight_v") { sc = conv1dSeq(sc, base: "\(base).conv1x1", pad: 0) }
+        let invSqrt2: Float = 0.7071067811865476
+        let T = min(h.count, sc.count)
+        var out = [[Float]](repeating: [Float](repeating: 0, count: outC), count: T)
+        for t in 0 ..< T { for c in 0 ..< outC { out[t][c] = (h[t][c] + sc[t][c]) * invSqrt2 } }
+        return out
+    }
+
+    /// ×2 nearest-neighbour upsample of an `[L, C]` sequence.
+    func upsampleNearest2(_ x: [[Float]]) -> [[Float]] {
+        var out = [[Float]]()
+        out.reserveCapacity(x.count * 2)
+        for r in x { out.append(r); out.append(r) }
+        return out
+    }
+
+    /// Weight-norm `ConvTranspose1d` ×2 up-sample (the `pool` in F0/N blocks):
+    /// kernel 3, stride 2. Weight `[C,1,3]` (depthwise). Approximated as
+    /// nearest-upsample + depthwise conv, sufficient for the prosody curve.
+    func convTransposeUp2(_ x: [[Float]], base: String, channels C: Int) -> [[Float]] {
+        let up = upsampleNearest2(x)
+        let (w, _) = convWeight(base)  // [C,1,3]
+        let b = convBias(base)
+        let L = up.count
+        var out = [[Float]](repeating: [Float](repeating: 0, count: C), count: L)
+        for c in 0 ..< C {
+            for t in 0 ..< L {
+                var acc: Float = b.isEmpty ? 0 : b[c]
+                for k in 0 ..< 3 {
+                    let s = t + k - 1
+                    if s >= 0 && s < L { acc += w[c * 3 + k] * up[s][c] }
+                }
+                out[t][c] = acc
+            }
+        }
+        return out
+    }
+
+    /// Duration encoder: 3×(BiLSTM[640→512] over `[feat ⊕ style]`, then
+    /// AdaLayerNorm). Returns `[L, 512]`.
+    func durationEncoder(_ feat: [[Float]], style: [Float]) -> [[Float]] {
+        var x = feat
+        for pair in 0 ..< 3 {
+            let li = pair * 2
+            let withStyle = x.map { $0 + style }  // [L, 512+128=640]
+            x = KokoroMath.biLSTM(
+                withStyle,
+                wihF: vec("predictor.text_encoder.lstms.\(li).weight_ih_l0"),
+                whhF: vec("predictor.text_encoder.lstms.\(li).weight_hh_l0"),
+                bihF: vec("predictor.text_encoder.lstms.\(li).bias_ih_l0"),
+                bhhF: vec("predictor.text_encoder.lstms.\(li).bias_hh_l0"),
+                wihR: vec("predictor.text_encoder.lstms.\(li).weight_ih_l0_reverse"),
+                whhR: vec("predictor.text_encoder.lstms.\(li).weight_hh_l0_reverse"),
+                bihR: vec("predictor.text_encoder.lstms.\(li).bias_ih_l0_reverse"),
+                bhhR: vec("predictor.text_encoder.lstms.\(li).bias_hh_l0_reverse"),
+                inDim: 640, hidden: 256)
+            // AdaLayerNorm: channel-LayerNorm then style affine (1+γ)·+β.
+            let fc = "predictor.text_encoder.lstms.\(li + 1).fc"
+            let gb = KokoroMath.linear([style], weight: vec("\(fc).weight"), bias: vec("\(fc).bias"),
+                outDim: 1024, inDim: 128)[0]
+            for i in x.indices {
+                KokoroMath.layerNorm(&x[i], weight: [Float](repeating: 1, count: 512),
+                    bias: [Float](repeating: 0, count: 512), eps: 1e-5)
+                for c in 0 ..< 512 { x[i][c] = (1 + gb[c]) * x[i][c] + gb[512 + c] }
+            }
+        }
+        return x
+    }
+
+    /// Predict per-token integer durations + the aligned F0/N curves.
+    /// `dEn` is bert_encoder output `[L,512]`; `style` the 128-dim voice
+    /// half used by the predictor. Returns `(durations, F0[T], N[T])` and the
+    /// `[L,T]` expansion is applied by the caller to the acoustic features.
+    func predict(dEn: [[Float]], style: [Float], speed: Float) -> (dur: [Int], f0: [Float], n: [Float], dAligned: [[Float]]) {
+        let d = durationEncoder(dEn, style: style)
+        let x = KokoroMath.biLSTM(
+            d.map { $0 + style },
+            wihF: vec("predictor.lstm.weight_ih_l0"), whhF: vec("predictor.lstm.weight_hh_l0"),
+            bihF: vec("predictor.lstm.bias_ih_l0"), bhhF: vec("predictor.lstm.bias_hh_l0"),
+            wihR: vec("predictor.lstm.weight_ih_l0_reverse"), whhR: vec("predictor.lstm.weight_hh_l0_reverse"),
+            bihR: vec("predictor.lstm.bias_ih_l0_reverse"), bhhR: vec("predictor.lstm.bias_hh_l0_reverse"),
+            inDim: 640, hidden: 256)
+        let dp = KokoroMath.linear(x, weight: vec("predictor.duration_proj.linear_layer.weight"),
+            bias: vec("predictor.duration_proj.linear_layer.bias"), outDim: 50, inDim: 512)
+        var dur = [Int]()
+        for row in dp {
+            var s: Float = 0
+            for v in row { s += 1 / (1 + expf(-v)) }
+            dur.append(max(1, Int((s / max(speed, 0.1)).rounded())))
+        }
+        // Length-regulate the duration-encoder output → [T, 512].
+        var dAligned = [[Float]]()
+        for (i, r) in d.enumerated() { for _ in 0 ..< dur[i] { dAligned.append(r) } }
+        // Shared LSTM → F0/N AdaIN res-block stacks.
+        let sh = KokoroMath.biLSTM(
+            dAligned.map { $0 + style },
+            wihF: vec("predictor.shared.weight_ih_l0"), whhF: vec("predictor.shared.weight_hh_l0"),
+            bihF: vec("predictor.shared.bias_ih_l0"), bhhF: vec("predictor.shared.bias_hh_l0"),
+            wihR: vec("predictor.shared.weight_ih_l0_reverse"), whhR: vec("predictor.shared.weight_hh_l0_reverse"),
+            bihR: vec("predictor.shared.bias_ih_l0_reverse"), bhhR: vec("predictor.shared.bias_hh_l0_reverse"),
+            inDim: 640, hidden: 256)
+        func curve(_ tag: String) -> [Float] {
+            var h = adainResBlk(sh, style: style, base: "predictor.\(tag).0", inC: 512, outC: 512, upsample: false)
+            h = adainResBlk(h, style: style, base: "predictor.\(tag).1", inC: 512, outC: 256, upsample: true)
+            h = adainResBlk(h, style: style, base: "predictor.\(tag).2", inC: 256, outC: 256, upsample: false)
+            let proj = convWeight("predictor.\(tag)_proj")  // [1,256,1]
+            let pb = convBias("predictor.\(tag)_proj")
+            return h.map { row -> Float in
+                var acc: Float = pb.isEmpty ? 0 : pb[0]
+                for c in 0 ..< 256 { acc += proj.w[c] * row[c] }
+                return acc
+            }
+        }
+        return (dur, curve("F0"), curve("N"), dAligned)
+    }
+}
+
 // ─── Small CPU math helpers (acoustic front-end is tiny, run once) ────
 
 enum KokoroMath {
