@@ -118,9 +118,12 @@ extension DeepSeekV4Variant {
         // Gemma 4 / Qwen 3 hybrid family defaults — large enough to
         // amortise the MLA absorb-W_UK setup over many positions,
         // small enough to fit on a 96 GB Apple Silicon machine.
+        // No model-specific maxTokens — fall to the GenerationParameters
+        // default so callers control generation length. DeepSeek-V3/V4
+        // recommend temperature 0.6 / top-p 0.95 for general use.
         GenerationParameters(
-            maxTokens: 256, prefillStepSize: 4096,
-            temperature: 1.0, topP: 0.95, topK: 64,
+            prefillStepSize: 4096,
+            temperature: 0.6, topP: 0.95, topK: 64,
             repetitionPenalty: 1.0)
     }
 
