@@ -580,9 +580,12 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
         var h = Ops.gemm(
             weight: patchEmbedWeight, input: unfolded,
             nRows: nPatches, on: cmd)
-        // Add the learned 2D position embedding (x + y axis lookups).
-        let posEmb = positionEmbedding(gridH: gridH, gridW: gridW)
-        h = Ops.add(h, posEmb, on: cmd)
+        // Fuse the learned 2D position-embedding build + add into one GPU
+        // dispatch: out = h + posX[col] + posY[row].
+        let (posX, posY) = resolvedPositionTables(gridH: gridH, gridW: gridW)
+        h = Ops.posEmb2dAdd(
+            tokens: h, posX: posX, posY: posY,
+            hidden: cfg.hidden, gridW: gridW, gridH: gridH, on: cmd)
         cmd.commit()
         cmd.waitUntilCompleted()
 
@@ -702,30 +705,40 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
 
     // ── Position embedding ──
 
-    /// Build the per-patch learned 2D position embedding `[nPatches,
-    /// hidden]` — the x-axis table indexed by the patch column plus the
-    /// y-axis table indexed by the patch row.
-    private func positionEmbedding(gridH: Int, gridW: Int) -> Tensor {
+    /// Resolve the learned 2D position tables to the current patch grid:
+    /// `posX[col] = tableX[min(posSize-1, col)]` (`col ∈ [0, gridW)`) and
+    /// `posY[row] = tableY[min(posSize-1, row)]` (`row ∈ [0, gridH)`).
+    /// Returns the two f32 tables `Ops.posEmb2dAdd` consumes — it fuses the
+    /// per-patch `tokens + posX[col] + posY[row]` build-and-add into one GPU
+    /// dispatch. The `min(posSize-1, ·)` clamp mirrors the reference's
+    /// bounded table lookup for grids larger than the learned table.
+    private func resolvedPositionTables(
+        gridH: Int, gridW: Int
+    ) -> (posX: Tensor, posY: Tensor) {
         let hidden = cfg.hidden
+        let posSize = cfg.positionEmbeddingSize
         let tableX = posTableX.toFloatArray()
         let tableY = posTableY.toFloatArray()
-        let posSize = cfg.positionEmbeddingSize
-        let nPatches = gridH * gridW
-        var dst = [Float](repeating: 0, count: nPatches * hidden)
-        for pr in 0 ..< gridH {
-            for pc in 0 ..< gridW {
-                let patch = pr * gridW + pc
-                let xi = min(posSize - 1, pc)
-                let yi = min(posSize - 1, pr)
-                for d in 0 ..< hidden {
-                    dst[patch * hidden + d] =
-                        tableX[xi * hidden + d] + tableY[yi * hidden + d]
-                }
+        var xFlat = [Float](repeating: 0, count: gridW * hidden)
+        for col in 0 ..< gridW {
+            let xi = min(posSize - 1, col)
+            for d in 0 ..< hidden {
+                xFlat[col * hidden + d] = tableX[xi * hidden + d]
             }
         }
-        return ImagePreprocessing.makeTensor(
-            from: dst, shape: [nPatches, hidden], dtype: dtype,
-            device: .shared)
+        var yFlat = [Float](repeating: 0, count: gridH * hidden)
+        for row in 0 ..< gridH {
+            let yi = min(posSize - 1, row)
+            for d in 0 ..< hidden {
+                yFlat[row * hidden + d] = tableY[yi * hidden + d]
+            }
+        }
+        // `Ops.posEmb2dAdd` requires the tables in f32.
+        let posX = ImagePreprocessing.makeTensor(
+            from: xFlat, shape: [gridW, hidden], dtype: .f32, device: .shared)
+        let posY = ImagePreprocessing.makeTensor(
+            from: yFlat, shape: [gridH, hidden], dtype: .f32, device: .shared)
+        return (posX, posY)
     }
 
     // ── Attention pooling ──
@@ -740,30 +753,31 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
         let softH = gridH / k
         let softW = gridW / k
         let hidden = cfg.hidden
-        let src = h.toFloatArray()
-        let kArea = Float(k * k)
+        // ── k×k average pool over the patch grid on the GPU. `h` is the
+        // `[gridH·gridW, hidden]` token map = NHWC `[1, gridH, gridW, hidden]`;
+        // a stride-k, pad-0 avg pool collapses each k×k neighbourhood to one
+        // soft token, in the same `(sy, sx)` raster the CPU path produced.
+        let cmd = device.makeCommandBuffer()
+        let pooledT = Ops.avgPool2dNHWC(
+            h, batch: 1, inH: gridH, inW: gridW, channels: hidden,
+            kH: k, kW: k, stride: k, pad: 0, on: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        // ── Trailing √hidden scale + optional standardization affine. Both
+        // are per-channel and trivially cheap at soft-token resolution, so
+        // they stay on the CPU (no per-channel-affine GPU op exists yet).
+        var pooled = pooledT.toFloatArray()
         let rootHidden = Float(Double(hidden).squareRoot())
-        var pooled = [Float](repeating: 0, count: softH * softW * hidden)
         let stdB = stdBias?.toFloatArray()
         let stdS = stdScale?.toFloatArray()
-        for sy in 0 ..< softH {
-            for sx in 0 ..< softW {
-                let outBase = (sy * softW + sx) * hidden
-                for c in 0 ..< hidden {
-                    var acc: Float = 0
-                    for dy in 0 ..< k {
-                        for dx in 0 ..< k {
-                            let py = sy * k + dy
-                            let px = sx * k + dx
-                            acc += src[(py * gridW + px) * hidden + c]
-                        }
-                    }
-                    var val = (acc / kArea) * rootHidden
-                    if let stdB, let stdS {
-                        val = (val - stdB[c]) * stdS[c]
-                    }
-                    pooled[outBase + c] = val
+        for t in 0 ..< (softH * softW) {
+            let base = t * hidden
+            for c in 0 ..< hidden {
+                var val = pooled[base + c] * rootHidden
+                if let stdB, let stdS {
+                    val = (val - stdB[c]) * stdS[c]
                 }
+                pooled[base + c] = val
             }
         }
         let out = Tensor.empty(
