@@ -196,6 +196,9 @@ public final class KokoroModel: @unchecked Sendable {
     /// Acoustic-stack weights (PLBERT + text/duration encoders + predictor +
     /// decoder + generator). `nil` when built config-only (vocoder tests).
     let acoustic: KokoroWeights?
+    /// GPU weight cache for the iSTFTNet generator tail (uploads each conv
+    /// once, lazily on first synthesis). `nil` when there's no acoustic stack.
+    private lazy var gpuWeights: KokoroGPUWeights? = acoustic.map { KokoroGPUWeights($0) }
     /// Snapshot directory — used to resolve per-voice style packs lazily.
     let directory: URL?
     let dtype: DType
@@ -327,7 +330,7 @@ public final class KokoroModel: @unchecked Sendable {
         var asrAligned = [[Float]]()
         for (i, r) in asr.enumerated() { for _ in 0 ..< dur[min(i, dur.count - 1)] { asrAligned.append(r) } }
         let (re, im) = acoustic.decode(
-            asr: asrAligned, f0: f0, n: n, style: sDec, vocoder: vocoder)
+            asr: asrAligned, f0: f0, n: n, style: sDec, vocoder: vocoder, gpu: gpuWeights)
         let nFreq = vocoder.nFFT / 2 + 1
         let frames = re.count
         var reFlat = [Float](repeating: 0, count: frames * nFreq)

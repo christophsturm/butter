@@ -126,4 +126,42 @@ struct KokoroIntegrationTests {
         #expect(distinct > 50, "degenerate waveform")
         print("Kokoro full-chain: \(samples.count) samples, energy=\(energy), distinct=\(distinct)")
     }
+
+    @Test("generator — GPU matches the CPU iSTFTNet reference (re/im parity)")
+    func generatorGPUParity() async throws {
+        let dir = try await ModelLoadLock.shared.loadSerially {
+            try await ModelLocator().resolve(idOrPath: "mlx-community/Kokoro-82M-bf16")
+        }
+        let model = try KokoroModel.load(directory: dir)
+        let acoustic = try #require(model.acoustic, "no acoustic weights")
+        // Synthetic decoder output + F0 at a small frame count so the CPU
+        // reference is fast; the generator is shape-generic, so this exercises
+        // every conv / adain / snake / leaky path at the real channel widths.
+        let t2 = 8
+        func ramp(_ n: Int, _ seed: Int, _ amp: Float) -> [Float] {
+            (0 ..< n).map { (Float(($0 * 7 + seed) % 23) / 23 - 0.5) * amp }
+        }
+        let x0 = (0 ..< t2).map { t in ramp(512, t * 3 + 1, 0.6) }  // [T2, 512]
+        let f0 = (0 ..< t2).map { Float(120 + ($0 % 5) * 30) }  // voiced curve
+        let style = ramp(128, 99, 0.4)
+
+        let (reCPU, imCPU) = acoustic.generate(
+            x0, style: style, f0: f0, vocoder: model.vocoder)
+        let gw = KokoroGPUWeights(acoustic)
+        let (reGPU, imGPU) = acoustic.generateGPU(
+            x0, style: style, f0: f0, vocoder: model.vocoder, gw: gw)
+
+        try #require(reGPU.count == reCPU.count, "frame count differs: GPU \(reGPU.count) vs CPU \(reCPU.count)")
+        var maxRe: Float = 0, maxIm: Float = 0, denom: Float = 1e-9
+        for t in 0 ..< reCPU.count {
+            for k in 0 ..< reCPU[t].count {
+                maxRe = max(maxRe, abs(reGPU[t][k] - reCPU[t][k]))
+                maxIm = max(maxIm, abs(imGPU[t][k] - imCPU[t][k]))
+                denom = max(denom, abs(reCPU[t][k]), abs(imCPU[t][k]))
+            }
+        }
+        print("generator GPU↔CPU parity: maxRe=\(maxRe) maxIm=\(maxIm) scale=\(denom)")
+        #expect(maxRe / denom < 1e-2, "re diverges (max \(maxRe), scale \(denom))")
+        #expect(maxIm / denom < 1e-2, "im diverges (max \(maxIm), scale \(denom))")
+    }
 }

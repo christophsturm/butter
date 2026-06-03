@@ -585,7 +585,10 @@ extension KokoroWeights {
     /// ×4 (last up-samples ×2) → generator → re/im planes. The F0/N curves come
     /// in at 2T (predictor upsamples once); the decoder's F0_conv/N_conv are
     /// stride-2 depthwise convs that bring them back to the asr rate T.
-    func decode(asr: [[Float]], f0: [Float], n: [Float], style: [Float], vocoder: KokoroVocoder) -> (re: [[Float]], im: [[Float]]) {
+    /// `gpu` (when non-nil) runs the iSTFTNet generator tail — the conv-heavy
+    /// bottleneck — on the GPU; the small AdaIN decoder stack stays on the CPU.
+    func decode(asr: [[Float]], f0: [Float], n: [Float], style: [Float], vocoder: KokoroVocoder,
+        gpu: KokoroGPUWeights? = nil) -> (re: [[Float]], im: [[Float]]) {
         let T = asr.count
         // F0/N down-conv: weight-norm Conv1d(1→1, k3, stride 2, pad 1) over the
         // 2T curve → T frames. Reference `ConvWeighted(1,1,3,stride=2,padding=1)`.
@@ -620,6 +623,10 @@ extension KokoroWeights {
             x = adainResBlk(cat, style: style, base: "decoder.decode.\(blk)", inC: 1090, outC: outC, upsample: up)
         }
         // Generator runs on the original (2T) F0 curve, not the down-sampled one.
+        // GPU path when available (the iSTFTNet tail is the bottleneck).
+        if let gpu {
+            return generateGPU(x, style: style, f0: f0, vocoder: vocoder, gw: gpu)
+        }
         return generate(x, style: style, f0: f0, vocoder: vocoder)
     }
 }
