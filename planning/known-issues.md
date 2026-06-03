@@ -245,6 +245,79 @@ shape. Remaining gaps:
   path.
 - **GGUF** — no parser (Phase 10).
 
+## metaltile `moe_gather_down_q2k_correctness` — RESOLVED (test oracle, not the kernel)
+
+**Was:** `make test` in the sibling **metaltile** repo failed
+`moe_gather_down_q2k_correctness` (the fused MoE down-projection gather over
+a Q2_K-quantized expert weight disagreed with its CPU reference at ~0.71
+relative error), landing with #243.
+
+**Root cause + fix (branch `ek/fix-q2k-gather-down-test`, commit
+`c685e4ce`).** The **kernel was correct** — byte-identical Q2_K dequant math
+to the validated `gguf_dequant_q2_k`. The **test oracle was wrong**: it
+unpacked the 2-bit quants with the naive 4-consecutive-per-byte mapping
+(`in_block/4` byte, `(in_block%4)*2` shift) while the canonical layout (the
+kernel + `gguf_dequant_q2_k`) is the llama.cpp `dequantize_row_q2_K` order
+(2 halves of 128, 4 j-groups of 32, two 16-runs at a shared `jg*2` shift).
+Fix: gave the oracle a `q2_k_qpos` helper identical to `gguf_dequant_q2_k`.
+Both `gather_down_q2k_{f32,f16}` now pass. (Pending PR back to metaltile
+`dev`.)
+
+## metaltile `test_mel_spectrogram` / `test_mel_spectrogram_magnitude` [f16] — flaky GPU correctness cell
+
+**Symptom.** The metaltile `kernel_tests_harness` umbrella intermittently
+fails one of the two f16 Mel `#[test_kernel]`s (which one, and the delta,
+vary run-to-run — e.g. `max|Δ|≈16` then `≈8`), so `make test` is
+flaky-red. Reproduces on **clean `dev`** with none of our kernels present —
+**pre-existing, not ours**, and macOS-gated so it does not run on
+metaltile's Linux CI.
+
+**Why.** The Mel kernels accumulate the DFT in f32, but the **f16 inputs**
+of a near-tonal test sine leave most bins at the log-floor, where `log`
+amplifies tiny magnitude differences; the flakiness points at a too-tight
+f16 tolerance and/or an under-padded test audio buffer (the frame walk reads
+past the buffer on the last frames → nondeterministic). It does **not**
+affect FFAI: the Gemma4 audio front-end uses the **f32** Mel path (validated
+to 4.4e-4 vs the feature-extractor oracle + a coherent audio→text decode).
+
+**Next step (upstream metaltile):** loosen the f16 Mel tolerance to the
+log-floor regime, switch the test signal to broadband noise, or pad the test
+audio to `(n_frames-1)*hop + n_fft`.
+
+## Qwen2/2.5/3-VL vision — `Ops.gather: unsupported dtype u32` crash in the forward
+
+**Symptom.** With `IntegrationGroupGating.enableVisionSuites` flipped on, the
+Qwen vision integration suites abort early with `FFAI/Ops.swift:371: Fatal
+error: Ops.gather: unsupported dtype u32`. **Pre-existing** — reproduced on
+the CPU-unfold baseline (our GPU patch-unfold wiring reverted), which is why
+the vision-suite group is gated off as "not yet verified on current HEAD".
+
+**Impact on our work.** It blocks **end-to-end** validation of the new Qwen
+GPU patch-unfold wiring (`Ops.patchUnfoldQwen`), but that wiring is otherwise
+proven: the metaltile `patch_unfold_qwen` GPU-correctness cells (square
+image, square video, non-square image) and the FFAI
+`OpsTests.patchUnfoldQwenF32` unit test all pass. Gemma4 vision — which uses
+the sibling `im2col_patch_interleaved` kernel — passes its full integration
+suite (tower oracle + image/video→text).
+
+**Next step.** Find the u32 `Ops.gather` call site reachable from the Qwen
+vision forward (likely a position/window index path) and either add a u32
+overload to `Ops.gather` or fix the caller to pass the intended dtype, then
+re-enable + bisect the Qwen vision suites.
+
+## Orphaned GPU kernels still awaiting a consumer
+
+`Ops.frameDiffLuma` (video luma frame-diff motion gate) and
+`Ops.gatedRmsNormQgemvInt4Fast` (Mamba2 fused gated-RMSNorm + int4 GEMV) have
+metaltile kernels + FFAI Ops wrappers + unit tests but **no model call
+site**. Wiring `frameDiffLuma` means designing a new video motion-gate
+feature (which frames to skip, threshold) — a behavior change, not a
+mechanical swap. Wiring `gatedRmsNormQgemvInt4Fast` means restructuring
+Mamba2's quantized SSM decode (tracked separately as the "wire landed-but-
+orphaned kernels" task). `Ops.patchEmbed` (fused unfold+embed) is
+functionally superseded for Gemma4 by `Ops.im2colPatchInterleaved` + the
+existing `Ops.gemm`. Left as tracked follow-ups.
+
 ## Tokenizers — InternLM2Tokenizer not registered
 
 Loading InternLM2 logs `InternLM2Tokenizer is not registered, falling
