@@ -71,7 +71,7 @@ struct Gemma4OmniDrafterIntegrationTests {
         }
     }
 
-    @Test("convert preserves the EAGLE heads (pre_projection / centroids / lm_head)")
+    @Test("convert preserves the EAGLE fusion heads (pre_projection / post_projection)")
     func convertPreservesEagleHeads() async throws {
         let dir = try await ModelLoadLock.shared.loadSerially {
             try await ModelLocator().resolve(idOrPath: drafterPath)
@@ -79,7 +79,10 @@ struct Gemma4OmniDrafterIntegrationTests {
         let weights = try SafeTensorsBundle(directory: dir)
         let keys = weights.allKeys
         func hasSuffix(_ s: String) -> Bool { keys.contains { $0.hasSuffix(s) } }
+        // The EAGLE fusion: pre_projection (2·backbone_hidden -> hidden) consumes
+        // the target's hidden state; post_projection (hidden -> backbone_hidden)
+        // feeds it back. Both must survive `ffai convert`.
         #expect(hasSuffix("pre_projection.weight"), "pre_projection dropped by convert")
-        #expect(hasSuffix("centroids.weight"), "centroids dropped by convert")
+        #expect(hasSuffix("post_projection.weight"), "post_projection dropped by convert")
     }
 }
