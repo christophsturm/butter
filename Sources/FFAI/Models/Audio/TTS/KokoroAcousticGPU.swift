@@ -86,6 +86,28 @@ final class KokoroGPUWeights {
         upload("\(name).A", w.vec(name), shape: [C])
     }
 
+    /// Weight-norm depthwise transposed-conv weight (the `pool`): stored
+    /// `[C, 1, k]`, normalized over dim 0 → flattened `[C, k]`.
+    func poolW(_ base: String, channels C: Int) -> Tensor {
+        let g = w.vec("\(base).weight_g"), v = w.vec("\(base).weight_v")
+        let sh = w.shape("\(base).weight_v")  // [C, 1, k]
+        let wv = WeightNorm.effectiveWeight(g: g, v: v, shape: sh, exceptDim: 0)
+        return upload("\(base).PW", wv, shape: [C, sh[2]])
+    }
+
+    /// A cached all-zero bias `[C]` (the weight-norm `conv1x1` is bias-less,
+    /// but `Ops.conv1dDilated` requires a bias).
+    func zeroBias(_ C: Int) -> Tensor {
+        upload("zeroBias.\(C)", [Float](repeating: 0, count: C), shape: [C])
+    }
+
+    /// Upload an arbitrary CPU `[rows, cols]` (row-major) as a GPU tensor.
+    func uploadMatrix(_ data: [Float], rows: Int, cols: Int) -> Tensor {
+        let t = Tensor.empty(shape: [rows, cols], dtype: .f32, device: device)
+        t.copyIn(from: data)
+        return t
+    }
+
     /// AdaIN affine for a `[C]`-channel feature map: `gamma = 1 + fc(style)[:C]`,
     /// `beta = fc(style)[C:]`, computed on the CPU (the `fc` is tiny — `[2C,128]
     /// · [128]`) and uploaded as two `[C]` tensors. The kernel folds `(1+γ)`
@@ -267,5 +289,155 @@ extension KokoroWeights {
             h = Ops.add(h, a, on: cmd)
         }
         return h
+    }
+}
+
+// ─── GPU decoder (AdaIN res-block stack) ─────────────────────────────
+
+extension KokoroWeights {
+    /// GPU decoder: `concat(asr, F0, N) → encode → concat(asr_res, F0, N) →
+    /// decode ×4 (last up-samples ×2) → generator → re/im`. Mirrors the CPU
+    /// `decode`. The small F0/N stride-2 convs run on the CPU (1-channel); the
+    /// AdaIN res-block stack and generator run on the GPU. Each res-block
+    /// self-manages its command buffer (it materialises its output for the
+    /// next channels-first concat), so the orchestration stays simple.
+    func decodeGPU(
+        asr: [[Float]], f0: [Float], n: [Float], style: [Float], vocoder: KokoroVocoder,
+        gw: KokoroGPUWeights, device: Device = .shared
+    ) -> (re: [[Float]], im: [[Float]]) {
+        let T = asr.count
+        // F0/N stride-2 depthwise convs (tiny, 1-channel) on the CPU.
+        func single(_ curve: [Float], base: String) -> [Float] {
+            let (cw, _) = convWeight(base)  // [1,1,3]
+            let b = convBias(base)
+            let L = curve.count
+            let lOut = (L + 2 * 1 - 3) / 2 + 1
+            return (0 ..< lOut).map { t -> Float in
+                var acc: Float = b.isEmpty ? 0 : b[0]
+                let start = t * 2 - 1
+                for k in 0 ..< 3 { let s = start + k; if s >= 0 && s < L { acc += cw[k] * curve[s] } }
+                return acc
+            }
+        }
+        let f0d = single(f0, base: "decoder.F0_conv")  // [T]
+        let nd = single(n, base: "decoder.N_conv")  // [T]
+        // F0/N as channels-first [1, T] GPU rows.
+        let f0T = gw.uploadMatrix(f0d, rows: 1, cols: T)
+        let ndT = gw.uploadMatrix(nd, rows: 1, cols: T)
+        // asr channels-first [512, T].
+        var asrCF = [Float](repeating: 0, count: 512 * T)
+        for t in 0 ..< T { for c in 0 ..< 512 { asrCF[c * T + t] = asr[t][c] } }
+        let asrT = gw.uploadMatrix(asrCF, rows: 512, cols: T)
+        // asr_res.0 (512→64, k1) on the GPU.
+        let arBase = "decoder.asr_res.0"
+        let arK = shape("\(arBase).weight_v")[2]
+        let cmdAR = device.makeCommandBuffer()
+        let asrRes = Ops.conv1dDilated(
+            asrT, weight: gw.convW(arBase), bias: gw.convB(arBase, outC: 64),
+            batch: 1, inCh: 512, inLen: T, outCh: 64, k: arK, stride: 1, pad: 0, dilation: 1, on: cmdAR
+        ).reshaped(to: [64, T])
+        cmdAR.commit(); cmdAR.waitUntilCompleted()
+
+        // encode: AdainResBlk on concat(asr, F0, N) = [514, T] → [1024, T].
+        let encIn = concatRowsGPU([asrT, f0T, ndT], rows: [512, 1, 1], length: T, gw: gw, device: device)
+        var x = adainResBlkGPU(encIn, base: "decoder.encode", inC: 514, outC: 1024,
+            upsample: false, length: T, style: style, gw: gw, device: device)
+        var xLen = T
+        for blk in 0 ..< 4 {
+            // concat(x, asr_res, F0, N) = [1090, T].
+            let cat = concatRowsGPU([x, asrRes, f0T, ndT], rows: [x.shape[0], 64, 1, 1], length: T, gw: gw, device: device)
+            let up = (blk == 3)
+            let outC = up ? 512 : 1024
+            x = adainResBlkGPU(cat, base: "decoder.decode.\(blk)", inC: 1090, outC: outC,
+                upsample: up, length: T, style: style, gw: gw, device: device)
+            xLen = up ? 2 * T : T
+        }
+        // Decoder output [512, 2T] → channels-last [2T, 512] for the generator.
+        let xFlat = x.toFloatArray()
+        let x0 = (0 ..< xLen).map { t in (0 ..< 512).map { c in xFlat[c * xLen + t] } }
+        return generateGPU(x0, style: style, f0: f0, vocoder: vocoder, gw: gw, device: device)
+    }
+
+    /// GPU `AdainResBlk1d`: `norm1 → leaky → [pool] → conv1 → norm2 → leaky →
+    /// conv2`, residual `(x + shortcut)/√2` with optional ×2 up-sample +
+    /// 1×1 shortcut. Channels-first `[C, T]`. Self-managed command buffer
+    /// (commits + materialises its result).
+    private func adainResBlkGPU(
+        _ x: Tensor, base: String, inC: Int, outC: Int, upsample: Bool, length T: Int,
+        style: [Float], gw: KokoroGPUWeights, device: Device
+    ) -> Tensor {
+        var cmd = device.makeCommandBuffer()
+        let (g1, b1) = gw.adainAffine("\(base).norm1.fc", style: style, channels: inC)
+        var h = Ops.adain1d(x.reshaped(to: [inC, T]), gamma: g1, beta: b1, rows: inC, length: T, on: cmd)
+        h = Ops.leakyReLU(h, slope: 0.2, on: cmd)
+        var hLen = T
+        if upsample {
+            // pool: depthwise convT (k3 s2 p1) → [inC, 2T-1], then left-pad → [inC, 2T].
+            let poolW = gw.poolW("\(base).pool", channels: inC)
+            let poolB = gw.convB("\(base).pool", outC: inC)
+            h = Ops.conv1dTransposeDepthwise(h, weight: poolW, bias: poolB,
+                channels: inC, inLen: T, k: 3, stride: 2, pad: 1, on: cmd)
+            let poolLen = (T - 1) * 2 - 2 + 2 + 1  // 2T - 1
+            cmd.commit(); cmd.waitUntilCompleted()
+            let flat = h.toFloatArray()
+            var padded = [Float](repeating: 0, count: inC * (poolLen + 1))
+            for c in 0 ..< inC { for t in 0 ..< poolLen { padded[c * (poolLen + 1) + (t + 1)] = flat[c * poolLen + t] } }
+            h = Tensor.empty(shape: [inC, poolLen + 1], dtype: .f32, device: device)
+            h.copyIn(from: padded)
+            hLen = poolLen + 1  // 2T
+            cmd = device.makeCommandBuffer()
+        }
+        let k1 = shape("\(base).conv1.weight_v")[2]
+        h = Ops.conv1dDilated(
+            h, weight: gw.convW("\(base).conv1"), bias: gw.convB("\(base).conv1", outC: outC),
+            batch: 1, inCh: inC, inLen: hLen, outCh: outC, k: k1, stride: 1, pad: (k1 - 1) / 2, dilation: 1, on: cmd
+        ).reshaped(to: [outC, hLen])
+        let (g2, b2) = gw.adainAffine("\(base).norm2.fc", style: style, channels: outC)
+        h = Ops.adain1d(h, gamma: g2, beta: b2, rows: outC, length: hLen, on: cmd)
+        h = Ops.leakyReLU(h, slope: 0.2, on: cmd)
+        let k2 = shape("\(base).conv2.weight_v")[2]
+        h = Ops.conv1dDilated(
+            h, weight: gw.convW("\(base).conv2"), bias: gw.convB("\(base).conv2", outC: outC),
+            batch: 1, inCh: outC, inLen: hLen, outCh: outC, k: k2, stride: 1, pad: (k2 - 1) / 2, dilation: 1, on: cmd
+        ).reshaped(to: [outC, hLen])
+        // Shortcut: [×2 up-sample] → [1×1 conv].
+        var sc = x.reshaped(to: [inC, T])
+        var scLen = T
+        if upsample {
+            sc = Ops.upsampleNearest1d(sc, channels: inC, inLen: T, factor: 2, on: cmd)
+            scLen = 2 * T
+        }
+        if has("\(base).conv1x1.weight_v") {
+            sc = Ops.conv1dDilated(
+                sc, weight: gw.convW("\(base).conv1x1"), bias: gw.zeroBias(outC),
+                batch: 1, inCh: inC, inLen: scLen, outCh: outC, k: 1, stride: 1, pad: 0, dilation: 1, on: cmd
+            ).reshaped(to: [outC, scLen])
+        }
+        // (h + sc) / √2.
+        let T2 = min(hLen, scLen)
+        var out = Ops.add(h.reshaped(to: [outC, hLen]), sc, on: cmd)
+        let invSqrt2 = Tensor.filled(0.7071067811865476, shape: [outC, T2], dtype: .f32, device: device)
+        out = Ops.mul(out, invSqrt2, on: cmd)
+        cmd.commit(); cmd.waitUntilCompleted()
+        return out
+    }
+
+    /// Concatenate channels-first `[Cᵢ, length]` tensors along the channel
+    /// axis → `[ΣCᵢ, length]`. Channel-major layout makes each block a
+    /// contiguous region, so this is a sequence of blits.
+    private func concatRowsGPU(
+        _ parts: [Tensor], rows: [Int], length: Int, gw: KokoroGPUWeights, device: Device
+    ) -> Tensor {
+        let total = rows.reduce(0, +)
+        let out = Tensor.empty(shape: [total, length], dtype: .f32, device: device)
+        let cmd = device.makeCommandBuffer()
+        var rowOffset = 0
+        for (i, part) in parts.enumerated() {
+            let dst = out.slicedRows(start: rowOffset, count: rows[i])
+            Ops.copy(part.reshaped(to: [rows[i], length]), into: dst, on: cmd)
+            rowOffset += rows[i]
+        }
+        cmd.commit(); cmd.waitUntilCompleted()
+        return out
     }
 }

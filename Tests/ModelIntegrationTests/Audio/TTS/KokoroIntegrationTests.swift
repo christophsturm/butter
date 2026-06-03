@@ -163,5 +163,27 @@ struct KokoroIntegrationTests {
         print("generator GPU↔CPU parity: maxRe=\(maxRe) maxIm=\(maxIm) scale=\(denom)")
         #expect(maxRe / denom < 1e-2, "re diverges (max \(maxRe), scale \(denom))")
         #expect(maxIm / denom < 1e-2, "im diverges (max \(maxIm), scale \(denom))")
+
+        // Full decoder + generator parity: CPU decode() vs GPU decodeGPU().
+        // asr is the aligned rate T; F0/N are the 2T predictor curves (the
+        // decoder's stride-2 F0_conv/N_conv bring them back to T).
+        let asr = (0 ..< t2).map { t in ramp(512, t * 5 + 2, 0.5) }  // [T, 512]
+        let f0Dec = (0 ..< 2 * t2).map { Float(110 + ($0 % 6) * 25) }  // [2T]
+        let nDec = (0 ..< 2 * t2).map { Float(($0 % 7) - 3) * 3 }  // [2T]
+        let (dReCPU, dImCPU) = acoustic.decode(asr: asr, f0: f0Dec, n: nDec, style: style, vocoder: model.vocoder)
+        let (dReGPU, dImGPU) = acoustic.decodeGPU(
+            asr: asr, f0: f0Dec, n: nDec, style: style, vocoder: model.vocoder, gw: gw)
+        try #require(dReGPU.count == dReCPU.count, "decoder frame count differs: GPU \(dReGPU.count) vs CPU \(dReCPU.count)")
+        var dRe: Float = 0, dIm: Float = 0, dDen: Float = 1e-9
+        for t in 0 ..< dReCPU.count {
+            for k in 0 ..< dReCPU[t].count {
+                dRe = max(dRe, abs(dReGPU[t][k] - dReCPU[t][k]))
+                dIm = max(dIm, abs(dImGPU[t][k] - dImCPU[t][k]))
+                dDen = max(dDen, abs(dReCPU[t][k]), abs(dImCPU[t][k]))
+            }
+        }
+        print("decoder GPU↔CPU parity: maxRe=\(dRe) maxIm=\(dIm) scale=\(dDen)")
+        #expect(dRe / dDen < 2e-2, "decoder re diverges (max \(dRe), scale \(dDen))")
+        #expect(dIm / dDen < 2e-2, "decoder im diverges (max \(dIm), scale \(dDen))")
     }
 }

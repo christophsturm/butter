@@ -589,6 +589,11 @@ extension KokoroWeights {
     /// bottleneck — on the GPU; the small AdaIN decoder stack stays on the CPU.
     func decode(asr: [[Float]], f0: [Float], n: [Float], style: [Float], vocoder: KokoroVocoder,
         gpu: KokoroGPUWeights? = nil) -> (re: [[Float]], im: [[Float]]) {
+        // GPU path: the whole AdaIN decoder stack + iSTFTNet generator run on
+        // the GPU (the CPU path below is the reference).
+        if let gpu {
+            return decodeGPU(asr: asr, f0: f0, n: n, style: style, vocoder: vocoder, gw: gpu)
+        }
         let T = asr.count
         // F0/N down-conv: weight-norm Conv1d(1→1, k3, stride 2, pad 1) over the
         // 2T curve → T frames. Reference `ConvWeighted(1,1,3,stride=2,padding=1)`.
