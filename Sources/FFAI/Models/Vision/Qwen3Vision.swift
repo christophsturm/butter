@@ -914,11 +914,20 @@ public enum Qwen3VL {
         // ── Text backbone — Qwen 3 dense engine ──
         // Qwen3-VL stores text hyper-parameters under `text_config`; the
         // standalone `Qwen3Dense` loader reads top-level config keys, so
-        // re-wrap the `text_config` sub-tree as a flat `ModelConfig`.
+        // re-wrap the `text_config` sub-tree as a flat `ModelConfig`. MLX VL
+        // checkpoints declare `quantization` once at the TOP level (not inside
+        // `text_config`), but the backbone loader reads it from its own
+        // config — carry it in so the embedding / linears / lm_head all load
+        // as quantized. Without it the packed-u32 embedding is gathered as a
+        // dense table (`Ops.gather: unsupported dtype u32`).
+        var textRaw = textConfigRaw
+        if textRaw["quantization"] == nil, let q = config.nested("quantization") {
+            textRaw["quantization"] = q
+        }
         let textConfig = ModelConfig(
             architecture: "Qwen3ForCausalLM",
             modelType: "qwen3",
-            raw: textConfigRaw)
+            raw: textRaw)
         let textWeights = weights.prefixed("language_model.")
         let textEngine = try Qwen3Dense.loadModel(
             config: textConfig, weights: textWeights,
