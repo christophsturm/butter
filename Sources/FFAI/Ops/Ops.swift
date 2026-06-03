@@ -271,6 +271,34 @@ public enum Ops {
         return result
     }
 
+    /// Exact (erf-based) GELU `0.5·x·(1 + erf(x/√2))` — PyTorch `nn.GELU()`
+    /// default. Distinct from ``gelu`` (the tanh approximation): the Kokoro
+    /// PLBERT needs the exact form so its 12 shared FFNs don't drift the
+    /// prosody predictor's rounding-sensitive durations. Wraps `ffai_gelu_erf`.
+    public static func geluErf(
+        _ x: Tensor, on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        let result = out ?? Tensor.empty(shape: x.shape, dtype: x.dtype)
+        let (grid, tg) = elementwiseGrid(x.elementCount)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.ffai_gelu_erf_f32(
+                input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_gelu_erf_f16(
+                input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_gelu_erf_bf16(
+                input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.geluErf: unsupported dtype \(x.dtype)")
+        }
+        return result
+    }
+
     /// Softplus: out[i] = log(1 + exp(x[i])). Numerically stable across
     /// the full input range. Used by Mamba 2's `dt = softplus(dt_raw +
     /// dt_bias)` per-head time-step computation.

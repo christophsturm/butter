@@ -2631,6 +2631,22 @@ struct OpsTests {
         }
     }
 
+    @Test("geluErf — GPU matches an exact erf-GELU reference")
+    func geluErfF32() {
+        autoreleasepool {
+            let n = 256
+            let x = (0 ..< n).map { Float($0 - 128) * 0.05 }
+            let expected = x.map { 0.5 * $0 * (1 + erff($0 * 0.70710678118654752)) }
+            let xT = Tensor.empty(shape: [n], dtype: .f32); xT.copyIn(from: x)
+            var outT: Tensor!
+            runAndWait { cmd in outT = Ops.geluErf(xT, on: cmd) }
+            let got = outT.toArray(as: Float.self)
+            var maxDiff: Float = 0
+            for i in 0 ..< n { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-5, "geluErf diverges (max \(maxDiff))")
+        }
+    }
+
     @Test("conv1dTransposeDepthwise — GPU matches a CPU depthwise convT (k3 s2 pad1)")
     func conv1dTransposeDepthwiseF32() {
         autoreleasepool {
