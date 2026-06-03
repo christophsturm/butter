@@ -8356,6 +8356,54 @@ public enum Ops {
         return result
     }
 
+    /// Depthwise (grouped, `groups == channels`) transposed 1-D conv —
+    /// the StyleTTS2 / Kokoro decoder `AdainResBlk1d` up-sample `pool`
+    /// (`ConvTranspose1d(C, C, k, stride, pad, groups=C)`). `weight` is
+    /// per-channel `[channels, k]` (the depthwise `[C,1,k]` flattened),
+    /// `bias` `[channels]`. `outLen = (inLen−1)·stride − 2·pad +
+    /// dilation·(k−1) + 1`. Wraps `ffai_conv1d_transpose_depthwise`.
+    public static func conv1dTransposeDepthwise(
+        _ input: Tensor, weight: Tensor, bias: Tensor,
+        channels: Int, inLen: Int, k: Int, stride: Int, pad: Int, dilation: Int = 1,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            input.elementCount == channels * inLen,
+            "Ops.conv1dTransposeDepthwise: input must be [channels,inLen] = \(channels * inLen)")
+        precondition(
+            weight.elementCount == channels * k && bias.elementCount == channels,
+            "Ops.conv1dTransposeDepthwise: weight [channels,k] / bias [channels] shape mismatch")
+        let outLen = (inLen - 1) * stride - 2 * pad + dilation * (k - 1) + 1
+        precondition(outLen > 0, "Ops.conv1dTransposeDepthwise: degenerate outLen \(outLen)")
+        let result = out ?? Tensor.empty(shape: [channels, outLen], dtype: input.dtype)
+        let (grid, tg) = elementwiseGrid(channels * outLen)
+        let (c, il, ol) = (UInt32(channels), UInt32(inLen), UInt32(outLen))
+        let (kk, st, pd, dl) = (UInt32(k), UInt32(stride), UInt32(pad), UInt32(dilation))
+        switch input.dtype {
+        case .f32:
+            MetalTileKernels.ffai_conv1d_transpose_depthwise_f32(
+                input: input.buffer, inputOffset: input.offset, weight: weight.buffer, weightOffset: weight.offset,
+                bias: bias.buffer, biasOffset: bias.offset, out: result.buffer, outOffset: result.offset,
+                channels: c, in_len: il, out_len: ol, k: kk, stride: st, pad: pd, dilation: dl,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_conv1d_transpose_depthwise_f16(
+                input: input.buffer, inputOffset: input.offset, weight: weight.buffer, weightOffset: weight.offset,
+                bias: bias.buffer, biasOffset: bias.offset, out: result.buffer, outOffset: result.offset,
+                channels: c, in_len: il, out_len: ol, k: kk, stride: st, pad: pd, dilation: dl,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_conv1d_transpose_depthwise_bf16(
+                input: input.buffer, inputOffset: input.offset, weight: weight.buffer, weightOffset: weight.offset,
+                bias: bias.buffer, biasOffset: bias.offset, out: result.buffer, outOffset: result.offset,
+                channels: c, in_len: il, out_len: ol, k: kk, stride: st, pad: pd, dilation: dl,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.conv1dTransposeDepthwise: unsupported dtype \(input.dtype)")
+        }
+        return result
+    }
+
     /// Shared per-dtype dispatch for ``conv1dDilated`` / ``conv1dTranspose``
     /// (identical signatures; only the kernel + weight layout differ).
     private static func conv1dDispatch(

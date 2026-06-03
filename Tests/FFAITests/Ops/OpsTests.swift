@@ -2631,6 +2631,49 @@ struct OpsTests {
         }
     }
 
+    @Test("conv1dTransposeDepthwise — GPU matches a CPU depthwise convT (k3 s2 pad1)")
+    func conv1dTransposeDepthwiseF32() {
+        autoreleasepool {
+            let (channels, inLen, k, stride, pad, dilation) = (6, 13, 3, 2, 1, 1)
+            let outLen = (inLen - 1) * stride - 2 * pad + dilation * (k - 1) + 1
+            func ramp(_ n: Int, _ s: Int, _ amp: Float) -> [Float] { (0 ..< n).map { (Float(($0 * 7 + s) % 17) / 17 - 0.5) * amp } }
+            let input = ramp(channels * inLen, 1, 4)
+            let weight = ramp(channels * k, 2, 2)
+            let bias = ramp(channels, 3, 0.5)
+            var expected = [Float](repeating: 0, count: channels * outLen)
+            for c in 0 ..< channels {
+                for op in 0 ..< outLen {
+                    var acc = bias[c]
+                    let opp = op + pad
+                    for kx in 0 ..< k {
+                        let tap = kx * dilation
+                        guard opp >= tap else { continue }
+                        let num = opp - tap
+                        guard num % stride == 0 else { continue }
+                        let ip = num / stride
+                        guard ip < inLen else { continue }
+                        acc += input[c * inLen + ip] * weight[c * k + kx]
+                    }
+                    expected[c * outLen + op] = acc
+                }
+            }
+            let inT = Tensor.empty(shape: [channels, inLen], dtype: .f32); inT.copyIn(from: input)
+            let wT = Tensor.empty(shape: [channels, k], dtype: .f32); wT.copyIn(from: weight)
+            let bT = Tensor.empty(shape: [channels], dtype: .f32); bT.copyIn(from: bias)
+            var outT: Tensor!
+            runAndWait { cmd in
+                outT = Ops.conv1dTransposeDepthwise(
+                    inT, weight: wT, bias: bT, channels: channels, inLen: inLen,
+                    k: k, stride: stride, pad: pad, dilation: dilation, on: cmd)
+            }
+            let got = outT.toArray(as: Float.self)
+            #expect(outT.shape == [channels, outLen])
+            var maxDiff: Float = 0
+            for i in 0 ..< channels * outLen { maxDiff = max(maxDiff, abs(got[i] - expected[i])) }
+            #expect(maxDiff < 1e-4, "conv1dTransposeDepthwise diverges (max \(maxDiff))")
+        }
+    }
+
     @Test("depthwiseConv2dNHWC — GPU matches a CPU NHWC reference (3×3 s1 pad1)")
     func depthwiseConv2dNHWC() {
         autoreleasepool {
