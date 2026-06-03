@@ -170,8 +170,9 @@ extension KokoroWeights {
         // [L, Cin] → channels-first flat [Cin, L].
         var xf = [Float](repeating: 0, count: cIn * L)
         for t in 0 ..< L { for c in 0 ..< cIn { xf[c * L + t] = x[t][c] } }
+        let cb = convBias(base)
         let (yf, ysh) = AudioMath.conv1d(
-            x: xf, xShape: [1, cIn, L], weight: w, wShape: sh, bias: convBias(base),
+            x: xf, xShape: [1, cIn, L], weight: w, wShape: sh, bias: cb.isEmpty ? nil : cb,
             stride: 1, padding: pad, dilation: dilation, groups: 1)
         let lOut = ysh[2]
         var out = [[Float]](repeating: [Float](repeating: 0, count: cOut), count: lOut)
@@ -235,12 +236,12 @@ extension KokoroWeights {
     ) -> [[Float]] {
         var h = adaIN1d(x, style: style, fcBase: "\(base).norm1.fc", channels: inC)
         KokoroMath.leakyReLU(&h)
-        if upsample { h = convTransposeUp2(h, base: "\(base).pool", channels: inC) }
+        if upsample { h = poolUp2(h, base: "\(base).pool", channels: inC) }
         h = conv1dSeq(h, base: "\(base).conv1", pad: 1)
         h = adaIN1d(h, style: style, fcBase: "\(base).norm2.fc", channels: outC)
         KokoroMath.leakyReLU(&h)
         h = conv1dSeq(h, base: "\(base).conv2", pad: 1)
-        // Shortcut: optional 1×1 conv + optional ×2 upsample.
+        // Shortcut: optional ×2 upsample then optional 1×1 conv.
         var sc = x
         if upsample { sc = upsampleNearest2(sc) }
         if has("\(base).conv1x1.weight_v") { sc = conv1dSeq(sc, base: "\(base).conv1x1", pad: 0) }
@@ -259,25 +260,28 @@ extension KokoroWeights {
         return out
     }
 
-    /// Weight-norm `ConvTranspose1d` ×2 up-sample (the `pool` in F0/N blocks):
-    /// kernel 3, stride 2. Weight `[C,1,3]` (depthwise). Approximated as
-    /// nearest-upsample + depthwise conv, sufficient for the prosody curve.
-    func convTransposeUp2(_ x: [[Float]], base: String, channels C: Int) -> [[Float]] {
-        let up = upsampleNearest2(x)
-        let (w, _) = convWeight(base)  // [C,1,3]
+    /// The `pool` up-sampler inside an `AdainResBlk1d` (StyleTTS2): a
+    /// weight-norm **grouped** (depthwise) `ConvTranspose1d` — kernel 3,
+    /// stride 2, padding 1, `groups = C` — followed by a left zero-pad of 1
+    /// frame. Weight `[C, 1, 3]`. Output length is `2·L` (convT gives
+    /// `2L-1`, the left-pad makes it `2L`), matching the nearest-×2 shortcut.
+    func poolUp2(_ x: [[Float]], base: String, channels C: Int) -> [[Float]] {
+        let g = vec("\(base).weight_g"), v = vec("\(base).weight_v")
+        let sh = shape("\(base).weight_v")  // [C, 1, 3]
+        let w = WeightNorm.effectiveWeight(g: g, v: v, shape: sh, exceptDim: 0)
         let b = convBias(base)
-        let L = up.count
-        var out = [[Float]](repeating: [Float](repeating: 0, count: C), count: L)
-        for c in 0 ..< C {
-            for t in 0 ..< L {
-                var acc: Float = b.isEmpty ? 0 : b[c]
-                for k in 0 ..< 3 {
-                    let s = t + k - 1
-                    if s >= 0 && s < L { acc += w[c * 3 + k] * up[s][c] }
-                }
-                out[t][c] = acc
-            }
-        }
+        let L = x.count
+        // [L, C] → channels-first flat [C, L].
+        var xf = [Float](repeating: 0, count: C * L)
+        for t in 0 ..< L { for c in 0 ..< C { xf[c * L + t] = x[t][c] } }
+        let (yf, ysh) = AudioMath.convTransposed1d(
+            x: xf, xShape: [1, C, L], weight: w, wShape: sh,
+            bias: b.isEmpty ? nil : b, stride: 2, padding: 1, dilation: 1,
+            outputPadding: 0, groups: C)
+        let lOut = ysh[2]  // 2L - 1
+        // Channels-first → [time, C], prepending one zero frame (left-pad 1).
+        var out = [[Float]](repeating: [Float](repeating: 0, count: C), count: lOut + 1)
+        for c in 0 ..< C { for t in 0 ..< lOut { out[t + 1][c] = yf[c * lOut + t] } }
         return out
     }
 
@@ -327,11 +331,14 @@ extension KokoroWeights {
             inDim: 640, hidden: 256)
         let dp = KokoroMath.linear(x, weight: vec("predictor.duration_proj.linear_layer.weight"),
             bias: vec("predictor.duration_proj.linear_layer.bias"), outDim: 50, inDim: 512)
+        // Duration per token: round(Σ sigmoid(logits) / speed), clipped to [1,100].
+        let maxFramesPerPhoneme = 100
         var dur = [Int]()
         for row in dp {
             var s: Float = 0
             for v in row { s += 1 / (1 + expf(-v)) }
-            dur.append(max(1, Int((s / max(speed, 0.1)).rounded())))
+            let r = Int((s / max(speed, 0.1)).rounded())
+            dur.append(min(max(r, 1), maxFramesPerPhoneme))
         }
         // Length-regulate the duration-encoder output → [T, 512].
         var dAligned = [[Float]]()
@@ -348,11 +355,11 @@ extension KokoroWeights {
             var h = adainResBlk(sh, style: style, base: "predictor.\(tag).0", inC: 512, outC: 512, upsample: false)
             h = adainResBlk(h, style: style, base: "predictor.\(tag).1", inC: 512, outC: 256, upsample: true)
             h = adainResBlk(h, style: style, base: "predictor.\(tag).2", inC: 256, outC: 256, upsample: false)
-            let proj = convWeight("predictor.\(tag)_proj")  // [1,256,1]
-            let pb = convBias("predictor.\(tag)_proj")
+            let projW = vec("predictor.\(tag)_proj.weight")  // plain [1,256,1]
+            let pb = vec("predictor.\(tag)_proj.bias")
             return h.map { row -> Float in
                 var acc: Float = pb.isEmpty ? 0 : pb[0]
-                for c in 0 ..< 256 { acc += proj.w[c] * row[c] }
+                for c in 0 ..< 256 { acc += projW[c] * row[c] }
                 return acc
             }
         }
@@ -370,12 +377,18 @@ extension KokoroWeights {
         let dils = [1, 3, 5]
         var h = x
         for (j, dil) in dils.enumerated() {
+            // `same` padding derived from the conv's own kernel size: convs1
+            // is dilated (pad = dil·(k-1)/2), convs2 is dilation-1 (pad =
+            // (k-1)/2). Kernel size differs per res-block (3 / 7 / 11), so it
+            // must come from the weight shape, not be hard-coded.
+            let k1 = shape("\(base).convs1.\(j).weight_v")[2]
+            let k2 = shape("\(base).convs2.\(j).weight_v")[2]
             var a = adaIN1d(h, style: style, fcBase: "\(base).adain1.\(j).fc", channels: C)
             snake(&a, base: "\(base).alpha1.\(j)", channels: C)
-            a = conv1dSeq(a, base: "\(base).convs1.\(j)", pad: dil, dilation: dil)
+            a = conv1dSeq(a, base: "\(base).convs1.\(j)", pad: dil * (k1 - 1) / 2, dilation: dil)
             a = adaIN1d(a, style: style, fcBase: "\(base).adain2.\(j).fc", channels: C)
             snake(&a, base: "\(base).alpha2.\(j)", channels: C)
-            a = conv1dSeq(a, base: "\(base).convs2.\(j)", pad: 1)
+            a = conv1dSeq(a, base: "\(base).convs2.\(j)", pad: (k2 - 1) / 2)
             let T = min(h.count, a.count)
             for t in 0 ..< T { for c in 0 ..< C { h[t][c] += a[t][c] } }
         }
@@ -395,57 +408,64 @@ extension KokoroWeights {
     }
 
     /// Weight-norm `ConvTranspose1d` up-sample. Weight `[Cin, Cout, K]`,
-    /// `stride`. Standard transposed-conv scatter-add.
-    func convTranspose1d(_ x: [[Float]], base: String, stride: Int) -> [[Float]] {
+    /// `stride`, symmetric `padding` (cropped from both ends). Weight-norm is
+    /// over dim 0 (`g` is `[Cin,1,1]`).
+    func convTranspose1d(_ x: [[Float]], base: String, stride: Int, padding: Int) -> [[Float]] {
         let g = vec("\(base).weight_g"), v = vec("\(base).weight_v")
         let sh = shape("\(base).weight_v")  // [Cin, Cout, K]
-        let (cIn, cOut, K) = (sh[0], sh[1], sh[2])
-        // weight-norm over dim0? ConvTranspose g is [Cin,1,1] → per-in-channel.
+        let (cIn, cOut) = (sh[0], sh[1])
         let w = WeightNorm.effectiveWeight(g: g, v: v, shape: sh, exceptDim: 0)
         let b = convBias(base)
         let L = x.count
-        let lOut = (L - 1) * stride + K
-        var out = [[Float]](repeating: [Float](repeating: b.isEmpty ? 0 : 0, count: cOut), count: lOut)
-        if !b.isEmpty { for t in 0 ..< lOut { for c in 0 ..< cOut { out[t][c] = b[c] } } }
-        for t in 0 ..< L {
-            for ci in 0 ..< cIn {
-                let xv = x[t][ci]
-                if xv == 0 { continue }
-                let wb = ci * cOut * K
-                for co in 0 ..< cOut {
-                    let wb2 = wb + co * K
-                    for k in 0 ..< K {
-                        let pos = t * stride + k
-                        out[pos][co] += w[wb2 + k] * xv
-                    }
-                }
-            }
-        }
+        var xf = [Float](repeating: 0, count: cIn * L)
+        for t in 0 ..< L { for c in 0 ..< cIn { xf[c * L + t] = x[t][c] } }
+        let (yf, ysh) = AudioMath.convTransposed1d(
+            x: xf, xShape: [1, cIn, L], weight: w, wShape: sh,
+            bias: b.isEmpty ? nil : b, stride: stride, padding: padding,
+            dilation: 1, outputPadding: 0, groups: 1)
+        let lOut = ysh[2]
+        var out = [[Float]](repeating: [Float](repeating: 0, count: cOut), count: lOut)
+        for c in 0 ..< cOut { for t in 0 ..< lOut { out[t][c] = yf[c * lOut + t] } }
         return out
     }
 
     /// iSTFTNet generator: NSF harmonic source + 2 up-sample stages (×10, ×6)
-    /// with Snake-AdaIN res-blocks → conv_post (22ch) → [re,im] → iSTFT.
+    /// with Snake-AdaIN res-blocks → conv_post (22ch) → mag/phase → [re,im].
     /// Returns the `[nFrames, nFreq]` re/im planes for `KokoroVocoder`.
+    ///
+    /// `f0` is the predictor F0 curve at the (2T) decoder rate; the source is
+    /// built at full sample resolution then down-projected per stage by the
+    /// `noise_convs`. Leaky-ReLU slopes match the reference (0.1 in the loop,
+    /// 0.01 at the tail).
     func generate(_ x0: [[Float]], style: [Float], f0: [Float], vocoder: KokoroVocoder) -> (re: [[Float]], im: [[Float]]) {
-        // NSF source: sine excitation at F0 (single harmonic, mean-aggregated)
-        // → [T_up, 22] spectral frames matched to the iSTFT framing.
         var x = x0
-        let upRates = [10, 6]
-        let upChans = [256, 128]
-        let nFreq = vocoder.nFFT / 2 + 1  // 11
-        // Harmonic source at the post-decode rate, up-sampled per stage.
-        for stage in 0 ..< 2 {
-            KokoroMath.leakyReLU(&x)
-            x = convTranspose1d(x, base: "decoder.generator.ups.\(stage)", stride: upRates[stage])
+        let upRates = [10, 6], upPads = [5, 3], upChans = [256, 128]
+        let nFFT = vocoder.nFFT, hop = vocoder.hopLength
+        let nFreq = nFFT / 2 + 1  // 11
+        let totalUp = (upRates[0] * upRates[1]) * hop  // 300
+        // Harmonic NSF source spectrogram at the iSTFT framing: [framesFull, 22].
+        let har = nsfSource(f0Curve: f0, totalUpsample: totalUp, nFFT: nFFT, hop: hop)
+        let numUp = upRates.count
+        for stage in 0 ..< numUp {
+            KokoroMath.leakyReLU(&x, slope: 0.1)
             let C = upChans[stage]
-            // Noise/source injection: project the (broadcast) F0 source via
-            // noise_convs[stage] (plain conv) into the upsampled stream.
-            let srcFrames = harmonicSpec(f0: f0, frames: x.count, nFreq: nFreq)
-            var src = conv1dSeqPlain(srcFrames, base: "decoder.generator.noise_convs.\(stage)",
-                outC: C, pad: stage == 0 ? 0 : 0)
-            if has("decoder.generator.noise_res.\(stage).adain1.0.fc.weight") {
-                src = genResBlock(src, style: style, base: "decoder.generator.noise_res.\(stage)", channels: C)
+            // Source branch: noise_convs (strided plain conv) → noise_res block.
+            // stage 0: kernel 2·stride_f0, stride stride_f0=6, pad (stride_f0+1)/2.
+            // stage 1 (last): kernel 1, stride 1, pad 0.
+            // Kernel/stride come from the stored weight; `stride_f0` is the
+            // product of the *later* upsample rates (6 for stage 0, 1 for the
+            // last stage), and padding is (stride_f0 + 1) / 2.
+            let strideF0 = (stage == 0) ? upRates[1] : 1
+            let padSrc = (stage == 0) ? (strideF0 + 1) / 2 : 0
+            var src = conv1dSeqPlain(har, base: "decoder.generator.noise_convs.\(stage)",
+                outC: C, pad: padSrc, stride: strideF0)
+            src = genResBlock(src, style: style, base: "decoder.generator.noise_res.\(stage)", channels: C)
+            // Main branch: transposed-conv up-sample (+ left zero-pad on the
+            // last stage, the reference `reflection_pad((1,0))`), then add source.
+            x = convTranspose1d(x, base: "decoder.generator.ups.\(stage)",
+                stride: upRates[stage], padding: upPads[stage])
+            if stage == numUp - 1 {
+                x.insert([Float](repeating: 0, count: C), at: 0)  // left-pad 1 frame
             }
             let T = min(x.count, src.count)
             x = Array(x.prefix(T))
@@ -459,43 +479,102 @@ extension KokoroWeights {
             }
             x = acc
         }
-        KokoroMath.leakyReLU(&x)
+        KokoroMath.leakyReLU(&x, slope: 0.01)
         let post = conv1dSeq(x, base: "decoder.generator.conv_post", pad: 3)  // → 22ch
-        // Split 22 → re[0..11), im[11..22).
+        // conv_post → magnitude/phase: spec = exp(x[:nFreq]), phase = sin(x[nFreq:]),
+        // then the complex spectrum is mag·e^{iφ} → (re, im) for the iSTFT.
         var re = [[Float]](repeating: [Float](repeating: 0, count: nFreq), count: post.count)
         var im = re
         for t in post.indices {
             for k in 0 ..< nFreq {
-                re[t][k] = post[t][k]
-                im[t][k] = post[t][nFreq + k]
+                let mag = expf(post[t][k])
+                let ph = sinf(post[t][nFreq + k])
+                re[t][k] = mag * cosf(ph)
+                im[t][k] = mag * sinf(ph)
             }
         }
         return (re, im)
     }
 
-    /// A crude harmonic source spectrogram `[frames, 22]` from the F0 curve —
-    /// the NSF excitation, expressed in the iSTFT's 22-channel (re/im) space.
-    func harmonicSpec(f0: [Float], frames: Int, nFreq: Int) -> [[Float]] {
-        var out = [[Float]](repeating: [Float](repeating: 0, count: 2 * nFreq), count: frames)
-        for t in 0 ..< frames {
-            let fi = min(f0.count - 1, t * f0.count / max(frames, 1))
-            let voiced: Float = f0.isEmpty ? 0 : (f0[fi] > 1 ? 0.1 : 0)
-            for k in 0 ..< nFreq { out[t][k] = voiced }
+    /// NSF harmonic source spectrogram `[frames, 2·nFreq]` (magnitude ⊕ phase)
+    /// from the F0 curve — the StyleTTS2 `SourceModuleHnNSF` + STFT. Builds a
+    /// 9-harmonic sine excitation at the full sample rate (anti-aliased via the
+    /// reference's down/cumsum/up-interpolate dance), merges it through
+    /// `m_source.l_linear` + tanh, and STFTs it to the iSTFT framing. Noise is
+    /// zeroed (deterministic); the sine excitation carries the voiced energy.
+    func nsfSource(f0Curve: [Float], totalUpsample: Int, nFFT: Int, hop: Int) -> [[Float]] {
+        let SR: Float = 24_000
+        let harmonics = 9
+        let sineAmp: Float = 0.1
+        let voicedThresh: Float = 10
+        let F = f0Curve.count
+        let N = F * totalUpsample
+        guard F > 0 else { return [] }
+        let lW = vec("decoder.generator.m_source.l_linear.weight")  // [1,9] → 9
+        let lB = vec("decoder.generator.m_source.l_linear.bias")  // [1]
+        // Per-frame phase for each harmonic: cumsum of (f0·h/SR mod 1) over the
+        // F frames, ×2π, then ×totalUpsample (the reference scales before the
+        // up-interpolate). phaseScaled[m][h].
+        var phaseScaled = [[Float]](repeating: [Float](repeating: 0, count: harmonics), count: F)
+        var running = [Float](repeating: 0, count: harmonics)
+        let twoPi = 2 * Float.pi
+        for m in 0 ..< F {
+            for h in 0 ..< harmonics {
+                let rad = (f0Curve[m] * Float(h + 1) / SR).truncatingRemainder(dividingBy: 1)
+                running[h] += rad
+                phaseScaled[m][h] = running[h] * twoPi * Float(totalUpsample)
+            }
+        }
+        // Up-sample phase to N samples (linear interp, align_corners=None):
+        // xu = n·(F/N) + 0.5·(F/N) − 0.5; negative xLow wraps to F−1 (mlx).
+        // Parallelised over a raw mutable buffer (no `[Float]` CoW race).
+        var merged = [Float](repeating: 0, count: N)
+        let scaleFN = Float(F) / Float(N)
+        nonisolated(unsafe) let psU = phaseScaled
+        nonisolated(unsafe) let f0U = f0Curve
+        nonisolated(unsafe) let lWU = lW, lBU = lB
+        merged.withUnsafeMutableBufferPointer { buf in
+            nonisolated(unsafe) let ptr = buf.baseAddress!
+            DispatchQueue.concurrentPerform(iterations: N) { n in
+                let xu = Float(n) * scaleFN + 0.5 * scaleFN - 0.5
+                let xLowRaw = Int(floorf(xu))
+                let frac = xu - Float(xLowRaw)
+                let lo = xLowRaw < 0 ? F - 1 : min(xLowRaw, F - 1)
+                let hi = min(xLowRaw + 1, F - 1)
+                let block = min(n / totalUpsample, F - 1)
+                let uv: Float = f0U[block] > voicedThresh ? 1 : 0
+                var sum: Float = lBU.isEmpty ? 0 : lBU[0]
+                for h in 0 ..< harmonics {
+                    let ph = psU[lo][h] * (1 - frac) + psU[hi][h] * frac
+                    let sine = sinf(ph) * sineAmp * uv
+                    sum += lWU[h] * sine
+                }
+                ptr[n] = tanhf(sum)
+            }
+        }
+        // STFT(merged) → [frames, nFreq] magnitude + phase, concatenated.
+        let (mag, phase) = KokoroMath.forwardSTFT(merged, nFFT: nFFT, hop: hop)
+        let frames = mag.count
+        var out = [[Float]](repeating: [Float](repeating: 0, count: 2 * (nFFT / 2 + 1)), count: frames)
+        let nFreq = nFFT / 2 + 1
+        for f in 0 ..< frames {
+            for k in 0 ..< nFreq { out[f][k] = mag[f][k]; out[f][nFreq + k] = phase[f][k] }
         }
         return out
     }
 
-    /// Plain (non-weight-norm) `Conv1d` over `[L, Cin]` → `[L, Cout]`.
-    func conv1dSeqPlain(_ x: [[Float]], base: String, outC: Int, pad: Int) -> [[Float]] {
+    /// Plain (non-weight-norm) `Conv1d` over `[L, Cin]` → `[L, Cout]` with
+    /// `stride`. `noise_convs` weights are PyTorch `[Cout, Cin, K]` row-major.
+    func conv1dSeqPlain(_ x: [[Float]], base: String, outC: Int, pad: Int, stride: Int = 1) -> [[Float]] {
         let w = vec("\(base).weight")
         let sh = shape("\(base).weight")
-        let cIn = sh[1], K = sh[2]
+        let cIn = sh[1]
         let L = x.count
         var xf = [Float](repeating: 0, count: cIn * L)
         for t in 0 ..< L { for c in 0 ..< cIn { xf[c * L + t] = x[t][c] } }
         let (yf, ysh) = AudioMath.conv1d(
             x: xf, xShape: [1, cIn, L], weight: w, wShape: sh, bias: vec("\(base).bias"),
-            stride: 1, padding: pad, dilation: 1, groups: 1)
+            stride: stride, padding: pad, dilation: 1, groups: 1)
         let lOut = ysh[2]
         var out = [[Float]](repeating: [Float](repeating: 0, count: outC), count: lOut)
         for c in 0 ..< outC { for t in 0 ..< lOut { out[t][c] = yf[c * lOut + t] } }
@@ -503,27 +582,32 @@ extension KokoroWeights {
     }
 
     /// Decoder: concat(asr, F0, N) → encode → concat(asr_res, F0, N) → decode
-    /// ×4 (last up-samples ×2) → generator → re/im planes.
+    /// ×4 (last up-samples ×2) → generator → re/im planes. The F0/N curves come
+    /// in at 2T (predictor upsamples once); the decoder's F0_conv/N_conv are
+    /// stride-2 depthwise convs that bring them back to the asr rate T.
     func decode(asr: [[Float]], f0: [Float], n: [Float], style: [Float], vocoder: KokoroVocoder) -> (re: [[Float]], im: [[Float]]) {
         let T = asr.count
-        // F0/N down-conv (weight [1,1,3], stride 2 in StyleTTS2 — keep rate here).
+        // F0/N down-conv: weight-norm Conv1d(1→1, k3, stride 2, pad 1) over the
+        // 2T curve → T frames. Reference `ConvWeighted(1,1,3,stride=2,padding=1)`.
         func single(_ curve: [Float], base: String) -> [Float] {
-            let (w, _) = convWeight(base)
+            let (w, _) = convWeight(base)  // [1,1,3]
             let b = convBias(base)
-            return (0 ..< T).map { t -> Float in
+            let L = curve.count
+            let lOut = (L + 2 * 1 - 3) / 2 + 1
+            return (0 ..< lOut).map { t -> Float in
                 var acc: Float = b.isEmpty ? 0 : b[0]
-                let fi = min(curve.count - 1, t)
+                let start = t * 2 - 1  // stride 2, pad 1
                 for k in 0 ..< 3 {
-                    let s = fi + k - 1
-                    if s >= 0 && s < curve.count { acc += w[k] * curve[s] }
+                    let s = start + k
+                    if s >= 0 && s < L { acc += w[k] * curve[s] }
                 }
                 return acc
             }
         }
-        let f0d = single(f0, base: "decoder.F0_conv")
-        let nd = single(n, base: "decoder.N_conv")
+        let f0d = single(f0, base: "decoder.F0_conv")  // length T
+        let nd = single(n, base: "decoder.N_conv")  // length T
         // encode: AdainResBlk on [asr ⊕ F0 ⊕ N] (514 → 1024).
-        var x = (0 ..< T).map { asr[$0] + [f0d[$0], nd[$0]] }
+        var x = (0 ..< T).map { asr[$0] + [f0d[min($0, f0d.count - 1)], nd[min($0, nd.count - 1)]] }
         x = adainResBlk(x, style: style, base: "decoder.encode", inC: 514, outC: 1024, upsample: false)
         let asrRes = conv1dSeq(asr, base: "decoder.asr_res.0", pad: 0)  // 512 → 64
         for blk in 0 ..< 4 {
@@ -535,6 +619,7 @@ extension KokoroWeights {
             let outC = (blk == 3) ? 512 : 1024
             x = adainResBlk(cat, style: style, base: "decoder.decode.\(blk)", inC: 1090, outC: outC, upsample: up)
         }
+        // Generator runs on the original (2T) F0 curve, not the down-sampled one.
         return generate(x, style: style, f0: f0, vocoder: vocoder)
     }
 }
@@ -579,18 +664,72 @@ enum KokoroMath {
         return out
     }
 
-    /// Tanh-approximation GELU in-place (the BERT/ALBERT variant).
+    /// Exact (erf-based) GELU in-place — ALBERT's `nn.GELU()` default. The
+    /// tanh approximation drifts enough over 12 shared layers to matter, so
+    /// we match the reference exactly: `0.5·x·(1 + erf(x/√2))`.
     static func gelu(_ x: inout [Float]) {
-        let c: Float = 0.7978845608028654  // sqrt(2/pi)
+        let invSqrt2: Float = 0.7071067811865476
         for i in x.indices {
             let v = x[i]
-            x[i] = 0.5 * v * (1 + tanhf(c * (v + 0.044715 * v * v * v)))
+            x[i] = 0.5 * v * (1 + erff(v * invSqrt2))
         }
     }
 
     /// LeakyReLU in-place.
     static func leakyReLU(_ x: inout [[Float]], slope: Float = 0.2) {
         for i in x.indices { for j in x[i].indices where x[i][j] < 0 { x[i][j] *= slope } }
+    }
+
+    /// Real STFT matching `mlx_audio.utils.stft`: center reflect-pad by
+    /// `nFFT/2`, a symmetric Hann window (`denom = nFFT−1`), `rfft` per frame.
+    /// Returns `(magnitude, phase)` each `[frames][nFreq]`, `nFreq = nFFT/2+1`,
+    /// `frames = 1 + (paddedLen − nFFT)/hop`. The FFT is a naïve DFT — fine for
+    /// Kokoro's tiny `nFFT = 20`.
+    static func forwardSTFT(_ sig: [Float], nFFT: Int, hop: Int) -> (mag: [[Float]], phase: [[Float]]) {
+        let pad = nFFT / 2
+        let n = sig.count
+        // Reflect pad: prefix = sig[1...pad] reversed, suffix = sig[n-pad-1 ... n-2] reversed.
+        var padded = [Float]()
+        padded.reserveCapacity(n + 2 * pad)
+        if pad > 0 { for i in stride(from: pad, through: 1, by: -1) { padded.append(sig[i]) } }
+        padded.append(contentsOf: sig)
+        if pad > 0 { for i in stride(from: n - 2, through: n - 1 - pad, by: -1) { padded.append(sig[i]) } }
+        // Symmetric Hann window (periodic = false): 0.5·(1 − cos(2πk/(nFFT−1))).
+        var win = [Float](repeating: 0, count: nFFT)
+        let denom = Float(max(nFFT - 1, 1))
+        for k in 0 ..< nFFT { win[k] = 0.5 * (1 - cosf(2 * Float.pi * Float(k) / denom)) }
+        let nFreq = nFFT / 2 + 1
+        let frames = 1 + (padded.count - nFFT) / hop
+        // Precompute DFT twiddles.
+        var cosT = [Float](repeating: 0, count: nFreq * nFFT)
+        var sinT = [Float](repeating: 0, count: nFreq * nFFT)
+        for kk in 0 ..< nFreq {
+            for nn in 0 ..< nFFT {
+                let ang = -2 * Float.pi * Float(kk) * Float(nn) / Float(nFFT)
+                cosT[kk * nFFT + nn] = cosf(ang)
+                sinT[kk * nFFT + nn] = sinf(ang)
+            }
+        }
+        var mag = [[Float]](repeating: [Float](repeating: 0, count: nFreq), count: frames)
+        var phase = mag
+        // Serial: nFFT = 20 → ~frames·11·20 mults, microseconds. (A parallel
+        // version here would need careful buffer-pointer handling to avoid the
+        // CoW data race that concurrent `[[Float]]` element writes trigger.)
+        for f in 0 ..< frames {
+            let start = f * hop
+            for kk in 0 ..< nFreq {
+                var re: Float = 0, im: Float = 0
+                let base = kk * nFFT
+                for nn in 0 ..< nFFT {
+                    let v = padded[start + nn] * win[nn]
+                    re += v * cosT[base + nn]
+                    im += v * sinT[base + nn]
+                }
+                mag[f][kk] = (re * re + im * im).squareRoot()
+                phase[f][kk] = atan2f(im, re)
+            }
+        }
+        return (mag, phase)
     }
 
     /// LayerNorm1d over the channel dim of a `[L, C]` sequence (StyleTTS2's
@@ -649,12 +788,15 @@ enum KokoroMath {
         let L = q.count
         let hd = dim / heads
         let scale = 1.0 / Float(hd).squareRoot()
+        // Parallelize over query positions — each iteration writes a distinct
+        // `out[i]` row (all heads for that row), so no inner-array data race.
         nonisolated(unsafe) var out = [[Float]](
             repeating: [Float](repeating: 0, count: dim), count: L)
         nonisolated(unsafe) let qq = q, kk = k, vv = v
-        DispatchQueue.concurrentPerform(iterations: heads) { h in
-            let base = h * hd
-            for i in 0 ..< L {
+        DispatchQueue.concurrentPerform(iterations: L) { i in
+            var row = [Float](repeating: 0, count: dim)
+            for h in 0 ..< heads {
+                let base = h * hd
                 var scores = [Float](repeating: 0, count: L)
                 var mx = -Float.greatestFiniteMagnitude
                 for j in 0 ..< L {
@@ -670,10 +812,12 @@ enum KokoroMath {
                 for c in 0 ..< hd {
                     var acc: Float = 0
                     for j in 0 ..< L { acc += scores[j] * vv[j][base + c] }
-                    out[i][base + c] = acc * invSum
+                    row[base + c] = acc * invSum
                 }
             }
+            out[i] = row
         }
         return out
     }
 }
+

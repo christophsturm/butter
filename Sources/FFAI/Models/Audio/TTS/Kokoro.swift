@@ -302,17 +302,26 @@ public final class KokoroModel: @unchecked Sendable {
         // into the predictor (prosody, second 128) and decoder (acoustic,
         // first 128) halves.
         let voiceURL = dir.appendingPathComponent("voices/\(currentVoice).safetensors")
-        let vb = try SafeTensorsBundle(directory: voiceURL.deletingLastPathComponent())
-        let key = (try? vb.tensor(named: currentVoice)) != nil ? currentVoice : "\(currentVoice).weight"
-        let voice = ((try? vb.tensor(named: key))?.toFloatArray()) ?? []
-        let row = min(max(phonemeIds.count - 1, 0), max(voice.count / 256 - 1, 0))
+        // Load the SPECIFIC voice file — NOT the `voices/` directory. Every
+        // voice pack stores its tensor under the same key "voice", so a
+        // directory-level `SafeTensorsBundle` would index all ~50 packs and
+        // resolve "voice" to whichever file sorts last (wrong speaker → wrong
+        // style vector → wrong prosody). A single-file read is unambiguous.
+        let vf = try SafeTensorsFile(url: voiceURL)
+        // Kokoro voice packs store a single `[N, 1, 256]` tensor keyed "voice".
+        let voice = ((try? vf.tensor(named: "voice"))?.toFloatArray()) ?? []
+        guard voice.count >= 256 else { throw KokoroError.acousticFrontEndUnavailable }
+        let row = min(max(phonemeIds.count - 1, 0), voice.count / 256 - 1)
         let refS = Array(voice[(row * 256) ..< (row * 256 + 256)])
         let sDec = Array(refS[0 ..< 128])
         let sPred = Array(refS[128 ..< 256])
 
+        // StyleTTS2 wraps the phoneme ids with a leading/trailing pad token
+        // (id 0) — the BOS/EOS the encoders + aligner were trained with.
+        let ids = [0] + phonemeIds + [0]
         let plbert = KokoroPLBert(w: acoustic)
-        let dEn = acoustic.bertEncode(plbert.encode(phonemeIds))  // [L, 512]
-        let asr = acoustic.textEncode(phonemeIds)  // [L, 512]
+        let dEn = acoustic.bertEncode(plbert.encode(ids))  // [L, 512]
+        let asr = acoustic.textEncode(ids)  // [L, 512]
         let (dur, f0, n, _) = acoustic.predict(dEn: dEn, style: sPred, speed: speed)
         // Length-regulate the acoustic features by the predicted durations.
         var asrAligned = [[Float]]()

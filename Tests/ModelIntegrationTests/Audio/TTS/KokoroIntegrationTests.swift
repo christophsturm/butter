@@ -105,4 +105,25 @@ struct KokoroIntegrationTests {
             "Kokoro synthesized \(expectedLen) samples, "
                 + "energy=\(energy), distinct=\(distinct)")
     }
+
+    @Test("synthesize — full acoustic chain produces non-degenerate speech")
+    func synthesize_fullChain() async throws {
+        // Full-precision acoustic weights (the 4-bit pack quantizes them).
+        let dir = try await ModelLoadLock.shared.loadSerially {
+            try await ModelLocator().resolve(idOrPath: "mlx-community/Kokoro-82M-bf16")
+        }
+        let model = try KokoroModel.load(directory: dir)
+        // A short IPA phoneme string mapped through the checkpoint vocab.
+        let ids = model.phonemeIds(for: "hɛlˈoʊ wˈɜːld")
+        try #require(!ids.isEmpty, "no phonemes mapped — vocab issue")
+        let waveform = try model.synthesize(phonemeIds: ids)
+        let samples = waveform.toFloatArray()
+        #expect(samples.count > 1000, "waveform too short: \(samples.count)")
+        #expect(samples.allSatisfy { $0.isFinite }, "non-finite samples")
+        let energy = samples.map { $0 * $0 }.reduce(0, +)
+        #expect(energy > 1e-4, "silent waveform")
+        let distinct = Set(samples.map { ($0 * 1000).rounded() }).count
+        #expect(distinct > 50, "degenerate waveform")
+        print("Kokoro full-chain: \(samples.count) samples, energy=\(energy), distinct=\(distinct)")
+    }
 }
