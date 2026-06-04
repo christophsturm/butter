@@ -266,7 +266,39 @@ extension Model {
         var rng = params.makeRNG()
         var tokenHistory = promptTokens  // grows as decode produces tokens; used by cpu-sample
 
+        // ─── Live quality-metric capture (design §5) ─────────────────────
+        // The single InspectTap drives this. `FFAI_TELEMETRY=ppl` opts into
+        // accumulating the model's self-perplexity over its own stream — the
+        // NLL of each token it actually picks. Off by default: when the flag
+        // is unset `capturePPL` is false and the hot path is byte-for-byte
+        // the existing fused-kernel sampler (no logit readback, no softmax).
+        //
+        // `.kld` / `.niah` are not actionable in the live decode loop — KLD
+        // needs a paired reference and NIAH is its own retrieval harness; both
+        // run through `ffai bench`. The tap flags still gate them there.
+        let tap = InspectTap.fromEnvironment
+        let capturePPL = tap.captures(.perplexity)
+        var liveNLLSum = 0.0
+        var liveNLLCount = 0
+
         func sampleNext(tokenId t: Int, position i: Int) -> Int {
+            // Capturing path: route through full logits so we can read the
+            // chosen token's probability. Only taken when the flag is on.
+            if capturePPL {
+                let logits = engine.forward(tokenId: t, position: i, caches: caches)
+                let chosen: Int
+                switch path {
+                case .greedyGPU:
+                    chosen = Perplexity.argmaxLogits(logits)
+                case .gpuCategorical, .cpuSample:
+                    chosen = Sampling.sample(
+                        logits, parameters: params,
+                        rng: &rng, tokenHistory: tokenHistory)
+                }
+                liveNLLSum += Perplexity.negLogSoftmaxAt(logits: logits, index: chosen)
+                liveNLLCount += 1
+                return chosen
+            }
             switch path {
             case .greedyGPU:
                 return engine.forwardSample(tokenId: t, position: i, caches: caches)
@@ -409,13 +441,17 @@ extension Model {
                 Double(generated.count) / max(decodeTime, 1e-9)))
 
         let split = ThinkingSplit.split(tokens: generated, model: self)
+        // Live self-perplexity over the generated stream, when captured.
+        let livePerplexity: Double? =
+            (capturePPL && liveNLLCount > 0) ? exp(liveNLLSum / Double(liveNLLCount)) : nil
         let stats = makeStats(
             promptTokens: promptTokens, generatedCount: generated.count,
             contextSize: engine.maxSeq, prefillTime: prefillTime,
             decodeTime: decodeTime, ttftMs: ttftMs,
             perTokenWallclock: perTokenWallclock,
             memTracker: memTracker, caches: caches,
-            weightsBytes: weightsBytes, splitTokens: split
+            weightsBytes: weightsBytes, splitTokens: split,
+            genPerplexity: livePerplexity
         )
 
         continuation.yield(
@@ -431,7 +467,8 @@ extension Model {
         prefillTime: Double, decodeTime: Double, ttftMs: Double,
         perTokenWallclock: [Double],
         memTracker: PhaseMemoryTracker, caches: [any LayerCacheProtocol],
-        weightsBytes: Int, splitTokens: ThinkingSplit.Split?
+        weightsBytes: Int, splitTokens: ThinkingSplit.Split?,
+        genPerplexity: Double? = nil
     ) -> GenerationStats {
         let steady: Double? = {
             guard perTokenWallclock.count > 10 else { return nil }
@@ -458,7 +495,7 @@ extension Model {
             kvCacheAllocatedBytes: caches.totalBytesAllocated,
             kvCacheUsedBytes: caches.totalBytesInUse,
             thinkPerplexity: nil,
-            genPerplexity: nil,
+            genPerplexity: genPerplexity,
             thinkKLDivergence: nil,
             genKLDivergence: nil,
             thinkTokenCount: splitTokens.map { $0.thinkTokens.count },
