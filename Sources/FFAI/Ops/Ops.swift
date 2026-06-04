@@ -2951,6 +2951,81 @@ public enum Ops {
         }
     }
 
+    /// Mamba-**1** selective-scan single step — the 2-D `A_log` variant.
+    ///
+    /// Unlike `ssmStep` (Mamba-2, per-head scalar `A_log [nHeads]`), this
+    /// takes a per-**(channel, state)** `aLog [nHeads·headDim, stateDim]`
+    /// (the full Mamba-1 decay matrix). Per `(head, d)` thread, channel =
+    /// `head·headDim + d`:
+    /// ```text
+    ///   decay   = exp(-exp(aLog[channel, n]) · dt[head])
+    ///   h'[n]   = decay · h[n] + dt[head] · B[n] · x[channel]
+    ///   y[channel] = Σ_n C[n] · h'[n]
+    /// ```
+    /// The kernel applies `-exp(aLog)` ITSELF — pass the RAW `A_log`, not a
+    /// pre-computed `-exp(A_log)`. `B` / `C` are `[stateDim]` (shared
+    /// across channels, per Mamba-1). The `D` skip and the `silu(z)` gate
+    /// are NOT included — the caller adds `D·x` and gates afterward. State
+    /// `h` is fp32 `[nHeads, stateDim, headDim]`.
+    ///
+    /// For a flat per-channel scan (Jamba), use `headDim = 1`,
+    /// `nHeads = d_inner` so `dt` / `x` / `y` index per channel directly.
+    public static func ssmStepA2d(
+        x: Tensor, aLog: Tensor, b: Tensor, c: Tensor, dt: Tensor,
+        state h: Tensor, into y: Tensor,
+        nHeads: Int, headDim: Int, stateDim: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(h.dtype == .f32, "Ops.ssmStepA2d: state h must be f32")
+        precondition(x.dtype == y.dtype, "Ops.ssmStepA2d: x and y dtype must match")
+        precondition(
+            aLog.dtype == x.dtype && b.dtype == x.dtype
+                && c.dtype == x.dtype && dt.dtype == x.dtype,
+            "Ops.ssmStepA2d: aLog/b/c/dt dtype must match x")
+        precondition(
+            aLog.elementCount == nHeads * headDim * stateDim,
+            "Ops.ssmStepA2d: aLog must be [nHeads·headDim, stateDim]")
+        let grid = MTLSize(width: nHeads * headDim, height: 1, depth: 1)
+        let tg = MTLSize(width: 1, height: 1, depth: 1)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.ssm_step_a2d_f32(
+                x: x.buffer, xOffset: x.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                b: b.buffer, bOffset: b.offset,
+                c: c.buffer, cOffset: c.offset,
+                dt: dt.buffer, dtOffset: dt.offset,
+                h: h.buffer, hOffset: h.offset,
+                y: y.buffer, yOffset: y.offset,
+                head_dim: UInt32(headDim), state_dim: UInt32(stateDim),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ssm_step_a2d_f16(
+                x: x.buffer, xOffset: x.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                b: b.buffer, bOffset: b.offset,
+                c: c.buffer, cOffset: c.offset,
+                dt: dt.buffer, dtOffset: dt.offset,
+                h: h.buffer, hOffset: h.offset,
+                y: y.buffer, yOffset: y.offset,
+                head_dim: UInt32(headDim), state_dim: UInt32(stateDim),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ssm_step_a2d_bf16(
+                x: x.buffer, xOffset: x.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                b: b.buffer, bOffset: b.offset,
+                c: c.buffer, cOffset: c.offset,
+                dt: dt.buffer, dtOffset: dt.offset,
+                h: h.buffer, hOffset: h.offset,
+                y: y.buffer, yOffset: y.offset,
+                head_dim: UInt32(headDim), state_dim: UInt32(stateDim),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.ssmStepA2d: unsupported dtype \(x.dtype)")
+        }
+    }
+
     /// Gated Delta Net (GDN) recurrent single-token decode step.
     ///
     /// Computes, per decode step and per value head, the recurrence

@@ -24,8 +24,9 @@
 // Concrete variants + the hybrid decoder + per-layer impl live under
 // `Models/Text/JambaText.swift`:
 //   - `JambaHybrid` — the single stack-interleaved (Mamba 1 + attention
-//     + MoE/MLP) variant; CPU-side selective scan for the Mamba mixer,
-//     mid-layer command-buffer commits handled by `JambaModel`.
+//     + MoE/MLP) variant; GPU selective scan (`Ops.ssmStepA2d`) for the
+//     Mamba mixer, mid-layer command-buffer commits (for the host dt/B/C
+//     layernorms) handled by `JambaModel`.
 
 import Foundation
 

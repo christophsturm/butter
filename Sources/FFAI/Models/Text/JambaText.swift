@@ -401,16 +401,22 @@ public struct JambaHybrid: JambaVariant {
             return zeroVectorJamba(dInner, dtype: dtype, device: device)
         }()
 
-        // A_eff = -exp(A_log), full [d_inner, d_state] host array. D is
-        // [d_inner] host array. Both feed the CPU selective scan.
-        let aLogT = try weights.tensor(named: "\(p).A_log")
+        // Raw A_log [d_inner, d_state] and D [d_inner] as GPU tensors in
+        // the model dtype — the GPU `Ops.ssmStepA2d` scan reads A_log
+        // directly (it applies `-exp` itself) and the D skip multiplies x.
+        // Cast to `dtype` so they satisfy the kernel's `aLog.dtype ==
+        // x.dtype` contract (A_log may ship fp32 even at bf16 activation).
+        let aLogRaw = try weights.tensor(named: "\(p).A_log")
         precondition(
-            aLogT.elementCount == dInner * dState,
+            aLogRaw.elementCount == dInner * dState,
             "Jamba: A_log expected [d_inner, d_state] = "
-                + "[\(dInner), \(dState)], got \(aLogT.shape)")
-        let aEff = readFloatsJamba(aLogT).map { -Foundation.exp($0) }
-        let dHost = readFloatsJamba(try weights.tensor(named: "\(p).D"))
-        precondition(dHost.count == dInner, "Jamba: D expected [d_inner]")
+                + "[\(dInner), \(dState)], got \(aLogRaw.shape)")
+        let aLogT = Tensor.empty(shape: [dInner * dState], dtype: dtype)
+        writeFloatsJamba(readFloatsJamba(aLogRaw), into: aLogT)
+        let dFloats = readFloatsJamba(try weights.tensor(named: "\(p).D"))
+        precondition(dFloats.count == dInner, "Jamba: D expected [d_inner]")
+        let dT = Tensor.empty(shape: [dInner], dtype: dtype)
+        writeFloatsJamba(dFloats, into: dT)
 
         // dt/B/C layernorms — small RMSNorm weights applied CPU-side in
         // the scan (dims dt_rank / d_state are not 128-aligned, so the
@@ -422,7 +428,7 @@ public struct JambaHybrid: JambaVariant {
         return JambaMambaMixer(
             inProj: inProj, outProj: outProj, xProj: xProj, dtProj: dtProj,
             convW: convW, convB: convB,
-            aEff: aEff, dHost: dHost,
+            aLogT: aLogT, dT: dT,
             dtNorm: dtNorm, bNorm: bNorm, cNorm: cNorm,
             hidden: hidden, dInner: dInner, dState: dState, dtRank: dtRank,
             convKernel: convKernel, eps: eps, dtype: dtype)
@@ -525,16 +531,20 @@ enum JambaFFN {
 // ─── JambaMambaMixer — Mamba 1 selective SSM ─────────────────────────
 //
 // The Mamba 1 mixer. GPU owns the projections (`in_proj`, `conv1d`,
-// `x_proj`, `dt_proj`, `out_proj`); the host owns the dt/B/C layernorms
-// and the per-(channel, state) selective scan. See the file header for
-// why the scan is host-side.
+// `x_proj`, `dt_proj`, `out_proj`) AND the per-(channel, state) selective
+// scan (`Ops.ssmStepA2d`, 2-D A_log). The host still owns only the small
+// dt/B/C layernorms (dims dt_rank / d_state aren't 128-aligned), so the
+// forward still commits mid-decode to read `x_proj` back for those.
 
 public final class JambaMambaMixer: Module {
     let inProj, outProj, xProj, dtProj: AnyLinear
     let convW: Tensor  // [kernel, d_inner]
     let convB: Tensor  // [d_inner]
-    let aEff: [Float]  // [d_inner * d_state]  = -exp(A_log), row-major
-    let dHost: [Float]  // [d_inner]
+    /// RAW `A_log` `[d_inner, d_state]` (model dtype) — the GPU
+    /// `Ops.ssmStepA2d` kernel applies `-exp(A_log)` itself, so this is
+    /// the raw weight, NOT a pre-computed `-exp(A_log)`.
+    let aLogT: Tensor
+    let dT: Tensor  // [d_inner]  D skip, model dtype (GPU)
     let dtNorm: [Float]  // [dt_rank]   dt_layernorm weight
     let bNorm: [Float]  // [d_state]   b_layernorm weight
     let cNorm: [Float]  // [d_state]   c_layernorm weight
@@ -545,7 +555,7 @@ public final class JambaMambaMixer: Module {
     init(
         inProj: AnyLinear, outProj: AnyLinear, xProj: AnyLinear, dtProj: AnyLinear,
         convW: Tensor, convB: Tensor,
-        aEff: [Float], dHost: [Float],
+        aLogT: Tensor, dT: Tensor,
         dtNorm: [Float], bNorm: [Float], cNorm: [Float],
         hidden: Int, dInner: Int, dState: Int, dtRank: Int,
         convKernel: Int, eps: Float, dtype: DType
@@ -556,8 +566,8 @@ public final class JambaMambaMixer: Module {
         self.dtProj = dtProj
         self.convW = convW
         self.convB = convB
-        self.aEff = aEff
-        self.dHost = dHost
+        self.aLogT = aLogT
+        self.dT = dT
         self.dtNorm = dtNorm
         self.bNorm = bNorm
         self.cNorm = cNorm
@@ -580,9 +590,9 @@ public final class JambaMambaMixer: Module {
     }
 
     /// Single-token mixer forward. `xNorm` is the already-normalized
-    /// layer input. Commits `cmd` mid-way (the host scan needs the GPU
-    /// projections on the CPU) and returns a fully-resident `[hidden]`
-    /// tensor produced on a fresh command buffer.
+    /// layer input. Commits `cmd` mid-way (the host dt/B/C layernorms need
+    /// the GPU `x_proj` output on the CPU) and returns a fully-resident
+    /// `[hidden]` tensor. The selective scan itself runs on the GPU.
     func forward(
         _ xNorm: Tensor, cache: ConvStateCache, ssmState: SSMScanState,
         cmd: MTLCommandBuffer, device: Device
@@ -603,17 +613,14 @@ public final class JambaMambaMixer: Module {
         // slices for the dt/B/C layernorms.
         let deltaBC = xProj(convAct, on: cmd)
 
-        // Commit so the host can read convAct / z / deltaBC.
+        // Commit so the host can read `deltaBC` for the dt/B/C layernorms.
+        // `convAct` and `z` stay GPU-resident for the phase-3 scan + gate.
         cmd.commit()
         cmd.waitUntilCompleted()
 
-        // ── Host phase: dt/B/C layernorms + dt_proj input prep ────────
-        let convHost = convAct.toFloatArray()  // [d_inner]
-        let zHost = z.toFloatArray()  // [d_inner]
+        // ── Host phase: dt/B/C layernorms (dims dt_rank / d_state aren't
+        //    128-aligned, so the GPU rmsNorm kernel doesn't apply) ──────
         let deltaBCHost = deltaBC.toFloatArray()  // [dt_rank + 2*d_state]
-
-        // Split dt_raw | B | C, then RMSNorm each (matches mlx-lm:
-        // dt_layernorm / b_layernorm / c_layernorm are weighted RMSNorm).
         var dtRaw = Array(deltaBCHost[0 ..< dtRank])
         var bVec = Array(deltaBCHost[dtRank ..< (dtRank + dState)])
         var cVec = Array(deltaBCHost[(dtRank + dState) ..< (dtRank + 2 * dState)])
@@ -629,36 +636,35 @@ public final class JambaMambaMixer: Module {
         phase2.commit()
         phase2.waitUntilCompleted()
 
-        // ── Host phase: softplus(dt) + selective scan ─────────────────
-        let dtHost = dtProjOut.toFloatArray().map { softplusScalar($0) }  // [d_inner]
-        // Selective scan: per channel c, per state n,
-        //   state[c,n] = exp(A[c,n]·dt[c])·state[c,n] + dt[c]·x[c]·B[n]
-        //   y[c]       = Σ_n C[n]·state[c,n]  +  D[c]·x[c]
-        // then y *= silu(z).
-        var yGated = [Float](repeating: 0, count: dInner)
-        ssmState.h.withUnsafeMutableBufferPointer { state in
-            for c in 0 ..< dInner {
-                let xc = convHost[c]
-                let dtc = dtHost[c]
-                let dtx = dtc * xc
-                let base = c * dState
-                var yc: Float = 0
-                for n in 0 ..< dState {
-                    let decay = Foundation.exp(aEff[base + n] * dtc)
-                    let s = decay * state[base + n] + dtx * bVec[n]
-                    state[base + n] = s
-                    yc += cVec[n] * s
-                }
-                yc += dHost[c] * xc
-                yGated[c] = yc * siluScalar(zHost[c])
-            }
-        }
+        // softplus(dt) — small host map over [d_inner].
+        let dtHost = dtProjOut.toFloatArray().map { softplusScalar($0) }
 
-        // ── GPU phase 3: out_proj(yGated) on the phase-2 buffer's heir ─
+        // ── GPU phase 3: selective scan + D-skip + gate + out_proj ────
+        // The Mamba-1 scan runs on the GPU via `Ops.ssmStepA2d` — a flat
+        // per-channel scan (headDim=1, nHeads=d_inner) over the 2-D A_log
+        // that reads + writes `ssmState.h` in place. The kernel computes
+        //   y[c] = Σ_n C[n]·(exp(-exp(A_log[c,n])·dt[c])·h[c,n] + dt[c]·x[c]·B[n])
+        // (equal to the old host `exp(aEff·dt)` since aEff = -exp(A_log)),
+        // but OMITS the D skip and the silu(z) gate — applied right after:
+        //   y[c] = scan(c) + D[c]·x[c];  yGated = y · silu(z).
         let phase3 = device.makeCommandBuffer()
-        let yGatedT = Tensor.empty(shape: [dInner], dtype: dtype, device: device)
-        writeFloatsJamba(yGated, into: yGatedT)
-        let result = outProj(yGatedT, on: phase3)  // [hidden]
+        let bT = Tensor.empty(shape: [dState], dtype: dtype, device: device)
+        writeFloatsJamba(bVec, into: bT)
+        let cT = Tensor.empty(shape: [dState], dtype: dtype, device: device)
+        writeFloatsJamba(cVec, into: cT)
+        let dtT = Tensor.empty(shape: [dInner], dtype: dtype, device: device)
+        writeFloatsJamba(dtHost, into: dtT)
+
+        let yScan = Tensor.empty(shape: [dInner], dtype: dtype, device: device)
+        Ops.ssmStepA2d(
+            x: convAct, aLog: aLogT, b: bT, c: cT, dt: dtT,
+            state: ssmState.h, into: yScan,
+            nHeads: dInner, headDim: 1, stateDim: dState, on: phase3)
+        let dx = Ops.mul(dT, convAct, on: phase3)  // D·x
+        let ySkip = Ops.add(yScan, dx, on: phase3)
+        let zAct = Ops.silu(z, on: phase3)  // silu(z) gate
+        let yGated = Ops.mul(ySkip, zAct, on: phase3)
+        let result = outProj(yGated, on: phase3)  // [hidden]
         phase3.commit()
         phase3.waitUntilCompleted()
         return result
@@ -772,37 +778,38 @@ public final class JambaDenseMLP: Module {
     }
 }
 
-// ─── SSMScanState — host-side Mamba 1 recurrent state ────────────────
+// ─── SSMScanState — Mamba 1 recurrent state (GPU) ────────────────────
 //
 // The Mamba 1 selective scan keeps a `[d_inner, d_state]` state matrix
-// that accumulates across decode steps. Because Jamba's scan runs on
-// the CPU (see the file header) the state lives in a plain host array,
-// not a GPU buffer. `SSMScanState` is the per-layer storage; it sits
-// inside `JambaMambaLayerCache`.
+// that accumulates across decode steps. The scan runs on the GPU
+// (`Ops.ssmStepA2d`), so the state is a GPU-resident fp32 tensor that the
+// kernel reads + writes in place each step. `SSMScanState` is the
+// per-layer storage; it sits inside `JambaMambaLayerCache`.
 
 public final class SSMScanState: @unchecked Sendable {
-    /// `[d_inner * d_state]` row-major recurrent state, fp32.
-    var h: [Float]
+    /// `[d_inner * d_state]` row-major recurrent state, fp32, GPU-resident
+    /// — the Mamba-1 selective scan runs on the GPU via `Ops.ssmStepA2d`,
+    /// which reads + writes this state matrix in place each decode step.
+    let h: Tensor
     let dInner, dState: Int
 
-    init(dInner: Int, dState: Int) {
+    init(dInner: Int, dState: Int, device: Device = .shared) {
         self.dInner = dInner
         self.dState = dState
-        self.h = [Float](repeating: 0, count: dInner * dState)
+        self.h = Tensor.empty(shape: [dInner * dState], dtype: .f32, device: device)
+        self.h.zero()
     }
 
-    func reset() {
-        for i in 0 ..< h.count { h[i] = 0 }
-    }
+    func reset() { h.zero() }
 
-    var bytesAllocated: Int { h.count * MemoryLayout<Float>.stride }
+    var bytesAllocated: Int { h.byteCount }
 }
 
-// ─── JambaMambaLayerCache — conv state + host SSM scan state ─────────
+// ─── JambaMambaLayerCache — conv state + SSM scan state ──────────────
 //
 // A Jamba mamba layer needs two pieces of per-token state: the rolling
 // conv1d window (`ConvStateCache`, GPU) and the Mamba 1 selective-scan
-// matrix (`SSMScanState`, host). This bundles both behind
+// matrix (`SSMScanState`, GPU). This bundles both behind
 // `LayerCacheProtocol` so the heterogeneous decode loop can index it.
 
 public final class JambaMambaLayerCache: LayerCacheProtocol, @unchecked Sendable {
@@ -820,7 +827,7 @@ public final class JambaMambaLayerCache: LayerCacheProtocol, @unchecked Sendable
             nChannels: dInner,
             kernelSize: convKernelSize,
             dtype: dtype, device: device)
-        self.scan = SSMScanState(dInner: dInner, dState: dState)
+        self.scan = SSMScanState(dInner: dInner, dState: dState, device: device)
     }
 
     public func reset() {
@@ -845,9 +852,10 @@ public final class JambaMambaLayerCache: LayerCacheProtocol, @unchecked Sendable
 // One stack-interleaved hybrid layer with a Mamba 1 mixer. Conforms to
 // `DecoderLayer`; its cache slot is a `JambaMambaLayerCache`.
 //
-// `commitsCommandBuffer` is ALWAYS true: the Mamba 1 scan runs host-side
-// so `JambaMambaMixer.forward` commits the command buffer mid-decode.
-// (An MoE FFN would also commit.) The host model refreshes `cmd` after
+// `commitsCommandBuffer` is ALWAYS true: the host dt/B/C layernorms need
+// the GPU `x_proj` output read back, so `JambaMambaMixer.forward` commits
+// the command buffer mid-decode. (An MoE FFN would also commit.) The host
+// model refreshes `cmd` after
 // this layer — see `JambaModel.forward`.
 
 public final class JambaMambaLayer: Module, DecoderLayer {
@@ -1342,11 +1350,6 @@ private func transposeConv1dWeightJamba(
     let t = Tensor.empty(shape: [K, C], dtype: dtype, device: device)
     writeFloatsJamba(dst, into: t)
     return t
-}
-
-/// Scalar SiLU: `x · sigmoid(x)`. Used in the host SSM gating.
-private func siluScalar(_ x: Float) -> Float {
-    return x / (1.0 + Foundation.exp(-x))
 }
 
 /// Scalar softplus: `log(1 + exp(x))`, numerically stable for large x.

@@ -1145,6 +1145,44 @@ struct OpsTests {
         }
     }
 
+    // MARK: - ssmStepA2d (Mamba-1 2-D A_log selective scan)
+
+    /// Direct test of `Ops.ssmStepA2d`. One step from zero state:
+    ///   h'[n] = decay·0 + dt·B[n]·x = dt·B[n]·x;  y = Σ_n C[n]·h'[n].
+    /// nHeads=1, headDim=1, stateDim=2, x=1, dt=1, B=C=[1,1] → h'=[1,1],
+    /// y = 1+1 = 2; state advances to [1,1].
+    @Test("ssmStepA2d f32 — single step from zero state, 2-D A_log")
+    func ssmStepA2dF32() {
+        autoreleasepool {
+            let nHeads = 1, headDim = 1, stateDim = 2
+            let x = Tensor.empty(shape: [nHeads * headDim], dtype: .f32)
+            x.copyIn(from: [Float(1)])
+            // aLog [channel, state] = [1, 2]; value irrelevant at zero state.
+            let aLog = Tensor.empty(shape: [nHeads * headDim * stateDim], dtype: .f32)
+            aLog.copyIn(from: [Float(0), 0])
+            let b = Tensor.empty(shape: [stateDim], dtype: .f32)
+            b.copyIn(from: [Float(1), 1])
+            let c = Tensor.empty(shape: [stateDim], dtype: .f32)
+            c.copyIn(from: [Float(1), 1])
+            let dt = Tensor.empty(shape: [nHeads], dtype: .f32)
+            dt.copyIn(from: [Float(1)])
+            let h = Tensor.empty(shape: [nHeads * stateDim * headDim], dtype: .f32)
+            h.copyIn(from: [Float(0), 0])
+            let y = Tensor.empty(shape: [nHeads * headDim], dtype: .f32)
+            runAndWait { cb in
+                Ops.ssmStepA2d(
+                    x: x, aLog: aLog, b: b, c: c, dt: dt, state: h, into: y,
+                    nHeads: nHeads, headDim: headDim, stateDim: stateDim, on: cb)
+            }
+            let r = y.toArray(as: Float.self)
+            #expect(abs(r[0] - 2) < 1e-4, "expected y=2, got \(r[0])")
+            let hr = h.toArray(as: Float.self)
+            #expect(
+                abs(hr[0] - 1) < 1e-4 && abs(hr[1] - 1) < 1e-4,
+                "expected state [1,1], got \(hr)")
+        }
+    }
+
     // MARK: - rmsNormRows (multi-row RMSNorm reduction kernel)
 
     /// Direct test of `Ops.rmsNormRows`. Each of `nRows` rows is
