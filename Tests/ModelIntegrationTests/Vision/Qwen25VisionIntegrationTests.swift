@@ -150,38 +150,26 @@ struct Qwen25VisionIntegrationTests {
             try await Model.load(Self.videoModelId)
         }
         let vlm = try #require(m.vlModel, "Qwen 2.5-VL checkpoint is not a VLM")
-        let videoTokenId = try #require(vlm.videoTokenId)
-
-        // Pull `frameCount` evenly-spaced frames from cat.mp4.
-        let frames = try VisionTestHelpers.catVideoFrames(maxFrames: Self.frameCount)
-
-        // The merged-token-per-temporal-patch count equals one frame's
-        // native `smartResize` merged-token count (gridT=1); read it from
-        // the encoder so the count tracks the frames' actual resolution.
-        // With `temporal_patch_size` = 2 and 8 frames, the splice
-        // substitutes 4 × that per-frame count of rows.
-        let temporalPatchSize = 2
-        let perFrameTokens = vlm.encodeImage(frames[0]).shape[0]
-        let videoTokenCount = (frames.count / temporalPatchSize) * perFrameTokens
+        _ = try #require(vlm.videoTokenId, "Qwen 2.5-VL must be video-capable")
 
         // Build the standard Qwen 2.5-VL video prompt:
-        //   <|im_start|>user\n<|vision_start|><|video_pad|>...<|vision_end|>What's in this video?<|im_end|>\n
+        //   <|im_start|>user\n<|vision_start|><|video_pad|>…<|vision_end|>What's in this video?<|im_end|>\n
         //   <|im_start|>assistant\n
-        // We assemble the placeholder run directly (Qwen's chat
-        // template normally expands `<|video_pad|>` to the right count
-        // from frame metadata).
+        // The model decodes cat.mp4 (`maxFrames` evenly-spaced frames), folds
+        // them into temporal patches, and inserts exactly the matching number
+        // of `<|video_pad|>` placeholders between the markers — the test no
+        // longer decodes frames or hand-computes the placeholder count.
         let preTokens = m.tokenizer.encode(
             text: "<|im_start|>user\n<|vision_start|>")
         let postTokens = m.tokenizer.encode(
             text: "<|vision_end|>What's in this video?<|im_end|>\n"
                 + "<|im_start|>assistant\n")
-        let promptTokens =
-            preTokens
-            + Array(repeating: videoTokenId, count: videoTokenCount)
-            + postTokens
 
         let generated = try vlm.generate(
-            promptTokens: promptTokens, videoFrames: frames,
+            preTokens: preTokens,
+            videoURL: VisionTestHelpers.catVideoURL(),
+            maxFrames: Self.frameCount,
+            postTokens: postTokens,
             maxTokens: 200,
             eosTokenId: m.config.eosTokenId,
             eosTokenIds: m.config.eosTokenIds)

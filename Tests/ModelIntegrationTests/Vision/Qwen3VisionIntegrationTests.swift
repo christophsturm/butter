@@ -138,32 +138,26 @@ struct Qwen3VisionIntegrationTests {
             try await Model.load(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "Qwen 3-VL checkpoint is not a VLM")
-        let videoTokenId = try #require(vlm.videoTokenId)
-
-        // Pull `frameCount` evenly-spaced frames from cat.mp4.
-        let frames = try VisionTestHelpers.catVideoFrames(maxFrames: Self.frameCount)
-
-        // The merged-token-per-temporal-patch count is the same as one
-        // image's merged token count. With `temporal_patch_size` = 2 and
-        // 4 frames, the splice substitutes 2 × `imageTokenCount` rows.
-        let temporalPatchSize = 2
-        let videoTokenCount = (frames.count / temporalPatchSize) * vlm.imageTokenCount
+        _ = try #require(vlm.videoTokenId, "Qwen 3-VL must be video-capable")
 
         // Build the standard Qwen 3-VL video prompt:
-        //   <|im_start|>user\n<|vision_start|><|video_pad|>...<|vision_end|>What's in this video?<|im_end|>\n
+        //   <|im_start|>user\n<|vision_start|><|video_pad|>…<|vision_end|>What's in this video?<|im_end|>\n
         //   <|im_start|>assistant\n
+        // The model decodes cat.mp4 (`maxFrames` evenly-spaced frames), folds
+        // them into temporal patches, and inserts exactly the matching number
+        // of `<|video_pad|>` placeholders between the markers — the test no
+        // longer decodes frames or hand-computes the placeholder count.
         let preTokens = m.tokenizer.encode(
             text: "<|im_start|>user\n<|vision_start|>")
         let postTokens = m.tokenizer.encode(
             text: "<|vision_end|>What's in this video?<|im_end|>\n"
                 + "<|im_start|>assistant\n")
-        let promptTokens =
-            preTokens
-            + Array(repeating: videoTokenId, count: videoTokenCount)
-            + postTokens
 
         let generated = try vlm.generate(
-            promptTokens: promptTokens, videoFrames: frames,
+            preTokens: preTokens,
+            videoURL: VisionTestHelpers.catVideoURL(),
+            maxFrames: Self.frameCount,
+            postTokens: postTokens,
             maxTokens: 200,
             eosTokenId: m.config.eosTokenId,
             eosTokenIds: m.config.eosTokenIds)

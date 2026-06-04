@@ -415,6 +415,50 @@ public final class VisionModel: @unchecked Sendable {
             eosTokenIds: eosTokenIds, device: device)
     }
 
+    #if canImport(AVFoundation)
+        /// Greedy multi-modal generation from a VIDEO FILE.
+        ///
+        /// The model owns the whole video path: it decodes + samples up to
+        /// `maxFrames` frames from `videoURL` (via
+        /// `MediaUtils.decodeVideoFrames`), folds them into temporal patches,
+        /// and builds the prompt by inserting EXACTLY the right number of
+        /// `videoTokenId` placeholders between the caller-supplied
+        /// `preTokens` / `postTokens` (the family's chat-template markers).
+        /// The caller no longer decodes frames or computes the placeholder
+        /// count — the model derives it from the encoded video-token rows, so
+        /// it always matches the tower's `temporal_patch_size` / resolution.
+        ///
+        /// Throws `VisionModelError.videoTokenIdMissing` for VLMs that were
+        /// built without a `videoTokenId`.
+        public func generate(
+            preTokens: [Int], videoURL: URL, maxFrames: Int, postTokens: [Int],
+            maxTokens: Int, parameters: GenerationParameters? = nil,
+            eosTokenId: Int?,
+            eosTokenIds: [Int] = [],
+            device: Device = .shared
+        ) throws -> [Int] {
+            guard let videoTokenId else {
+                throw VisionModelError.videoTokenIdMissing(
+                    String(describing: type(of: visionEncoder)))
+            }
+            let frames = try MediaUtils.decodeVideoFrames(
+                url: videoURL, maxFrames: maxFrames)
+            let videoTokens = try encodeVideo(frames, device: device)
+            // One placeholder per encoded video-token row — guaranteed to
+            // match the splice (which substitutes one row per placeholder).
+            let promptTokens =
+                preTokens
+                + Array(repeating: videoTokenId, count: videoTokens.shape[0])
+                + postTokens
+            return try runSampled(
+                promptTokens: promptTokens,
+                imageTokens: nil, videoTokens: videoTokens, audioTokens: nil,
+                maxTokens: maxTokens, parameters: parameters,
+                eosTokenId: eosTokenId,
+                eosTokenIds: eosTokenIds, device: device)
+        }
+    #endif
+
     /// Greedy multi-modal generation with an audio prompt. `waveform` is a
     /// raw 16 kHz mono signal; the audio front-end + encoder + multi-modal
     /// embedder turn it into audio soft tokens, and the splice substitutes
