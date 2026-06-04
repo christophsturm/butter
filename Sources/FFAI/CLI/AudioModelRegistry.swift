@@ -54,6 +54,7 @@ public enum LoadedAudioModel: @unchecked Sendable {
     case cohereTranscribe(CohereTranscribeModel)
     case mossFormer2SE(MossFormer2SEModel)
     case samAudio(SAMAudioModel)
+    case fishSpeech(FishSpeechModel)
 
     /// The capabilities this model exposes — `audioIn` for STT / omni,
     /// `audioOut` for TTS.
@@ -85,6 +86,7 @@ public enum LoadedAudioModel: @unchecked Sendable {
         case .cohereTranscribe: return Capability.speechToText
         case .mossFormer2SE: return Capability.speechToSpeech
         case .samAudio: return Capability.speechToSpeech
+        case .fishSpeech: return Capability.textToSpeech
         }
     }
 }
@@ -145,6 +147,10 @@ public enum AudioModelRegistry {
     public static func capabilities(for config: ModelConfig)
         -> Set<Capability>?
     {
+        // FishSpeech first: its `fish_qwen3_omni` model_type contains
+        // "qwen3_omni", which QwenOmni's structural fallback could otherwise
+        // grab.
+        if FishSpeechModel.handles(config) { return Capability.textToSpeech }
         if Qwen3TTSModel.handles(config) { return Capability.textToSpeech }
         if Qwen3ASRModel.handles(config) { return Capability.speechToText }
         if QwenOmniModel.handles(config) { return Capability.omniAudio }
@@ -187,7 +193,34 @@ public enum AudioModelRegistry {
     public static func load(directory: URL, device: Device = .shared)
         async throws -> LoadedAudioModel
     {
+        let loaded = try await resolve(directory: directory, device: device)
+        // Uniformly attach the snapshot tokenizer to any model whose
+        // streaming-transcription decode renders token ids to text. The
+        // `StreamingTranscriber` shape carries no tokenizer argument, and the
+        // synchronous per-model loaders can't run the async tokenizer load —
+        // so it's done here, once, for every `TokenizerAttachable` model.
+        // `try?`: a missing / unsupported tokenizer just leaves the streaming
+        // path to surface its own missing-tokenizer error; it must not fail
+        // the whole load.
+        if let attachable = loaded.tokenizerAttachable {
+            attachable.tokenizer = try? await TokenizerLoader().load(from: directory)
+        }
+        return loaded
+    }
+
+    /// Resolve the architecture from `config.json` and construct the model.
+    /// Tokenizer attachment is handled uniformly by `load`, not here.
+    private static func resolve(directory: URL, device: Device = .shared)
+        async throws -> LoadedAudioModel
+    {
         let config = try ModelConfig.load(from: directory)
+        // FishSpeech first: its `fish_qwen3_omni` model_type contains
+        // "qwen3_omni", which QwenOmni's structural fallback could otherwise
+        // grab — route the snapshot here before the Qwen checks.
+        if FishSpeechModel.handles(config) {
+            return .fishSpeech(
+                try FishSpeechModel.load(directory: directory, device: device))
+        }
         // Qwen3TTS is checked before QwenOmni: both are Qwen-family
         // audio models, but Qwen3TTS's `talker_config` is its own marker.
         if Qwen3TTSModel.handles(config) {
@@ -200,26 +233,12 @@ public enum AudioModelRegistry {
         // routing-precedence reasoning (Qwen3-ASR's `audio_config` is
         // also matched by QwenOmni's structural fallback).
         if Qwen3ASRModel.handles(config) {
-            let model = try Qwen3ASRModel.load(
-                directory: directory, device: device)
-            // The `StreamingTranscriber` protocol shape carries no tokenizer
-            // argument, so attach the snapshot's tokenizer here for the
-            // streaming (`transcribeStream`) path (mirrors GLMASR below). The
-            // batch `transcribe` entry point still takes a tokenizer explicitly.
-            // `try?`: a missing tokenizer only disables streaming (which then
-            // throws `missingTokenizer`), it must not fail the whole load.
-            model.tokenizer = try? await TokenizerLoader().load(from: directory)
-            return .qwen3ASR(model)
+            return .qwen3ASR(
+                try Qwen3ASRModel.load(directory: directory, device: device))
         }
         if QwenOmniModel.handles(config) {
-            let model = try QwenOmniModel.load(
-                directory: directory, device: device)
-            // Attach the tokenizer the audio→text `transcribe` /
-            // `transcribeStream` path needs — the sync loader can't run
-            // the async tokenizer load itself.
-            model.tokenizer = try? await TokenizerLoader().load(
-                from: directory)
-            return .qwenOmni(model)
+            return .qwenOmni(
+                try QwenOmniModel.load(directory: directory, device: device))
         }
         if MarvisModel.handles(config) {
             return .marvis(
@@ -298,14 +317,8 @@ public enum AudioModelRegistry {
                     directory: directory, device: device))
         }
         if LFMAudioModel.handles(config) {
-            let model = try LFMAudioModel.load(
-                directory: directory, device: device)
-            // Attach the tokenizer the audio→text `transcribe` /
-            // `transcribeStream` path needs — the sync loader can't run
-            // the async tokenizer load itself.
-            model.tokenizer = try? await TokenizerLoader().load(
-                from: directory)
-            return .lfmAudio(model)
+            return .lfmAudio(
+                try LFMAudioModel.load(directory: directory, device: device))
         }
         if VoxtralRealtimeModel.handles(config) {
             return .voxtralRealtime(
@@ -313,14 +326,8 @@ public enum AudioModelRegistry {
                     directory: directory, device: device))
         }
         if GLMASRModel.handles(config) {
-            let model = try GLMASRModel.load(
-                directory: directory, device: device)
-            // Attach the tokenizer so the protocol-shaped `transcribeStream`
-            // (which takes no tokenizer argument) can decode. The sync
-            // `GLMASRModel.load` can't perform the async tokenizer load; the
-            // registry's async context can.
-            model.tokenizer = try? await TokenizerLoader().load(from: directory)
-            return .glmASR(model)
+            return .glmASR(
+                try GLMASRModel.load(directory: directory, device: device))
         }
         if PocketTTSModel.handles(config) {
             return .pocketTTS(

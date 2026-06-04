@@ -44,6 +44,7 @@
 
 import Foundation
 import Metal
+import Tokenizers
 
 // ─── Configuration ───────────────────────────────────────────────────
 
@@ -245,6 +246,14 @@ public final class SenseVoiceEncoderLayer: Module {
 public final class SenseVoiceModel: @unchecked Sendable {
     public let config: SenseVoiceConfig
 
+    /// The snapshot tokenizer, attached by `AudioModelRegistry.load`. NOTE:
+    /// SenseVoice (FunASR) ships a `tokens.txt` / SentencePiece vocab, not a
+    /// HuggingFace `tokenizer.json`, so `TokenizerLoader` usually can't load
+    /// it — `tokenizer` then stays nil and `decodeTokens` falls back to the
+    /// token-id rendering. Wiring a FunASR-vocab decoder is a follow-up; the
+    /// `TokenizerAttachable` mechanism is in place so it lights up for free.
+    public var tokenizer: (any Tokenizer)?
+
     /// Query-prefix embedding `[16, inputSize]` — language / event /
     /// emotion / text-norm prompt tokens prepended to the FBANK frames.
     let queryEmbed: Tensor
@@ -389,6 +398,17 @@ public final class SenseVoiceModel: @unchecked Sendable {
         tokens.map(String.init).joined(separator: " ")
     }
 
+    /// Render CTC token ids as text. Prefers the attached `tokenizer` (real
+    /// transcript); falls back to the deterministic space-joined token-id
+    /// string when none is wired (the common SenseVoice case — see the
+    /// `tokenizer` property note).
+    public func decodeTokens(_ tokens: [Int]) -> String {
+        if let tokenizer {
+            return tokenizer.decode(tokens: tokens, skipSpecialTokens: true)
+        }
+        return Self.tokensToText(tokens)
+    }
+
     /// Streaming transcription. SenseVoice is a single-pass,
     /// non-autoregressive CTC encoder — one forward pass over the whole
     /// utterance yields the frame log-probabilities, and a greedy collapse
@@ -421,7 +441,7 @@ public final class SenseVoiceModel: @unchecked Sendable {
                     // helper) — never a bare `waitUntilCompleted()` here.
                     let tokens = model.transcribeTokens(waveform: waveform)
                     try Task.checkCancellation()
-                    let text = SenseVoiceModel.tokensToText(tokens)
+                    let text = model.decodeTokens(tokens)
                     if !text.isEmpty {
                         continuation.yield(text)
                     }

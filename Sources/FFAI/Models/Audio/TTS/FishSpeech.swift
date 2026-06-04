@@ -67,7 +67,12 @@ public enum FishSpeech {
 /// `fishS1DAC` codec is bound, decodes the resulting VQ codes to a waveform.
 /// If `fishS1DAC` is nil (codec weights absent from snapshot), it throws
 /// `AudioGenerationError.codecNotAvailable`.
-public final class FishSpeechModel: Module, AudioModel {
+// `@unchecked Sendable`: inference is single-threaded (one synthesis at a
+// time) and the weight tensors / sub-modules are effectively immutable after
+// load (`fishS1DAC` is bound once during `load`). This matches every other
+// audio model in the registry and lets `FishSpeechModel` satisfy the
+// `StreamingSynthesizer: Sendable` contract.
+public final class FishSpeechModel: Module, AudioModel, @unchecked Sendable {
     public static let defaultRepositoryID = "mlx-community/fish-audio-s2-pro-8bit"
 
     public let fishConfig: FishSpeechConfig
@@ -616,6 +621,25 @@ public final class FishSpeechModel: Module, AudioModel {
 
     // ─── Static loader ────────────────────────────────────────────────
 
+    /// Whether a decoded `config.json` describes a FishSpeech checkpoint.
+    /// Used by `AudioModelRegistry` to route the snapshot here.
+    public static func handles(_ config: ModelConfig) -> Bool {
+        if let mt = config.modelType { return FishSpeech.modelTypes.contains(mt) }
+        return false
+    }
+
+    /// Registry-convention convenience: read `config.json` + the safetensors
+    /// bundle from `directory` and build the model (the lower-level
+    /// `load(config:weights:directory:device:)` takes them pre-loaded).
+    public static func load(directory: URL, device: Device = .shared) throws
+        -> FishSpeechModel
+    {
+        let config = try ModelConfig.load(from: directory)
+        let weights = try SafeTensorsBundle(directory: directory)
+        return try load(
+            config: config, weights: weights, directory: directory, device: device)
+    }
+
     /// Load a FishSpeech model from a model directory (HF snapshot).
     ///
     /// Attempts to load the FishS1DAC codec from the snapshot directory (or a
@@ -801,5 +825,40 @@ public final class FishSpeechModel: Module, AudioModel {
                 ))
         }
         return layers
+    }
+}
+
+// ─── StreamingSynthesizer conformance ────────────────────────────────
+
+extension FishSpeechModel: StreamingSynthesizer {
+    /// Streaming text→audio. FishSpeech tokenizes the text itself (no
+    /// external g2p) and decodes the whole utterance in one pass — slow +
+    /// fast AR loops → VQ codes → FishS1DAC waveform — so this yields the
+    /// full waveform once (single-element stream). `voice` / `speed` are
+    /// accepted for protocol shape; FishSpeech has no named-voice table or
+    /// rate control. Throws `AudioGenerationError.codecNotAvailable` through
+    /// the stream when the Stage-2 codec weights are absent.
+    public func synthesizeStream(
+        text: String, voice: String?, speed: Float
+    ) -> AsyncThrowingStream<Tensor, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    // GPU sync stays inside the synchronous `synthesize`.
+                    let samples = try model.synthesize(
+                        text: text, parameters: AudioGenerationParameters())
+                    let audio = Tensor.empty(
+                        shape: [samples.count], dtype: .f32, device: .shared)
+                    audio.copyIn(from: samples)
+                    continuation.yield(audio)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 }

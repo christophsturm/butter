@@ -192,6 +192,12 @@ public final class WhisperModel: @unchecked Sendable {
     public let config: WhisperConfig
     public let encoder: AudioEncoder
 
+    /// The snapshot tokenizer, attached by `AudioModelRegistry.load` (the
+    /// model decodes to token ids; the tokenizer renders them to text). When
+    /// present, `decodeTokens` produces real text; when nil it falls back to
+    /// the deterministic space-joined token-id rendering.
+    public var tokenizer: (any Tokenizer)?
+
     let tokenEmbedding: Tensor  // [vocab, hidden]
     let decoderPosEmbedding: Tensor  // [maxDecoderCtx, hidden]
     let decoderLayers: [WhisperDecoderLayer]
@@ -377,6 +383,18 @@ public final class WhisperModel: @unchecked Sendable {
         tokens.map(String.init).joined(separator: " ")
     }
 
+    /// Render transcript token ids as text. Prefers the attached `tokenizer`
+    /// (real transcript text, special tokens stripped); falls back to the
+    /// deterministic space-joined token-id string when no tokenizer is wired.
+    /// Both batch and streaming decode route through this, so the streamed
+    /// concatenation always equals the batch transcript.
+    public func decodeTokens(_ tokens: [Int]) -> String {
+        if let tokenizer {
+            return tokenizer.decode(tokens: tokens, skipSpecialTokens: true)
+        }
+        return Self.tokensToText(tokens)
+    }
+
     /// Streaming transcription — greedy-decodes the audio and yields the
     /// incremental transcript TEXT (one delta per generated token), so a
     /// consumer can render the transcript as it grows. Shares the
@@ -442,9 +460,9 @@ public final class WhisperModel: @unchecked Sendable {
                         let prev =
                             generated.count == 1
                             ? ""
-                            : WhisperModel.tokensToText(
+                            : model.decodeTokens(
                                 Array(generated.dropLast()))
-                        let cur = WhisperModel.tokensToText(generated)
+                        let cur = model.decodeTokens(generated)
                         if cur.count > prev.count {
                             continuation.yield(String(cur.dropFirst(prev.count)))
                         }

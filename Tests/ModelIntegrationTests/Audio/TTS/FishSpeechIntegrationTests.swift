@@ -160,4 +160,60 @@ struct FishSpeechIntegrationTests {
         #expect(codes.count == model.fishConfig.numCodebooks)
         #expect(codes.first?.isEmpty == false)
     }
+
+    @Test("registry — FishSpeech routes through the audio registry as a synthesizer")
+    func registry_routesFishSpeech() async throws {
+        let dir = try await resolveDirectory()
+        let loaded = try await AudioModelRegistry.load(directory: dir)
+        guard case .fishSpeech = loaded else {
+            Issue.record("AudioModelRegistry did not route to FishSpeech; got \(loaded)")
+            return
+        }
+        #expect(loaded.capabilities.contains(.audioOut))
+        // It must surface as a StreamingSynthesizer (the `speak` CLI path).
+        #expect(loaded.synthesizer != nil)
+        #expect(loaded.transcriber == nil)
+    }
+
+    @Test("synthesizeStream — streamed waveform equals a single synthesize")
+    func synthesizeStreamingFromText() async throws {
+        let model = try await loadModel()
+        let text = "Hi."
+
+        // FishSpeech tokenizes text itself. When the Stage-2 codec is bound,
+        // `synthesize` returns a waveform; otherwise it throws
+        // `codecNotAvailable`. The single-yield stream is a thin wrapper, so
+        // both paths must agree.
+        var batch: [Float]?
+        var batchError: Error?
+        do { batch = try model.synthesize(text: text, parameters: .init()) } catch {
+            batchError = error
+        }
+
+        var chunks: [[Float]] = []
+        var streamError: Error?
+        do {
+            for try await audio in model.synthesizeStream(
+                text: text, voice: nil, speed: 1.0)
+            {
+                chunks.append(audio.toFloatArray())
+            }
+        } catch { streamError = error }
+
+        if batchError != nil {
+            // Codec absent: both paths fail identically, no audio yielded.
+            #expect(streamError != nil, "stream succeeded but batch failed")
+            #expect(chunks.isEmpty)
+            return
+        }
+        let batchSamples = try #require(batch)
+        #expect(streamError == nil, "stream failed but batch succeeded")
+        let streamed = chunks.flatMap { $0 }
+        let streamedCount = streamed.count
+        let batchCount = batchSamples.count
+        #expect(
+            streamedCount == batchCount,
+            "streamed (\(streamedCount)) != batch (\(batchCount))")
+        print("FishSpeech streamed \(streamedCount) samples @ \(model.sampleRate) Hz")
+    }
 }

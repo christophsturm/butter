@@ -157,7 +157,9 @@ struct WhisperIntegrationTests {
         #expect(!wave.isEmpty, "fixture waveform failed to load")
 
         // Batch reference: the same greedy decode the stream runs, rendered
-        // to the model's token-id-level text via `tokensToText`.
+        // via `decodeTokens` (real text when a tokenizer is attached — the
+        // registry wires it — else the token-id fallback). The stream uses
+        // the identical decode, so the two must agree.
         let features = model.encodeAudio(waveform: wave)
         let prefix = WhisperModel.decodePromptPrefix.filter {
             $0 < model.config.vocab
@@ -169,7 +171,7 @@ struct WhisperIntegrationTests {
             audioFeatures: features,
             initialTokens: prefix.isEmpty ? [0] : prefix,
             eosToken: eos, maxTokens: 64)
-        let batchText = WhisperModel.tokensToText(batchTokens)
+        let batchText = model.decodeTokens(batchTokens)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Streamed: concatenate the per-token text deltas. The streaming and

@@ -147,7 +147,7 @@ struct SenseVoiceIntegrationTests {
         // token-id-level text. SenseVoice is single-pass (no decode loop),
         // so the stream is a single-element stream of the full transcript.
         let batchTokens = model.transcribeTokens(waveform: wave)
-        let batchText = SenseVoiceModel.tokensToText(batchTokens)
+        let batchText = model.decodeTokens(batchTokens)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         var streamed = ""

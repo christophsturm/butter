@@ -24,6 +24,18 @@
 // accessors return nil.
 
 import Foundation
+import Tokenizers
+
+/// An audio model whose streaming-transcription path needs the snapshot's
+/// tokenizer attached at load time. The `StreamingTranscriber` protocol
+/// shape carries no tokenizer argument, and several decoders (GLMASR,
+/// Qwen3ASR, QwenOmni, LFMAudio, Whisper, SenseVoice) emit token ids that a
+/// tokenizer renders to text — so `AudioModelRegistry.load` attaches the
+/// snapshot tokenizer uniformly after construction (the synchronous
+/// per-model loaders can't run the async tokenizer load themselves).
+public protocol TokenizerAttachable: AnyObject {
+    var tokenizer: (any Tokenizer)? { get set }
+}
 
 /// Speech-to-text streaming. Yields incremental transcript TEXT (one delta
 /// per decoded token for autoregressive decoders; a single yield for
@@ -72,6 +84,21 @@ extension LoadedAudioModel {
         }
     }
 
+    /// The loaded model as a tokenizer-attachable, or nil if its decode
+    /// path doesn't need the snapshot tokenizer wired at load. The registry
+    /// uses this for a single uniform attach instead of per-branch wiring.
+    var tokenizerAttachable: (any TokenizerAttachable)? {
+        switch self {
+        case .glmASR(let m): return m
+        case .qwen3ASR(let m): return m
+        case .qwenOmni(let m): return m
+        case .lfmAudio(let m): return m
+        case .whisper(let m): return m
+        case .senseVoice(let m): return m
+        default: return nil
+        }
+    }
+
     /// The loaded model as a text-to-speech streamer, or nil if it isn't a
     /// synthesis model. Mirrors the `textToSpeech` bucket in
     /// `capabilities(for:)`. Cases are added as each model gains a
@@ -90,6 +117,7 @@ extension LoadedAudioModel {
         case .mossTTSNano(let m): return m
         case .pocketTTS(let m): return m
         case .soprano(let m): return m
+        case .fishSpeech(let m): return m
         default: return nil
         }
     }
@@ -100,3 +128,15 @@ extension LoadedAudioModel {
 // GraniteSpeechModel already ships `transcribeStream(_:maxNewTokens:
 // temperature:)` with the exact protocol shape — conformance is a marker.
 extension GraniteSpeechModel: StreamingTranscriber {}
+
+// MARK: - TokenizerAttachable conformances
+
+// Each of these exposes a settable `tokenizer` property; the registry wires
+// the snapshot tokenizer into it after load so the token-id → text decode in
+// `transcribeStream` (and the batch transcribe) can render real text.
+extension GLMASRModel: TokenizerAttachable {}
+extension Qwen3ASRModel: TokenizerAttachable {}
+extension QwenOmniModel: TokenizerAttachable {}
+extension LFMAudioModel: TokenizerAttachable {}
+extension WhisperModel: TokenizerAttachable {}
+extension SenseVoiceModel: TokenizerAttachable {}
