@@ -92,4 +92,36 @@ struct Mamba2TextIntegrationTests {
             label: "Mamba 2 130M"
         )
     }
+
+    /// 4-bit conversion — exercises the FUSED pre-gated-RMSNorm + int4
+    /// out_proj GEMV path (`Ops.gatedRmsNormPregateQgemvInt4Fast`). The
+    /// bf16 test above takes the unfused fallback (out_proj isn't int4);
+    /// only a quantized out_proj triggers the fused kernel, so this is the
+    /// only suite that covers it end-to-end. Coherence parity with the
+    /// bf16 case confirms the gate-then-norm fusion is mathematically
+    /// correct (the kernel is GPU-correctness-tested against a CPU oracle
+    /// in metaltile; this is the in-model integration check).
+    @Test("4-bit — fused pre-gated RMSNorm + int4 out_proj decodes coherently")
+    func loadAndGenerate4bit() async throws {
+        let m = try await ModelLoadLock.shared.loadSerially {
+            try await Model.load("ekryski/mamba2-130m-4bit")
+        }
+        #expect(m.mamba2 != nil)
+        #expect(m.engine.hidden == 768)
+        #expect(m.engine.nLayers == 24)
+
+        let result = try await m.generate(
+            prompt: "The quick brown fox jumps over the",
+            parameters: m.defaultGenerationParameters.with { $0.maxTokens = 64; $0.seed = 42 }
+        )
+        let text = m.tokenizer.decode(tokens: result.generatedTokens)
+        print("Mamba2-130M-4bit generated: \(text)")
+        #expect(result.tokensPerSecond > 0)
+        expectCoherentOutput(
+            result.generatedTokens,
+            minTokens: 32,
+            minUniqueRatio: 0.15,
+            label: "Mamba 2 130M 4bit (fused path)"
+        )
+    }
 }

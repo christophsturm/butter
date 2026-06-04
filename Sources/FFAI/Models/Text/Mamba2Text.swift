@@ -73,6 +73,11 @@ public struct Mamba2Dense: Mamba2Variant {
         let useBias = config.bool("use_bias") ?? false
         let eps = config.float("rms_norm_eps") ?? config.float("layer_norm_epsilon") ?? 1e-5
         let tieEmbed = config.tieWordEmbeddings
+        // Quantization spec (nil for bf16/fp16 checkpoints). The mixer
+        // in_proj / out_proj are quantized in 4-bit conversions — load them
+        // through `loadLinear` so they become `QuantizedLinear` rather than
+        // a plain `Linear` holding packed u32 weights.
+        let quant = config.quantization
 
         guard nGroups == 1 else {
             throw Mamba2Error.unsupportedConfig("n_groups > 1 not yet supported (got \(nGroups))")
@@ -108,12 +113,10 @@ public struct Mamba2Dense: Mamba2Variant {
                 weight: try weights.tensor(named: "\(p).norm.weight"),
                 eps: Float(eps))
 
-            let inProj = AnyLinear(
-                Linear(
-                    weight: try weights.tensor(named: "\(p).mixer.in_proj.weight")))
-            let outProj = AnyLinear(
-                Linear(
-                    weight: try weights.tensor(named: "\(p).mixer.out_proj.weight")))
+            let inProj = try loadLinear(
+                base: "\(p).mixer.in_proj", in: weights, quantization: quant)
+            let outProj = try loadLinear(
+                base: "\(p).mixer.out_proj", in: weights, quantization: quant)
 
             // conv1d.weight ships as [conv_dim, 1, kernel_size]; the
             // metaltile kernel expects [kernel_size, conv_dim].
@@ -184,7 +187,7 @@ public struct Mamba2Dense: Mamba2Variant {
 
         let lmHead: AnyLinear
         if !tieEmbed, weights.has("lm_head.weight") {
-            lmHead = try loadLinear(base: "lm_head", in: weights, quantization: nil)
+            lmHead = try loadLinear(base: "lm_head", in: weights, quantization: quant)
         } else {
             lmHead = AnyLinear(Linear(weight: embedTokens.weight))
         }
@@ -303,13 +306,49 @@ public final class Mamba2Layer: Module {
         let dx = Ops.mul(dTiled, x, on: cmd)
         let ySkip = Ops.add(y, dx, on: cmd)
 
-        // (8) gating: y *= silu(z)
-        let zAct = Ops.silu(z, on: cmd)
-        let yGated = Ops.mul(ySkip, zAct, on: cmd)
-
-        // (9) mixer norm + out_proj
-        let yNorm = mixerNorm(yGated, on: cmd)
-        let yOut = outProj(yNorm, on: cmd)
+        // (8+9) gated mixer RMSNorm + out_proj.
+        //
+        // Fast path: when out_proj is int4 (group 64) and `d_inner` fits the
+        // kernel's TG-memory contract, fuse `silu`-gate → pre-gated RMSNorm
+        // → int4 GEMV into ONE dispatch. `Ops.gatedRmsNormPregateQgemvInt4Fast`
+        // is the Mamba-2 gate-then-norm convention (variance over `y·silu(z)`,
+        // full `[d_inner]` weight). `n_groups == 1` → one normalization group
+        // over the whole `d_inner` → `hv = 1, dv = d_inner`. The kernel
+        // applies `silu(z)` internally, so the RAW gate `z` is passed (not the
+        // pre-activated `silu(z)`). Falls back to the unfused chain otherwise.
+        let yOut: Tensor
+        if let qOut = outProj.inner as? QuantizedLinear,
+            qOut.bits == 4, qOut.groupSize == 64, qOut.additiveBias == nil,
+            mixerNorm.weight.dtype == dtype, z.dtype == dtype,
+            dInner % 512 == 0, dInner <= 8192, hidden % 8 == 0
+        {
+            // The kernel reads `y` in f32 (the SSM recurrence output crosses
+            // the gated-norm boundary at full precision in the reference).
+            let ySkipF32: Tensor
+            if ySkip.dtype == .f32 {
+                ySkipF32 = ySkip
+            } else {
+                ySkipF32 = Tensor.empty(
+                    shape: ySkip.shape, dtype: .f32, device: device)
+                Ops.castToF32(ySkip, into: ySkipF32, on: cmd)
+            }
+            let fusedOut = Tensor.empty(
+                shape: [hidden], dtype: dtype, device: device)
+            Ops.gatedRmsNormPregateQgemvInt4Fast(
+                y: ySkipF32, z: z, normWeight: mixerNorm.weight,
+                eps: mixerNorm.eps,
+                qWeight: qOut.weight, qScales: qOut.scales, qBiases: qOut.biases,
+                hv: 1, dv: dInner, outDim: hidden, groupSize: 64,
+                on: cmd, into: fusedOut)
+            yOut = fusedOut
+        } else {
+            // (8) gating: y *= silu(z)
+            let zAct = Ops.silu(z, on: cmd)
+            let yGated = Ops.mul(ySkip, zAct, on: cmd)
+            // (9) mixer norm + out_proj
+            let yNorm = mixerNorm(yGated, on: cmd)
+            yOut = outProj(yNorm, on: cmd)
+        }
 
         // (10) residual add
         let result = Ops.add(h, yOut, on: cmd)

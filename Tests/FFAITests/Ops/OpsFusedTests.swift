@@ -129,6 +129,50 @@ struct OpsFusedTests {
         }
     }
 
+    @Test("gatedRmsNormPregateQgemvInt4Fast f32 — gate-then-norm + int4 GEMV")
+    func gatedRmsNormPregateQgemvInt4FastF32() {
+        autoreleasepool {
+            // Analytic case: hv=1, dv=512, out_dim=8, group_size=64.
+            //   y all 1, z all 10 → silu(10) ≈ 10 > 0 → gated row all equal
+            //   → rms_norm(gated) all = 1 → ·normWeight(all 1) → inner all 1.
+            //   int4 weights all quantize to a constant 0.5 (packed nibbles
+            //   all 0, scale 1, bias 0.5), so out[o] = Σ_512 (0.5·1) = 256.
+            let hv = 1, dv = 512, outDim = 8, groupSize = 64
+            let inDim = hv * dv  // 512
+            let nGroups = inDim / groupSize  // 8
+            let packsPerRow = inDim / 8  // 64
+
+            let y = Tensor.empty(shape: [inDim], dtype: .f32)
+            y.copyIn(from: Array(repeating: Float(1), count: inDim))
+            let z = Tensor.empty(shape: [inDim], dtype: .f32)
+            z.copyIn(from: Array(repeating: Float(10), count: inDim))
+            let normWeight = Tensor.empty(shape: [inDim], dtype: .f32)
+            normWeight.copyIn(from: Array(repeating: Float(1), count: inDim))
+
+            // int4: packed nibbles all 0 → q=0; scale 1, bias 0.5 →
+            // dequant = 0·1 + 0.5 = 0.5 everywhere.
+            let qWeight = Tensor.empty(shape: [outDim * packsPerRow], dtype: .u32)
+            qWeight.copyIn(from: Array(repeating: UInt32(0), count: outDim * packsPerRow))
+            let qScales = Tensor.empty(shape: [outDim * nGroups], dtype: .f32)
+            qScales.copyIn(from: Array(repeating: Float(1), count: outDim * nGroups))
+            let qBiases = Tensor.empty(shape: [outDim * nGroups], dtype: .f32)
+            qBiases.copyIn(from: Array(repeating: Float(0.5), count: outDim * nGroups))
+
+            let out = Tensor.empty(shape: [outDim], dtype: .f32)
+            runAndWait { cb in
+                Ops.gatedRmsNormPregateQgemvInt4Fast(
+                    y: y, z: z, normWeight: normWeight, eps: 1e-6,
+                    qWeight: qWeight, qScales: qScales, qBiases: qBiases,
+                    hv: hv, dv: dv, outDim: outDim, groupSize: groupSize,
+                    on: cb, into: out)
+            }
+            let r = out.toArray(as: Float.self)
+            for v in r {
+                #expect(abs(v - 256) < 0.5, "expected ~256, got \(v)")
+            }
+        }
+    }
+
     @Test("rmsNormSmall f32 — n=64 row, all-2 input → all-1 output")
     func rmsNormSmallF32() {
         autoreleasepool {

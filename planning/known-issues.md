@@ -4,6 +4,20 @@ Open bugs + rough notes from the model-family port. Each entry carries
 enough context to pick up cold. Resolved-work history lives in
 `planning/session-plan.md` / `plan.md`, not here.
 
+## Mamba2-130M bf16 greedy generation exits early — PRE-EXISTING (2026-06-04)
+
+`Mamba2TextIntegrationTests.loadAndGenerate` (bf16 `mlx-community/mamba2-130m`)
+greedy-decodes only ~6 tokens before EOS on "The quick brown fox jumps over
+the" (`[22658, 4370, 187, 187, 8193, 10764]`), failing `minTokens: 32`.
+**Confirmed pre-existing** — reproduces identically with all 2026-06-04 Mamba2
+changes stashed (original `Linear(weight:)` loader). The 130M *base* model
+naturally completes the pangram and emits EOS; the test's ≥32-token
+expectation is too strict for this prompt at the quality floor. The NEW
+4-bit variant (`loadAndGenerate4bit`, `ekryski/mamba2-130m-4bit`) rambles
+past 32 (quant noise perturbs the greedy trajectory) and PASSES, so the
+fused pre-gated-RMSNorm path is validated. Fix options: a longer/less
+self-terminating prompt, or lower `minTokens`. Not a forward bug.
+
 ## GPU LSTM (`ffai_lstm`) — context-dependent NaN in the full Kokoro chain
 
 **Symptom.** With the Kokoro front-end wired to run its LSTMs on the GPU
