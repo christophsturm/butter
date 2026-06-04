@@ -284,39 +284,48 @@ to 4.4e-4 vs the feature-extractor oracle + a coherent audio→text decode).
 log-floor regime, switch the test signal to broadband noise, or pad the test
 audio to `(n_frames-1)*hop + n_fft`.
 
-## Qwen2/2.5/3-VL vision — `Ops.gather: unsupported dtype u32` crash in the forward
+## Qwen3-VL vision — `Ops.gather: unsupported dtype u32` crash — RESOLVED
 
-**Symptom.** With `IntegrationGroupGating.enableVisionSuites` flipped on, the
-Qwen vision integration suites abort early with `FFAI/Ops.swift:371: Fatal
-error: Ops.gather: unsupported dtype u32`. **Pre-existing** — reproduced on
-the CPU-unfold baseline (our GPU patch-unfold wiring reverted), which is why
-the vision-suite group is gated off as "not yet verified on current HEAD".
+**Was:** the Qwen3-VL suite aborted at load (`Model.prewarm` → first forward)
+with `FFAI/Ops.swift:371: Fatal error: Ops.gather: unsupported dtype u32`.
+**Root cause:** `Qwen3Vision.load` re-wrapped the checkpoint's `text_config`
+into a fresh `ModelConfig` but dropped the **top-level** `quantization` block
+(MLX VL checkpoints declare it once at the top level, not inside
+`text_config`). The Qwen3Dense backbone then loaded its embedding as a plain
+`Embedding` over the packed-u32 weight (and would have mis-loaded every
+quantized linear). **Fix (commit `14f127d`):** inject the top-level
+`quantization` into the re-wrapped text config. Qwen2/2.5-VL thread
+`quantization` through as a parameter and never had the bug.
 
-**Impact on our work.** It blocks **end-to-end** validation of the new Qwen
-GPU patch-unfold wiring (`Ops.patchUnfoldQwen`), but that wiring is otherwise
-proven: the metaltile `patch_unfold_qwen` GPU-correctness cells (square
-image, square video, non-square image) and the FFAI
-`OpsTests.patchUnfoldQwenF32` unit test all pass. Gemma4 vision — which uses
-the sibling `im2col_patch_interleaved` kernel — passes its full integration
-suite (tower oracle + image/video→text).
-
-**Next step.** Find the u32 `Ops.gather` call site reachable from the Qwen
-vision forward (likely a position/window index path) and either add a u32
-overload to `Ops.gather` or fix the caller to pass the intended dtype, then
-re-enable + bisect the Qwen vision suites.
+**Result.** Qwen3-VL now loads + runs; **video→text is coherent** (the cat
+clip is described correctly), which validates the GPU `Ops.patchUnfoldQwen`
+wiring end-to-end (the multi-frame temporal path). Remaining: **image→text
+still degenerates** — a separate, pre-existing square-grid issue (Qwen3
+`runForward`/`unfoldPatches` assume one square `gridSide`, while the
+native-resolution image processor produces non-square grids; the GPU
+`patch_unfold_qwen` kernel already supports non-square, but the position
+embedding / M-RoPE / merger still assume square). Tracked under the
+smart_resize native-resolution work (the in-progress Qwen×4 processor task).
 
 ## Orphaned GPU kernels still awaiting a consumer
 
-`Ops.frameDiffLuma` (video luma frame-diff motion gate) and
-`Ops.gatedRmsNormQgemvInt4Fast` (Mamba2 fused gated-RMSNorm + int4 GEMV) have
-metaltile kernels + FFAI Ops wrappers + unit tests but **no model call
-site**. Wiring `frameDiffLuma` means designing a new video motion-gate
-feature (which frames to skip, threshold) — a behavior change, not a
-mechanical swap. Wiring `gatedRmsNormQgemvInt4Fast` means restructuring
-Mamba2's quantized SSM decode (tracked separately as the "wire landed-but-
-orphaned kernels" task). `Ops.patchEmbed` (fused unfold+embed) is
+`Ops.frameDiffLuma` (video luma frame-diff motion gate) has a metaltile
+kernel + FFAI Ops wrapper + unit test but **no model call site**: it is
+infrastructure for the planned real-time video loop (metaltile
+`multi-modal-support.md` §7c / K7) — a cheap motion gate that skips
+near-static frames before the vision tower. No model currently decodes
+multi-frame video through such a gate, so wiring it is net-new feature work
+(threshold + which frames to skip), not a mechanical swap. Left until the
+real-time video pipeline lands. `Ops.patchEmbed` (fused unfold+embed) is
 functionally superseded for Gemma4 by `Ops.im2colPatchInterleaved` + the
-existing `Ops.gemm`. Left as tracked follow-ups.
+existing `Ops.gemm`.
+
+**Resolved:** `Ops.gatedRmsNormQgemvInt4Fast` is now wired (commit
+`8cc1635`) into the **Qwen3.5/3.6 Gated-DeltaNet** decode tail — fusing the
+gated mixer RMSNorm + int4 out_proj when out_proj is 4-bit (group 64) and
+the GDN value dim fits. It was previously mis-attributed to Mamba2; Mamba2's
+global `n_groups=1` norm is incompatible with this per-head gated RMSNorm.
+Validated by `Qwen35TextIntegrationTests` (coherent decode).
 
 ## Tokenizers — InternLM2Tokenizer not registered
 
