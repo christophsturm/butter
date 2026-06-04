@@ -90,6 +90,27 @@ struct BenchCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Cap WikiText-2 token count (default 2048).")
     var wikitext2MaxTokens: Int = 2048
 
+    @Option(
+        name: .long,
+        help:
+            "Sliding context window (n_ctx) for PPL/KLD scoring. 0 (default) = legacy single-pass; > 0 strides by window/2 and scores each window's second half so scored tokens carry real left-context (design §6.1)."
+    )
+    var wikitext2Context: Int = 0
+
+    @Option(
+        name: .long,
+        help:
+            "Phase B of two-phase KLD: score against a reference distribution cached by a prior --save-ref-logits run, instead of co-loading --ref-model."
+    )
+    var refLogits: String?
+
+    @Option(
+        name: .long,
+        help:
+            "Phase A of two-phase KLD: dump this model's per-position log-probs to <file> so future candidates can KLD against it without re-running the reference. Use with the bf16 reference as --model."
+    )
+    var saveRefLogits: String?
+
     @Flag(name: .long, help: "Enable debug logging.")
     var debug: Bool = false
 
@@ -165,7 +186,10 @@ struct BenchCommand: AsyncParsableCommand {
             quantization: quantization,
             wikitext2Corpus: wikitext2Corpus.map { URL(fileURLWithPath: $0) },
             wikitext2MaxTokens: wikitext2MaxTokens,
-            referenceModel: reference
+            wikitext2ContextWindow: wikitext2Context,
+            referenceModel: reference,
+            referenceLogits: refLogits.map { URL(fileURLWithPath: $0) },
+            saveReferenceLogits: saveRefLogits.map { URL(fileURLWithPath: $0) }
         )
         let runner = BenchRunner(model: candidate, modelLabel: model)
         let row = try await runner.run(method: benchMethod, options: opts)
