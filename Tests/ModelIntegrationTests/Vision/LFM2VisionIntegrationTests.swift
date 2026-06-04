@@ -74,8 +74,7 @@ struct LFM2VisionIntegrationTests {
         }
         let vlm = try #require(m.vlModel, "LFM2-VL checkpoint is not a VLM")
 
-        // Build the LFM2-VL chat prompt, mirroring the mlx-vlm reference
-        // template exactly:
+        // Build the LFM2-VL chat prompt:
         //   <|startoftext|><|im_start|>user\n<image>Describe this image.
         //   <|im_end|>\n<|im_start|>assistant\n
         // where `<image>` expands to the per-image vision-token run. Without
