@@ -46,6 +46,17 @@ public struct BenchRow: Sendable, Codable, Equatable {
     public let genPerplexity: Double?
     public let genKLDivergence: Double?
     public let outputPreview: String?
+    // Quality-of-service + energy axes. All optional so older sidecars
+    // (which lack these keys) still decode — Codable maps absent keys to
+    // nil. The markdown surfaces a curated subset; the full set lives in
+    // the JSON for analysis tooling.
+    public let interTokenLatencyP50Ms: Double?
+    public let interTokenLatencyP95Ms: Double?
+    public let interTokenLatencyP99Ms: Double?
+    public let sustainedDecodeRatio: Double?
+    public let decodeEnergyJoules: Double?
+    public let joulesPerToken: Double?
+    public let thermalStateAtEnd: String?
 
     public init(
         model: String, method: String, quantization: String?,
@@ -56,7 +67,14 @@ public struct BenchRow: Sendable, Codable, Equatable {
         baselineGPUBytes: Int, peakGPUBytes: Int,
         kvCacheUsedBytes: Int, weightsBytes: Int, wiredTicketBytes: Int,
         genPerplexity: Double?, genKLDivergence: Double?,
-        outputPreview: String?
+        outputPreview: String?,
+        interTokenLatencyP50Ms: Double? = nil,
+        interTokenLatencyP95Ms: Double? = nil,
+        interTokenLatencyP99Ms: Double? = nil,
+        sustainedDecodeRatio: Double? = nil,
+        decodeEnergyJoules: Double? = nil,
+        joulesPerToken: Double? = nil,
+        thermalStateAtEnd: String? = nil
     ) {
         self.model = model
         self.method = method
@@ -76,6 +94,13 @@ public struct BenchRow: Sendable, Codable, Equatable {
         self.genPerplexity = genPerplexity
         self.genKLDivergence = genKLDivergence
         self.outputPreview = outputPreview
+        self.interTokenLatencyP50Ms = interTokenLatencyP50Ms
+        self.interTokenLatencyP95Ms = interTokenLatencyP95Ms
+        self.interTokenLatencyP99Ms = interTokenLatencyP99Ms
+        self.sustainedDecodeRatio = sustainedDecodeRatio
+        self.decodeEnergyJoules = decodeEnergyJoules
+        self.joulesPerToken = joulesPerToken
+        self.thermalStateAtEnd = thermalStateAtEnd
     }
 }
 
@@ -235,13 +260,13 @@ public struct BenchmarkWriter: Sendable {
         out += "- OS: \(report.osVersion)\n"
         out += "- Created: \(report.createdAt.ISO8601Format())\n\n"
         out +=
-            "| Model | Method | Quant | Ctx | Prompt | Prefill tok/s | Decode tok/s | Steady tok/s | TTFT (ms) | Gen tokens | Baseline GPU | Peak GPU | KV used | Weights | Gen PPL | Gen KLD | Sample |\n"
-        out += "|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|\n"
+            "| Model | Method | Quant | Ctx | Prompt | Prefill tok/s | Decode tok/s | Steady tok/s | TTFT (ms) | Gen tokens | Baseline GPU | Peak GPU | KV used | Weights | Gen PPL | Gen KLD | J/tok | p95 ms | Retention | Thermal | Sample |\n"
+        out += "|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|---|\n"
         for r in report.rows {
             out +=
                 "| \(r.model) | \(r.method) | \(r.quantization ?? "-") | \(r.contextSize) | \(r.promptTokens) | "
             out += String(
-                format: "%.2f | %.2f | %@ | %.2f | %d | %@ | %@ | %@ | %@ | %@ | %@ | %@ |\n",
+                format: "%.2f | %.2f | %@ | %.2f | %d | %@ | %@ | %@ | %@ | %@ | %@ | %@ | %@ | %@ | %@ | %@ |\n",
                 r.prefillTokensPerSecond,
                 r.decodeTokensPerSecond,
                 r.steadyTokensPerSecond.map { String(format: "%.2f", $0) } ?? "-",
@@ -253,6 +278,10 @@ public struct BenchmarkWriter: Sendable {
                 formatBytes(r.weightsBytes),
                 r.genPerplexity.map { String(format: "%.3f", $0) } ?? "-",
                 r.genKLDivergence.map { String(format: "%.4f", $0) } ?? "-",
+                r.joulesPerToken.map { String(format: "%.4f", $0) } ?? "-",
+                r.interTokenLatencyP95Ms.map { String(format: "%.2f", $0) } ?? "-",
+                r.sustainedDecodeRatio.map { String(format: "%.0f%%", $0 * 100) } ?? "-",
+                r.thermalStateAtEnd ?? "-",
                 (r.outputPreview ?? "").replacingOccurrences(of: "|", with: "\\|"))
         }
         return out
@@ -289,7 +318,15 @@ extension BenchRow {
             wiredTicketBytes: stats.wiredTicketBytes,
             genPerplexity: genPerplexity,
             genKLDivergence: genKLDivergence,
-            outputPreview: outputPreview
+            outputPreview: outputPreview,
+            interTokenLatencyP50Ms: stats.interTokenLatencyP50Ms,
+            interTokenLatencyP95Ms: stats.interTokenLatencyP95Ms,
+            interTokenLatencyP99Ms: stats.interTokenLatencyP99Ms,
+            sustainedDecodeRatio: stats.sustainedDecodeRatio,
+            decodeEnergyJoules: stats.decodeEnergyJoules,
+            joulesPerToken: stats.joulesPerToken,
+            thermalStateAtEnd: stats.thermalStateAtEnd == .unknown
+                ? nil : stats.thermalStateAtEnd.rawValue
         )
     }
 }

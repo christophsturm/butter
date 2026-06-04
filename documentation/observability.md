@@ -30,7 +30,13 @@ ffai --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time" --s
   KV cache (alloc): 64.0 MB
   KV cache (used):  4.5 MB
   wired ticket:     16.00 GB
+  inter-token (ms): p50 15.20  p95 22.40  p99 31.10
+  decode retention: 96.5%   (late tok/s ÷ early)
+  energy:           0.1840 J/token   (decode 11.78 J)
+  thermal:          nominal → peak fair → nominal
 ```
+
+The last four lines are the **quality-of-service + energy axes** — the dimensions a single mean tok/s hides, and the ones the cross-framework Apple-Silicon benchmarks (e.g. [`john-rocky/apple-silicon-llm-bench`](https://github.com/john-rocky/apple-silicon-llm-bench)) report. They only render when a real decode loop produced them; hand-built or empty-prompt stats omit them.
 
 ### What each field means
 
@@ -47,6 +53,10 @@ ffai --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time" --s
 | `KV cache (alloc)` | sum of `KVCache.bytesAllocated` | Capacity allocated up-front at the cache's current `capacity`. |
 | `KV cache (used)` | sum of `KVCache.bytesInUse` | The live `length / capacity` slice — the part you're actually paying for in attention math. |
 | `wired ticket` | `MTLDevice.recommendedMaxWorkingSetSize` | The OS's wired-memory budget for this device. |
+| `inter-token (ms)` | percentiles of the per-token decode wall-clock series | p50 / p95 / p99 of the gap between consecutive tokens. The tail (p95/p99) is the worst-case UI stall a mean tok/s smooths away. `nil` until decode produces tokens. |
+| `decode retention` | early-vs-late window tok/s | Late-window tok/s ÷ early-window tok/s after dropping the 10-token warm-up. 100 % ≈ rock-steady; below means thermal throttle or growing KV cost. Sharpens on the 512+-token runs the benchmarks use. `nil` for short runs. |
+| `energy` | `task_info(TASK_POWER_INFO_V2)` `task_energy` delta over decode | Joules the kernel attributes to this process (CPU + GPU) divided by generated tokens. **No `sudo`** — unlike `powermetrics`, this is a plain Mach read. `nil` if the read is unavailable. |
+| `thermal` | `ProcessInfo.thermalState` at start / peak / end | `nominal` → `fair` → `serious` → `critical`. Peak is the worst state seen mid-run, so a throttle that recovers is still visible. |
 
 ### Programmatic access
 
@@ -60,6 +70,11 @@ print(result.stats.prefillGrowthBytes)   // post-prefill – baseline
 print(result.stats.decodeGrowthBytes)    // post-decode  – post-prefill
 print(result.stats.kvCacheUsedBytes)
 print(result.stats.steadyTokensPerSecond ?? "<warm-up only>")
+
+print(result.stats.interTokenLatencyP99Ms ?? "<no decode>")  // worst-case stall
+print(result.stats.sustainedDecodeRatio ?? "<short run>")     // throughput retention
+print(result.stats.joulesPerToken ?? "<energy n/a>")          // decode J ÷ tokens
+print(result.stats.thermalStatePeak.rawValue)                 // nominal/fair/serious/critical
 ```
 
 For a custom report, call `result.stats.formatted()` — that's what the CLI prints.

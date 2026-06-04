@@ -114,6 +114,55 @@ struct BenchTests {
         #expect(row.outputPreview == "hello")
     }
 
+    @Test("BenchRow.init(stats:) carries the energy / latency / thermal axes")
+    func rowCarriesTelemetry() {
+        let stats = GenerationStats(
+            promptTokens: 5, generatedTokens: 16, contextSize: 4096,
+            prefillTimeS: 0.1, decodeTimeS: 1.0, timeToFirstTokenMs: 100,
+            steadyTokensPerSecond: 18.0,
+            baselineGPUBytes: 0, postPrefillGPUBytes: 0, postDecodeGPUBytes: 0,
+            prefillPeakGPUBytes: 0, decodePeakGPUBytes: 0,
+            wiredTicketBytes: 0, weightsBytes: 0,
+            kvCacheAllocatedBytes: 0, kvCacheUsedBytes: 0,
+            thinkPerplexity: nil, genPerplexity: nil,
+            thinkKLDivergence: nil, genKLDivergence: nil,
+            thinkTokenCount: nil, genTokenCount: nil,
+            interTokenLatencyP50Ms: 15, interTokenLatencyP95Ms: 22,
+            interTokenLatencyP99Ms: 31, sustainedDecodeRatio: 0.9,
+            prefillEnergyJoules: 0.5, decodeEnergyJoules: 2.0,
+            thermalStateAtStart: .nominal, thermalStatePeak: .fair,
+            thermalStateAtEnd: .fair)
+        let row = BenchRow(
+            model: "demo/foo", method: "simple", quantization: "4bit",
+            stats: stats, outputPreview: nil)
+        #expect(row.interTokenLatencyP95Ms == 22)
+        #expect(row.sustainedDecodeRatio == 0.9)
+        #expect(row.decodeEnergyJoules == 2.0)
+        #expect(row.joulesPerToken == 0.125)
+        #expect(row.thermalStateAtEnd == "fair")
+    }
+
+    @Test("Unknown thermal maps to nil in the row (kept out of the report)")
+    func rowThermalUnknownIsNil() {
+        let row = BenchRow(
+            model: "demo/foo", method: "simple", quantization: nil,
+            stats: makeStats(), outputPreview: nil)
+        #expect(row.thermalStateAtEnd == nil)
+        #expect(row.joulesPerToken == nil)
+    }
+
+    @Test("Markdown header advertises the new QoS / energy columns")
+    func markdownHasNewColumns() {
+        let report = BenchReport(
+            chip: "test-chip", systemRAMBytes: 0, osVersion: "0.0.0",
+            createdAt: Date(timeIntervalSince1970: 0))
+        let md = BenchmarkWriter.renderMarkdown(report: report)
+        #expect(md.contains("J/tok"))
+        #expect(md.contains("p95 ms"))
+        #expect(md.contains("Retention"))
+        #expect(md.contains("Thermal"))
+    }
+
     // MARK: - BenchmarkWriter
 
     @Test("Writer creates report directory + markdown + JSON sidecar")

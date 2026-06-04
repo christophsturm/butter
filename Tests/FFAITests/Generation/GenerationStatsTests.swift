@@ -138,4 +138,78 @@ struct GenerationStatsTests {
         )
         #expect(!s.formatted().contains("decode (steady)"))
     }
+
+    // MARK: - Energy / latency / thermal axes
+
+    @Test("New telemetry lines are omitted when unset (default)")
+    func telemetryLinesOmittedByDefault() {
+        let out = makeStats().formatted()
+        #expect(!out.contains("inter-token"))
+        #expect(!out.contains("decode retention"))
+        #expect(!out.contains("energy:"))
+        #expect(!out.contains("thermal:"))
+    }
+
+    @Test("joulesPerToken derives decode energy ÷ generated tokens")
+    func joulesPerTokenDerivation() {
+        let s = GenerationStats(
+            promptTokens: 5, generatedTokens: 16, contextSize: 4096,
+            prefillTimeS: 0.1, decodeTimeS: 1.0, timeToFirstTokenMs: 100,
+            steadyTokensPerSecond: 18.0,
+            baselineGPUBytes: 0, postPrefillGPUBytes: 0, postDecodeGPUBytes: 0,
+            prefillPeakGPUBytes: 0, decodePeakGPUBytes: 0,
+            wiredTicketBytes: 0, weightsBytes: 0,
+            kvCacheAllocatedBytes: 0, kvCacheUsedBytes: 0,
+            thinkPerplexity: nil, genPerplexity: nil,
+            thinkKLDivergence: nil, genKLDivergence: nil,
+            thinkTokenCount: nil, genTokenCount: nil,
+            decodeEnergyJoules: 2.0)
+        #expect(s.joulesPerToken == 0.125)
+    }
+
+    @Test("joulesPerToken is nil with no energy or no tokens")
+    func joulesPerTokenNil() {
+        // No energy captured.
+        #expect(makeStats().joulesPerToken == nil)
+        // Energy present but zero generated tokens.
+        let s = GenerationStats(
+            promptTokens: 5, generatedTokens: 0, contextSize: 4096,
+            prefillTimeS: 0.1, decodeTimeS: 0, timeToFirstTokenMs: 100,
+            steadyTokensPerSecond: nil,
+            baselineGPUBytes: 0, postPrefillGPUBytes: 0, postDecodeGPUBytes: 0,
+            prefillPeakGPUBytes: 0, decodePeakGPUBytes: 0,
+            wiredTicketBytes: 0, weightsBytes: 0,
+            kvCacheAllocatedBytes: 0, kvCacheUsedBytes: 0,
+            thinkPerplexity: nil, genPerplexity: nil,
+            thinkKLDivergence: nil, genKLDivergence: nil,
+            thinkTokenCount: nil, genTokenCount: nil,
+            decodeEnergyJoules: 1.0)
+        #expect(s.joulesPerToken == nil)
+    }
+
+    @Test("formatted() renders latency / retention / energy / thermal when set")
+    func telemetryLinesRendered() {
+        let s = GenerationStats(
+            promptTokens: 5, generatedTokens: 16, contextSize: 4096,
+            prefillTimeS: 0.1, decodeTimeS: 1.0, timeToFirstTokenMs: 100,
+            steadyTokensPerSecond: 18.0,
+            baselineGPUBytes: 0, postPrefillGPUBytes: 0, postDecodeGPUBytes: 0,
+            prefillPeakGPUBytes: 0, decodePeakGPUBytes: 0,
+            wiredTicketBytes: 0, weightsBytes: 0,
+            kvCacheAllocatedBytes: 0, kvCacheUsedBytes: 0,
+            thinkPerplexity: nil, genPerplexity: nil,
+            thinkKLDivergence: nil, genKLDivergence: nil,
+            thinkTokenCount: nil, genTokenCount: nil,
+            interTokenLatencyP50Ms: 15.0, interTokenLatencyP95Ms: 22.0,
+            interTokenLatencyP99Ms: 31.0, sustainedDecodeRatio: 0.92,
+            prefillEnergyJoules: 0.5, decodeEnergyJoules: 2.0,
+            thermalStateAtStart: .nominal, thermalStatePeak: .fair,
+            thermalStateAtEnd: .nominal)
+        let out = s.formatted()
+        #expect(out.contains("inter-token (ms): p50 15.00  p95 22.00  p99 31.00"))
+        #expect(out.contains("decode retention: 92.0%"))
+        #expect(out.contains("energy:"))
+        #expect(out.contains("J/token"))
+        #expect(out.contains("thermal:          nominal → peak fair → nominal"))
+    }
 }
