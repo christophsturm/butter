@@ -69,20 +69,24 @@ struct Mamba2TextIntegrationTests {
         // (all-equal) logits would indicate a forward-pass numerical bug.
         #expect(top[0].1 > top[4].1)
 
-        // Greedy generation. Asserts the model produces coherent output
-        // (no stuck-at-one-token, no degenerate alternation cycles).
+        // Greedy generation over a FIXED 64-token window to verify the
+        // SSM + conv1d forward + state cache sustain a long decode.
         //
-        // Cap maxTokens at 64 for this model: Mamba 2 130M is the
-        // smallest published Mamba 2 base LM and at greedy temperature=0
-        // it falls into an ~11-token cycle around token 80-100. The
-        // first 60-70 tokens are fluent (verifying that the SSM + conv1d
-        // forward + state cache work end-to-end) but past that the
-        // small-model quality ceiling kicks in. The other 200-token
-        // integration tests target 0.5B+ models that sustain diversity
-        // over the longer window.
+        // `stopOnEOS = false`: Mamba 2 130M is a *base* LM, and on this
+        // self-completing pangram it emits `<|endoftext|>` (id 0) after
+        // only ~6 fluent tokens (" lazy dog\n\n…") — a correct early
+        // termination, not a forward bug. Disabling EOS-stop forces the
+        // full window so the test exercises sustained decode rather than
+        // the model's natural stop point. At greedy temperature=0 the
+        // 130M falls into an ~11-token cycle past ~token 80, so 64 stays
+        // inside the fluent range.
         let result = try await m.generate(
             prompt: "The quick brown fox jumps over the",
-            parameters: m.defaultGenerationParameters.with { $0.maxTokens = 64; $0.seed = 42 }
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.seed = 42
+                $0.stopOnEOS = false
+            }
         )
         #expect(result.tokensPerSecond > 0)
         expectCoherentOutput(
