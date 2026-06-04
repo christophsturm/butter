@@ -76,13 +76,19 @@ struct LFM2VisionIntegrationTests {
         let imageTokenId = vlm.imageTokenId
         let questionTokens = m.tokenizer.encode(
             text: "Describe this image.")
-        let promptTokens =
-            Array(
-                repeating: imageTokenId,
-                count: vlm.imageTokenCount) + questionTokens
 
         // The shared golden-retriever fixture.
         let image = try VisionTestHelpers.dogImage()
+
+        // Native resolution: the projected vision-token count is per-image
+        // (the aspect-preserving smart-resize), so build exactly that many
+        // image-placeholder tokens.
+        let imageTokens =
+            (vlm.visionEncoder as? LFM2VLComposedEncoder)?
+            .nativeTokenCount(imageWidth: image.width, imageHeight: image.height)
+            ?? vlm.imageTokenCount
+        let promptTokens =
+            Array(repeating: imageTokenId, count: imageTokens) + questionTokens
 
         let generated = try vlm.generate(
             promptTokens: promptTokens, image: image,

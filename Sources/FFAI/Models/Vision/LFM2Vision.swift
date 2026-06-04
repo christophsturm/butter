@@ -270,23 +270,24 @@ public final class LFM2VLProjector: @unchecked Sendable {
     ///
     /// All steps run on the CPU so the Metal command buffer stays pristine
     /// for the text backbone.
-    func project(encoderTokens: Tensor, device: Device) -> Tensor {
+    func project(encoderTokens: Tensor, gridH: Int, gridW: Int, device: Device) -> Tensor {
         let numPatches = encoderTokens.shape[0]
         let visionHidden = encoderTokens.shape[1]
         let d = downsampleFactor
 
-        // The patch sequence is in raster order: row-major over the 2D
-        // grid of patches. patchesPerSide × patchesPerSide = numPatches.
-        let pps = Int(Double(numPatches).squareRoot().rounded())
+        // The patch sequence is row-major over the `gridH × gridW` grid
+        // (square for a fixed-resolution pass; aspect-shaped at native
+        // resolution). Pixel-unshuffle collapses each `d × d` block.
         precondition(
-            pps * pps == numPatches,
-            "LFM2VLProjector: numPatches \(numPatches) must be a perfect square")
+            numPatches == gridH * gridW,
+            "LFM2VLProjector: numPatches \(numPatches) != gridH·gridW \(gridH * gridW)")
         precondition(
-            pps % d == 0,
-            "LFM2VLProjector: patchesPerSide \(pps) must be divisible by downsampleFactor \(d)")
+            gridH % d == 0 && gridW % d == 0,
+            "LFM2VLProjector: grid \(gridH)x\(gridW) must be divisible by downsampleFactor \(d)")
 
-        let superPPS = pps / d  // super-patches per side
-        let numSuperPatches = superPPS * superPPS
+        let superH = gridH / d  // super-patch rows
+        let superW = gridW / d  // super-patch cols
+        let numSuperPatches = superH * superW
         let superPatchDim = visionHidden * d * d
 
         let src = encoderTokens.toFloatArray()
@@ -294,15 +295,15 @@ public final class LFM2VLProjector: @unchecked Sendable {
         // Pixel-unshuffle: for each (sy, sx) super-patch, concatenate the
         // d² constituent patch vectors in row-major (dy, dx) order.
         var unshuffled = [Float](repeating: 0, count: numSuperPatches * superPatchDim)
-        for sy in 0 ..< superPPS {
-            for sx in 0 ..< superPPS {
-                let outRow = sy * superPPS + sx
+        for sy in 0 ..< superH {
+            for sx in 0 ..< superW {
+                let outRow = sy * superW + sx
                 var col = 0
                 for dy in 0 ..< d {
                     for dx in 0 ..< d {
                         let py = sy * d + dy
                         let px = sx * d + dx
-                        let srcRow = py * pps + px
+                        let srcRow = py * gridW + px
                         for c in 0 ..< visionHidden {
                             unshuffled[outRow * superPatchDim + col] =
                                 src[srcRow * visionHidden + c]
@@ -501,11 +502,59 @@ final class LFM2VLComposedEncoder: VisionEncoder {
             dtype: tower.dtype)
     }
 
+    /// Native-resolution preprocess: aspect-preserving smart-resize (so the
+    /// non-square dog isn't squished — the OOD case that made SigLIP2 NaFlex
+    /// hallucinate) + SigLIP normalization, bicubic. `factor = patch·d`
+    /// guarantees the patch grid is divisible by the pixel-unshuffle factor.
+    override func preprocessImage(
+        _ image: RGBImage, device: Device = .shared
+    ) -> Tensor? {
+        let patch = tower.encoder.config.patchSize
+        let d = tower.projector.downsampleFactor
+        let maxPatches = tower.imageTokenCount * d * d
+        let bounds = MediaUtils.SmartResizeBounds(
+            factor: patch * d,
+            minPixels: (patch * d) * (patch * d),
+            maxPixels: maxPatches * patch * patch,
+            maxAspectRatio: 200)
+        guard
+            let (h, w) = try? MediaUtils.smartResize(
+                height: image.height, width: image.width, bounds: bounds)
+        else { return nil }
+        return MediaUtils.resizeNormalize(
+            image, targetW: w, targetH: h, normalization: .siglip,
+            dtype: tower.dtype, mode: .bicubic, device: device)
+    }
+
     override func encode(image: Tensor, device: Device = .shared) -> Tensor {
-        // Run the SigLIP2 forward pass.
+        // The preprocessed image is `[1, 3, H, W]` at native (possibly
+        // non-square) resolution; derive the patch grid and thread it through.
+        let patch = tower.encoder.config.patchSize
+        let gridH = image.shape[2] / patch
+        let gridW = image.shape[3] / patch
         let raw = tower.encoder.encode(image: image, device: device)
-        // Pixel-unshuffle + project.
-        return tower.projector.project(encoderTokens: raw, device: device)
+        return tower.projector.project(
+            encoderTokens: raw, gridH: gridH, gridW: gridW, device: device)
+    }
+
+    /// The number of projected vision tokens this tower emits for an image of
+    /// the given pixel dimensions (after the aspect-preserving smart-resize +
+    /// `d × d` pixel-unshuffle). Native resolution makes this per-image, so
+    /// prompt builders must insert exactly this many image-placeholder tokens.
+    func nativeTokenCount(imageWidth: Int, imageHeight: Int) -> Int {
+        let patch = tower.encoder.config.patchSize
+        let d = tower.projector.downsampleFactor
+        let maxPatches = tower.imageTokenCount * d * d
+        let bounds = MediaUtils.SmartResizeBounds(
+            factor: patch * d,
+            minPixels: (patch * d) * (patch * d),
+            maxPixels: maxPatches * patch * patch,
+            maxAspectRatio: 200)
+        guard
+            let (h, w) = try? MediaUtils.smartResize(
+                height: imageHeight, width: imageWidth, bounds: bounds)
+        else { return tower.imageTokenCount }
+        return (h / patch / d) * (w / patch / d)
     }
 }
 
