@@ -14,7 +14,7 @@
 //
 // Step 3 text backbone — Step-3.5-Flash / Step-3.7-Flash decoder.
 //
-// **Status:** WIP scaffold. This file declares the static shape — the
+// **Status:** Scaffold. This file declares the static shape — the
 // `Step3TextConfig` decoder, the `Step3Hybrid` variant, and the
 // `Step3Model` placeholder — so the loader can identify a Step-3
 // checkpoint and dispatch into the family. Concrete forward / per-layer
@@ -262,8 +262,9 @@ struct Step3TextConfig {
 public enum Step3Hybrid: Step3Variant {
     public static var availableCapabilities: Set<Capability> { [.textIn, .textOut] }
     public static var defaultGenerationParameters: GenerationParameters {
+        // No model-specific maxTokens — callers own generation length.
         GenerationParameters(
-            maxTokens: 256, prefillStepSize: 4096,
+            prefillStepSize: 4096,
             temperature: 1.0, topP: 0.95, topK: 64,
             repetitionPenalty: 1.0)
     }
@@ -285,7 +286,7 @@ public enum Step3Hybrid: Step3Variant {
 
 // ─── Step3Model — placeholder ────────────────────────────────────────
 
-/// Hybrid Step-3 decoder. **WIP** — the concrete `Module` conformance,
+/// Hybrid Step-3 decoder. The concrete `Module` conformance,
 /// per-layer wiring, and `forward` paths land in follow-up commits. The
 /// type exists so the family entry-point + loader dispatch type-check
 /// today.

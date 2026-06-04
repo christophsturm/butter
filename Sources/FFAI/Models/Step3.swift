@@ -33,7 +33,7 @@
 // tower + 2× strided patch-downsampler + projector — lives in
 // `Models/Vision/Step3Vision.swift` alongside the tower internals.
 //
-// **Status:** WIP. Family scaffold + config decoders + loader hook are
+// **Status:** Family scaffold + config decoders + loader hook are
 // in place so a `Step3.7-Flash` checkpoint can be identified end-to-end;
 // the forward path (Step3Model + Step3VLVisionModel) is stubbed and
 // raises `Step3Error.notYetImplemented` on load. Concrete kernels and
@@ -101,9 +101,10 @@ extension Step3Variant {
         // Step-3.x-Flash: 256K context with YARN on full-attention layers,
         // 512-token sliding window on the other 3-of-4. The
         // hybrid-cache shape dominates prefill costing; 4096-step
-        // chunking matches the Gemma 4 hybrid family defaults.
+        // chunking matches the Gemma 4 hybrid family defaults. No
+        // model-specific maxTokens — callers own generation length.
         GenerationParameters(
-            maxTokens: 256, prefillStepSize: 4096,
+            prefillStepSize: 4096,
             temperature: 1.0, topP: 0.95, topK: 64,
             repetitionPenalty: 1.0)
     }
@@ -135,7 +136,7 @@ public enum Step3Error: Error, CustomStringConvertible {
         case .unsupportedRouterShape(let why):
             return "Step3: MoE router shape unsupported: \(why)"
         case .notYetImplemented(let what):
-            return "Step3: \(what) — WIP, not yet implemented"
+            return "Step3: \(what) — not yet implemented"
         }
     }
 }

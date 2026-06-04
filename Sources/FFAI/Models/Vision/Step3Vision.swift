@@ -16,7 +16,7 @@
 // downsamplers + projector, plus the Step-3 vision-language
 // orchestrator (`enum Step3VL`).
 //
-// **Status:** WIP scaffold. This file declares the static shape
+// **Status:** Scaffold. This file declares the static shape
 // (`Step3VLVisionConfig`) and the orchestrator entry point so a
 // `Step3ForConditionalGeneration` checkpoint can be type-identified
 // end-to-end. The tower forward path lands in follow-ups.
@@ -131,7 +131,7 @@ public enum Step3VL {
     /// Build a `VisionModel` from a Step-3 vision-language checkpoint:
     /// the Perception-Encoder vision tower + 2× downsamplers +
     /// projector + Step-3 text backbone, joined by the cross-modal
-    /// splice. **WIP** — both the vision tower forward and the text
+    /// splice. Both the vision tower forward and the text
     /// backbone load throw `Step3Error.notYetImplemented` today; the
     /// scaffold is in place so the loader dispatch type-checks.
     public static func load(
