@@ -433,13 +433,13 @@ public enum ModelRegistry {
             if config.architecture == "MiniCPMV4_6ForConditionalGeneration"
                 || config.modelType == "minicpmv4_6"
             {
-                let vlm = try MiniCPMV4_6.load(
+                let vlm = try MiniCPM4.load(
                     config: config, weights: weights,
                     options: options, device: device)
                 return Loaded(
                     engine: vlm.engine,
                     defaultGenerationParameters: Qwen35Hybrid.defaultGenerationParameters,
-                    availableCapabilities: MiniCPMV4_6.availableCapabilities,
+                    availableCapabilities: MiniCPM4.availableCapabilities,
                     vlModel: vlm)
             }
             // Nemotron-VLM — NVIDIA's Nemotron Nano VL: a ViT tower +

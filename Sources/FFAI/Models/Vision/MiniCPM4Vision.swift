@@ -14,10 +14,10 @@
 //
 // MiniCPM-V 4.6 — vision tower internals.
 //
-// Config structs, SigLIP2 encoder layers, `MiniCPMVViTMerger`,
-// `MiniCPMVMerger`, `MiniCPMVComposedEncoder`, and all encode methods
+// Config structs, SigLIP2 encoder layers, `MiniCPM4ViTMerger`,
+// `MiniCPM4Merger`, `MiniCPM4ComposedEncoder`, and all encode methods
 // live here. The family orchestrator (load entrypoint, public constants,
-// `MiniCPMVError`) lives in `Models/MiniCPMV.swift`.
+// `MiniCPM4Error`) lives in `Models/MiniCPM4.swift`.
 //
 // Reference: `mlx-vlm/mlx_vlm/models/minicpmv4_6/`
 // (`minicpmv4_6.py`, `vision.py`, `processing_minicpmv4_6.py`).
@@ -25,7 +25,7 @@
 import Foundation
 import Metal
 
-// ─── MiniCPMVViTMerger — window cross-attention merger ───────────────
+// ─── MiniCPM4ViTMerger — window cross-attention merger ───────────────
 //
 // One pass of (2,2) grid merging with a window self-attention block,
 // then a flat MLP, with two residual paths:
@@ -35,7 +35,7 @@ import Metal
 //
 // Reference: `VitMerger` in `mlx-vlm/models/minicpmv4_6/minicpmv4_6.py`.
 
-final class MiniCPMVViTMerger {
+final class MiniCPM4ViTMerger {
     /// Per-token LayerNorm applied before the window self-attention.
     let layerNorm1: LayerNorm
     let qProj, kProj, vProj, oProj: Linear
@@ -79,7 +79,7 @@ final class MiniCPMVViTMerger {
         weights: SafeTensorsBundle,
         hidden: Int, nHeads: Int,
         windowIntermediate: Int, eps: Float
-    ) throws -> MiniCPMVViTMerger {
+    ) throws -> MiniCPM4ViTMerger {
         func lin(_ name: String) throws -> Linear {
             Linear(
                 weight: try weights.tensor(named: "\(name).weight"),
@@ -91,7 +91,7 @@ final class MiniCPMVViTMerger {
         let preNorm = LayerNorm(
             weight: try weights.tensor(named: "pre_norm.weight"),
             bias: try weights.tensor(named: "pre_norm.bias"), eps: eps)
-        return MiniCPMVViTMerger(
+        return MiniCPM4ViTMerger(
             layerNorm1: ln1,
             qProj: try lin("self_attn.q_proj"),
             kProj: try lin("self_attn.k_proj"),
@@ -112,11 +112,11 @@ final class MiniCPMVViTMerger {
     ) -> Tensor {
         precondition(
             tokens.shape == [gridH * gridW, hidden],
-            "MiniCPMVViTMerger: tokens \(tokens.shape) ≠ "
+            "MiniCPM4ViTMerger: tokens \(tokens.shape) ≠ "
                 + "[\(gridH * gridW), \(hidden)]")
         precondition(
             gridH % 2 == 0 && gridW % 2 == 0,
-            "MiniCPMVViTMerger: grid \(gridH)x\(gridW) must be (2,2)-divisible")
+            "MiniCPM4ViTMerger: grid \(gridH)x\(gridW) must be (2,2)-divisible")
         let mergedH = gridH / 2
         let mergedW = gridW / 2
         let nWindows = mergedH * mergedW
@@ -246,7 +246,7 @@ final class MiniCPMVViTMerger {
         let stride = nHeads * headDim
         precondition(
             stride == hidden,
-            "MiniCPMVViTMerger: nHeads·headDim must equal hidden")
+            "MiniCPM4ViTMerger: nHeads·headDim must equal hidden")
         var out = [Float](repeating: 0, count: nWindows * 4 * stride)
         let hd = headDim
         let sc = scale
@@ -329,7 +329,7 @@ final class MiniCPMVViTMerger {
     }
 }
 
-// ─── MiniCPMVMerger — final (2,2) reduction + text-hidden projection ──
+// ─── MiniCPM4Merger — final (2,2) reduction + text-hidden projection ──
 //
 // `merger_times` rounds of `MergerBlock`. Each round groups (2,2) tokens
 // into a flat `4·hidden` row, then runs `LayerNorm → Linear → GELU →
@@ -339,7 +339,7 @@ final class MiniCPMVViTMerger {
 //                                  → pre_norm → linear_1 → GELU → linear_2
 //                                  → [num_windows/4, text_hidden]   (8×8 = 64)
 
-final class MiniCPMVMerger {
+final class MiniCPM4Merger {
     /// One round per `merger_times`. Each block is consumed in order.
     let blocks: [MergerBlock]
     let mergeH: Int = 2
@@ -348,7 +348,7 @@ final class MiniCPMVMerger {
     init(blocks: [MergerBlock]) {
         precondition(
             !blocks.isEmpty,
-            "MiniCPMVMerger: must have at least one MergerBlock")
+            "MiniCPM4Merger: must have at least one MergerBlock")
         self.blocks = blocks
     }
 
@@ -360,10 +360,10 @@ final class MiniCPMVMerger {
         weights: SafeTensorsBundle,
         hidden: Int, textHidden: Int, mergerTimes: Int,
         eps: Float
-    ) throws -> MiniCPMVMerger {
+    ) throws -> MiniCPM4Merger {
         precondition(
             mergerTimes >= 1,
-            "MiniCPMVMerger: mergerTimes must be ≥ 1, got \(mergerTimes)")
+            "MiniCPM4Merger: mergerTimes must be ≥ 1, got \(mergerTimes)")
         var blocks: [MergerBlock] = []
         for i in 0 ..< mergerTimes {
             let p = "mlp.\(i)"
@@ -381,7 +381,7 @@ final class MiniCPMVMerger {
                     preNorm: preNorm,
                     linear1: try lin("linear_1"), linear2: try lin("linear_2")))
         }
-        return MiniCPMVMerger(blocks: blocks)
+        return MiniCPM4Merger(blocks: blocks)
     }
 
     /// Run all rounds. `tokens` is `[gridH·gridW, hidden]` row-major
@@ -476,16 +476,16 @@ final class MergerBlock {
     }
 }
 
-// ─── MiniCPMVComposedEncoder ─────────────────────────────────────────
+// ─── MiniCPM4ComposedEncoder ─────────────────────────────────────────
 //
 // A `VisionEncoder` subclass whose `encode` runs the SigLIP2 stack
 // with `vit_merger` injected after `insertLayerId`, then `post_layernorm`,
 // then `merger`. The exposed `numPatches` is the final token count
 // (after both mergers), so `VisionModel.imageTokenCount` is correct.
 
-final class MiniCPMVComposedEncoder: VisionEncoder {
-    let vitMerger: MiniCPMVViTMerger
-    let merger: MiniCPMVMerger
+final class MiniCPM4ComposedEncoder: VisionEncoder {
+    let vitMerger: MiniCPM4ViTMerger
+    let merger: MiniCPM4Merger
     let insertLayerId: Int
     /// Initial patch grid (`runtimeImageSize / patchSize`).
     let initialGridSide: Int
@@ -497,7 +497,7 @@ final class MiniCPMVComposedEncoder: VisionEncoder {
         patchEmbedWeight: Tensor, patchEmbedBias: Tensor,
         positionEmbedding: Tensor, layers: [VisionEncoderLayer],
         postLayerNorm: LayerNorm,
-        vitMerger: MiniCPMVViTMerger, merger: MiniCPMVMerger,
+        vitMerger: MiniCPM4ViTMerger, merger: MiniCPM4Merger,
         insertLayerId: Int, initialGridSide: Int, outputTokenCount: Int,
         dtype: DType
     ) {
@@ -526,7 +526,7 @@ final class MiniCPMVComposedEncoder: VisionEncoder {
         visionWeights: SafeTensorsBundle, mergerWeights: SafeTensorsBundle,
         vitMergerOverride: SafeTensorsBundle,
         device: Device
-    ) throws -> MiniCPMVComposedEncoder {
+    ) throws -> MiniCPM4ComposedEncoder {
         guard let hidden = visionConfig.int("hidden_size"),
             let storedImageSize = visionConfig.int("image_size"),
             let patchSize = visionConfig.int("patch_size"),
@@ -534,7 +534,7 @@ final class MiniCPMVComposedEncoder: VisionEncoder {
             let nLayers = visionConfig.int("num_hidden_layers"),
             let nHeads = visionConfig.int("num_attention_heads")
         else {
-            throw MiniCPMVError.missingConfig(
+            throw MiniCPM4Error.missingConfig(
                 "vision_config hidden_size / image_size / patch_size / "
                     + "intermediate_size / num_hidden_layers / num_attention_heads")
         }
@@ -624,12 +624,12 @@ final class MiniCPMVComposedEncoder: VisionEncoder {
         // (the config also carries it but the weight is authoritative).
         let l1 = try vitMergerWeights.tensor(named: "linear_1.weight")
         let windowIntermediate = l1.shape[0]
-        let vitMerger = try MiniCPMVViTMerger.load(
+        let vitMerger = try MiniCPM4ViTMerger.load(
             weights: vitMergerWeights, hidden: hidden, nHeads: nHeads,
             windowIntermediate: windowIntermediate, eps: eps)
 
         // ── merger ────────────────────────────────────────────────────
-        let merger = try MiniCPMVMerger.load(
+        let merger = try MiniCPM4Merger.load(
             weights: mergerWeights, hidden: hidden,
             textHidden: textHidden, mergerTimes: mergerTimes, eps: eps)
 
@@ -649,7 +649,7 @@ final class MiniCPMVComposedEncoder: VisionEncoder {
             intermediate: intermediate, nLayers: nLayers, nHeads: nHeads,
             layerNormEps: eps, textHidden: textHidden)
 
-        return MiniCPMVComposedEncoder(
+        return MiniCPM4ComposedEncoder(
             config: cfg, patchEmbedWeight: patchW, patchEmbedBias: patchB,
             positionEmbedding: posEmb, layers: layers, postLayerNorm: postLN,
             vitMerger: vitMerger, merger: merger,
@@ -681,12 +681,12 @@ final class MiniCPMVComposedEncoder: VisionEncoder {
     override func encode(frames: [Tensor], device: Device = .shared) throws -> Tensor {
         precondition(
             !frames.isEmpty,
-            "MiniCPMVComposedEncoder.encode(frames:): expected at least one frame")
+            "MiniCPM4ComposedEncoder.encode(frames:): expected at least one frame")
         let expectedShape = [1, config.inChannels, config.imageSize, config.imageSize]
         for (i, frame) in frames.enumerated() {
             precondition(
                 frame.shape == expectedShape,
-                "MiniCPMVComposedEncoder.encode(frames:): frame[\(i)] shape "
+                "MiniCPM4ComposedEncoder.encode(frames:): frame[\(i)] shape "
                     + "\(frame.shape) ≠ \(expectedShape)")
         }
 
@@ -808,7 +808,7 @@ final class MiniCPMVComposedEncoder: VisionEncoder {
 /// Apply a `Linear` `[outDim, inDim]` to every row of a `[nRows, inDim]`
 /// tensor: `Ops.gemm` for the matmul, then broadcast-add the bias to
 /// every row. Same shape as `VisionEncoderLayer.projectRows` — pulled
-/// out here so `MiniCPMVViTMerger` / `MergerBlock` share the helper.
+/// out here so `MiniCPM4ViTMerger` / `MergerBlock` share the helper.
 private func applyLinear(
     _ linear: Linear, _ x: Tensor, nRows: Int,
     outDim: Int, on cmd: MTLCommandBuffer
@@ -826,10 +826,10 @@ private func applyLinear(
     return Ops.add(y, tiled, on: cmd)
 }
 
-/// Internal alias so `MiniCPMVViTMerger` can call the shared
+/// Internal alias so `MiniCPM4ViTMerger` can call the shared
 /// `applyLinear` from inside an instance method (Swift's name lookup
 /// otherwise requires the helper to be a method).
-extension MiniCPMVViTMerger {
+extension MiniCPM4ViTMerger {
     fileprivate func projectRows(
         _ linear: Linear, _ x: Tensor, nRows: Int,
         outDim: Int, on cmd: MTLCommandBuffer

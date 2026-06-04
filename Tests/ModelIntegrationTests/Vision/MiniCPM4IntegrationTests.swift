@@ -26,7 +26,7 @@
 // The base checkpoint is ~9B params (~18 GB bf16) — skipped unless
 // already cached locally.
 // Now also covers the video path for the same checkpoint (merged from the
-// prior MiniCPMVVideoIntegrationTests.swift).
+// prior MiniCPM4VideoIntegrationTests.swift).
 
 import Foundation
 import TestHelpers
@@ -35,12 +35,12 @@ import Testing
 @testable import FFAI
 
 @Suite(
-    "MiniCPMV Vision Integration (image + video)", .serialized,
+    "MiniCPM4 Vision Integration (image + video)", .serialized,
     .enabled(
         if: IntegrationGroupGating.enableVisionSuites,
         IntegrationGroupGating.visionSkipReason)
 )
-struct MiniCPMVIntegrationTests {
+struct MiniCPM4IntegrationTests {
 
     static let modelId = "mlx-community/MiniCPM-V-4.6-4bit"
 
@@ -67,8 +67,8 @@ struct MiniCPMVIntegrationTests {
         // v1: 448×448 / patch-14 → 32×32 patches → vit_merger 16×16 →
         // merger 8×8 = 64 tokens per image (matches `query_num: 64`).
         #expect(vlm.imageTokenCount == 64)
-        #expect(vlm.imageTokenId == MiniCPMV4_6.defaultImageTokenId)
-        #expect(vlm.visionEncoder.config.imageSize == MiniCPMV4_6.runtimeImageSize)
+        #expect(vlm.imageTokenId == MiniCPM4.defaultImageTokenId)
+        #expect(vlm.visionEncoder.config.imageSize == MiniCPM4.runtimeImageSize)
         #expect(vlm.visionEncoder.config.patchSize == 14)
         #expect(vlm.visionEncoder.config.hidden == 1152)
         #expect(vlm.visionEncoder.config.nLayers == 27)
@@ -139,10 +139,10 @@ struct MiniCPMVIntegrationTests {
             vlm.videoTokenId != nil,
             "video_token_id should be threaded through from config")
         #expect(
-            vlm.videoTokenId == MiniCPMV4_6.defaultVideoTokenId,
+            vlm.videoTokenId == MiniCPM4.defaultVideoTokenId,
             "video_token_id should be 248057 (<|video_pad|>)")
         #expect(
-            vlm.imageTokenId == MiniCPMV4_6.defaultImageTokenId,
+            vlm.imageTokenId == MiniCPM4.defaultImageTokenId,
             "image_token_id should be 248056 (<|image_pad|>)")
         // Each frame produces 64 merged tokens (32×32 → vit_merger 16×16
         // → merger 8×8 = 64) for the v1 448×448 path.

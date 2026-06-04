@@ -47,7 +47,7 @@
 //
 // Vision tower internals (config structs, SigLIP encoder, vit_merger,
 // merger, composed encoder, encode methods) live in
-// `Models/Vision/MiniCPMVVision.swift`. This file is the family
+// `Models/Vision/MiniCPM4Vision.swift`. This file is the family
 // orchestrator (load entrypoint + public constants).
 
 import Foundation
@@ -55,7 +55,7 @@ import Metal
 
 // ─── Family entry point ──────────────────────────────────────────────
 
-public enum MiniCPMV4_6 {
+public enum MiniCPM4 {
     public static let modelTypes: Set<String> = ["minicpmv4_6"]
     public static let architectures: Set<String> =
         ["MiniCPMV4_6ForConditionalGeneration"]
@@ -95,7 +95,7 @@ public enum MiniCPMV4_6 {
         guard let visionConfig = config.subConfig("vision_config"),
             config.nested("text_config") != nil
         else {
-            throw MiniCPMVError.missingConfig(
+            throw MiniCPM4Error.missingConfig(
                 "vision_config / text_config")
         }
 
@@ -124,7 +124,7 @@ public enum MiniCPMV4_6 {
         let visionWeights = weights.prefixed("vision_tower.")
         let mergerWeights = weights.prefixed("merger.")
         let vitMergerWeights = weights.prefixed("vit_merger.")
-        let composed = try MiniCPMVComposedEncoder.load(
+        let composed = try MiniCPM4ComposedEncoder.load(
             visionConfig: visionConfig,
             insertLayerId: config.int("insert_layer_id") ?? 6,
             mergerTimes: config.int("merger_times") ?? 1,
@@ -146,7 +146,7 @@ public enum MiniCPMV4_6 {
     }
 }
 
-public enum MiniCPMVError: Error, CustomStringConvertible {
+public enum MiniCPM4Error: Error, CustomStringConvertible {
     case missingConfig(String)
     case unsupportedConfig(String)
     public var description: String {

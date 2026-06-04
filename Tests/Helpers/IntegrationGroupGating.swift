@@ -79,7 +79,7 @@ public enum IntegrationGroupGating {
     /// models). Status: pending verification (run after quantized).
     public static let enableKVCacheMatrixSuite: Bool = false
 
-    /// VLM integration suites (Paligemma, GlmOcr, MiniCPMV, Idefics3,
+    /// VLM integration suites (Paligemma, GlmOcr, MiniCPM4, Idefics3,
     /// Mistral3, FastVLM, Gemma3/4 VL, LFM2 VL, NemotronH VL, Qwen2/2.5/3/3.5
     /// VL, SmolVLM2). After commit `f8b87cb` every unverified
     /// sdpaBidirectional shape (d ∈ {32, 64, 80, 96}) routes through

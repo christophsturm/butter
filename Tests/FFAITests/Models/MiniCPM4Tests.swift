@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// MiniCPMVTests — root-file unit tests for `Sources/FFAI/Models/MiniCPMV.swift`.
+// MiniCPM4Tests — root-file unit tests for `Sources/FFAI/Models/MiniCPM4.swift`.
 //
 // Offline. MiniCPM-V-4.6 registration + the bilinear position-embed
 // resample helper are already covered by
-// `Tests/FFAITests/Models/Vision/MiniCPMVTests.swift`. This file
-// focuses on the family-root constants + `MiniCPMVError`
+// `Tests/FFAITests/Models/Vision/MiniCPM4Tests.swift`. This file
+// focuses on the family-root constants + `MiniCPM4Error`
 // descriptions + the multi-modality capability advertisement.
 
 import Foundation
@@ -26,25 +26,25 @@ import Testing
 @testable import FFAI
 
 @Suite("MiniCPM-V Family Root — error + multi-modality capabilities")
-struct MiniCPMVRootTests {
+struct MiniCPM4RootTests {
 
-    @Test("MiniCPMV4_6 advertises the canonical model_type + architecture")
+    @Test("MiniCPM4 advertises the canonical model_type + architecture")
     func registration() {
-        #expect(MiniCPMV4_6.modelTypes.contains("minicpmv4_6"))
+        #expect(MiniCPM4.modelTypes.contains("minicpmv4_6"))
         #expect(
-            MiniCPMV4_6.architectures
+            MiniCPM4.architectures
                 .contains("MiniCPMV4_6ForConditionalGeneration"))
     }
 
     @Test("token id defaults match the shipped checkpoint")
     func tokenIdDefaults() {
-        #expect(MiniCPMV4_6.defaultImageTokenId == 248_056)
-        #expect(MiniCPMV4_6.defaultVideoTokenId == 248_057)
+        #expect(MiniCPM4.defaultImageTokenId == 248_056)
+        #expect(MiniCPM4.defaultVideoTokenId == 248_057)
     }
 
     @Test("availableCapabilities advertise text + image + video in")
     func capabilities() {
-        let caps = MiniCPMV4_6.availableCapabilities
+        let caps = MiniCPM4.availableCapabilities
         #expect(caps.contains(.textIn))
         #expect(caps.contains(.textOut))
         #expect(caps.contains(.imageIn))
@@ -53,15 +53,15 @@ struct MiniCPMVRootTests {
 
     @Test("runtimeImageSize is the 448px tile the chat template emits")
     func runtimeImageSize() {
-        #expect(MiniCPMV4_6.runtimeImageSize == 448)
+        #expect(MiniCPM4.runtimeImageSize == 448)
     }
 
-    @Test("MiniCPMVError stringifies every case with its payload")
+    @Test("MiniCPM4Error stringifies every case with its payload")
     func errorDescriptions() {
         #expect(
-            MiniCPMVError.missingConfig("vision_config").description
+            MiniCPM4Error.missingConfig("vision_config").description
                 .contains("vision_config"))
-        #expect(MiniCPMVError.unsupportedConfig("bad").description.contains("bad"))
-        #expect(MiniCPMVError.missingConfig("x").description.contains("MiniCPM-V"))
+        #expect(MiniCPM4Error.unsupportedConfig("bad").description.contains("bad"))
+        #expect(MiniCPM4Error.missingConfig("x").description.contains("MiniCPM-V"))
     }
 }

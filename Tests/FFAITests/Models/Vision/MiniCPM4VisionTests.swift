@@ -14,7 +14,7 @@
 //
 // MiniCPM-V 4.6 — pure-logic unit coverage. The GPU-bound encoder
 // machinery (vit_merger + merger window cross-attention) is exercised
-// by `Tests/ModelTests/MiniCPMVIntegrationTests.swift`.
+// by `Tests/ModelTests/MiniCPM4IntegrationTests.swift`.
 
 import Foundation
 import Metal
@@ -24,14 +24,14 @@ import Testing
 
 // ─── Family registration ─────────────────────────────────────────────
 
-@Suite("MiniCPMV Vision Registration")
-struct MiniCPMVRegistrationTests {
+@Suite("MiniCPM4 Vision Registration")
+struct MiniCPM4RegistrationTests {
 
-    @Test("MiniCPMV4_6 owns the minicpmv4_6 model_type + ConditionalGeneration arch")
+    @Test("MiniCPM4 owns the minicpmv4_6 model_type + ConditionalGeneration arch")
     func familyStrings() {
-        #expect(MiniCPMV4_6.modelTypes.contains("minicpmv4_6"))
+        #expect(MiniCPM4.modelTypes.contains("minicpmv4_6"))
         #expect(
-            MiniCPMV4_6.architectures.contains(
+            MiniCPM4.architectures.contains(
                 "MiniCPMV4_6ForConditionalGeneration"))
     }
 
@@ -44,14 +44,14 @@ struct MiniCPMVRegistrationTests {
 
     @Test("default image_token_id matches the checkpoint chat template")
     func defaultImageTokenId() {
-        #expect(MiniCPMV4_6.defaultImageTokenId == 248056)
+        #expect(MiniCPM4.defaultImageTokenId == 248056)
     }
 }
 
 // ─── Position-embedding bilinear interpolation ───────────────────────
 
-@Suite("MiniCPMV Vision Position Embedding Interpolation")
-struct MiniCPMVPosEmbInterpTests {
+@Suite("MiniCPM4 Vision Position Embedding Interpolation")
+struct MiniCPM4PosEmbInterpTests {
 
     /// Identity case: target side equals stored side → returned tensor
     /// is the original (no work, no precision drift).
