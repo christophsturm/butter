@@ -19,11 +19,9 @@
 // Energy is read from the kernel's per-task power accounting via
 // `task_info(TASK_POWER_INFO_V2)`. On Apple Silicon the `task_energy`
 // field is the cumulative energy (nanojoules) the kernel attributes to
-// this process — CPU + GPU work folded into one counter. Crucially it
-// needs **no elevated privileges**: unlike `powermetrics` (which the
-// external benchmarks shell out to under sudo), this is a plain Mach
-// call any process can make. We sample the cumulative counter at each
-// phase boundary and take deltas, exactly like the GPU-memory tracker.
+// this process — CPU + GPU work folded into one counter. This is a plain
+// Mach call. We sample the cumulative counter at each phase boundary and 
+// take deltas, exactly like the GPU-memory tracker.
 //
 // Thermal is `ProcessInfo.thermalState` — a cached property the OS
 // updates on notifications, so reading it per token is near-free. We

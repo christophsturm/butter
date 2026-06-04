@@ -55,7 +55,7 @@ The last four lines are the **quality-of-service + energy axes** — the dimensi
 | `wired ticket` | `MTLDevice.recommendedMaxWorkingSetSize` | The OS's wired-memory budget for this device. |
 | `inter-token (ms)` | percentiles of the per-token decode wall-clock series | p50 / p95 / p99 of the gap between consecutive tokens. The tail (p95/p99) is the worst-case UI stall a mean tok/s smooths away. `nil` until decode produces tokens. |
 | `decode retention` | early-vs-late window tok/s | Late-window tok/s ÷ early-window tok/s after dropping the 10-token warm-up. 100 % ≈ rock-steady; below means thermal throttle or growing KV cost. Sharpens on the 512+-token runs the benchmarks use. `nil` for short runs. |
-| `energy` | `task_info(TASK_POWER_INFO_V2)` `task_energy` delta over decode | Joules the kernel attributes to this process (CPU + GPU) divided by generated tokens. **No `sudo`** — unlike `powermetrics`, this is a plain Mach read. `nil` if the read is unavailable. |
+| `energy` | `task_info(TASK_POWER_INFO_V2)` `task_energy` delta over decode | Joules the kernel attributes to this process (CPU + GPU) divided by generated tokens. This is a plain Mach read. `nil` if the read is unavailable. |
 | `thermal` | `ProcessInfo.thermalState` at start / peak / end | `nominal` → `fair` → `serious` → `critical`. Peak is the worst state seen mid-run, so a throttle that recovers is still visible. |
 
 ### Programmatic access
