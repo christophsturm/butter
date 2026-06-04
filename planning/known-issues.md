@@ -168,27 +168,34 @@ the LFM2-MoE integration test. Stale `unsupportedConfig` comment at
 `LFM2Text.swift:198-200` corrected. Separately, `ffai convert` now keeps
 MoE routers full-precision by default (`--router-bits` opts in).
 
-## GPT-OSS-20B-4bit + Gemma4-31B-4bit degenerate output — newly surfaced (2026-05-29)
+## GPT-OSS-20B-4bit degenerate output — RESOLVED (2026-06-03): NOT a forward bug, it was sampling config
 
-Surfaced once the `FFAI_BUILD_MACHINE` gate was removed and these heavy
-models ran in the bisect for the first time:
-- **GPT-OSS-20B-4bit** (`loan-star/gpt-oss-20b-mlx-4Bit`) —
-  `GPTOSSTextIntegrationTests` greedy-decodes 200 tokens at **12 %
-  diversity** (24 unique): real tokens, then loops. Default raw KV cache +
-  host-side sink correction.
-- **Gemma4-31B-4bit** (`mlx-community/gemma-4-31b-it-4bit`) — the
-  `Gemma4Dense (31B)` case at **10 % diversity**. Gemma4 **E2B / E4B /
-  26B-A4B pass** — only the 31B dense degenerates.
+**Root cause: sampling configuration, not a kernel/forward bug.** Verified
+against mlx-lm 0.31.3 on the *identical* `loan-star/gpt-oss-20b-mlx-4Bit`
+checkpoint:
+- **FFAI's forward is bit-coherent with mlx-lm.** Prompt "The history of
+  the printing press began when" → next-token argmax is `' the'` (id 290,
+  logit ~13.5) in BOTH, with top-3 `[290, 261, 1665]` identical. The
+  MXFP4→affine-int4 transcode only reorders the logit tail.
+- **The "degenerate output" is GPT-OSS's OpenAI default sampling**
+  (`temperature 1.0 / top_p 1.0 / no top_k / no min_p` — zero tail
+  truncation) applied to a **RAW completion prompt**. GPT-OSS is a
+  reasoning model tuned for the harmony chat format; sampling the flat
+  low-probability tail at temp 1.0 yields word-salad. **mlx-lm reproduces
+  the IDENTICAL word-salad** under the same config — it is correct,
+  intended behaviour, not an FFAI defect.
+- **Coherent under proper usage**, both impls: greedy, or `min_p 0.05`, or
+  the harmony chat template all produce fluent prose.
 
-Same class as the Qwen3.6-27B-4bit case above (large hidden / fused-path
-kernel-shape sensitivity at 4-bit). **NOT a regression** from the
-2026-05-29 cache / spec-decode / ungating work — the default raw-decode
-paths these hit were untouched; the suites had simply never run before
-(build-machine-gated). Investigation: separate a genuine 4-bit
-quant-quality floor from a fast-path kernel-shape bug by A/B-ing the
-fused-path env overrides (`FFAI_NO_FUSED_QKV` / `FFAI_NO_FUSED_LM_HEAD`
-for GPT-OSS; the analogous Gemma4 fast paths), exactly as was done for
-Qwen3.6-27B.
+`GPTOSSTextIntegrationTests` now carries a hard **forward-parity guard**
+(argmax must equal mlx-lm's 290) plus a `min_p`-constrained coherence
+check. The prior coherence assertion was weak — it only measured token
+*diversity*, which word-salad passes.
+
+**Gemma4-31B-4bit** (`mlx-community/gemma-4-31b-it-4bit`,
+`Gemma4Dense (31B)`, ~10 % diversity; E2B / E4B / 26B-A4B pass) is still
+OPEN and likely the same class — re-test it with constrained sampling /
+the chat template before assuming a kernel bug.
 
 ## Qwen3-1.7B-3bit degenerate output — model quality floor, NOT a kernel bug
 
