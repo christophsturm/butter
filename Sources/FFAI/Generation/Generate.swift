@@ -258,6 +258,10 @@ extension Model {
         }()
         let weightsBytes = engine.parameters().reduce(0) { $0 + $1.1.byteCount }
         let memTracker = PhaseMemoryTracker()
+        // Energy (per-task kernel counter) + thermal state, sampled at
+        // the same phase boundaries as memory. Both are best-effort and
+        // sudo-free; see EnergyStats.
+        let energyTracker = EnergyThermalTracker()
 
         // Path selector for the sampling step:
         //
@@ -346,6 +350,7 @@ extension Model {
                 cmd.commit()
                 cmd.waitUntilCompleted()
                 memTracker.sample()
+                energyTracker.sampleThermal()
                 pos = end
             }
             if n > 0 {
@@ -356,6 +361,7 @@ extension Model {
             }
         }
         memTracker.endPrefill()
+        energyTracker.endPrefill()
         let prefillTime = Date().timeIntervalSince(prefillStart)
         profile.recordPhase("prefill", durationS: prefillTime)
         profile.event("ttft")
@@ -366,11 +372,12 @@ extension Model {
                 Double(promptTokens.count) / max(prefillTime, 1e-9)))
 
         if promptTokens.isEmpty {
+            energyTracker.endDecode()
             let stats = makeStats(
                 promptTokens: promptTokens, generatedCount: 0,
                 contextSize: engine.maxContextWindow, prefillTime: 0, decodeTime: 0,
                 ttftMs: 0, perTokenWallclock: [],
-                memTracker: memTracker, caches: caches,
+                memTracker: memTracker, energyTracker: energyTracker, caches: caches,
                 weightsBytes: weightsBytes, splitTokens: nil
             )
             continuation.yield(
@@ -407,6 +414,7 @@ extension Model {
             }
             tokenHistory.append(priorToken)
             memTracker.sample()
+            energyTracker.sampleThermal()
             let now = Date()
             perTokenWallclock.append(now.timeIntervalSince(lastStep))
             lastStep = now
@@ -414,6 +422,7 @@ extension Model {
         }
         let decodeTime = Date().timeIntervalSince(decodeStart)
         memTracker.endDecode()
+        energyTracker.endDecode()
         profile.recordPhase("ttft", durationS: ttftMs / 1000)
         profile.recordPhase("decode", durationS: decodeTime)
         profile.recordPhase("generation_total", durationS: prefillTime + decodeTime)
@@ -429,7 +438,7 @@ extension Model {
             contextSize: engine.maxContextWindow, prefillTime: prefillTime,
             decodeTime: decodeTime, ttftMs: ttftMs,
             perTokenWallclock: perTokenWallclock,
-            memTracker: memTracker, caches: caches,
+            memTracker: memTracker, energyTracker: energyTracker, caches: caches,
             weightsBytes: weightsBytes, splitTokens: split
         )
 
@@ -445,7 +454,8 @@ extension Model {
         promptTokens: [Int], generatedCount: Int, contextSize: Int,
         prefillTime: Double, decodeTime: Double, ttftMs: Double,
         perTokenWallclock: [Double],
-        memTracker: PhaseMemoryTracker, caches: [any LayerCacheProtocol],
+        memTracker: PhaseMemoryTracker, energyTracker: EnergyThermalTracker,
+        caches: [any LayerCacheProtocol],
         weightsBytes: Int, splitTokens: ThinkingSplit.Split?
     ) -> GenerationStats {
         let steady: Double? = {
@@ -477,7 +487,16 @@ extension Model {
             thinkKLDivergence: nil,
             genKLDivergence: nil,
             thinkTokenCount: splitTokens.map { $0.thinkTokens.count },
-            genTokenCount: splitTokens.map { $0.genTokens.count }
+            genTokenCount: splitTokens.map { $0.genTokens.count },
+            interTokenLatencyP50Ms: DecodeTimeline.percentileMs(perTokenWallclock, 0.50),
+            interTokenLatencyP95Ms: DecodeTimeline.percentileMs(perTokenWallclock, 0.95),
+            interTokenLatencyP99Ms: DecodeTimeline.percentileMs(perTokenWallclock, 0.99),
+            sustainedDecodeRatio: DecodeTimeline.sustainedRetention(perTokenWallclock),
+            prefillEnergyJoules: energyTracker.prefillEnergyJoules,
+            decodeEnergyJoules: energyTracker.decodeEnergyJoules,
+            thermalStateAtStart: energyTracker.thermalAtStart,
+            thermalStatePeak: energyTracker.thermalPeak,
+            thermalStateAtEnd: energyTracker.thermalAtEnd
         )
     }
 }

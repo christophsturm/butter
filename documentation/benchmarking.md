@@ -90,12 +90,12 @@ The markdown re-renders from the JSON sidecar on every append:
 - OS: 15.4.0
 - Created: 2026-05-15T13:00:00Z
 
-| Model | Method | Quant | Ctx | Prompt | Prefill tok/s | Decode tok/s | Steady tok/s | TTFT (ms) | Gen tokens | Baseline GPU | Peak GPU | KV used | Weights | Gen PPL | Gen KLD | Sample |
-|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|
-| unsloth/Llama-3.2-1B | simple | bf16 | 131072 | 5 | 60.71 | 64.06 | 65.20 | 82.34 | 64 | 1.21 GB | 1.27 GB | 4.5 MB | 1.15 GB | - | - | Once upon a time, ... |
+| Model | Method | Quant | Ctx | Prompt | Prefill tok/s | Decode tok/s | Steady tok/s | TTFT (ms) | Gen tokens | Baseline GPU | Peak GPU | KV used | Weights | Gen PPL | Gen KLD | J/tok | p95 ms | Retention | Thermal | Sample |
+|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|---|
+| unsloth/Llama-3.2-1B | simple | bf16 | 131072 | 5 | 60.71 | 64.06 | 65.20 | 82.34 | 64 | 1.21 GB | 1.27 GB | 4.5 MB | 1.15 GB | - | - | 0.1840 | 22.40 | 96% | nominal | Once upon a time, ... |
 ```
 
-Field-for-field, the row schema mirrors mlx-swift-lm's `ResultRow` so analysis scripts (jq queries, plotting tools) work cross-repo without modification. The full schema lives in [`Sources/FFAI/Benchmark/BenchmarkWriter.swift`](../Sources/FFAI/Benchmark/BenchmarkWriter.swift).
+The shared throughput / memory / quality columns mirror mlx-swift-lm's `ResultRow` field-for-field, so analysis scripts (jq queries, plotting tools) work cross-repo without modification. The four trailing columns — **`J/tok`** (energy per token), **`p95 ms`** (inter-token latency tail), **`Retention`** (late-vs-early decode tok/s), and **`Thermal`** (end-of-run state) — are FFAI-specific quality-of-service + energy axes that put a run head-to-head with the cross-framework Apple-Silicon benchmarks. The markdown surfaces a curated subset; the JSON sidecar carries the full set (p50/p95/p99, retention, per-phase joules). The schema lives in [`Sources/FFAI/Benchmark/BenchmarkWriter.swift`](../Sources/FFAI/Benchmark/BenchmarkWriter.swift); the underlying fields are documented in [observability.md](observability.md#what-each-field-means).
 
 ## CLI streaming semantics
 

@@ -100,6 +100,46 @@ public struct GenerationStats: Sendable {
     public let thinkTokenCount: Int?
     public let genTokenCount: Int?
 
+    // ─── Inter-token latency distribution (decode, ms) ───────────────
+    //
+    // Percentiles of the gap between consecutive decode tokens. Mean
+    // tok/s hides the tail; p95 / p99 surface the worst-case stalls a
+    // user actually feels. `nil` until the decode loop produces tokens.
+
+    public let interTokenLatencyP50Ms: Double?
+    public let interTokenLatencyP95Ms: Double?
+    public let interTokenLatencyP99Ms: Double?
+
+    /// Decode-throughput retention: late-window tok/s ÷ early-window
+    /// tok/s over the run. 1.0 ≈ steady, <1.0 ≈ thermal / KV drift.
+    /// `nil` for runs too short to judge (see `DecodeTimeline`).
+    public let sustainedDecodeRatio: Double?
+
+    // ─── Energy + thermal ────────────────────────────────────────────
+    //
+    // Energy is the kernel's per-task counter (CPU+GPU, no sudo); see
+    // `EnergyStats`. `nil` when the Mach read is unavailable.
+
+    /// Joules attributed to this process during prefill.
+    public let prefillEnergyJoules: Double?
+    /// Joules attributed to this process during decode.
+    public let decodeEnergyJoules: Double?
+
+    /// Process thermal state at the start of generation, the worst
+    /// (peak) state seen during it, and the state at the end. `.unknown`
+    /// when not captured (hand-built stats / empty prompt).
+    public let thermalStateAtStart: ThermalState
+    public let thermalStatePeak: ThermalState
+    public let thermalStateAtEnd: ThermalState
+
+    /// Energy per generated token over the decode phase — the headline
+    /// efficiency number. `nil` when energy was unavailable or no tokens
+    /// were generated.
+    public var joulesPerToken: Double? {
+        guard let e = decodeEnergyJoules, generatedTokens > 0 else { return nil }
+        return e / Double(generatedTokens)
+    }
+
     // ─── Scaffold for future modes ───────────────────────────────────
     //
     // Uncomment + populate when the corresponding capability ships.
@@ -114,6 +154,78 @@ public struct GenerationStats: Sendable {
     //   public let acceptanceRate: Double?
     //   public let draftTokensPerSecond: Double?
     //   public let draftAcceptedTokens: Int?
+
+    // ─── Init ─────────────────────────────────────────────────────────
+    //
+    // Explicit so the new telemetry params can default — every existing
+    // call site predates them and passes only through `genTokenCount:`.
+    // Keep the new params trailing + defaulted to preserve that.
+
+    public init(
+        promptTokens: Int,
+        generatedTokens: Int,
+        contextSize: Int,
+        prefillTimeS: Double,
+        decodeTimeS: Double,
+        timeToFirstTokenMs: Double,
+        steadyTokensPerSecond: Double?,
+        baselineGPUBytes: Int,
+        postPrefillGPUBytes: Int,
+        postDecodeGPUBytes: Int,
+        prefillPeakGPUBytes: Int,
+        decodePeakGPUBytes: Int,
+        wiredTicketBytes: Int,
+        weightsBytes: Int,
+        kvCacheAllocatedBytes: Int,
+        kvCacheUsedBytes: Int,
+        thinkPerplexity: Double?,
+        genPerplexity: Double?,
+        thinkKLDivergence: Double?,
+        genKLDivergence: Double?,
+        thinkTokenCount: Int?,
+        genTokenCount: Int?,
+        interTokenLatencyP50Ms: Double? = nil,
+        interTokenLatencyP95Ms: Double? = nil,
+        interTokenLatencyP99Ms: Double? = nil,
+        sustainedDecodeRatio: Double? = nil,
+        prefillEnergyJoules: Double? = nil,
+        decodeEnergyJoules: Double? = nil,
+        thermalStateAtStart: ThermalState = .unknown,
+        thermalStatePeak: ThermalState = .unknown,
+        thermalStateAtEnd: ThermalState = .unknown
+    ) {
+        self.promptTokens = promptTokens
+        self.generatedTokens = generatedTokens
+        self.contextSize = contextSize
+        self.prefillTimeS = prefillTimeS
+        self.decodeTimeS = decodeTimeS
+        self.timeToFirstTokenMs = timeToFirstTokenMs
+        self.steadyTokensPerSecond = steadyTokensPerSecond
+        self.baselineGPUBytes = baselineGPUBytes
+        self.postPrefillGPUBytes = postPrefillGPUBytes
+        self.postDecodeGPUBytes = postDecodeGPUBytes
+        self.prefillPeakGPUBytes = prefillPeakGPUBytes
+        self.decodePeakGPUBytes = decodePeakGPUBytes
+        self.wiredTicketBytes = wiredTicketBytes
+        self.weightsBytes = weightsBytes
+        self.kvCacheAllocatedBytes = kvCacheAllocatedBytes
+        self.kvCacheUsedBytes = kvCacheUsedBytes
+        self.thinkPerplexity = thinkPerplexity
+        self.genPerplexity = genPerplexity
+        self.thinkKLDivergence = thinkKLDivergence
+        self.genKLDivergence = genKLDivergence
+        self.thinkTokenCount = thinkTokenCount
+        self.genTokenCount = genTokenCount
+        self.interTokenLatencyP50Ms = interTokenLatencyP50Ms
+        self.interTokenLatencyP95Ms = interTokenLatencyP95Ms
+        self.interTokenLatencyP99Ms = interTokenLatencyP99Ms
+        self.sustainedDecodeRatio = sustainedDecodeRatio
+        self.prefillEnergyJoules = prefillEnergyJoules
+        self.decodeEnergyJoules = decodeEnergyJoules
+        self.thermalStateAtStart = thermalStateAtStart
+        self.thermalStatePeak = thermalStatePeak
+        self.thermalStateAtEnd = thermalStateAtEnd
+    }
 
     // ─── Pretty printer for `--stats` ────────────────────────────────
 
@@ -159,6 +271,26 @@ public struct GenerationStats: Sendable {
         }
         if let t = thinkTokenCount, let g = genTokenCount {
             out += "  think / gen split: \(t) / \(g) tokens\n"
+        }
+        if let p50 = interTokenLatencyP50Ms {
+            out += String(
+                format: "  inter-token (ms): p50 %.2f  p95 %.2f  p99 %.2f\n",
+                p50, interTokenLatencyP95Ms ?? p50, interTokenLatencyP99Ms ?? p50)
+        }
+        if let r = sustainedDecodeRatio {
+            out += String(
+                format: "  decode retention: %.1f%%   (late tok/s ÷ early)\n", r * 100)
+        }
+        if let jpt = joulesPerToken {
+            out += String(
+                format: "  energy:           %.4f J/token   (decode %.2f J)\n",
+                jpt, decodeEnergyJoules ?? 0)
+        }
+        if thermalStateAtStart != .unknown || thermalStatePeak != .unknown {
+            out +=
+                "  thermal:          \(thermalStateAtStart.rawValue)"
+                + " → peak \(thermalStatePeak.rawValue)"
+                + " → \(thermalStateAtEnd.rawValue)\n"
         }
         return out
     }
