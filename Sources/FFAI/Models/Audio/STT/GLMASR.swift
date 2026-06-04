@@ -341,10 +341,10 @@ public final class GLMASRModel: @unchecked Sendable {
         // ── Log-Mel spectrogram (Whisper-normalised) ──
         let melDtype: DType = dtype == .f16 ? .f16 : .f32
         let cmdMel = device.makeCommandBuffer()
-        let melRaw = AudioPreprocessing.logMelSpectrogram(
+        let melRaw = MediaUtils.logMelSpectrogram(
             waveform: waveform, cfg: frontEnd, dtype: melDtype,
             whisperNormalize: true, device: device, on: cmdMel)
-        let melF = AudioPreprocessing.castTensor(
+        let melF = MediaUtils.castTensor(
             melRaw, to: dtype,
             device: device)
         // melF: [nFrames, nMels]; reshape for audioConv1d: [1, nMels, nFrames].
@@ -410,7 +410,7 @@ public final class GLMASRModel: @unchecked Sendable {
         let seqT = Tensor.empty(
             shape: [seqCapped, dModel], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(seqVals, into: seqT)
+        MediaUtils.copyFloats(seqVals, into: seqT)
 
         // ── Audio layer-norm ──
         let cmdN = device.makeCommandBuffer()
@@ -452,7 +452,7 @@ public final class GLMASRModel: @unchecked Sendable {
         let mergedT = Tensor.empty(
             shape: [newSeqLen, mergedDim],
             dtype: adaptorDtype, device: device)
-        AudioPreprocessing.copyFloats(merged, into: mergedT)
+        MediaUtils.copyFloats(merged, into: mergedT)
 
         let cmdA = device.makeCommandBuffer()
         let fc1Out = Ops.gemm(
@@ -475,7 +475,7 @@ public final class GLMASRModel: @unchecked Sendable {
         let fc1Act = Tensor.empty(
             shape: [newSeqLen, fc1Dim], dtype: adaptorDtype,
             device: device)
-        AudioPreprocessing.copyFloats(fc1Vals, into: fc1Act)
+        MediaUtils.copyFloats(fc1Vals, into: fc1Act)
 
         let cmdB = device.makeCommandBuffer()
         let fc2Out = Ops.gemm(
@@ -493,7 +493,7 @@ public final class GLMASRModel: @unchecked Sendable {
         let audioFeatures = Tensor.empty(
             shape: [newSeqLen, lmH],
             dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(fc2Vals, into: audioFeatures)
+        MediaUtils.copyFloats(fc2Vals, into: audioFeatures)
         return audioFeatures  // [nAudioTokens, lmHiddenSize]
     }
 
@@ -511,7 +511,7 @@ public final class GLMASRModel: @unchecked Sendable {
         let seqT = Tensor.empty(
             shape: [seqLen, hidden], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(seqVals, into: seqT)
+        MediaUtils.copyFloats(seqVals, into: seqT)
 
         let cmd = device.makeCommandBuffer()
         let normed = Ops.layerNorm(
@@ -598,7 +598,7 @@ public final class GLMASRModel: @unchecked Sendable {
         let geluT = Tensor.empty(
             shape: [seqLen, ffInter], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(ff1Vals, into: geluT)
+        MediaUtils.copyFloats(ff1Vals, into: geluT)
 
         let cmd3 = device.makeCommandBuffer()
         let ff2Out = layer.fc2.callMany(geluT, t: seqLen, on: cmd3, device: device)
@@ -688,7 +688,7 @@ public final class GLMASRModel: @unchecked Sendable {
         let result = Tensor.empty(
             shape: [seqLen, H], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return result
     }
 
@@ -710,7 +710,7 @@ public final class GLMASRModel: @unchecked Sendable {
         let result = Tensor.empty(
             shape: [nRows, rowSize], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return result
     }
 
@@ -954,7 +954,7 @@ public final class GLMASRModel: @unchecked Sendable {
         let result = Tensor.empty(
             shape: [seqLen, hidden], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return result
     }
 }
@@ -1020,7 +1020,7 @@ extension GLMASRModel {
             let out = Tensor.empty(
                 shape: [outCh, inCh, k], dtype: dtype,
                 device: .shared)
-            AudioPreprocessing.copyFloats(transposed, into: out)
+            MediaUtils.copyFloats(transposed, into: out)
             return out
         }
 

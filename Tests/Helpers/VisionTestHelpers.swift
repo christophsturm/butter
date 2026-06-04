@@ -62,7 +62,7 @@ public enum VisionTestHelpers {
     /// encoder cost, so a simple bilinear resize is fine.
     public static func dogImageCHW(targetSize: Int) throws -> [Float] {
         let img = try dogImage()
-        let resized = ImagePreprocessing.resize(
+        let resized = MediaUtils.resize(
             img, targetW: targetSize, targetH: targetSize)
         var planar = [Float](repeating: 0, count: 3 * targetSize * targetSize)
         let plane = targetSize * targetSize
@@ -277,7 +277,7 @@ public enum VisionTestHelpers {
     /// its own (CLIP for GLM-OCR, SigLIP for PaliGemma, …).
     public static func ocrTestImageCHW(targetSize: Int) throws -> [Float] {
         let img = try ocrTestImage()
-        let resized = ImagePreprocessing.resize(
+        let resized = MediaUtils.resize(
             img, targetW: targetSize, targetH: targetSize)
         var planar = [Float](repeating: 0, count: 3 * targetSize * targetSize)
         let plane = targetSize * targetSize
@@ -322,7 +322,7 @@ public enum VisionTestHelpers {
         targetSize: Int, normalization: ImageNormalization
     ) throws -> [Float] {
         let img = try ocrTestImage()
-        let resized = ImagePreprocessing.resize(
+        let resized = MediaUtils.resize(
             img, targetW: targetSize, targetH: targetSize)
         let means = [normalization.mean.0, normalization.mean.1, normalization.mean.2]
         let stds = [normalization.std.0, normalization.std.1, normalization.std.2]

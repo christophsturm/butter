@@ -191,7 +191,7 @@ public final class VisionModel: @unchecked Sendable {
             return visionEncoder.encode(image: pixels, device: device)
         }
         let cfg = visionEncoder.config
-        let pixels = ImagePreprocessing.preprocess(
+        let pixels = MediaUtils.preprocess(
             image, targetW: cfg.imageSize, targetH: cfg.imageSize,
             normalization: normalization, dtype: visionEncoder.dtype,
             device: device)
@@ -217,7 +217,7 @@ public final class VisionModel: @unchecked Sendable {
             // Honour a family-specific processor (Gemma 4's variable
             // resolution) per frame; otherwise the generic fixed square.
             visionEncoder.preprocessImage(frame, device: device)
-                ?? ImagePreprocessing.preprocess(
+                ?? MediaUtils.preprocess(
                     frame, targetW: cfg.imageSize, targetH: cfg.imageSize,
                     normalization: normalization, dtype: visionEncoder.dtype,
                     device: device)

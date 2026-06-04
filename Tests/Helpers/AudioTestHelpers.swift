@@ -44,7 +44,7 @@ public enum AudioTestHelpers {
     /// this clip (see `expectMentionsSureICanHelp(...)`).
     public static func clean001Waveform() throws -> [Float] {
         let url = resourceURL("clean_001.wav")
-        return try AudioPreprocessing.loadWaveform(url: url, targetRate: 16_000)
+        return try MediaUtils.loadWaveform(url: url, targetRate: 16_000)
     }
 
     /// Load the bundled conversational speech fixture as a mono 16 kHz
@@ -54,7 +54,7 @@ public enum AudioTestHelpers {
     /// Sourced from ekryski/mlx-audio-swift @ ek/audio-benchmarks.
     public static func conversationalAWaveform() throws -> [Float] {
         let url = resourceURL("conversational_a.wav")
-        return try AudioPreprocessing.loadWaveform(url: url, targetRate: 16_000)
+        return try MediaUtils.loadWaveform(url: url, targetRate: 16_000)
     }
 
     // MARK: - STT phrase assertion

@@ -226,7 +226,7 @@ public final class Gemma3VLProjector: @unchecked Sendable {
         let pooledT = Tensor.empty(
             shape: [numTokens, vh], dtype: encoderTokens.dtype,
             device: device)
-        ImagePreprocessing.copyFloats(pooled, into: pooledT)
+        MediaUtils.copyFloats(pooled, into: pooledT)
 
         // ── GemmaRMSNorm each pooled token, then project ──
         let cmd = device.makeCommandBuffer()
@@ -261,7 +261,7 @@ public final class Gemma3VLProjector: @unchecked Sendable {
             for j in 0 ..< c { dst[j * r + i] = src[i * c + j] }
         }
         let out = Tensor.empty(shape: [c, r], dtype: t.dtype, device: device)
-        ImagePreprocessing.copyFloats(dst, into: out)
+        MediaUtils.copyFloats(dst, into: out)
         return out
     }
 }
@@ -358,7 +358,7 @@ func transposeOHWItoOIHW(_ w: Tensor) -> Tensor {
         }
     }
     let out = Tensor.empty(shape: [oc, ic, kh, kw], dtype: w.dtype)
-    ImagePreprocessing.copyFloats(dst, into: out)
+    MediaUtils.copyFloats(dst, into: out)
     return out
 }
 

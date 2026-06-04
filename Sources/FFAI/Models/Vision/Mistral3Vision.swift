@@ -179,7 +179,7 @@ final class Mistral3Projector: @unchecked Sendable {
         let mergedTensor = Tensor.empty(
             shape: [nMerged, mergedDim],
             dtype: normed.dtype, device: device)
-        ImagePreprocessing.copyFloats(merged, into: mergedTensor)
+        MediaUtils.copyFloats(merged, into: mergedTensor)
 
         // ── Step 3: Merge projection [visionHidden*s², visionHidden] ──
         // Uses `mistral3ApplyLinearRows` which dispatches to a single
@@ -283,7 +283,7 @@ private func mistral3BroadcastAddBias(
         for c in 0 ..< rowSize { flat[r * rowSize + c] = biasVals[c] }
     }
     let biasT = Tensor.empty(shape: [nRows, rowSize], dtype: x.dtype, device: device)
-    ImagePreprocessing.copyFloats(flat, into: biasT)
+    MediaUtils.copyFloats(flat, into: biasT)
     let cmd = device.makeCommandBuffer()
     let out = Ops.add(x, biasT, on: cmd)
     cmd.commit()

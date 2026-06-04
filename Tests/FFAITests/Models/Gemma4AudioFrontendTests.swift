@@ -79,8 +79,8 @@ struct Gemma4AudioFrontendTests {
     @Test("HTK norm=None filterbank differs from Slaney")
     func filterbankNormDiffers() {
         let cfg = AudioFrontEndConfig.gemma4
-        let slaney = AudioPreprocessing.melFilterbank(cfg, norm: .slaney)
-        let none = AudioPreprocessing.melFilterbank(cfg, norm: .none)
+        let slaney = MediaUtils.melFilterbank(cfg, norm: .slaney)
+        let none = MediaUtils.melFilterbank(cfg, norm: .none)
         #expect(slaney.count == none.count)
         #expect(none.count == cfg.nMels * cfg.nFreq)
         // norm=None leaves unit-peak triangles; Slaney rescales each by

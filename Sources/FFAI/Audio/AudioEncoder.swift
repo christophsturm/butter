@@ -270,7 +270,7 @@ public final class AudioEncoderLayer: Module {
         let result = Tensor.empty(
             shape: [nFrames, stride], dtype: q.dtype,
             device: device)
-        AudioPreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return result
     }
 
@@ -463,7 +463,7 @@ public final class AudioEncoder: Module {
             }
         }
         let out = Tensor.empty(shape: [cols, rows], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(dst, into: out)
+        MediaUtils.copyFloats(dst, into: out)
         return out
     }
 
@@ -479,7 +479,7 @@ public final class AudioEncoder: Module {
         for r in 0 ..< nRows {
             for c in 0 ..< rowSize { flat[r * rowSize + c] = biasVals[c] }
         }
-        AudioPreprocessing.copyFloats(flat, into: tiled)
+        MediaUtils.copyFloats(flat, into: tiled)
         return Ops.add(x, tiled, on: cmd)
     }
 }

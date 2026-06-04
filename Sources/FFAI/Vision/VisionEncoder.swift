@@ -99,13 +99,18 @@ public final class VisionEncoderLayer: Module {
 
     let hidden, nHeads, headDim, intermediate: Int
     let scale: Float
+    /// Use the exact erf-based GELU (SigLIP2 `nn.GELU(approx="precise")`)
+    /// instead of the tanh approximation (SigLIP v1 / CLIP `gelu_pytorch_tanh`).
+    let useExactGelu: Bool
 
     init(
         layerNorm1: LayerNorm,
         qProj: Linear, kProj: Linear, vProj: Linear, oProj: Linear,
         layerNorm2: LayerNorm, fc1: Linear, fc2: Linear,
-        hidden: Int, nHeads: Int, intermediate: Int
+        hidden: Int, nHeads: Int, intermediate: Int,
+        useExactGelu: Bool = false
     ) {
+        self.useExactGelu = useExactGelu
         self.layerNorm1 = layerNorm1
         self.qProj = qProj
         self.kProj = kProj
@@ -216,7 +221,7 @@ public final class VisionEncoderLayer: Module {
         let ff1 = projectRows(
             fc1, normed2, nTokens: nTokens,
             outDim: intermediate, on: cmd2)
-        let act = Ops.gelu(ff1, on: cmd2)
+        let act = useExactGelu ? Ops.geluErf(ff1, on: cmd2) : Ops.gelu(ff1, on: cmd2)
         let ff2 = projectRows(
             fc2, act, nTokens: nTokens,
             inDim: intermediate, outDim: hidden, on: cmd2)
@@ -325,7 +330,7 @@ public final class VisionEncoderLayer: Module {
         let out = Tensor.empty(
             shape: [nHeads, nTokens, headDim],
             dtype: t.dtype, device: device)
-        ImagePreprocessing.copyFloats(dst, into: out)
+        MediaUtils.copyFloats(dst, into: out)
         return out
     }
 
@@ -410,7 +415,7 @@ public final class VisionEncoderLayer: Module {
         let result = Tensor.empty(
             shape: [nTokens, stride], dtype: q.dtype,
             device: device)
-        ImagePreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return result
     }
 
@@ -444,7 +449,7 @@ public final class VisionEncoderLayer: Module {
         for r in 0 ..< nRows {
             for c in 0 ..< rowSize { flat[r * rowSize + c] = biasVals[c] }
         }
-        ImagePreprocessing.copyFloats(flat, into: tiled)
+        MediaUtils.copyFloats(flat, into: tiled)
         return Ops.add(x, tiled, on: cmd)
     }
 }
@@ -469,7 +474,12 @@ public class VisionEncoder: Module {
     /// Encoder blocks.
     public let layers: [VisionEncoderLayer]
     /// Post-encoder LayerNorm.
-    public let postLayerNorm: LayerNorm
+    /// Post-encoder LayerNorm. `nil` for towers consumed as an
+    /// intermediate-layer feature extractor (e.g. LFM2-VL reads
+    /// `hidden_states[vision_feature_layer]`, which is taken BEFORE
+    /// `post_layernorm` — applying it shifts the feature distribution the
+    /// projector was trained on).
+    public let postLayerNorm: LayerNorm?
     /// Optional projection into the text hidden dim. `nil` when the
     /// encoder hidden already equals the text hidden.
     public let projection: Linear?
@@ -480,7 +490,7 @@ public class VisionEncoder: Module {
         config: VisionEncoderConfig,
         patchEmbedWeight: Tensor, patchEmbedBias: Tensor,
         positionEmbedding: Tensor, layers: [VisionEncoderLayer],
-        postLayerNorm: LayerNorm, projection: Linear?,
+        postLayerNorm: LayerNorm?, projection: Linear?,
         dtype: DType
     ) {
         self.config = config
@@ -503,7 +513,9 @@ public class VisionEncoder: Module {
                 out.append(("encoder.layers.\(i).\(k)", v))
             }
         }
-        for (k, v) in postLayerNorm.parameters() { out.append(("post_layernorm.\(k)", v)) }
+        if let postLayerNorm {
+            for (k, v) in postLayerNorm.parameters() { out.append(("post_layernorm.\(k)", v)) }
+        }
         if let proj = projection {
             for (k, v) in proj.parameters() { out.append(("projection.\(k)", v)) }
         }
@@ -512,7 +524,7 @@ public class VisionEncoder: Module {
 
     /// Optional family-specific preprocessing from a raw `RGBImage` to the
     /// NCHW pixel tensor `encode(image:)` consumes. Returns `nil` to fall
-    /// back to the generic fixed-square `ImagePreprocessing.preprocess`
+    /// back to the generic fixed-square `MediaUtils.preprocess`
     /// (`VisionModel.encodeImage`). Gemma 4 overrides this for its
     /// variable-resolution / aspect-ratio-preserving image processor, which
     /// produces a non-square `[1, 3, H, W]` tensor.
@@ -526,7 +538,7 @@ public class VisionEncoder: Module {
     /// text hidden dim.
     ///
     /// `image` is a normalized NCHW tensor `[1, inChannels, imageSize,
-    /// imageSize]` (the `ImagePreprocessing.preprocess` output).
+    /// imageSize]` (the `MediaUtils.preprocess` output).
     /// Returns `[numPatches, textHidden]` — the tokens a VLM splices
     /// into its text stream. All GPU work is queued on a private command
     /// buffer that is committed + waited before returning, since callers
@@ -571,15 +583,18 @@ public class VisionEncoder: Module {
                 device: device, on: cmd)
         }
 
-        // Post-encoder LayerNorm.
-        let cmdN = device.makeCommandBuffer()
-        h = Ops.layerNorm(
-            h, weight: postLayerNorm.weight,
-            bias: postLayerNorm.bias, eps: postLayerNorm.eps,
-            nRows: config.numPatches, rowSize: config.hidden,
-            on: cmdN)
-        cmdN.commit()
-        cmdN.waitUntilCompleted()
+        // Post-encoder LayerNorm — skipped when the tower is read as an
+        // intermediate-layer feature extractor (postLayerNorm == nil).
+        if let postLayerNorm {
+            let cmdN = device.makeCommandBuffer()
+            h = Ops.layerNorm(
+                h, weight: postLayerNorm.weight,
+                bias: postLayerNorm.bias, eps: postLayerNorm.eps,
+                nRows: config.numPatches, rowSize: config.hidden,
+                on: cmdN)
+            cmdN.commit()
+            cmdN.waitUntilCompleted()
+        }
         tokens = h
 
         // Project into the text hidden dim if the encoder hidden differs.
@@ -600,7 +615,7 @@ public class VisionEncoder: Module {
             }
             let biasTiled = Tensor.empty(
                 shape: [config.numPatches, config.textHidden], dtype: dtype)
-            ImagePreprocessing.copyFloats(flat, into: biasTiled)
+            MediaUtils.copyFloats(flat, into: biasTiled)
             projected = Ops.add(projected, biasTiled, on: cmd3)
         }
         cmd3.commit()
@@ -635,36 +650,14 @@ public class VisionEncoder: Module {
         let out = Tensor.empty(
             shape: [numPatches, hidden], dtype: dtype,
             device: device)
-        ImagePreprocessing.copyFloats(dst, into: out)
+        MediaUtils.copyFloats(dst, into: out)
         return out
     }
 }
 
-extension ImagePreprocessing {
-    /// Write a `[Float]` array into an existing `Tensor`, converting to
-    /// the tensor's storage dtype. Shared by the vision encoder for its
-    /// CPU-side transpose / bias-tile staging.
-    static func copyFloats(_ values: [Float], into tensor: Tensor) {
-        precondition(
-            values.count == tensor.elementCount,
-            "copyFloats: count mismatch \(values.count) vs \(tensor.elementCount)")
-        switch tensor.dtype {
-        case .f32:
-            tensor.copyIn(from: values)
-        case .f16:
-            tensor.copyIn(from: values.map { Float16($0) })
-        case .bf16:
-            tensor.copyIn(
-                from: values.map { v -> UInt16 in
-                    let bits = v.bitPattern
-                    let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
-                    return UInt16(rounded >> 16)
-                })
-        default:
-            fatalError("copyFloats: unsupported dtype \(tensor.dtype)")
-        }
-    }
-}
+// `MediaUtils.copyFloats(_:into:)` lives in `Media/AudioPreprocessing.swift`
+// (the shared host→GPU staging helper, used by both the vision encoder and
+// the audio front-ends).
 
 public enum VisionEncoderError: Error, CustomStringConvertible {
     /// The base `VisionEncoder.encode(frames:)` default throws this.

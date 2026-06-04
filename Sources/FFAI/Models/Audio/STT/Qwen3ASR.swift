@@ -443,10 +443,10 @@ public final class Qwen3ASRModel: @unchecked Sendable {
         // Do NOT commit again here; `castTensor` reads the already-completed result.
         let melDtype: DType = dtype == .f16 ? .f16 : .f32
         let cmdMel = device.makeCommandBuffer()
-        let melRaw = AudioPreprocessing.logMelSpectrogram(
+        let melRaw = MediaUtils.logMelSpectrogram(
             waveform: waveform, cfg: frontEnd, dtype: melDtype,
             whisperNormalize: true, device: device, on: cmdMel)
-        let melF = AudioPreprocessing.castTensor(melRaw, to: dtype, device: device)
+        let melF = MediaUtils.castTensor(melRaw, to: dtype, device: device)
 
         // melF shape: [nFrames, nMels]. Treat as a 2D image with a single
         // channel — reshape to [1, 1, nMels, nFrames] (NCHW).
@@ -499,7 +499,7 @@ public final class Qwen3ASRModel: @unchecked Sendable {
             }
         }
         let xFlat = Tensor.empty(shape: [W, flatDim], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(reordered, into: xFlat)
+        MediaUtils.copyFloats(reordered, into: xFlat)
 
         // ── conv_out linear: [W, flatDim] → [W, dModel] ──
         let dModel = ac.dModel
@@ -512,7 +512,7 @@ public final class Qwen3ASRModel: @unchecked Sendable {
         let peCount = min(W, ac.maxSourcePositions) * dModel
         let peVals = Array(audioPositionalEmbedding.prefix(peCount))
         let peT = Tensor.empty(shape: [W, dModel], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(peVals, into: peT)
+        MediaUtils.copyFloats(peVals, into: peT)
         let cmd5 = device.makeCommandBuffer()
         h = Ops.add(h, peT, on: cmd5)
         cmd5.commit()
@@ -529,7 +529,7 @@ public final class Qwen3ASRModel: @unchecked Sendable {
         }
 
         let seqT = Tensor.empty(shape: [W, dModel], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(seqVals, into: seqT)
+        MediaUtils.copyFloats(seqVals, into: seqT)
 
         // ── Post layer-norm → proj1 (GELU) → proj2 ──
         let cmd6 = device.makeCommandBuffer()
@@ -555,7 +555,7 @@ public final class Qwen3ASRModel: @unchecked Sendable {
             p1Act[i] = 0.5 * v * (1 + tanh(inner))
         }
         let p1T = Tensor.empty(shape: [W, p1Dim], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(p1Act, into: p1T)
+        MediaUtils.copyFloats(p1Act, into: p1T)
 
         // proj2: [W, p1Dim] → [W, outputDim]
         let outputDim = ac.outputDim
@@ -574,7 +574,7 @@ public final class Qwen3ASRModel: @unchecked Sendable {
         let audioFeatures = Tensor.empty(
             shape: [W, outputDim], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(finalVals, into: audioFeatures)
+        MediaUtils.copyFloats(finalVals, into: audioFeatures)
         return audioFeatures  // [nAudioTokens, outputDim]
     }
 
@@ -590,7 +590,7 @@ public final class Qwen3ASRModel: @unchecked Sendable {
     ) -> [Float] {
         // Upload, apply layer-norm, compute Q/K/V projections.
         let seqT = Tensor.empty(shape: [seqLen, hidden], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(seqVals, into: seqT)
+        MediaUtils.copyFloats(seqVals, into: seqT)
 
         let cmd = device.makeCommandBuffer()
         let normed = Ops.layerNorm(
@@ -675,7 +675,7 @@ public final class Qwen3ASRModel: @unchecked Sendable {
         let geluT = Tensor.empty(
             shape: [seqLen, ffIntermediate], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(geluVals, into: geluT)
+        MediaUtils.copyFloats(geluVals, into: geluT)
 
         let cmd3 = device.makeCommandBuffer()
         let ff2 = Ops.gemm(
@@ -710,11 +710,11 @@ public final class Qwen3ASRModel: @unchecked Sendable {
                 headDim: headDim, scale: scale, device: device)
         }
         let qT = Tensor.empty(shape: [seqLen, H], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(qa, into: qT)
+        MediaUtils.copyFloats(qa, into: qT)
         let kT = Tensor.empty(shape: [seqLen, H], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(ka, into: kT)
+        MediaUtils.copyFloats(ka, into: kT)
         let vT = Tensor.empty(shape: [seqLen, H], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(va, into: vT)
+        MediaUtils.copyFloats(va, into: vT)
         let cmd = device.makeCommandBuffer()
         let kHead = Ops.transposeTokensToHeads(
             kT, nTokens: seqLen, nHeads: nHeads, headDim: headDim, on: cmd)
@@ -797,7 +797,7 @@ public final class Qwen3ASRModel: @unchecked Sendable {
             }
         }
         let result = Tensor.empty(shape: [seqLen, H], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return result
     }
 
@@ -817,7 +817,7 @@ public final class Qwen3ASRModel: @unchecked Sendable {
             }
         }
         let result = Tensor.empty(shape: [nRows, rowSize], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return result
     }
 
@@ -1127,7 +1127,7 @@ public final class Qwen3ASRModel: @unchecked Sendable {
         }
 
         let result = Tensor.empty(shape: [seqLen, hidden], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return result
     }
 }
@@ -1205,7 +1205,7 @@ extension Qwen3ASRModel {
             let out = Tensor.empty(
                 shape: [outCh, inCh, kH, kW], dtype: dtype,
                 device: .shared)
-            AudioPreprocessing.copyFloats(transposed, into: out)
+            MediaUtils.copyFloats(transposed, into: out)
             return out
         }
 
@@ -1220,7 +1220,7 @@ extension Qwen3ASRModel {
         let convOutWeight = try bundle.tensor(named: "audio_tower.conv_out.weight")
 
         // Sinusoidal positional embedding (computed, not stored in checkpoint).
-        let audioPositionalEmbedding = AudioPreprocessing.sinusoidalPositions(
+        let audioPositionalEmbedding = MediaUtils.sinusoidalPositions(
             length: ac.maxSourcePositions, dim: ac.dModel)
 
         // ── Encoder transformer layers ──
@@ -1375,7 +1375,7 @@ extension Qwen3ASRModel {
         var vals = [Float](repeating: 0, count: size * size)
         for i in 0 ..< size { vals[i * size + i] = 1.0 }
         let t = Tensor.empty(shape: [size, size], dtype: dtype)
-        AudioPreprocessing.copyFloats(vals, into: t)
+        MediaUtils.copyFloats(vals, into: t)
         return t
     }
 }

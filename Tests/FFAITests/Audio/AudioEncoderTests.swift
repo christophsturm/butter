@@ -200,7 +200,7 @@ struct AudioEncoderTests {
             // on `cb` so `runAndWait` owns the commit (the normalised
             // path commits internally — that would double-commit here).
             runAndWait { cb in
-                mel = AudioPreprocessing.logMelSpectrogram(
+                mel = MediaUtils.logMelSpectrogram(
                     waveform: wave, cfg: cfg, whisperNormalize: false,
                     on: cb)
             }

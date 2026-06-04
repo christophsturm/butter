@@ -230,7 +230,7 @@ private func floatToTensor(
     dtype: DType, device: Device
 ) -> Tensor {
     let t = Tensor.empty(shape: shape, dtype: dtype, device: device)
-    ImagePreprocessing.copyFloats(vals, into: t)
+    MediaUtils.copyFloats(vals, into: t)
     return t
 }
 
@@ -811,7 +811,7 @@ final class FastVLMVisionTower {
         // Return token-major [patchH*patchW, mmHiddenSize] Tensor.
         let nTokens = curH * curW
         let result = Tensor.empty(shape: [nTokens, mmHidden], dtype: dtype, device: device)
-        ImagePreprocessing.copyFloats(act, into: result)
+        MediaUtils.copyFloats(act, into: result)
         return result
     }
 
@@ -848,7 +848,7 @@ final class FastVLMVisionTower {
             let inC = t.shape[3]
             let flat = t.toFloatArray()
             let result = Tensor.empty(shape: [outC, inC], dtype: t.dtype, device: device)
-            ImagePreprocessing.copyFloats(flat, into: result)
+            MediaUtils.copyFloats(flat, into: result)
             return result
         }
 

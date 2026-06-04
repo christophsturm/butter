@@ -687,7 +687,7 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
         if image.dtype == dtype {
             img = image
         } else {
-            img = ImagePreprocessing.makeTensor(
+            img = MediaUtils.makeTensor(
                 from: image.toFloatArray(), shape: [3, imgH, imgW],
                 dtype: dtype, device: .shared)
         }
@@ -727,9 +727,9 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
             }
         }
         // `Ops.posEmb2dAdd` requires the tables in f32.
-        let posX = ImagePreprocessing.makeTensor(
+        let posX = MediaUtils.makeTensor(
             from: xFlat, shape: [gridW, hidden], dtype: .f32, device: .shared)
-        let posY = ImagePreprocessing.makeTensor(
+        let posY = MediaUtils.makeTensor(
             from: yFlat, shape: [gridH, hidden], dtype: .f32, device: .shared)
         return (posX, posY)
     }
@@ -776,7 +776,7 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
         let out = Tensor.empty(
             shape: [softH * softW, hidden],
             dtype: dtype, device: device)
-        ImagePreprocessing.copyFloats(pooled, into: out)
+        MediaUtils.copyFloats(pooled, into: out)
         return out
     }
 
@@ -800,7 +800,7 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
         let normedT = Tensor.empty(
             shape: [nTokens, hidden], dtype: dtype,
             device: device)
-        ImagePreprocessing.copyFloats(normed, into: normedT)
+        MediaUtils.copyFloats(normed, into: normedT)
 
         let cmd = device.makeCommandBuffer()
         // Use `callMany` so quantized weights (QuantizedLinear from a 4-bit
@@ -833,9 +833,9 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
             x[i] = src[i]
             y[i] = src[plane + i]
         }
-        let xT = ImagePreprocessing.makeTensor(
+        let xT = MediaUtils.makeTensor(
             from: x, shape: [posSize, hidden], dtype: raw.dtype, device: device)
-        let yT = ImagePreprocessing.makeTensor(
+        let yT = MediaUtils.makeTensor(
             from: y, shape: [posSize, hidden], dtype: raw.dtype, device: device)
         return (xT, yT)
     }
@@ -884,7 +884,7 @@ final class Gemma4VLComposedEncoder: VisionEncoder {
         let (th, tw) = tower.aspectPreservingSize(
             width: image.width, height: image.height)
         let identity = ImageNormalization(mean: (0, 0, 0), std: (1, 1, 1))
-        return ImagePreprocessing.preprocess(
+        return MediaUtils.preprocess(
             image, targetW: tw, targetH: th, normalization: identity,
             dtype: tower.dtype, device: device)
     }
@@ -920,7 +920,7 @@ final class Gemma4VLComposedEncoder: VisionEncoder {
             totalTokens += soft.shape[0]
             flat.append(contentsOf: soft.toFloatArray())
         }
-        return ImagePreprocessing.makeTensor(
+        return MediaUtils.makeTensor(
             from: flat,
             shape: [totalTokens, textHidden],
             dtype: tower.dtype, device: device)
@@ -1252,7 +1252,7 @@ final class Gemma4OmniVisionEncoder: VisionEncoder {
             patchSize: cfg.patchSize, poolingKernelSize: cfg.poolingKernelSize,
             maxSoftTokens: cfg.numSoftTokens)
         let identity = ImageNormalization(mean: (0, 0, 0), std: (1, 1, 1))
-        return ImagePreprocessing.preprocess(
+        return MediaUtils.preprocess(
             image, targetW: tw, targetH: th, normalization: identity,
             dtype: towerDtype, device: device)
     }
@@ -1324,7 +1324,7 @@ final class Gemma4OmniVisionEncoder: VisionEncoder {
             totalTokens += soft.shape[0]
             flat.append(contentsOf: soft.toFloatArray())
         }
-        return ImagePreprocessing.makeTensor(
+        return MediaUtils.makeTensor(
             from: flat, shape: [totalTokens, textHidden],
             dtype: towerDtype, device: device)
     }
@@ -1360,7 +1360,7 @@ final class Gemma4OmniVisionEncoder: VisionEncoder {
                 }
             }
         }
-        return ImagePreprocessing.makeTensor(
+        return MediaUtils.makeTensor(
             from: rows, shape: [nPatches, patchDim],
             dtype: towerDtype, device: .shared)
     }
@@ -1385,7 +1385,7 @@ final class Gemma4OmniVisionEncoder: VisionEncoder {
                 }
             }
         }
-        return ImagePreprocessing.makeTensor(
+        return MediaUtils.makeTensor(
             from: dst, shape: [nPatches, hidden], dtype: towerDtype,
             device: .shared)
     }
@@ -1411,9 +1411,9 @@ final class Gemma4OmniVisionEncoder: VisionEncoder {
             }
         }
         return (
-            ImagePreprocessing.makeTensor(
+            MediaUtils.makeTensor(
                 from: x, shape: [posSize, hidden], dtype: dtype, device: device),
-            ImagePreprocessing.makeTensor(
+            MediaUtils.makeTensor(
                 from: y, shape: [posSize, hidden], dtype: dtype, device: device)
         )
     }
@@ -1429,9 +1429,9 @@ private func loadLayerNormCast(
 ) throws -> LayerNorm {
     let w = try bundle.tensor(named: "\(base).weight")
     let b = try bundle.tensor(named: "\(base).bias")
-    let wCast = ImagePreprocessing.makeTensor(
+    let wCast = MediaUtils.makeTensor(
         from: w.toFloatArray(), shape: w.shape, dtype: dtype, device: device)
-    let bCast = ImagePreprocessing.makeTensor(
+    let bCast = MediaUtils.makeTensor(
         from: b.toFloatArray(), shape: b.shape, dtype: dtype, device: device)
     return LayerNorm(weight: wCast, bias: bCast, eps: eps)
 }

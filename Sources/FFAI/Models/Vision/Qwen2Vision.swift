@@ -218,9 +218,9 @@ final class Qwen2VLVisionBlock {
         let qT = Tensor.empty(shape: [nTokens, hidden], dtype: qkv.dtype, device: device)
         let kT = Tensor.empty(shape: [nTokens, hidden], dtype: qkv.dtype, device: device)
         let vT = Tensor.empty(shape: [nTokens, hidden], dtype: qkv.dtype, device: device)
-        ImagePreprocessing.copyFloats(qTok, into: qT)
-        ImagePreprocessing.copyFloats(kTok, into: kT)
-        ImagePreprocessing.copyFloats(vTok, into: vT)
+        MediaUtils.copyFloats(qTok, into: qT)
+        MediaUtils.copyFloats(kTok, into: kT)
+        MediaUtils.copyFloats(vTok, into: vT)
 
         let cmd = device.makeCommandBuffer()
         let kHead = Ops.transposeTokensToHeads(
@@ -586,7 +586,7 @@ final class Qwen2VLVisionModel: @unchecked Sendable {
         // `[nFrames, c, imgH, imgW]` tensor; the GPU kernel emits the
         // merge-block raster + `(t, c, py, px)` columns, zero-padded.
         let flat = framePixels.flatMap { $0 }
-        let framesT = ImagePreprocessing.makeTensor(
+        let framesT = MediaUtils.makeTensor(
             from: flat, shape: [framePixels.count, c, imgH, imgW],
             dtype: dtype, device: .shared)
         return Ops.patchUnfoldQwen(

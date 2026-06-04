@@ -277,15 +277,15 @@ final class Qwen25VLVisionBlock {
             let qT = Tensor.empty(
                 shape: [nTokens, nHeads, headDim], dtype: .f32,
                 device: device)
-            ImagePreprocessing.copyFloats(qFlat, into: qT)
+            MediaUtils.copyFloats(qFlat, into: qT)
             let kT = Tensor.empty(
                 shape: [nHeads, nTokens, headDim], dtype: .f32,
                 device: device)
-            ImagePreprocessing.copyFloats(kFlat, into: kT)
+            MediaUtils.copyFloats(kFlat, into: kT)
             let vT = Tensor.empty(
                 shape: [nHeads, nTokens, headDim], dtype: .f32,
                 device: device)
-            ImagePreprocessing.copyFloats(vFlat, into: vT)
+            MediaUtils.copyFloats(vFlat, into: vT)
             let cmd = device.makeCommandBuffer()
             let outT = Ops.sdpaBidirectional(
                 q: qT, k: kT, v: vT,
@@ -300,7 +300,7 @@ final class Qwen25VLVisionBlock {
             let result = Tensor.empty(
                 shape: [nTokens, hidden], dtype: qkv.dtype,
                 device: device)
-            ImagePreprocessing.copyFloats(outFlat, into: result)
+            MediaUtils.copyFloats(outFlat, into: result)
             return result
         }
 
@@ -347,11 +347,11 @@ final class Qwen25VLVisionBlock {
                 }
             }
             let qT = Tensor.empty(shape: [nTokens, nHeads, headDim], dtype: .f32, device: device)
-            ImagePreprocessing.copyFloats(qPerm, into: qT)
+            MediaUtils.copyFloats(qPerm, into: qT)
             let kT = Tensor.empty(shape: [nHeads, nTokens, headDim], dtype: .f32, device: device)
-            ImagePreprocessing.copyFloats(kPerm, into: kT)
+            MediaUtils.copyFloats(kPerm, into: kT)
             let vT = Tensor.empty(shape: [nHeads, nTokens, headDim], dtype: .f32, device: device)
-            ImagePreprocessing.copyFloats(vPerm, into: vT)
+            MediaUtils.copyFloats(vPerm, into: vT)
             let ssT = Tensor.empty(shape: [nTokens], dtype: .u32, device: device)
             ssT.copyIn(from: segStart)
             let slT = Tensor.empty(shape: [nTokens], dtype: .u32, device: device)
@@ -377,7 +377,7 @@ final class Qwen25VLVisionBlock {
             }
             let result = Tensor.empty(
                 shape: [nTokens, hidden], dtype: qkv.dtype, device: device)
-            ImagePreprocessing.copyFloats(ctx, into: result)
+            MediaUtils.copyFloats(ctx, into: result)
             return result
         }
 
@@ -423,7 +423,7 @@ final class Qwen25VLVisionBlock {
         let result = Tensor.empty(
             shape: [nTokens, hidden], dtype: qkv.dtype,
             device: device)
-        ImagePreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return result
     }
 
@@ -787,7 +787,7 @@ final class Qwen25VLVisionModel: @unchecked Sendable {
         // `[nFrames, c, imgH, imgW]` tensor; the GPU kernel emits the
         // merge-block raster + `(t, c, py, px)` columns, zero-padded.
         let flat = framePixels.flatMap { $0 }
-        let framesT = ImagePreprocessing.makeTensor(
+        let framesT = MediaUtils.makeTensor(
             from: flat, shape: [framePixels.count, c, imgH, imgW],
             dtype: dtype, device: .shared)
         return Ops.patchUnfoldQwen(

@@ -143,7 +143,7 @@ struct Gemma4MultimodalIntegrationTests {
         }
         let melFlat = readF32(melPath)
         let nFrames = melFlat.count / 128
-        let mel = ImagePreprocessing.makeTensor(
+        let mel = MediaUtils.makeTensor(
             from: melFlat, shape: [nFrames, 128], dtype: .f32, device: .shared)
         let (enc, _) = encoder.encode(
             mel: mel, melMask: [Bool](repeating: true, count: nFrames), device: .shared)

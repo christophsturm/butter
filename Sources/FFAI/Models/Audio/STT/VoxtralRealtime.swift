@@ -525,7 +525,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
 
         // ── Reflect-pad by windowSize/2 on both sides ──
         let pad = nFFT / 2
-        let padded = AudioPreprocessing.reflectPad(waveform, pad: pad)
+        let padded = MediaUtils.reflectPad(waveform, pad: pad)
 
         // ── Periodic Hann window (n denominator, not n-1) ──
         var window = [Float](repeating: 0, count: nFFT)
@@ -539,11 +539,11 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
         let slaneyConfig = AudioFrontEndConfig(
             sampleRate: ac.samplingRate, nFFT: nFFT, hopLength: hop,
             nMels: nMels, fMin: 0.0, fMax: 8000.0)
-        let filterbank = AudioPreprocessing.melFilterbank(slaneyConfig)
+        let filterbank = MediaUtils.melFilterbank(slaneyConfig)
         let nFreq = slaneyConfig.nFreq
 
         // ── GPU mel spectrogram (natural-log output) ──
-        let nFrames = AudioPreprocessing.frameCount(
+        let nFrames = MediaUtils.frameCount(
             paddedSamples: padded.count, cfg: slaneyConfig)
         guard nFrames > 0 else { return [] }
 
@@ -552,12 +552,12 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
 
         // Use the Whisper-normalised=false path so we can apply Voxtral norms.
         let winT = Tensor.empty(shape: [nFFT], dtype: .f32, device: device)
-        AudioPreprocessing.copyFloats(window, into: winT)
+        MediaUtils.copyFloats(window, into: winT)
         let melT = Tensor.empty(shape: [nMels, nFreq], dtype: .f32, device: device)
-        AudioPreprocessing.copyFloats(filterbank, into: melT)
+        MediaUtils.copyFloats(filterbank, into: melT)
 
         let audioT = Tensor.empty(shape: [padded.count], dtype: .f32, device: device)
-        AudioPreprocessing.copyFloats(padded, into: audioT)
+        MediaUtils.copyFloats(padded, into: audioT)
 
         let cmdMel = device.makeCommandBuffer()
         let rawMel = Ops.melSpectrogram(
@@ -618,7 +618,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
 
         // Upload [1, nMels, inLen0].
         let in0T = Tensor.empty(shape: [1, nMels, inLen0], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(padded0, into: in0T)
+        MediaUtils.copyFloats(padded0, into: in0T)
 
         let cmd0 = device.makeCommandBuffer()
         // outLen = (inLen + 2*0 - k) / stride + 1 = (nFrames + k0 - 1 - k0) / 1 + 1 = nFrames.
@@ -650,7 +650,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
         }
 
         let in1T = Tensor.empty(shape: [1, ec.dim, inLen1], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(padded1, into: in1T)
+        MediaUtils.copyFloats(padded1, into: in1T)
 
         let cmd1 = device.makeCommandBuffer()
         let out1T = Ops.audioConv1d(
@@ -787,7 +787,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
 
         // ── Upload + RMSNorm ──
         let seqT = Tensor.empty(shape: [seqLen, H], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(seqVals, into: seqT)
+        MediaUtils.copyFloats(seqVals, into: seqT)
 
         let cmd = device.makeCommandBuffer()
         let normed = Ops.rmsNormRows(
@@ -852,7 +852,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
         // ── Output projection + residual ──
         let cmd2 = device.makeCommandBuffer()
         let outProjT = Tensor.empty(shape: [seqLen, H], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(attnCtx, into: outProjT)
+        MediaUtils.copyFloats(attnCtx, into: outProjT)
         let outProj = Ops.gemm(
             weight: layer.attn.woWeight, input: outProjT,
             nRows: seqLen, on: cmd2)
@@ -866,7 +866,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
 
         // ── RMSNorm + SwiGLU FFN ──
         let hT2 = Tensor.empty(shape: [seqLen, H], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(hVals, into: hT2)
+        MediaUtils.copyFloats(hVals, into: hT2)
         let normed2 = Ops.rmsNormRows(
             hT2, weight: layer.ffnNorm.weight, eps: layer.ffnNorm.eps,
             nRows: seqLen, rowSize: H, on: cmd2)
@@ -891,7 +891,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
             gatedVals[i] = silu * ff3Vals[i]
         }
         let gatedT = Tensor.empty(shape: [seqLen, hidDim], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(gatedVals, into: gatedT)
+        MediaUtils.copyFloats(gatedVals, into: gatedT)
 
         let cmd3 = device.makeCommandBuffer()
         let ff2Out = Ops.gemm(
@@ -989,7 +989,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
             }
         }
         let result = Tensor.empty(shape: [seqLen, qHeadDim], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return out
     }
 
@@ -1021,7 +1021,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
             }
         }
         let reshapedT = Tensor.empty(shape: [dsLen, flatDim], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(reshaped, into: reshapedT)
+        MediaUtils.copyFloats(reshaped, into: reshapedT)
 
         // Projection 0 → GELU.
         // audioProj0.weight is [decoderDim, dim*downsampleFactor]; use Ops.gemm
@@ -1045,7 +1045,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
         }
 
         let p0T = Tensor.empty(shape: [dsLen, decoderDim], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(p0Act, into: p0T)
+        MediaUtils.copyFloats(p0Act, into: p0T)
 
         // Projection 2.
         let cmd2 = device.makeCommandBuffer()
@@ -1106,7 +1106,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
         let result = Tensor.empty(
             shape: [nAudioTokens, config.decoderConfig.dim],
             dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(adapterVals, into: result)
+        MediaUtils.copyFloats(adapterVals, into: result)
         return result
     }
 
@@ -1195,7 +1195,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
         var lastLogits: Tensor? = nil
         for pos in 0 ..< promptLength {
             let rowEmbed = Tensor.empty(shape: [hidden], dtype: dtype, device: device)
-            AudioPreprocessing.copyFloats(
+            MediaUtils.copyFloats(
                 Array(prefixVals[pos * hidden ..< (pos + 1) * hidden]), into: rowEmbed)
             lastLogits = forwardOneDecoderToken(
                 embed: rowEmbed, caches: &caches, device: device)
@@ -1245,7 +1245,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
             }
 
             let inputT = Tensor.empty(shape: [hidden], dtype: dtype, device: device)
-            AudioPreprocessing.copyFloats(inputVals, into: inputT)
+            MediaUtils.copyFloats(inputVals, into: inputT)
             logits = forwardOneDecoderToken(embed: inputT, caches: &caches, device: device)
         }
 
@@ -1325,9 +1325,9 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
             position: offset, theta: theta)
 
         let qT = Tensor.empty(shape: [nH, hd], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(qVals, into: qT)
+        MediaUtils.copyFloats(qVals, into: qT)
         let kT = Tensor.empty(shape: [nKVH, hd], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(kVals, into: kT)
+        MediaUtils.copyFloats(kVals, into: kT)
         let vT = v.reshaped(to: [nKVH, hd])
 
         // ── KV cache append + sdpaDecode ──
@@ -1358,7 +1358,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
             var scaled = [Float](repeating: 0, count: H)
             for i in 0 ..< H { scaled[i] = scaleVals[i] * (1.0 + scale[i]) }
             let scaledT = Tensor.empty(shape: [H], dtype: dtype, device: device)
-            AudioPreprocessing.copyFloats(scaled, into: scaledT)
+            MediaUtils.copyFloats(scaled, into: scaledT)
             ffnIn = scaledT
             let cmd3 = device.makeCommandBuffer()
             let gate = layer.w1Weight(ffnIn, on: cmd3)
@@ -1412,7 +1412,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
             }
             // ada_down: [bottleneck, H] → GELU → ada_up: [H, bottleneck].
             let tT = Tensor.empty(shape: [H], dtype: dtype, device: .shared)
-            AudioPreprocessing.copyFloats(tEmbed, into: tT)
+            MediaUtils.copyFloats(tEmbed, into: tT)
             let cmd = Device.shared.makeCommandBuffer()
             let down = ada.adaDown(tT, on: cmd)
             let geluOut = Ops.gelu(down, on: cmd)
@@ -1463,7 +1463,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
         device: Device
     ) -> [Float] {
         let t = Tensor.empty(shape: [nRows, rowSize], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(vals, into: t)
+        MediaUtils.copyFloats(vals, into: t)
         let cmd = device.makeCommandBuffer()
         let normed = Ops.rmsNormRows(
             t, weight: weight, eps: eps,
@@ -1601,7 +1601,7 @@ extension VoxtralRealtimeModel {
             let t = Tensor.empty(
                 shape: [outCh, inCh, kSz], dtype: dtype,
                 device: .shared)
-            AudioPreprocessing.copyFloats(transposed, into: t)
+            MediaUtils.copyFloats(transposed, into: t)
             return t
         }
 

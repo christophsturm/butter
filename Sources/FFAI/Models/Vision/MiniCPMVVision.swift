@@ -218,7 +218,7 @@ final class MiniCPMVViTMerger {
         let out = Tensor.empty(
             shape: [nWindows * 4, hidden], dtype: tokens.dtype,
             device: device)
-        ImagePreprocessing.copyFloats(dst, into: out)
+        MediaUtils.copyFloats(dst, into: out)
         return out
     }
 
@@ -300,7 +300,7 @@ final class MiniCPMVViTMerger {
         let result = Tensor.empty(
             shape: [nWindows * 4, stride], dtype: q.dtype,
             device: device)
-        ImagePreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return result
     }
 
@@ -324,7 +324,7 @@ final class MiniCPMVViTMerger {
         let out = Tensor.empty(
             shape: [nWindows, hidden], dtype: x.dtype,
             device: device)
-        ImagePreprocessing.copyFloats(dst, into: out)
+        MediaUtils.copyFloats(dst, into: out)
         return out
     }
 }
@@ -455,7 +455,7 @@ final class MergerBlock {
         let grouped = Tensor.empty(
             shape: [nWindows, groupDim],
             dtype: tokens.dtype, device: device)
-        ImagePreprocessing.copyFloats(dst, into: grouped)
+        MediaUtils.copyFloats(dst, into: grouped)
 
         // ── LN → Linear → GELU → Linear ──────────────────────────────
         let cmd = device.makeCommandBuffer()
@@ -676,7 +676,7 @@ final class MiniCPMVComposedEncoder: VisionEncoder {
     /// are concatenated along dim 0 to form the video token stream.
     ///
     /// Precondition: every frame must be `[1, 3, imageSize, imageSize]`
-    /// — the caller should preprocess with `ImagePreprocessing.preprocess`
+    /// — the caller should preprocess with `MediaUtils.preprocess`
     /// at `config.imageSize` before calling this method.
     override func encode(frames: [Tensor], device: Device = .shared) throws -> Tensor {
         precondition(
@@ -765,13 +765,15 @@ final class MiniCPMVComposedEncoder: VisionEncoder {
         }
 
         // ── post_layernorm on the (post-vit_merger) grid ──────────────
-        let cmdN = device.makeCommandBuffer()
-        h = Ops.layerNorm(
-            h, weight: postLayerNorm.weight, bias: postLayerNorm.bias,
-            eps: postLayerNorm.eps, nRows: nTokens, rowSize: config.hidden,
-            on: cmdN)
-        cmdN.commit()
-        cmdN.waitUntilCompleted()
+        if let postLayerNorm {
+            let cmdN = device.makeCommandBuffer()
+            h = Ops.layerNorm(
+                h, weight: postLayerNorm.weight, bias: postLayerNorm.bias,
+                eps: postLayerNorm.eps, nRows: nTokens, rowSize: config.hidden,
+                on: cmdN)
+            cmdN.commit()
+            cmdN.waitUntilCompleted()
+        }
 
         // ── merger: (2,2)·merger_times reduction + text-hidden project ─
         tokens = merger.forward(
@@ -796,7 +798,7 @@ final class MiniCPMVComposedEncoder: VisionEncoder {
         let out = Tensor.empty(
             shape: [numPatches, hidden], dtype: dtype,
             device: device)
-        ImagePreprocessing.copyFloats(dst, into: out)
+        MediaUtils.copyFloats(dst, into: out)
         return out
     }
 }
@@ -820,7 +822,7 @@ private func applyLinear(
     for r in 0 ..< nRows {
         for c in 0 ..< outDim { flat[r * outDim + c] = biasVals[c] }
     }
-    ImagePreprocessing.copyFloats(flat, into: tiled)
+    MediaUtils.copyFloats(flat, into: tiled)
     return Ops.add(y, tiled, on: cmd)
 }
 
@@ -880,6 +882,6 @@ func interpolatePositionEmbedding(
     let out = Tensor.empty(
         shape: [targetSide * targetSide, hidden],
         dtype: posEmb.dtype, device: device)
-    ImagePreprocessing.copyFloats(dst, into: out)
+    MediaUtils.copyFloats(dst, into: out)
     return out
 }

@@ -219,7 +219,7 @@ func gemma4AudioClampTensor(
         if flat[i] < lo { flat[i] = lo }
         if flat[i] > hi { flat[i] = hi }
     }
-    return ImagePreprocessing.makeTensor(
+    return MediaUtils.makeTensor(
         from: flat, shape: x.shape, dtype: x.dtype, device: device)
 }
 
@@ -317,7 +317,7 @@ final class Gemma4ConformerFeedForward {
 func gemma4AudioFilledTensor(
     value: Float, count: Int, shape: [Int], dtype: DType, device: Device
 ) -> Tensor {
-    ImagePreprocessing.makeTensor(
+    MediaUtils.makeTensor(
         from: [Float](repeating: value, count: count),
         shape: shape, dtype: dtype, device: device)
 }
@@ -411,7 +411,7 @@ final class Gemma4ConformerLightConv1d {
                 conv[t * hidden + c] = acc
             }
         }
-        let convT = ImagePreprocessing.makeTensor(
+        let convT = MediaUtils.makeTensor(
             from: conv, shape: [nTokens, hidden], dtype: x.dtype, device: device)
 
         // clip → conv_norm → SiLU → linear_end, + residual. The clip is
@@ -522,7 +522,7 @@ final class Gemma4ConformerBlock {
         for t in 0 ..< nTokens where !valid[t] {
             for c in 0 ..< hidden { flat[t * hidden + c] = 0 }
         }
-        return ImagePreprocessing.makeTensor(
+        return MediaUtils.makeTensor(
             from: flat, shape: [nTokens, hidden], dtype: x.dtype, device: device)
     }
 }
@@ -650,7 +650,7 @@ final class Gemma4AudioAttention {
         // `dtype` is the projection weight's storage dtype — the GEMM
         // input must match it.
         let cmd = device.makeCommandBuffer()
-        let signalT = ImagePreprocessing.makeTensor(
+        let signalT = MediaUtils.makeTensor(
             from: signal, shape: [maxSpanPlus1, hidden], dtype: dtype, device: device)
         let projected = relativeKProj.callMany(
             signalT, t: maxSpanPlus1, on: cmd, device: device)
@@ -839,7 +839,7 @@ final class Gemma4AudioAttention {
         }
 
         // Reassemble [nTokens, hidden] context and post-project.
-        let contextT = ImagePreprocessing.makeTensor(
+        let contextT = MediaUtils.makeTensor(
             from: outFlat, shape: [nTokens, H], dtype: hiddenStates.dtype,
             device: device)
         var cmd2 = device.makeCommandBuffer()
@@ -1292,7 +1292,7 @@ final class Gemma4AudioEncoder: @unchecked Sendable {
             "Gemma4AudioEncoder.subsample: flat dim \(flatDim) ≠ "
                 + "input_proj in-dim \(inputProjInDim)")
         // `act` is already [T, F, C] row-major == [T, F*C] flat.
-        let features = ImagePreprocessing.makeTensor(
+        let features = MediaUtils.makeTensor(
             from: act, shape: [curT, flatDim], dtype: dtype, device: device)
         return (features, mask, curT)
     }
@@ -1306,7 +1306,7 @@ final class Gemma4AudioEncoder: @unchecked Sendable {
         for t in 0 ..< nOut where t < valid.count && !valid[t] {
             for c in 0 ..< outDim { flat[t * outDim + c] = 0 }
         }
-        return ImagePreprocessing.makeTensor(
+        return MediaUtils.makeTensor(
             from: flat, shape: [nOut, outDim], dtype: x.dtype, device: device)
     }
 }
@@ -1389,7 +1389,7 @@ final class Gemma4AudioEmbedder: @unchecked Sendable {
             let inv = 1.0 / (ss / Float(dim) + normEps).squareRoot()
             for d in 0 ..< dim { normed[t * dim + d] = src[t * dim + d] * inv }
         }
-        let normedT = ImagePreprocessing.makeTensor(
+        let normedT = MediaUtils.makeTensor(
             from: normed, shape: [nTokens, dim], dtype: dtype, device: device)
 
         let cmd = device.makeCommandBuffer()
@@ -1434,7 +1434,7 @@ enum Gemma4OmniAudio {
             1, (samples.count + samplesPerToken - 1) / samplesPerToken)
         var rows = [Float](repeating: 0, count: nFrames * samplesPerToken)
         for i in 0 ..< samples.count { rows[i] = samples[i] }
-        return ImagePreprocessing.makeTensor(
+        return MediaUtils.makeTensor(
             from: rows, shape: [nFrames, samplesPerToken],
             dtype: dtype, device: device)
     }

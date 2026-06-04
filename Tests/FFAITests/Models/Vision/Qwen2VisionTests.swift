@@ -171,7 +171,7 @@ struct Qwen2VisionSmartResizeTests {
         let cfg = try config()
         // [1, 3, 56, 84] (H=56, W=84) → grid (56/14, 84/14) = (4, 6).
         let pixels = [Float](repeating: 0, count: 1 * 3 * 56 * 84)
-        let t = ImagePreprocessing.makeTensor(
+        let t = MediaUtils.makeTensor(
             from: pixels, shape: [1, 3, 56, 84], dtype: .f32, device: .shared)
         let (gridH, gridW) = Qwen2VLVisionModel.gridDims(for: t, cfg: cfg)
         #expect(gridH == 4 && gridW == 6)

@@ -96,7 +96,9 @@ public enum MelNorm: Sendable {
     case none
 }
 
-public enum AudioPreprocessing {
+// Audio preprocessing lives on `MediaUtils` — the single facade models call.
+// The data types above (`AudioFrontEndConfig`, `MelNorm`) stay top-level.
+extension MediaUtils {
 
     // ─── Window + filterbank construction ────────────────────────────
 

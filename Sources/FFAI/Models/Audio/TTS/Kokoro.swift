@@ -136,9 +136,9 @@ public final class KokoroVocoder: @unchecked Sendable {
     ) {
         self.nFFT = nFFT
         self.hopLength = hopLength
-        let win = AudioPreprocessing.hannWindow(nFFT)
+        let win = MediaUtils.hannWindow(nFFT)
         let w = Tensor.empty(shape: [nFFT], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(win, into: w)
+        MediaUtils.copyFloats(win, into: w)
         self.window = w
     }
 

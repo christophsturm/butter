@@ -159,7 +159,9 @@ public struct ImageNormalization: Sendable {
         std: (0.26862954, 0.26130258, 0.27577711))
 }
 
-public enum ImagePreprocessing {
+// Image preprocessing lives on `MediaUtils` — the single facade models call.
+// The data types above (`RGBImage`, `ImageNormalization`) stay top-level.
+extension MediaUtils {
 
     /// Resize `image` to `targetW × targetH` with bilinear interpolation.
     /// Vision encoders expect a fixed input resolution (SigLIP 224 / 896,
@@ -170,7 +172,7 @@ public enum ImagePreprocessing {
     ) -> RGBImage {
         precondition(
             targetW > 0 && targetH > 0,
-            "ImagePreprocessing.resize: target dims must be positive")
+            "MediaUtils.resize: target dims must be positive")
         if image.width == targetW && image.height == targetH { return image }
 
         var out = [Float](repeating: 0, count: targetW * targetH * 3)
@@ -253,10 +255,10 @@ public enum ImagePreprocessing {
     ) -> Tensor {
         precondition(
             planar.count == channels * height * width,
-            "ImagePreprocessing.patchify: array size mismatch")
+            "MediaUtils.patchify: array size mismatch")
         precondition(
             height % patchH == 0 && width % patchW == 0,
-            "ImagePreprocessing.patchify: image not divisible by patch")
+            "MediaUtils.patchify: image not divisible by patch")
         let patchesH = height / patchH
         let patchesW = width / patchW
         let numPatches = patchesH * patchesW

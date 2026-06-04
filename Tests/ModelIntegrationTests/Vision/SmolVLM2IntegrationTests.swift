@@ -55,7 +55,7 @@ struct SmolVLM2IntegrationTests {
         _ image: RGBImage,
         size: Int
     ) -> [Float] {
-        let resized = ImagePreprocessing.resize(
+        let resized = MediaUtils.resize(
             image, targetW: size, targetH: size)
         // Normalize: (x - 0.5) / 0.5 = 2*x - 1
         return resized.pixels.map { $0 * 2.0 - 1.0 }

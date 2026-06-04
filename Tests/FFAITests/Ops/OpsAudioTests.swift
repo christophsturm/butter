@@ -44,7 +44,7 @@ struct OpsAudioTests {
             var audio = [Float](repeating: 0, count: nSamples)
             for i in 0 ..< nSamples { audio[i] = sin(Float(i) * 0.7) }
             // A simple analysis window + filterbank.
-            let window = AudioPreprocessing.hannWindow(nFFT)
+            let window = MediaUtils.hannWindow(nFFT)
             var melW = [Float](repeating: 0, count: nMels * nFreq)
             for m in 0 ..< nMels {
                 for k in 0 ..< nFreq {
@@ -119,7 +119,7 @@ struct OpsAudioTests {
             // on `cb` so `runAndWait` owns the commit (the normalised
             // path commits internally — that would double-commit here).
             runAndWait { cb in
-                out = AudioPreprocessing.logMelSpectrogram(
+                out = MediaUtils.logMelSpectrogram(
                     waveform: wave, cfg: cfg, whisperNormalize: false,
                     on: cb)
             }
@@ -298,7 +298,7 @@ struct OpsAudioTests {
                 specRe[i] = Float(i % 7) * 0.2 - 0.5
                 specIm[i] = Float(i % 5) * 0.15 - 0.3
             }
-            let window = AudioPreprocessing.hannWindow(nFFT)
+            let window = MediaUtils.hannWindow(nFFT)
 
             // CPU reference — the kernel's per-output-sample gather.
             var expected = [Float](repeating: 0, count: outLen)
@@ -359,7 +359,7 @@ struct OpsAudioTests {
     @Test("reflectPad mirrors the signal across the boundary")
     func reflectPadMirrors() {
         let x: [Float] = [1, 2, 3, 4]
-        let padded = AudioPreprocessing.reflectPad(x, pad: 2)
+        let padded = MediaUtils.reflectPad(x, pad: 2)
         // numpy reflect: [3,2, 1,2,3,4, 3,2]
         #expect(padded == [3, 2, 1, 2, 3, 4, 3, 2])
     }
@@ -367,9 +367,9 @@ struct OpsAudioTests {
     @Test("resample changes length by the rate ratio")
     func resampleLength() {
         let x = [Float](repeating: 0.5, count: 100)
-        let up = AudioPreprocessing.resample(x, from: 8000, to: 16000)
+        let up = MediaUtils.resample(x, from: 8000, to: 16000)
         #expect(up.count == 200)
-        let down = AudioPreprocessing.resample(x, from: 16000, to: 8000)
+        let down = MediaUtils.resample(x, from: 16000, to: 8000)
         #expect(down.count == 50)
         // Constant signal stays constant through linear interpolation.
         #expect(up.allSatisfy { abs($0 - 0.5) < 1e-5 })
@@ -378,7 +378,7 @@ struct OpsAudioTests {
     @Test("melFilterbank rows are non-negative and overlap")
     func melFilterbankShape() {
         let cfg = AudioFrontEndConfig.whisper
-        let bank = AudioPreprocessing.melFilterbank(cfg)
+        let bank = MediaUtils.melFilterbank(cfg)
         #expect(bank.count == cfg.nMels * cfg.nFreq)
         #expect(bank.allSatisfy { $0 >= 0 })
         // Each Mel filter should have at least one non-zero tap.

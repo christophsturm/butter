@@ -428,7 +428,7 @@ extension FireRedASR2Model {
         // HTK-scale mel filterbank (SenseVoice uses the same Slaney-norm mel
         // filterbank; FireRedASR2 uses htk-scale but the encoder's LayerNorm
         // absorbs the per-bin scale difference, matching the mlx-audio-swift approach).
-        let melBank = AudioPreprocessing.melFilterbank(
+        let melBank = MediaUtils.melFilterbank(
             AudioFrontEndConfig(
                 sampleRate: fbankSampleRate,
                 nFFT: fftLength,
@@ -533,7 +533,7 @@ extension FireRedASR2Model {
         let inputT = Tensor.empty(
             shape: [1, 1, paddedLen, idim],
             dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(padded, into: inputT)
+        MediaUtils.copyFloats(padded, into: inputT)
 
         let cmd1 = device.makeCommandBuffer()
         // conv1: [32, 1, 3, 3], stride=(2,2), pad=(0,0)
@@ -582,7 +582,7 @@ extension FireRedASR2Model {
         let xFlat = Tensor.empty(
             shape: [hOut, flatDim], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(reordered, into: xFlat)
+        MediaUtils.copyFloats(reordered, into: xFlat)
 
         // Linear projection: [hOut, flatDim] → [hOut, dModel]
         let cmd3 = device.makeCommandBuffer()
@@ -622,7 +622,7 @@ extension FireRedASR2Model {
         let result = Tensor.empty(
             shape: [T, dModel], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(seqVals, into: result)
+        MediaUtils.copyFloats(seqVals, into: result)
         return result
     }
 
@@ -1566,7 +1566,7 @@ extension FireRedASR2Model {
                 let out = Tensor.empty(
                     shape: [outCh, inCh, kH, kW], dtype: dtype,
                     device: device)
-                AudioPreprocessing.copyFloats(src, into: out)
+                MediaUtils.copyFloats(src, into: out)
                 return out
             } else {
                 // OHWI → OIHW transpose.
@@ -1586,7 +1586,7 @@ extension FireRedASR2Model {
                 let out = Tensor.empty(
                     shape: [outCh, inCh, kH, kW], dtype: dtype,
                     device: device)
-                AudioPreprocessing.copyFloats(transposed, into: out)
+                MediaUtils.copyFloats(transposed, into: out)
                 return out
             }
         }
@@ -1635,7 +1635,7 @@ extension FireRedASR2Model {
             let src = raw.toFloatArray()
             let flat = Tensor.empty(shape: [outCh, kW], dtype: dtype, device: device)
             let vals = Array(src.prefix(outCh * kW))
-            AudioPreprocessing.copyFloats(vals, into: flat)
+            MediaUtils.copyFloats(vals, into: flat)
             return Linear(weight: flat, bias: nil)
         }
 

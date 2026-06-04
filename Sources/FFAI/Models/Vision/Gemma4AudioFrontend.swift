@@ -17,7 +17,7 @@
 // (`Gemma4Audio`) consumes, plus a per-frame validity mask.
 //
 // This reuses FFAI's existing GPU Mel path (`Ops.melSpectrogram`, wrapped
-// by `AudioPreprocessing.logMelSpectrogram`) rather than re-deriving an
+// by `MediaUtils.logMelSpectrogram`) rather than re-deriving an
 // STFT / Mel projection. Gemma 4 differs from Whisper in three ways, all
 // parameterised here rather than mutating the Whisper path:
 //
@@ -133,17 +133,17 @@ enum Gemma4AudioFrontend {
         // realises "window the 320-sample frame, then RFFT with n=512".
         // VALIDATE: reference uses `window_function(frame_length)` which is
         // a periodic Hann of length 320 (divisor 320, matching
-        // `AudioPreprocessing.hannWindow`); the zero tail to 512 is the
+        // `MediaUtils.hannWindow`); the zero tail to 512 is the
         // implicit RFFT zero-pad.
-        var window = AudioPreprocessing.hannWindow(frameLength)
+        var window = MediaUtils.hannWindow(frameLength)
         window.append(
             contentsOf: [Float](repeating: 0, count: fftLength - frameLength))
         let winT = Tensor.empty(shape: [fftLength], dtype: .f32, device: device)
-        AudioPreprocessing.copyFloats(window, into: winT)
+        MediaUtils.copyFloats(window, into: winT)
 
         // ── HTK, norm=None Mel filterbank (Gemma 4 / HF). `bank` is
         // `[nMels, nFreq]` row-major (filter weight per (mel_bin, freq)).
-        let bank = AudioPreprocessing.melFilterbank(cfg, norm: .none)
+        let bank = MediaUtils.melFilterbank(cfg, norm: .none)
 
         // ── STFT → MAGNITUDE Mel → log, on the GPU.
         //
@@ -166,10 +166,10 @@ enum Gemma4AudioFrontend {
         let nFreq = cfg.nFreq
         let audioT = Tensor.empty(
             shape: [padded.count], dtype: .f32, device: device)
-        AudioPreprocessing.copyFloats(padded, into: audioT)
+        MediaUtils.copyFloats(padded, into: audioT)
         let bankT = Tensor.empty(
             shape: [nMels, nFreq], dtype: .f32, device: device)
-        AudioPreprocessing.copyFloats(bank, into: bankT)
+        MediaUtils.copyFloats(bank, into: bankT)
         let cmd = device.makeCommandBuffer()
         let melGPU = Ops.melSpectrogramMagnitude(
             audio: audioT, window: winT, melWeight: bankT,
@@ -199,7 +199,7 @@ enum Gemma4AudioFrontend {
             for m in 0 ..< nMels { melFlat[base + m] = 0 }
         }
 
-        let mel = ImagePreprocessing.makeTensor(
+        let mel = MediaUtils.makeTensor(
             from: melFlat, shape: [nFrames, nMels], dtype: .f32, device: device)
 
         return (mel, mask)

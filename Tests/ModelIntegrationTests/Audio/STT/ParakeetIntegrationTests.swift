@@ -71,7 +71,7 @@ struct ParakeetIntegrationTests {
     /// Load the bundled conversational speech fixture, if present.
     /// Falls back to a synthetic tone when the fixture file is absent
     /// (the worktree does not include the Resources/ subtree). Routes
-    /// through `AudioPreprocessing.loadWaveform` so the 24 kHz source
+    /// through `MediaUtils.loadWaveform` so the 24 kHz source
     /// is resampled to 16 kHz for Parakeet's front-end.
     private func speechFixtureWaveform() -> [Float] {
         if let wave = try? AudioTestHelpers.conversationalAWaveform(),

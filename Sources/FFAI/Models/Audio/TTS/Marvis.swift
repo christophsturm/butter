@@ -747,7 +747,7 @@ extension MarvisModel {
         let out = Tensor.empty(
             shape: [nPlanes, audioVocab, decoderHidden],
             dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(dst, into: out)
+        MediaUtils.copyFloats(dst, into: out)
         return out
     }
 }

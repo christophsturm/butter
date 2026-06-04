@@ -388,7 +388,7 @@ public final class SenseVoiceModel: @unchecked Sendable {
         let inputT = Tensor.empty(
             shape: [nRows, config.inputSize],
             dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(rows, into: inputT)
+        MediaUtils.copyFloats(rows, into: inputT)
 
         // SenseVoice scales the input by sqrt(hidden) then adds a
         // sinusoidal position embedding before the first block.
@@ -470,7 +470,7 @@ public final class SenseVoiceModel: @unchecked Sendable {
         let memT = Tensor.empty(
             shape: [nRows, H], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(fsmnMemory, into: memT)
+        MediaUtils.copyFloats(fsmnMemory, into: memT)
         attnOut = Ops.add(attnOut, memT, on: cmd2)
         // Residual — block 0 of `encoders0` changes dim, so skip the
         // residual there (`inSize != hidden`).
@@ -564,11 +564,11 @@ public final class SenseVoiceModel: @unchecked Sendable {
         // Upload Q/K/V frame-major; transpose K/V to head-major for the
         // SDPA contract (Q stays frame-major / `[nRows, heads, headDim]`).
         let qT = Tensor.empty(shape: [nRows, stride], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(qa, into: qT)
+        MediaUtils.copyFloats(qa, into: qT)
         let kT = Tensor.empty(shape: [nRows, stride], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(ka, into: kT)
+        MediaUtils.copyFloats(ka, into: kT)
         let vT = Tensor.empty(shape: [nRows, stride], dtype: dtype, device: device)
-        AudioPreprocessing.copyFloats(va, into: vT)
+        MediaUtils.copyFloats(va, into: vT)
         let cmd = device.makeCommandBuffer()
         let kHead = Ops.transposeTokensToHeads(
             kT, nTokens: nRows, nHeads: heads, headDim: headDim, on: cmd)
@@ -651,7 +651,7 @@ public final class SenseVoiceModel: @unchecked Sendable {
         let result = Tensor.empty(
             shape: [nRows, stride], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return result
     }
 
@@ -713,7 +713,7 @@ public final class SenseVoiceModel: @unchecked Sendable {
     ) -> Tensor {
         let vals = x.toFloatArray().map { $0 * factor }
         let out = Tensor.empty(shape: x.shape, dtype: dtype)
-        AudioPreprocessing.copyFloats(vals, into: out)
+        MediaUtils.copyFloats(vals, into: out)
         return out
     }
 
@@ -742,7 +742,7 @@ public final class SenseVoiceModel: @unchecked Sendable {
         let posT = Tensor.empty(
             shape: [nRows, dim], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(table, into: posT)
+        MediaUtils.copyFloats(table, into: posT)
         let cmd = device.makeCommandBuffer()
         let out = Ops.add(x, posT, on: cmd)
         cmd.commit()
@@ -775,7 +775,7 @@ public final class SenseVoiceModel: @unchecked Sendable {
         let result = Tensor.empty(
             shape: [nRows, rowSize], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return result
     }
 }
@@ -836,7 +836,7 @@ public enum SenseVoiceFrontEnd {
         // LayerNorms and the learned `ctc_lo` projection absorb it, so
         // the greedy-CTC transcript stays coherent. A bit-exact HTK
         // bank is a later accuracy pass.
-        let melBank = AudioPreprocessing.melFilterbank(
+        let melBank = MediaUtils.melFilterbank(
             AudioFrontEndConfig(
                 sampleRate: cfg.sampleRate, nFFT: fftLength,
                 hopLength: hopLength, nMels: cfg.nMels,

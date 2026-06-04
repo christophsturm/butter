@@ -57,12 +57,12 @@ struct VisionTowerOpsAddRowBiasTests {
         let rowSize = 4
         // x = row-major [0..11].
         let xVals: [Float] = (0 ..< (nRows * rowSize)).map { Float($0) }
-        let x = ImagePreprocessing.makeTensor(
+        let x = MediaUtils.makeTensor(
             from: xVals, shape: [nRows, rowSize], dtype: .f32, device: device)
         // bias = [10, 20, 30, 40] — distinct per column so we can detect
         // column-order mistakes.
         let biasVals: [Float] = [10, 20, 30, 40]
-        let bias = ImagePreprocessing.makeTensor(
+        let bias = MediaUtils.makeTensor(
             from: biasVals, shape: [rowSize], dtype: .f32, device: device)
 
         let cmd = device.makeCommandBuffer()
@@ -95,9 +95,9 @@ struct VisionTowerOpsPadRowsTests {
     @Test("identity when outOld == toRows")
     func identityPassThrough() {
         let device = Device.shared
-        let w = ImagePreprocessing.makeTensor(
+        let w = MediaUtils.makeTensor(
             from: [1, 2, 3, 4], shape: [2, 2], dtype: .f32, device: device)
-        let b = ImagePreprocessing.makeTensor(
+        let b = MediaUtils.makeTensor(
             from: [10, 20], shape: [2], dtype: .f32, device: device)
         let lin = Linear(weight: w, bias: b)
         let out = padLinearRows(lin, toRows: 2, device: device)
@@ -113,9 +113,9 @@ struct VisionTowerOpsPadRowsTests {
     func zeroExtendsRowsAndBias() {
         let device = Device.shared
         // weight = [[1, 2], [3, 4]] (outOld=2, inDim=2). Pad to outNew=4.
-        let w = ImagePreprocessing.makeTensor(
+        let w = MediaUtils.makeTensor(
             from: [1, 2, 3, 4], shape: [2, 2], dtype: .f32, device: device)
-        let b = ImagePreprocessing.makeTensor(
+        let b = MediaUtils.makeTensor(
             from: [10, 20], shape: [2], dtype: .f32, device: device)
         let lin = Linear(weight: w, bias: b)
 
@@ -134,7 +134,7 @@ struct VisionTowerOpsPadColsTests {
     @Test("identity when inOld == toCols")
     func identityPassThrough() {
         let device = Device.shared
-        let w = ImagePreprocessing.makeTensor(
+        let w = MediaUtils.makeTensor(
             from: [1, 2, 3, 4], shape: [2, 2], dtype: .f32, device: device)
         let lin = Linear(weight: w, bias: nil)
         let out = padLinearCols(lin, toCols: 2, device: device)
@@ -150,9 +150,9 @@ struct VisionTowerOpsPadColsTests {
     func zeroExtendsCols() {
         let device = Device.shared
         // weight = [[1, 2], [3, 4]] (outDim=2, inOld=2). Pad to inNew=4.
-        let w = ImagePreprocessing.makeTensor(
+        let w = MediaUtils.makeTensor(
             from: [1, 2, 3, 4], shape: [2, 2], dtype: .f32, device: device)
-        let b = ImagePreprocessing.makeTensor(
+        let b = MediaUtils.makeTensor(
             from: [10, 20], shape: [2], dtype: .f32, device: device)
         let lin = Linear(weight: w, bias: b)
 
@@ -173,7 +173,7 @@ struct VisionTowerOpsPadColsTensorTests {
     @Test("identity when inOld == toCols")
     func identityPassThrough() {
         let device = Device.shared
-        let w = ImagePreprocessing.makeTensor(
+        let w = MediaUtils.makeTensor(
             from: [1, 2, 3, 4], shape: [2, 2], dtype: .f32, device: device)
         let out = padLinearColsTo(w, toCols: 2, device: device)
         #expect(out.shape == [2, 2])
@@ -186,7 +186,7 @@ struct VisionTowerOpsPadColsTensorTests {
     @Test("zero-extends trailing columns on a raw tensor")
     func zeroExtendsCols() {
         let device = Device.shared
-        let w = ImagePreprocessing.makeTensor(
+        let w = MediaUtils.makeTensor(
             from: [1, 2, 3, 4], shape: [2, 2], dtype: .f32, device: device)
         let out = padLinearColsTo(w, toCols: 4, device: device)
         #expect(out.shape == [2, 4])
@@ -217,7 +217,7 @@ struct VisionTowerOpsFlattenPatchEmbedTests {
         // Walk the source contiguously so each cell is obvious.
         let srcVals: [Float] =
             (0 ..< (hidden * tP * p * p * inCh)).map { Float($0) }
-        let w = ImagePreprocessing.makeTensor(
+        let w = MediaUtils.makeTensor(
             from: srcVals, shape: [hidden, tP, p, p, inCh], dtype: .f32,
             device: device)
 
@@ -271,7 +271,7 @@ struct VisionTowerOpsFlattenPatchEmbedTests {
         let patchDimPadded = 64  // next K-tile multiple ≥ 50
         let srcVals: [Float] =
             (0 ..< (hidden * inCh * tP * p * p)).map { Float($0) }
-        let w = ImagePreprocessing.makeTensor(
+        let w = MediaUtils.makeTensor(
             from: srcVals, shape: [hidden, inCh, tP, p, p], dtype: .f32,
             device: device)
 

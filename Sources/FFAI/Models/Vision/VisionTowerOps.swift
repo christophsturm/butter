@@ -74,7 +74,7 @@ func addRowBias(
         for c in 0 ..< rowSize { flat[r * rowSize + c] = biasVals[c] }
     }
     let tiled = Tensor.empty(shape: [nRows, rowSize], dtype: x.dtype)
-    ImagePreprocessing.copyFloats(flat, into: tiled)
+    MediaUtils.copyFloats(flat, into: tiled)
     return Ops.add(x, tiled, on: cmd)
 }
 
@@ -96,7 +96,7 @@ func padLinearRows(_ linear: Linear, toRows: Int, device: Device) -> Linear {
     for r in 0 ..< outOld {
         for c in 0 ..< inDim { dst[r * inDim + c] = src[r * inDim + c] }
     }
-    let w = ImagePreprocessing.makeTensor(
+    let w = MediaUtils.makeTensor(
         from: dst, shape: [toRows, inDim], dtype: linear.weight.dtype,
         device: device)
     var b: Tensor?
@@ -104,7 +104,7 @@ func padLinearRows(_ linear: Linear, toRows: Int, device: Device) -> Linear {
         let bs = bias.toFloatArray()
         var bd = [Float](repeating: 0, count: toRows)
         for i in 0 ..< outOld { bd[i] = bs[i] }
-        b = ImagePreprocessing.makeTensor(
+        b = MediaUtils.makeTensor(
             from: bd, shape: [toRows], dtype: bias.dtype, device: device)
     }
     return Linear(weight: w, bias: b)
@@ -127,7 +127,7 @@ func padLinearCols(_ linear: Linear, toCols: Int, device: Device) -> Linear {
     for r in 0 ..< outDim {
         for c in 0 ..< inOld { dst[r * toCols + c] = src[r * inOld + c] }
     }
-    let w = ImagePreprocessing.makeTensor(
+    let w = MediaUtils.makeTensor(
         from: dst, shape: [outDim, toCols], dtype: linear.weight.dtype,
         device: device)
     return Linear(weight: w, bias: linear.bias)
@@ -150,7 +150,7 @@ func padLinearColsTo(_ w: Tensor, toCols: Int, device: Device) -> Tensor {
     for r in 0 ..< outDim {
         for c in 0 ..< inOld { dst[r * toCols + c] = src[r * inOld + c] }
     }
-    return ImagePreprocessing.makeTensor(
+    return MediaUtils.makeTensor(
         from: dst, shape: [outDim, toCols], dtype: w.dtype, device: device)
 }
 
@@ -217,7 +217,7 @@ func flattenPatchEmbed(
             }
         }
     }
-    return ImagePreprocessing.makeTensor(
+    return MediaUtils.makeTensor(
         from: dst, shape: [hidden, patchDimPadded], dtype: w.dtype,
         device: device)
 }

@@ -241,10 +241,10 @@ public final class WhisperModel: @unchecked Sendable {
         // `whisperNormalize: true` — `logMelSpectrogram` commits + waits
         // on `cmd` itself (it normalises the kernel result on the CPU),
         // so the result is already CPU-synced; do NOT re-commit `cmd`.
-        let melRaw = AudioPreprocessing.logMelSpectrogram(
+        let melRaw = MediaUtils.logMelSpectrogram(
             waveform: framed, cfg: config.frontEnd, dtype: melDtype,
             whisperNormalize: true, device: device, on: cmd)
-        var mel = AudioPreprocessing.castTensor(
+        var mel = MediaUtils.castTensor(
             melRaw, to: dtype,
             device: device)
         // The kernel's frame walk yields one extra frame versus
@@ -416,7 +416,7 @@ public final class WhisperModel: @unchecked Sendable {
         let audioT = Tensor.empty(
             shape: [nAudioCtx, H], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(audio, into: audioT)
+        MediaUtils.copyFloats(audio, into: audioT)
         let crossK = project(layer.crossKProj, audioT, nRows: nAudioCtx, on: cmd2)
         let crossV = project(layer.crossVProj, audioT, nRows: nAudioCtx, on: cmd2)
         cmd2.commit()
@@ -523,7 +523,7 @@ public final class WhisperModel: @unchecked Sendable {
         let result = Tensor.empty(
             shape: [nQuery, stride], dtype: dtype,
             device: device)
-        AudioPreprocessing.copyFloats(out, into: result)
+        MediaUtils.copyFloats(out, into: result)
         return result
     }
 }

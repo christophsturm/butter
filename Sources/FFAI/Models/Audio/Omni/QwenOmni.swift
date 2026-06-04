@@ -207,10 +207,10 @@ public final class QwenOmniModel: @unchecked Sendable {
         // `whisperNormalize: true` — `logMelSpectrogram` commits + waits
         // on `cmd` itself (it normalises the kernel result on the CPU),
         // so the result is already CPU-synced; do NOT re-commit `cmd`.
-        let melRaw = AudioPreprocessing.logMelSpectrogram(
+        let melRaw = MediaUtils.logMelSpectrogram(
             waveform: waveform, cfg: config.frontEnd, dtype: melDtype,
             whisperNormalize: true, device: device, on: cmd)
-        let mel = AudioPreprocessing.castTensor(
+        let mel = MediaUtils.castTensor(
             melRaw, to: dtype,
             device: device)
 
@@ -347,12 +347,12 @@ extension QwenOmniModel {
         if bundle.has(prefix + "embed_positions.weight") {
             posEmbedding = try t("embed_positions.weight")
         } else {
-            let table = AudioPreprocessing.sinusoidalPositions(
+            let table = MediaUtils.sinusoidalPositions(
                 length: qc.maxAudioCtx, dim: qc.encoderHidden)
             let pe = Tensor.empty(
                 shape: [qc.maxAudioCtx, qc.encoderHidden],
                 dtype: dtype)
-            AudioPreprocessing.copyFloats(table, into: pe)
+            MediaUtils.copyFloats(table, into: pe)
             posEmbedding = pe
         }
 

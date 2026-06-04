@@ -422,7 +422,7 @@ final class PixtralVisionBlock {
         let result = Tensor.empty(
             shape: [nPatches, hidden], dtype: q.dtype,
             device: device)
-        ImagePreprocessing.copyFloats(outT.toFloatArray(), into: result)
+        MediaUtils.copyFloats(outT.toFloatArray(), into: result)
         return result
     }
 }
@@ -594,7 +594,7 @@ final class PixtralVisionEncoder: @unchecked Sendable {
     private func makeZeroBias(length: Int, dtype: DType, device: Device) -> Tensor {
         let zeros = [Float](repeating: 0, count: length)
         let t = Tensor.empty(shape: [length], dtype: dtype, device: device)
-        ImagePreprocessing.copyFloats(zeros, into: t)
+        MediaUtils.copyFloats(zeros, into: t)
         return t
     }
 
@@ -613,7 +613,7 @@ final class PixtralVisionEncoder: @unchecked Sendable {
         let out = Tensor.empty(
             shape: [numPatches, hidden], dtype: dtype,
             device: device)
-        ImagePreprocessing.copyFloats(dst, into: out)
+        MediaUtils.copyFloats(dst, into: out)
         return out
     }
 }

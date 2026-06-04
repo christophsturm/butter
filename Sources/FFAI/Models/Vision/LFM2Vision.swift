@@ -113,9 +113,17 @@ func lfm2vlLoadVisionEncoder(
                 oProj: try lin("self_attn.out_proj"),
                 layerNorm2: ln2,
                 fc1: try lin("mlp.fc1"), fc2: try lin("mlp.fc2"),
-                hidden: hidden, nHeads: nHeads, intermediate: intermediate))
+                hidden: hidden, nHeads: nHeads, intermediate: intermediate,
+                // SigLIP2 uses the exact (erf) GELU, not the tanh approximation.
+                useExactGelu: true))
     }
 
+    // post_layernorm IS applied: mlx-vlm truncates the encoder to
+    // `vision_feature_layer + 1` layers, then takes the tower's
+    // `last_hidden_state = post_layernorm(encoder_outputs[-1])`
+    // (see mlx_vlm lfm2_vl `*_, hidden_states = self.vision_tower(...)` +
+    // siglip2 `vision.py` VisionTransformer.__call__). So post_layernorm
+    // runs over the truncated (26-layer) output.
     let postLN = LayerNorm(
         weight: try weights.tensor(named: "post_layernorm.weight"),
         bias: try weights.tensor(named: "post_layernorm.bias"),
@@ -132,28 +140,45 @@ func lfm2vlLoadVisionEncoder(
         dtype: patchW.dtype)
 }
 
-/// Reshape a Linear patch-embed weight from `[hidden, channels*h*w]` to
-/// `[hidden, channels, h, w]` (OIHW). The data order is unchanged — it
-/// is a pure shape view, materialised into a fresh tensor so the result
-/// is a standard `Tensor` backed by a Metal buffer.
+/// Permute a SigLIP2-NaFlex Linear patch-embed weight from its native
+/// `[hidden, (py, px, channel)]` column order into the `[hidden, channels,
+/// patch_h, patch_w]` (OIHW) layout `VisionEncoder`'s `(channel, py, px)`
+/// patch unfold consumes.
+///
+/// SigLIP2's image processor patchifies as
+/// `reshape(nph, ph, npw, pw, c).transpose(0,2,1,3,4).reshape(-1, ph*pw*c)`,
+/// i.e. each patch is flattened `(py, px, channel)` with **channel fastest**.
+/// A raw byte-reshape (treating the columns as `(channel, py, px)`) scrambles
+/// every patch's pixels → garbage features → coherent-but-image-independent
+/// captions. This permutes the columns so the projection matches.
 private func reshapeLinearPatchEmbed(
     _ src: Tensor, hidden: Int, channels: Int, patchSize: Int
 ) -> Tensor {
     precondition(
         src.shape == [hidden, channels * patchSize * patchSize],
         "reshapeLinearPatchEmbed: unexpected shape \(src.shape)")
-    // Create a new tensor with the 4D OIHW shape; the underlying bytes are
-    // identical, so we can copy the raw buffer content directly.
-    let dst = Tensor.empty(
+    let patchArea = patchSize * patchSize
+    let rowLen = channels * patchArea
+    let srcF = src.toFloatArray()
+    var dstF = [Float](repeating: 0, count: hidden * rowLen)
+    for o in 0 ..< hidden {
+        let oBase = o * rowLen
+        for ch in 0 ..< channels {
+            for py in 0 ..< patchSize {
+                for px in 0 ..< patchSize {
+                    // src column (py, px, c) — channel fastest.
+                    let srcCol = (py * patchSize + px) * channels + ch
+                    // dst OIHW element (c, py, px).
+                    let dstIdx = (ch * patchSize + py) * patchSize + px
+                    dstF[oBase + dstIdx] = srcF[oBase + srcCol]
+                }
+            }
+        }
+    }
+    return MediaUtils.makeTensor(
+        from: dstF,
         shape: [hidden, channels, patchSize, patchSize],
-        dtype: src.dtype)
-    // Raw byte copy — element order is unchanged.
-    let byteCount = src.byteCount
-    memcpy(
-        dst.buffer.contents().advanced(by: dst.offset),
-        src.buffer.contents().advanced(by: src.offset),
-        byteCount)
-    return dst
+        dtype: src.dtype, device: .shared)
 }
 
 // ─── Multi-modal projector ────────────────────────────────────────────
@@ -292,7 +317,7 @@ public final class LFM2VLProjector: @unchecked Sendable {
         let unshuffledT = Tensor.empty(
             shape: [numSuperPatches, superPatchDim], dtype: encoderTokens.dtype,
             device: device)
-        ImagePreprocessing.copyFloats(unshuffled, into: unshuffledT)
+        MediaUtils.copyFloats(unshuffled, into: unshuffledT)
 
         // LayerNorm over each super-patch row (GPU).
         let cmd1 = device.makeCommandBuffer()
@@ -404,7 +429,7 @@ private func lfm2vlBroadcastAddBias(
         for c in 0 ..< rowSize { flat[r * rowSize + c] = biasVals[c] }
     }
     let biasT = Tensor.empty(shape: [nRows, rowSize], dtype: x.dtype, device: device)
-    ImagePreprocessing.copyFloats(flat, into: biasT)
+    MediaUtils.copyFloats(flat, into: biasT)
     let cmd = device.makeCommandBuffer()
     let out = Ops.add(x, biasT, on: cmd)
     cmd.commit()

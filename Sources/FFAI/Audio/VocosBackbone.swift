@@ -255,7 +255,7 @@ struct VocosISTFTHead {
         reT.copyIn(from: specRe)
         let imT = Tensor.empty(shape: [t, nFreq], dtype: .f32, device: device)
         imT.copyIn(from: specIm)
-        let win = AudioPreprocessing.hannWindow(nFFT)
+        let win = MediaUtils.hannWindow(nFFT)
         let winT = Tensor.empty(shape: [nFFT], dtype: .f32, device: device)
         winT.copyIn(from: win)
 

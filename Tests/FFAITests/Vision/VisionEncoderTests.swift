@@ -30,7 +30,7 @@ struct VisionEncoderTests {
     @Test("resize — identity when target equals source")
     func resizeIdentity() {
         let img = RGBImage.solid(width: 8, height: 8, r: 0.2, g: 0.5, b: 0.9)
-        let out = ImagePreprocessing.resize(img, targetW: 8, targetH: 8)
+        let out = MediaUtils.resize(img, targetW: 8, targetH: 8)
         #expect(out.width == 8 && out.height == 8)
         #expect(out.pixels == img.pixels)
     }
@@ -38,7 +38,7 @@ struct VisionEncoderTests {
     @Test("resize — solid color is preserved under downscale")
     func resizeSolidPreserved() {
         let img = RGBImage.solid(width: 16, height: 16, r: 0.3, g: 0.6, b: 0.1)
-        let out = ImagePreprocessing.resize(img, targetW: 4, targetH: 4)
+        let out = MediaUtils.resize(img, targetW: 4, targetH: 4)
         #expect(out.width == 4 && out.height == 4)
         // A solid color stays that color regardless of resampling.
         for i in 0 ..< (4 * 4) {
@@ -52,7 +52,7 @@ struct VisionEncoderTests {
     func preprocessNormalize() {
         // Solid mid-gray 0.5 under SigLIP norm (mean 0.5, std 0.5) → 0.
         let img = RGBImage.solid(width: 12, height: 12, r: 0.5, g: 0.5, b: 0.5)
-        let t = ImagePreprocessing.preprocess(
+        let t = MediaUtils.preprocess(
             img, targetW: 8, targetH: 8,
             normalization: .siglip, dtype: .f32)
         #expect(t.shape == [1, 3, 8, 8])
@@ -63,7 +63,7 @@ struct VisionEncoderTests {
     @Test("patchify — flattens 3ch image into [num_patches, patch_dim]")
     func patchifyShape() {
         let planar = (0 ..< (3 * 8 * 8)).map { Float($0) }
-        let t = ImagePreprocessing.patchify(
+        let t = MediaUtils.patchify(
             planar: planar, channels: 3, height: 8, width: 8,
             patchH: 4, patchW: 4, dtype: .f32)
         #expect(t.shape == [4, 48])  // (8/4)^2 = 4 patches, 3*4*4 = 48 dim
@@ -165,7 +165,7 @@ struct VisionEncoderTests {
             let img = RGBImage.solid(
                 width: 32, height: 32,
                 r: 0.4, g: 0.5, b: 0.6)
-            let pixels = ImagePreprocessing.preprocess(
+            let pixels = MediaUtils.preprocess(
                 img, targetW: 32, targetH: 32,
                 normalization: .siglip, dtype: .f32)
             let out = enc.encode(image: pixels)
@@ -188,7 +188,7 @@ struct VisionEncoderTests {
             let img = RGBImage.solid(
                 width: 28, height: 28,
                 r: 0.3, g: 0.7, b: 0.2)
-            let pixels = ImagePreprocessing.preprocess(
+            let pixels = MediaUtils.preprocess(
                 img, targetW: 28, targetH: 28,
                 normalization: .clip, dtype: .f32)
             let out = enc.encode(image: pixels)

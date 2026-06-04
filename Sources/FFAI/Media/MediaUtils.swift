@@ -32,7 +32,7 @@ public enum MediaUtils {
     /// GPU resize + per-channel normalize → planar NCHW
     /// `[1, 3, targetH, targetW]`, via the fused `ffai_resize_normalize{,_bicubic}`
     /// kernel (`Ops.resizeNormalize`). Replaces the CPU triple-loop in
-    /// `ImagePreprocessing.resize` + `preprocess`. `align_corners = false`
+    /// `MediaUtils.resize` + `preprocess`. `align_corners = false`
     /// half-pixel sampling (the HF / transformers convention). `mode` selects
     /// the interpolation filter — `.bilinear` (default) or `.bicubic` for the
     /// down-scaling-heavy native-resolution `smart_resize` path.
@@ -52,7 +52,7 @@ public enum MediaUtils {
             "MediaUtils.resizeNormalize: target dims must be positive")
         // Upload the interleaved source at the requested dtype (the kernel
         // is generic over T; `makeTensor` handles the f32→dtype conversion).
-        let src = ImagePreprocessing.makeTensor(
+        let src = MediaUtils.makeTensor(
             from: image.pixels,
             shape: [image.height, image.width, 3],
             dtype: dtype, device: device)
