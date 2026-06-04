@@ -202,4 +202,21 @@ struct MediaVideoGeometryTests {
         #expect(r.gridW % 2 == 0)
         #expect(r.mergedTokens == (r.gridH / 2) * (r.gridW / 2))
     }
+
+    @Test("aspectPreservingSize: divisible by pool·patch, within patch budget")
+    func aspectPreservingSize() {
+        let patch = 14, pool = 4, maxSoft = 256
+        let sideMult = pool * patch  // 56
+        let maxPatches = maxSoft * pool * pool  // 4096
+        for (w, h) in [(1024, 1024), (1920, 1080), (640, 1280), (224, 224)] {
+            let r = MediaUtils.aspectPreservingSize(
+                width: w, height: h,
+                patchSize: patch, poolingKernelSize: pool, maxSoftTokens: maxSoft)
+            #expect(r.h > 0 && r.w > 0)
+            #expect(r.h % sideMult == 0, "h=\(r.h) not a multiple of \(sideMult)")
+            #expect(r.w % sideMult == 0, "w=\(r.w) not a multiple of \(sideMult)")
+            let patches = (r.h / patch) * (r.w / patch)
+            #expect(patches <= maxPatches, "patches=\(patches) > \(maxPatches)")
+        }
+    }
 }

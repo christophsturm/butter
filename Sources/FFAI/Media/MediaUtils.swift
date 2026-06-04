@@ -237,4 +237,42 @@ public enum MediaUtils {
             (gridH / spatialMergeSize) * (gridW / spatialMergeSize)
         )
     }
+
+    /// Aspect-ratio-preserving target `(height, width)` for Gemma 4's
+    /// variable-resolution image processor: the largest dims that (1)
+    /// produce at most `maxSoftTokens · pool²` patches at `patchSize`, and
+    /// (2) are divisible by `pool · patchSize`. Mirrors the reference
+    /// `get_aspect_ratio_preserving_size` (`image_processing_pil_gemma4`).
+    /// Pure geometry — unit-testable across aspect ratios.
+    public static func aspectPreservingSize(
+        width: Int, height: Int,
+        patchSize: Int, poolingKernelSize: Int, maxSoftTokens: Int
+    ) -> (h: Int, w: Int) {
+        let pool = poolingKernelSize
+        let maxPatches = maxSoftTokens * pool * pool
+        let sideMult = pool * patchSize
+        let targetPx = Double(maxPatches * patchSize * patchSize)
+        let factor = (targetPx / Double(width * height)).squareRoot()
+        var th =
+            Int((factor * Double(height) / Double(sideMult)).rounded(.down))
+            * sideMult
+        var tw =
+            Int((factor * Double(width) / Double(sideMult)).rounded(.down))
+            * sideMult
+        // Degenerate-aspect clamps (reference): a dim that rounds to 0 is
+        // pinned to one `sideMult` block, the other capped at `maxSide`.
+        let maxSide = (maxPatches / (pool * pool)) * sideMult
+        if th == 0 {
+            th = sideMult
+            tw = min(
+                Int((Double(width) / Double(height)).rounded(.down)) * sideMult,
+                maxSide)
+        } else if tw == 0 {
+            tw = sideMult
+            th = min(
+                Int((Double(height) / Double(width)).rounded(.down)) * sideMult,
+                maxSide)
+        }
+        return (h: th, w: tw)
+    }
 }

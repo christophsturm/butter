@@ -428,10 +428,21 @@ public final class VisionModel: @unchecked Sendable {
         /// count — the model derives it from the encoded video-token rows, so
         /// it always matches the tower's `temporal_patch_size` / resolution.
         ///
+        /// Optional `framePrefix` / `frameSuffix` wrap EACH decoded frame's
+        /// placeholder run — for families whose video prompt interleaves
+        /// per-frame markers (Gemma 4 emits a `"MM:SS "` timestamp +
+        /// begin/end-of-image tokens around every frame). When BOTH are nil
+        /// (Qwen / MiniCPM), the placeholders are one flat run. When either
+        /// is provided, the rows are split evenly across the decoded frames
+        /// (`totalRows / frameCount` per frame — valid for towers without
+        /// temporal folding, i.e. one frame → one contiguous row block).
+        ///
         /// Throws `VisionModelError.videoTokenIdMissing` for VLMs that were
         /// built without a `videoTokenId`.
         public func generate(
             preTokens: [Int], videoURL: URL, maxFrames: Int, postTokens: [Int],
+            framePrefix: ((Int) -> [Int])? = nil,
+            frameSuffix: ((Int) -> [Int])? = nil,
             maxTokens: Int, parameters: GenerationParameters? = nil,
             eosTokenId: Int?,
             eosTokenIds: [Int] = [],
@@ -444,12 +455,32 @@ public final class VisionModel: @unchecked Sendable {
             let frames = try MediaUtils.decodeVideoFrames(
                 url: videoURL, maxFrames: maxFrames)
             let videoTokens = try encodeVideo(frames, device: device)
-            // One placeholder per encoded video-token row — guaranteed to
-            // match the splice (which substitutes one row per placeholder).
-            let promptTokens =
-                preTokens
-                + Array(repeating: videoTokenId, count: videoTokens.shape[0])
-                + postTokens
+            let totalRows = videoTokens.shape[0]
+            // Build the placeholder span. The splice substitutes one video
+            // row per `videoTokenId` placeholder, IN ORDER, so the total
+            // placeholder count must equal `totalRows` for both layouts.
+            let videoSpan: [Int]
+            if framePrefix != nil || frameSuffix != nil {
+                // Per-frame layout: one row block per decoded frame, wrapped
+                // by the caller's per-frame markers.
+                precondition(
+                    frames.count > 0 && totalRows % frames.count == 0,
+                    "VisionModel.generate(videoURL:): per-frame layout needs "
+                        + "the video-token rows (\(totalRows)) divisible by "
+                        + "the frame count (\(frames.count))")
+                let perFrame = totalRows / frames.count
+                var span: [Int] = []
+                for i in 0 ..< frames.count {
+                    span += framePrefix?(i) ?? []
+                    span += Array(repeating: videoTokenId, count: perFrame)
+                    span += frameSuffix?(i) ?? []
+                }
+                videoSpan = span
+            } else {
+                // Flat layout: one placeholder per encoded video-token row.
+                videoSpan = Array(repeating: videoTokenId, count: totalRows)
+            }
+            let promptTokens = preTokens + videoSpan + postTokens
             return try runSampled(
                 promptTokens: promptTokens,
                 imageTokens: nil, videoTokens: videoTokens, audioTokens: nil,

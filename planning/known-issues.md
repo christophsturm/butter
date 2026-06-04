@@ -4,6 +4,23 @@ Open bugs + rough notes from the model-family port. Each entry carries
 enough context to pick up cold. Resolved-work history lives in
 `planning/session-plan.md` / `plan.md`, not here.
 
+## Qwen3-VL-tower VIDEO path degenerate — surfaced 2026-06-04
+
+`Qwen35VisionIntegrationTests.videoTextGeneration` (`mlx-community/Qwen3.5-2B-4bit`,
+the Qwen3-VL ViT tower via `Qwen35VL.load`) greedy-decodes **degenerate**
+output on cat.mp4: 200 tokens at only **24 % unique**, stuck emitting
+`<think>` with no content — the cat is never described. The IMAGE path on the
+SAME tower is healthy (54 % unique, correctly describes the dog), and the
+video-token COUNT matches (the splice doesn't throw), so the per-token
+**video FEATURES** are wrong, not the placeholder geometry. Prime suspects:
+the Qwen3 tower's `encode(frames:)` temporal-patch fold (`temporal_patch_size`
+= 2) or the video M-RoPE position assignment. First time the Qwen3-VL-tower
+video path has had integration coverage (the suite previously pointed at the
+wrong model — Qwen3-VL-30B-A3B). Likely also affects
+`Qwen3VisionIntegrationTests.videoTextGeneration` (same tower); the full
+integration bisect will confirm. Debug via an mlx-vlm video-feature parity
+dump (same method that fixed LFM2-VL). NOT a placeholder/count bug.
+
 ## GPU LSTM (`ffai_lstm`) — context-dependent NaN in the full Kokoro chain
 
 **Symptom.** With the Kokoro front-end wired to run its LSTMs on the GPU

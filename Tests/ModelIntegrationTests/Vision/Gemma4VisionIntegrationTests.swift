@@ -216,35 +216,33 @@ struct Gemma4VisionIntegrationTests {
             try await Model.load(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "Gemma 4 VL checkpoint is not a VLM")
-        let videoTokenId = try #require(vlm.videoTokenId, "no video token id")
+        _ = try #require(vlm.videoTokenId, "no video token id")
 
-        // A handful of evenly-sampled frames from the cat video.
-        let frames = try VisionTestHelpers.catVideoFrames(maxFrames: 4)
-        // All frames share the video's resolution, so they pool to the same
-        // soft-token count; encode one (same variable-resolution processor
-        // as the image path) to size each frame's placeholder run.
-        let perFrame = vlm.encodeImage(frames[0]).shape[0]
-
+        // Gemma 4's video prompt interleaves a `"MM:SS "` timestamp +
+        // begin/end-of-image markers around EACH frame's soft-token run. The
+        // model decodes cat.mp4, sizes each frame's placeholder run from the
+        // encoded rows, and wraps it via the per-frame `framePrefix` /
+        // `frameSuffix` closures — the test no longer decodes frames or
+        // computes the per-frame token count.
         let bos = try #require(
             m.tokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
         let boiTokenId = 255999
         let eoiTokenId = 258882
-        let userPrefix = m.tokenizer.encode(text: "<start_of_turn>user\n")
-        let userSuffix = m.tokenizer.encode(
+        let tokenizer = m.tokenizer
+        let userPrefix = tokenizer.encode(text: "<start_of_turn>user\n")
+        let userSuffix = tokenizer.encode(
             text: "\nWhat animal is in this video?<end_of_turn>\n"
                 + "<start_of_turn>model\n")
-        var videoSpan: [Int] = []
-        for i in 0 ..< frames.count {
-            videoSpan += m.tokenizer.encode(text: "00:0\(i) ")
-            videoSpan += [boiTokenId]
-            videoSpan += Array(repeating: videoTokenId, count: perFrame)
-            videoSpan += [eoiTokenId]
-            videoSpan += m.tokenizer.encode(text: " ")
-        }
-        let promptTokens = [bos] + userPrefix + videoSpan + userSuffix
 
         let generated = try vlm.generate(
-            promptTokens: promptTokens, videoFrames: frames,
+            preTokens: [bos] + userPrefix,
+            videoURL: VisionTestHelpers.catVideoURL(),
+            maxFrames: 4,
+            postTokens: userSuffix,
+            framePrefix: { i in
+                tokenizer.encode(text: "00:0\(i) ") + [boiTokenId]
+            },
+            frameSuffix: { _ in [eoiTokenId] + tokenizer.encode(text: " ") },
             maxTokens: 160,
             parameters: m.defaultGenerationParameters.with { $0.seed = 42 },
             eosTokenId: m.config.eosTokenId,
