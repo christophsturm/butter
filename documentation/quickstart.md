@@ -22,11 +22,17 @@ print(String(format: "%.2f tok/s", result.tokensPerSecond))
 The same surface ships as the `ffai` executable. See [using-the-cli.md](using-the-cli.md) for how to build the binary and get it on `PATH`; once that's done:
 
 ```bash
-ffai --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time"
-ffai --model mlx-community/Qwen3-4B-4bit --prompt "Hello" --max-tokens 128
+# Text (default) — `text` is implicit, so the prompt can be positional.
+ffai generate text "Once upon a time" -m mlx-community/Qwen3.5-0.8B-MLX-4bit
+ffai -m mlx-community/Qwen3-4B-4bit "Hello" --max-tokens 128
+
+# Multimodal input → text, one subcommand per modality.
+ffai generate image photo.jpg  -m mlx-community/Qwen3-VL-4B-Instruct-4bit --prompt "What's in this photo?"
+ffai generate video clip.mp4    -m mlx-community/Qwen3-VL-4B-Instruct-4bit --max-frames 8
+ffai generate audio speech.wav  -m <omni-model> --prompt "Summarize the audio."
 ```
 
-Tokens are streamed to stdout as they're generated. Pass `--no-streaming` to print the full text once at the end (matches the buffered API exactly). Pass `--stats` for the post-run `[STATS]` block (per-phase memory, TTFT, KV cache, wired ticket — see [observability.md](observability.md)). Pass `--verbose` to print the top-5 next-token distribution from a single prefill instead of generating.
+Every modality streams tokens to stdout as they're generated — streaming is the CLI's primary route. Pass `--no-streaming` to print the full text once at the end (matches the buffered API exactly). Pass `--stats` for the post-run `[STATS]` block (per-phase memory, TTFT, KV cache, wired ticket — see [observability.md](observability.md)). `generate text --verbose` prints the top-5 next-token distribution from a single prefill instead of generating. For the dedicated speech commands (`ffai transcribe`, `ffai speak`), see [using-the-cli.md](using-the-cli.md).
 
 ## Customizing the generation
 
@@ -51,7 +57,9 @@ for try await chunk in model.generateStream(prompt: "Why is the sky blue?") {
 }
 ```
 
-The final chunk carries the full `GenerationStats` (peak GPU, KV cache size, TTFT, …) on its `stats` property. Cancel the consuming task to stop generation early — the producer notices at the next token boundary. See [streaming.md](streaming.md).
+The final chunk carries the full `GenerationStats` (peak GPU, KV cache size, TTFT, …) on its `stats` property. Cancel the consuming task to stop generation early — the producer notices at the next token boundary.
+
+The same `AsyncThrowingStream<GenerationChunk, Error>` contract extends to multimodal input — `vlModel.generateStream(image:)` / `generateStream(videoFrames:)` / `generateStream(audio:)` — and the speech models stream too: STT yields incremental transcript text, TTS yields one waveform chunk per segment. See [streaming.md](streaming.md).
 
 ## Chat / multi-turn
 

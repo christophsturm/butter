@@ -34,7 +34,8 @@ struct FFAIRoot: AsyncParsableCommand {
         // documentation/developing/publishing.md).
         version: FFAI.version,
         subcommands: [
-            GenerateCommand.self, BenchCommand.self,
+            GenerateCommand.self, TranscribeCommand.self,
+            SpeakCommand.self, BenchCommand.self,
             InspectCommand.self, ModelsCommand.self,
             ConvertCommand.self, DownloadCommand.self,
             CardCommand.self,

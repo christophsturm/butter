@@ -29,7 +29,7 @@ ln -s "$PWD/.build/release/ffai" /usr/local/bin/ffai
 ffai generate -m mlx-community/Qwen3.5-0.8B-MLX-4bit -p "Once upon a time"
 ```
 
-`generate` is the default subcommand, so the `-m / -p` flags can be passed directly to `ffai` (`ffai -m … -p …` is equivalent to `ffai generate -m … -p …`).
+`generate` is the default subcommand and `generate text` is its default in turn, so a bare prompt flows straight through: `ffai "Once upon a time" -m …` is equivalent to `ffai generate text "Once upon a time" -m …`. The prompt is positional for `generate text`; the `-m / --model` flag works at every level.
 
 **Instruct / reasoning models need `--mode chat`.** By default `generate` feeds the prompt verbatim (`--mode raw`), which suits base / completion models. Instruct and reasoning models (e.g. `LFM2.5`, most `-Instruct` checkpoints) are trained on a chat template and degenerate on raw input — pass `--mode chat` to wrap the prompt as a user turn and render it through the model's chat template (loaded from `tokenizer_config.json` *or* a standalone `chat_template.jinja`):
 
@@ -43,12 +43,84 @@ ffai generate -m ekryski/LFM2.5-8B-A1B-4bit --mode chat -p "What is the capital 
 
 | Subcommand | One-liner | More |
 |---|---|---|
-| `generate` (default) | Stream a single prompt's continuation to stdout. | `ffai generate --help` |
+| `generate` (default) | Stream a prompt's continuation to stdout. Has one input-modality subcommand each: `text` (default), `image`, `video`, `audio`. | [§ `generate`](#generate--text--image--video--audio--text) |
+| `transcribe` | Stream a transcript from an audio file (speech-to-text). | [§ `transcribe` / `speak`](#transcribe--speak--speech) |
+| `speak` | Synthesize speech from text to a `.wav` file (text-to-speech). | [§ `transcribe` / `speak`](#transcribe--speak--speech) |
 | `models` | List every supported model family with copy-paste example repo IDs (bf16 / 8-bit / 4-bit). | `ffai models` |
 | `inspect` | Load a model and dump architecture + tokenization + top-K logits for a fixed probe prompt. The first thing to reach for when a new model produces broken output. | `ffai inspect --help` |
 | `download` | Pre-fetch one or more HuggingFace checkpoints into the local cache — no model load, no GPU work. | [§ `download`](#download--pre-fetch-checkpoints-into-the-cache) |
 | `convert` | Quantize a bf16/fp16 HuggingFace checkpoint to MLX 4-bit affine format using FFAI's own GPU kernels — no Python / mlx-lm dependency. Optionally upload to HF. | [§ `convert`](#convert--quantize-a-checkpoint-to-mlx-affine-format) |
 | `bench` | Run a benchmark method against a model, append to a per-day report. | [benchmarking.md](benchmarking.md) |
+
+### `generate` — text / image / video / audio → text
+
+`generate` is a command group with one subcommand per input modality. All
+of them stream to stdout by default (streaming is the primary route) and
+share the same model / sampling / KV-cache flags; pass `--no-streaming` to
+buffer and print once.
+
+```bash
+# text (default subcommand — the prompt is positional)
+ffai generate text "Explain RoPE in one sentence." -m mlx-community/Qwen3-4B-4bit
+ffai generate text "Explain RoPE." -m <instruct-model> --mode chat   # chat-template models
+
+# image + prompt → text
+ffai generate image dog.jpg -m mlx-community/Qwen3-VL-4B-Instruct-4bit \
+    --prompt "What breed is this dog?"
+
+# video + prompt → text (samples up to --max-frames frames)
+ffai generate video clip.mp4 -m mlx-community/Qwen3-VL-4B-Instruct-4bit \
+    --max-frames 8 --prompt "Summarize what happens."
+
+# audio + prompt → text (omni models that declare audioIn)
+ffai generate audio speech.wav -m <omni-model> --prompt "Transcribe and summarize."
+```
+
+The media subcommands take the file as a positional argument and the
+instruction as `--prompt` (each has a sensible default, e.g. "Describe this
+image."). The prompt is built generically from the model's chat template
+with the media-placeholder run spliced in ahead of the question, so any VLM
+/ omni family that declares the matching capability (`imageIn` / `videoIn` /
+`audioIn`) works without per-family flags. For the highest-fidelity
+per-family prompt framing, the integration tests remain the reference.
+
+| Flag (all `generate` subcommands) | Default | Meaning |
+|---|---|---|
+| `-m` / `--model` | `unsloth/Llama-3.2-1B` | HF repo id or local path. |
+| `--max-tokens` | family default | Cap on generated tokens. |
+| `--no-streaming` | streaming on | Buffer and print once at the end. |
+| `--stats` | off | Print the `[STATS]` block after the run. |
+| `--temperature` / `--top-k` / `--top-p` / `--min-p` / `--repetition-penalty` / `--seed` | family default | Sampling overrides. |
+| `--kv-cache` / `--kv-window-size` / `--kv-window-keep` / `--aura-decode-path` | `raw` | KV-cache scheme + sliding-window eviction (see [observability.md](observability.md)). |
+| `--max-frames` (video only) | `8` | Frames sampled from the video. |
+| `--prompt` (image/video/audio) | per-modality default | Instruction about the media. |
+
+### `transcribe` / `speak` — speech
+
+`transcribe` runs a speech-to-text model and streams the transcript as it
+decodes; `speak` runs a text-to-speech model and writes a `.wav`, streaming
+the synthesis segment-by-segment. Both stream by default.
+
+```bash
+# speech → text (streams the transcript incrementally)
+ffai transcribe meeting.wav -m mlx-community/granite-4.0-1b-speech-5bit
+
+# text → speech (writes out.wav; --voice picks the speaker where supported)
+ffai speak "The quick brown fox." -m <tts-model> --voice af_heart --out out.wav
+```
+
+| Flag | Applies to | Meaning |
+|---|---|---|
+| `<file>` / `<text>` (positional) | both | Input audio file (`transcribe`) or text to speak (`speak`). |
+| `-m` / `--model` | both | HF repo id or local path to an STT / TTS checkpoint. |
+| `--no-streaming` | both | Buffer instead of streaming (`transcribe` prints once; `speak` writes once). |
+| `--max-new-tokens` | `transcribe` | Decode cap (STT). |
+| `--voice` | `speak` | Speaker/voice id for multi-speaker TTS models. |
+| `--out` | `speak` | Output `.wav` path (default `out.wav`). |
+
+Under the hood every STT model exposes `transcribeStream` and every TTS
+model exposes `synthesizeStream`, so the buffered and streamed paths share
+one decode loop (see [streaming.md](streaming.md)).
 
 ### `models` — what can I run?
 

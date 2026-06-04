@@ -56,6 +56,69 @@ for try await chunk in stream {
 See [`chat-templates.md`](chat-templates.md) for how `ChatMessage`
 + `ChatTemplateOptions` map onto the tokenizer's Jinja template.
 
+## Multimodal streaming (image / video / audio → text)
+
+`VisionModel` mirrors the text streaming surface — one `generateStream`
+overload per input modality, each returning the same
+`AsyncThrowingStream<GenerationChunk, Error>`. A buffered collect of any of
+them is bit-identical to the corresponding `generate(...)` call (they share
+the prefill + per-token decode seam). Chunks carry token ids only —
+`VisionModel` has no tokenizer, so the caller detokenizes:
+
+```swift
+let vlm = try #require(model.vlModel)
+let stream = vlm.generateStream(
+    promptTokens: promptTokens, image: image,
+    maxTokens: 200,
+    eosTokenId: model.config.eosTokenId, eosTokenIds: model.config.eosTokenIds)
+
+var collected: [Int] = []
+for try await chunk in stream {
+    collected.append(contentsOf: chunk.tokens)
+    // Robust incremental detokenization: decode the full running buffer
+    // each step and print only the newly-revealed suffix (survives BPE
+    // merges and multi-token glyphs a per-token decode would mangle).
+    let text = model.tokenizer.decode(tokens: collected, skipSpecialTokens: true)
+    // … print the delta vs what you printed last step …
+}
+```
+
+`generateStream(videoFrames:)` and `generateStream(audio:)` are the video
+and omni-audio analogues (both `throws`, because the frame / waveform
+encode can fail before the stream starts). The image overload is
+non-throwing.
+
+## Speech streaming (STT / TTS)
+
+The speech models stream on the same `AsyncThrowingStream` contract, with a
+modality-appropriate element type:
+
+```swift
+// STT — yields incremental transcript TEXT (one delta per decoded token).
+for try await delta in sttModel.transcribeStream(waveform, maxNewTokens: 256) {
+    print(delta, terminator: "")
+}
+
+// TTS — yields one waveform Tensor per segment (audio chunks instead of
+// tokens), so playback can start on segment 1 while segment 2 synthesizes.
+for try await chunk in ttsModel.synthesizeStream(text: "Hello there.", voice: nil) {
+    play(chunk)   // [samples] f32 @ the model's sample rate
+}
+```
+
+Concatenating the STT deltas reproduces the batch transcript (modulo the
+batch's trailing whitespace trim); concatenating the TTS chunks equals
+`synthesize` over the joined segments. Autoregressive encoders stream
+per-token; single-pass (CTC / RNN-T) encoders yield once — the best
+"streaming" possible without chunked audio input.
+
+## CLI streaming
+
+Streaming is the `ffai` CLI's **primary route** for every command — text,
+`generate image|video|audio`, `transcribe`, and `speak` all stream by
+default. Pass `--no-streaming` to buffer and print once (bit-identical to
+the buffered API). See [using-the-cli.md](using-the-cli.md).
+
 ## Buffered collection
 
 `Model.generate(prompt:parameters:)` is implemented as roughly:
