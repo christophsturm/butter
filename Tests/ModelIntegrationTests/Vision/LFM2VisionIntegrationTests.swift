@@ -16,11 +16,13 @@
 // `Lfm2VlForConditionalGeneration` checkpoint).
 //
 // Verifies the end-to-end vision path on a real checkpoint:
-// the SigLIP2 vision tower loads into the shared `VisionEncoder`, the
-// pixel-unshuffle + MLP projector reduces and projects the 256 ViT tokens
-// to 64 super-patch embeddings, the cross-modal splice injects the image
-// tokens, and the fused stream decodes coherent text through the LFM2
-// hybrid text backbone (short-conv / attention layers).
+// the SigLIP2 NaFlex tower loads into the shared `VisionEncoder` and runs
+// at native (aspect-preserving) resolution — the patch grid is capped at
+// `max_num_patches` (1024), so the per-image ViT-token count varies. The
+// pixel-unshuffle(2) + MLP projector reduces and projects to per-image
+// super-patch embeddings, the cross-modal splice injects the image tokens,
+// and the fused stream decodes coherent text through the LFM2 hybrid text
+// backbone (short-conv / attention layers).
 //
 // Uses the mlx-community 4-bit conversion (LFM2-VL-1.6B-4bit). The
 // checkpoint MUST load — a load failure fails the test.
@@ -58,7 +60,9 @@ struct LFM2VisionIntegrationTests {
         #expect(m.engine.supportsEmbeddingInput)  // VLM splice prerequisite
 
         let vlm = try #require(m.vlModel)
-        // SigLIP2-256-patch-16 → 256 patches, pixel-unshuffle(2) → 64 tokens.
+        // `imageTokenCount` is the NOMINAL square count (256 patches →
+        // pixel-unshuffle(2) → 64); the actual per-image token count is
+        // derived at native resolution (see `nativeTokenCount`).
         #expect(vlm.imageTokenCount == 64)
         #expect(vlm.imageTokenId == 396)
     }

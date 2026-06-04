@@ -191,9 +191,9 @@ private func reshapeLinearPatchEmbed(
 /// the feature dim by `d²`. The LayerNorm + two-layer MLP then project the
 /// super-patches into the text hidden dim.
 ///
-/// All of this runs on the CPU (once per image) — the token count is at
-/// most 256 (or 64 in our simplified pass), so the cost is negligible
-/// next to the GPU projection GEMMs.
+/// All of this runs on the CPU (once per image) — the projected token
+/// count is at most `max_image_tokens` (256) after the native-resolution
+/// resize, so the cost is negligible next to the GPU projection GEMMs.
 public final class LFM2VLProjector: @unchecked Sendable {
     let layerNorm: LayerNorm
     let linear1: AnyLinear
