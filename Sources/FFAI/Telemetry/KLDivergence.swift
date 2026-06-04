@@ -21,7 +21,7 @@
 //
 // Mirrors the canonical TQ+ harness output from
 // `bench-tq+/harness/kld_vs_baseline.py` in
-// /Users/tom/local_llms/llama.cpp: same field names, same percentile
+// the reference TQ+ implementation: same field names, same percentile
 // list, so plot scripts + cross-codec comparisons remain compatible.
 
 import Foundation

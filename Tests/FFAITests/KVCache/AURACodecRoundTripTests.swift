@@ -202,7 +202,7 @@ struct AURACodecRoundTripTests {
     /// encode stores `corrected = ||x|| / ||centroid_recon||`, dequant
     /// multiplies each centroid value by `corrected`, restoring the
     /// row L2 norm of the dequant to match the input. Mirrors canonical
-    /// TQ+'s matched-norm step (`~/local_llms/llama.cpp/ggml/src/ggml-
+    /// TQ+'s matched-norm step (in the reference C++ implementation, ggml-
     /// turbo-quant.c` line 510).
     ///
     /// A future refactor that drops the norm-correction stage (or

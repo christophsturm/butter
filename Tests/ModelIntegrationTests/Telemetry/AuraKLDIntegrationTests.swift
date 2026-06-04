@@ -18,7 +18,7 @@
 // the aggregate KLD vs the baseline + same-top-token rate. Mirrors the
 // canonical TQ+ harness output from
 // `bench-tq+/harness/kld_vs_baseline.py` (in
-// /Users/tom/local_llms/llama.cpp).
+// the reference TQ+ harness).
 //
 // This test is the regression gate for every subsequent TQ+ port —
 // matched-norm L2 correction, InnerQ equalization, per-group FP8 scale.

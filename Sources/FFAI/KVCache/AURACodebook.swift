@@ -20,7 +20,7 @@
 // the coordinate distribution of unit-sphere vectors converges to a
 // near-Gaussian, so a fixed Lloyd-Max table is near-optimal.
 //
-// The reference values here are mined from llama.cpp's `k_quants`
+// The reference values here are mined from the reference C++ `k_quants`
 // tables (empirically optimal for unit-norm Gaussian data at d=128)
 // and scaled to other head dims by √(128 / dim) — a heuristic that
 // approximates the analytic 1/√d Beta-variance scaling from the

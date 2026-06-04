@@ -100,8 +100,8 @@ public struct AURAScheme: Sendable, Equatable, Hashable {
     /// directly without env coupling.
     ///
     /// Canonical-source mapping: TURBO_AUTO_ASYMMETRIC in
-    /// `~/local_llms/llama.cpp/src/llama-kv-cache.cpp`. Threshold = 6
-    /// matches the llama.cpp implementation.
+    /// the reference C++ KV-cache implementation. Threshold = 6
+    /// matches that reference.
     public static func autoAsymmetric(
         requested: AURAScheme, gqaFactor: Int
     ) -> AURAScheme {
