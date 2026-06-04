@@ -1519,10 +1519,10 @@ private func qformerMHA(
     let k = batchMatVec(kW, kvInput, kB, outDim: hs, inDim: kvDim)
     let v = batchMatVec(vW, kvInput, vB, outDim: hs, inDim: kvDim)
 
-    // ── GPU path: dispatch Ops.sdpaBidirectional when the head_dim has
-    // a kernel shipped. Falls back to the CPU per-head loop below for
-    // unusual configurations (e.g. headDim outside {32,64,72,80,96}).
-    if OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(headDim) {
+    // ── GPU path: dispatch Ops.sdpaBidirectional when the head_dim is
+    // production-verified safe. Falls back to the CPU per-head loop below
+    // for unusual configurations (e.g. headDim outside {64,72,80,96}).
+    if OpsValidation.sdpaBidirectionalIsProductionSafe(headDim: headDim) {
         let device = Device.shared
         // Pack Q into [L, numHeads, headDim] — row-major, same memory
         // order as `q[i][h*Dh+d]`. K/V need transpose to

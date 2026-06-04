@@ -169,23 +169,18 @@ public final class VisionEncoderLayer: Module {
         // Bidirectional multi-head attention. GPU path when the kernel
         // is known-safe at this head_dim; CPU fallback otherwise.
         //
-        // GUARD: `Ops.sdpaBidirectional(headDim: 64)` pinned the GPU at
-        // the GlmOcr production shape (nQuery=576, nQHeads=16, f32)
-        // during the 2026-05-27 bisect. Until a paired GPU correctness
-        // test for `mt_sdpa_bidirectional_d64_*` at production shape
-        // lands in metaltile-std and the inner-loop / bounds-select
-        // arithmetic is verified, force d=64 (LFM2-VL SigLIP2,
-        // SigLIP-base / CLIP-L users) through the CPU path. d=72
-        // (SigLIP-So400m → Paligemma / Gemma3VL / Idefics3 /
-        // NemotronVL / MiniCPMV) is confirmed-safe via Paligemma's
-        // 2026-05-27 PASS. Other dims have not pinned but also have
-        // not been validated at production shapes; treat them as
-        // medium-risk and gate to CPU until per-dim correctness lands.
+        // GPU vs CPU bidirectional attention is gated on
+        // `OpsValidation.sdpaBidirectionalIsProductionSafe` — the single
+        // source of truth for which head_dims have a passing metaltile
+        // production-shape GPU-correctness cell (16 heads × 576-patch tower,
+        // 9216 threadgroups). The 2026-05-27 GlmOcr "pin" at d64 was a
+        // wrong-dispatch bug (since fixed in `Ops.sdpaBidirectional`); d64,
+        // d72, d80, d96 are now all verified correct + unpinned at
+        // production shape (see `sdpa_bidirectional.rs`
+        // `*_vision_tower` / `*_audio_encoder` cells). d32 (FastViT-HD) has
+        // a kernel but no production cell yet, so it stays on CPU.
         let attnFlat: Tensor
-        let useGPUSdpaBidirectional = headDim == 72
-        if useGPUSdpaBidirectional
-            && OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(headDim)
-        {
+        if OpsValidation.sdpaBidirectionalIsProductionSafe(headDim: headDim) {
             attnFlat = gpuAttention(
                 q: q, k: k, v: v, nTokens: nTokens,
                 device: device, on: cmd)

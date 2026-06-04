@@ -171,7 +171,7 @@ final class Qwen3VLVisionBlock {
         let nHeads = cfg.numHeads
         let headDim = cfg.headDim
         let hidden = cfg.hidden
-        guard OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(headDim) else {
+        guard OpsValidation.sdpaBidirectionalIsProductionSafe(headDim: headDim) else {
             return cpuAttention(
                 qkv: qkv, nTokens: nTokens,
                 cosTable: cosTable, sinTable: sinTable, device: device)

@@ -248,6 +248,38 @@ public enum OpsValidation {
     /// d80: Qwen2.5-VL. d96: Qwen2-VL. (d128 lives in sdpa_multi.)
     public static let sdpaBidirectionalSupportedHeadDims: Set<Int> = [32, 64, 72, 80, 96]
 
+    /// head_dim values whose GPU `Ops.sdpaBidirectional` path is **verified
+    /// safe at production shape** — a metaltile production-shape
+    /// GPU-correctness cell (16 heads × 576-patch vision tower /
+    /// 1500-frame audio encoder; 9216–24000 threadgroups of 1024) exists,
+    /// passes against the CPU oracle, and does NOT pin the GPU. See
+    /// `crates/metaltile-std/src/ffai/sdpa_bidirectional.rs`:
+    /// `test_ffai_sdpa_bidirectional_d{64,80,96}_vision_tower` +
+    /// `_d64_audio_encoder`.
+    ///
+    /// Why this is separate from `sdpaBidirectionalSupportedHeadDims` (which
+    /// only asserts a kernel is *emitted*): the 2026-05 GPU freeze was a
+    /// **wrong-dispatch** bug (`elementwiseGrid` on a reduction kernel →
+    /// `n_simd = 0` → infinite loop), not the kernel arithmetic. After the
+    /// `Ops.sdpaBidirectional` wrapper was fixed to dispatch the correct
+    /// `grid = nQHeads·nQuery·1024, tg = 1024` geometry, d64/d80/d96 were
+    /// proven correct + unpinned at production shape (d72 was the original
+    /// confirmed-safe dim). Callers choose GPU vs CPU attention on THIS set.
+    /// d32 (FastViT-HD) has a kernel but no production-shape cell yet, so it
+    /// stays off the list until one lands.
+    public static let sdpaBidirectionalProductionSafeHeadDims: Set<Int> = [64, 72, 80, 96]
+
+    /// Whether the GPU bidirectional-SDPA path is cleared for this head_dim
+    /// at production vision / audio shapes (vs the CPU `cpuAttention`
+    /// fallback). True iff a kernel is emitted for the dim AND that dim is
+    /// production-verified (`sdpaBidirectionalProductionSafeHeadDims`).
+    /// This is the single source of truth the model towers gate on — it
+    /// replaces the historical hard-coded `headDim == 72` GPU-pin guard.
+    public static func sdpaBidirectionalIsProductionSafe(headDim: Int) -> Bool {
+        sdpaBidirectionalSupportedHeadDims.contains(headDim)
+            && sdpaBidirectionalProductionSafeHeadDims.contains(headDim)
+    }
+
     public static func validateSdpaBidirectional(
         headDim: Int, nQHeads: Int, nKVHeads: Int,
         baseKV: Int, nQuery: Int, kvStride: Int

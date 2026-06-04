@@ -703,7 +703,7 @@ public final class Qwen3ASRModel: @unchecked Sendable {
     ) -> Tensor {
         let H = nHeads * headDim
         let isMultiDim = headDim == 128 || headDim == 256
-        let isBidirDim = OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(headDim)
+        let isBidirDim = OpsValidation.sdpaBidirectionalIsProductionSafe(headDim: headDim)
         guard isMultiDim || isBidirDim else {
             return cpuBidirectionalAttention(
                 qa: qa, ka: ka, va: va, seqLen: seqLen, nHeads: nHeads,

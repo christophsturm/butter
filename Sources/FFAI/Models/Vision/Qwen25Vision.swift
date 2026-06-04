@@ -252,7 +252,7 @@ final class Qwen25VLVisionBlock {
             windowGroups.count == 1
             && windowGroups[0].count == nTokens
         if isFullAttention
-            && OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(headDim)
+            && OpsValidation.sdpaBidirectionalIsProductionSafe(headDim: headDim)
         {
             // GPU path. qH/kH/vH are already laid out as
             // [nHeads, nTokens, headDim] — kernel K/V layout natively.

@@ -555,7 +555,7 @@ public final class SenseVoiceModel: @unchecked Sendable {
     ) -> Tensor {
         let stride = heads * headDim
         let isMultiDim = headDim == 128 || headDim == 256
-        let isBidirDim = OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(headDim)
+        let isBidirDim = OpsValidation.sdpaBidirectionalIsProductionSafe(headDim: headDim)
         guard isMultiDim || isBidirDim else {
             return cpuAttention(
                 qa: qa, ka: ka, va: va, nRows: nRows, heads: heads,

@@ -154,7 +154,7 @@ public final class AudioEncoderLayer: Module {
         // whole block is one GPU submission for supported head dims.
         let attnFlat: Tensor
         let mlpCmd: MTLCommandBuffer
-        if OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(headDim) {
+        if OpsValidation.sdpaBidirectionalIsProductionSafe(headDim: headDim) {
             let kHead = Ops.transposeTokensToHeads(
                 k, nTokens: nFrames, nHeads: nHeads, headDim: headDim, on: cmd)
             let vHead = Ops.transposeTokensToHeads(

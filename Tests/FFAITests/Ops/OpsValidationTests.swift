@@ -427,6 +427,34 @@ struct OpsValidationTests {
                 baseKV: 64, nQuery: 32, kvStride: 96) == nil)
     }
 
+    @Test("sdpaBidirectional production-safe set ⊆ supported set")
+    func sdpaBidirectionalProductionSafeIsSubsetOfSupported() {
+        // Every production-verified dim must also have a kernel emitted —
+        // a dim can't be "GPU-safe at production shape" without a kernel.
+        for hd in OpsValidation.sdpaBidirectionalProductionSafeHeadDims {
+            #expect(
+                OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(hd),
+                "production-safe head_dim \(hd) must be in the supported set")
+        }
+    }
+
+    @Test("sdpaBidirectional production-safe gate covers the verified vision/audio dims")
+    func sdpaBidirectionalProductionSafeGate() {
+        // d64/d72/d80/d96 each have a passing metaltile production-shape cell
+        // (576-patch vision tower / 1500-frame audio encoder) → GPU-cleared.
+        for hd in [64, 72, 80, 96] {
+            #expect(
+                OpsValidation.sdpaBidirectionalIsProductionSafe(headDim: hd),
+                "head_dim \(hd) should be production-safe (has a passing prod cell)")
+        }
+        // d32 (FastViT-HD) has a kernel but no production-shape cell yet, so
+        // it is NOT cleared for the GPU path — callers keep it on CPU.
+        #expect(OpsValidation.sdpaBidirectionalSupportedHeadDims.contains(32))
+        #expect(!OpsValidation.sdpaBidirectionalIsProductionSafe(headDim: 32))
+        // A dim with no kernel at all is never production-safe.
+        #expect(!OpsValidation.sdpaBidirectionalIsProductionSafe(headDim: 128))
+    }
+
     // ─── gemm (multi-row) ──────────────────────────────────────────
 
     @Test("gemm accepts production projection shapes")
