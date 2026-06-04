@@ -99,6 +99,15 @@ public struct ConvertOptions: Sendable {
     /// consumes `QuantizedLinear`.
     public var visionSpec: QuantSpec? = nil
 
+    /// Spec for audio-tower / audio-projector weights (keys matching
+    /// `audio_tower.` / `audio_embedder` / `embed_audio` / the shared
+    /// `multimodal_embedder`). `nil` (default) keeps them full-precision —
+    /// the same rationale as `visionSpec`: encoder-free projectors (e.g.
+    /// Gemma 4 Omni's `embed_audio` 640→3840) are tiny and precision-
+    /// sensitive (the sole audio pathway), so bf16 is the safe default.
+    /// Set via `--audio-bits` to quantize them anyway.
+    public var audioSpec: QuantSpec? = nil
+
     /// Spec for MoE router gates — the small `[num_experts, hidden]`
     /// projection that scores experts for top-k routing (keys ending in
     /// `.gate.weight` / `.router.weight`: `feed_forward.gate`,
@@ -190,7 +199,7 @@ public enum ConvertDriver {
         // need no validation here.
         let allSpecs: [QuantSpec?] = [
             options.bits, options.embeddingSpec, options.lmHeadSpec, options.visionSpec,
-            options.routerSpec, options.expertSpec,
+            options.audioSpec, options.routerSpec, options.expertSpec,
         ]
         for spec in allSpecs {
             if case .bits(let b) = spec, !QuantSpec.supportedBits.contains(b) {
@@ -274,7 +283,10 @@ public enum ConvertDriver {
     ///   * vision-tower keys (matches `.visual.` / `visual.` /
     ///     `vision_tower.` / `vision_model.` prefixes used across
     ///     Qwen3-VL / Qwen3.5-VL / Pixtral / SigLIP / Idefics3 /
-    ///     MiniCPM-V / FastVLM)                       → `visionSpec`
+    ///     MiniCPM-V / FastVLM, plus Gemma 4 Omni's encoder-free
+    ///     `vision_embedder.*` / `embed_vision`)       → `visionSpec`
+    ///   * audio-tower keys (`audio_tower.` / `audio_embedder` /
+    ///     `embed_audio`)                              → `audioSpec`
     ///   * everything else (attention + MLP)           → `bits`
     ///
     /// For a `.bits(N)` spec we further check that the tensor is 2D,
@@ -484,8 +496,19 @@ public enum ConvertDriver {
             roleSpec = options.lmHeadSpec
         } else if key.contains(".visual.") || key.hasPrefix("visual.")
             || key.contains("vision_tower.") || key.contains("vision_model.")
+            || key.contains("vision_embedder") || key.contains("embed_vision")
+            || key.contains("patch_embedder")
         {
+            // Vision-tower / encoder-free vision projector (Gemma 4 Omni
+            // `vision_embedder.*` + `embed_vision`). Defaults to bf16.
             roleSpec = options.visionSpec
+        } else if key.contains("audio_tower.") || key.contains("audio_embedder")
+            || key.contains("embed_audio")
+        {
+            // Audio-tower / encoder-free audio projector (Gemma 4 Omni
+            // `embed_audio`). Defaults to bf16; falls back to the vision
+            // knob when `--audio-bits` is unset so one flag can cover both.
+            roleSpec = options.audioSpec ?? options.visionSpec
         } else if isMoERouterKey(key) {
             // MoE router gates default to full-precision (`routerSpec`
             // nil → pass-through); the `--router-bits` flag opts in.
@@ -892,6 +915,9 @@ public enum ConvertDriver {
         if let v = options.visionSpec, v != options.bits {
             tags.append("vision-\(v.label)")
         }
+        if let a = options.audioSpec, a != options.bits {
+            tags.append("audio-\(a.label)")
+        }
 
         let tagsBlock = tags.map { "  - \($0)" }.joined(separator: "\n")
 
@@ -916,6 +942,9 @@ public enum ConvertDriver {
         }
         if let v = options.visionSpec {
             cmd += " --vision-bits \(cliBitsValue(v))"
+        }
+        if let a = options.audioSpec {
+            cmd += " --audio-bits \(cliBitsValue(a))"
         }
         if let r = options.uploadRepo {
             cmd += " \\\n    --upload-repo \(r)"

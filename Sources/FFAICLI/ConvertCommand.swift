@@ -17,8 +17,8 @@
 //
 // Per-tensor-class specs: `--bits` controls the attention + MLP
 // linears (the bulk of the model), and `--embedding-bits` /
-// `--lm-head-bits` / `--vision-bits` override the spec for those
-// specific tensors. Each flag accepts any of:
+// `--lm-head-bits` / `--vision-bits` / `--audio-bits` override the
+// spec for those specific tensors. Each flag accepts any of:
 //
 //   2 / 3 / 4 / 5 / 6 / 8   → affine-quantize to that bit-width
 //   fp16 / bf16             → downcast to that dtype (no quant)
@@ -118,6 +118,15 @@ struct ConvertCommand: AsyncParsableCommand {
     @Option(
         name: .long,
         help: ArgumentHelp(
+            "Spec for audio-tower / audio-projector weights (independent of --bits). Same "
+                + "accepted values as --bits. Omit to keep them in their source dtype — "
+                + "encoder-free audio projectors (e.g. Gemma 4 Omni's embed_audio) are tiny and "
+                + "precision-sensitive, so bf16 is the safe default."))
+    var audioBits: QuantSpec?
+
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
             "Spec for MoE router gates (.gate / .router projections). Same accepted values as "
                 + "--bits. Omit (default) to keep routers full-precision — quantizing the router "
                 + "risks flipping top-k expert selection for negligible memory saving. Set to "
@@ -180,6 +189,7 @@ struct ConvertCommand: AsyncParsableCommand {
         opts.embeddingSpec = embeddingBits
         opts.lmHeadSpec = lmHeadBits
         opts.visionSpec = visionBits
+        opts.audioSpec = audioBits
         opts.routerSpec = routerBits
         opts.expertLayout = expertLayout
         opts.expertSpec = expertBits

@@ -38,11 +38,33 @@ import Foundation
 // ─── Family entry point ──────────────────────────────────────────────
 
 public enum Gemma4 {
-    public static let modelTypes: Set<String> = ["gemma4", "gemma4_text"]
+    public static let modelTypes: Set<String> = [
+        "gemma4", "gemma4_text",
+        // Gemma 4 Omni (encoder-free) — the omni checkpoint's text tower
+        // is byte-for-byte a Gemma4Dense backbone; `gemma4_unified_text` is
+        // the text_config model_type. The top-level `gemma4_unified` carries
+        // a `vision_config`, so the dispatcher routes it through the VL
+        // section to the omni loader; a bare text-only `gemma4_unified_text`
+        // checkpoint (if one ships) loads as a plain Gemma4Dense backbone.
+        "gemma4_unified", "gemma4_unified_text",
+    ]
     public static let architectures: Set<String> = [
         "Gemma4ForCausalLM", "Gemma4TextForCausalLM",
         "Gemma4ForConditionalGeneration",
+        // Gemma 4 Omni (the VL section intercepts this — it has a
+        // vision_config — and routes to `Gemma4Omni.load`).
+        "Gemma4UnifiedForConditionalGeneration",
     ]
+
+    /// The EAGLE/MTP drafter (`google/gemma-4-12B-it-assistant`). Its
+    /// architecture is kept OUT of `Gemma4.architectures` so it never
+    /// auto-routes to standalone text generation — it cannot generate
+    /// without the target model's hidden state (spec-decode, Phase 8.7).
+    /// `Gemma4OmniDrafter` provides a typed loader for tests + the future
+    /// draft loop; the dispatcher recognizes these strings to raise an
+    /// actionable error.
+    public static let drafterModelTypes: Set<String> = ["gemma4_unified_assistant"]
+    public static let drafterArchitectures: Set<String> = ["Gemma4UnifiedAssistantForCausalLM"]
 
     /// Resolve the concrete variant from config. MoE wins over PLE wins
     /// over plain dense.

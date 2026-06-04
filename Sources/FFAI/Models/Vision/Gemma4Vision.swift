@@ -1065,3 +1065,457 @@ public enum Gemma4VL {
             audioEncode: audioEncode)
     }
 }
+
+// ─── Gemma 4 Omni (encoder-free) ─────────────────────────────────────
+//
+// Google's Gemma 4 12B "Unified"/Omni (`Gemma4UnifiedForConditionalGeneration`,
+// model_type `gemma4_unified`) drops the bespoke ViT + Conformer encoders of
+// the Gemma 4 VL family above. Instead it projects raw inputs straight into
+// the text embedding space:
+//
+//   • Vision (`model.vision_embedder.*` + `model.embed_vision.*`):
+//       image → 48×48 raw-pixel patches (flattened to 3·48·48 = 6912)
+//             → patch_ln1 (LayerNorm 6912)
+//             → patch_dense (Linear 6912→3840, +bias)
+//             → patch_ln2 (LayerNorm 3840)
+//             → + factorized 2D position embedding `[1120, 2, 3840]`
+//             → pos_norm (LayerNorm 3840)
+//             → embed_vision (RMSNorm-no-scale + Linear 3840→3840)
+//       One soft token per 48×48 patch; the aspect-preserving resize keeps
+//       the patch count ≤ `num_soft_tokens` (default 280). There is NO ViT
+//       block stack and NO separate avg-pool: the 3×3 pooling is folded into
+//       the 48-px (= 16·3) patch unfold (resize divisibility = patch·pool).
+//   • Audio (`model.embed_audio.*`): raw 16 kHz waveform → 640-sample/40 ms
+//       frames → embed_audio (RMSNorm-no-scale + Linear 640→3840). See
+//       `Gemma4OmniAudio.frame` in Gemma4Audio.swift.
+//   • Video: a temporally-ordered sequence of frames, each run through the
+//       vision path, spliced at the `<|video|>` placeholders.
+//
+// The text backbone is byte-for-byte a `Gemma4Dense` (the omni text_config
+// resolves to it), loaded from the `model.language_model.`-prefixed sub-tree.
+// The three are joined by `VisionModel`'s cross-modal splice on the
+// `<|image|>` / `<|audio|>` / `<|video|>` placeholder ids.
+
+/// Static shape of the Gemma 4 Omni encoder-free vision embedder, decoded
+/// from the checkpoint's `vision_config`.
+struct Gemma4OmniVisionConfig {
+    /// Raw-pixel patch side (`model_patch_size`, 48) — `patch_dense`'s input
+    /// is `3 · modelPatchSize²` (6912).
+    let modelPatchSize: Int
+    /// Processor sub-patch (`patch_size`, 16). Resize divisibility is
+    /// `patchSize · poolingKernelSize` (48); the unfold uses `modelPatchSize`.
+    let patchSize: Int
+    /// Pooling kernel (`pooling_kernel_size`, 3) — folded into the 48-px unfold.
+    let poolingKernelSize: Int
+    /// Multi-modal embed dim (`mm_embed_dim`, 3840) — the patch projection
+    /// output + the position-embedding width.
+    let hidden: Int
+    /// Soft-token budget (`num_soft_tokens`, default 280; budgets
+    /// {70,140,280,560,1120}).
+    let numSoftTokens: Int
+    /// Position-embedding table length (`mm_posemb_size`, 1120).
+    let posEmbSize: Int
+    /// LayerNorm epsilon for patch_ln1 / patch_ln2 / pos_norm (Gemma
+    /// convention, `rms_norm_eps`).
+    let layerNormEps: Float
+
+    static func decode(_ c: ModelConfig) throws -> Gemma4OmniVisionConfig {
+        guard let hidden = c.int("mm_embed_dim"),
+            let modelPatch = c.int("model_patch_size")
+        else {
+            throw Gemma4Error.missingConfig("vision_config")
+        }
+        return Gemma4OmniVisionConfig(
+            modelPatchSize: modelPatch,
+            patchSize: c.int("patch_size") ?? 16,
+            poolingKernelSize: c.int("pooling_kernel_size") ?? 3,
+            hidden: hidden,
+            numSoftTokens: c.int("num_soft_tokens") ?? 280,
+            posEmbSize: c.int("mm_posemb_size") ?? 1120,
+            layerNormEps: Float(c.float("rms_norm_eps") ?? 1e-6))
+    }
+}
+
+/// The Gemma 4 Omni encoder-free vision tower, presented as a
+/// `VisionEncoder` subclass so `VisionModel` accepts it (it overrides
+/// `preprocessImage` / `encode(image:)` / `encode(frames:)`; the base
+/// ViT slots are unused placeholders). All weights stay bf16 (the convert
+/// pipeline routes the multimodal projectors to `--vision-bits`, default
+/// bf16). `@unchecked Sendable` via the `VisionEncoder` base — the held
+/// weights are immutable `let`s set once at load.
+final class Gemma4OmniVisionEncoder: VisionEncoder {
+    let cfg: Gemma4OmniVisionConfig
+    let textHidden: Int
+    /// Activation dtype (the text engine's) — every intermediate tensor +
+    /// the cast LayerNorm weights use this so `Ops.layerNorm`'s same-dtype
+    /// precondition holds.
+    let towerDtype: DType
+    /// `patch_dense` — Linear `[3840, 6912]` (+ bias), kept bf16.
+    let patchDense: AnyLinear
+    /// LayerNorms (weight+bias cast to `towerDtype`).
+    let patchLN1: LayerNorm  // over 6912
+    let patchLN2: LayerNorm  // over 3840
+    let posNorm: LayerNorm  // over 3840
+    /// Per-axis position tables `[posEmbSize, hidden]`, split from the
+    /// `[posEmbSize, 2, hidden]` `pos_embedding` parameter.
+    let posTableX: Tensor
+    let posTableY: Tensor
+    /// `embed_vision` — RMSNorm-no-scale + Linear `[3840, 3840]`.
+    let embedder: Gemma4MultimodalEmbedder
+
+    init(
+        cfg: Gemma4OmniVisionConfig, textHidden: Int, towerDtype: DType,
+        patchDense: AnyLinear, patchLN1: LayerNorm, patchLN2: LayerNorm,
+        posNorm: LayerNorm, posTableX: Tensor, posTableY: Tensor,
+        embedder: Gemma4MultimodalEmbedder
+    ) {
+        self.cfg = cfg
+        self.textHidden = textHidden
+        self.towerDtype = towerDtype
+        self.patchDense = patchDense
+        self.patchLN1 = patchLN1
+        self.patchLN2 = patchLN2
+        self.posNorm = posNorm
+        self.posTableX = posTableX
+        self.posTableY = posTableY
+        self.embedder = embedder
+        // Facade config so the base `VisionEncoder` is validly constructed;
+        // every consumed method is overridden, so the ViT slots below are
+        // never read. `imageSize`/`patchSize` are nominal.
+        let facade = VisionEncoderConfig(
+            inChannels: 3, imageSize: cfg.modelPatchSize,
+            patchSize: cfg.modelPatchSize,
+            hidden: cfg.hidden, intermediate: cfg.hidden,
+            nLayers: 0, nHeads: 1,
+            layerNormEps: cfg.layerNormEps, textHidden: textHidden)
+        let placeholder = Tensor.empty(shape: [1], dtype: towerDtype)
+        let placeholderNorm = LayerNorm(
+            weight: placeholder, bias: placeholder, eps: cfg.layerNormEps)
+        super.init(
+            config: facade,
+            patchEmbedWeight: placeholder, patchEmbedBias: placeholder,
+            positionEmbedding: placeholder, layers: [],
+            postLayerNorm: placeholderNorm, projection: nil, dtype: towerDtype)
+    }
+
+    static func load(
+        visionConfig: ModelConfig, textHidden: Int,
+        weights: SafeTensorsBundle, dtype: DType,
+        quantization: ModelConfig.QuantizationConfig?, device: Device
+    ) throws -> Gemma4OmniVisionEncoder {
+        let cfg = try Gemma4OmniVisionConfig.decode(visionConfig)
+        // The omni checkpoint nests the vision embedder under
+        // `model.vision_embedder.` (the convert keeps it bf16). Probe the
+        // bare prefix too for forward-compat with a re-hosted layout.
+        let ve =
+            weights.has("vision_embedder.patch_dense.weight")
+            ? weights.prefixed("vision_embedder.")
+            : weights.prefixed("model.vision_embedder.")
+        let patchDense = try loadLinear(
+            base: "patch_dense", in: ve, quantization: quantization)
+        let patchLN1 = try loadLayerNormCast(
+            base: "patch_ln1", in: ve, eps: cfg.layerNormEps,
+            dtype: dtype, device: device)
+        let patchLN2 = try loadLayerNormCast(
+            base: "patch_ln2", in: ve, eps: cfg.layerNormEps,
+            dtype: dtype, device: device)
+        let posNorm = try loadLayerNormCast(
+            base: "pos_norm", in: ve, eps: cfg.layerNormEps,
+            dtype: dtype, device: device)
+        // `pos_embedding` is `[posEmbSize, 2, hidden]` (axis-1 = x/y) — note
+        // the axis order differs from the VL tower's `[2, posSize, hidden]`.
+        let posRaw = try ve.tensor(named: "pos_embedding")
+        let (posX, posY) = splitOmniPositionTable(
+            posRaw, dtype: dtype, device: device)
+        // `embed_vision` — the shared multimodal embedder, embeddingDim =
+        // mm_embed_dim (3840).
+        let embedder = try Gemma4MultimodalEmbedder.load(
+            weights: weights, embeddingDim: cfg.hidden,
+            normEps: cfg.layerNormEps, dtype: dtype,
+            quantization: quantization, prefix: "embed_vision")
+        return Gemma4OmniVisionEncoder(
+            cfg: cfg, textHidden: textHidden, towerDtype: dtype,
+            patchDense: patchDense, patchLN1: patchLN1, patchLN2: patchLN2,
+            posNorm: posNorm, posTableX: posX, posTableY: posY,
+            embedder: embedder)
+    }
+
+    /// Aspect-ratio-preserving resize to dims divisible by
+    /// `patchSize · poolingKernelSize` (48), then rescale to `[0, 1]` ONLY
+    /// (the omni image processor is `do_normalize=false`; `RGBImage` pixels
+    /// are already `[0, 1]` and `patch_ln1` is affine-invariant to centring).
+    override func preprocessImage(
+        _ image: RGBImage, device: Device = .shared
+    ) -> Tensor? {
+        let (th, tw) = Gemma4VLVisionModel.aspectPreservingSize(
+            width: image.width, height: image.height,
+            patchSize: cfg.patchSize, poolingKernelSize: cfg.poolingKernelSize,
+            maxSoftTokens: cfg.numSoftTokens)
+        let identity = ImageNormalization(mean: (0, 0, 0), std: (1, 1, 1))
+        return ImagePreprocessing.preprocess(
+            image, targetW: tw, targetH: th, normalization: identity,
+            dtype: towerDtype, device: device)
+    }
+
+    /// Encode a preprocessed `[1, 3, H, W]` image (H, W multiples of 48)
+    /// into `[nSoftTokens, textHidden]` soft tokens. One soft token per
+    /// 48×48 patch.
+    override func encode(image: Tensor, device: Device = .shared) -> Tensor {
+        let shp = image.shape
+        let imgH = shp[shp.count - 2]
+        let imgW = shp[shp.count - 1]
+        let p = cfg.modelPatchSize
+        let gridH = imgH / p
+        let gridW = imgW / p
+        let nPatches = gridH * gridW
+        let patchDim = 3 * p * p
+
+        // 1. Unfold into [nPatches, 6912] (raster (row,col) order). Values
+        //    stay [0,1]; patch_ln1 normalises per-row so centring is moot.
+        let unfolded = unfoldPatches(
+            image: image, gridH: gridH, gridW: gridW, patchDim: patchDim)
+
+        // 2. patch_ln1 → 3. patch_dense → 4. patch_ln2 → 5. +pos → 6. pos_norm.
+        let cmd = device.makeCommandBuffer()
+        var h = Ops.layerNorm(
+            unfolded, weight: patchLN1.weight, bias: patchLN1.bias,
+            eps: patchLN1.eps, nRows: nPatches, rowSize: patchDim, on: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let cmd2 = device.makeCommandBuffer()
+        h = patchDense.callMany(h, t: nPatches, on: cmd2, device: device)
+        cmd2.commit()
+        cmd2.waitUntilCompleted()
+
+        let cmd3 = device.makeCommandBuffer()
+        h = Ops.layerNorm(
+            h, weight: patchLN2.weight, bias: patchLN2.bias,
+            eps: patchLN2.eps, nRows: nPatches, rowSize: cfg.hidden, on: cmd3)
+        let posEmb = positionEmbedding(gridH: gridH, gridW: gridW)
+        h = Ops.add(h, posEmb, on: cmd3)
+        cmd3.commit()
+        cmd3.waitUntilCompleted()
+
+        let cmd4 = device.makeCommandBuffer()
+        h = Ops.layerNorm(
+            h, weight: posNorm.weight, bias: posNorm.bias,
+            eps: posNorm.eps, nRows: nPatches, rowSize: cfg.hidden, on: cmd4)
+        cmd4.commit()
+        cmd4.waitUntilCompleted()
+
+        // 7. embed_vision (RMSNorm-no-scale + Linear 3840→3840).
+        return embedder.embed(h, device: device)
+    }
+
+    /// Video: run every frame through the vision path and concatenate the
+    /// per-frame soft tokens in frame order (no temporal fold — same as the
+    /// VL composed encoder).
+    override func encode(
+        frames: [Tensor], device: Device = .shared
+    ) throws -> Tensor {
+        precondition(
+            !frames.isEmpty,
+            "Gemma4OmniVisionEncoder.encode(frames:): expected ≥ 1 frame")
+        var flat = [Float]()
+        var totalTokens = 0
+        for frame in frames {
+            let soft = encode(image: frame, device: device)
+            totalTokens += soft.shape[0]
+            flat.append(contentsOf: soft.toFloatArray())
+        }
+        return ImagePreprocessing.makeTensor(
+            from: flat, shape: [totalTokens, textHidden],
+            dtype: towerDtype, device: device)
+    }
+
+    // ── Helpers ──
+
+    /// Unfold a normalized NCHW image into `[nPatches, patchDim]` where each
+    /// row is one `3 · modelPatchSize²` patch in (channel-last per pixel)
+    /// raster `(patchRow, patchCol)` order. No re-centring (LayerNorm-invariant).
+    private func unfoldPatches(
+        image: Tensor, gridH: Int, gridW: Int, patchDim: Int
+    ) -> Tensor {
+        let p = cfg.modelPatchSize
+        let pix = image.toFloatArray()  // [3, H, W]
+        let imgH = gridH * p
+        let imgW = gridW * p
+        let nPatches = gridH * gridW
+        var rows = [Float](repeating: 0, count: nPatches * patchDim)
+        for pr in 0 ..< gridH {
+            for pc in 0 ..< gridW {
+                let patch = pr * gridW + pc
+                var col = 0
+                for py in 0 ..< p {
+                    let yy = pr * p + py
+                    for px in 0 ..< p {
+                        let xx = pc * p + px
+                        for ch in 0 ..< 3 {
+                            rows[patch * patchDim + col] =
+                                pix[(ch * imgH + yy) * imgW + xx]
+                            col += 1
+                        }
+                    }
+                }
+            }
+        }
+        return ImagePreprocessing.makeTensor(
+            from: rows, shape: [nPatches, patchDim],
+            dtype: towerDtype, device: .shared)
+    }
+
+    /// Build the per-patch 2D position embedding `[nPatches, hidden]`:
+    /// `tableX[col] + tableY[row]`, clamped to the table length.
+    private func positionEmbedding(gridH: Int, gridW: Int) -> Tensor {
+        let hidden = cfg.hidden
+        let tableX = posTableX.toFloatArray()
+        let tableY = posTableY.toFloatArray()
+        let posSize = cfg.posEmbSize
+        let nPatches = gridH * gridW
+        var dst = [Float](repeating: 0, count: nPatches * hidden)
+        for pr in 0 ..< gridH {
+            for pc in 0 ..< gridW {
+                let patch = pr * gridW + pc
+                let xi = min(posSize - 1, pc)
+                let yi = min(posSize - 1, pr)
+                for d in 0 ..< hidden {
+                    dst[patch * hidden + d] =
+                        tableX[xi * hidden + d] + tableY[yi * hidden + d]
+                }
+            }
+        }
+        return ImagePreprocessing.makeTensor(
+            from: dst, shape: [nPatches, hidden], dtype: towerDtype,
+            device: .shared)
+    }
+
+    /// Split a `[posSize, 2, hidden]` position table into the per-axis
+    /// `[posSize, hidden]` tables (axis-1 index 0 = x, 1 = y). Cast to `dtype`.
+    static func splitOmniPositionTable(
+        _ raw: Tensor, dtype: DType, device: Device
+    ) -> (x: Tensor, y: Tensor) {
+        precondition(
+            raw.shape.count == 3 && raw.shape[1] == 2,
+            "Gemma4Omni: pos_embedding must be [posSize, 2, hidden], "
+                + "got \(raw.shape)")
+        let posSize = raw.shape[0]
+        let hidden = raw.shape[2]
+        let src = raw.toFloatArray()  // [pos][axis][d]
+        var x = [Float](repeating: 0, count: posSize * hidden)
+        var y = [Float](repeating: 0, count: posSize * hidden)
+        for pos in 0 ..< posSize {
+            for d in 0 ..< hidden {
+                x[pos * hidden + d] = src[(pos * 2 + 0) * hidden + d]
+                y[pos * hidden + d] = src[(pos * 2 + 1) * hidden + d]
+            }
+        }
+        return (
+            ImagePreprocessing.makeTensor(
+                from: x, shape: [posSize, hidden], dtype: dtype, device: device),
+            ImagePreprocessing.makeTensor(
+                from: y, shape: [posSize, hidden], dtype: dtype, device: device)
+        )
+    }
+}
+
+/// Load a `<base>.{weight,bias}` LayerNorm, casting both to `dtype` so
+/// `Ops.layerNorm`'s same-dtype precondition holds against `dtype`
+/// activations (the omni norms ship bf16; the cast is a no-op when the
+/// activation dtype already matches).
+private func loadLayerNormCast(
+    base: String, in bundle: SafeTensorsBundle, eps: Float,
+    dtype: DType, device: Device
+) throws -> LayerNorm {
+    let w = try bundle.tensor(named: "\(base).weight")
+    let b = try bundle.tensor(named: "\(base).bias")
+    let wCast = ImagePreprocessing.makeTensor(
+        from: w.toFloatArray(), shape: w.shape, dtype: dtype, device: device)
+    let bCast = ImagePreprocessing.makeTensor(
+        from: b.toFloatArray(), shape: b.shape, dtype: dtype, device: device)
+    return LayerNorm(weight: wCast, bias: bCast, eps: eps)
+}
+
+/// Gemma 4 Omni family orchestrator — builds a `VisionModel` from a
+/// `Gemma4UnifiedForConditionalGeneration` checkpoint: the `Gemma4Dense`
+/// text backbone + the encoder-free vision tower + the raw-frame audio
+/// embedder, joined by the cross-modal splice.
+public enum Gemma4Omni {
+    /// `<|image|>` placeholder id (config `image_token_id`).
+    public static let defaultImageTokenId = 258_880
+    /// `<|audio|>` placeholder id (config `audio_token_id`).
+    public static let defaultAudioTokenId = 258_881
+    /// `<|video|>` placeholder id (config `video_token_id`).
+    public static let defaultVideoTokenId = 258_884
+    /// `audio_samples_per_token` / `audio_embed_dim` default (640 = 40 ms @ 16 kHz).
+    public static let defaultAudioSamplesPerToken = 640
+
+    public static func load(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> VisionModel {
+        guard let visionConfig = config.subConfig("vision_config") else {
+            throw Gemma4Error.missingConfig("vision_config")
+        }
+
+        // ── Text backbone (Gemma4Dense; the omni text_config resolves to it) ──
+        let textVariant = try Gemma4.variant(for: config)
+        let textEngine = try textVariant.loadModel(
+            config: config, weights: weights, options: options, device: device)
+        let dtype = textEngine.dtype
+
+        // ── Encoder-free vision tower ──
+        let vision = try Gemma4OmniVisionEncoder.load(
+            visionConfig: visionConfig, textHidden: textEngine.hidden,
+            weights: weights, dtype: dtype,
+            quantization: config.quantization, device: device)
+
+        let imageTokenId =
+            config.int("image_token_id")
+            ?? config.int("image_token_index") ?? defaultImageTokenId
+
+        // ── Encoder-free audio (optional — gate on `embed_audio.*`) ──
+        var audioTokenId: Int? = nil
+        var audioEncode:
+            (@Sendable (_ waveform: [Float], _ device: Device) -> Tensor)? = nil
+        let hasAudio =
+            weights.has("embed_audio.embedding_projection.weight")
+            || weights.has("model.embed_audio.embedding_projection.weight")
+        if hasAudio {
+            let audioCfg = config.subConfig("audio_config")
+            let samplesPerToken =
+                audioCfg?.int("audio_samples_per_token")
+                ?? audioCfg?.int("audio_embed_dim")
+                ?? defaultAudioSamplesPerToken
+            let audioEps = Float(audioCfg?.float("rms_norm_eps") ?? 1e-6)
+            let embedAudio = try Gemma4MultimodalEmbedder.load(
+                weights: weights, embeddingDim: samplesPerToken,
+                normEps: audioEps, dtype: dtype,
+                quantization: config.quantization, prefix: "embed_audio")
+            audioTokenId =
+                config.int("audio_token_id")
+                ?? config.int("audio_token_index") ?? defaultAudioTokenId
+            // Raw-frame audio: waveform → [nFrames, 640] → embed_audio. No mel.
+            audioEncode = { waveform, dev in
+                let frames = Gemma4OmniAudio.frame(
+                    waveform, samplesPerToken: samplesPerToken,
+                    dtype: dtype, device: dev)
+                return embedAudio.embed(frames, device: dev)
+            }
+        }
+
+        let videoTokenId =
+            config.int("video_token_id") ?? config.int("video_token_index")
+            ?? defaultVideoTokenId
+
+        // The omni image processor is rescale-only; the encoder overrides
+        // `preprocessImage`, so this normalization is just the unused fallback.
+        let identity = ImageNormalization(mean: (0, 0, 0), std: (1, 1, 1))
+        return try VisionModel(
+            visionEncoder: vision, engine: textEngine,
+            imageTokenId: imageTokenId, videoTokenId: videoTokenId,
+            normalization: identity,
+            imageTokenCount: vision.cfg.numSoftTokens,
+            audioTokenId: audioTokenId, audioEncode: audioEncode)
+    }
+}

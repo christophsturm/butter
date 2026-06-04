@@ -1311,6 +1311,14 @@ final class Gemma4AudioEncoder: @unchecked Sendable {
     }
 }
 
+/// Semantic alias used by the Gemma 4 Omni encoder-free path, where the
+/// same RMSNorm-no-scale + linear projector is the shared multimodal
+/// embedder for BOTH the vision (`embed_vision`) and audio (`embed_audio`)
+/// projections. The implementation lives on `Gemma4AudioEmbedder` (the
+/// original VL audio-tower call site); the alias keeps the vision call site
+/// readable.
+typealias Gemma4MultimodalEmbedder = Gemma4AudioEmbedder
+
 /// Multi-modal embedder for the audio path (`embed_audio`). Mirrors the
 /// reference `MultimodalEmbedder`: an unweighted RMSNorm (`RMSNormNoScale`,
 /// `embedding_pre_projection_norm`) over each audio soft token followed by
@@ -1341,17 +1349,23 @@ final class Gemma4AudioEmbedder: @unchecked Sendable {
         self.dtype = dtype
     }
 
-    /// Load `embed_audio.embedding_projection.{weight,scales,biases}` from
-    /// the checkpoint. Probes both the bare and `model.`-namespaced
-    /// prefixes (VLM conversions may carry either).
+    /// Load `<prefix>.embedding_projection.{weight,scales,biases}` from the
+    /// checkpoint. Probes both the bare and `model.`-namespaced prefixes
+    /// (VLM conversions may carry either). `prefix` defaults to
+    /// `embed_audio` (the encoder-based VL audio tower); the Gemma 4 Omni
+    /// encoder-free path reuses this same module for its vision projector
+    /// (`embed_vision`, embeddingDim 3840) and audio projector
+    /// (`embed_audio`, embeddingDim 640) — the embedder is generic in
+    /// `embeddingDim`, so only the prefix + dim differ.
     static func load(
         weights: SafeTensorsBundle, embeddingDim: Int, normEps: Float,
-        dtype: DType, quantization: ModelConfig.QuantizationConfig?
+        dtype: DType, quantization: ModelConfig.QuantizationConfig?,
+        prefix: String = "embed_audio"
     ) throws -> Gemma4AudioEmbedder {
         let ea =
-            weights.has("embed_audio.embedding_projection.weight")
-            ? weights.prefixed("embed_audio.")
-            : weights.prefixed("model.embed_audio.")
+            weights.has("\(prefix).embedding_projection.weight")
+            ? weights.prefixed("\(prefix).")
+            : weights.prefixed("model.\(prefix).")
         let projection = try loadLinear(
             base: "embedding_projection", in: ea, quantization: quantization)
         return Gemma4AudioEmbedder(
@@ -1386,5 +1400,42 @@ final class Gemma4AudioEmbedder: @unchecked Sendable {
         cmd.commit()
         cmd.waitUntilCompleted()
         return projected
+    }
+}
+
+// ─── Gemma 4 Omni encoder-free audio framing ─────────────────────────
+
+/// Gemma 4 Omni's encoder-free audio front-end. Unlike the encoder-based
+/// Gemma 4 VL audio tower (mel front-end + Conformer, above), the Omni
+/// model does the 40 ms / 640-sample framing in its *processor*: raw
+/// 16 kHz samples ARE the features. So the Swift side just reshapes the
+/// waveform into `[nFrames, samplesPerToken]` — no mel, no STFT, no
+/// Conformer — and feeds it straight to `embed_audio` (the shared
+/// `Gemma4MultimodalEmbedder`: RMSNorm-no-scale + Linear 640→3840).
+enum Gemma4OmniAudio {
+    /// `audio_seq_length` cap from the processor config — 30 s at
+    /// 40 ms/token (`750 · 640 = 480000` samples at 16 kHz).
+    static let maxFrames = 750
+
+    /// Slice `waveform` into non-overlapping `samplesPerToken` (640 = 40 ms
+    /// at 16 kHz) frames, right zero-padding the final partial frame, capped
+    /// at `maxFrames`. Returns `[nFrames, samplesPerToken]` in `dtype`.
+    /// Always ≥ 1 frame (empty / sub-frame input → one zero-padded frame,
+    /// matching a single `<|audio|>` placeholder).
+    static func frame(
+        _ waveform: [Float], samplesPerToken: Int,
+        dtype: DType, device: Device
+    ) -> Tensor {
+        let maxSamples = maxFrames * samplesPerToken
+        let samples =
+            waveform.count > maxSamples
+            ? Array(waveform[0 ..< maxSamples]) : waveform
+        let nFrames = max(
+            1, (samples.count + samplesPerToken - 1) / samplesPerToken)
+        var rows = [Float](repeating: 0, count: nFrames * samplesPerToken)
+        for i in 0 ..< samples.count { rows[i] = samples[i] }
+        return ImagePreprocessing.makeTensor(
+            from: rows, shape: [nFrames, samplesPerToken],
+            dtype: dtype, device: device)
     }
 }

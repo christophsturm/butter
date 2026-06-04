@@ -294,10 +294,15 @@ public struct Gemma4MoE: Gemma4Variant {
 enum Gemma4Loader {
     /// Weight-key prefix. Gemma 4 checkpoints are VLM conversions that
     /// nest the text tower under `language_model.model.`; a plain text
-    /// checkpoint would use `model.`. We probe for the embed tensor.
+    /// checkpoint would use `model.`. The Gemma 4 Omni (`gemma4_unified`)
+    /// checkpoint nests it under `model.language_model.` instead. We probe
+    /// for the embed tensor under each known layout.
     static func resolvePrefix(_ weights: SafeTensorsBundle) -> String {
         if weights.has("language_model.model.embed_tokens.weight") {
             return "language_model.model."
+        }
+        if weights.has("model.language_model.embed_tokens.weight") {
+            return "model.language_model."
         }
         return "model."
     }
