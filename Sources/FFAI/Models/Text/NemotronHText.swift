@@ -832,6 +832,9 @@ public final class NemotronHMoELayer: Module, DecoderLayer {
     /// `[nRouted]` host-resident copy of `eScoreCorrectionBias` — read
     /// once at init so each decode skips a CPU readback of the bias.
     let eScoreCorrectionBiasHost: [Float]
+    /// `[nRouted]` f32 GPU-resident copy of the selection bias — fed to
+    /// the f32-only `Ops.moeRouterSigmoidBias` kernel each decode.
+    let eScoreCorrectionBiasF32: Tensor
     let experts: [NemotronHExpert]
     /// Always-on dense shared MLP. `nil` if the checkpoint declared
     /// `n_shared_experts == 0`.
@@ -856,7 +859,11 @@ public final class NemotronHMoELayer: Module, DecoderLayer {
         self.norm = norm
         self.gate = gate
         self.eScoreCorrectionBias = eScoreCorrectionBias
-        self.eScoreCorrectionBiasHost = readFloatsNH(eScoreCorrectionBias)
+        let biasHost = readFloatsNH(eScoreCorrectionBias)
+        self.eScoreCorrectionBiasHost = biasHost
+        let biasF32 = Tensor.empty(shape: [biasHost.count], dtype: .f32)
+        biasF32.copyIn(from: biasHost)
+        self.eScoreCorrectionBiasF32 = biasF32
         self.experts = experts
         self.sharedExpert = sharedExpert
         self.hidden = hidden
@@ -899,18 +906,30 @@ public final class NemotronHMoELayer: Module, DecoderLayer {
         // ── Pre-mixer RMSNorm + router GEMV on the caller's buffer ───
         let xNorm = norm(h, on: cmd)
         let logitsTensor = gate(xNorm, on: cmd)
+        // GPU router score: scores = sigmoid(logits) + bias, fused onto
+        // the same command buffer as the gate GEMV (the metaltile
+        // `ffai_moe_router_sigmoid_bias` kernel; f32-only, so cast the
+        // gate logits to f32 first if the activation dtype differs).
+        let logitsF32: Tensor
+        if logitsTensor.dtype == .f32 {
+            logitsF32 = logitsTensor
+        } else {
+            logitsF32 = Tensor.empty(
+                shape: logitsTensor.shape, dtype: .f32, device: device)
+            Ops.castToF32(logitsTensor, into: logitsF32, on: cmd)
+        }
+        let scoresTensor = Ops.moeRouterSigmoidBias(
+            logits: logitsF32, bias: eScoreCorrectionBiasF32, on: cmd)
         cmd.commit()
         cmd.waitUntilCompleted()
 
-        // ── CPU routing — sigmoid + bias for selection, raw sigmoid
-        //                  for weighting ─────────────────────────────
-        let logits = logitsTensor.toFloatArray()
+        // ── CPU top-K — selection uses sigmoid+bias (GPU `scores`); the
+        //    raw sigmoid used for the final weight is recovered as
+        //    `selection − bias` (the kernel folds the bias in). ─────────
+        let selectionScores = scoresTensor.toFloatArray()
         var origScores = [Float](repeating: 0, count: nRouted)
-        var selectionScores = [Float](repeating: 0, count: nRouted)
         for i in 0 ..< nRouted {
-            let s = 1.0 / (1.0 + Foundation.exp(-logits[i]))
-            origScores[i] = s
-            selectionScores[i] = s + eScoreCorrectionBiasHost[i]
+            origScores[i] = selectionScores[i] - eScoreCorrectionBiasHost[i]
         }
         let order = (0 ..< nRouted).sorted { a, b in
             if selectionScores[a] != selectionScores[b] {

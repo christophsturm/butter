@@ -331,6 +331,38 @@ public enum Ops {
         return result
     }
 
+    /// MoE router score: `scores[i] = sigmoid(logits[i]) + bias[i]`.
+    ///
+    /// The sigmoid-with-bias gate used by NemotronH / DeepSeek-V3 expert
+    /// routing: the bias steers SELECTION only — the final expert weight
+    /// is the raw `sigmoid(logits)`, recoverable as `scores - bias`.
+    /// Elementwise over `[nExperts]`, **f32-only** (the metaltile
+    /// `ffai_moe_router_sigmoid_bias` kernel is a non-generic all-`f32`
+    /// `#[kernel]` — see
+    /// `crates/metaltile-std/src/ffai/moe_router_sigmoid_bias.rs`).
+    public static func moeRouterSigmoidBias(
+        logits: Tensor, bias: Tensor, on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(
+            logits.dtype == .f32, "Ops.moeRouterSigmoidBias: logits must be f32")
+        precondition(
+            bias.dtype == .f32, "Ops.moeRouterSigmoidBias: bias must be f32")
+        precondition(
+            logits.elementCount == bias.elementCount,
+            "Ops.moeRouterSigmoidBias: logits/bias element-count mismatch "
+                + "(\(logits.elementCount) vs \(bias.elementCount))")
+        let result = out ?? Tensor.empty(shape: logits.shape, dtype: .f32)
+        let n = logits.elementCount
+        let (grid, tg) = elementwiseGrid(n)
+        MetalTileKernels.ffai_moe_router_sigmoid_bias_f32(
+            logits: logits.buffer, logitsOffset: logits.offset,
+            bias: bias.buffer, biasOffset: bias.offset,
+            scores: result.buffer, scoresOffset: result.offset,
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+        return result
+    }
+
     /// Embedding lookup. `table` is [vocab, dim], `tokenIds` is [n_tokens]
     /// (u32), output is [n_tokens, dim].
     public static func gather(

@@ -1116,6 +1116,35 @@ struct OpsTests {
         }
     }
 
+    // MARK: - moeRouterSigmoidBias
+
+    /// Direct test of `Ops.moeRouterSigmoidBias`:
+    /// scores[i] = sigmoid(logits[i]) + bias[i] — the NemotronH /
+    /// DeepSeek-V3 sigmoid-with-bias expert-selection score.
+    @Test("moeRouterSigmoidBias f32 — scores[i] = sigmoid(logits[i]) + bias[i]")
+    func moeRouterSigmoidBiasF32() {
+        autoreleasepool {
+            let logits: [Float] = [0, 1, -1, 2, -5, 8, -20, 0.5, -0.5, 3.3]
+            let bias: [Float] = [0, -0.15, 0.1, 0.05, -0.1, 0.2, -0.2, 0.0, 0.15, -0.05]
+            let lt = Tensor.empty(shape: [logits.count], dtype: .f32)
+            lt.copyIn(from: logits)
+            let bt = Tensor.empty(shape: [bias.count], dtype: .f32)
+            bt.copyIn(from: bias)
+            var out: Tensor!
+            runAndWait { cb in
+                out = Ops.moeRouterSigmoidBias(logits: lt, bias: bt, on: cb)
+            }
+            let r = out.toArray(as: Float.self)
+            for i in 0 ..< logits.count {
+                let expected =
+                    Float(1.0 / (1.0 + exp(-Double(logits[i])))) + bias[i]
+                #expect(
+                    abs(r[i] - expected) < 1e-4,
+                    "i=\(i) got \(r[i]) expected \(expected)")
+            }
+        }
+    }
+
     // MARK: - rmsNormRows (multi-row RMSNorm reduction kernel)
 
     /// Direct test of `Ops.rmsNormRows`. Each of `nRows` rows is
