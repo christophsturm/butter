@@ -448,19 +448,25 @@ private func lfm2vlBroadcastAddBias(
 final class LFM2VLComposedTower {
     let encoder: VisionEncoder
     let projector: LFM2VLProjector
-    let imageSize: Int  // encoder input resolution (256 for the simplified pass)
-    let imageTokenCount: Int
+    let imageSize: Int  // encoder input resolution (nominal square)
+    let imageTokenCount: Int  // nominal square-image token count
+    /// The processor's patch budget (`preprocessor_config.max_num_patches`,
+    /// default 1024) — the aspect-preserving resize caps the patch grid here,
+    /// NOT at `num_patches` (256, which is only the posEmb table size).
+    let maxNumPatches: Int
     let textHidden: Int
     let dtype: DType
 
     init(
         encoder: VisionEncoder, projector: LFM2VLProjector,
-        imageSize: Int, imageTokenCount: Int, textHidden: Int, dtype: DType
+        imageSize: Int, imageTokenCount: Int, maxNumPatches: Int,
+        textHidden: Int, dtype: DType
     ) {
         self.encoder = encoder
         self.projector = projector
         self.imageSize = imageSize
         self.imageTokenCount = imageTokenCount
+        self.maxNumPatches = maxNumPatches
         self.textHidden = textHidden
         self.dtype = dtype
     }
@@ -511,7 +517,10 @@ final class LFM2VLComposedEncoder: VisionEncoder {
     ) -> Tensor? {
         let patch = tower.encoder.config.patchSize
         let d = tower.projector.downsampleFactor
-        let maxPatches = tower.imageTokenCount * d * d
+        // Cap the SigLIP patch grid at the processor's budget (1024), NOT at
+        // the posEmb table size (256) — using 256 here squished the dog to a
+        // ~12×18 grid (4× too coarse to recognize).
+        let maxPatches = tower.maxNumPatches
         let bounds = MediaUtils.SmartResizeBounds(
             factor: patch * d,
             minPixels: (patch * d) * (patch * d),
@@ -544,7 +553,7 @@ final class LFM2VLComposedEncoder: VisionEncoder {
     func nativeTokenCount(imageWidth: Int, imageHeight: Int) -> Int {
         let patch = tower.encoder.config.patchSize
         let d = tower.projector.downsampleFactor
-        let maxPatches = tower.imageTokenCount * d * d
+        let maxPatches = tower.maxNumPatches
         let bounds = MediaUtils.SmartResizeBounds(
             factor: patch * d,
             minPixels: (patch * d) * (patch * d),

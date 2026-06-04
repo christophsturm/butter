@@ -70,25 +70,33 @@ struct LFM2VisionIntegrationTests {
         }
         let vlm = try #require(m.vlModel, "LFM2-VL checkpoint is not a VLM")
 
-        // Build a minimal image+text prompt. 64 image-placeholder tokens
-        // followed by a short instruction (no chat template — keeping it
-        // simple for the coherence-first integration test).
+        // Build the LFM2-VL chat prompt, mirroring the mlx-vlm reference
+        // template exactly:
+        //   <|startoftext|><|im_start|>user\n<image>Describe this image.
+        //   <|im_end|>\n<|im_start|>assistant\n
+        // where `<image>` expands to the per-image vision-token run. Without
+        // the chat framing (BOS + im_start/assistant turn) the hybrid LFM2
+        // backbone degenerates to whitespace — the vision features alone are
+        // correct (they match the reference distribution).
         let imageTokenId = vlm.imageTokenId
-        let questionTokens = m.tokenizer.encode(
-            text: "Describe this image.")
+        let bos = try #require(
+            m.tokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
+        let userPrefix = m.tokenizer.encode(text: "<|im_start|>user\n")
+        let userSuffix = m.tokenizer.encode(
+            text: "Describe this image.<|im_end|>\n<|im_start|>assistant\n")
 
         // The shared golden-retriever fixture.
         let image = try VisionTestHelpers.dogImage()
 
         // Native resolution: the projected vision-token count is per-image
         // (the aspect-preserving smart-resize), so build exactly that many
-        // image-placeholder tokens.
-        let imageTokens =
-            (vlm.visionEncoder as? LFM2VLComposedEncoder)?
-            .nativeTokenCount(imageWidth: image.width, imageHeight: image.height)
-            ?? vlm.imageTokenCount
+        // image-placeholder tokens. Encode once up front to size the run;
+        // `generate` re-encodes internally.
+        let imageTokens = vlm.encodeImage(image).shape[0]
         let promptTokens =
-            Array(repeating: imageTokenId, count: imageTokens) + questionTokens
+            [bos] + userPrefix
+            + Array(repeating: imageTokenId, count: imageTokens)
+            + userSuffix
 
         let generated = try vlm.generate(
             promptTokens: promptTokens, image: image,

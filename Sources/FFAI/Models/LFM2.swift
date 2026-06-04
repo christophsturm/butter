@@ -207,11 +207,18 @@ public enum LFM2VL {
         let numPatches1D = Int(Double(numPatches).squareRoot().rounded())
         let patchSize = visionConfig.int("patch_size") ?? 16
         let imageSize = numPatches1D * patchSize  // natural resolution (256)
+        // The processor's aspect-preserving resize caps the patch grid at
+        // `max_num_patches` (1024), NOT at `num_patches` (256, the posEmb
+        // table size). Top config wins; fall back to the vision sub-config.
+        let maxNumPatches =
+            config.int("max_num_patches")
+            ?? visionConfig.int("max_num_patches") ?? 1024
         let composed = LFM2VLComposedTower(
             encoder: visionEncoder,
             projector: projector,
             imageSize: imageSize,
             imageTokenCount: imageTokenCount,
+            maxNumPatches: maxNumPatches,
             textHidden: textEngine.hidden,
             dtype: textEngine.dtype)
 
