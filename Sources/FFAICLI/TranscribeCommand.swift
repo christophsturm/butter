@@ -71,10 +71,10 @@ struct TranscribeCommand: AsyncParsableCommand {
         let stream = transcriber.transcribeStream(
             waveform, maxNewTokens: maxNewTokens, temperature: temperature)
         var text = ""
-        for try await delta in stream {
-            text += delta
+        for try await chunk in stream {
+            text += chunk
             if streaming {
-                print(delta, terminator: "")
+                print(chunk, terminator: "")
                 fflush(stdout)
             }
         }

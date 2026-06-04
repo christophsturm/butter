@@ -95,8 +95,8 @@ modality-appropriate element type:
 
 ```swift
 // STT — yields incremental transcript TEXT (one delta per decoded token).
-for try await delta in sttModel.transcribeStream(waveform, maxNewTokens: 256) {
-    print(delta, terminator: "")
+for try await chunk in sttModel.transcribeStream(waveform, maxNewTokens: 256) {
+    print(chunk, terminator: "")
 }
 
 // TTS — yields one waveform Tensor per segment (audio chunks instead of

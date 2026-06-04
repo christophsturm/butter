@@ -236,10 +236,10 @@ struct FireRedASR2IntegrationTests {
         // Concatenating the (single) delta must equal the batch transcript.
         var streamed = ""
         var deltaCount = 0
-        for try await delta in model.transcribeStream(
+        for try await chunk in model.transcribeStream(
             wave, maxNewTokens: cap, temperature: 0.0)
         {
-            streamed += delta
+            streamed += chunk
             deltaCount += 1
         }
         print(

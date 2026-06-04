@@ -168,10 +168,10 @@ struct Qwen3ASRIntegrationTests {
         // trailing-whitespace trim). The token budget must match.
         var streamed = ""
         var deltaCount = 0
-        for try await delta in model.transcribeStream(
+        for try await chunk in model.transcribeStream(
             wave, maxNewTokens: maxTokens, temperature: 0.0)
         {
-            streamed += delta
+            streamed += chunk
             deltaCount += 1
         }
         print("Qwen3ASR streamed (\(deltaCount) deltas): '\(streamed)'")

@@ -205,8 +205,8 @@ struct ParakeetIntegrationTests {
         // delta) must equal the batch transcript.
         var streamed = ""
         var deltaCount = 0
-        for try await delta in model.transcribeStream(wave) {
-            streamed += delta
+        for try await chunk in model.transcribeStream(wave) {
+            streamed += chunk
             deltaCount += 1
         }
         let streamedTrimmed = streamed.trimmingCharacters(

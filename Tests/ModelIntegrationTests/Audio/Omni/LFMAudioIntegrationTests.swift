@@ -239,10 +239,10 @@ struct LFMAudioIntegrationTests {
         // batch's trailing whitespace trim).
         var streamed = ""
         var deltaCount = 0
-        for try await delta in model.transcribeStream(
+        for try await chunk in model.transcribeStream(
             waveform, maxNewTokens: 64, temperature: 0.0)
         {
-            streamed += delta
+            streamed += chunk
             deltaCount += 1
         }
         print("LFMAudio streamed (\(deltaCount) deltas): '\(streamed)'")
