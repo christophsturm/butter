@@ -45,9 +45,25 @@ public enum BenchMethod: String, Sendable, CaseIterable {
     /// non-zero rather than silently producing garbage.
     public var isImplemented: Bool {
         switch self {
-        case .simple, .summarization, .wikitext2:
+        case .simple, .summarization, .wikitext2, .niah:
             return true
-        case .niah, .multiTurn, .toolCalling,
+        case .multiTurn, .toolCalling,
+            .ngramSpot, .ngramSweep, .ngramSweepSummary, .vision:
+            return false
+        }
+    }
+
+    /// `true` for methods that forced-decode (or long-context retrieval-
+    /// score) an entire corpus and so publish *quality* numbers. These
+    /// are the ones that must run on a release build — in debug the
+    /// per-token decode loop is slow enough that the numbers are
+    /// meaningless as a throughput reference and painfully slow to
+    /// produce. See `planning/telemetry-quality-metrics-design.md` §7.
+    public var isQualityMetric: Bool {
+        switch self {
+        case .wikitext2, .niah:
+            return true
+        case .simple, .summarization, .multiTurn, .toolCalling,
             .ngramSpot, .ngramSweep, .ngramSweepSummary, .vision:
             return false
         }

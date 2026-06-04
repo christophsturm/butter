@@ -93,6 +93,13 @@ struct BenchCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Enable debug logging.")
     var debug: Bool = false
 
+    @Flag(
+        name: .long,
+        help:
+            "Run a quality bench (wikitext2 / niah) even on a debug build. Off by default — debug forced-decode is far too slow to publish (see design §7). Use `swift run -c release ffai bench …` for real numbers."
+    )
+    var allowDebugBench: Bool = false
+
     @Option(
         name: .long,
         help:
@@ -121,6 +128,27 @@ struct BenchCommand: AsyncParsableCommand {
                 dependency: benchMethod.dependency ?? "<unknown>"
             )
         }
+
+        // Guard quality benches against debug builds. Forced decode over a
+        // corpus is far too slow in debug for the numbers to be a useful
+        // reference, and publishing debug-speed quality numbers by accident
+        // is worse than refusing. Hard-refuse unless explicitly overridden
+        // (design §7, open question 5: we land on refuse-by-default since a
+        // silent slow run is the failure mode we actually want to prevent).
+        #if DEBUG
+            if benchMethod.isQualityMetric && !allowDebugBench {
+                throw ValidationError(
+                    """
+                    ffai bench --method \(benchMethod.rawValue) is a quality bench and you're on a DEBUG build.
+                    Debug forced-decode is far too slow to publish (design §7). Run it in release:
+
+                        swift run -c release ffai bench --method \(benchMethod.rawValue) --model \(model) …
+
+                    Or pass --allow-debug-bench to override (smoke testing only — do not publish the numbers).
+                    """
+                )
+            }
+        #endif
 
         print("ffai bench \(benchMethod.rawValue) — loading \(model)…")
         let candidate = try await Model.load(model)
