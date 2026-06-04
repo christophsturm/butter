@@ -1999,7 +1999,11 @@ public struct TranscriptionResult: Sendable {
 /// Note: does NOT conform to the `AudioModel` protocol declared in
 /// `AudioModel.swift` — that one is for TTS (`synthesize(text:...)`).
 /// GraniteSpeech follows the standalone STT pattern: `load(...)` + `transcribe(...)`.
-public final class GraniteSpeechModel: Module {
+// `@unchecked Sendable`: inference is single-threaded (one decode at a time)
+// and `transcribeStream` runs its producer on a detached `Task` that holds
+// the only live reference while it decodes — same contract as `Model`. The
+// GPU buffers it touches are serialized through the command queue.
+public final class GraniteSpeechModel: Module, @unchecked Sendable {
     public let config: GraniteSpeechConfig
 
     // CPU-side encoder & projector weights
@@ -2068,13 +2072,24 @@ public final class GraniteSpeechModel: Module {
     // MARK: - AudioModel conformance
 
     /// Transcribe a 16 kHz mono waveform.
-    public func transcribe(
-        _ waveform: [Float],
-        maxNewTokens: Int = 512,
-        temperature: Float = 0.0
-    ) throws -> TranscriptionResult {
-        let start = Date()
+    /// Sample one token from logits (greedy at temperature 0).
+    private func sampleTok(_ logits: Tensor, temperature: Float) -> Int {
+        if temperature == 0 { return Sampling.argmax(logits) }
+        var rng = SystemRandomNumberGenerator()
+        return Sampling.sample(
+            logits,
+            parameters: GenerationParameters(temperature: temperature),
+            rng: &rng)
+    }
 
+    /// Encode the audio, splice the projected audio embeddings into the
+    /// prompt, run prefill, and sample the first decode token. Shared by the
+    /// batch `transcribe` and the streaming `transcribeStream` — the
+    /// audio-encode + prefill is the expensive part; both decode loops
+    /// continue from the returned state.
+    private func prepareTranscribe(
+        _ waveform: [Float], temperature: Float
+    ) throws -> (caches: [any LayerCacheProtocol], firstToken: Int, promptLen: Int) {
         // 1. Extract mel features and encode
         let melFrames = extractMelFeatures(waveform)
         let encoderOut = runEncoder(melFrames, weights: encoderWeights)
@@ -2137,42 +2152,85 @@ public final class GraniteSpeechModel: Module {
             if pos == promptLen - 1 { lastLogits = logits }
         }
 
-        // 6. Decode
+        // First decode token from the prefill tail.
+        let firstToken = sampleTok(lastLogits, temperature: temperature)
+        return (caches: caches, firstToken: firstToken, promptLen: promptLen)
+    }
+
+    /// Batch transcription — prefill, then decode to EOS / `maxNewTokens`.
+    public func transcribe(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0
+    ) throws -> TranscriptionResult {
+        let start = Date()
+        let st = try prepareTranscribe(waveform, temperature: temperature)
         var generatedTokens: [Int] = []
-        var lastTok: Int = -1
-
-        if temperature == 0 {
-            lastTok = Sampling.argmax(lastLogits)
-        } else {
-            var rng = SystemRandomNumberGenerator()
-            lastTok = Sampling.sample(
-                lastLogits,
-                parameters: GenerationParameters(temperature: temperature),
-                rng: &rng)
-        }
-
+        var lastTok = st.firstToken
         for _ in 0 ..< maxNewTokens {
             if lastTok == eosTokenId { break }
             generatedTokens.append(lastTok)
-
             let nextLogits = lmForwardToken(
-                tokenId: lastTok, position: promptLen + generatedTokens.count - 1, caches: caches)
-            if temperature == 0 {
-                lastTok = Sampling.argmax(nextLogits)
-            } else {
-                var rng = SystemRandomNumberGenerator()
-                lastTok = Sampling.sample(
-                    nextLogits,
-                    parameters: GenerationParameters(temperature: temperature),
-                    rng: &rng)
-            }
+                tokenId: lastTok,
+                position: st.promptLen + generatedTokens.count - 1,
+                caches: st.caches)
+            lastTok = sampleTok(nextLogits, temperature: temperature)
         }
-
         let text = tokenizer.decode(tokens: generatedTokens)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let elapsed = Date().timeIntervalSince(start)
         return TranscriptionResult(
-            text: text, generatedTokens: generatedTokens.count, totalTimeS: elapsed)
+            text: text, generatedTokens: generatedTokens.count,
+            totalTimeS: Date().timeIntervalSince(start))
+    }
+
+    /// Streaming transcription — yields the incremental decoded TEXT (one
+    /// delta per generated token) as the LM decodes. Same audio-encode +
+    /// prefill + per-token loop as `transcribe`, so concatenating the yielded
+    /// deltas reproduces the batch transcript (modulo the batch's trailing
+    /// trim). Cancelling the consuming task stops decode at the next step.
+    public func transcribeStream(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0
+    ) -> AsyncThrowingStream<String, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let st = try model.prepareTranscribe(
+                        waveform, temperature: temperature)
+                    var generated: [Int] = []
+                    var lastTok = st.firstToken
+                    for _ in 0 ..< maxNewTokens {
+                        try Task.checkCancellation()
+                        if lastTok == model.eosTokenId { break }
+                        generated.append(lastTok)
+                        // Emit the new suffix of the running decode (decode the
+                        // whole prefix each step — robust to BPE tokens that
+                        // don't decode standalone; concatenation == batch text).
+                        let prev =
+                            generated.count == 1
+                            ? ""
+                            : model.tokenizer.decode(
+                                tokens: Array(generated.dropLast()))
+                        let cur = model.tokenizer.decode(tokens: generated)
+                        if cur.count > prev.count {
+                            continuation.yield(String(cur.dropFirst(prev.count)))
+                        }
+                        let nextLogits = model.lmForwardToken(
+                            tokenId: lastTok,
+                            position: st.promptLen + generated.count - 1,
+                            caches: st.caches)
+                        lastTok = model.sampleTok(
+                            nextLogits, temperature: temperature)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     // MARK: - Internal helpers

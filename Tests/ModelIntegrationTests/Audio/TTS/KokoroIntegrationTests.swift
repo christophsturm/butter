@@ -127,6 +127,41 @@ struct KokoroIntegrationTests {
         print("Kokoro full-chain: \(samples.count) samples, energy=\(energy), distinct=\(distinct)")
     }
 
+    @Test("synthesizeStream yields one non-degenerate audio chunk per segment")
+    func synthesizeStreaming() async throws {
+        let dir = try await ModelLoadLock.shared.loadSerially {
+            try await ModelLocator().resolve(idOrPath: "mlx-community/Kokoro-82M-bf16")
+        }
+        let model = try KokoroModel.load(directory: dir)
+        // Two phrase segments → two streamed audio chunks (the TTS analogue
+        // of token-streaming: audio per sentence/segment).
+        let seg1 = model.phonemeIds(for: "hɛlˈoʊ")
+        let seg2 = model.phonemeIds(for: "wˈɜːld")
+        try #require(!seg1.isEmpty && !seg2.isEmpty, "no phonemes mapped")
+
+        var chunks: [[Float]] = []
+        for try await audio in model.synthesizeStream(
+            phonemeSegments: [seg1, seg2])
+        {
+            chunks.append(audio.toFloatArray())
+        }
+        #expect(
+            chunks.count == 2,
+            "expected one audio chunk per segment, got \(chunks.count)")
+        for (i, c) in chunks.enumerated() {
+            #expect(c.count > 500, "chunk \(i) too short: \(c.count)")
+            #expect(c.allSatisfy { $0.isFinite }, "chunk \(i) non-finite")
+            let energy = c.map { $0 * $0 }.reduce(0, +)
+            #expect(energy > 1e-4, "chunk \(i) is silent")
+        }
+        // The first streamed chunk equals the batch synthesis of segment 1.
+        let batch1 = try model.synthesize(phonemeIds: seg1).toFloatArray()
+        #expect(
+            chunks[0].count == batch1.count,
+            "streamed chunk 0 (\(chunks[0].count)) != batch (\(batch1.count))")
+        print("Kokoro streamed \(chunks.count) chunks: \(chunks.map { $0.count })")
+    }
+
     @Test("front-end — GPU PLBERT matches the CPU reference")
     func plbertGPUParity() async throws {
         let dir = try await ModelLoadLock.shared.loadSerially {

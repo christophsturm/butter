@@ -354,6 +354,38 @@ public final class KokoroModel: @unchecked Sendable {
         imT.copyIn(from: imFlat)
         return vocoder.synthesize(specRe: reT, specIm: imT, device: device)
     }
+
+    /// Streaming text→audio synthesis — yields ONE waveform `Tensor` per
+    /// phoneme segment (the TTS analogue of token-streaming: audio chunks
+    /// instead of tokens). The caller segments the utterance (typically one
+    /// segment per sentence / pause) so playback can start on segment 1 while
+    /// segment 2 synthesizes. Concatenating the yielded chunks equals
+    /// `synthesize` over the joined segments. Cancelling the consumer stops
+    /// synthesis at the next segment boundary.
+    public func synthesizeStream(
+        phonemeSegments: [[Int]],
+        speed: Float = 1.0,
+        device: Device = .shared
+    ) -> AsyncThrowingStream<Tensor, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for segment in phonemeSegments {
+                        try Task.checkCancellation()
+                        if segment.isEmpty { continue }
+                        let audio = try model.synthesize(
+                            phonemeIds: segment, speed: speed, device: device)
+                        continuation.yield(audio)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
 
 // ─── Loading ─────────────────────────────────────────────────────────
