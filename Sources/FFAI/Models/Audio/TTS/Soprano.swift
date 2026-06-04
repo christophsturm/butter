@@ -1022,6 +1022,51 @@ public final class SopranoModel: @unchecked Sendable {
         return Array(raw[lo ..< hi])
     }
 
+    /// Streaming text→audio synthesis (`StreamingSynthesizer` conformance).
+    ///
+    /// Soprano's `synthesize(text:)` accepts raw text and tokenises it
+    /// internally via the loaded BPE tokenizer (no external g2p / phonemiser
+    /// is required), so streaming simply reuses the full synthesis path and
+    /// yields the complete waveform as a single chunk. Single-yield keeps the
+    /// streamed signal bit-identical to a one-shot `synthesize` — correctness
+    /// first; Soprano has no clean codec-frame boundary to split on.
+    ///
+    /// - Parameters:
+    ///   - text: Text to synthesise (tokenised internally).
+    ///   - voice: Ignored — Soprano-80M is single-speaker and exposes no
+    ///     voice catalogue.
+    ///   - speed: Ignored — Soprano does not apply a post-decode rate change.
+    /// - Note: Soprano-1.1 (LLM-only) checkpoints have no Vocos decoder; the
+    ///   stream finishes by throwing `SopranoError.decoderNotAvailable`.
+    public func synthesizeStream(
+        text: String,
+        voice: String? = nil,
+        speed: Float = 1.0
+    ) -> AsyncThrowingStream<Tensor, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    // Soprano is single-speaker and applies no speed change;
+                    // both arguments are accepted for protocol conformance but
+                    // unused. `synthesize` is a synchronous GPU helper — calling
+                    // it from the Task keeps GPU sync out of the stream body.
+                    _ = voice
+                    _ = speed
+                    let samples = try model.synthesize(text: text)
+                    let audio = Tensor.empty(shape: [samples.count], dtype: .f32)
+                    audio.copyIn(from: samples)
+                    continuation.yield(audio)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     // ── Tokenizer ─────────────────────────────────────────────────────
 
     /// Space token ID in the Soprano BPE vocabulary.
@@ -1358,3 +1403,10 @@ extension SopranoModel {
         return model
     }
 }
+
+// ─── Streaming conformance ───────────────────────────────────────────
+
+// SopranoModel ships `synthesizeStream(text:voice:speed:)` with the exact
+// protocol shape — conformance is a marker. The streamed signal is a
+// single-chunk re-emission of the full `synthesize(text:)` waveform.
+extension SopranoModel: StreamingSynthesizer {}

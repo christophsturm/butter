@@ -49,6 +49,7 @@
 
 import Foundation
 import Metal
+import Tokenizers
 
 // ─── Configuration ───────────────────────────────────────────────────
 
@@ -156,6 +157,11 @@ public enum QwenOmniError: Error, CustomStringConvertible {
     /// The text backbone is not loaded — `QwenOmni` was constructed
     /// audio-only. `encodeAudio` works regardless.
     case textBackboneUnavailable
+    /// `transcribe` / `transcribeStream` was called before a tokenizer
+    /// was attached. The synchronous `load(directory:)` path can't run the
+    /// async tokenizer load, so the registry's async loader (or a caller)
+    /// must set `tokenizer` before driving the audio→text path.
+    case tokenizerUnavailable
 
     public var description: String {
         switch self {
@@ -163,6 +169,10 @@ public enum QwenOmniError: Error, CustomStringConvertible {
             return "QwenOmni: the text backbone is not loaded in this "
                 + "audio-only build; use encodeAudio to obtain audio "
                 + "feature tokens and run them through a Qwen3 model"
+        case .tokenizerUnavailable:
+            return "QwenOmni: no tokenizer attached — set `tokenizer` "
+                + "(the async registry loader does this) before calling "
+                + "transcribe / transcribeStream"
         }
     }
 }
@@ -181,16 +191,38 @@ public final class QwenOmniModel: @unchecked Sendable {
     public let textBackbone: Qwen3Model?
     let dtype: DType
 
+    /// Token id that marks an audio-pad slot in the prompt — the position
+    /// whose embedding is replaced by an encoded audio feature row. Matches
+    /// the Qwen-Omni / Qwen3-ASR `<|audio_pad|>` id.
+    public let audioTokenId: Int
+    /// EOS token ids — autoregressive decode stops when any is produced.
+    /// Qwen-Omni emits either the generic `<|endoftext|>` (151643) or the
+    /// chat-turn `<|im_end|>` (151645).
+    public let eosTokenIds: [Int]
+
+    /// Tokenizer used by the `transcribe` / `transcribeStream` audio→text
+    /// path. Optional because the synchronous `load(directory:)` can't run
+    /// the async tokenizer load; the async registry loader (or a caller
+    /// that already holds a tokenizer) sets it before transcribing. Marked
+    /// mutable; the class-level `@unchecked Sendable` already covers it.
+    public var tokenizer: (any Tokenizer)?
+
     public init(
         config: QwenOmniAudioConfig, audioEncoder: AudioEncoder,
         audioProjection: Linear?, textBackbone: Qwen3Model?,
-        dtype: DType
+        dtype: DType,
+        audioTokenId: Int = 151_676,
+        eosTokenIds: [Int] = [151_643, 151_645],
+        tokenizer: (any Tokenizer)? = nil
     ) {
         self.config = config
         self.audioEncoder = audioEncoder
         self.audioProjection = audioProjection
         self.textBackbone = textBackbone
         self.dtype = dtype
+        self.audioTokenId = audioTokenId
+        self.eosTokenIds = eosTokenIds
+        self.tokenizer = tokenizer
     }
 
     /// Encode a waveform into audio feature tokens in the text backbone
@@ -241,6 +273,216 @@ public final class QwenOmniModel: @unchecked Sendable {
     public var hasTextBackbone: Bool { textBackbone != nil }
 }
 
+// ─── Audio → text transcription ──────────────────────────────────────
+//
+// The audio→text path encodes the waveform into feature tokens, splices
+// them into a Qwen-Omni chat prompt's embedding stream (replacing the
+// `<|audio_pad|>` placeholders), prefills the Qwen3 backbone, then
+// greedily / temperature-samples tokens until EOS. The batch
+// `transcribe` and streaming `transcribeStream` share one
+// `prepareTranscribe` + an identical per-token decode loop, so the
+// concatenated stream deltas reproduce the batch transcript exactly
+// (modulo the batch's trailing-whitespace trim).
+
+extension QwenOmniModel {
+    /// State carried from prefill into the decode loop, shared by the
+    /// batch and streaming transcription paths.
+    private struct TranscribeState {
+        let backbone: Qwen3Model
+        let tokenizer: any Tokenizer
+        let caches: [any LayerCacheProtocol]
+        let firstToken: Int
+        let promptLen: Int
+    }
+
+    /// Sample one token from a `[vocab]` logits tensor — argmax at
+    /// `temperature == 0`, otherwise temperature sampling.
+    private func sampleTok(_ logits: Tensor, temperature: Float) -> Int {
+        if temperature == 0 { return Sampling.argmax(logits) }
+        var rng = SystemRandomNumberGenerator()
+        return Sampling.sample(
+            logits,
+            parameters: GenerationParameters(temperature: temperature),
+            rng: &rng)
+    }
+
+    /// Forward one decode token through the backbone, returning `[vocab]`
+    /// logits. The GPU `commit` + `waitUntilCompleted` live here, in a
+    /// synchronous helper, so the async `transcribeStream` `Task` only
+    /// calls into it and never blocks on the GPU directly.
+    private func forwardDecodeToken(
+        _ backbone: Qwen3Model, tokenId: Int, position: Int,
+        caches: [any LayerCacheProtocol], device: Device
+    ) -> Tensor {
+        let cmd = device.makeCommandBuffer()
+        let logits = backbone.forward(
+            tokenId: tokenId, position: position,
+            caches: caches, on: cmd, device: device)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return logits
+    }
+
+    /// Build the Qwen-Omni transcription prompt token ids, embed them on
+    /// the backbone, splice the encoded audio rows into the
+    /// `<|audio_pad|>` positions, prefill the KV cache, and sample the
+    /// first decode token. Throws when the backbone or tokenizer is
+    /// absent (an audio-only build, or a tokenizer that was never
+    /// attached).
+    private func prepareTranscribe(
+        _ waveform: [Float], temperature: Float, device: Device
+    ) throws -> TranscribeState {
+        guard let backbone = textBackbone else {
+            throw QwenOmniError.textBackboneUnavailable
+        }
+        guard let tokenizer = tokenizer else {
+            throw QwenOmniError.tokenizerUnavailable
+        }
+
+        // 1. Encode the waveform → [nAudioTokens, textHidden] feature rows.
+        let audioFeatures = encodeAudio(waveform: waveform, device: device)
+        let nAudioTokens = audioFeatures.shape[0]
+
+        // 2. Build the chat prompt with `nAudioTokens` audio-pad slots
+        //    wrapped in the audio-span markers, then the assistant turn.
+        let audioPad = String(repeating: "<|audio_pad|>", count: nAudioTokens)
+        let prompt =
+            "<|im_start|>system\n<|im_end|>\n"
+            + "<|im_start|>user\n<|audio_start|>"
+            + audioPad
+            + "<|audio_end|><|im_end|>\n"
+            + "<|im_start|>assistant\n"
+        let promptIds = tokenizer.encode(text: prompt)
+        let promptLen = promptIds.count
+
+        // 3. Build the spliced prompt-embedding stream: text tokens get
+        //    their table embedding, audio-pad positions get the next
+        //    encoded audio feature row.
+        let caches = backbone.makeLayerCaches(maxSeq: nil, device: device)
+        var lastLogits: Tensor!
+        var audioIdx = 0
+        for (pos, tokenId) in promptIds.enumerated() {
+            let rowEmbed: Tensor
+            if tokenId == audioTokenId, audioIdx < nAudioTokens {
+                rowEmbed = audioFeatures
+                    .slicedRows(start: audioIdx, count: 1)
+                    .reshaped(to: [config.textHidden])
+                audioIdx += 1
+            } else {
+                rowEmbed = backbone.textEmbedding(
+                    tokenId: tokenId, device: device)
+            }
+            let cmd = device.makeCommandBuffer()
+            lastLogits = backbone.forward(
+                inputEmbedding: rowEmbed, position: pos,
+                caches: caches, on: cmd, device: device)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+        }
+
+        // 4. Sample the first decode token from the prefill tail.
+        let firstToken = sampleTok(lastLogits, temperature: temperature)
+        return TranscribeState(
+            backbone: backbone, tokenizer: tokenizer, caches: caches,
+            firstToken: firstToken, promptLen: promptLen)
+    }
+
+    /// Batch transcription — prefill, then decode to EOS / `maxNewTokens`,
+    /// returning the full trimmed transcript. Shares `prepareTranscribe`
+    /// + the per-token loop with `transcribeStream`.
+    public func transcribe(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0,
+        device: Device = .shared
+    ) throws -> TranscriptionResult {
+        let start = Date()
+        let st = try prepareTranscribe(
+            waveform, temperature: temperature, device: device)
+        let eosIds = Set(eosTokenIds)
+        var generated: [Int] = []
+        var lastTok = st.firstToken
+        for _ in 0 ..< maxNewTokens {
+            if eosIds.contains(lastTok) { break }
+            generated.append(lastTok)
+            let nextLogits = forwardDecodeToken(
+                st.backbone, tokenId: lastTok,
+                position: st.promptLen + generated.count - 1,
+                caches: st.caches, device: device)
+            lastTok = sampleTok(nextLogits, temperature: temperature)
+        }
+        let text = st.tokenizer.decode(tokens: generated)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return TranscriptionResult(
+            text: text, generatedTokens: generated.count,
+            totalTimeS: Date().timeIntervalSince(start))
+    }
+
+    /// Streaming transcription — yields the incremental decoded TEXT (one
+    /// delta per generated token) as the backbone decodes. Same
+    /// audio-encode + prefill + per-token loop as `transcribe`, so
+    /// concatenating the yielded deltas reproduces the batch transcript
+    /// (modulo the batch's trailing trim). Cancelling the consuming task
+    /// stops decode at the next step.
+    ///
+    /// The GPU sync stays inside the synchronous `prepareTranscribe` /
+    /// `backbone.forward(...)` helpers; the async `Task` only orchestrates
+    /// them, checks cancellation, and yields text — never blocks on the
+    /// GPU itself.
+    public func transcribeStream(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0
+    ) -> AsyncThrowingStream<String, Error> {
+        let model = self
+        let device = Device.shared
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let st = try model.prepareTranscribe(
+                        waveform, temperature: temperature, device: device)
+                    let eosIds = Set(model.eosTokenIds)
+                    var generated: [Int] = []
+                    var lastTok = st.firstToken
+                    for _ in 0 ..< maxNewTokens {
+                        try Task.checkCancellation()
+                        if eosIds.contains(lastTok) { break }
+                        generated.append(lastTok)
+                        // Decode the running prefix each step and emit the
+                        // new suffix — robust to BPE tokens that don't
+                        // decode standalone; concatenation == batch text.
+                        let prev =
+                            generated.count == 1
+                            ? ""
+                            : st.tokenizer.decode(
+                                tokens: Array(generated.dropLast()))
+                        let cur = st.tokenizer.decode(tokens: generated)
+                        if cur.count > prev.count {
+                            continuation.yield(String(cur.dropFirst(prev.count)))
+                        }
+                        let nextLogits = model.forwardDecodeToken(
+                            st.backbone, tokenId: lastTok,
+                            position: st.promptLen + generated.count - 1,
+                            caches: st.caches, device: device)
+                        lastTok = model.sampleTok(
+                            nextLogits, temperature: temperature)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
+/// Streaming-transcription conformance. The protocol-shaped
+/// `transcribeStream(_:maxNewTokens:temperature:)` is implemented above;
+/// the conformance is a marker so a loaded QwenOmni surfaces as a
+/// `StreamingTranscriber` (see `AudioStreaming.swift`).
+extension QwenOmniModel: StreamingTranscriber {}
+
 // ─── Loading ─────────────────────────────────────────────────────────
 
 extension QwenOmniModel {
@@ -276,14 +518,20 @@ extension QwenOmniModel {
                 "config.json has no audio_config — not a QwenOmni checkpoint")
         }
         let bundle = try SafeTensorsBundle(directory: directory, device: device)
-        return try build(config: qc, bundle: bundle)
+        return try build(config: qc, bundle: bundle, modelConfig: config)
     }
 
     /// Assemble a `QwenOmniModel` audio path from a decoded config + a
     /// weight bundle. Factored out so tests can drive it directly.
+    ///
+    /// `modelConfig` is the full decoded `config.json` — used to wire the
+    /// Qwen3 text backbone (the audio→text decode path). When `nil` (the
+    /// encoder-only test path), the backbone is left unwired and the
+    /// model is the documented audio-only build.
     public static func build(
         config qc: QwenOmniAudioConfig,
-        bundle: SafeTensorsBundle
+        bundle: SafeTensorsBundle,
+        modelConfig: ModelConfig? = nil
     ) throws -> QwenOmniModel {
         // Qwen-Omni prefixes the audio tower weights; conversions vary
         // (`audio_tower.` / `thinker.audio_tower.`). Detect the prefix.
@@ -382,9 +630,66 @@ extension QwenOmniModel {
             }
         }
 
+        // Wire the Qwen3 text backbone when the checkpoint carries text
+        // weights. Qwen-Omni nests the text decoder under `thinker.model.`
+        // (and the text hyper-params under `thinker_config.text_config`);
+        // some mlx conversions hoist them to `model.` / `text_config`.
+        // Best-effort: leave `textBackbone` nil (the documented
+        // audio-only build) when no text weights are present, so the
+        // audio-encode path and tests that build encoder-only still work.
+        let textBackbone = try? loadTextBackbone(
+            modelConfig: modelConfig, bundle: bundle)
+
         return QwenOmniModel(
             config: qc, audioEncoder: encoder,
-            audioProjection: audioProjection, textBackbone: nil,
+            audioProjection: audioProjection, textBackbone: textBackbone,
             dtype: dtype)
+    }
+
+    /// Load the Qwen3 text backbone from a Qwen-Omni checkpoint, or return
+    /// `nil` when the text weights / config aren't present (an audio-only
+    /// build). The text decoder is the standard Qwen3 dense engine —
+    /// QwenOmni composes it rather than reimplementing it.
+    static func loadTextBackbone(
+        modelConfig: ModelConfig?, bundle: SafeTensorsBundle
+    ) throws -> Qwen3Model? {
+        guard let modelConfig else { return nil }
+
+        // The text sub-config lives under `thinker_config.text_config`
+        // (Qwen2.5-Omni) or top-level `text_config` (hoisted conversions).
+        let textRaw: [String: Any]?
+        if let thinker = modelConfig.nested("thinker_config"),
+            let text = thinker["text_config"] as? [String: Any]
+        {
+            textRaw = text
+        } else {
+            textRaw = modelConfig.nested("text_config")
+        }
+        guard let textRaw else { return nil }
+
+        // Detect the prefix the text decoder weights live under. Qwen-Omni
+        // stores them beneath the `thinker.` namespace; hoisted
+        // conversions use the canonical `model.` prefix the Qwen3 loader
+        // expects directly.
+        let textPrefixes = ["thinker.model.", "model.", "thinker."]
+        guard
+            let textPrefix = textPrefixes.first(where: {
+                bundle.has("\($0)embed_tokens.weight")
+                    || bundle.has("\($0)layers.0.input_layernorm.weight")
+            })
+        else { return nil }
+
+        // The Qwen3 dense loader reads weights under the canonical
+        // `model.X` / `lm_head.X` prefix. Strip the detected prefix and
+        // re-add `model.` so the standard loader binds unmodified; the
+        // tied / standalone lm_head is read from the root namespace.
+        let textBundle = bundle.prefixed(textPrefix).withAddedPrefix("model.")
+        let textConfig = ModelConfig(
+            architecture: "Qwen3ForCausalLM",
+            modelType: "qwen3",
+            raw: textRaw)
+        return try Qwen3Dense.loadModel(
+            config: textConfig, weights: textBundle,
+            options: LoadOptions(), device: .shared)
     }
 }

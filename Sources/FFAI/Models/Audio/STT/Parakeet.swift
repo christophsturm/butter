@@ -548,6 +548,45 @@ public final class ParakeetModel: @unchecked Sendable {
         return ParakeetTokeniser.decode(tokens: tokens, vocabulary: config.vocabulary)
     }
 
+    /// Streaming transcription — Parakeet is a single-pass CTC/TDT encoder,
+    /// so there is no autoregressive token loop to stream incrementally. We
+    /// compute the full transcript via `transcribe(waveform:)` and yield it
+    /// once (a single-element stream). This is the honest contract for a
+    /// non-autoregressive decoder: concatenating the deltas (here, the one
+    /// delta) reproduces the batch transcript exactly.
+    ///
+    /// `maxNewTokens` and `temperature` are accepted to satisfy the
+    /// `StreamingTranscriber` protocol but are unused — greedy TDT decoding
+    /// has no token budget or sampling temperature.
+    ///
+    /// The GPU/CPU encode + decode runs inside a sync helper (`transcribe`)
+    /// called from the async `Task`; no command-buffer wait happens directly
+    /// in the `Task` body. Cancelling the consuming task before the single
+    /// yield aborts cleanly.
+    public func transcribeStream(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0
+    ) -> AsyncThrowingStream<String, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    // Single-pass decode in a sync helper — keeps the GPU
+                    // sync out of the async Task body.
+                    let text = model.transcribe(waveform: waveform)
+                    try Task.checkCancellation()
+                    continuation.yield(text)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     /// Transcribe a waveform and return raw vocabulary indices.
     public func transcribeTokens(waveform: [Float]) -> [Int] {
         // 1. Compute mel features [nFrames, nMels]
@@ -1328,6 +1367,11 @@ public final class ParakeetModel: @unchecked Sendable {
 
     private func silu1D(_ x: Float) -> Float { x / (1.0 + exp(-x)) }
 }
+
+// `transcribeStream(_:maxNewTokens:temperature:)` above matches the protocol
+// shape — conformance is a marker. Parakeet yields a single-element stream
+// (single-pass CTC/TDT encoder; no autoregressive loop to stream).
+extension ParakeetModel: StreamingTranscriber {}
 
 // ─── Conformer block weights container ───────────────────────────────
 

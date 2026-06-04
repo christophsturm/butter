@@ -1253,6 +1253,220 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
+    // ─── Streaming transcription ──────────────────────────────────────
+
+    /// Per-token state carried between streaming decode steps.
+    private struct VoxtralStreamState {
+        var caches: [KVCache]
+        var logits: Tensor
+        var adapterVals: [Float]
+        var nAudioTotal: Int
+        var promptLength: Int
+        var hidden: Int
+    }
+
+    /// Synchronous prefill: encode audio, build the BOS + pad prefix (adding
+    /// the adapter features), and feed the prompt through the decoder one row
+    /// at a time. Returns the per-step state plus the first-step logits. GPU
+    /// sync stays inside this sync helper, never on the async streaming `Task`.
+    private func prepareTranscribeStream(
+        waveform: [Float], maxTokens: Int, delayMs: Int?, device: Device
+    ) -> VoxtralStreamState? {
+        let dc = config.decoderConfig
+        let ac = config.audioConfig
+
+        // ── 1. Audio features ──
+        let adapterOut = encodeAudio(waveform: waveform, device: device)
+        let nAudioTotal = adapterOut.shape[0]
+
+        // ── 2. Delay / padding geometry ──
+        let resolvedDelayMs = delayMs ?? config.transcriptionDelayMs
+        let nDelay = numDelayTokens(delayMs: resolvedDelayMs, sampleRate: ac.samplingRate)
+        let nLeft = config.nLeftPadTokens
+        let promptLength = 1 + nLeft + nDelay  // BOS + pad×nLeft + pad×nDelay
+
+        // ── 3. AdaRMSNorm scales (depend only on the delay) ──
+        ensureAdaScales(delayTokens: nDelay)
+
+        // ── 4. Prompt embeddings + adapter add ──
+        let promptIds =
+            [config.bosTokenId]
+            + [Int](repeating: config.streamingPadTokenId, count: nLeft + nDelay)
+        let maxSeq = promptLength + max(nAudioTotal - promptLength, 0) + maxTokens + 16
+
+        let idsTensor = Tensor.empty(shape: [promptLength], dtype: .u32, device: device)
+        idsTensor.copyIn(from: promptIds.map { UInt32($0) })
+        let cmd = device.makeCommandBuffer()
+        let promptEmbeds = tokEmbeddings(idsTensor, on: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let adapterVals = adapterOut.toFloatArray()
+        let embedVals = promptEmbeds.toFloatArray()
+        let hidden = dc.dim
+        var prefixVals = [Float](repeating: 0, count: promptLength * hidden)
+        let usableAdapter = min(promptLength, nAudioTotal)
+        for i in 0 ..< usableAdapter {
+            for c in 0 ..< hidden {
+                prefixVals[i * hidden + c] =
+                    adapterVals[i * hidden + c] + embedVals[i * hidden + c]
+            }
+        }
+        for i in usableAdapter ..< promptLength {
+            for c in 0 ..< hidden {
+                prefixVals[i * hidden + c] = embedVals[i * hidden + c]
+            }
+        }
+
+        // ── 5. Prefill the decoder, one row at a time ──
+        let nLayers = dc.nLayers
+        var caches = (0 ..< nLayers).map { _ in
+            KVCache(
+                nKVHeads: dc.nKVHeads, headDim: dc.headDim,
+                contextLength: maxSeq, dtype: dtype, device: device)
+        }
+        var lastLogits: Tensor? = nil
+        for pos in 0 ..< promptLength {
+            let rowEmbed = Tensor.empty(shape: [hidden], dtype: dtype, device: device)
+            MediaUtils.copyFloats(
+                Array(prefixVals[pos * hidden ..< (pos + 1) * hidden]), into: rowEmbed)
+            lastLogits = forwardOneDecoderToken(
+                embed: rowEmbed, caches: &caches, device: device)
+        }
+        guard let logits = lastLogits else { return nil }
+        return VoxtralStreamState(
+            caches: caches, logits: logits, adapterVals: adapterVals,
+            nAudioTotal: nAudioTotal, promptLength: promptLength, hidden: hidden)
+    }
+
+    /// Synchronous single streaming decode step: embed the just-sampled token,
+    /// fold in the adapter features when still inside the audio span, run the
+    /// decoder, and return the next-step logits. Mutates `state.logits` and
+    /// `state.caches` in place. GPU sync stays inside this sync helper.
+    private func streamDecodeStep(
+        sampledToken: Int, pos: Int,
+        state: inout VoxtralStreamState, device: Device
+    ) {
+        let hidden = state.hidden
+
+        // Embed the sampled token.
+        let nextIdT = Tensor.empty(shape: [1], dtype: .u32, device: device)
+        nextIdT.copyIn(from: [UInt32(sampledToken)])
+        let cmdEmb = device.makeCommandBuffer()
+        let tokenEmbed = tokEmbeddings(nextIdT, on: cmdEmb)
+        cmdEmb.commit()
+        cmdEmb.waitUntilCompleted()
+        let tokenEmbVals = tokenEmbed.toFloatArray()  // [hidden]
+
+        // Combine with adapter output while still inside the audio span.
+        let inputVals: [Float]
+        if pos < state.nAudioTotal {
+            var combined = [Float](repeating: 0, count: hidden)
+            for c in 0 ..< hidden {
+                combined[c] = state.adapterVals[pos * hidden + c] + tokenEmbVals[c]
+            }
+            inputVals = combined
+        } else {
+            inputVals = tokenEmbVals
+        }
+
+        let inputT = Tensor.empty(shape: [hidden], dtype: dtype, device: device)
+        MediaUtils.copyFloats(inputVals, into: inputT)
+        state.logits = forwardOneDecoderToken(
+            embed: inputT, caches: &state.caches, device: device)
+    }
+
+    /// Streaming transcription — yields the incremental decoded TEXT (one delta
+    /// per generated token) as the Mistral decoder runs. Shares the same audio
+    /// encode → prefill → greedy decode as `transcribe`, so concatenating the
+    /// yielded deltas reproduces the batch transcript (modulo the batch's
+    /// trailing whitespace trim). Cancelling the consuming task stops decode at
+    /// the next step.
+    ///
+    /// The decoder is greedy (argmax); `temperature` is accepted for protocol
+    /// conformance but does not alter selection, matching `transcribe`. Uses the
+    /// model's loaded Tekken tokenizer (wired by `load(directory:)`); if none is
+    /// present the stream finishes without emitting any text.
+    ///
+    /// - Parameters:
+    ///   - waveform: 16 kHz mono PCM samples.
+    ///   - maxNewTokens: Maximum generated transcript tokens (default 512).
+    ///   - temperature: Accepted for protocol conformance; decode is greedy.
+    public func transcribeStream(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0
+    ) -> AsyncThrowingStream<String, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard let tokenizer = model.tekkenTokenizer else {
+                        continuation.finish()
+                        return
+                    }
+                    let device = Device.shared
+                    guard
+                        var state = model.prepareTranscribeStream(
+                            waveform: waveform, maxTokens: maxNewTokens,
+                            delayMs: nil, device: device)
+                    else {
+                        continuation.finish()
+                        return
+                    }
+
+                    let eos = model.config.eosTokenId
+                    var generated: [Int] = []
+                    // Mirror `transcribe`: positions run from the prompt tail
+                    // across the audio span, then into free decode.
+                    let endPos = state.nAudioTotal + maxNewTokens
+                    var pos = state.promptLength
+                    while pos < endPos {
+                        try Task.checkCancellation()
+
+                        // Greedy argmax over the current logits.
+                        let logitVals = state.logits.toFloatArray()
+                        var best = 0
+                        var bestVal = -Float.greatestFiniteMagnitude
+                        for (i, v) in logitVals.enumerated() where v > bestVal {
+                            bestVal = v
+                            best = i
+                        }
+                        if best == eos { break }
+                        if generated.count >= maxNewTokens { break }
+                        generated.append(best)
+
+                        // Emit the new suffix of the running decode (decode the
+                        // whole prefix each step — robust to Tekken byte pieces
+                        // that don't form a standalone UTF-8 sequence;
+                        // concatenation == batch text).
+                        let prev =
+                            generated.count == 1
+                            ? ""
+                            : tokenizer.decode(tokenIds: Array(generated.dropLast()))
+                        let cur = tokenizer.decode(tokenIds: generated)
+                        if cur.count > prev.count {
+                            continuation.yield(String(cur.dropFirst(prev.count)))
+                        }
+
+                        // Backstop: prevent infinite repetition loops.
+                        if generated.count >= 24,
+                            Set(generated.suffix(24)).count <= 3 { break }
+
+                        model.streamDecodeStep(
+                            sampledToken: best, pos: pos,
+                            state: &state, device: device)
+                        pos += 1
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     // ─── Decoder forward pass ─────────────────────────────────────────
 
     /// Forward a single embedding `[hidden]` through all Voxtral decoder
@@ -1768,3 +1982,9 @@ extension VoxtralRealtimeModel {
             dtype: dtype)
     }
 }
+
+// MARK: - Streaming conformance
+
+// VoxtralRealtimeModel ships `transcribeStream(_:maxNewTokens:temperature:)`
+// with the exact `StreamingTranscriber` shape — conformance is a marker.
+extension VoxtralRealtimeModel: StreamingTranscriber {}

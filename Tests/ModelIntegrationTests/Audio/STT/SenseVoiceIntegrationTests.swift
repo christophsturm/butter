@@ -137,6 +137,40 @@ struct SenseVoiceIntegrationTests {
                 + "tokens (\(distinct) distinct): \(tokens.prefix(16))")
     }
 
+    @Test("transcribeStream yields the same transcript incrementally")
+    func transcribeStreaming() async throws {
+        let model = try await loadSenseVoice()
+        let wave = try AudioTestHelpers.conversationalAWaveform()
+        #expect(!wave.isEmpty, "fixture waveform failed to load")
+
+        // Batch reference: the greedy-CTC token ids rendered to the model's
+        // token-id-level text. SenseVoice is single-pass (no decode loop),
+        // so the stream is a single-element stream of the full transcript.
+        let batchTokens = model.transcribeTokens(waveform: wave)
+        let batchText = SenseVoiceModel.tokensToText(batchTokens)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var streamed = ""
+        var deltaCount = 0
+        for try await delta in model.transcribeStream(
+            wave, maxNewTokens: 64, temperature: 0.0)
+        {
+            streamed += delta
+            deltaCount += 1
+        }
+        print("SenseVoice streamed (\(deltaCount) deltas): '\(streamed)'")
+        // CTC is single-pass: exactly one non-empty yield for a real
+        // utterance (the whole transcript).
+        #expect(
+            deltaCount == 1,
+            "SenseVoice CTC stream must yield exactly once; got \(deltaCount)")
+        let streamedTrimmed = streamed.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        #expect(
+            streamedTrimmed == batchText,
+            "streamed transcript '\(streamedTrimmed)' must equal batch '\(batchText)'")
+    }
+
     @Test("registry — SenseVoice routes through the audio registry")
     func registry_routesSenseVoice() async throws {
         let dir = try await resolveDir()

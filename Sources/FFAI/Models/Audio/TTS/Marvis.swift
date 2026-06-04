@@ -571,7 +571,63 @@ public final class MarvisModel: @unchecked Sendable {
             seed: seed, device: device)
         return decoder.decode(codes: codes, device: device)
     }
+
+    // ─── Streaming synthesis ──────────────────────────────────────────
+
+    /// Map a `StreamingSynthesizer` `voice` string onto CSM's integer
+    /// speaker id. CSM frames text as `[speaker]text`, so the protocol's
+    /// free-form voice is interpreted as the speaker index (`"0"`, `"1"`,
+    /// …); a `nil` or non-numeric voice falls back to speaker 0.
+    private static func speaker(for voice: String?) -> Int {
+        guard let voice, let id = Int(voice.trimmingCharacters(in: .whitespaces))
+        else { return 0 }
+        return id
+    }
+
+    /// Streaming text→waveform synthesis (`StreamingSynthesizer`
+    /// conformance). CSM decodes the whole utterance into a `[K, nFrames]`
+    /// Mimi code matrix, and the Mimi decoder turns the *complete* matrix
+    /// into the waveform in a single pass — there is no clean per-frame
+    /// decode boundary whose concatenation reproduces a full synth (the
+    /// Mimi decoder has cross-frame receptive field). So this is a
+    /// SINGLE-yield stream: it runs the existing `synthesize` path once
+    /// and emits the full waveform as the one element. Concatenating the
+    /// stream therefore equals a single `synthesize` by construction.
+    ///
+    /// - `voice` maps onto CSM's integer speaker id (see `speaker(for:)`).
+    /// - `speed` is accepted for protocol conformance but **ignored** —
+    ///   CSM has no rate control; the Mimi codec emits a fixed 24 kHz
+    ///   waveform.
+    ///
+    /// GPU sync stays inside the synchronous `synthesize` helper; the
+    /// `Task` only calls it and yields the result. Cancelling the
+    /// consumer cancels the decode task.
+    public func synthesizeStream(
+        text: String, voice: String? = nil, speed: Float = 1.0
+    ) -> AsyncThrowingStream<Tensor, Error> {
+        let model = self
+        let speaker = MarvisModel.speaker(for: voice)
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    let audio = try model.synthesize(text: text, speaker: speaker)
+                    try Task.checkCancellation()
+                    continuation.yield(audio)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
+
+// MarvisModel already exposes `sampleRate` and
+// `synthesizeStream(text:voice:speed:)` with the exact protocol shape —
+// conformance is a marker.
+extension MarvisModel: StreamingSynthesizer {}
 
 // ─── Loading ─────────────────────────────────────────────────────────
 

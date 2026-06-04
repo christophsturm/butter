@@ -192,6 +192,44 @@ struct GLMASRIntegrationTests {
         // Nothing to assert on content — reaching here means no crash / NaN.
     }
 
+    @Test("transcribeStream yields the same transcript incrementally")
+    func transcribeStreaming() async throws {
+        let dir = try await resolveDir()
+        let model = try GLMASRModel.load(directory: dir)
+        let tokenizer = try await TokenizerLoader().load(from: dir)
+        // The sync `load` can't perform the async tokenizer load; the registry
+        // attaches it in production. Mirror that here so `transcribeStream`
+        // (which takes no tokenizer argument) can decode.
+        model.tokenizer = tokenizer
+
+        let wave = syntheticTone(seconds: 1.0)
+        let cap = 64
+
+        // Batch reference transcript.
+        let batch = model.transcribe(
+            waveform: wave, tokenizer: tokenizer, maxTokens: cap)
+
+        // Streamed: concatenate the per-token text deltas. The streaming and
+        // batch paths share `prepareTranscribe` + `decodeStep`, so the
+        // concatenation must equal the batch transcript (modulo the batch's
+        // trailing whitespace trim).
+        var streamed = ""
+        var deltaCount = 0
+        for try await delta in model.transcribeStream(
+            wave, maxNewTokens: cap, temperature: 0.0)
+        {
+            streamed += delta
+            deltaCount += 1
+        }
+        print("[GLM-ASR integration] streamed (\(deltaCount) deltas): \(streamed.debugDescription)")
+
+        let streamedTrimmed = streamed.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        #expect(
+            streamedTrimmed == batch,
+            "streamed transcript \(streamedTrimmed.debugDescription) must equal batch \(batch.debugDescription)")
+    }
+
     @Test("registry — AudioModelRegistry routes checkpoint to .glmASR")
     func registryRoutes() async throws {
         let dir = try await resolveDir()

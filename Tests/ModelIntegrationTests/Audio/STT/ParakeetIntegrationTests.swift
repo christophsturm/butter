@@ -189,6 +189,38 @@ struct ParakeetIntegrationTests {
                 + "(\(distinct) distinct) → \"\(text)\"")
     }
 
+    @Test("transcribeStream yields the same transcript in one delta")
+    func transcribeStreaming() async throws {
+        let model = try await loadParakeet()
+        let wave = speechFixtureWaveform()
+        #expect(!wave.isEmpty, "speech fixture waveform is empty")
+
+        // Batch reference transcript.
+        let batch = model.transcribe(waveform: wave)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Parakeet is a single-pass CTC/TDT encoder — there is no
+        // autoregressive loop to stream, so `transcribeStream` yields the full
+        // transcript in a single delta. Concatenating the deltas (here, the one
+        // delta) must equal the batch transcript.
+        var streamed = ""
+        var deltaCount = 0
+        for try await delta in model.transcribeStream(wave) {
+            streamed += delta
+            deltaCount += 1
+        }
+        let streamedTrimmed = streamed.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        print(
+            "Parakeet streamed (\(deltaCount) delta(s)): '\(streamedTrimmed)'")
+        #expect(
+            deltaCount <= 1,
+            "Parakeet is single-pass; expected at most one delta, got \(deltaCount)")
+        #expect(
+            streamedTrimmed == batch,
+            "streamed transcript '\(streamedTrimmed)' must equal batch '\(batch)'")
+    }
+
     @Test("registry — Parakeet routes through AudioModelRegistry")
     func registry_routesParakeet() async throws {
         let dir = try await resolveParakeetDir()

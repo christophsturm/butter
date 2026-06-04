@@ -432,7 +432,64 @@ public final class EchoTTSModel: @unchecked Sendable {
         _ = device
         throw EchoTTSError.diffusionNotWired
     }
+
+    /// Streaming text→waveform synthesis conforming to `StreamingSynthesizer`.
+    ///
+    /// EchoTTS tokenizes raw text internally (UTF-8 byte tokenizer +
+    /// optional `[S1]` normalization), so no external g2p / phonemizer is
+    /// needed — the stream drives `synthesize(text:refAudio:device:)`
+    /// directly. Because the DiT diffusion forward pass + Fish S1 DAC codec
+    /// are not yet wired (see `EchoTTSError.diffusionNotWired`), `synthesize`
+    /// throws, so this stream finishes with that same descriptive error
+    /// rather than emitting incorrect audio.
+    ///
+    /// Geometry once synthesis lands: a SINGLE waveform `Tensor` is yielded
+    /// (the full utterance) — EchoTTS diffuses the whole latent sequence in
+    /// one Euler-CFG pass, so there is no clean codec-frame boundary to
+    /// stream on, and a single yield keeps the streamed bytes bit-identical
+    /// to a one-shot `synthesize`.
+    ///
+    /// - Parameters:
+    ///   - text: Input text (UTF-8). Passed verbatim to `synthesize`.
+    ///   - voice: Reserved for future reference-audio voice selection.
+    ///            EchoTTS clones a voice from a reference waveform, not a
+    ///            named-voice table, so a `String` voice id has no binding
+    ///            today and is ignored (the no-reference default voice is
+    ///            used). Pass `nil`.
+    ///   - speed: Reserved. EchoTTS has no speed control in its diffusion
+    ///            sampler, so this is ignored.
+    public func synthesizeStream(
+        text: String,
+        voice: String? = nil,
+        speed: Float = 1.0
+    ) -> AsyncThrowingStream<Tensor, Error> {
+        // `voice` and `speed` have no binding in EchoTTS today (see doc):
+        // voice cloning is reference-audio-driven, and the sampler has no
+        // speed control. Acknowledge them so the contract is explicit.
+        _ = voice
+        _ = speed
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    // `synthesize` is synchronous (GPU sync stays inside it);
+                    // it throws `diffusionNotWired` until the DiT path lands.
+                    let audio = try model.synthesize(text: text)
+                    continuation.yield(audio)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
+
+// ─── Streaming conformance ──────────────────────────────────────────────────────
+
+extension EchoTTSModel: StreamingSynthesizer {}
 
 // ─── Loading ──────────────────────────────────────────────────────────────────
 

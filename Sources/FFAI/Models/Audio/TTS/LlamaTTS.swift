@@ -271,7 +271,53 @@ public final class LlamaTTSModel: @unchecked Sendable {
             seed: seed, device: device)
         return decoder.decode(codes: codes, device: device)
     }
+
+    // ─── Streaming synthesis ──────────────────────────────────────────
+
+    /// Streaming text→waveform synthesis (`StreamingSynthesizer`
+    /// conformance). Orpheus decodes the whole utterance into one flat
+    /// run of SNAC codes, and the SNAC decoder turns the *complete* three
+    /// code planes into the waveform in a single pass — there is no clean
+    /// per-frame decode boundary whose concatenation reproduces a full
+    /// synth (SNAC up-sampling has cross-frame receptive field). So this
+    /// is a SINGLE-yield stream: it runs the existing `synthesize` path
+    /// once and emits the full waveform as the one element. Concatenating
+    /// the stream therefore equals a single `synthesize` by construction.
+    ///
+    /// - `voice` maps onto the Orpheus speaker prefix (`promptTokens`); a
+    ///   `nil` voice synthesizes without a named speaker.
+    /// - `speed` is accepted for protocol conformance but **ignored** —
+    ///   Orpheus has no rate control; the SNAC codec emits a fixed 24 kHz
+    ///   waveform. (Re-timing would have to happen in a resampler tail.)
+    ///
+    /// GPU sync stays inside the synchronous `synthesize` helper; the
+    /// `Task` only calls it and yields the result. Cancelling the
+    /// consumer cancels the decode task.
+    public func synthesizeStream(
+        text: String, voice: String? = nil, speed: Float = 1.0
+    ) -> AsyncThrowingStream<Tensor, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    let audio = try model.synthesize(text: text, voice: voice)
+                    try Task.checkCancellation()
+                    continuation.yield(audio)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
+
+// LlamaTTSModel already exposes `sampleRate` and
+// `synthesizeStream(text:voice:speed:)` with the exact protocol shape —
+// conformance is a marker.
+extension LlamaTTSModel: StreamingSynthesizer {}
 
 // ─── Loading ─────────────────────────────────────────────────────────
 

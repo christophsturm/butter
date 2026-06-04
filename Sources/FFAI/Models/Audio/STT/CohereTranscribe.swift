@@ -1547,6 +1547,128 @@ public final class CohereTranscribeModel: @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Synchronous single decode step: run the full decoder stack over the
+    /// current `seqIds`, apply the final LayerNorm to the last hidden state,
+    /// and project to `[vocabSize]` logits. The CohereTranscribe decoder is
+    /// stateless (no KV cache) — it re-runs the whole prefix each step — so the
+    /// streaming path calls this once per generated token. Kept as a sync
+    /// helper so the async streaming `Task` never blocks on CPU/GPU work inline.
+    private func cohereDecodeLogits(
+        seqIds: [Int],
+        encOut: [Float], encT: Int,
+        hiddenSize: Int,
+        finalNormW: [Float], finalNormB: [Float]
+    ) -> [Float] {
+        var seqEmb = embedAndNorm(tokenIds: seqIds, hiddenSize: hiddenSize)
+        for layer in decoderLayers {
+            seqEmb = runDecoderLayer(
+                layer, seqIn: seqEmb, S: seqIds.count,
+                encOut: encOut, encT: encT,
+                hiddenSize: hiddenSize)
+        }
+        var lastHidden = Array(seqEmb.suffix(hiddenSize))
+        applyLayerNorm1D(
+            &lastHidden, weight: finalNormW, bias: finalNormB,
+            eps: decoderFinalNorm.eps)
+        return projectToVocab(lastHidden, hiddenSize: hiddenSize)
+    }
+
+    /// Streaming transcription — yields the incremental decoded TEXT (one
+    /// delta per generated token) as the Transformer AED decoder runs. Shares
+    /// the same encode → prefill → greedy-argmax decode as `transcribe`, so
+    /// concatenating the yielded deltas reproduces the batch transcript (modulo
+    /// the batch's trailing whitespace trim). Cancelling the consuming task
+    /// stops decode at the next step.
+    ///
+    /// The decoder is greedy (argmax); `temperature` is accepted for protocol
+    /// conformance but does not alter selection, matching `transcribe`. Uses the
+    /// model's loaded `tokenizer` (wired by `load(directory:)`); if none is
+    /// present the stream finishes without emitting any text.
+    ///
+    /// - Parameters:
+    ///   - waveform: 16 kHz mono PCM samples.
+    ///   - maxNewTokens: Maximum generated transcript tokens (default 512).
+    ///   - temperature: Accepted for protocol conformance; decode is greedy.
+    public func transcribeStream(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0
+    ) -> AsyncThrowingStream<String, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard let tokenizer = model.tokenizer else {
+                        continuation.finish()
+                        return
+                    }
+                    let dc = model.config.decoder
+                    let hiddenSize = dc.hiddenSize
+
+                    // ── Encode audio ──
+                    let encOut = model.encodeAudio(waveform: waveform)
+                    guard !encOut.isEmpty else {
+                        continuation.finish()
+                        return
+                    }
+                    let encT = encOut.count / hiddenSize
+
+                    // ── Build prompt token ids ──
+                    let promptIds = tokenizer.buildPromptTokens(language: "en")
+                    guard !promptIds.isEmpty else {
+                        continuation.finish()
+                        return
+                    }
+                    let eosId = tokenizer.eosId
+                    let finalNormW = model.decoderFinalNorm.weight.toFloatArray()
+                    let finalNormB = model.decoderFinalNorm.bias.toFloatArray()
+
+                    // ── Greedy autoregressive decode, yielding per-token text ──
+                    var seqIds = promptIds
+                    var generated: [Int] = []
+                    for _ in 0 ..< maxNewTokens {
+                        try Task.checkCancellation()
+                        let logits = model.cohereDecodeLogits(
+                            seqIds: seqIds, encOut: encOut, encT: encT,
+                            hiddenSize: hiddenSize,
+                            finalNormW: finalNormW, finalNormB: finalNormB)
+                        // Greedy: argmax.
+                        var bestId = 0
+                        var bestVal = -Float.greatestFiniteMagnitude
+                        for (i, v) in logits.enumerated() where v > bestVal {
+                            bestVal = v
+                            bestId = i
+                        }
+                        if bestId == eosId { break }
+                        generated.append(bestId)
+                        seqIds.append(bestId)
+
+                        // Emit the new suffix of the running decode (decode the
+                        // whole prefix each step — robust to BPE pieces that
+                        // don't decode standalone; concatenation == batch text).
+                        let prev =
+                            generated.count == 1
+                            ? ""
+                            : tokenizer.decode(tokens: Array(generated.dropLast()))
+                        let cur = tokenizer.decode(tokens: generated)
+                        if cur.count > prev.count {
+                            continuation.yield(String(cur.dropFirst(prev.count)))
+                        }
+
+                        // Backstop: repetition guard (≤ 3 distinct in last 24),
+                        // matching `transcribe`.
+                        if generated.count >= 24,
+                            Set(generated.suffix(24)).count <= 3 { break }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     // ─── Embedding + norm helpers ─────────────────────────────────────
 
     /// Embed a token id sequence and add fixed positional encoding, then
@@ -2099,3 +2221,9 @@ extension CohereTranscribeModel {
             nHeads: nHeads, headDim: headDim)
     }
 }
+
+// MARK: - Streaming conformance
+
+// CohereTranscribeModel ships `transcribeStream(_:maxNewTokens:temperature:)`
+// with the exact `StreamingTranscriber` shape — conformance is a marker.
+extension CohereTranscribeModel: StreamingTranscriber {}

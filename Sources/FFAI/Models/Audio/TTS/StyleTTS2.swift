@@ -512,6 +512,10 @@ public enum StyleTTS2Error: Error, CustomStringConvertible {
     case missingFile(String)
     /// The named voice is not in the loaded voices file.
     case unknownVoice(String)
+    /// `synthesizeStream(text:...)` was handed raw graphemes (plain
+    /// English) but StyleTTS2 / KittenTTS consume *phonemes* and FFAI has
+    /// no bundled grapheme-to-phoneme (G2P) front-end. Carries the text.
+    case needsPhonemizedInput(text: String)
 
     public var description: String {
         switch self {
@@ -526,6 +530,13 @@ public enum StyleTTS2Error: Error, CustomStringConvertible {
             return "StyleTTS2: required file missing from model directory: \(name)"
         case .unknownVoice(let name):
             return "StyleTTS2: voice '\(name)' not found in voices file"
+        case .needsPhonemizedInput(let text):
+            return "StyleTTS2: synthesizeStream(text:) received raw text "
+                + "(\"\(text)\") but StyleTTS2 / KittenTTS synthesize from "
+                + "PHONEMES and FFAI ships no bundled grapheme-to-phoneme "
+                + "(G2P) front-end. Phonemize the text to an IPA string first "
+                + "(e.g. via espeak-ng or the Misaki G2P), then use "
+                + "`phonemeIds(for:)` with the acoustic path."
         }
     }
 }
@@ -634,7 +645,74 @@ public final class StyleTTS2Model: @unchecked Sendable {
         _ = device
         throw StyleTTS2Error.acousticFrontEndNotWired
     }
+
+    // ─── Streaming synthesis (StreamingSynthesizer) ───────────────────
+
+    /// Streaming text→audio synthesis (the `StreamingSynthesizer`
+    /// contract the `ffai speak` CLI drives).
+    ///
+    /// StyleTTS2 / KittenTTS synthesize from *phonemes*, and on top of
+    /// that this build's acoustic front-end (ALBERT + prosody predictor +
+    /// AdaIN decoder) is **not yet wired** — `synthesize(text:)` throws
+    /// `StyleTTS2Error.acousticFrontEndNotWired`. So this stream cannot
+    /// produce real audio yet; it finishes with a clear error rather than
+    /// shipping silence or garbage:
+    ///
+    ///   • raw graphemes (plain English) → `needsPhonemizedInput`
+    ///     (FFAI bundles no grapheme-to-phoneme front-end);
+    ///   • already-phonemized input → `acousticFrontEndNotWired`
+    ///     (the GPU acoustic operators aren't in the Ops set yet).
+    ///
+    /// The vocoder tail IS functional — drive it directly via
+    /// `synthesizeFromSpectrogram(specRe:specIm:)` with a predicted
+    /// spectrogram if you have one.
+    ///
+    /// - Parameters:
+    ///   - text: Input text (raw or pre-phonemized IPA).
+    ///   - voice: Voice name; currently unused (validated when the
+    ///            acoustic stack lands).
+    ///   - speed: Synthesis speed multiplier.
+    public func synthesizeStream(
+        text: String,
+        voice: String?,
+        speed: Float
+    ) -> AsyncThrowingStream<Tensor, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    // Distinguish the two failure modes so the CLI can tell
+                    // the user *why* there's no audio. Raw English needs a
+                    // G2P pass FFAI doesn't bundle; phonemized input needs
+                    // the acoustic front-end this build hasn't wired.
+                    if TTSPhonemeText.looksPhonemized(text) {
+                        _ = try model.synthesize(
+                            text: text, voice: voice ?? "expr-voice-5-m",
+                            speed: speed)
+                        // `synthesize` always throws today; the line above
+                        // never returns. When the acoustic stack lands this
+                        // becomes the real per-segment synthesis path.
+                        continuation.finish()
+                    } else {
+                        throw StyleTTS2Error.needsPhonemizedInput(text: text)
+                    }
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
+
+// ─── StreamingSynthesizer conformance ──────────────────────────────────────────
+
+// StyleTTS2 exposes `sampleRate` (24 kHz, from config) and the
+// `synthesizeStream(text:voice:speed:)` method above with the exact
+// protocol shape — conformance is a marker. The text path throws (no
+// bundled G2P, acoustic front-end not wired); see the method doc comment.
+extension StyleTTS2Model: StreamingSynthesizer {}
 
 // ─── Loading ─────────────────────────────────────────────────────────────────
 

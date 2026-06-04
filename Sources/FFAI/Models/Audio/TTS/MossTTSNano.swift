@@ -294,7 +294,61 @@ public final class MossTTSNanoModel: @unchecked Sendable {
         _ = device
         throw MossTTSNanoError.synthesisNotWired
     }
+
+    /// Streaming text→speech synthesis (`StreamingSynthesizer` conformance).
+    ///
+    /// MOSS-TTS-Nano consumes raw TEXT directly: the GPT-2 global transformer
+    /// tokenizes the prompt internally (the local transformer then emits the
+    /// per-codebook audio tokens), so no external g2p / phonemizer is
+    /// required. Once the global + local generation loop and the MOSS Nano
+    /// audio tokenizer decoder land, this will single-yield the full 48 kHz
+    /// waveform produced by `synthesize` (codec-frame streaming is a later
+    /// refinement once frame-wise concatenation is proven identical to a full
+    /// synth).
+    ///
+    /// Until then the underlying `synthesize` throws
+    /// `MossTTSNanoError.synthesisNotWired`; this stream surfaces that error
+    /// via `continuation.finish(throwing:)` rather than emitting silent or
+    /// wrong audio.
+    ///
+    /// - Parameters:
+    ///   - text: Text to speak. Tokenized by the GPT-2 backbone internally.
+    ///   - voice: Speaker / voice id. MOSS-TTS-Nano is single-voice in this
+    ///     build, so the argument is currently ignored.
+    ///   - speed: Speaking-rate multiplier. Not yet supported by the MOSS Nano
+    ///     generation loop; currently ignored.
+    public func synthesizeStream(
+        text: String,
+        voice: String? = nil,
+        speed: Float = 1.0
+    ) -> AsyncThrowingStream<Tensor, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    // `voice` / `speed` are not yet mapped — single-voice,
+                    // fixed-rate until the generation loop lands.
+                    _ = voice
+                    _ = speed
+                    let samples = try model.synthesize(text: text)
+                    let audio = Tensor.empty(
+                        shape: [samples.count], dtype: .f32, device: .shared)
+                    audio.copyIn(from: samples)
+                    continuation.yield(audio)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
+
+// ─── Streaming conformance ────────────────────────────────────────────
+
+extension MossTTSNanoModel: StreamingSynthesizer {}
 
 // ─── Loading ─────────────────────────────────────────────────────────
 

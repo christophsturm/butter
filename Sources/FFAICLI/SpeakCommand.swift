@@ -27,8 +27,12 @@ struct SpeakCommand: AsyncParsableCommand {
         abstract: "Synthesize speech from text to a .wav file (text-to-speech)."
     )
 
+    // Default to Soprano: it synthesizes from RAW text (BPE → LLM → Vocos)
+    // with no external grapheme-to-phoneme step. Phoneme-based models
+    // (Kokoro, StyleTTS2) need IPA input — FFAI bundles no g2p — and most
+    // other TTS families are staged ports whose synthesis isn't wired yet.
     @Option(name: .shortAndLong, help: "HuggingFace repo id or local path to a TTS model.")
-    var model: String = "mlx-community/Kokoro-82M-4bit"
+    var model: String = "mlx-community/Soprano-80M-4bit"
 
     @Argument(help: "Text to speak.")
     var text: String

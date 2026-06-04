@@ -238,7 +238,75 @@ public final class Qwen3TTSModel: @unchecked Sendable {
         _ = (text, voice, device)
         throw Qwen3TTSError.synthesisNotWired
     }
+
+    // ─── Streaming ───────────────────────────────────────────────────
+
+    /// Streaming text→waveform synthesis (`StreamingSynthesizer`
+    /// conformance). Yields the synthesized waveform as `Tensor` chunks so
+    /// `ffai speak` can drive Qwen3TTS through the same uniform path as every
+    /// other TTS model.
+    ///
+    /// ## Granularity — SINGLE yield
+    ///
+    /// The Qwen3TTS pipeline is talker → code-predictor → speech-tokenizer
+    /// codec: the talker autoregressively emits the *entire* code stream,
+    /// the code predictor expands it, and the codec decoder reconstructs the
+    /// waveform in one pass. The codec decoder's convolutional up-sampling
+    /// has receptive-field overlap across codec frames, so a per-frame
+    /// partial waveform would NOT concatenate cleanly into the full
+    /// synthesis. Per the protocol's correctness-over-granularity rule, this
+    /// conformance yields the full waveform in a single chunk rather than
+    /// streaming partial frames.
+    ///
+    /// While `synthesize` is staged (it throws
+    /// `Qwen3TTSError.synthesisNotWired` until the talker / code-predictor /
+    /// codec stages land), that error is propagated through the stream — the
+    /// streaming surface is wired so the staged work lands behind it.
+    ///
+    /// - Parameters:
+    ///   - text: Text to synthesize.
+    ///   - voice: Optional reference-speaker selector, forwarded to
+    ///     `synthesize`'s `voice` argument. Ignored when `nil`.
+    ///   - speed: Playback-speed multiplier. The talker / codec rate is fixed
+    ///     by the model, so this value is accepted for protocol conformance
+    ///     but has no effect.
+    /// - Returns: An `AsyncThrowingStream` yielding one full-waveform
+    ///   `Tensor`. Throws `Qwen3TTSError.synthesisNotWired` (staged port)
+    ///   propagated through the stream.
+    public func synthesizeStream(
+        text: String,
+        voice: String? = nil,
+        speed: Float = 1.0
+    ) -> AsyncThrowingStream<Tensor, Error> {
+        // `speed` is unsupported by the talker / codec rate — accepted for
+        // protocol conformance, intentionally unused.
+        _ = speed
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    // `synthesize` is synchronous (it owns its GPU sync);
+                    // calling it from the Task keeps GPU waits off the async
+                    // path. One talker→codec pass → one waveform chunk.
+                    let audio = try model.synthesize(text: text, voice: voice)
+                    try Task.checkCancellation()
+                    continuation.yield(audio)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
+
+// ─── StreamingSynthesizer conformance ────────────────────────────────
+
+// `sampleRate` and `synthesizeStream(text:voice:speed:)` are declared on
+// the model above with the exact protocol shape — conformance is a marker.
+extension Qwen3TTSModel: StreamingSynthesizer {}
 
 // ─── Loading ─────────────────────────────────────────────────────────
 

@@ -428,7 +428,56 @@ public final class PocketTTSModel: @unchecked Sendable {
         _ = device
         throw PocketTTSError.synthesisNotWired
     }
+
+    /// Streaming text→audio synthesis (`StreamingSynthesizer` conformance).
+    ///
+    /// PocketTTS's synthesis pipeline — sentencepiece tokenisation, flow LM
+    /// autoregressive decode, and Mimi codec decode — is not wired yet (see
+    /// the STAGED PORT scope note above). Until it lands, the stream finishes
+    /// immediately by throwing `PocketTTSError.synthesisNotWired` rather than
+    /// emitting an empty or incorrect waveform. The signature matches the
+    /// protocol exactly so the model conforms today and starts producing real
+    /// audio the moment `synthesize(text:)` is implemented.
+    ///
+    /// - Parameters:
+    ///   - text: Text to synthesise (ignored until synthesis is wired).
+    ///   - voice: Speaker / audio-prompt id (maps to the model's voice
+    ///     embedding once wired). `nil` selects `defaultAudioPrompt`.
+    ///   - speed: Speaking-rate multiplier (not yet applied).
+    public func synthesizeStream(
+        text: String,
+        voice: String? = nil,
+        speed: Float = 1.0
+    ) -> AsyncThrowingStream<Tensor, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    // `synthesize` is a synchronous GPU helper; calling it from
+                    // the Task keeps the GPU sync out of the AsyncStream body.
+                    let audioPrompt = voice ?? PocketTTSModel.defaultAudioPrompt
+                    let samples = try model.synthesize(text: text, voice: audioPrompt)
+                    _ = speed  // Speed is not yet applied (synthesis unwired).
+                    let audio = Tensor.empty(shape: [samples.count], dtype: .f32)
+                    audio.copyIn(from: samples)
+                    continuation.yield(audio)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
+
+// ─── Streaming conformance ───────────────────────────────────────────
+
+// PocketTTSModel ships `synthesizeStream(text:voice:speed:)` with the exact
+// protocol shape — conformance is a marker. (The stream throws
+// `synthesisNotWired` until the synthesis pipeline lands; see the scope note.)
+extension PocketTTSModel: StreamingSynthesizer {}
 
 // ─── Loading ─────────────────────────────────────────────────────────
 

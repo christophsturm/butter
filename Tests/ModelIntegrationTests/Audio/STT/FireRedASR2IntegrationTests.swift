@@ -214,6 +214,49 @@ struct FireRedASR2IntegrationTests {
         // Nothing to assert on content, but getting here means no crash / NaN.
     }
 
+    @Test("transcribeStream yields the same transcript (single yield)")
+    func transcribeStreaming() async throws {
+        let model = try await loadModel()
+        let wave = syntheticTone(seconds: 1.0)
+
+        // Cap `maxNewTokens` small — FireRedASR2's full-length beam decode is
+        // slow enough to time out CI (see suite header / decode path notes).
+        let cap = 32
+
+        // Batch reference — the exact decode path the stream taps, with the
+        // stream's default beam width (3) and the model's bundled tokenizer.
+        let batch = model.transcribe(
+            waveform: wave,
+            tokenizer: model.tokenizer,
+            beamSize: 3,
+            maxLen: cap)
+
+        // Streamed: FireRedASR2 beam search isn't tappable for per-token
+        // deltas, so `transcribeStream` yields the full transcript once.
+        // Concatenating the (single) delta must equal the batch transcript.
+        var streamed = ""
+        var deltaCount = 0
+        for try await delta in model.transcribeStream(
+            wave, maxNewTokens: cap, temperature: 0.0)
+        {
+            streamed += delta
+            deltaCount += 1
+        }
+        print(
+            "[FireRedASR2 integration] streamed (\(deltaCount) deltas): "
+                + streamed.debugDescription)
+
+        // Single-yield contract: at most one delta.
+        #expect(deltaCount <= 1, "single-yield stream emitted \(deltaCount) deltas")
+
+        let streamedTrimmed = streamed.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        let batchTrimmed = batch.trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(
+            streamedTrimmed == batchTrimmed,
+            "streamed transcript \(streamedTrimmed.debugDescription) must equal batch \(batchTrimmed.debugDescription)")
+    }
+
     @Test("registry — AudioModelRegistry routes to .fireRedASR2")
     func registryRoutes() async throws {
         let dir = try await resolveDir()

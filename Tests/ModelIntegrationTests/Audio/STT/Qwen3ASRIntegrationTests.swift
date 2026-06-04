@@ -143,4 +143,42 @@ struct Qwen3ASRIntegrationTests {
             words.count >= 2,
             "Qwen3ASR transcript is degenerate: \(transcript.debugDescription)")
     }
+
+    @Test("transcribeStream yields the same transcript incrementally")
+    func transcribeStreaming() async throws {
+        let model = try await loadModel()
+        let wave = try AudioTestHelpers.conversationalAWaveform()
+        #expect(!wave.isEmpty, "audio fixture failed to load")
+
+        // The tokenizer lives alongside the weights in the resolved snapshot
+        // directory. The batch path takes it as an argument; the streaming
+        // (`StreamingTranscriber`) shape reads it from `model.tokenizer`.
+        let dir = try await resolveDir()
+        let tokenizer = try await TokenizerLoader().load(from: dir)
+        model.tokenizer = tokenizer
+
+        // Batch reference transcript (greedy — Qwen3ASR decode is greedy).
+        let maxTokens = 64
+        let batch = model.transcribe(
+            waveform: wave, tokenizer: tokenizer, maxTokens: maxTokens)
+
+        // Streamed: concatenate the per-token text deltas. The streaming and
+        // batch paths share `prepareTranscribe` + the greedy `decodeStep`, so
+        // the concatenation must equal the batch transcript (modulo the batch's
+        // trailing-whitespace trim). The token budget must match.
+        var streamed = ""
+        var deltaCount = 0
+        for try await delta in model.transcribeStream(
+            wave, maxNewTokens: maxTokens, temperature: 0.0)
+        {
+            streamed += delta
+            deltaCount += 1
+        }
+        print("Qwen3ASR streamed (\(deltaCount) deltas): '\(streamed)'")
+        let streamedTrimmed = streamed.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        #expect(
+            streamedTrimmed == batch,
+            "streamed transcript '\(streamedTrimmed)' must equal batch '\(batch)'")
+    }
 }

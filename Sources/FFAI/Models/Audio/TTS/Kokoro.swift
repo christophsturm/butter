@@ -172,6 +172,12 @@ public enum KokoroError: Error, CustomStringConvertible {
     /// decoder) is not yet wired in this build — `synthesize(phonemes:)`
     /// needs it. `synthesizeFromSpectrogram` works regardless.
     case acousticFrontEndUnavailable
+    /// `synthesizeStream(text:...)` was handed raw graphemes (plain
+    /// English / unphonemized text) but Kokoro has no in-tree
+    /// grapheme-to-phoneme (G2P) front-end. The acoustic model consumes
+    /// *phonemes*, so the caller must phonemize the text first. Carries
+    /// the offending text for diagnostics.
+    case needsPhonemizedInput(text: String)
 
     public var description: String {
         switch self {
@@ -180,6 +186,14 @@ public enum KokoroError: Error, CustomStringConvertible {
                 + "in this build; drive the vocoder via "
                 + "synthesizeFromSpectrogram or supply a predicted "
                 + "spectrogram from an external acoustic model"
+        case .needsPhonemizedInput(let text):
+            return "Kokoro: synthesizeStream(text:) received raw text "
+                + "(\"\(text)\") but Kokoro synthesizes from PHONEMES and "
+                + "FFAI ships no bundled grapheme-to-phoneme (G2P) front-end. "
+                + "Phonemize the text to an IPA string first (e.g. via Misaki "
+                + "G2P or espeak-ng), then call `phonemeIds(for:)` + "
+                + "`synthesize(phonemeIds:)` / `synthesizeStream(phonemeSegments:)`, "
+                + "or register a `Phonemizer` on `PhonemizerRegistry.shared`."
         }
     }
 }
@@ -386,6 +400,83 @@ public final class KokoroModel: @unchecked Sendable {
             continuation.onTermination = { _ in task.cancel() }
         }
     }
+
+    /// Streaming text→audio synthesis (the `StreamingSynthesizer`
+    /// contract the `ffai speak` CLI drives).
+    ///
+    /// **Kokoro consumes phonemes, not graphemes**, and FFAI ships no
+    /// bundled grapheme-to-phoneme (G2P) front-end. So `text` must already
+    /// be a *phonemized IPA string* (the alphabet `config.json`'s `vocab`
+    /// table publishes — see `phonemeIds(for:)`). The stream:
+    ///
+    ///   1. applies `voice` (when non-nil) via `setVoice(_:)`;
+    ///   2. verifies `text` looks phonemized — if it's raw graphemes the
+    ///      stream finishes with `KokoroError.needsPhonemizedInput`
+    ///      (we do NOT fabricate a phonemizer and ship wrong audio);
+    ///   3. splits the phoneme string into sentence/segment chunks and
+    ///      reuses the per-segment `synthesize(phonemeIds:)` path, yielding
+    ///      one waveform `Tensor` per segment.
+    ///
+    /// Concatenating the yielded chunks equals concatenating a
+    /// `synthesize(phonemeIds:)` over each sentence segment — the stream
+    /// drives the exact same per-segment acoustic path as the batch API,
+    /// so streamed and buffered audio stay sample-identical per segment.
+    ///
+    /// - Parameters:
+    ///   - text: A phonemized IPA string (NOT raw English). Plain text is
+    ///           rejected with `needsPhonemizedInput`.
+    ///   - voice: Voice name (e.g. `af_heart`); `nil` keeps `currentVoice`.
+    ///   - speed: Synthesis speed multiplier.
+    public func synthesizeStream(
+        text: String,
+        voice: String?,
+        speed: Float
+    ) -> AsyncThrowingStream<Tensor, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    // Apply the requested voice before any synthesis so the
+                    // whole utterance uses one consistent speaker.
+                    if let voice { try model.setVoice(voice) }
+
+                    // Kokoro needs phonemes. Reject raw graphemes loudly
+                    // rather than mapping ASCII letters as if they were
+                    // phonemes (which would ship garbage audio).
+                    guard TTSPhonemeText.looksPhonemized(text) else {
+                        throw KokoroError.needsPhonemizedInput(text: text)
+                    }
+
+                    // One segment per sentence so playback can start on the
+                    // first sentence while later ones synthesize. Each
+                    // segment is mapped to phoneme ids independently.
+                    let segments = TTSPhonemeText.sentenceSegments(text)
+                        .map { model.phonemeIds(for: $0) }
+                    for segment in segments {
+                        try Task.checkCancellation()
+                        if segment.isEmpty { continue }
+                        let audio = try model.synthesize(
+                            phonemeIds: segment, speed: speed, device: .shared)
+                        continuation.yield(audio)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
+// ─── StreamingSynthesizer conformance ────────────────────────────────
+
+// `synthesizeStream(text:voice:speed:)` above has the exact protocol
+// shape; the text path requires phonemized input (Kokoro has no G2P) —
+// see that method's doc comment. The model's output rate lives on its
+// config, so surface it as `sampleRate` for the protocol.
+extension KokoroModel: StreamingSynthesizer {
+    public var sampleRate: Int { config.sampleRate }
 }
 
 // ─── Loading ─────────────────────────────────────────────────────────

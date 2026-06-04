@@ -206,4 +206,50 @@ struct LFMAudioIntegrationTests {
         #expect(model.blocks.count == model.config.encoder.nLayers)
         print("AudioModelRegistry correctly loaded LFMAudio (\(model.config.modelType))")
     }
+
+    // ── Streaming transcription ──────────────────────────────────────────
+
+    @Test("transcribeStream yields the same transcript incrementally")
+    func transcribeStreaming() async throws {
+        // Load through the registry so the audio→text path's tokenizer is
+        // attached (the sync `LFMAudioModel.load` can't run the async
+        // tokenizer load).
+        let dir = try await ModelLoadLock.shared.loadSerially {
+            try await ModelLocator().resolve(idOrPath: Self.repoId)
+        }
+        let loaded = try await ModelLoadLock.shared.loadSerially {
+            try await AudioModelRegistry.load(directory: dir)
+        }
+        guard case .lfmAudio(let model) = loaded else {
+            Issue.record("AudioModelRegistry did not route to .lfmAudio")
+            return
+        }
+        #expect(model.tokenizer != nil, "registry must attach a tokenizer")
+
+        let waveform = try AudioTestHelpers.conversationalAWaveform()
+        #expect(!waveform.isEmpty, "fixture waveform failed to load")
+
+        // Batch reference transcript.
+        let batch = try model.transcribe(
+            waveform, maxNewTokens: 64, temperature: 0.0)
+
+        // Streamed: concatenate the per-token text deltas. The streaming
+        // and batch paths share `prepareTranscribe` + the greedy decode,
+        // so the concatenation must equal the batch transcript (modulo the
+        // batch's trailing whitespace trim).
+        var streamed = ""
+        var deltaCount = 0
+        for try await delta in model.transcribeStream(
+            waveform, maxNewTokens: 64, temperature: 0.0)
+        {
+            streamed += delta
+            deltaCount += 1
+        }
+        print("LFMAudio streamed (\(deltaCount) deltas): '\(streamed)'")
+        let streamedTrimmed = streamed.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        #expect(
+            streamedTrimmed == batch.text,
+            "streamed transcript '\(streamedTrimmed)' must equal batch '\(batch.text)'")
+    }
 }

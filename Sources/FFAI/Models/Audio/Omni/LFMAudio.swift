@@ -54,6 +54,7 @@
 
 import Foundation
 import Metal
+import Tokenizers
 
 // ─── Error types ─────────────────────────────────────────────────────
 
@@ -61,6 +62,11 @@ public enum LFMAudioError: Error, CustomStringConvertible {
     case missingConfig(String)
     case unsupportedConfig(String)
     case weightNotFound(String)
+    /// `transcribe` / `transcribeStream` was called before a tokenizer
+    /// was attached. The synchronous `load(directory:)` path can't run the
+    /// async tokenizer load, so the registry's async loader (or a caller)
+    /// must set `tokenizer` before driving the audio→text path.
+    case tokenizerUnavailable
 
     public var description: String {
         switch self {
@@ -70,6 +76,10 @@ public enum LFMAudioError: Error, CustomStringConvertible {
             return "LFMAudio: unsupported config: \(m)"
         case .weightNotFound(let k):
             return "LFMAudio: weight not found: \(k)"
+        case .tokenizerUnavailable:
+            return "LFMAudio: no tokenizer attached — set `tokenizer` "
+                + "(the async registry loader does this) before calling "
+                + "transcribe / transcribeStream"
         }
     }
 }
@@ -379,13 +389,27 @@ public final class LFMAudioModel: @unchecked Sendable {
     var relPosTable: [Float]
     var relPosMaxLen: Int
 
+    /// EOS token ids — autoregressive decode stops when any is produced.
+    /// LFM2.5-Audio ends a turn with `<|im_end|>` (7) and also emits the
+    /// generic `<|endoftext|>` (2).
+    public let eosTokenIds: [Int]
+
+    /// Tokenizer used by the `transcribe` / `transcribeStream` audio→text
+    /// path. Optional because the synchronous `load(directory:)` can't run
+    /// the async tokenizer load; the async registry loader (or a caller
+    /// that already holds a tokenizer) sets it before transcribing. The
+    /// class-level `@unchecked Sendable` already covers this mutable ref.
+    public var tokenizer: (any Tokenizer)?
+
     init(
         config: LFMAudioConfig,
         subsampling: LFMAudioSubsamplingWeights,
         blocks: [LFMAudioConformerBlockWeights],
         adapter: LFMAudioAdapterWeights,
         lfm: LFM2Model, dtype: DType,
-        relPosTable: [Float], relPosMaxLen: Int
+        relPosTable: [Float], relPosMaxLen: Int,
+        eosTokenIds: [Int] = [7, 2],
+        tokenizer: (any Tokenizer)? = nil
     ) {
         self.config = config
         self.subsampling = subsampling
@@ -395,6 +419,8 @@ public final class LFMAudioModel: @unchecked Sendable {
         self.dtype = dtype
         self.relPosTable = relPosTable
         self.relPosMaxLen = relPosMaxLen
+        self.eosTokenIds = eosTokenIds
+        self.tokenizer = tokenizer
     }
 
     // ── Detection ────────────────────────────────────────────────────
@@ -1243,6 +1269,211 @@ public final class LFMAudioModel: @unchecked Sendable {
         return 0.5 * x * (1 + tanh(Float(0.7978845608028654) * v))
     }
 }
+
+// ─── Audio → text transcription ──────────────────────────────────────
+//
+// The audio→text path encodes the waveform into feature tokens (already
+// in the LFM2 hidden dim), splices them into an LFM2 chat prompt's
+// embedding stream — text-token rows around an `<|audio_start|> …
+// <|audio_end|>` span of the encoded audio rows — prefills the LFM2
+// backbone, then greedily / temperature-samples tokens until EOS. The
+// batch `transcribe` and streaming `transcribeStream` share one
+// `prepareTranscribe` + an identical per-token decode loop, so the
+// concatenated stream deltas reproduce the batch transcript exactly
+// (modulo the batch's trailing-whitespace trim).
+
+extension LFMAudioModel {
+    /// State carried from prefill into the decode loop, shared by the
+    /// batch and streaming transcription paths.
+    private struct TranscribeState {
+        let tokenizer: any Tokenizer
+        let caches: [any LayerCacheProtocol]
+        let firstToken: Int
+        let nextPosition: Int
+    }
+
+    /// Sample one token from a `[vocab]` logits tensor — argmax at
+    /// `temperature == 0`, otherwise temperature sampling.
+    private func sampleTok(_ logits: Tensor, temperature: Float) -> Int {
+        if temperature == 0 { return Sampling.argmax(logits) }
+        var rng = SystemRandomNumberGenerator()
+        return Sampling.sample(
+            logits,
+            parameters: GenerationParameters(temperature: temperature),
+            rng: &rng)
+    }
+
+    /// Run one prefill / decode position through the LFM2 backbone from a
+    /// precomputed `[lfmHidden]` embedding row, returning `[vocab]` logits.
+    /// Keeps the GPU sync inside this synchronous helper so the async
+    /// streaming `Task` never blocks on the GPU directly.
+    private func lfmForwardEmbed(
+        _ embed: Tensor, position: Int,
+        caches: [any LayerCacheProtocol], device: Device
+    ) -> Tensor {
+        let cmd = device.makeCommandBuffer()
+        let logits = lfm.forward(
+            inputEmbedding: embed.reshaped(to: [lfm.hidden]),
+            position: position, caches: caches, on: cmd, device: device)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return logits
+    }
+
+    /// Encode the waveform, build the spliced LFM2 prompt-embedding
+    /// stream (text rows + encoded audio rows), prefill the KV cache, and
+    /// sample the first decode token. Throws when no tokenizer is attached
+    /// (the sync `load(directory:)` path can't load one).
+    private func prepareTranscribe(
+        _ waveform: [Float], temperature: Float, device: Device
+    ) throws -> TranscribeState {
+        guard let tokenizer = tokenizer else {
+            throw LFMAudioError.tokenizerUnavailable
+        }
+
+        // 1. Encode the waveform → [nAudioTokens, lfmHidden] feature rows
+        //    (already in the LFM2 backbone hidden dim).
+        let audioFeatures = encodeAudio(waveform: waveform, device: device)
+        let nAudioTokens = audioFeatures.shape[0]
+
+        // 2. Tokenize the prompt halves around the audio span. The audio
+        //    feature rows are interleaved directly into the embedding
+        //    stream between `<|audio_start|>` and `<|audio_end|>`.
+        let prefixIds = tokenizer.encode(
+            text: "<|im_start|>user\n<|audio_start|>")
+        let suffixIds = tokenizer.encode(
+            text: "<|audio_end|><|im_end|>\n<|im_start|>assistant\n")
+
+        // 3. Prefill: text-prefix rows, then audio rows, then text-suffix
+        //    rows — one position at a time, retaining the tail logits.
+        let caches = lfm.makeLayerCaches(maxSeq: nil, device: device)
+        var position = 0
+        var lastLogits: Tensor!
+
+        for tokenId in prefixIds {
+            let row = lfm.textEmbedding(tokenId: tokenId, device: device)
+            lastLogits = lfmForwardEmbed(
+                row, position: position, caches: caches, device: device)
+            position += 1
+        }
+        for a in 0 ..< nAudioTokens {
+            let row = audioFeatures
+                .slicedRows(start: a, count: 1)
+                .reshaped(to: [lfm.hidden])
+            lastLogits = lfmForwardEmbed(
+                row, position: position, caches: caches, device: device)
+            position += 1
+        }
+        for tokenId in suffixIds {
+            let row = lfm.textEmbedding(tokenId: tokenId, device: device)
+            lastLogits = lfmForwardEmbed(
+                row, position: position, caches: caches, device: device)
+            position += 1
+        }
+
+        // 4. Sample the first decode token from the prefill tail.
+        let firstToken = sampleTok(lastLogits, temperature: temperature)
+        return TranscribeState(
+            tokenizer: tokenizer, caches: caches,
+            firstToken: firstToken, nextPosition: position)
+    }
+
+    /// Batch transcription — prefill, then decode to EOS / `maxNewTokens`,
+    /// returning the full trimmed transcript. Shares `prepareTranscribe`
+    /// + the per-token loop with `transcribeStream`.
+    public func transcribe(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0,
+        device: Device = .shared
+    ) throws -> TranscriptionResult {
+        let start = Date()
+        let st = try prepareTranscribe(
+            waveform, temperature: temperature, device: device)
+        let eosIds = Set(eosTokenIds)
+        var generated: [Int] = []
+        var lastTok = st.firstToken
+        for _ in 0 ..< maxNewTokens {
+            if eosIds.contains(lastTok) { break }
+            generated.append(lastTok)
+            let row = lfm.textEmbedding(tokenId: lastTok, device: device)
+            let nextLogits = lfmForwardEmbed(
+                row, position: st.nextPosition + generated.count - 1,
+                caches: st.caches, device: device)
+            lastTok = sampleTok(nextLogits, temperature: temperature)
+        }
+        let text = st.tokenizer.decode(tokens: generated)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return TranscriptionResult(
+            text: text, generatedTokens: generated.count,
+            totalTimeS: Date().timeIntervalSince(start))
+    }
+
+    /// Streaming transcription — yields the incremental decoded TEXT (one
+    /// delta per generated token) as the backbone decodes. Same
+    /// audio-encode + prefill + per-token loop as `transcribe`, so
+    /// concatenating the yielded deltas reproduces the batch transcript
+    /// (modulo the batch's trailing trim). Cancelling the consuming task
+    /// stops decode at the next step.
+    ///
+    /// All GPU sync stays inside the synchronous `prepareTranscribe` /
+    /// `lfmForwardEmbed` helpers; the async `Task` only orchestrates them,
+    /// checks cancellation, and yields text — it never blocks on the GPU.
+    public func transcribeStream(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0
+    ) -> AsyncThrowingStream<String, Error> {
+        let model = self
+        let device = Device.shared
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let st = try model.prepareTranscribe(
+                        waveform, temperature: temperature, device: device)
+                    let eosIds = Set(model.eosTokenIds)
+                    var generated: [Int] = []
+                    var lastTok = st.firstToken
+                    for _ in 0 ..< maxNewTokens {
+                        try Task.checkCancellation()
+                        if eosIds.contains(lastTok) { break }
+                        generated.append(lastTok)
+                        // Decode the running prefix each step and emit the
+                        // new suffix — robust to BPE tokens that don't
+                        // decode standalone; concatenation == batch text.
+                        let prev =
+                            generated.count == 1
+                            ? ""
+                            : st.tokenizer.decode(
+                                tokens: Array(generated.dropLast()))
+                        let cur = st.tokenizer.decode(tokens: generated)
+                        if cur.count > prev.count {
+                            continuation.yield(String(cur.dropFirst(prev.count)))
+                        }
+                        let row = model.lfm.textEmbedding(
+                            tokenId: lastTok, device: device)
+                        let nextLogits = model.lfmForwardEmbed(
+                            row,
+                            position: st.nextPosition + generated.count - 1,
+                            caches: st.caches, device: device)
+                        lastTok = model.sampleTok(
+                            nextLogits, temperature: temperature)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
+/// Streaming-transcription conformance. The protocol-shaped
+/// `transcribeStream(_:maxNewTokens:temperature:)` is implemented above;
+/// the conformance is a marker so a loaded LFMAudio surfaces as a
+/// `StreamingTranscriber` (see `AudioStreaming.swift`).
+extension LFMAudioModel: StreamingTranscriber {}
 
 // ─── Builder functions ────────────────────────────────────────────────
 

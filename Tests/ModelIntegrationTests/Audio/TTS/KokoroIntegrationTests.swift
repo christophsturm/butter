@@ -162,6 +162,76 @@ struct KokoroIntegrationTests {
         print("Kokoro streamed \(chunks.count) chunks: \(chunks.map { $0.count })")
     }
 
+    @Test("synthesizeStream(text:) phonemized — chunks concat to per-segment synth")
+    func synthesizeStreamingFromText() async throws {
+        let dir = try await ModelLoadLock.shared.loadSerially {
+            try await ModelLocator().resolve(idOrPath: "mlx-community/Kokoro-82M-bf16")
+        }
+        let model = try KokoroModel.load(directory: dir)
+
+        // Kokoro synthesizes from PHONEMES (no bundled G2P), so the
+        // `StreamingSynthesizer` text path expects an already-phonemized
+        // IPA string. Two sentences → the stream chunks per sentence.
+        let s1 = "hɛlˈoʊ."
+        let s2 = "wˈɜːld."
+        let text = "\(s1) \(s2)"
+
+        var streamed: [Float] = []
+        var chunkCount = 0
+        for try await audio in model.synthesizeStream(
+            text: text, voice: "af_heart", speed: 1.0)
+        {
+            streamed.append(contentsOf: audio.toFloatArray())
+            chunkCount += 1
+        }
+        #expect(chunkCount == 2, "expected one chunk per sentence, got \(chunkCount)")
+        #expect(streamed.allSatisfy { $0.isFinite }, "non-finite streamed samples")
+        let energy = streamed.map { $0 * $0 }.reduce(0, +)
+        #expect(energy > 1e-4, "streamed text synthesis is silent")
+
+        // Concatenating the streamed chunks equals concatenating the
+        // per-segment batch synths (the stream reuses the same per-segment
+        // `synthesize(phonemeIds:)` path the batch reference walks here).
+        var batch: [Float] = []
+        for seg in [s1, s2] {
+            let ids = model.phonemeIds(for: seg)
+            batch.append(contentsOf: try model.synthesize(phonemeIds: ids).toFloatArray())
+        }
+        #expect(
+            streamed.count == batch.count,
+            "streamed length \(streamed.count) != per-segment batch \(batch.count)")
+        if streamed.count == batch.count {
+            var maxDiff: Float = 0
+            for i in 0 ..< streamed.count { maxDiff = max(maxDiff, abs(streamed[i] - batch[i])) }
+            #expect(maxDiff < 1e-3, "streamed text synthesis diverges from batch (max \(maxDiff))")
+        }
+        print("Kokoro text-stream: \(chunkCount) chunks, \(streamed.count) samples, energy=\(energy)")
+    }
+
+    @Test("synthesizeStream(text:) raw graphemes → needsPhonemizedInput")
+    func synthesizeStreamingRejectsRawText() async throws {
+        let dir = try await ModelLoadLock.shared.loadSerially {
+            try await ModelLocator().resolve(idOrPath: "mlx-community/Kokoro-82M-bf16")
+        }
+        let model = try KokoroModel.load(directory: dir)
+        // Plain English (no IPA) — Kokoro has no G2P, so the stream must
+        // fail loudly rather than mapping ASCII letters as phonemes.
+        do {
+            for try await _ in model.synthesizeStream(
+                text: "Hello world.", voice: nil, speed: 1.0)
+            {
+                Issue.record("expected no audio for raw graphemes")
+            }
+            Issue.record("expected KokoroError.needsPhonemizedInput")
+        } catch let error as KokoroError {
+            if case .needsPhonemizedInput = error {
+                // Correct — raw text was rejected with a clear error.
+            } else {
+                Issue.record("unexpected KokoroError: \(error)")
+            }
+        }
+    }
+
     @Test("front-end — GPU PLBERT matches the CPU reference")
     func plbertGPUParity() async throws {
         let dir = try await ModelLoadLock.shared.loadSerially {

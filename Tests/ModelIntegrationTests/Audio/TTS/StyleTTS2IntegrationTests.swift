@@ -188,6 +188,53 @@ struct StyleTTS2IntegrationTests {
                 + "energy=\(energy), distinct=\(distinct)")
     }
 
+    @Test("synthesizeStream(text:) finishes with a clear error (no fabricated audio)")
+    func synthesizeStreamingFromText() async throws {
+        let dir = try #require(
+            Self.cachedSnapshotDir,
+            "StyleTTS2 stream: kitten-tts checkpoint not cached")
+        let loaded = try await AudioModelRegistry.load(directory: dir)
+        guard case .styleTTS2(let model) = loaded else {
+            Issue.record("expected LoadedAudioModel.styleTTS2, got \(loaded)")
+            return
+        }
+
+        // StyleTTS2 synthesizes from PHONEMES, FFAI bundles no G2P, and the
+        // acoustic front-end isn't wired in this build. So the streaming
+        // text path must finish with a clear error and yield NO audio —
+        // not silence, not garbage.
+
+        // 1. Raw English (no IPA) → needsPhonemizedInput.
+        do {
+            for try await _ in model.synthesizeStream(
+                text: "Hello world.", voice: nil, speed: 1.0)
+            {
+                Issue.record("expected no audio for raw graphemes")
+            }
+            Issue.record("expected StyleTTS2Error.needsPhonemizedInput")
+        } catch let error as StyleTTS2Error {
+            if case .needsPhonemizedInput = error {
+                // Correct.
+            } else {
+                Issue.record("unexpected StyleTTS2Error: \(error)")
+            }
+        }
+
+        // 2. Phonemized IPA → acousticFrontEndNotWired (front-end staged).
+        do {
+            for try await _ in model.synthesizeStream(
+                text: "hɛlˈoʊ wˈɜːld.", voice: nil, speed: 1.0)
+            {
+                Issue.record("expected no audio — acoustic front-end not wired")
+            }
+            Issue.record("expected StyleTTS2Error.acousticFrontEndNotWired")
+        } catch StyleTTS2Error.acousticFrontEndNotWired {
+            // Correct — the GPU acoustic operators aren't in the Ops set yet.
+        } catch {
+            Issue.record("unexpected error from phonemized stream: \(error)")
+        }
+    }
+
     @Test("AudioModelRegistry.load throws for non-audio directory")
     func registryRejectsTextModel() async throws {
         let dir = FileManager.default.temporaryDirectory

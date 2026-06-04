@@ -380,7 +380,70 @@ public final class Qwen3TTSBaseModel: @unchecked Sendable {
             seed: seed, device: device)
         return decoder.decode(codes: codes, device: device)
     }
+
+    // ─── Streaming ───────────────────────────────────────────────────
+
+    /// Streaming text→waveform synthesis (`StreamingSynthesizer`
+    /// conformance). Yields the synthesized waveform as `Tensor` chunks so
+    /// `ffai speak` can drive Qwen3TTSBase through the same uniform path as
+    /// every other TTS model.
+    ///
+    /// ## Granularity — SINGLE yield
+    ///
+    /// The VyvoTTS pipeline is decode-then-codec: the Qwen3 backbone
+    /// autoregressively emits the *entire* run of SNAC code tokens, which
+    /// are de-interleaved into the three SNAC planes and handed to the SNAC
+    /// decoder as one tensor. The SNAC decoder's three-layer transposed-conv
+    /// up-sampling has receptive-field overlap across frame boundaries, so a
+    /// per-frame partial waveform would NOT concatenate cleanly into the
+    /// full synthesis. Per the protocol's correctness-over-granularity rule,
+    /// this conformance therefore yields the full waveform in a single chunk
+    /// rather than streaming partial frames.
+    ///
+    /// - Parameters:
+    ///   - text: Text to synthesize.
+    ///   - voice: Optional speaker prefix (e.g. `"en-us-1"`), forwarded to
+    ///     `synthesize`'s `voice` argument. Ignored when `nil`.
+    ///   - speed: Playback-speed multiplier. The VyvoTTS / Qwen3 backbone has
+    ///     no speed control (rate is fixed by the SNAC codec), so this value
+    ///     is accepted for protocol conformance but has no effect.
+    /// - Returns: An `AsyncThrowingStream` yielding one full-waveform
+    ///   `Tensor`. Throws `Qwen3TTSBaseError.codecUnavailable` when no SNAC
+    ///   decoder is wired, propagated through the stream.
+    public func synthesizeStream(
+        text: String,
+        voice: String? = nil,
+        speed: Float = 1.0
+    ) -> AsyncThrowingStream<Tensor, Error> {
+        // `speed` is unsupported by the SNAC codec rate — accepted for
+        // protocol conformance, intentionally unused.
+        _ = speed
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    // `synthesize` is synchronous (it owns its GPU sync);
+                    // calling it from the Task keeps GPU waits off the async
+                    // path. One decode-then-codec pass → one waveform chunk.
+                    let audio = try model.synthesize(text: text, voice: voice)
+                    try Task.checkCancellation()
+                    continuation.yield(audio)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
+
+// ─── StreamingSynthesizer conformance ────────────────────────────────
+
+// `sampleRate` and `synthesizeStream(text:voice:speed:)` are declared on
+// the model above with the exact protocol shape — conformance is a marker.
+extension Qwen3TTSBaseModel: StreamingSynthesizer {}
 
 // ─── Loading ─────────────────────────────────────────────────────────
 

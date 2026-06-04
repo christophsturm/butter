@@ -207,6 +207,38 @@ struct SopranoIntegrationTests {
                 + "rms=\(String(format: "%.4f", rms))")
     }
 
+    @Test("synthesizeStream — Soprano-80M streamed waveform equals a single full synthesize")
+    func synthesizeStreamingFromText() async throws {
+        let model = try await loadSoprano80M()
+        let text = "Hello world."
+
+        // Stream: collect every yielded chunk into one signal.
+        var streamed: [Float] = []
+        var chunks = 0
+        for try await chunk in model.synthesizeStream(text: text) {
+            streamed.append(contentsOf: chunk.toFloatArray())
+            chunks += 1
+        }
+        #expect(chunks >= 1, "stream yielded no audio chunks")
+        #expect(!streamed.isEmpty, "streamed waveform is empty")
+
+        // Baseline: a single full synthesis of the same text.
+        let full = try model.synthesize(text: text)
+
+        // Streaming reuses the full synthesis path, so the concatenated
+        // streamed samples must match the one-shot waveform sample-for-sample.
+        #expect(
+            streamed.count == full.count,
+            "streamed length (\(streamed.count)) != full synth (\(full.count))")
+        let n = min(streamed.count, full.count)
+        var maxDiff: Float = 0
+        for i in 0 ..< n { maxDiff = max(maxDiff, abs(streamed[i] - full[i])) }
+        #expect(maxDiff < 1e-5, "streamed waveform diverges from full synth (max \(maxDiff))")
+        print(
+            "[Soprano-80M] synthesizeStream: chunks=\(chunks), "
+                + "samples=\(streamed.count), maxDiff=\(maxDiff)")
+    }
+
     @Test("load — Soprano-1.1 loads without error (LLM-only checkpoint)")
     func load_soprano11LoadsWithoutError() async throws {
         let model = try await loadSoprano11()

@@ -149,4 +149,46 @@ struct WhisperIntegrationTests {
             "Whisper transcribed real speech into \(generated.count) "
                 + "tokens (\(distinct) distinct): \(generated.prefix(16))")
     }
+
+    @Test("transcribeStream yields the same transcript incrementally")
+    func transcribeStreaming() async throws {
+        let model = try await loadWhisper()
+        let wave = try AudioTestHelpers.conversationalAWaveform()
+        #expect(!wave.isEmpty, "fixture waveform failed to load")
+
+        // Batch reference: the same greedy decode the stream runs, rendered
+        // to the model's token-id-level text via `tokensToText`.
+        let features = model.encodeAudio(waveform: wave)
+        let prefix = WhisperModel.decodePromptPrefix.filter {
+            $0 < model.config.vocab
+        }
+        let eos =
+            WhisperModel.endOfTranscriptToken < model.config.vocab
+            ? WhisperModel.endOfTranscriptToken : model.config.vocab
+        let batchTokens = model.generateTranscript(
+            audioFeatures: features,
+            initialTokens: prefix.isEmpty ? [0] : prefix,
+            eosToken: eos, maxTokens: 64)
+        let batchText = WhisperModel.tokensToText(batchTokens)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Streamed: concatenate the per-token text deltas. The streaming and
+        // batch paths share `encodeAudio` + the greedy argmax decode, so the
+        // concatenation must equal the batch transcript (modulo the batch's
+        // trailing-whitespace trim).
+        var streamed = ""
+        var deltaCount = 0
+        for try await delta in model.transcribeStream(
+            wave, maxNewTokens: 64, temperature: 0.0)
+        {
+            streamed += delta
+            deltaCount += 1
+        }
+        print("Whisper streamed (\(deltaCount) deltas): '\(streamed)'")
+        let streamedTrimmed = streamed.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        #expect(
+            streamedTrimmed == batchText,
+            "streamed transcript '\(streamedTrimmed)' must equal batch '\(batchText)'")
+    }
 }

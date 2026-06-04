@@ -377,6 +377,63 @@ public final class SenseVoiceModel: @unchecked Sendable {
         return collapsed.filter { $0 != Self.blankToken }
     }
 
+    // ─── Streaming transcription ──────────────────────────────────────
+
+    /// Render greedy-CTC token ids as a stable, space-joined decimal
+    /// string. SenseVoiceModel has no bundled tokenizer (it operates at the
+    /// token-id level — see the file header), so the streaming contract
+    /// surfaces the decoded ids as text: each id renders to its decimal
+    /// form, ids separated by single spaces. Deterministic and identical to
+    /// the batch rendering of the same ids.
+    static func tokensToText(_ tokens: [Int]) -> String {
+        tokens.map(String.init).joined(separator: " ")
+    }
+
+    /// Streaming transcription. SenseVoice is a single-pass,
+    /// non-autoregressive CTC encoder — one forward pass over the whole
+    /// utterance yields the frame log-probabilities, and a greedy collapse
+    /// produces the entire transcript at once. There is no token-by-token
+    /// decode loop to interleave, so the streamed transcript is a
+    /// single-element stream: the full transcript yielded once. (Fabricating
+    /// per-token deltas would misrepresent the model — the whole transcript
+    /// only becomes available after the single encode + CTC pass.)
+    ///
+    /// `maxNewTokens` and `temperature` are accepted for protocol
+    /// conformance; the CTC decode is greedy and emits as many tokens as
+    /// the collapse yields, so neither alters the output.
+    ///
+    /// - Parameters:
+    ///   - waveform: 16 kHz mono PCM samples.
+    ///   - maxNewTokens: Accepted for protocol conformance; ignored (CTC is
+    ///     single-pass).
+    ///   - temperature: Accepted for protocol conformance; decode is greedy.
+    public func transcribeStream(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0
+    ) -> AsyncThrowingStream<String, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    // GPU sync lives inside `transcribeTokens` (a sync
+                    // helper) — never a bare `waitUntilCompleted()` here.
+                    let tokens = model.transcribeTokens(waveform: waveform)
+                    try Task.checkCancellation()
+                    let text = SenseVoiceModel.tokensToText(tokens)
+                    if !text.isEmpty {
+                        continuation.yield(text)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     // ─── Encoder internals ───────────────────────────────────────────
 
     /// Run the SAN-M encoder over `[nRows, inputSize]` row-major input
@@ -1196,3 +1253,10 @@ extension SenseVoiceModel {
         return (mean, invStd)
     }
 }
+
+// MARK: - StreamingTranscriber conformance
+
+// `SenseVoiceModel` is `@unchecked Sendable` and ships
+// `transcribeStream(_:maxNewTokens:temperature:)` with the exact protocol
+// shape (single-pass CTC → one yield) — conformance is a marker.
+extension SenseVoiceModel: StreamingTranscriber {}

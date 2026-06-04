@@ -560,7 +560,71 @@ public final class ChatterboxModel: @unchecked Sendable {
         _ = device
         throw ChatterboxError.synthesisNotWired
     }
+
+    /// Streaming text→waveform synthesis conforming to `StreamingSynthesizer`.
+    ///
+    /// Chatterbox's T3 stage tokenizes raw text internally (its own text
+    /// tokenizer over `text_tokens_dict_size`), so no external g2p /
+    /// phonemizer is required — the stream drives
+    /// `synthesize(text:device:)` directly. Because the two-stage pipeline
+    /// (T3 backbone → S3Gen flow decoder → HiFi-GAN vocoder) is not yet
+    /// wired (see `ChatterboxError.synthesisNotWired`), `synthesize` throws,
+    /// so this stream finishes with that same descriptive error rather than
+    /// emitting incorrect audio.
+    ///
+    /// Geometry once synthesis lands: a SINGLE waveform `Tensor` is yielded
+    /// (the full utterance at `sampleRate`). The full samples produced by
+    /// `synthesize` are wrapped into one `[nSamples]` f32 `Tensor`, so the
+    /// streamed bytes are bit-identical to a one-shot synthesis.
+    ///
+    /// - Parameters:
+    ///   - text: Input text. Passed verbatim to `synthesize`.
+    ///   - voice: Reserved for future reference-audio voice selection.
+    ///            Chatterbox clones a voice from reference audio +
+    ///            conditioning (`conds.safetensors`), not a named-voice
+    ///            table, so a `String` voice id has no binding today and is
+    ///            ignored. Pass `nil`.
+    ///   - speed: Reserved. Chatterbox exposes emotion/exaggeration controls
+    ///            rather than a speed dial, so this is ignored.
+    public func synthesizeStream(
+        text: String,
+        voice: String? = nil,
+        speed: Float = 1.0
+    ) -> AsyncThrowingStream<Tensor, Error> {
+        // `voice` and `speed` have no binding in Chatterbox today (see doc):
+        // voice is reference-audio/conditioning-driven and there is no speed
+        // control. Acknowledge them so the contract is explicit.
+        _ = voice
+        _ = speed
+        let model = self
+        let rate = sampleRate
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    // `synthesize` is synchronous (GPU sync stays inside it);
+                    // it throws `synthesisNotWired` until the T3 + S3Gen +
+                    // HiFi-GAN stages land.
+                    let samples = try model.synthesize(text: text)
+                    _ = rate  // sampleRate surfaces via the protocol property.
+                    // Wrap the full waveform into a single `[nSamples]` Tensor.
+                    let audio = Tensor.empty(
+                        shape: [samples.count], dtype: .f32, device: .shared)
+                    audio.copyIn(from: samples)
+                    continuation.yield(audio)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
+
+// ─── Streaming conformance ─────────────────────────────────────────────
+
+extension ChatterboxModel: StreamingSynthesizer {}
 
 // ─── Loading ─────────────────────────────────────────────────────────
 

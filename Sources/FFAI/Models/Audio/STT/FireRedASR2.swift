@@ -966,6 +966,54 @@ extension FireRedASR2Model {
         return tok?.decode(tokenIds: tokenIds) ?? ""
     }
 
+    /// Streaming transcription — conforms to ``StreamingTranscriber``.
+    ///
+    /// FireRedASR2 decodes with **beam search**, not a left-to-right greedy
+    /// loop: the surviving best beam can change between steps, so a partial
+    /// prefix is not stable and per-token text deltas would NOT concatenate to
+    /// the final transcript. The decode loop is therefore not cleanly tappable
+    /// for incremental yields. We run the existing batch `transcribe` (the
+    /// exact decode path, unchanged — important because that path is the one
+    /// CI exercises) and yield the full transcript ONCE.
+    ///
+    /// GPU sync stays inside `transcribe` / `encodeAudio` (both synchronous);
+    /// the async `Task` never calls `waitUntilCompleted` directly. Cancelling
+    /// the consuming task is honoured before the (single) blocking decode runs
+    /// and via `onTermination`.
+    ///
+    /// - Parameters:
+    ///   - waveform: 16 kHz mono PCM samples.
+    ///   - maxNewTokens: Max decode steps (mapped to `transcribe`'s `maxLen`).
+    ///   - temperature: Accepted for protocol conformance; FireRedASR2's beam
+    ///     search has its own `softmaxSmoothing` and ignores this value.
+    public func transcribeStream(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0
+    ) -> AsyncThrowingStream<String, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    // Reuse the unchanged batch decode path verbatim — only the
+                    // `maxLen` cap is threaded from `maxNewTokens`.
+                    let text = model.transcribe(
+                        waveform: waveform,
+                        maxLen: maxNewTokens)
+                    try Task.checkCancellation()
+                    if !text.isEmpty {
+                        continuation.yield(text)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     /// Greedy-beam search over the attention decoder.
     /// Returns the best token id sequence (excluding SOS; trimmed at EOS).
     private func beamSearch(
@@ -1817,3 +1865,11 @@ extension FireRedASR2Model {
             dtype: dtype)
     }
 }
+
+// MARK: - Streaming conformance
+
+// `transcribeStream(_:maxNewTokens:temperature:)` above already matches the
+// `StreamingTranscriber` protocol shape — the conformance is a marker.
+// FireRedASR2's beam-search decode isn't tappable for per-token deltas, so the
+// stream yields the full batch transcript once (see the method's doc comment).
+extension FireRedASR2Model: StreamingTranscriber {}

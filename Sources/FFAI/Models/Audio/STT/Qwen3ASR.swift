@@ -388,6 +388,15 @@ public final class Qwen3ASRModel: @unchecked Sendable {
 
     let dtype: DType
 
+    /// Tokenizer used by the protocol-shaped `transcribeStream(_:maxNewTokens:
+    /// temperature:)` path. The batch `transcribe(waveform:tokenizer:...)`
+    /// entry point takes a tokenizer explicitly, but the `StreamingTranscriber`
+    /// protocol shape carries no tokenizer argument, so the streaming path
+    /// reads it from here. Set it after `load` (the registry's async loader
+    /// does this automatically) before calling `transcribeStream`. The class
+    /// is already `@unchecked Sendable`, which covers this mutable reference.
+    public var tokenizer: (any Tokenizer)?
+
     public init(
         config: Qwen3ASRConfig,
         conv2d1Weight: Tensor, conv2d1Bias: Tensor,
@@ -870,6 +879,53 @@ public final class Qwen3ASRModel: @unchecked Sendable {
         language: String? = nil,
         device: Device = .shared
     ) -> String {
+        // Prefill (audio encode + prompt embed + KV warm-up), then greedy
+        // decode to EOS / `maxTokens`. The streaming path reuses the exact
+        // same `prepareTranscribe` + `decodeNextToken` helpers, so streamed
+        // concatenation equals this transcript modulo the trailing trim.
+        let st = prepareTranscribe(
+            waveform: waveform, tokenizer: tokenizer,
+            maxTokens: maxTokens, language: language, device: device)
+        var logits = st.firstLogits
+        let caches = st.caches
+        var generated: [Int] = []
+
+        for _ in 0 ..< maxTokens {
+            let step = decodeStepStreaming(
+                logits: logits, generated: generated,
+                caches: caches, device: device)
+            guard let token = step.token else { break }
+            generated.append(token)
+            if step.shouldStop { break }
+            logits = step.nextLogits!
+        }
+
+        return tokenizer.decode(tokens: generated)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // ─── Streaming transcription ──────────────────────────────────────
+
+    /// Holds the prefill result shared by the batch and streaming decode
+    /// loops: the warmed KV caches and the logits produced from the prompt
+    /// tail (the distribution over the FIRST generated token).
+    private struct DecodeState {
+        let caches: [KVCache]
+        let firstLogits: Tensor
+    }
+
+    /// Run prefill: audio encode → prompt tokenize → embed → splice audio
+    /// features → feed every prompt position through the seqLen=1 decode path
+    /// to warm the KV caches. Returns the caches plus the prompt-tail logits.
+    /// All GPU command buffers are committed + waited inside this sync helper,
+    /// so the async streaming `Task` never blocks on the GPU directly.
+    private func prepareTranscribe(
+        waveform: [Float],
+        tokenizer: Tokenizer,
+        maxTokens: Int,
+        language: String?,
+        device: Device
+    ) -> DecodeState {
         // ── 1. Audio encoding ──
         let audioFeatures = encodeAudio(waveform: waveform, device: device)
         let nAudioTokens = audioFeatures.shape[0]
@@ -919,43 +975,137 @@ public final class Qwen3ASRModel: @unchecked Sendable {
             lastLogits = forwardOneToken(embed: rowEmbed, caches: caches, device: device)
         }
         // promptLen is always ≥ 1 (the chat template has several fixed tokens).
-        var logits: Tensor = lastLogits!
+        return DecodeState(caches: caches, firstLogits: lastLogits!)
+    }
 
-        // ── 6. Greedy autoregressive decode ──
-        var generated: [Int] = []
+    /// The outcome of one greedy decode step.
+    private struct DecodeStep {
+        /// The picked token, or `nil` if it's EOS (caller should stop and NOT
+        /// append it).
+        let token: Int?
+        /// `true` when the run should stop AFTER appending `token` (degenerate
+        /// backstop tripped). When `true`, `nextLogits` is `nil`.
+        let shouldStop: Bool
+        /// Logits for the NEXT step. `nil` when stopping (EOS or backstop).
+        let nextLogits: Tensor?
+        /// The KV caches threaded forward to the next step (same instances —
+        /// returned for symmetry so callers can keep a single `let`).
+        let caches: [KVCache]
+    }
+
+    /// Greedily pick the next token from `logits`, apply the EOS / degenerate
+    /// backstop checks, and — unless stopping — embed it and forward it through
+    /// the warmed `caches` to get the next step's logits. `generated` is the
+    /// tokens decoded so far (used only for the degenerate-run backstop). All
+    /// GPU sync happens inside this sync helper, so it is safe to call from the
+    /// streaming `Task`.
+    private func decodeStepStreaming(
+        logits: Tensor, generated: [Int],
+        caches: [KVCache], device: Device
+    ) -> DecodeStep {
         let eosIds = Set(config.eosTokenIds)
 
-        for _ in 0 ..< maxTokens {
-            // Pick the next token greedily.
-            let logitVals = logits.toFloatArray()
-            var best = 0
-            var bestVal = -Float.greatestFiniteMagnitude
-            for (i, v) in logitVals.enumerated() where v > bestVal {
-                bestVal = v
-                best = i
-            }
-            if eosIds.contains(best) { break }
-            generated.append(best)
-
-            // Backstop: if the last 24 tokens have ≤3 unique ids, stop to
-            // prevent multi-GB KV cache growth on stuck greedy decoders.
-            if generated.count >= 24, Set(generated.suffix(24)).count <= 3 {
-                break
-            }
-
-            // Embed the new token and forward it.
-            let nextIdT = Tensor.empty(shape: [1], dtype: .u32, device: device)
-            nextIdT.copyIn(from: [UInt32(best)])
-            let cmd2 = device.makeCommandBuffer()
-            let nextEmbed = embedTokens(nextIdT, on: cmd2)
-            cmd2.commit()
-            cmd2.waitUntilCompleted()
-
-            logits = forwardOneToken(embed: nextEmbed, caches: caches, device: device)
+        // Pick the next token greedily.
+        let logitVals = logits.toFloatArray()
+        var best = 0
+        var bestVal = -Float.greatestFiniteMagnitude
+        for (i, v) in logitVals.enumerated() where v > bestVal {
+            bestVal = v
+            best = i
+        }
+        if eosIds.contains(best) {
+            return DecodeStep(
+                token: nil, shouldStop: true, nextLogits: nil, caches: caches)
         }
 
-        return tokenizer.decode(tokens: generated)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Backstop: if the last 24 tokens (including this pick) have ≤3 unique
+        // ids, stop to prevent multi-GB KV cache growth on stuck greedy
+        // decoders. The token is still emitted; we just don't forward past it.
+        let withThis = generated + [best]
+        if withThis.count >= 24, Set(withThis.suffix(24)).count <= 3 {
+            return DecodeStep(
+                token: best, shouldStop: true, nextLogits: nil, caches: caches)
+        }
+
+        // Embed the new token and forward it for the next step's logits.
+        let nextIdT = Tensor.empty(shape: [1], dtype: .u32, device: device)
+        nextIdT.copyIn(from: [UInt32(best)])
+        let cmd2 = device.makeCommandBuffer()
+        let nextEmbed = embedTokens(nextIdT, on: cmd2)
+        cmd2.commit()
+        cmd2.waitUntilCompleted()
+        let nextLogits = forwardOneToken(
+            embed: nextEmbed, caches: caches, device: device)
+        return DecodeStep(
+            token: best, shouldStop: false,
+            nextLogits: nextLogits, caches: caches)
+    }
+
+    /// Streaming transcription — yields the incremental decoded TEXT (one delta
+    /// per generated token) as the Qwen3 text decoder autoregresses. Shares
+    /// `prepareTranscribe` + `decodeStepStreaming` with the batch `transcribe`,
+    /// so concatenating the yielded deltas reproduces the batch transcript
+    /// (modulo the batch's trailing-whitespace trim).
+    ///
+    /// The tokenizer comes from the stored `tokenizer` property — set it after
+    /// `load` (the `StreamingTranscriber` protocol shape carries no tokenizer
+    /// argument). GPU sync stays inside the sync `prepareTranscribe` /
+    /// `decodeStepStreaming` helpers; the async `Task` only orchestrates and checks
+    /// cancellation. `temperature` is accepted for protocol conformance but
+    /// unused — Qwen3ASR decode is greedy.
+    public func transcribeStream(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0
+    ) -> AsyncThrowingStream<String, Error> {
+        let model = self
+        let device = Device.shared
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard let tokenizer = model.tokenizer else {
+                        throw ModelError.unsupportedModelType(
+                            "Qwen3ASRModel.transcribeStream requires a tokenizer; "
+                                + "none was loaded onto the model")
+                    }
+                    let st = model.prepareTranscribe(
+                        waveform: waveform, tokenizer: tokenizer,
+                        maxTokens: maxNewTokens, language: nil, device: device)
+                    var logits = st.firstLogits
+                    var generated: [Int] = []
+                    var caches = st.caches
+
+                    for _ in 0 ..< maxNewTokens {
+                        try Task.checkCancellation()
+                        let step = model.decodeStepStreaming(
+                            logits: logits, generated: generated,
+                            caches: caches, device: device)
+                        guard let token = step.token else { break }
+                        generated.append(token)
+
+                        // Emit the new suffix of the running decode (decode the
+                        // whole prefix each step — robust to BPE tokens that
+                        // don't decode standalone; concatenation == batch text).
+                        let prev =
+                            generated.count == 1
+                            ? ""
+                            : tokenizer.decode(tokens: Array(generated.dropLast()))
+                        let cur = tokenizer.decode(tokens: generated)
+                        if cur.count > prev.count {
+                            continuation.yield(String(cur.dropFirst(prev.count)))
+                        }
+
+                        if step.shouldStop { break }
+                        logits = step.nextLogits!
+                        caches = step.caches
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     // ─── Text decoder forward pass ────────────────────────────────────
@@ -1131,6 +1281,14 @@ public final class Qwen3ASRModel: @unchecked Sendable {
         return result
     }
 }
+
+// ─── Streaming conformance ───────────────────────────────────────────
+
+// `transcribeStream(_:maxNewTokens:temperature:)` above matches the protocol
+// shape — conformance is a marker. Qwen3ASR does real per-token streaming
+// (autoregressive Qwen3 text decoder), sharing prefill + decode with the batch
+// `transcribe`, so streamed concatenation == the batch transcript.
+extension Qwen3ASRModel: StreamingTranscriber {}
 
 // ─── Registry detection + loader ─────────────────────────────────────
 

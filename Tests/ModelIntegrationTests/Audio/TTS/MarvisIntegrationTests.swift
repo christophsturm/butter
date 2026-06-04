@@ -92,4 +92,66 @@ struct MarvisIntegrationTests {
             "Marvis generated \(nFrames) Mimi frames "
                 + "× \(codes.count) codebooks")
     }
+
+    @Test("synthesizeStream — streamed waveform equals a single synthesize")
+    func synthesizeStreamingFromText() async throws {
+        let model = try await loadMarvis()
+        let text = "Hello."
+
+        // Drive the single-shot synthesis once. Without a wired Mimi codec
+        // `synthesize` throws `codecUnavailable`; the streaming path must
+        // surface the *same* outcome (the stream is a thin wrapper over
+        // `synthesize`), so capture either the waveform or the error.
+        var batch: [Float]?
+        var batchError: Error?
+        do {
+            batch = try model.synthesize(text: text, speaker: 0).toFloatArray()
+        } catch {
+            batchError = error
+        }
+
+        // Collect the streamed chunks. A SINGLE-yield stream (Mimi has no
+        // clean per-frame decode boundary), so at most one chunk. `voice`
+        // "0" maps onto speaker 0 — the same speaker the batch used.
+        var chunks: [[Float]] = []
+        var streamError: Error?
+        do {
+            for try await audio in model.synthesizeStream(
+                text: text, voice: "0")
+            {
+                chunks.append(audio.toFloatArray())
+            }
+        } catch {
+            streamError = error
+        }
+
+        if let batchError {
+            // No codec wired: both paths must fail identically and yield
+            // nothing — the contract still holds (empty == empty).
+            #expect(streamError != nil, "stream succeeded but batch failed")
+            #expect(
+                String(describing: streamError)
+                    == String(describing: batchError),
+                "stream/batch error mismatch")
+            #expect(chunks.isEmpty)
+            return
+        }
+
+        // Codec wired: concatenated stream must equal the single synth.
+        let batchSamples = try #require(batch)
+        #expect(streamError == nil, "stream failed but batch succeeded")
+        let streamed = chunks.flatMap { $0 }
+        let streamedCount = streamed.count
+        let batchCount = batchSamples.count
+        #expect(
+            streamedCount == batchCount,
+            "streamed (\(streamedCount)) != batch (\(batchCount))")
+        if let sFirst = streamed.first, let bFirst = batchSamples.first {
+            #expect(sFirst == bFirst, "first sample differs")
+        }
+        if let sLast = streamed.last, let bLast = batchSamples.last {
+            #expect(sLast == bLast, "last sample differs")
+        }
+        print("Marvis streamed \(streamed.count) samples")
+    }
 }

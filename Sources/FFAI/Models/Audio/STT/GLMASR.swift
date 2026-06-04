@@ -289,6 +289,15 @@ public final class GLMASRModel: @unchecked Sendable {
 
     let dtype: DType
 
+    /// Tokenizer for prompt building and decoding. Optional because the
+    /// synchronous `load(directory:)` path can't perform the async tokenizer
+    /// load; the registry's async `load` (or callers that have a tokenizer in
+    /// hand) populate it. The protocol-shaped `transcribeStream` requires it.
+    ///
+    /// Written once immediately after load (same "load-time only" contract
+    /// that justifies the type's `@unchecked Sendable`), read-only thereafter.
+    public var tokenizer: (any Tokenizer)?
+
     public init(
         config: GLMASRConfig,
         conv1Weight: Tensor, conv1Bias: Tensor,
@@ -303,7 +312,8 @@ public final class GLMASRModel: @unchecked Sendable {
         textLayers: [GLMASRTextLayer],
         textNorm: RMSNorm,
         lmHead: AnyLinear,
-        dtype: DType
+        dtype: DType,
+        tokenizer: (any Tokenizer)? = nil
     ) {
         self.config = config
         self.conv1Weight = conv1Weight
@@ -323,6 +333,7 @@ public final class GLMASRModel: @unchecked Sendable {
         self.textNorm = textNorm
         self.lmHead = lmHead
         self.dtype = dtype
+        self.tokenizer = tokenizer
     }
 
     // ─── Audio encoding ───────────────────────────────────────────────
@@ -732,20 +743,30 @@ public final class GLMASRModel: @unchecked Sendable {
 
     // ─── Transcription ────────────────────────────────────────────────
 
-    /// Transcribe a 16 kHz mono waveform into a text string.
-    ///
-    /// - Parameters:
-    ///   - waveform: 16 kHz mono PCM samples.
-    ///   - tokenizer: Tokenizer loaded from the checkpoint directory.
-    ///   - maxTokens: Maximum transcript tokens to generate. Default 512.
-    ///   - device: Metal device for GPU dispatch.
-    /// - Returns: The decoded transcript string.
-    public func transcribe(
+    /// Mutable decode session: the per-layer KV caches plus the logits from
+    /// the most recent forward pass. Both `transcribe` and `transcribeStream`
+    /// drive the same state through `decodeStep`, so the buffered and streamed
+    /// paths stay token-identical.
+    struct DecodeState {
+        let caches: [KVCache]
+        /// Logits `[vocabSize]` from the last forward pass (prefill tail or the
+        /// previous decode step) — the distribution the next token samples from.
+        var logits: Tensor
+        /// Token ids generated so far (excludes the prompt + EOS).
+        var generated: [Int] = []
+        /// Set once a stop condition (EOS / degenerate backstop) fires.
+        var finished = false
+    }
+
+    /// Encode the audio, build + prefill the prompt, and return a decode
+    /// session primed with the prefill-tail logits. All GPU work happens here
+    /// synchronously (the caller never awaits across a `waitUntilCompleted`).
+    func prepareTranscribe(
         waveform: [Float],
         tokenizer: any Tokenizer,
-        maxTokens: Int = 512,
+        maxTokens: Int,
         device: Device = .shared
-    ) -> String {
+    ) -> DecodeState {
         // ── 1. Encode audio ──
         let audioFeatures = encodeAudio(waveform: waveform, device: device)
         let nAudioTokens = audioFeatures.shape[0]
@@ -792,42 +813,136 @@ public final class GLMASRModel: @unchecked Sendable {
                 embed: rowEmbed, caches: caches,
                 device: device)
         }
-        var logits: Tensor = lastLogits!
+        return DecodeState(caches: caches, logits: lastLogits!)
+    }
 
-        // ── 6. Greedy autoregressive decode ──
-        var generated: [Int] = []
+    /// Greedily sample one token from `state.logits`, advance the decoder, and
+    /// mutate `state` in place. Returns the newly generated token id, or `nil`
+    /// when a stop condition (EOS or the degenerate-loop backstop) fires — in
+    /// which case `state.finished` is set and no token was appended.
+    ///
+    /// All GPU dispatch + `waitUntilCompleted` is contained here; safe to call
+    /// from a streaming `Task` because the caller never awaits mid-step.
+    func decodeStep(_ state: inout DecodeState, device: Device = .shared) -> Int? {
         let eosIds = Set(config.eosTokenIds)
 
-        for _ in 0 ..< maxTokens {
-            let logitVals = logits.toFloatArray()
-            var best = 0
-            var bestV = -Float.greatestFiniteMagnitude
-            for (i, v) in logitVals.enumerated() where v > bestV {
-                bestV = v
-                best = i
-            }
-            if eosIds.contains(best) { break }
-            generated.append(best)
+        // Argmax over the current logits (greedy).
+        let logitVals = state.logits.toFloatArray()
+        var best = 0
+        var bestV = -Float.greatestFiniteMagnitude
+        for (i, v) in logitVals.enumerated() where v > bestV {
+            bestV = v
+            best = i
+        }
+        if eosIds.contains(best) {
+            state.finished = true
+            return nil
+        }
+        state.generated.append(best)
 
-            // Backstop: ≤3 unique ids in last 24 tokens → stuck decoder.
-            if generated.count >= 24, Set(generated.suffix(24)).count <= 3 {
-                break
-            }
-
-            let nextT = Tensor.empty(shape: [1], dtype: .u32, device: device)
-            nextT.copyIn(from: [UInt32(best)])
-            let cmdNext = device.makeCommandBuffer()
-            let nextEmbed = embedTokens(nextT, on: cmdNext)
-            cmdNext.commit()
-            cmdNext.waitUntilCompleted()
-
-            logits = forwardOneToken(
-                embed: nextEmbed, caches: caches,
-                device: device)
+        // Backstop: ≤3 unique ids in last 24 tokens → stuck decoder.
+        if state.generated.count >= 24,
+            Set(state.generated.suffix(24)).count <= 3
+        {
+            state.finished = true
+            return best
         }
 
-        return tokenizer.decode(tokens: generated)
+        // Embed the chosen token and run one decoder step to refresh logits.
+        let nextT = Tensor.empty(shape: [1], dtype: .u32, device: device)
+        nextT.copyIn(from: [UInt32(best)])
+        let cmdNext = device.makeCommandBuffer()
+        let nextEmbed = embedTokens(nextT, on: cmdNext)
+        cmdNext.commit()
+        cmdNext.waitUntilCompleted()
+
+        state.logits = forwardOneToken(
+            embed: nextEmbed, caches: state.caches,
+            device: device)
+        return best
+    }
+
+    /// Transcribe a 16 kHz mono waveform into a text string.
+    ///
+    /// - Parameters:
+    ///   - waveform: 16 kHz mono PCM samples.
+    ///   - tokenizer: Tokenizer loaded from the checkpoint directory.
+    ///   - maxTokens: Maximum transcript tokens to generate. Default 512.
+    ///   - device: Metal device for GPU dispatch.
+    /// - Returns: The decoded transcript string.
+    public func transcribe(
+        waveform: [Float],
+        tokenizer: any Tokenizer,
+        maxTokens: Int = 512,
+        device: Device = .shared
+    ) -> String {
+        var state = prepareTranscribe(
+            waveform: waveform, tokenizer: tokenizer,
+            maxTokens: maxTokens, device: device)
+
+        for _ in 0 ..< maxTokens {
+            _ = decodeStep(&state, device: device)
+            if state.finished { break }
+        }
+
+        return tokenizer.decode(tokens: state.generated)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Streaming transcription — yields the incremental decoded TEXT (one
+    /// delta per generated token) as the LLaMA decoder runs. Shares
+    /// `prepareTranscribe` + `decodeStep` with `transcribe`, so concatenating
+    /// the yielded deltas reproduces the batch transcript (modulo the batch's
+    /// trailing whitespace trim).
+    ///
+    /// Conforms to ``StreamingTranscriber``. The tokenizer is taken from the
+    /// model's stored ``tokenizer`` (populated by the registry's async load);
+    /// if absent, the stream finishes with ``ModelError``.
+    ///
+    /// GPU sync stays inside the synchronous `prepareTranscribe` / `decodeStep`
+    /// helpers — the async `Task` never calls `waitUntilCompleted` directly.
+    /// Cancelling the consuming task stops decode at the next step.
+    public func transcribeStream(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0
+    ) -> AsyncThrowingStream<String, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard let tokenizer = model.tokenizer else {
+                        throw ModelError.unsupportedModelType(
+                            "GLMASRModel.transcribeStream requires a tokenizer; "
+                                + "none was loaded onto the model")
+                    }
+                    var state = model.prepareTranscribe(
+                        waveform: waveform, tokenizer: tokenizer,
+                        maxTokens: maxNewTokens)
+                    for _ in 0 ..< maxNewTokens {
+                        try Task.checkCancellation()
+                        _ = model.decodeStep(&state)
+                        // Emit the new suffix of the running decode (decode the
+                        // whole prefix each step — robust to BPE tokens that
+                        // don't decode standalone; concatenation == batch text).
+                        let prev =
+                            state.generated.count <= 1
+                            ? ""
+                            : tokenizer.decode(
+                                tokens: Array(state.generated.dropLast()))
+                        let cur = tokenizer.decode(tokens: state.generated)
+                        if cur.count > prev.count {
+                            continuation.yield(String(cur.dropFirst(prev.count)))
+                        }
+                        if state.finished { break }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     // ─── Text decoder forward pass (seqLen = 1) ───────────────────────
@@ -1245,3 +1360,9 @@ extension GLMASRModel {
         return result
     }
 }
+
+// MARK: - Streaming conformance
+
+// `transcribeStream(_:maxNewTokens:temperature:)` above already matches the
+// `StreamingTranscriber` protocol shape — the conformance is a marker.
+extension GLMASRModel: StreamingTranscriber {}

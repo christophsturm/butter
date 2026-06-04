@@ -125,4 +125,45 @@ struct Qwen3TTSBaseIntegrationTests {
             _ = try model.synthesize(text: "Hello.")
         }
     }
+
+    @Test("synthesizeStream — concatenated stream matches a single full synthesize")
+    func synthesizeStreamingFromText() async throws {
+        let model = try await loadModel()
+        let text = "Hello there."
+
+        // Drive the streaming surface and concatenate every yielded chunk.
+        // The conformance is a SINGLE-yield (decode-then-codec has no clean
+        // per-frame split — see synthesizeStream's doc comment), so the
+        // concatenation equals the one chunk it yields.
+        func drainStream() async throws -> [Float] {
+            var samples: [Float] = []
+            for try await chunk in model.synthesizeStream(text: text) {
+                samples.append(contentsOf: chunk.toFloatArray())
+            }
+            return samples
+        }
+
+        // The SNAC decoder is a separate staged port. When it is not wired,
+        // both the batch and streaming paths surface the same typed error;
+        // when it IS wired, the concatenated stream must equal the batch
+        // synthesis sample-for-sample.
+        if model.snacDecoder == nil {
+            // Streaming must propagate the SAME typed error as the batch path.
+            await #expect(throws: Qwen3TTSBaseError.self) {
+                _ = try await drainStream()
+            }
+        } else {
+            let streamed = try await drainStream()
+            let batch = try model.synthesize(text: text).toFloatArray()
+            #expect(
+                streamed.count == batch.count,
+                "streamed (\(streamed.count)) != batch (\(batch.count))")
+            // SINGLE-yield ⇒ streamed concatenation is bit-identical to batch.
+            var maxDiff: Float = 0
+            for i in 0 ..< min(streamed.count, batch.count) {
+                maxDiff = max(maxDiff, abs(streamed[i] - batch[i]))
+            }
+            #expect(maxDiff < 1e-5, "stream/batch mismatch (max \(maxDiff))")
+        }
+    }
 }

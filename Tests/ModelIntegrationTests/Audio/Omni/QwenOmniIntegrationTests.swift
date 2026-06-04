@@ -112,4 +112,55 @@ struct QwenOmniIntegrationTests {
             "QwenOmni encoded real speech into \(features.shape[0]) "
                 + "tokens, feature variance=\(variance)")
     }
+
+    @Test("transcribeStream yields the same transcript incrementally")
+    func transcribeStreaming() async throws {
+        // Load through the registry so the audio→text path's tokenizer is
+        // attached (the sync `QwenOmniModel.load` can't run the async
+        // tokenizer load). Skip cleanly when the checkpoint is audio-only
+        // (no text backbone wired) — `transcribe` then throws
+        // `textBackboneUnavailable`, which is the documented contract.
+        let dir = try await ModelLoadLock.shared.loadSerially {
+            try await ModelLocator().resolve(idOrPath: Self.repoId)
+        }
+        let loaded = try await ModelLoadLock.shared.loadSerially {
+            try await AudioModelRegistry.load(directory: dir)
+        }
+        guard case .qwenOmni(let model) = loaded else {
+            Issue.record("AudioModelRegistry did not route to .qwenOmni")
+            return
+        }
+        guard model.hasTextBackbone, model.tokenizer != nil else {
+            print(
+                "QwenOmni: audio-only build (no text backbone / tokenizer) "
+                    + "— skipping streaming-equivalence check")
+            return
+        }
+
+        let waveform = try AudioTestHelpers.conversationalAWaveform()
+        #expect(!waveform.isEmpty, "fixture waveform failed to load")
+
+        // Batch reference transcript.
+        let batch = try model.transcribe(
+            waveform, maxNewTokens: 64, temperature: 0.0)
+
+        // Streamed: concatenate the per-token text deltas. The streaming
+        // and batch paths share `prepareTranscribe` + the greedy decode,
+        // so the concatenation must equal the batch transcript (modulo the
+        // batch's trailing whitespace trim).
+        var streamed = ""
+        var deltaCount = 0
+        for try await delta in model.transcribeStream(
+            waveform, maxNewTokens: 64, temperature: 0.0)
+        {
+            streamed += delta
+            deltaCount += 1
+        }
+        print("QwenOmni streamed (\(deltaCount) deltas): '\(streamed)'")
+        let streamedTrimmed = streamed.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        #expect(
+            streamedTrimmed == batch.text,
+            "streamed transcript '\(streamedTrimmed)' must equal batch '\(batch.text)'")
+    }
 }

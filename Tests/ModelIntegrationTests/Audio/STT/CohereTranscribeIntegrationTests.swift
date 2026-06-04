@@ -210,6 +210,44 @@ struct CohereTranscribeIntegrationTests {
         // Nothing to assert on content — reaching here means no crash / NaN.
     }
 
+    @Test("transcribeStream yields the same transcript incrementally")
+    func transcribeStreaming() async throws {
+        let model = try await loadModel()
+
+        // Bundled fixture (same clip the batch test uses).
+        let wave = try AudioTestHelpers.conversationalAWaveform()
+        #expect(!wave.isEmpty, "audio fixture waveform is empty")
+
+        guard let tok = model.tokenizer else {
+            Issue.record("CohereTranscribe checkpoint did not include a tokenizer")
+            return
+        }
+
+        // Batch reference transcript (greedy, "en").
+        let batch = model.transcribe(
+            waveform: wave, tokenizer: tok, language: "en", maxTokens: 64)
+
+        // Streamed: concatenate the per-token text deltas. The streaming and
+        // batch paths share `encodeAudio` + the greedy decode, so the
+        // concatenation must equal the batch transcript (modulo the batch's
+        // trailing whitespace trim).
+        var streamed = ""
+        var deltaCount = 0
+        for try await delta in model.transcribeStream(
+            wave, maxNewTokens: 64, temperature: 0.0)
+        {
+            streamed += delta
+            deltaCount += 1
+        }
+        print("[CohereTranscribe integration] streamed (\(deltaCount) deltas): "
+            + streamed.debugDescription)
+        let streamedTrimmed = streamed.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        #expect(
+            streamedTrimmed == batch,
+            "streamed transcript '\(streamedTrimmed)' must equal batch '\(batch)'")
+    }
+
     @Test("registry — AudioModelRegistry routes checkpoint to .cohereTranscribe")
     func registryRoutes() async throws {
         let dir = try await resolveDir()

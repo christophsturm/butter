@@ -354,6 +354,112 @@ public final class WhisperModel: @unchecked Sendable {
         return generated
     }
 
+    // ─── Streaming transcription ──────────────────────────────────────
+
+    /// Whisper's decoder prompt prefix — `<|startoftranscript|>`,
+    /// `<|en|>`, `<|transcribe|>`, `<|notimestamps|>`. Their exact ids are
+    /// stable across the standard multilingual tokenizer builds. Filtered
+    /// against `config.vocab` so an English-only checkpoint (smaller vocab)
+    /// degrades gracefully instead of indexing out of range.
+    public static let decodePromptPrefix = [50258, 50259, 50359, 50363]
+
+    /// Whisper's end-of-transcript token id (`<|endoftext|>`).
+    public static let endOfTranscriptToken = 50257
+
+    /// Render generated CTC/decoder token ids as a stable, space-joined
+    /// decimal string. WhisperModel has no bundled tokenizer (it operates
+    /// at the token-id level — see the file header), so the streaming
+    /// contract surfaces the decoded ids as text. Each id renders to its
+    /// decimal form, ids separated by single spaces — deterministic and
+    /// round-trippable, and identical whether built incrementally
+    /// (streaming) or all at once (batch).
+    static func tokensToText(_ tokens: [Int]) -> String {
+        tokens.map(String.init).joined(separator: " ")
+    }
+
+    /// Streaming transcription — greedy-decodes the audio and yields the
+    /// incremental transcript TEXT (one delta per generated token), so a
+    /// consumer can render the transcript as it grows. Shares the
+    /// audio-encode + greedy decode of `generateTranscript`, so
+    /// concatenating the yielded deltas reproduces the batch transcript
+    /// (`tokensToText(generateTranscript(...))`) modulo trailing-whitespace
+    /// trim. Cancelling the consuming task stops the decode at the next
+    /// step.
+    ///
+    /// The decoder is greedy (argmax); `temperature` is accepted for
+    /// protocol conformance but does not alter selection, matching
+    /// `generateTranscript`.
+    ///
+    /// - Parameters:
+    ///   - waveform: 16 kHz mono PCM samples.
+    ///   - maxNewTokens: Maximum generated transcript tokens (default 512).
+    ///   - temperature: Accepted for protocol conformance; decode is greedy.
+    public func transcribeStream(
+        _ waveform: [Float],
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.0
+    ) -> AsyncThrowingStream<String, Error> {
+        let model = self
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    // ── Encode audio (expensive; once per stream) ──
+                    // GPU sync lives inside `encodeAudio` / `decoderLogits`,
+                    // which are sync helpers called from the Task — never a
+                    // bare `waitUntilCompleted()` here.
+                    let features = model.encodeAudio(waveform: waveform)
+
+                    let vocab = model.config.vocab
+                    let prefix = WhisperModel.decodePromptPrefix
+                        .filter { $0 < vocab }
+                    let initialTokens = prefix.isEmpty ? [0] : prefix
+                    let eos =
+                        WhisperModel.endOfTranscriptToken < vocab
+                        ? WhisperModel.endOfTranscriptToken : vocab
+
+                    // ── Greedy autoregressive decode, yielding per-token text ──
+                    var tokens = initialTokens
+                    var generated: [Int] = []
+                    let cap = min(maxNewTokens, model.config.maxDecoderCtx)
+                    for _ in 0 ..< cap {
+                        try Task.checkCancellation()
+                        let logits = model.decoderLogits(
+                            tokenIds: tokens, audioFeatures: features)
+                        var best = 0
+                        var bestVal = -Float.greatestFiniteMagnitude
+                        for (i, v) in logits.enumerated() where v > bestVal {
+                            bestVal = v
+                            best = i
+                        }
+                        if best == eos { break }
+                        tokens.append(best)
+                        generated.append(best)
+
+                        // Emit the new suffix of the running decode (render
+                        // the whole prefix each step so the delta logic is
+                        // identical to the BPE-tokenizer models;
+                        // concatenation == batch text).
+                        let prev =
+                            generated.count == 1
+                            ? ""
+                            : WhisperModel.tokensToText(
+                                Array(generated.dropLast()))
+                        let cur = WhisperModel.tokensToText(generated)
+                        if cur.count > prev.count {
+                            continuation.yield(String(cur.dropFirst(prev.count)))
+                        }
+
+                        if tokens.count >= model.config.maxDecoderCtx { break }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     // ─── Decoder internals ───────────────────────────────────────────
 
     /// Embed transcript tokens + add the decoder positional embedding.
@@ -658,3 +764,10 @@ extension WhisperModel {
             dtype: dtype)
     }
 }
+
+// MARK: - StreamingTranscriber conformance
+
+// `WhisperModel` is `@unchecked Sendable` and ships
+// `transcribeStream(_:maxNewTokens:temperature:)` with the exact protocol
+// shape — conformance is a marker.
+extension WhisperModel: StreamingTranscriber {}
