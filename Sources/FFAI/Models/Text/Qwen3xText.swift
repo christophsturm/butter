@@ -1588,13 +1588,36 @@ public final class Qwen35GDNMixer: Module {
         // committed.
         let result: Tensor
         if fused {
-            Ops.gatedMixerNorm(
-                y: yT, z: z, weight: mixerNorm.weight,
-                epsBuf: epsBufFused,
-                into: yGatedScratch,
-                numValueHeads: numValueHeads, valueHeadDim: valueHeadDim,
-                on: cmd)
-            result = outProj(yGatedScratch, on: cmd)
+            // Fuse the gated mixer RMSNorm + int4 out_proj into ONE dispatch
+            // when out_proj is 4-bit (group 64) and the GDN value dim fits the
+            // kernel's threadgroup-memory contract (Hv·Dv a multiple of 512,
+            // ≤ 8192). `Ops.gatedRmsNormQgemvInt4Fast` computes
+            // `out = int4_gemv(rms_norm(y, w) · silu(z))` — identical to the
+            // gatedMixerNorm + out_proj pair, in one encoder pass (saves the
+            // intermediate `yGatedScratch` + an encoder boundary per GDN layer
+            // per decode token). Falls back to the two-op path otherwise.
+            if let qOut = outProj.inner as? QuantizedLinear,
+                qOut.bits == 4, qOut.groupSize == 64, qOut.additiveBias == nil,
+                mixerNorm.weight.dtype == dtype, z.dtype == dtype,
+                valueDim % 512 == 0, valueDim <= 8192, hidden % 8 == 0
+            {
+                let fusedOut = Tensor.empty(
+                    shape: [hidden], dtype: dtype, device: device)
+                Ops.gatedRmsNormQgemvInt4Fast(
+                    y: yT, z: z, normWeight: mixerNorm.weight, eps: eps,
+                    qWeight: qOut.weight, qScales: qOut.scales, qBiases: qOut.biases,
+                    hv: numValueHeads, dv: valueHeadDim, outDim: hidden,
+                    groupSize: 64, on: cmd, into: fusedOut)
+                result = fusedOut
+            } else {
+                Ops.gatedMixerNorm(
+                    y: yT, z: z, weight: mixerNorm.weight,
+                    epsBuf: epsBufFused,
+                    into: yGatedScratch,
+                    numValueHeads: numValueHeads, valueHeadDim: valueHeadDim,
+                    on: cmd)
+                result = outProj(yGatedScratch, on: cmd)
+            }
             // NOTE: no commit here. The fused path keeps `cmd` in-flight
             // so `Qwen35GDNLayer.decode` can chain the residual add +
             // FFN onto the same command buffer. The FFN (MoE branch)
