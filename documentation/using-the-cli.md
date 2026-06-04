@@ -105,8 +105,9 @@ the synthesis segment-by-segment. Both stream by default.
 # speech → text (streams the transcript incrementally)
 ffai transcribe meeting.wav -m mlx-community/granite-4.0-1b-speech-5bit
 
-# text → speech (writes out.wav; --voice picks the speaker where supported)
-ffai speak "The quick brown fox." -m <tts-model> --voice af_heart --out out.wav
+# text → speech (writes out.wav; Soprano synthesizes straight from text)
+ffai speak "The quick brown fox." --out out.wav
+ffai speak "The quick brown fox." -m mlx-community/Soprano-80M-4bit --out out.wav
 ```
 
 | Flag | Applies to | Meaning |
@@ -115,12 +116,25 @@ ffai speak "The quick brown fox." -m <tts-model> --voice af_heart --out out.wav
 | `-m` / `--model` | both | HF repo id or local path to an STT / TTS checkpoint. |
 | `--no-streaming` | both | Buffer instead of streaming (`transcribe` prints once; `speak` writes once). |
 | `--max-new-tokens` | `transcribe` | Decode cap (STT). |
-| `--voice` | `speak` | Speaker/voice id for multi-speaker TTS models. |
+| `--voice` | `speak` | Speaker/voice id for multi-speaker TTS models (ignored by single-speaker models). |
 | `--out` | `speak` | Output `.wav` path (default `out.wav`). |
 
 Under the hood every STT model exposes `transcribeStream` and every TTS
 model exposes `synthesizeStream`, so the buffered and streamed paths share
 one decode loop (see [streaming.md](streaming.md)).
+
+**TTS input formats vary by family.** `speak` defaults to **Soprano**, which
+synthesizes directly from raw text (BPE → LM → Vocos). Two caveats worth
+knowing when choosing `-m`:
+
+- **Phoneme-input models** (Kokoro, StyleTTS2) expect a phonemized **IPA**
+  string, not raw English — FFAI bundles no grapheme-to-phoneme step, so
+  `speak` with raw text errors with a clear "needs phonemized input"
+  message. Pass IPA, or use a text-native model.
+- **Staged-port models** (several codec/diffusion TTS families) declare the
+  streaming surface but their synthesis isn't wired yet; `speak` surfaces a
+  typed "not wired" error rather than emitting silence. The model still
+  *streams* — there's just nothing to synthesize until the port lands.
 
 ### `models` — what can I run?
 
