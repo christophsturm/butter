@@ -311,4 +311,52 @@ extension MediaUtils {
         }
         return t
     }
+
+    /// CPU bicubic resize of an `[srcH, srcW, channels]` row-major grid to
+    /// `[dstH, dstW, channels]`. Catmull-Rom cubic kernel (`a = -0.75`) with
+    /// half-pixel sample centres (PyTorch `align_corners=false`), edge-clamped
+    /// taps. Used to resize a learned position-embedding grid to a target
+    /// patch grid for native-resolution towers (SigLIP2 NaFlex
+    /// `resize_positional_embeddings`). Cold path — one resize per image.
+    static func bicubicResize(
+        _ src: [Float], srcH: Int, srcW: Int, channels: Int,
+        dstH: Int, dstW: Int
+    ) -> [Float] {
+        precondition(
+            src.count == srcH * srcW * channels,
+            "bicubicResize: src count \(src.count) != \(srcH * srcW * channels)")
+        func cubic(_ t: Float) -> Float {
+            let a: Float = -0.75
+            let x = abs(t)
+            if x <= 1 { return ((a + 2) * x - (a + 3)) * x * x + 1 }
+            if x < 2 { return (((x - 5) * x + 8) * x - 4) * a }
+            return 0
+        }
+        func clampIdx(_ i: Int, _ n: Int) -> Int { Swift.max(0, Swift.min(n - 1, i)) }
+        var dst = [Float](repeating: 0, count: dstH * dstW * channels)
+        let scaleY = Float(srcH) / Float(dstH)
+        let scaleX = Float(srcW) / Float(dstW)
+        for oy in 0 ..< dstH {
+            let sy = (Float(oy) + 0.5) * scaleY - 0.5
+            let y0 = Int(sy.rounded(.down))
+            let wy = (0 ..< 4).map { cubic(sy - Float(y0 - 1 + $0)) }
+            for ox in 0 ..< dstW {
+                let sx = (Float(ox) + 0.5) * scaleX - 0.5
+                let x0 = Int(sx.rounded(.down))
+                let wx = (0 ..< 4).map { cubic(sx - Float(x0 - 1 + $0)) }
+                for c in 0 ..< channels {
+                    var acc: Float = 0
+                    for j in 0 ..< 4 {
+                        let yy = clampIdx(y0 - 1 + j, srcH)
+                        for i in 0 ..< 4 {
+                            let xx = clampIdx(x0 - 1 + i, srcW)
+                            acc += wy[j] * wx[i] * src[(yy * srcW + xx) * channels + c]
+                        }
+                    }
+                    dst[(oy * dstW + ox) * channels + c] = acc
+                }
+            }
+        }
+        return dst
+    }
 }

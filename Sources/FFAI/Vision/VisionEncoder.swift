@@ -544,33 +544,42 @@ public class VisionEncoder: Module {
     /// buffer that is committed + waited before returning, since callers
     /// consume the result on the CPU (the cross-modal splice).
     public func encode(image: Tensor, device: Device = .shared) -> Tensor {
+        // Accept square OR non-square `[1, C, H, W]`. Native-resolution towers
+        // (SigLIP2 NaFlex) feed a variable grid; the patch conv + token path
+        // are grid-agnostic and the learned posEmb is resized to the actual
+        // grid (`resolvedPositionEmbedding`). Fixed-square towers (Paligemma,
+        // Gemma3) pass `imageSize×imageSize` and hit the raw-table fast path.
         precondition(
-            image.shape == [
-                1, config.inChannels,
-                config.imageSize, config.imageSize,
-            ],
-            "VisionEncoder.encode: image shape \(image.shape) != "
-                + "[1,\(config.inChannels),\(config.imageSize),\(config.imageSize)]")
+            image.shape.count == 4 && image.shape[0] == 1
+                && image.shape[1] == config.inChannels,
+            "VisionEncoder.encode: image shape \(image.shape) != [1,\(config.inChannels),H,W]")
+        let inH = image.shape[2]
+        let inW = image.shape[3]
+        precondition(
+            inH % config.patchSize == 0 && inW % config.patchSize == 0,
+            "VisionEncoder.encode: \(inH)x\(inW) not divisible by patch \(config.patchSize)")
+        let gridH = inH / config.patchSize
+        let gridW = inW / config.patchSize
+        let numPatches = gridH * gridW
         let cmd = device.makeCommandBuffer()
 
         // Patch embedding — fused conv (one thread per output element).
-        // conv2d output is NCHW [1, hidden, patchesPerSide, patchesPerSide];
-        // flatten the spatial grid to [numPatches, hidden] token-major.
+        // conv2d output is NCHW [1, hidden, gridH, gridW]; flatten the
+        // spatial grid to [numPatches, hidden] token-major.
         let conv = Ops.conv2d(
             input: image, weight: patchEmbedWeight, bias: patchEmbedBias,
             strideH: config.patchSize, strideW: config.patchSize, on: cmd)
-        // conv is [1, hidden, P, P] channel-major; we need [numPatches, hidden]
-        // token-major — transpose on the CPU after the conv completes.
         cmd.commit()
         cmd.waitUntilCompleted()
 
         var tokens = channelMajorToTokenMajor(
-            conv, hidden: config.hidden, numPatches: config.numPatches,
-            device: device)
+            conv, hidden: config.hidden, numPatches: numPatches, device: device)
 
-        // Add the learned position embedding.
+        // Add the learned position embedding (bicubic-resized to the grid
+        // when the image isn't the table's native square).
+        let posEmb = resolvedPositionEmbedding(gridH: gridH, gridW: gridW, device: device)
         let cmd2 = device.makeCommandBuffer()
-        var h = Ops.add(tokens, positionEmbedding, on: cmd2)
+        var h = Ops.add(tokens, posEmb, on: cmd2)
         cmd2.commit()
         cmd2.waitUntilCompleted()
 
@@ -578,9 +587,7 @@ public class VisionEncoder: Module {
         // internally (its attention core needs a CPU sync point).
         for layer in layers {
             let cmd = device.makeCommandBuffer()
-            h = layer.forward(
-                h, nTokens: config.numPatches,
-                device: device, on: cmd)
+            h = layer.forward(h, nTokens: numPatches, device: device, on: cmd)
         }
 
         // Post-encoder LayerNorm — skipped when the tower is read as an
@@ -590,8 +597,7 @@ public class VisionEncoder: Module {
             h = Ops.layerNorm(
                 h, weight: postLayerNorm.weight,
                 bias: postLayerNorm.bias, eps: postLayerNorm.eps,
-                nRows: config.numPatches, rowSize: config.hidden,
-                on: cmdN)
+                nRows: numPatches, rowSize: config.hidden, on: cmdN)
             cmdN.commit()
             cmdN.waitUntilCompleted()
         }
@@ -601,26 +607,45 @@ public class VisionEncoder: Module {
         guard let proj = projection else { return tokens }
         let cmd3 = device.makeCommandBuffer()
         var projected = Ops.gemm(
-            weight: proj.weight, input: tokens,
-            nRows: config.numPatches, on: cmd3)
+            weight: proj.weight, input: tokens, nRows: numPatches, on: cmd3)
         if let bias = proj.bias {
             let biasVals = bias.toFloatArray()
-            var flat = [Float](
-                repeating: 0,
-                count: config.numPatches * config.textHidden)
-            for r in 0 ..< config.numPatches {
+            var flat = [Float](repeating: 0, count: numPatches * config.textHidden)
+            for r in 0 ..< numPatches {
                 for c in 0 ..< config.textHidden {
                     flat[r * config.textHidden + c] = biasVals[c]
                 }
             }
             let biasTiled = Tensor.empty(
-                shape: [config.numPatches, config.textHidden], dtype: dtype)
+                shape: [numPatches, config.textHidden], dtype: dtype)
             MediaUtils.copyFloats(flat, into: biasTiled)
             projected = Ops.add(projected, biasTiled, on: cmd3)
         }
         cmd3.commit()
         cmd3.waitUntilCompleted()
         return projected
+    }
+
+    /// The learned position embedding resolved to a `gridH × gridW` patch
+    /// grid. Returns the raw `[posSize², hidden]` table when the grid is the
+    /// table's native square (fixed-square towers); otherwise bicubic-resizes
+    /// it to `[gridH·gridW, hidden]` (SigLIP2 NaFlex
+    /// `resize_positional_embeddings`).
+    private func resolvedPositionEmbedding(
+        gridH: Int, gridW: Int, device: Device
+    ) -> Tensor {
+        let total = positionEmbedding.shape[0]
+        let posSize = Int(Double(total).squareRoot().rounded())
+        if gridH == posSize && gridW == posSize {
+            return positionEmbedding
+        }
+        let table = positionEmbedding.toFloatArray()
+        let resized = MediaUtils.bicubicResize(
+            table, srcH: posSize, srcW: posSize, channels: config.hidden,
+            dstH: gridH, dstW: gridW)
+        return MediaUtils.makeTensor(
+            from: resized, shape: [gridH * gridW, config.hidden],
+            dtype: dtype, device: device)
     }
 
     /// Encode a sequence of frames as a temporally-batched token stream.
