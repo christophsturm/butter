@@ -16,8 +16,8 @@
 // knows about. Mirrors mlx-swift-lm's `MLX_BENCH_METHOD` set so the
 // reports are cross-comparable.
 //
-// Implemented today:                 simple, summarization, wikitext2
-// Plumbed but not implemented yet:   niah, multiTurn, toolCalling,
+// Implemented today:                 simple, summarization, wikitext2, niah
+// Plumbed but not implemented yet:   multiTurn, toolCalling,
 //                                    ngramSpot, ngramSweep,
 //                                    ngramSweepSummary, vision
 //
@@ -90,10 +90,8 @@ public enum BenchMethod: String, Sendable, CaseIterable {
     /// today problem or a future-phase problem.
     public var dependency: String? {
         switch self {
-        case .simple, .summarization, .wikitext2:
+        case .simple, .summarization, .wikitext2, .niah:
             return nil
-        case .niah:
-            return "sliding-window attention mask + needle-position bookkeeping"
         case .multiTurn:
             return "ChatSession-style multi-turn cache reuse helper"
         case .toolCalling:

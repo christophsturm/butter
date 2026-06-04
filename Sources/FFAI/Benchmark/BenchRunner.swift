@@ -114,6 +114,8 @@ public struct BenchRunner {
             return try await runSummarization(options: options)
         case .wikitext2:
             return try await runWikiText2(options: options)
+        case .niah:
+            return try await runNIAH(options: options)
         default:
             throw BenchRunnerError.notImplemented(
                 method: method,
@@ -262,6 +264,55 @@ public struct BenchRunner {
             stats: stats, outputPreview: nil,
             genPerplexity: pplResult.perplexity,
             genKLDivergence: kld
+        )
+    }
+
+    // MARK: - NIAH — needle-in-a-haystack retrieval
+
+    private func runNIAH(options: BenchOptions) async throws -> BenchRow {
+        // A single --ctx pins one context length; otherwise sweep the
+        // default grid (clamped to the model's max sequence by NIAH.run).
+        let lengths = options.contextSize.map { [$0] } ?? [1024, 2048, 4096]
+        let memTracker = PhaseMemoryTracker()
+        let result = NIAH.run(model: model, contextLengths: lengths)
+        memTracker.endPrefill()
+        memTracker.endDecode()
+
+        print("[BENCH] niah \(modelLabel)")
+        print("  ctx-tokens  depth  result  answer")
+        for t in result.trials {
+            let ctxStr = String(t.contextTokens)
+            let ctx = String(repeating: " ", count: max(0, 9 - ctxStr.count)) + ctxStr
+            let depth = String(format: "%.2f", t.depthFraction)
+            let verdict = t.passed ? "PASS" : "miss"
+            print("  \(ctx)  \(depth)  \(verdict)  \(t.answerPreview)")
+        }
+        print("  \(result.summaryLine)")
+
+        let weightsBytes = model.engine.parameters().reduce(0) { $0 + $1.1.byteCount }
+        let stats = GenerationStats(
+            promptTokens: result.trials.map(\.contextTokens).max() ?? 0,
+            generatedTokens: 0,
+            contextSize: model.engine.maxSeq,
+            prefillTimeS: 0, decodeTimeS: 0, timeToFirstTokenMs: 0,
+            steadyTokensPerSecond: nil,
+            baselineGPUBytes: memTracker.baseline.gpuBytes,
+            postPrefillGPUBytes: memTracker.postPrefill?.gpuBytes ?? 0,
+            postDecodeGPUBytes: memTracker.postDecode?.gpuBytes ?? 0,
+            prefillPeakGPUBytes: memTracker.prefillPeakBytes,
+            decodePeakGPUBytes: memTracker.decodePeakBytes,
+            wiredTicketBytes: memTracker.baseline.wiredTicketBytes,
+            weightsBytes: weightsBytes,
+            kvCacheAllocatedBytes: 0, kvCacheUsedBytes: 0,
+            thinkPerplexity: nil, genPerplexity: nil,
+            thinkKLDivergence: nil, genKLDivergence: nil,
+            thinkTokenCount: nil, genTokenCount: nil
+        )
+        return BenchRow(
+            model: modelLabel, method: BenchMethod.niah.rawValue,
+            quantization: options.quantization,
+            stats: stats, outputPreview: result.summaryLine,
+            genPerplexity: nil, genKLDivergence: nil
         )
     }
 

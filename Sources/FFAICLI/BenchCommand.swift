@@ -39,7 +39,7 @@ struct BenchCommand: AsyncParsableCommand {
               simple              \(BenchMethod.simple.description)
               summarization       \(BenchMethod.summarization.description)
               wikitext2           \(BenchMethod.wikitext2.description)
-              niah                \(BenchMethod.niah.description) [TODO: \(BenchMethod.niah.dependency ?? "?")]
+              niah                \(BenchMethod.niah.description)
               multi-turn          \(BenchMethod.multiTurn.description) [TODO: \(BenchMethod.multiTurn.dependency ?? "?")]
               tool-calling        \(BenchMethod.toolCalling.description) [TODO: \(BenchMethod.toolCalling.dependency ?? "?")]
               ngram-spot          \(BenchMethod.ngramSpot.description) [TODO: \(BenchMethod.ngramSpot.dependency ?? "?")]
