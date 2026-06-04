@@ -159,27 +159,20 @@ struct MiniCPMVIntegrationTests {
         let vlm = try #require(
             m.vlModel,
             "MiniCPM-V 4.6 checkpoint is not a VLM")
-        let videoTokenId = try #require(
+        _ = try #require(
             vlm.videoTokenId,
             "video_token_id must be set for video generation")
 
-        // Decode `frameCount` evenly-spaced frames from cat.mp4.
-        let frames = try VisionTestHelpers.catVideoFrames(maxFrames: Self.frameCount)
-
-        // MiniCPM-V 4.6 video token count: frameCount × outputTokenCount
-        // (no temporal folding — each frame maps 1:1 to a token run).
-        // The encoder's imageTokenCount is the per-frame merged count.
-        let videoTokenCount = frames.count * vlm.imageTokenCount
-
-        // Build the MiniCPM-V chat-template prompt for a video query.
-        // The chat template emits one <|video_pad|> placeholder per token;
-        // we inline the expanded run directly (the Python side does the
-        // same expansion before passing to the tokenizer).
-        // Prompt structure:
+        // Build the MiniCPM-V chat-template prompt for a video query. The
+        // model decodes cat.mp4 (`maxFrames` frames; MiniCPM-V maps each
+        // frame 1:1 to an `imageTokenCount` run, no temporal folding) and
+        // inserts the matching number of `<|video_pad|>` placeholders
+        // between the markers — the test no longer decodes frames or
+        // hand-computes the count. Prompt structure:
         //   <|im_start|>user\n
-        //   <|video_pad|> × videoTokenCount
+        //   <|video_pad|> × (frames · imageTokenCount)
         //   \nWhat's in this video?<|im_end|>\n
-        //   <|im_start|>assistant\n
+        //   <|im_start|>assistant\n<think>\n\n</think>\n\n
         let header = m.tokenizer.encode(text: "<|im_start|>user\n")
         // Mirror the image-path opener (`<think>\n\n</think>\n\n` after
         // `<|im_start|>assistant\n`) so video-mode generation gets the
@@ -187,14 +180,12 @@ struct MiniCPMVIntegrationTests {
         let trailer = m.tokenizer.encode(
             text: "\nWhat's in this video?<|im_end|>\n"
                 + "<|im_start|>assistant\n<think>\n\n</think>\n\n")
-        let promptTokens =
-            header
-            + Array(repeating: videoTokenId, count: videoTokenCount)
-            + trailer
 
         let generated = try vlm.generate(
-            promptTokens: promptTokens,
-            videoFrames: frames,
+            preTokens: header,
+            videoURL: VisionTestHelpers.catVideoURL(),
+            maxFrames: Self.frameCount,
+            postTokens: trailer,
             maxTokens: 200,
             eosTokenId: m.config.eosTokenId,
             eosTokenIds: m.config.eosTokenIds)

@@ -195,6 +195,21 @@ struct Gemma4VisionIntegrationTests {
     /// frames space-joined (transformers `processing_gemma4.py`). Note the
     /// IMAGE markers (boi/eoi) wrap the frames but the placeholders are the
     /// `video_token` (258884).
+    @Test("load — checkpoint reports .videoIn capability")
+    func loadVLCheckpointVideo() async throws {
+        let m = try await ModelLoadLock.shared.loadSerially {
+            try await Model.load(Self.modelId)
+        }
+        #expect(m.vlModel != nil)
+        #expect(m.availableCapabilities.contains(.imageIn))
+        #expect(m.availableCapabilities.contains(.videoIn))
+
+        let vlm = try #require(m.vlModel)
+        // The video splice needs the loader to thread `video_token_id`
+        // through to VisionModel.init.
+        #expect(vlm.videoTokenId != nil)
+    }
+
     @Test("video + text prompt — identifies the cat in the cat video")
     func videoTextGeneration() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
