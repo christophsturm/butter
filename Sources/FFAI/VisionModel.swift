@@ -512,19 +512,103 @@ public final class VisionModel: @unchecked Sendable {
             eosTokenIds: eosTokenIds, device: device)
     }
 
+    // ─── Streaming multimodal generation ─────────────────────────────
+    //
+    // Token-by-token mirrors of the batch `generate(...)` methods above:
+    // each yields one `GenerationChunk` per decoded token (token id only —
+    // the `Model` layer fills in `text` via the tokenizer), then a final
+    // stats chunk. A buffered collect of any of these is bit-identical to
+    // the corresponding batch call (shared `prepareMultimodalDecode` +
+    // `decodeOneToken`). The image encode is non-throwing; the video / audio
+    // encodes can throw, so those entry points are `throws` (the failure
+    // surfaces before the stream rather than inside it).
+
+    /// Streaming image + text generation. See `generate(promptTokens:image:)`.
+    public func generateStream(
+        promptTokens: [Int], image: RGBImage?,
+        maxTokens: Int, parameters: GenerationParameters? = nil,
+        eosTokenId: Int?,
+        eosTokenIds: [Int] = [],
+        device: Device = .shared
+    ) -> AsyncThrowingStream<GenerationChunk, Error> {
+        let imageTokens = image.map { encodeImage($0, device: device) }
+        return generateMultimodalStream(
+            promptTokens: promptTokens,
+            imageTokens: imageTokens, videoTokens: nil, audioTokens: nil,
+            maxTokens: maxTokens, parameters: parameters,
+            eosTokenId: eosTokenId, eosTokenIds: eosTokenIds, device: device)
+    }
+
+    /// Streaming video + text generation. See
+    /// `generate(promptTokens:videoFrames:)`.
+    public func generateStream(
+        promptTokens: [Int], videoFrames: [RGBImage],
+        maxTokens: Int, parameters: GenerationParameters? = nil,
+        eosTokenId: Int?,
+        eosTokenIds: [Int] = [],
+        device: Device = .shared
+    ) throws -> AsyncThrowingStream<GenerationChunk, Error> {
+        guard videoTokenId != nil else {
+            throw VisionModelError.videoTokenIdMissing(
+                String(describing: type(of: visionEncoder)))
+        }
+        let videoTokens = try encodeVideo(videoFrames, device: device)
+        return generateMultimodalStream(
+            promptTokens: promptTokens,
+            imageTokens: nil, videoTokens: videoTokens, audioTokens: nil,
+            maxTokens: maxTokens, parameters: parameters,
+            eosTokenId: eosTokenId, eosTokenIds: eosTokenIds, device: device)
+    }
+
+    /// Streaming audio + text generation. See `generate(promptTokens:audio:)`.
+    public func generateStream(
+        promptTokens: [Int], audio waveform: [Float],
+        maxTokens: Int, parameters: GenerationParameters? = nil,
+        eosTokenId: Int?,
+        eosTokenIds: [Int] = [],
+        device: Device = .shared
+    ) throws -> AsyncThrowingStream<GenerationChunk, Error> {
+        let audioTokens = try encodeAudio(waveform, device: device)
+        return generateMultimodalStream(
+            promptTokens: promptTokens,
+            imageTokens: nil, videoTokens: nil, audioTokens: audioTokens,
+            maxTokens: maxTokens, parameters: parameters,
+            eosTokenId: eosTokenId, eosTokenIds: eosTokenIds, device: device)
+    }
+
     /// Shared multimodal decode driver — builds the prefill embedding
     /// stream (with optional pre-encoded image / video / audio tokens),
     /// runs prefill to fill the KV cache, then decodes one token at a time,
     /// **sampling each step per `parameters`** via the same
     /// `Sampling.sample` the text path uses (not hard-wired argmax).
-    private func runSampled(
+    /// Per-token decode state captured right after the multimodal prefill
+    /// — the shared seam between the batch `runSampled` and the streaming
+    /// `generateMultimodalStream`. The prefill (splice + batched embedding
+    /// forward) is the expensive part; both decode loops continue from the
+    /// same state, so the two paths stay bit-identical.
+    private struct MultimodalDecodeState {
+        let caches: [any LayerCacheProtocol]
+        var nextToken: Int
+        var rng: AnyRandomNumberGenerator
+        let params: GenerationParameters
+        var tokenHistory: [Int]
+        let stopSet: Set<Int>
+        var pos: Int
+        let maxTokens: Int
+        let promptCount: Int
+        let prefillTimeS: Double
+    }
+
+    /// Run the multimodal prefill (splice → batched embedding forward) and
+    /// return the decode state poised to emit the first token. Shared by the
+    /// batch + streaming decode loops.
+    private func prepareMultimodalDecode(
         promptTokens: [Int],
         imageTokens: Tensor?, videoTokens: Tensor?, audioTokens: Tensor?,
         maxTokens: Int, parameters: GenerationParameters?,
-        eosTokenId: Int?,
-        eosTokenIds: [Int],
+        eosTokenId: Int?, eosTokenIds: [Int],
         device: Device
-    ) throws -> [Int] {
+    ) throws -> MultimodalDecodeState {
         // Respect the caller's generation parameters (temperature / top-p /
         // top-k / min-p / repetition-penalty / seed). Default — when a
         // caller passes none — is deterministic greedy (temperature 0), but
@@ -536,6 +620,7 @@ public final class VisionModel: @unchecked Sendable {
             parameters ?? GenerationParameters().with { $0.temperature = 0 }
         var rng = params.makeRNG()
         let caches = engine.makeLayerCaches(device: device)
+        let prefillStart = Date()
 
         // Build the prefill embedding stream.
         let stream: [Tensor]
@@ -565,24 +650,17 @@ public final class VisionModel: @unchecked Sendable {
 
         // `tokenHistory` feeds the repetition penalty (prompt + decoded so
         // far), mirroring `Generate.driveGeneration`.
-        var tokenHistory = promptTokens
+        let tokenHistory = promptTokens
 
         // Prefill: BATCHED. Assemble the spliced stream into a contiguous
         // `[seqLen, hidden]` block and feed it to the engine's batched
         // embedding-prefill (`forwardMulti(inputEmbeddings:)`) in
-        // `prefillStepSize`-sized chunks. Backbones with a batched layer
-        // path (Llama / Qwen 2 VL) collapse each chunk into one
-        // `Ops.sdpaMulti(causal: true)` per layer — turning the old
-        // ~seqLen serial dispatches (each a commit + host-sync) into a
-        // handful. With native-resolution preprocessing one image is ~1000
-        // placeholder tokens, so this is the dominant prefill cost. Only
-        // the FINAL position's logits matter — `forwardMulti` returns the
-        // chunk tail, so the last chunk yields the first decoded token's
-        // logits, sampled via the shared `Sampling.sample` (temperature 0 →
-        // greedy, plus top-k / top-p / min-p / rep-penalty).
+        // `prefillStepSize`-sized chunks. Only the FINAL position's logits
+        // matter — `forwardMulti` returns the chunk tail, so the last chunk
+        // yields the first decoded token's logits, sampled via the shared
+        // `Sampling.sample` (temperature 0 → greedy, plus top-k / top-p /
+        // min-p / rep-penalty).
         let embeddingBlock = assembleEmbeddingBlock(stream, device: device)
-        // Per-position token ids for Gemma 4 PLE: real id at text positions,
-        // `0` at multimodal placeholders. Engines without PLE ignore it.
         let plePositionIds = promptTokens.map { pleTokenId(for: $0) }
 
         var nextToken = 0
@@ -610,32 +688,146 @@ public final class VisionModel: @unchecked Sendable {
             prefillPos = end
         }
 
-        // Decode: token-id forward from the prefill tail, sampling each step
-        // per the generation parameters (not hard-wired argmax).
-        // Stop on any EOS — Gemma 3+ etc. publish `eos_token_id` as a
-        // list; the caller passes both `eosTokenId` (back-compat single
-        // id) and the optional `eosTokenIds` list.
+        // Stop on any EOS — Gemma 3+ etc. publish `eos_token_id` as a list;
+        // the caller passes both `eosTokenId` (single) and `eosTokenIds`.
         var stopSet: Set<Int> = Set(eosTokenIds)
         if let single = eosTokenId { stopSet.insert(single) }
+
+        return MultimodalDecodeState(
+            caches: caches, nextToken: nextToken, rng: rng, params: params,
+            tokenHistory: tokenHistory, stopSet: stopSet, pos: stream.count,
+            maxTokens: maxTokens, promptCount: promptTokens.count,
+            prefillTimeS: Date().timeIntervalSince(prefillStart))
+    }
+
+    private func runSampled(
+        promptTokens: [Int],
+        imageTokens: Tensor?, videoTokens: Tensor?, audioTokens: Tensor?,
+        maxTokens: Int, parameters: GenerationParameters?,
+        eosTokenId: Int?,
+        eosTokenIds: [Int],
+        device: Device
+    ) throws -> [Int] {
+        var st = try prepareMultimodalDecode(
+            promptTokens: promptTokens,
+            imageTokens: imageTokens, videoTokens: videoTokens,
+            audioTokens: audioTokens,
+            maxTokens: maxTokens, parameters: parameters,
+            eosTokenId: eosTokenId, eosTokenIds: eosTokenIds, device: device)
+        // Decode: token-id forward from the prefill tail, sampling each step.
         var generated: [Int] = []
-        var pos = stream.count
-        for _ in 0 ..< maxTokens {
-            if stopSet.contains(nextToken) { break }
-            generated.append(nextToken)
-            tokenHistory.append(nextToken)
-            let prior = nextToken
-            let cmd = device.makeCommandBuffer()
-            let logits = engine.forward(
-                tokenId: prior, position: pos,
-                caches: caches, on: cmd, device: device)
-            cmd.commit()
-            cmd.waitUntilCompleted()
-            nextToken = Sampling.sample(
-                logits, parameters: params, rng: &rng,
-                tokenHistory: tokenHistory)
-            pos += 1
+        for _ in 0 ..< st.maxTokens {
+            if st.stopSet.contains(st.nextToken) { break }
+            generated.append(st.nextToken)
+            st.tokenHistory.append(st.nextToken)
+            st.nextToken = decodeOneToken(
+                prior: st.nextToken, pos: st.pos,
+                caches: st.caches, params: st.params, rng: &st.rng,
+                tokenHistory: st.tokenHistory, device: device)
+            st.pos += 1
         }
         return generated
+    }
+
+    /// Streaming multimodal decode — yields one `GenerationChunk` per
+    /// decoded token (token id only; the `Model` layer fills in `text` via
+    /// the tokenizer), then a final chunk carrying `GenerationStats`. The
+    /// same prefill + per-token loop as `runSampled`, so a buffered collect
+    /// of this stream is bit-identical to the batch path. Cancelling the
+    /// consuming task stops decode at the next step.
+    func generateMultimodalStream(
+        promptTokens: [Int],
+        imageTokens: Tensor?, videoTokens: Tensor?, audioTokens: Tensor?,
+        maxTokens: Int, parameters: GenerationParameters?,
+        eosTokenId: Int?,
+        eosTokenIds: [Int],
+        device: Device
+    ) -> AsyncThrowingStream<GenerationChunk, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    var st = try prepareMultimodalDecode(
+                        promptTokens: promptTokens,
+                        imageTokens: imageTokens, videoTokens: videoTokens,
+                        audioTokens: audioTokens,
+                        maxTokens: maxTokens, parameters: parameters,
+                        eosTokenId: eosTokenId, eosTokenIds: eosTokenIds,
+                        device: device)
+                    let decodeStart = Date()
+                    var generatedCount = 0
+                    for _ in 0 ..< st.maxTokens {
+                        try Task.checkCancellation()
+                        if st.stopSet.contains(st.nextToken) { break }
+                        st.tokenHistory.append(st.nextToken)
+                        generatedCount += 1
+                        continuation.yield(
+                            GenerationChunk(
+                                text: "", tokens: [st.nextToken],
+                                position: st.pos + 1, stats: nil))
+                        st.nextToken = decodeOneToken(
+                            prior: st.nextToken, pos: st.pos,
+                            caches: st.caches, params: st.params, rng: &st.rng,
+                            tokenHistory: st.tokenHistory, device: device)
+                        st.pos += 1
+                    }
+                    let stats = Self.minimalStats(
+                        promptTokens: st.promptCount,
+                        generatedTokens: generatedCount,
+                        contextSize: engine.maxContextWindow,
+                        prefillTimeS: st.prefillTimeS,
+                        decodeTimeS: Date().timeIntervalSince(decodeStart))
+                    continuation.yield(
+                        GenerationChunk(
+                            text: "", tokens: [], position: st.pos, stats: stats))
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// One decode step: token-id forward → sample the next token. SYNC (it
+    /// blocks on `waitUntilCompleted` internally), so it is safe to call
+    /// from the streaming `Task` — the async context forbids a DIRECT
+    /// `waitUntilCompleted`, but a sync helper that wraps it is fine (same
+    /// trick the text path uses via `engine.forwardSample`).
+    private func decodeOneToken(
+        prior: Int, pos: Int,
+        caches: [any LayerCacheProtocol],
+        params: GenerationParameters,
+        rng: inout AnyRandomNumberGenerator,
+        tokenHistory: [Int],
+        device: Device
+    ) -> Int {
+        let cmd = device.makeCommandBuffer()
+        let logits = engine.forward(
+            tokenId: prior, position: pos,
+            caches: caches, on: cmd, device: device)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return Sampling.sample(
+            logits, parameters: params, rng: &rng, tokenHistory: tokenHistory)
+    }
+
+    /// Minimal `GenerationStats` for the multimodal stream's final chunk —
+    /// counts + timing only (the memory / energy / perplexity probes the
+    /// text path wires are not plumbed through the multimodal decode yet).
+    private static func minimalStats(
+        promptTokens: Int, generatedTokens: Int, contextSize: Int,
+        prefillTimeS: Double, decodeTimeS: Double
+    ) -> GenerationStats {
+        GenerationStats(
+            promptTokens: promptTokens, generatedTokens: generatedTokens,
+            contextSize: contextSize, prefillTimeS: prefillTimeS,
+            decodeTimeS: decodeTimeS, timeToFirstTokenMs: prefillTimeS * 1000,
+            steadyTokensPerSecond: nil,
+            baselineGPUBytes: 0, postPrefillGPUBytes: 0, postDecodeGPUBytes: 0,
+            prefillPeakGPUBytes: 0, decodePeakGPUBytes: 0, wiredTicketBytes: 0,
+            weightsBytes: 0, kvCacheAllocatedBytes: 0, kvCacheUsedBytes: 0,
+            thinkPerplexity: nil, genPerplexity: nil, thinkKLDivergence: nil,
+            genKLDivergence: nil, thinkTokenCount: nil, genTokenCount: nil)
     }
 
     /// Pack the spliced embedding stream — one `[hidden]` row per prompt

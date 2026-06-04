@@ -114,4 +114,51 @@ struct LFM2VisionIntegrationTests {
         print("LFM2-VL generated: \(text)")
         VisionTestHelpers.expectMentionsDog(text, label: "LFM2-VL")
     }
+
+    @Test("image + text prompt — STREAMING yields tokens incrementally")
+    func imageTextGenerationStreaming() async throws {
+        let m = try await ModelLoadLock.shared.loadSerially {
+            try await Model.load(Self.modelId)
+        }
+        let vlm = try #require(m.vlModel, "LFM2-VL checkpoint is not a VLM")
+
+        let imageTokenId = vlm.imageTokenId
+        let bos = try #require(
+            m.tokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
+        let userPrefix = m.tokenizer.encode(text: "<|im_start|>user\n")
+        let userSuffix = m.tokenizer.encode(
+            text: "Describe this image.<|im_end|>\n<|im_start|>assistant\n")
+        let image = try VisionTestHelpers.dogImage()
+        let imageTokens = vlm.encodeImage(image).shape[0]
+        let promptTokens =
+            [bos] + userPrefix
+            + Array(repeating: imageTokenId, count: imageTokens)
+            + userSuffix
+
+        // Consume the multimodal stream token-by-token. The model owns the
+        // splice + decode; chunks carry token ids (decoded to text here via
+        // the tokenizer — VisionModel has no tokenizer). The stream yields
+        // one token per chunk, then a final stats-bearing chunk.
+        let stream = vlm.generateStream(
+            promptTokens: promptTokens, image: image,
+            maxTokens: 200, eosTokenId: m.config.eosTokenId,
+            eosTokenIds: m.config.eosTokenIds)
+        var collected: [Int] = []
+        var tokenChunks = 0
+        var sawFinalStats = false
+        for try await chunk in stream {
+            if chunk.stats != nil { sawFinalStats = true }
+            if !chunk.tokens.isEmpty { tokenChunks += 1 }
+            collected.append(contentsOf: chunk.tokens)
+        }
+        #expect(sawFinalStats, "stream must end with a stats-bearing chunk")
+        #expect(
+            tokenChunks == collected.count,
+            "streaming must yield exactly one token per chunk")
+        expectCoherentOutput(
+            collected, minTokens: 8, label: "LFM2-VL streaming")
+        let text = m.tokenizer.decode(tokens: collected, skipSpecialTokens: true)
+        print("LFM2-VL streamed: \(text)")
+        VisionTestHelpers.expectMentionsDog(text, label: "LFM2-VL streaming")
+    }
 }
