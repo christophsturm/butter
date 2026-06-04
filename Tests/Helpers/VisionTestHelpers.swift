@@ -21,14 +21,13 @@
 // family test in lock-step and gives a single precise failure message
 // if the fixture goes missing.
 //
-// The video helpers below decode `Tests/Resources/cat.mp4` to ordered
-// RGB frames via AVFoundation — `catVideoFirstFrame()` for single-frame
-// VLM tests (the AVFoundation extraction path runs on every VLM run);
-// `catVideoFrames(maxFrames:)` for multi-frame `encode(frames:)`
-// integration tests.
+// The video helpers below are thin conveniences over the PRODUCTION
+// decoder `MediaUtils.decodeVideoFrames(url:maxFrames:)` (the AVFoundation
+// decode/sample logic lives in the Media layer, not here). They resolve
+// the checked-in `Tests/Resources/cat.mp4` fixture and decode it:
+// `catVideoFirstFrame()` for single-frame VLM tests, `catVideoFrames(
+// maxFrames:)` for multi-frame `encode(frames:)` integration tests.
 
-import AVFoundation
-import CoreGraphics
 import FFAI
 import Foundation
 import Testing
@@ -109,113 +108,26 @@ public enum VisionTestHelpers {
     public static func catVideoFirstFrame() throws -> RGBImage {
         let frames = try catVideoFrames(maxFrames: 1)
         guard let first = frames.first else {
-            throw VisionTestHelpersError.videoDecodeFailed(
+            throw MediaUtils.VideoError.decodeFailed(
                 "cat.mp4 decoded to zero frames")
         }
         return first
     }
 
-    /// Decode up to `maxFrames` evenly-spaced frames from `cat.mp4` as
-    /// `[RGBImage]` in display order. AVFoundation reads cleanly from
-    /// h.264 / HEVC / ProRes mp4s on Apple Silicon without any extra
-    /// framework dependency. Asks for `maxFrames` timestamps spaced
-    /// over the asset's duration; clips to actual frame count if the
-    /// clip is shorter than requested.
-    ///
-    /// Fails the calling test if AVFoundation can't decode the asset —
-    /// the file is checked in, so a miss is a real breakage.
+    /// Absolute URL to the checked-in `cat.mp4` fixture — for tests that
+    /// drive `MediaUtils.decodeVideoFrames(url:)` directly.
+    public static func catVideoURL() -> URL { resourceURL("cat.mp4") }
+
+    /// Decode up to `maxFrames` evenly-spaced frames from the checked-in
+    /// `cat.mp4` fixture. Thin convenience over the production decoder
+    /// `MediaUtils.decodeVideoFrames(url:maxFrames:)` — the AVFoundation
+    /// decode/sample logic lives in the Media layer, not here, so tests
+    /// exercise the same path real callers use. Fails the calling test if
+    /// the asset can't be decoded (the file is checked in, so a miss is a
+    /// real breakage).
     public static func catVideoFrames(maxFrames: Int) throws -> [RGBImage] {
-        precondition(maxFrames > 0, "maxFrames must be positive")
-        let url = resourceURL("cat.mp4")
-        let asset = AVURLAsset(url: url)
-        // `asset.duration` was deprecated in macOS 13 in favour of the
-        // async `load(.duration)` accessor; the test layer is sync, so
-        // bridge into a brief `DispatchSemaphore` wait. The captured
-        // result lives on a Sendable reference holder so the `Task`
-        // closure doesn't escape a mutable local across an isolation
-        // boundary (which Swift 6 strict concurrency refuses).
-        let durationCM = loadAssetDurationSync(asset)
-        let durationSecs = CMTimeGetSeconds(durationCM)
-        guard durationSecs.isFinite, durationSecs > 0 else {
-            throw VisionTestHelpersError.videoDecodeFailed(
-                "cat.mp4 has invalid duration \(durationSecs)")
-        }
-
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        // Tight tolerance so the timestamps land on real frames, not
-        // interpolated approximations — relevant for the multi-frame
-        // `encode(frames:)` path.
-        generator.requestedTimeToleranceBefore = .zero
-        generator.requestedTimeToleranceAfter = .zero
-
-        let stamps: [CMTime] = (0 ..< maxFrames).map { i in
-            // Evenly spaced — frame 0 at t=0, frame N-1 just before
-            // duration. For maxFrames=1 this picks t=0 (the natural
-            // "thumbnail" frame).
-            let t =
-                maxFrames == 1
-                ? 0.0
-                : durationSecs * Double(i) / Double(maxFrames)
-            return CMTime(seconds: t, preferredTimescale: 600)
-        }
-
-        var frames: [RGBImage] = []
-        frames.reserveCapacity(stamps.count)
-        for stamp in stamps {
-            do {
-                let cg = try generator.copyCGImage(at: stamp, actualTime: nil)
-                frames.append(try rgbImage(from: cg))
-            } catch {
-                // Skip frames AVFoundation can't decode; only throw if
-                // we end up with no frames at all.
-                continue
-            }
-        }
-        guard !frames.isEmpty else {
-            throw VisionTestHelpersError.videoDecodeFailed(
-                "cat.mp4 — AVAssetImageGenerator returned no frames")
-        }
-        return frames
-    }
-
-    /// Convert a CoreGraphics image to FFAI's `RGBImage` (planar-friendly
-    /// RGB Floats in [0,1]). Drops the alpha channel if present.
-    private static func rgbImage(from cg: CGImage) throws -> RGBImage {
-        let w = cg.width
-        let h = cg.height
-        // Render into a fresh 32-bit RGBA buffer so we don't have to
-        // guess the source colorspace / alpha layout.
-        var raw = [UInt8](repeating: 0, count: w * h * 4)
-        let bytesPerRow = w * 4
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
-        guard
-            let ctx = raw.withUnsafeMutableBufferPointer({ ptr in
-                CGContext(
-                    data: ptr.baseAddress,
-                    width: w, height: h, bitsPerComponent: 8,
-                    bytesPerRow: bytesPerRow,
-                    space: colorSpace, bitmapInfo: bitmapInfo)
-            })
-        else {
-            throw VisionTestHelpersError.videoDecodeFailed(
-                "CGContext init failed for \(w)x\(h)")
-        }
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
-
-        // Pack as RGB Float [0,1] row-major: pixels[(y*w+x)*3 + c].
-        var pixels = [Float](repeating: 0, count: w * h * 3)
-        for y in 0 ..< h {
-            for x in 0 ..< w {
-                let srcBase = (y * w + x) * 4
-                let dstBase = (y * w + x) * 3
-                pixels[dstBase + 0] = Float(raw[srcBase + 0]) / 255.0
-                pixels[dstBase + 1] = Float(raw[srcBase + 1]) / 255.0
-                pixels[dstBase + 2] = Float(raw[srcBase + 2]) / 255.0
-            }
-        }
-        return RGBImage(width: w, height: h, pixels: pixels)
+        try MediaUtils.decodeVideoFrames(
+            url: resourceURL("cat.mp4"), maxFrames: maxFrames)
     }
 
     // MARK: - Content-recognition assertions
@@ -383,40 +295,3 @@ public enum VisionTestHelpers {
     }
 }
 
-public enum VisionTestHelpersError: Error, CustomStringConvertible {
-    case videoDecodeFailed(String)
-
-    public var description: String {
-        switch self {
-        case .videoDecodeFailed(let msg):
-            return "VisionTestHelpers video decode failed: \(msg)"
-        }
-    }
-}
-
-// MARK: - Internal sync bridge for async asset loading
-
-/// `final class` so we can pass a reference into the `Task` closure without
-/// Swift 6 complaining about sending a mutable local across an isolation
-/// boundary. `@unchecked Sendable` is safe here because the sole reader
-/// (after `sem.wait()`) has the only live reference once the producer
-/// returns — strict happens-before via the semaphore.
-private final class CMTimeBox: @unchecked Sendable {
-    var value: CMTime = .zero
-}
-
-/// Synchronously read `asset.duration` via the modern async loader, bridged
-/// onto a `DispatchSemaphore`. Used only in the sync test-helper API; real
-/// (non-test) code uses the async accessor directly.
-private func loadAssetDurationSync(_ asset: AVURLAsset) -> CMTime {
-    let box = CMTimeBox()
-    let sem = DispatchSemaphore(value: 0)
-    Task {
-        if let value = try? await asset.load(.duration) {
-            box.value = value
-        }
-        sem.signal()
-    }
-    sem.wait()
-    return box.value
-}

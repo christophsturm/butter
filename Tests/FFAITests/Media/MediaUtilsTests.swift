@@ -13,6 +13,7 @@
 // limitations under the License.
 //
 import Foundation
+import TestHelpers
 import Testing
 
 @testable import FFAI
@@ -125,5 +126,38 @@ struct MediaUtilsSmartResizeTests {
         let r = try MediaUtils.smartResize(height: 512, width: 512, bounds: bounds)
         #expect(r.h % 32 == 0)
         #expect(r.w % 32 == 0)
+    }
+}
+
+// Unit tests for `MediaUtils.decodeVideoFrames` — the production video
+// decode/sample utility (AVFoundation). Decodes the checked-in `cat.mp4`
+// fixture; no model load. This is the path every VLM video integration
+// test now flows through (via `VisionTestHelpers.catVideoFrames`).
+@Suite("MediaUtils video decode")
+struct MediaVideoDecodeTests {
+    @Test("decodeVideoFrames samples cat.mp4 to RGB frames in [0,1]")
+    func decodeCatVideo() throws {
+        let frames = try MediaUtils.decodeVideoFrames(
+            url: VisionTestHelpers.catVideoURL(), maxFrames: 4)
+        #expect(!frames.isEmpty, "cat.mp4 should decode at least one frame")
+        #expect(frames.count <= 4, "must not exceed maxFrames")
+        for f in frames {
+            #expect(f.width > 0 && f.height > 0, "frame dims must be positive")
+            #expect(
+                f.pixels.count == f.width * f.height * 3,
+                "pixels must be row-major RGB (w·h·3)")
+        }
+        // Spot-check the pixel range on the first frame.
+        let first = try #require(frames.first)
+        #expect(
+            first.pixels.allSatisfy { $0 >= 0 && $0 <= 1 },
+            "decoded pixels must be normalized to [0, 1]")
+    }
+
+    @Test("maxFrames=1 yields exactly the t=0 thumbnail frame")
+    func decodeSingleFrame() throws {
+        let frames = try MediaUtils.decodeVideoFrames(
+            url: VisionTestHelpers.catVideoURL(), maxFrames: 1)
+        #expect(frames.count == 1)
     }
 }
