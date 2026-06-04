@@ -246,9 +246,12 @@ public struct DeepSeekV4TextConfig: Sendable {
 public enum DeepSeekV4Flash: DeepSeekV4Variant {
     public static var availableCapabilities: Set<Capability> { [.textIn, .textOut] }
     public static var defaultGenerationParameters: GenerationParameters {
+        // No model-specific maxTokens — falls to the GenerationParameters
+        // default so callers own generation length. DeepSeek-V3/V4 recommend
+        // temperature 0.6 / top-p 0.95.
         GenerationParameters(
-            maxTokens: 256, prefillStepSize: 4096,
-            temperature: 1.0, topP: 0.95, topK: 64,
+            prefillStepSize: 4096,
+            temperature: 0.6, topP: 0.95, topK: 64,
             repetitionPenalty: 1.0)
     }
 
