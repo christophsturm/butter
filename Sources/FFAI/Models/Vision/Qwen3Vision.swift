@@ -378,18 +378,18 @@ final class Qwen3VLVisionModel: @unchecked Sendable {
     /// contributes — `(T/tp) * (gridSide/m)²`. Used by callers to
     /// compute placeholder counts.
     func mergedTokenCount(frameCount: Int) -> Int {
-        let llmSide = gridSide / cfg.spatialMergeSize
-        let gridT = paddedFrameCount(frameCount) / cfg.temporalPatchSize
-        return gridT * llmSide * llmSide
+        MediaUtils.mergedVideoTokenCount(
+            frameCount: frameCount, gridSide: gridSide,
+            spatialMergeSize: cfg.spatialMergeSize,
+            temporalPatchSize: cfg.temporalPatchSize)
     }
 
     /// Round `frameCount` up to a multiple of `temporal_patch_size` by
     /// repeating the last frame (matches the mlx-vlm reference's
     /// `patchify` padding).
     func paddedFrameCount(_ frameCount: Int) -> Int {
-        let tp = cfg.temporalPatchSize
-        let mod = frameCount % tp
-        return mod == 0 ? frameCount : frameCount + (tp - mod)
+        MediaUtils.paddedFrameCount(
+            frameCount, temporalPatchSize: cfg.temporalPatchSize)
     }
 
     init(

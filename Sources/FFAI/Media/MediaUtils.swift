@@ -181,4 +181,60 @@ public enum MediaUtils {
         }
         return (h: hBar, w: wBar)
     }
+
+    // ─── Qwen-family video / merged-token geometry ───────────────────
+    //
+    // Pure integer geometry the Qwen2 / Qwen2.5 / Qwen3 VL towers share
+    // (previously copy-pasted per tower against each one's config type).
+    // Kept here next to `smartResize` so the merged-token math lives in
+    // one place; the towers pass their config's raw values.
+
+    /// Round `frameCount` up to a multiple of `temporalPatchSize` by
+    /// repeating the last frame (the Qwen-family video `patchify` padding,
+    /// matching the mlx-vlm reference).
+    public static func paddedFrameCount(
+        _ frameCount: Int, temporalPatchSize: Int
+    ) -> Int {
+        precondition(
+            temporalPatchSize > 0,
+            "MediaUtils.paddedFrameCount: temporalPatchSize must be positive")
+        let mod = frameCount % temporalPatchSize
+        return mod == 0 ? frameCount : frameCount + (temporalPatchSize - mod)
+    }
+
+    /// Merged vision-token count a `frameCount`-frame video contributes at
+    /// a fixed square patch grid: `(T/tp) · (gridSide/m)²`, where `gridSide`
+    /// is the per-frame patch-grid side, `m` the LLM-side spatial merge and
+    /// `tp` the temporal-patch size. Callers size the `<|video_pad|>`
+    /// placeholder run from this.
+    public static func mergedVideoTokenCount(
+        frameCount: Int, gridSide: Int,
+        spatialMergeSize: Int, temporalPatchSize: Int
+    ) -> Int {
+        let llmSide = gridSide / spatialMergeSize
+        let gridT =
+            paddedFrameCount(frameCount, temporalPatchSize: temporalPatchSize)
+            / temporalPatchSize
+        return gridT * llmSide * llmSide
+    }
+
+    /// The native `(gridH, gridW)` patch grid `smartResize` selects for an
+    /// image of the given pixel dims (Qwen `factor = patch · merge` bounds),
+    /// plus the merged vision-token count it yields (`(gridH/m)·(gridW/m)`).
+    /// Pure geometry — lets a caller size the image-placeholder run before
+    /// encoding. Throws on an extreme aspect ratio (`SmartResizeError`).
+    public static func smartResizeGrid(
+        width: Int, height: Int, patchSize: Int, spatialMergeSize: Int
+    ) throws -> (gridH: Int, gridW: Int, mergedTokens: Int) {
+        let bounds = SmartResizeBounds.qwen(
+            patchSize: patchSize, mergeSize: spatialMergeSize)
+        let (th, tw) = try smartResize(
+            height: height, width: width, bounds: bounds)
+        let gridH = th / patchSize
+        let gridW = tw / patchSize
+        return (
+            gridH, gridW,
+            (gridH / spatialMergeSize) * (gridW / spatialMergeSize)
+        )
+    }
 }

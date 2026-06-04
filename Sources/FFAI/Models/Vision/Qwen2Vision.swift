@@ -283,9 +283,10 @@ final class Qwen2VLVisionModel: @unchecked Sendable {
     /// contributes — `(T/tp) * (gridSide/m)²`. Used by callers to
     /// compute placeholder counts.
     func mergedTokenCount(frameCount: Int) -> Int {
-        let llmSide = gridSide / cfg.spatialMergeSize
-        let gridT = paddedFrameCount(frameCount) / cfg.temporalPatchSize
-        return gridT * llmSide * llmSide
+        MediaUtils.mergedVideoTokenCount(
+            frameCount: frameCount, gridSide: gridSide,
+            spatialMergeSize: cfg.spatialMergeSize,
+            temporalPatchSize: cfg.temporalPatchSize)
     }
 
     /// The standard Qwen-family `smartResize` pixel bounds for this config
@@ -307,21 +308,17 @@ final class Qwen2VLVisionModel: @unchecked Sendable {
     static func smartResizeGrid(
         width: Int, height: Int, cfg: Qwen2VLVisionConfig
     ) throws -> (gridH: Int, gridW: Int, mergedTokens: Int) {
-        let (th, tw) = try MediaUtils.smartResize(
-            height: height, width: width, bounds: smartResizeBounds(cfg: cfg))
-        let gridH = th / cfg.patchSize
-        let gridW = tw / cfg.patchSize
-        let m = cfg.spatialMergeSize
-        return (gridH, gridW, (gridH / m) * (gridW / m))
+        try MediaUtils.smartResizeGrid(
+            width: width, height: height,
+            patchSize: cfg.patchSize, spatialMergeSize: cfg.spatialMergeSize)
     }
 
     /// Round `frameCount` up to a multiple of `temporal_patch_size` by
     /// repeating the last frame (matches the mlx-vlm reference's
     /// `patchify` padding).
     func paddedFrameCount(_ frameCount: Int) -> Int {
-        let tp = cfg.temporalPatchSize
-        let mod = frameCount % tp
-        return mod == 0 ? frameCount : frameCount + (tp - mod)
+        MediaUtils.paddedFrameCount(
+            frameCount, temporalPatchSize: cfg.temporalPatchSize)
     }
 
     init(

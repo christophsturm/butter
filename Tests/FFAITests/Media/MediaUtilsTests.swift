@@ -161,3 +161,45 @@ struct MediaVideoDecodeTests {
         #expect(frames.count == 1)
     }
 }
+
+// Unit tests for the consolidated Qwen-family video / merged-token
+// geometry helpers (`paddedFrameCount`, `mergedVideoTokenCount`,
+// `smartResizeGrid`) that the Qwen2 / 2.5 / 3 VL towers now share. Pure
+// integer geometry — no GPU, no model.
+@Suite("MediaUtils video geometry")
+struct MediaVideoGeometryTests {
+    @Test("paddedFrameCount rounds up to a temporal-patch multiple")
+    func paddedFrameCount() {
+        #expect(MediaUtils.paddedFrameCount(4, temporalPatchSize: 2) == 4)
+        #expect(MediaUtils.paddedFrameCount(5, temporalPatchSize: 2) == 6)
+        #expect(MediaUtils.paddedFrameCount(1, temporalPatchSize: 2) == 2)
+        #expect(MediaUtils.paddedFrameCount(3, temporalPatchSize: 1) == 3)
+        #expect(MediaUtils.paddedFrameCount(7, temporalPatchSize: 4) == 8)
+    }
+
+    @Test("mergedVideoTokenCount = (T/tp)·(gridSide/m)²")
+    func mergedVideoTokenCount() {
+        // gridSide 32, merge 2 → llmSide 16. 4 frames, tp 2 → gridT 2.
+        // → 2 · 16² = 512.
+        #expect(
+            MediaUtils.mergedVideoTokenCount(
+                frameCount: 4, gridSide: 32,
+                spatialMergeSize: 2, temporalPatchSize: 2) == 512)
+        // 5 frames padded to 6 → gridT 3 → 3 · 256 = 768.
+        #expect(
+            MediaUtils.mergedVideoTokenCount(
+                frameCount: 5, gridSide: 32,
+                spatialMergeSize: 2, temporalPatchSize: 2) == 768)
+    }
+
+    @Test("smartResizeGrid returns an aligned grid + merged-token count")
+    func smartResizeGrid() throws {
+        // 512×512, patch 16, merge 2 → factor 32. The grid sides are
+        // multiples of merge; mergedTokens = (gridH/m)·(gridW/m).
+        let r = try MediaUtils.smartResizeGrid(
+            width: 512, height: 512, patchSize: 16, spatialMergeSize: 2)
+        #expect(r.gridH % 2 == 0)
+        #expect(r.gridW % 2 == 0)
+        #expect(r.mergedTokens == (r.gridH / 2) * (r.gridW / 2))
+    }
+}
