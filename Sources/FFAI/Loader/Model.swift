@@ -445,6 +445,22 @@ public enum ModelRegistry {
                     availableCapabilities: caps,
                     vlModel: vlm)
             }
+            // MiniCPM-V 4.5 — the image + video VLM (no audio). Qwen3-8B
+            // dense LLM (`llm.model.*`) + SigLIP encoder + perceiver
+            // `resampler` (64 tokens/image, `vpm.*` / `resampler.*`), joined
+            // by the cross-modal splice. Shares the resampler vision tower
+            // with MiniCPM-o; gated on the bare `MiniCPMV` arch + `version
+            // 4.5` so it does not shadow the 4.6 (`MiniCPMV4_6…`) checkpoint.
+            if MiniCPMV45.handles(config) {
+                let vlm = try MiniCPMV45.load(
+                    config: config, weights: weights,
+                    options: options, device: device)
+                return Loaded(
+                    engine: vlm.engine,
+                    defaultGenerationParameters: Qwen3Dense.defaultGenerationParameters,
+                    availableCapabilities: MiniCPMV45.availableCapabilities,
+                    vlModel: vlm)
+            }
             // MiniCPM-V 4.6 — SigLIP2-400M encoder + `vit_merger` (window
             // cross-attn merger injected after encoder layer 6 in the
             // default 16× mode) + final `merger` (2×2 reduction + project

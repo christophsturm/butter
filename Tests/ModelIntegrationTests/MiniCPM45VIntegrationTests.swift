@@ -1,0 +1,146 @@
+// Copyright 2026 Eric Kryski (@ekryski)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Consolidated integration suite for MiniCPM-V-4.5 (`model_type: minicpmv`,
+// `version: 4.5`): OpenBMB's image + video → text VLM. A Qwen3-8B dense
+// backbone + SigLIP vision + perceiver resampler (the same resampler tower
+// as MiniCPM-o, minus the audio half). ONE @Suite that loads the model
+// ONCE (static memoized Task) and runs a per-capability inference pass —
+// modeled on `MiniCPM46VIntegrationTests` / `MiniCPM45OmniIntegrationTests`.
+//
+// There is no mlx-community 4-bit conversion of MiniCPM-V-4.5, so this runs
+// against the bf16 base (`openbmb/MiniCPM-V-4_5`, ~16 GB).
+
+import Foundation
+import TestHelpers
+import Testing
+
+@testable import FFAI
+
+@Suite(
+    "MiniCPM-V 4.5 Integration", .serialized,
+    .enabled(
+        if: IntegrationGroupGating.enableVisionSuites,
+        IntegrationGroupGating.visionSkipReason)
+)
+struct MiniCPM45VIntegrationTests {
+
+    static let modelId = "openbmb/MiniCPM-V-4_5"
+
+    /// The checkpoint, loaded ONCE and shared across every `@Test`.
+    static let loaded = Task { try await loadModel(modelId) }
+
+    // MARK: - load
+
+    @Test("load — MiniCPM-V 4.5 loads as a VLM with image + video")
+    func load() async throws {
+        let m = try await Self.loaded.value
+        #expect(m.vlModel != nil)
+        #expect(m.availableCapabilities.contains(.imageIn))
+        #expect(m.availableCapabilities.contains(.videoIn))
+        // No audio — this is the V checkpoint, not the omni.
+        #expect(!m.availableCapabilities.contains(.audioIn))
+        #expect(m.engine.supportsEmbeddingInput)
+        // Qwen3-8B dense backbone.
+        #expect(m.engine.hidden == 4096)
+        let vlm = try #require(m.vlModel)
+        #expect(vlm.imageTokenCount == 64)  // resampler query_num
+        #expect(vlm.imageTokenId == MiniCPMV45.imageTokenId)
+        #expect(vlm.videoTokenId == MiniCPMV45.videoTokenId)
+        #expect(!vlm.supportsAudio)
+    }
+
+    // MARK: - text
+
+    @Test("text — Qwen3-8B backbone chat-generates coherently")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user,
+                    content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        let text = m.tokenizer.decode(tokens: r.generatedTokens, skipSpecialTokens: true)
+        print("MiniCPM-V 4.5 text → \(text)")
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "minicpmv45-text")
+    }
+
+    // MARK: - image → text
+
+    @Test("image + text — describes the dog photo")
+    func imageTextGeneration() async throws {
+        let m = try await Self.loaded.value
+        let vlm = try #require(m.vlModel, "MiniCPM-V 4.5 is not a VLM")
+
+        let image = try VisionTestHelpers.dogImage()
+        // MiniCPM-V image framing (processing_minicpmv.py): `<image>` +
+        // `placeholder × image_feature_size(64)` + `</image>`, inside a chat
+        // turn. The 64 placeholders (vlm.imageTokenId, `<|image_pad|>`) are
+        // replaced by the resampler's 64 image tokens.
+        let nImg = vlm.encodeImage(image).shape[0]
+        let pre = m.tokenizer.encode(text: "<|im_start|>user\n<image>")
+        let post = m.tokenizer.encode(
+            text: "</image>\nDescribe this image.<|im_end|>\n<|im_start|>assistant\n")
+        let prompt = pre + Array(repeating: vlm.imageTokenId, count: nImg) + post
+
+        let generated = try vlm.generate(
+            promptTokens: prompt, image: image, maxTokens: 200,
+            eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
+        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        print("MiniCPM-V 4.5 image → \(text)")
+        expectCoherentOutput(generated, minTokens: 8, label: "MiniCPM-V 4.5 image")
+        VisionTestHelpers.expectMentionsDog(text, label: "MiniCPM-V 4.5")
+    }
+
+    // MARK: - video → text
+
+    @Test("video + text — identifies the cat video")
+    func videoTextGeneration() async throws {
+        let m = try await Self.loaded.value
+        let vlm = try #require(m.vlModel, "MiniCPM-V 4.5 is not a VLM")
+        let videoTokenId = try #require(vlm.videoTokenId)
+
+        // MiniCPM-V encodes each video frame as an independent image (64
+        // resampler tokens/frame). Frame each `<image>`-wrapped placeholder
+        // run; the splice substitutes per-frame video tokens IN ORDER.
+        let frames = try VisionTestHelpers.catVideoFrames(maxFrames: 3)
+        let perFrame = vlm.encodeImage(frames[0]).shape[0]
+        let pre = m.tokenizer.encode(text: "<|im_start|>user\n")
+        let post = m.tokenizer.encode(
+            text: "\nWhat animal is in this video?<|im_end|>\n"
+                + "<|im_start|>assistant\n")
+        var span: [Int] = []
+        for _ in frames {
+            span += m.tokenizer.encode(text: "<image>")
+            span += Array(repeating: videoTokenId, count: perFrame)
+            span += m.tokenizer.encode(text: "</image>")
+        }
+        let prompt = pre + span + post
+
+        let generated = try vlm.generate(
+            promptTokens: prompt, videoFrames: frames, maxTokens: 96,
+            eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
+        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        print("MiniCPM-V 4.5 video → \(text)")
+        expectCoherentOutput(generated, minTokens: 4, label: "MiniCPM-V 4.5 video")
+        #expect(
+            text.lowercased().contains("cat"),
+            "video caption should mention a cat — got: \(text)")
+    }
+}

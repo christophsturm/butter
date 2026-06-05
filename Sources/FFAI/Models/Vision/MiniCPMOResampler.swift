@@ -134,14 +134,53 @@ final class MiniCPMOResampler {
 
         let kvProj = try loadLinear(
             base: "kv_proj", in: weights, quantization: quantization)
-        let qProj = try loadLinear(
-            base: "attn.q_proj", in: weights, quantization: quantization)
-        let kProj = try loadLinear(
-            base: "attn.k_proj", in: weights, quantization: quantization)
-        let vProj = try loadLinear(
-            base: "attn.v_proj", in: weights, quantization: quantization)
         let outProj = try loadLinear(
             base: "attn.out_proj", in: weights, quantization: quantization)
+
+        // The reference attention is `nn.MultiheadAttention`. Two shipped
+        // layouts:
+        //   • mlx-community conversions (e.g. MiniCPM-o-4_5-4bit) SPLIT the
+        //     fused `in_proj_weight` into separate `attn.{q,k,v}_proj`
+        //     linears (4-bit, with bias) → load via `loadLinear`.
+        //   • the bf16 base (`openbmb/MiniCPM-V-4_5` / `MiniCPM-o-4_5`)
+        //     ships the original fused `attn.in_proj_weight [3·embed, embed]`
+        //     + `attn.in_proj_bias [3·embed]` → slice into three `[embed,
+        //     embed]` Linears (q / k / v stacked along the output rows, the
+        //     PyTorch convention).
+        let qProj: AnyLinear
+        let kProj: AnyLinear
+        let vProj: AnyLinear
+        if weights.has("attn.q_proj.weight") {
+            qProj = try loadLinear(
+                base: "attn.q_proj", in: weights, quantization: quantization)
+            kProj = try loadLinear(
+                base: "attn.k_proj", in: weights, quantization: quantization)
+            vProj = try loadLinear(
+                base: "attn.v_proj", in: weights, quantization: quantization)
+        } else {
+            let inW = try weights.tensor(named: "attn.in_proj_weight")
+            let inB = try weights.tensor(named: "attn.in_proj_bias")
+            precondition(
+                inW.shape == [3 * embedDim, embedDim],
+                "MiniCPMOResampler: in_proj_weight shape \(inW.shape) ≠ "
+                    + "[\(3 * embedDim), \(embedDim)]")
+            precondition(
+                inB.shape == [3 * embedDim],
+                "MiniCPMOResampler: in_proj_bias shape \(inB.shape) ≠ "
+                    + "[\(3 * embedDim)]")
+            func slice(_ which: Int) -> AnyLinear {
+                let w = sliceRows(
+                    inW, rows: 3 * embedDim, cols: embedDim,
+                    from: which * embedDim, count: embedDim, device: device)
+                let b = sliceRows(
+                    inB, rows: 3 * embedDim, cols: 1,
+                    from: which * embedDim, count: embedDim, device: device)
+                return AnyLinear(Linear(weight: w, bias: b))
+            }
+            qProj = slice(0)
+            kProj = slice(1)
+            vProj = slice(2)
+        }
 
         let lnQ = LayerNorm(
             weight: try weights.tensor(named: "ln_q.weight"),
@@ -319,6 +358,31 @@ final class MiniCPMOResampler {
             shape: [nQuery, stride], dtype: q.dtype, device: device)
         MediaUtils.copyFloats(out, into: result)
         return result
+    }
+
+    /// Slice a contiguous block of `count` rows from a row-major
+    /// `[rows, cols]` tensor, starting at row `from`, into a fresh
+    /// `[count, cols]` tensor (dtype preserved). Used to split the fused
+    /// `nn.MultiheadAttention` `in_proj_weight` / `in_proj_bias` into the
+    /// per-projection q / k / v blocks. `cols == 1` handles the 1D bias.
+    static func sliceRows(
+        _ x: Tensor, rows: Int, cols: Int,
+        from: Int, count: Int, device: Device
+    ) -> Tensor {
+        precondition(
+            from >= 0 && from + count <= rows,
+            "MiniCPMOResampler.sliceRows: [\(from), \(from + count)) out of "
+                + "[0, \(rows))")
+        let src = x.toFloatArray()
+        var dst = [Float](repeating: 0, count: count * cols)
+        for r in 0 ..< count {
+            let srcBase = (from + r) * cols
+            let dstBase = r * cols
+            for c in 0 ..< cols { dst[dstBase + c] = src[srcBase + c] }
+        }
+        let shape = cols == 1 ? [count] : [count, cols]
+        return MediaUtils.makeTensor(
+            from: dst, shape: shape, dtype: x.dtype, device: device)
     }
 
     /// CPU transpose of a 2D `[rows, cols]` tensor to `[cols, rows]`.
