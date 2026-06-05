@@ -29,6 +29,25 @@ struct CapabilityTests {
         #expect(Capability.textWithTools == [.textIn, .textOut, .toolCalling])
     }
 
+    @Test("modality convenience sets resolve to their declared members")
+    func modalitySets() {
+        // Understanding (X → text).
+        #expect(Capability.speechToText == [.audioIn, .textOut])
+        #expect(Capability.imageToText == [.imageIn, .textOut])
+        #expect(Capability.videoToText == [.videoIn, .textOut])
+        // Omni — every input modality in, text out.
+        #expect(Capability.omni == [.textIn, .imageIn, .videoIn, .audioIn, .textOut])
+        #expect(Capability.omniAudio == [.textIn, .audioIn, .textOut])
+        // Audio generation / transformation.
+        #expect(Capability.textToSpeech == [.textIn, .audioOut])
+        #expect(Capability.speechToSpeech == [.audioIn, .audioOut])
+        // Visual generation (future-proofing).
+        #expect(Capability.textToImage == [.textIn, .imageOut])
+        #expect(Capability.imageToImage == [.imageIn, .imageOut])
+        #expect(Capability.textToVideo == [.textIn, .videoOut])
+        #expect(Capability.videoToVideo == [.videoIn, .videoOut])
+    }
+
     @Test("all cases enumerated")
     func allCases() {
         let s = Set(Capability.allCases)
@@ -38,10 +57,12 @@ struct CapabilityTests {
         #expect(s.contains(.videoIn))
         #expect(s.contains(.audioIn))
         #expect(s.contains(.audioOut))
+        #expect(s.contains(.imageOut))
+        #expect(s.contains(.videoOut))
         #expect(s.contains(.toolCalling))
         #expect(s.contains(.thinking))
         #expect(s.contains(.reasoningLevel))
-        #expect(s.count == 9)
+        #expect(s.count == 11)
     }
 
     @Test("ReasoningLevel — all cases round-trip via raw value")

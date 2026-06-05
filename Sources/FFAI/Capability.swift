@@ -38,6 +38,15 @@ public enum Capability: String, Sendable, Hashable, CaseIterable, Codable {
     case videoIn
     case audioIn
     case audioOut
+    /// Image output — a model that synthesizes images (text-to-image /
+    /// image-to-image generators). No FFAI family wires this yet; the case
+    /// exists so the capability vocabulary and the `textToImage` /
+    /// `imageToImage` sets below are in place ahead of the first generator.
+    case imageOut
+    /// Video output — a model that synthesizes video (text-to-video /
+    /// video-to-video generators). Future-proofing alongside `imageOut`;
+    /// no FFAI family wires this yet.
+    case videoOut
     case toolCalling
     /// Model supports chain-of-thought / "thinking" generation — emits
     /// a private reasoning trace before the final answer (Qwen 3 thinking,
@@ -142,11 +151,48 @@ extension Capability {
 
     /// Speech-to-text models (Whisper): audio in, text out.
     public static let speechToText: Set<Capability> = [.audioIn, .textOut]
+    /// Image-to-text models (image captioning / VQA): image in, text out.
+    public static let imageToText: Set<Capability> = [.imageIn, .textOut]
+    /// Video-to-text models (video captioning / understanding): video in,
+    /// text out.
+    public static let videoToText: Set<Capability> = [.videoIn, .textOut]
     /// Text-to-speech models (Kokoro): text in, audio out.
     public static let textToSpeech: Set<Capability> = [.textIn, .audioOut]
-    /// Omni-modal models (Qwen-Omni): text + audio in, text out.
+    /// Omni-modal models: every input modality (text + image + video +
+    /// audio in), text out. The full omni capability set — a model that
+    /// consumes all four modalities. (`omniAudio` below is the narrower
+    /// audio-only-omni subset FFAI's Qwen-Omni path currently wires.)
+    public static let omni: Set<Capability> = [
+        .textIn, .imageIn, .videoIn, .audioIn, .textOut,
+    ]
+    /// Audio-only omni models (Qwen-Omni as wired today): text + audio in,
+    /// text out. Subset of `omni` for families whose non-audio modalities
+    /// aren't spliced yet.
     public static let omniAudio: Set<Capability> = [.textIn, .audioIn, .textOut]
     /// Speech enhancement / source separation / audio segmentation
     /// (DeepFilterNet, MossFormer2-SE, SAMAudio): audio in, audio out.
     public static let speechToSpeech: Set<Capability> = [.audioIn, .audioOut]
+
+    // ── Generative output sets (future-proofing) ─────────────────────
+    // No FFAI family wires an image/video generator yet; these sets are
+    // declared ahead of the first one so the capability vocabulary is
+    // stable when it lands.
+
+    /// Text-to-image generators (diffusion / autoregressive): text in,
+    /// image out.
+    public static let textToImage: Set<Capability> = [.textIn, .imageOut]
+    /// Image-to-image generators (edit / style / super-resolution): image
+    /// in, image out.
+    public static let imageToImage: Set<Capability> = [.imageIn, .imageOut]
+    /// Text-to-video generators: text in, video out.
+    public static let textToVideo: Set<Capability> = [.textIn, .videoOut]
+    /// Image-to-video generators: image in, video out.
+    public static let imageToVideo: Set<Capability> = [.imageIn, .videoOut]
+    /// Omni-modal video models: every input modality (text + image + video),
+    /// video out. The full omni video capability set — a model that consumes
+    /// all three modalities.
+    public static let omniVideo: Set<Capability> = [.textIn, .imageIn, .videoIn, .videoOut]
+    /// Video-to-video generators (edit / interpolation): video in, video
+    /// out.
+    public static let videoToVideo: Set<Capability> = [.videoIn, .videoOut]
 }
