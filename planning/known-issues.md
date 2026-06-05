@@ -62,58 +62,55 @@ to churn the buffer pool), then bisect lstm.rs (threadgroup `h`/`c` init +
 barriers — they look correct on inspection) or the FFAI Tensor buffer
 pool. Re-point `biLstmGPU` back to `Ops.lstm` once fixed.
 
-## GPU pin — vision / audio bidirectional SDPA at production shape
+## GPU pin — broad vision SDPA pin ELIMINATED; residual d32 + watch item
 
-**Symptom.** Some VLM / audio runs peg the GPU at 100 % and never
-return (worst case seen: WindowServer freeze → hard reboot). Text decode
-is unaffected — `ffai inspect` confirms the same checkpoints load +
-text-decode cleanly, so the pin is isolated to the **vision-tower /
-audio-encoder forward**.
+**Status (updated 2026-06-05).** The broad GPU pin is **gone.** The
+2026-05-30 metaltile production-shape work added `(nQuery=576, nQHeads=16)`
+GPU-correctness cells for `ffai_sdpa_bidirectional` at d{64,72,80,96} and
+fixed the dispatch-geometry bug, so those dims are now **GPU
+production-safe** (`OpsValidation.sdpaBidirectionalProductionSafeHeadDims
+= {64,72,80,96}`; `sdpaBidirectionalIsProductionSafe(_:)` gates the choice).
+The vision towers that used to pin (GlmOcr, MiniCPM-V, Qwen2/2.5/3-VL,
+Gemma4, SmolVLM2 — all d64–d96) run their bidirectional attention on the
+GPU. (`defaultMaxCommandBufferCount` is 64 since PR #14 / J.7.)
 
-**Leading hypothesis.** `mt_sdpa_bidirectional_d64_*` (and likely the
-other bidirectional dims) has an inner-loop / bounds pathology at
-production geometry — first hit on GlmOcr + MiniCPM-V vision towers at
-`(nQHeads=16, nQuery=576, kvStride=576)`. No metaltile GPU-correctness
-test has ever exercised these production shapes. Same class as the
-wrong-dispatch freeze in
-`papers/post-mortem-2026-05-19-dispatch-shape-gpu-freeze.md`.
+**Residual — the only CPU-guarded bidirectional path:**
+- **d32 — FastViT-HD (FastVLM).** Has a kernel (`sdpaBidirectionalSupportedHeadDims`
+  includes 32) but is **not production-verified**
+  (`sdpaBidirectionalIsProductionSafe(32) == false`), so `VisionEncoderLayer`
+  falls back to the CPU `cpuAttention` path for d32. To close: add an
+  `sdpa_bidirectional_d32_*` production-shape correctness cell in
+  metaltile-std, then add 32 to `sdpaBidirectionalProductionSafeHeadDims`.
+- **d128** (Pixtral / Mistral3 / GlmOcr full-attention) routes through
+  `Ops.sdpaMulti(causal:false)`, not the bidirectional kernel — unaffected.
 
-**Mitigation in place.** Every `Ops.sdpaBidirectional` consumer at
-d ∈ {32,64,80,96} routes through a pure-CPU `concurrentPerform` softmax
-loop; `VisionEncoder.forward` takes the GPU path only at the one
-confirmed-safe dim (d72). Qwen2.5-VL d80 GPU path is behind
-`FFAI_QWEN25VL_GPU_SDPA=1`. Slow but no pin. (`defaultMaxCommandBufferCount`
-is 64 since PR #14 / J.7; the old `FFAI_MAX_COMMAND_BUFFERS=16` is still
-an override.)
+**Watch item (vision + audio).** The validate-or-fall-back guard
+(`sdpaBidirectionalIsProductionSafe`) means a **new, never-benched shape**
+(a tower with an unlisted head_dim, or a much larger `nQuery`) cleanly
+falls to CPU rather than pinning — but that's exactly where a future
+regression would hide, so keep watching new vision/audio attention shapes.
+The old "every dim CPU-guarded, only d72 GPU" state no longer applies.
 
-**Next step.** Reproduce under Metal System Trace / `MTLCaptureManager`
-to read the hung dispatch, OR add per-dim
-`sdpa_bidirectional_d{N}_gpu_correctness.rs` in metaltile-std at the real
-`(nQHeads,nQuery,kvStride)` shapes vs a CPU oracle, fix the kernel
-arithmetic, then drop the CPU guards (`VisionEncoder.swift` + per-family
-`*Vision.swift`). Use `make integration-bisect` + `ffai inspect` to
-localise which family/shape pins.
+## CPU cost remaining on audio encoders + FastVLM (vision now mostly GPU)
 
-## CPU saturation on vision / audio towers — mostly the intentional guard now
-
-**Status.** Largely EXPECTED today: vision/audio bidirectional attention
-runs on CPU **on purpose** (the GPU-pin guard above). So "all cores at
-100 %, GPU idle" during VLM/audio tests is the guard working, not a new
-bug. The genuine perf cost that remains:
+**Status (updated 2026-06-05).** The vision-tower bidirectional attention
+moved back to the GPU at d64–d96 (see the GPU-pin entry), so VLM tests no
+longer saturate CPU on attention. The genuine CPU perf cost that remains:
 
 - **Audio encoders (Whisper, Qwen-Omni)** — `AudioEncoder.swift::cpuAttention`
-  runs ~24 blocks of bidirectional attention over 1500 frames on CPU
+  runs ~24 blocks of bidirectional attention over ~1500 frames on CPU
   (~70 GFLOP/utterance); `WhisperIntegrationTests` /
   `QwenOmniIntegrationTests` can hit the test timeout. Whisper's decoder
   also re-pays cross-attention CPU cost per token (no cross-side KV cache).
-- **FastVLM 1024px** — FastViT-HD depthwise convs run CPU (no
-  `Ops.conv2dDepthwise`).
+  These towers are mostly d≥64, so the production-safe `sdpaBidirectional`
+  kernels now exist — the migration is wiring, not a missing kernel.
+- **FastVLM** — d32 FastViT-HD attention is CPU-guarded (see GPU-pin
+  residual) and its depthwise convs run CPU (no `Ops.conv2dDepthwise`).
 
-**Next step.** Same fix as the GPU-pin entry: once `sdpaBidirectional`
-is GPU-safe at production shape, vision towers move back to GPU. Audio
-encoder/decoder migrate to `Ops.sdpaBidirectional` (encoder) +
-`Ops.sdpaMulti(causal:true)` (decoder self-attn) + a precomputed-K/V
-cross-attention dispatch.
+**Next step.** Migrate the audio encoder to `Ops.sdpaBidirectional` and the
+decoder self-attn to `Ops.sdpaMulti(causal:true)` + a precomputed-K/V
+cross-attention dispatch; add the d32 production cell + a depthwise-conv2d
+kernel for FastVLM.
 
 ## SDPA head-dim + AURA kernel coverage
 
@@ -134,10 +131,10 @@ What's wired vs outstanding (verified 2026-05-28).
 
 **Vision bidirectional — `Ops.sdpaBidirectional`** (`sdpaBidirectionalSupportedHeadDims = {32,64,72,80,96}`):
 
-| head_dim | Kernel | GPU-safe? |
+| head_dim | Kernel | GPU production-safe? |
 |---|---|---|
-| 72 | ✅ | ✅ only confirmed-safe dim |
-| 32, 64, 80, 96 | ✅ | ❌ pins GPU at production shape → CPU-guarded (see GPU-pin entry) |
+| 64, 72, 80, 96 | ✅ | ✅ verified at production shape (576×16) — `sdpaBidirectionalProductionSafeHeadDims` |
+| 32 | ✅ | ❌ has a kernel but not production-verified → CPU-guarded (FastViT-HD / FastVLM) |
 | 128 | n/a | routed through `Ops.sdpaMulti(causal:false)` (Pixtral, Mistral3, GlmOcr) |
 
 **AURA KV (Π-rotated quantized cache):**
@@ -152,67 +149,15 @@ What's wired vs outstanding (verified 2026-05-28).
 - Performance: ❌ decode still uses the dequant B-path; compressed-domain
   `aura_flash` fast decode is Phase H (H.1/H.2 open in session-plan).
 
-## Qwen3.6-27B-4bit degenerate output — fix landed, pending test confirmation
+## Gemma4-31B-4bit degenerate output — likely sampling config, unverified
 
-**Was:** greedy decode emitted `"!"` every step at 27B (hidden=5120)
-while Qwen3.5-0.8B on the same engine was coherent. **Fix:**
-verified-shape gates now exclude the 27B shape from both fast paths —
-`Ops.batchedQkvQmmFast` (`Qwen3xText.swift:2032-2049`) and
-`Ops.rmsNormQgemvInt4Fast` (`:2759-2773`) — routing to the safe path.
-Env overrides `FFAI_NO_FUSED_QKV` / `FFAI_NO_FUSED_LM_HEAD` retained.
-
-**Confirmed 2026-05-29.** `Qwen36TextIntegrationTests` PASSED (123 s) in
-the full bisect — the fix holds. **RESOLVED** — stale
-`KNOWN FAILURE (2026-05-27)` comment deleted from `Qwen36TextIntegrationTests.swift`.
-
-## LFM2-MoE — quantized router loaded as plain Linear — RESOLVED 2026-05-29
-
-**Was:** `LFM2TextIntegrationTests` LFM2-MoE case crashed —
-`Ops.swift:406: Precondition failed: gemv: in_dim mismatch 512 vs 2048`.
-**Root cause (the original "router-shape mismatch" framing was wrong):**
-`mlx-community/LFM2-8B-A1B-4bit` ships the router `feed_forward.gate` as
-an **8-bit quantized triplet** (`gate.weight` packed U32 `[32, 512]` +
-`gate.scales`/`gate.biases` `[32, 32]`; logical in=2048 → out=32,
-group_size 64). `buildLFM2MoE` loaded it as a plain `Linear` on the
-packed U32 tensor, so the gemv read in_dim from the packed width (512)
-instead of the logical hidden (2048). It is NOT a bad conversion — the
-gate is deliberately quantized at higher precision than the 4-bit body.
-**Fix:** route the gate through `loadLinear` so the quantized triplet is
-detected and the bit-width derived (commit on `ek/fix-all-the-things`);
-raw checkpoints still fall back to a plain `Linear`. Guarded by
-`ConvertDriverTests.quantizedRouterLoadsViaLoadLinear` (round-trip) +
-the LFM2-MoE integration test. Stale `unsupportedConfig` comment at
-`LFM2Text.swift:198-200` corrected. Separately, `ffai convert` now keeps
-MoE routers full-precision by default (`--router-bits` opts in).
-
-## GPT-OSS-20B-4bit degenerate output — RESOLVED (2026-06-03): NOT a forward bug, it was sampling config
-
-**Root cause: sampling configuration, not a kernel/forward bug.** Verified
-against mlx-lm 0.31.3 on the *identical* `loan-star/gpt-oss-20b-mlx-4Bit`
-checkpoint:
-- **FFAI's forward is bit-coherent with mlx-lm.** Prompt "The history of
-  the printing press began when" → next-token argmax is `' the'` (id 290,
-  logit ~13.5) in BOTH, with top-3 `[290, 261, 1665]` identical. The
-  MXFP4→affine-int4 transcode only reorders the logit tail.
-- **The "degenerate output" is GPT-OSS's OpenAI default sampling**
-  (`temperature 1.0 / top_p 1.0 / no top_k / no min_p` — zero tail
-  truncation) applied to a **RAW completion prompt**. GPT-OSS is a
-  reasoning model tuned for the harmony chat format; sampling the flat
-  low-probability tail at temp 1.0 yields word-salad. **mlx-lm reproduces
-  the IDENTICAL word-salad** under the same config — it is correct,
-  intended behaviour, not an FFAI defect.
-- **Coherent under proper usage**, both impls: greedy, or `min_p 0.05`, or
-  the harmony chat template all produce fluent prose.
-
-`GPTOSSTextIntegrationTests` now carries a hard **forward-parity guard**
-(argmax must equal mlx-lm's 290) plus a `min_p`-constrained coherence
-check. The prior coherence assertion was weak — it only measured token
-*diversity*, which word-salad passes.
-
-**Gemma4-31B-4bit** (`mlx-community/gemma-4-31b-it-4bit`,
-`Gemma4Dense (31B)`, ~10 % diversity; E2B / E4B / 26B-A4B pass) is still
-OPEN and likely the same class — re-test it with constrained sampling /
-the chat template before assuming a kernel bug.
+`mlx-community/gemma-4-31b-it-4bit` (`Gemma4Dense (31B)`) greedy-decodes at
+~10 % diversity while E2B / E4B / 26B-A4B pass. Likely the **same class** as
+the (now-resolved) GPT-OSS-20B case — model default sampling on a RAW prompt
+(flat low-probability tail at temp 1.0 → word-salad), not a kernel/forward
+bug. Re-test with constrained sampling (`min_p 0.05`) or the chat template,
+and add a forward-parity guard vs mlx-lm (like `GPTOSSTextIntegrationTests`
+now has) before assuming a kernel bug.
 
 ## Qwen3-1.7B-3bit degenerate output — model quality floor, NOT a kernel bug
 
@@ -269,24 +214,6 @@ shape. Remaining gaps:
   path.
 - **GGUF** — no parser (Phase 10).
 
-## metaltile `moe_gather_down_q2k_correctness` — RESOLVED (test oracle, not the kernel)
-
-**Was:** `make test` in the sibling **metaltile** repo failed
-`moe_gather_down_q2k_correctness` (the fused MoE down-projection gather over
-a Q2_K-quantized expert weight disagreed with its CPU reference at ~0.71
-relative error), landing with #243.
-
-**Root cause + fix (branch `ek/fix-q2k-gather-down-test`, commit
-`c685e4ce`).** The **kernel was correct** — byte-identical Q2_K dequant math
-to the validated `gguf_dequant_q2_k`. The **test oracle was wrong**: it
-unpacked the 2-bit quants with the naive 4-consecutive-per-byte mapping
-(`in_block/4` byte, `(in_block%4)*2` shift) while the canonical layout (the
-kernel + `gguf_dequant_q2_k`) is the llama.cpp `dequantize_row_q2_K` order
-(2 halves of 128, 4 j-groups of 32, two 16-runs at a shared `jg*2` shift).
-Fix: gave the oracle a `q2_k_qpos` helper identical to `gguf_dequant_q2_k`.
-Both `gather_down_q2k_{f32,f16}` now pass. (Pending PR back to metaltile
-`dev`.)
-
 ## metaltile `test_mel_spectrogram` / `test_mel_spectrogram_magnitude` [f16] — flaky GPU correctness cell
 
 **Symptom.** The metaltile `kernel_tests_harness` umbrella intermittently
@@ -308,28 +235,19 @@ to 4.4e-4 vs the feature-extractor oracle + a coherent audio→text decode).
 log-floor regime, switch the test signal to broadband noise, or pad the test
 audio to `(n_frames-1)*hop + n_fft`.
 
-## Qwen3-VL vision — `Ops.gather: unsupported dtype u32` crash — RESOLVED
+## Qwen3-VL image→text degenerate — non-square native-resolution grid
 
-**Was:** the Qwen3-VL suite aborted at load (`Model.prewarm` → first forward)
-with `FFAI/Ops.swift:371: Fatal error: Ops.gather: unsupported dtype u32`.
-**Root cause:** `Qwen3Vision.load` re-wrapped the checkpoint's `text_config`
-into a fresh `ModelConfig` but dropped the **top-level** `quantization` block
-(MLX VL checkpoints declare it once at the top level, not inside
-`text_config`). The Qwen3Dense backbone then loaded its embedding as a plain
-`Embedding` over the packed-u32 weight (and would have mis-loaded every
-quantized linear). **Fix (commit `14f127d`):** inject the top-level
-`quantization` into the re-wrapped text config. Qwen2/2.5-VL thread
-`quantization` through as a parameter and never had the bug.
-
-**Result.** Qwen3-VL now loads + runs; **video→text is coherent** (the cat
-clip is described correctly), which validates the GPU `Ops.patchUnfoldQwen`
-wiring end-to-end (the multi-frame temporal path). Remaining: **image→text
-still degenerates** — a separate, pre-existing square-grid issue (Qwen3
-`runForward`/`unfoldPatches` assume one square `gridSide`, while the
-native-resolution image processor produces non-square grids; the GPU
-`patch_unfold_qwen` kernel already supports non-square, but the position
-embedding / M-RoPE / merger still assume square). Tracked under the
-smart_resize native-resolution work (the in-progress Qwen×4 processor task).
+Qwen3-VL loads + runs and **video→text is coherent** (validates the GPU
+`Ops.patchUnfoldQwen` multi-frame path), but **image→text still
+degenerates**: `Qwen3 runForward`/`unfoldPatches` + the position-embedding /
+M-RoPE / merger assume one square `gridSide`, while the native-resolution
+image processor produces non-square grids. The GPU `patch_unfold_qwen`
+kernel already supports non-square; the surrounding geometry does not.
+Tracked under the smart_resize native-resolution work (`updated-architecture-overview.md`
+§13 M1; the in-progress Qwen×4 processor task). (The earlier
+`Ops.gather: unsupported dtype u32` load crash on this family is RESOLVED —
+commit `14f127d` injects the top-level `quantization` into the re-wrapped
+text config.)
 
 ## Orphaned GPU kernels still awaiting a consumer
 
@@ -344,13 +262,6 @@ real-time video pipeline lands. `Ops.patchEmbed` (fused unfold+embed) is
 functionally superseded for Gemma4 by `Ops.im2colPatchInterleaved` + the
 existing `Ops.gemm`.
 
-**Resolved:** `Ops.gatedRmsNormQgemvInt4Fast` is now wired (commit
-`8cc1635`) into the **Qwen3.5/3.6 Gated-DeltaNet** decode tail — fusing the
-gated mixer RMSNorm + int4 out_proj when out_proj is 4-bit (group 64) and
-the GDN value dim fits. It was previously mis-attributed to Mamba2; Mamba2's
-global `n_groups=1` norm is incompatible with this per-head gated RMSNorm.
-Validated by `Qwen35TextIntegrationTests` (coherent decode).
-
 ## Tokenizers — InternLM2Tokenizer not registered
 
 Loading InternLM2 logs `InternLM2Tokenizer is not registered, falling
@@ -359,29 +270,6 @@ special-token / chat-template edges are at risk. Fix: register
 `InternLM2Tokenizer` against the SentencePiece/BPE handler where
 `LlamaTokenizer` / `Qwen2Tokenizer` etc. are mapped. Surfaced 2026-05-28
 with the InternLM2 loader work.
-
-## LFM2.5 "forward bug" — RESOLVED: instruct model needs its chat template
-
-Investigated 2026-05-30. **There is no forward bug.** `LiquidAI/LFM2.5-8B-A1B`
-looked degenerate on a RAW prompt ("…when when when … que que"), but it is an
-**instruct / reasoning model** that requires its chat template; LFM2-8B-A1B is
-a base model, which is why raw prompts worked there. Fed a chat-formatted
-prompt, LFM2.5 reasons and answers correctly ("…The answer: Paris…"). The
-conversion (per-expert + stacked), loader, quantization, and forward pass are
-all correct.
-
-**Root cause of the bad first impression:** LFM2.5 ships its chat template as a
-standalone `chat_template.jinja` file, NOT a `chat_template` field in
-`tokenizer_config.json`. swift-transformers' `AutoTokenizer` only loads the
-config field, so `Model.generate(messages:)` had no template and callers fell
-back to raw prompts. **Fix:** `Model.standaloneChatTemplate` reads the
-`.jinja` from the model directory when the tokenizer carries no built-in
-template, and `renderChatTemplate` passes it as a `ChatTemplateArgument.literal`
-override. `Model.supportsChatTemplate` reports availability.
-`LFM2TextIntegrationTests` LFM2.5 case now generates via the chat API and
-asserts coherence + the "Paris" answer. Also wired `InspectTap` into LFM2's
-forward so `ffai inspect --layer-trace` works for the family (it was a silent
-no-op before — used to confirm activations were healthy during this triage).
 
 ## Downloader — Xet-backed HF repos 404 (`ffai download` / `convert` / `Model.load`)
 
