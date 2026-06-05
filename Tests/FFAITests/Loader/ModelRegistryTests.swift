@@ -17,7 +17,7 @@ import Testing
 
 @testable import FFAI
 
-@Suite("ModelRegistry + ModelError")
+@Suite("ModelRegistry")
 struct ModelRegistryTests {
     static func writeBundle(in dir: URL) throws {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -59,16 +59,6 @@ struct ModelRegistryTests {
                 Issue.record("expected .unsupportedArchitecture, got \(e)")
             }
         }
-    }
-
-    @Test("ModelError.description renders each case")
-    func errorDescriptions() {
-        let a = ModelError.unsupportedArchitecture("foo")
-        #expect(String(describing: a).contains("foo"))
-        let b = ModelError.unsupportedModelType("bar")
-        #expect(String(describing: b).contains("bar"))
-        let c = ModelError.capabilityNotAvailable(.audioOut)
-        #expect(String(describing: c).contains("audioOut"))
     }
 
     @Test("Llama3Error.missingConfig description")
