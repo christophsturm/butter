@@ -62,4 +62,51 @@ struct MiniCPM45OmniIntegrationTests {
         #expect(vlm.imageTokenCount == 64)  // resampler query_num
         #expect(vlm.supportsAudio)
     }
+
+    // MARK: - text
+
+    @Test("text — Qwen3-8B backbone chat-generates coherently")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user,
+                    content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        let text = m.tokenizer.decode(tokens: r.generatedTokens, skipSpecialTokens: true)
+        print("MiniCPM-o text → \(text)")
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "minicpmo-text")
+    }
+
+    // MARK: - image → text
+
+    @Test("image + text — describes the dog photo")
+    func imageTextGeneration() async throws {
+        let m = try await Self.loaded.value
+        let vlm = try #require(m.vlModel, "MiniCPM-o is not a VLM")
+
+        let image = try VisionTestHelpers.dogImage()
+        // MiniCPM-o image framing (processing_minicpmo.py): `<image>` +
+        // `<unk>×image_feature_size(64)` + `</image>`, inside a chat turn.
+        // The 64 `<unk>` (vlm.imageTokenId) placeholders are replaced by the
+        // resampler's 64 image tokens.
+        let nImg = vlm.encodeImage(image).shape[0]
+        let pre = m.tokenizer.encode(text: "<|im_start|>user\n<image>")
+        let post = m.tokenizer.encode(
+            text: "</image>\nDescribe this image.<|im_end|>\n<|im_start|>assistant\n")
+        let prompt = pre + Array(repeating: vlm.imageTokenId, count: nImg) + post
+
+        let generated = try vlm.generate(
+            promptTokens: prompt, image: image, maxTokens: 200,
+            eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
+        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        print("MiniCPM-o image → \(text)")
+        expectCoherentOutput(generated, minTokens: 8, label: "MiniCPM-o image")
+        VisionTestHelpers.expectMentionsDog(text, label: "MiniCPM-o")
+    }
 }

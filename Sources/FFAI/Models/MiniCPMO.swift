@@ -49,12 +49,18 @@ public enum MiniCPMO {
     /// video features at — the `<unk>` token (`self.unk_token *
     /// feature_size` in `processing_minicpmo.py`, audio likewise wraps
     /// `<unk>` runs in `audio_start … audio_end`). The same id is used for
-    /// all three modalities; the splice substitutes whichever modality's
-    /// token stream is present (image / video / audio are passed
-    /// separately, so they never collide in one prompt).
-    /// Source: tokenizer `<unk>` id in the mlx-community
-    /// `MiniCPM-o-4_5-4bit` snapshot.
-    public static let placeholderTokenId = 128_244
+    /// DISTINCT per-modality placeholder ids. MiniCPM-o's processor scatters
+    /// vision/audio features over a shared `<unk>` (128244) run, but the
+    /// `VisionModel` splice validates + substitutes EACH modality by token
+    /// id — a shared id makes an image run look like a video run (the splice
+    /// can't tell them apart). The placeholder id is only a splice marker
+    /// (it is replaced by the encoder embedding before the LLM ever sees
+    /// it), so using the model's own distinct `<|image_pad|>` /
+    /// `<|video_pad|>` / `<|audio|>` vocab ids is output-identical and lets
+    /// a single prompt carry more than one modality unambiguously.
+    public static let imageTokenId = 151_655  // <|image_pad|>
+    public static let videoTokenId = 151_656  // <|video_pad|>
+    public static let audioPlaceholderTokenId = 151_698  // <|audio|>
 
     /// Per-image / per-frame vision-token count (`query_num`, 64) — the
     /// perceiver resampler emits exactly this many text-hidden tokens.
@@ -139,7 +145,7 @@ public enum MiniCPMO {
                 weights: weights, audioConfig: audioConfig,
                 textHidden: textEngine.hidden, poolStep: poolStep,
                 quantization: config.quantization, device: device)
-            audioTokenId = placeholderTokenId
+            audioTokenId = audioPlaceholderTokenId
             // The audio encode hook: waveform → log-Mel front-end → Whisper
             // encoder → projector → avg-pool. Mirrors the reference
             // `get_audio_embedding`.
@@ -149,14 +155,12 @@ public enum MiniCPMO {
         }
 
         // ── Cross-modal splice ────────────────────────────────────────
-        // Image, video, and audio share the `<unk>` placeholder id (the
-        // processor uses it for all three). They are supplied to
-        // `generate(...)` independently, so the per-modality token stream
-        // is unambiguous at splice time.
+        // Distinct per-modality placeholder ids (see the constants above) so
+        // the splice disambiguates image / video / audio runs.
         return try VisionModel(
             visionEncoder: vision, engine: textEngine,
-            imageTokenId: placeholderTokenId,
-            videoTokenId: placeholderTokenId,
+            imageTokenId: imageTokenId,
+            videoTokenId: videoTokenId,
             normalization: .siglip,
             imageTokenCount: vision.outputTokenCount,
             audioTokenId: audioTokenId,
