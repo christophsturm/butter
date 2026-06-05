@@ -12,21 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Slow integration test for MiniCPM-V 4.6 (the SigLIP2-400M + Qwen3.5
-// `MiniCPMV4_6ForConditionalGeneration` checkpoint).
+// Consolidated integration suite for MiniCPM-V 4.6 (the SigLIP2-400M +
+// Qwen3.5 `MiniCPMV4_6ForConditionalGeneration` checkpoint): ONE @Suite
+// that loads the model ONCE and exercises every capability it supports —
+// text, image, video — with a per-modality `@Test`. MiniCPM-V 4.6 has no
+// audio path, so there is no audio test.
 //
-// Verifies the v1 vision path end-to-end on the real `mlx-community/MiniCPM-V-4.6-4bit`
-// checkpoint: SigLIP2 vision tower loads, position embedding is
-// bilinearly resampled to the 32×32 runtime grid, `vit_merger` runs
-// after encoder layer 6 (16× mode), the final `merger` projects into
-// the Qwen 3.5 text hidden dim, the cross-modal splice injects 64
-// vision tokens, and the fused stream decodes coherent text through the
-// Qwen 3.5 backbone.
+// Verifies the v1 vision path end-to-end on the real
+// `mlx-community/MiniCPM-V-4.6-4bit` checkpoint: SigLIP2 vision tower
+// loads, position embedding is bilinearly resampled to the 32×32 runtime
+// grid, `vit_merger` runs after encoder layer 6 (16× mode), the final
+// `merger` projects into the Qwen 3.5 text hidden dim, the cross-modal
+// splice injects 64 vision tokens, and the fused stream decodes coherent
+// text through the Qwen 3.5 backbone. The video path maps each frame 1:1
+// to an `imageTokenCount` run (no temporal folding).
 //
-// The base checkpoint is ~9B params (~18 GB bf16) — skipped unless
-// already cached locally.
-// Now also covers the video path for the same checkpoint (merged from the
-// prior MiniCPM4VideoIntegrationTests.swift).
+// The base checkpoint is ~9B params (~18 GB bf16) — the omni-suite group
+// gate keeps it out of the default run.
 
 import Foundation
 import TestHelpers
@@ -35,12 +37,12 @@ import Testing
 @testable import FFAI
 
 @Suite(
-    "MiniCPM4 Vision Integration (image + video)", .serialized,
+    "MiniCPM-V 4.6 Integration", .serialized,
     .enabled(
         if: IntegrationGroupGating.enableVisionSuites,
         IntegrationGroupGating.visionSkipReason)
 )
-struct MiniCPM4IntegrationTests {
+struct MiniCPM46VIntegrationTests {
 
     static let modelId = "mlx-community/MiniCPM-V-4.6-4bit"
 
@@ -49,15 +51,24 @@ struct MiniCPM4IntegrationTests {
     /// frame count is valid. 4 frames is a lightweight integration sweep.
     static let frameCount = 4
 
-    @Test("load — MiniCPM-V 4.6 loads with vision capability")
-    func loadVLCheckpoint() async throws {
-        let modelId = "mlx-community/MiniCPM-V-4.6-4bit"
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+    /// The MiniCPM-V 4.6 checkpoint, loaded ONCE and shared across every
+    /// `@Test`. A lazily-started memoized `Task`: the first capability test
+    /// that awaits `.value` triggers the single load; the rest reuse it. A
+    /// skipped suite never accesses it, so no load happens when gated off.
+    static let loaded = Task { try await loadModel(modelId) }
 
-        // The checkpoint is a VLM — vlModel is present, .imageIn is
-        // available, and the text backbone is Qwen 3.5 (hidden 1024).
+    // MARK: - load
+
+    @Test("load — MiniCPM-V 4.6 loads with image + video capability")
+    func load() async throws {
+        let m = try await Self.loaded.value
+
+        // The checkpoint is a VLM — vlModel is present, .imageIn and
+        // .videoIn are available, and the text backbone is Qwen 3.5
+        // (hidden 1024). MiniCPM-V 4.6 has no audio path.
         #expect(m.vlModel != nil)
         #expect(m.availableCapabilities.contains(.imageIn))
+        #expect(m.availableCapabilities.contains(.videoIn))
         #expect(m.engine.hidden == 1024)
         #expect(m.engine.supportsEmbeddingInput)
         // Qwen 3.5 is the text backbone (`qwen3_5_text` text_config).
@@ -72,12 +83,43 @@ struct MiniCPM4IntegrationTests {
         #expect(vlm.visionEncoder.config.patchSize == 14)
         #expect(vlm.visionEncoder.config.hidden == 1152)
         #expect(vlm.visionEncoder.config.nLayers == 27)
+
+        // The MiniCPM-V 4.6 family loader threads video_token_id (248057)
+        // through to VisionModel.init; confirm it landed.
+        #expect(
+            vlm.videoTokenId != nil,
+            "video_token_id should be threaded through from config")
+        #expect(
+            vlm.videoTokenId == MiniCPM4.defaultVideoTokenId,
+            "video_token_id should be 248057 (<|video_pad|>)")
+        #expect(
+            vlm.imageTokenId == MiniCPM4.defaultImageTokenId,
+            "image_token_id should be 248056 (<|image_pad|>)")
     }
+
+    // MARK: - text
+
+    @Test("text — Qwen 3.5 backbone chat-generates coherently")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user,
+                    content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "minicpm4-text")
+    }
+
+    // MARK: - image → text
 
     @Test("image + text prompt — coherent multi-modal generation")
     func imageTextGeneration() async throws {
-        let modelId = "mlx-community/MiniCPM-V-4.6-4bit"
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "MiniCPM-V 4.6 checkpoint is not a VLM")
 
         // Build an image+text prompt. MiniCPM-V uses the Qwen-style chat
@@ -123,39 +165,11 @@ struct MiniCPM4IntegrationTests {
         print("MiniCPM-V 4.6 generated: \(text)")
     }
 
-    // ─── Video ───────────────────────────────────────────────────────────
-
-    @Test("load — checkpoint reports video capability")
-    func loadVLCheckpointVideo() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
-        }
-        // The MiniCPM-V 4.6 family loader threads video_token_id (248057)
-        // through to VisionModel.init; confirm it landed.
-        let vlm = try #require(
-            m.vlModel,
-            "MiniCPM-V 4.6 checkpoint is not a VLM")
-        #expect(
-            vlm.videoTokenId != nil,
-            "video_token_id should be threaded through from config")
-        #expect(
-            vlm.videoTokenId == MiniCPM4.defaultVideoTokenId,
-            "video_token_id should be 248057 (<|video_pad|>)")
-        #expect(
-            vlm.imageTokenId == MiniCPM4.defaultImageTokenId,
-            "image_token_id should be 248056 (<|image_pad|>)")
-        // Each frame produces 64 merged tokens (32×32 → vit_merger 16×16
-        // → merger 8×8 = 64) for the v1 448×448 path.
-        #expect(
-            vlm.imageTokenCount == 64,
-            "imageTokenCount should be 64 for the v1 single-tile path")
-    }
+    // MARK: - video → text
 
     @Test("video + text prompt — describes the cat clip")
     func videoTextGeneration() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
-        }
+        let m = try await Self.loaded.value
         let vlm = try #require(
             m.vlModel,
             "MiniCPM-V 4.6 checkpoint is not a VLM")

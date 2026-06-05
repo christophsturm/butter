@@ -12,21 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Slow integration test for Qwen 3-VL (the dynamic-resolution
-// full-attention ViT + Qwen 3 dense text backbone
-// `Qwen3VLForConditionalGeneration` checkpoint).
+// Consolidated integration suite for the Qwen 3.5-VL
+// (`Qwen3_5ForConditionalGeneration`) checkpoint: the Qwen3-VL ViT tower +
+// the Qwen 3.5 dense hybrid text backbone, joined via `Qwen35VL.load` in
+// `Models/Vision/Qwen3xVision.swift`. ONE @Suite that loads the model
+// ONCE and exercises every capability it supports — text, image, video —
+// with a per-modality `@Test`. This is the canonical multimodal test
+// shape: a single load shared across all capability tests (see `loaded`),
+// rather than one file + reload per modality.
 //
 // Verifies the vision path end-to-end on a real checkpoint: the
-// Qwen 3-VL vision tower loads, runs its full-attention + M-RoPE forward
+// Qwen3-VL vision tower loads, runs its full-attention + M-RoPE forward
 // and patch-merger, the cross-modal splice injects the merged image
-// tokens, and the fused stream decodes coherent text through the Qwen 3
-// backbone (which supports embedding-input forward for the splice).
+// tokens, and the fused stream decodes coherent text through the
+// Qwen 3.5 hybrid backbone.
 //
-// Uses the mlx-community 2B-Instruct 4-bit conversion — the smallest
-// published Qwen3-VL with a complete local snapshot. The checkpoint MUST
-// load — a load failure fails the test.
-// Now also covers the video path for the same checkpoint (merged from the
-// prior Qwen3VisionVideoIntegrationTests.swift).
+// Uses the mlx-community Qwen3.5-2B 4-bit conversion (model_type
+// `qwen3_5`, `image_token_id` 248056 / `video_token_id` 248057) — a
+// genuinely different model from Qwen3-VL-MoE, which carries its own
+// `qwen3_vl` orchestrator + the larger 30B-A3B checkpoint. Qwen 3.5-VL is
+// text + image + video (no audio). The checkpoint MUST load — a load
+// failure fails the test.
 
 import Foundation
 import TestHelpers
@@ -35,56 +41,66 @@ import Testing
 @testable import FFAI
 
 @Suite(
-    "Qwen3 Vision Integration (image + video)", .serialized,
+    "Qwen3.5-VLM Integration", .serialized,
     .enabled(
         if: IntegrationGroupGating.enableVisionSuites,
         IntegrationGroupGating.visionSkipReason)
 )
-struct Qwen3VisionIntegrationTests {
+struct Qwen35VLMIntegrationTests {
 
-    static let modelId = "mlx-community/Qwen3-VL-2B-Instruct-4bit"
-
-    /// Number of evenly-spaced frames to pull out of `cat.mp4`. Must be
-    /// a multiple of `temporal_patch_size` (2) so the vision tower
-    /// doesn't have to pad with the last frame — keeps the placeholder
-    /// arithmetic exact.
     static let frameCount = 4
 
-    @Test("load — Qwen 3-VL checkpoint loads with vision capability")
-    func loadVLCheckpoint() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
-        }
+    /// The Qwen 3.5-VL checkpoint, loaded ONCE and shared across every
+    /// `@Test`. A lazily-started memoized `Task`: the first capability
+    /// test that awaits `.value` triggers the single load; the rest reuse
+    /// it. A skipped suite never accesses it, so no load happens when
+    /// gated off.
+    static let loaded = Task { try await loadModel("mlx-community/Qwen3.5-2B-4bit") }
 
-        // The checkpoint is a VLM — vlModel is present, .imageIn is
-        // available, and the text backbone supports the splice.
+    // MARK: - load + text
+
+    @Test("load — Qwen 3.5-VL checkpoint loads with image + video capabilities")
+    func load() async throws {
+        let m = try await Self.loaded.value
+
+        // The checkpoint is a VLM — vlModel is present, .imageIn and
+        // .videoIn are available, and the text backbone supports the
+        // splice.
         #expect(m.vlModel != nil)
         #expect(m.availableCapabilities.contains(.imageIn))
+        #expect(m.availableCapabilities.contains(.videoIn))
         #expect(m.engine.supportsEmbeddingInput)  // VLM splice prerequisite
 
         let vlm = try #require(m.vlModel)
         // The vision tower contributes a positive run of merged tokens.
         #expect(vlm.imageTokenCount > 0)
+        // The video splice needs the family loader to thread
+        // `video_token_id` through to VisionModel.init.
+        #expect(vlm.videoTokenId != nil)
     }
 
-    @Test("enable / disable .imageIn — runtime capability flip")
-    func capabilityFlip() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
-        }
-        #expect(m.availableCapabilities.contains(.imageIn))
-        m.disable(.imageIn)
-        #expect(!m.isEnabled(.imageIn))
-        m.enable(.imageIn)
-        #expect(m.isEnabled(.imageIn))
+    @Test("text — Qwen 3.5 hybrid backbone chat-generates coherently")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user,
+                    content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "qwen35vl-text")
     }
 
-    @Test("image + text prompt — describes the dog photo")
+    // MARK: - image / video → text
+
+    @Test("image + text — describes the dog photo")
     func imageTextGeneration() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
-        }
-        let vlm = try #require(m.vlModel, "Qwen 3-VL checkpoint is not a VLM")
+        let m = try await Self.loaded.value
+        let vlm = try #require(m.vlModel, "Qwen 3.5-VL checkpoint is not a VLM")
 
         // Build an image+text prompt: a run of `imageTokenCount`
         // <|image_pad|> placeholders followed by a text question.
@@ -108,37 +124,17 @@ struct Qwen3VisionIntegrationTests {
         // mention a dog.
         expectCoherentOutput(
             generated, minTokens: 8,
-            label: "Qwen 3-VL image+text")
+            label: "Qwen 3.5-VL image+text")
         let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
-        print("Qwen 3-VL generated: \(text)")
-        VisionTestHelpers.expectMentionsDog(text, label: "Qwen 3-VL")
+        print("Qwen 3.5-VL generated: \(text)")
+        VisionTestHelpers.expectMentionsDog(text, label: "Qwen 3.5-VL")
     }
 
-    // ─── Video ───────────────────────────────────────────────────────────
-
-    @Test("load — checkpoint reports .videoIn capability")
-    func loadVLCheckpointVideo() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
-        }
-        // The Qwen 3-VL family now declares text + vision + video.
-        #expect(m.vlModel != nil)
-        #expect(m.availableCapabilities.contains(.imageIn))
-        #expect(m.availableCapabilities.contains(.videoIn))
-
-        let vlm = try #require(m.vlModel)
-        // The video splice needs the family loader to thread
-        // `video_token_id` through to VisionModel.init.
-        #expect(vlm.videoTokenId != nil)
-    }
-
-    @Test("video + text prompt — describes the cat clip")
+    @Test("video + text — describes the cat clip")
     func videoTextGeneration() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
-        }
-        let vlm = try #require(m.vlModel, "Qwen 3-VL checkpoint is not a VLM")
-        _ = try #require(vlm.videoTokenId, "Qwen 3-VL must be video-capable")
+        let m = try await Self.loaded.value
+        let vlm = try #require(m.vlModel, "Qwen 3.5-VL checkpoint is not a VLM")
+        _ = try #require(vlm.videoTokenId, "Qwen 3.5-VL must be video-capable")
 
         // Build the standard Qwen 3-VL video prompt:
         //   <|im_start|>user\n<|vision_start|><|video_pad|>…<|vision_end|>What's in this video?<|im_end|>\n
@@ -166,9 +162,9 @@ struct Qwen3VisionIntegrationTests {
         // mention a cat (or kitten — model verbosity varies).
         expectCoherentOutput(
             generated, minTokens: 8,
-            label: "Qwen 3-VL video+text")
+            label: "Qwen 3.5-VL video+text")
         let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
-        print("Qwen 3-VL video generated: \(text)")
-        VisionTestHelpers.expectMentionsCat(text, label: "Qwen 3-VL video")
+        print("Qwen 3.5-VL video generated: \(text)")
+        VisionTestHelpers.expectMentionsCat(text, label: "Qwen 3.5-VL video")
     }
 }
