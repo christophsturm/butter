@@ -42,11 +42,11 @@
 # Usage:
 #   ./scripts/integration-bisect.sh                  # all suites
 #   ./scripts/integration-bisect.sh Whisper Llama   # named suites only
-#   PER_TEST_TIMEOUT=600 ./scripts/integration-bisect.sh
+#   PER_TEST_TIMEOUT=300 ./scripts/integration-bisect.sh
 #
 # Env vars:
 #   PER_TEST_TIMEOUT  Seconds before a suite is treated as hung
-#                     (SIGTERM, then SIGKILL). Default 900 (15 min).
+#                     (SIGTERM, then SIGKILL). Default 300 (5 min).
 #   GPU_SETTLE_SEC    Seconds to wait after a suite exits before
 #                     sampling GPU util. Default 3.
 #   GPU_PIN_THRESHOLD Percent above which the GPU counts as pinned.
@@ -61,7 +61,7 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
-PER_TEST_TIMEOUT="${PER_TEST_TIMEOUT:-900}"
+PER_TEST_TIMEOUT="${PER_TEST_TIMEOUT:-300}"
 GPU_SETTLE_SEC="${GPU_SETTLE_SEC:-3}"
 GPU_PIN_THRESHOLD="${GPU_PIN_THRESHOLD:-50}"
 OUTPUT="${OUTPUT:-planning/integration-bisect-$(date -u +%Y%m%d-%H%M%S).md}"

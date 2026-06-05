@@ -176,7 +176,7 @@ integration-bisect: regenerate-kernels ## run each ModelIntegrationTests/*Integr
 	@#   make integration-bisect SUITES="Whisper Llama"
 	@#
 	@# Or use the script directly for per-suite timeouts:
-	@#   PER_TEST_TIMEOUT=600 ./scripts/integration-bisect.sh Whisper
+	@#   PER_TEST_TIMEOUT=300 ./scripts/integration-bisect.sh Whisper
 	./scripts/integration-bisect.sh $(SUITES)
 
 # ─── Lint / format ────────────────────────────────────────────────────

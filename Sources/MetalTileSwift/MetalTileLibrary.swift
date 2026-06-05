@@ -118,7 +118,7 @@ public final class MetalTileLibrary: @unchecked Sendable {
         // Remove once the freeze diagnostic settles.
         FileHandle.standardError.write(
             Data(
-                "[MetalTileLibrary] maxCommandBufferCount=\(cap) (FFAI_MAX_COMMAND_BUFFERS=\(ProcessInfo.processInfo.environment["FFAI_MAX_COMMAND_BUFFERS"] ?? "<unset>"))\n"
+                "[MetalTileLibrary] maxCommandBufferCount=\(cap) (FFAI_MAX_COMMAND_BUFFERS=\(ProcessInfo.processInfo.environment["FFAI_MAX_COMMAND_BUFFERS"] ?? "\(Self.defaultMaxCommandBufferCount)"))\n"
                     .utf8
             ))
         guard
