@@ -147,3 +147,111 @@ Cross-cutting rule (Q4): **every Source move/rename mirrors into `Tests/`** — 
 
 - `ModelInput` struct-payload field design (messages/tools/images vs waveform vs voice) — design when Phase 3 lands, not before.
 - Whether `Model.load` for directory-only audio/vad needs a pre-decode step shared with text (Phase 4 detail).
+
+## Phase 3 API sketch (proposed — awaiting sign-off)
+
+### Engine protocol layer (`FFAI/ModelType/`)
+
+```swift
+// Base — every loadable engine. Metadata/lifecycle only (D1: no forward here).
+public protocol ModelEngine: Module {
+    var capabilities: Set<Capability> { get }
+    var dtype: DType { get }
+}
+
+// Text generation (LLM/VLM). The existing `LanguageModel` becomes this (rename or
+// `LanguageModel: TextEngine` alias — decision T1). Keeps today's forward surface.
+public protocol TextEngine: ModelEngine {
+    var hidden: Int { get }; var maxContextWindow: Int { get }
+    func makeLayerCaches(maxSeq: Int?, device: Device) -> [any LayerCacheProtocol]
+    func forward(tokenId: Int, position: Int, caches: [any LayerCacheProtocol],
+                 on: MTLCommandBuffer, device: Device) -> Tensor
+    func forwardMulti(tokenIds: [Int], startingAt: Int, caches: [any LayerCacheProtocol],
+                      on: MTLCommandBuffer, device: Device) -> Tensor   // keep name (T2)
+    func forward(inputEmbedding: Tensor, position: Int, …) -> Tensor    // VLM splice
+    func textEmbedding(tokenId: Int, device: Device) -> Tensor
+}
+public protocol Transcribing: ModelEngine {                            // STT
+    func transcribe(_ w: [Float], parameters: TranscribeParameters, device: Device)
+        async throws -> TranscriptionResult
+    func transcribeStream(_ w: [Float], parameters: TranscribeParameters)
+        -> AsyncThrowingStream<String, Error>
+}
+public protocol Synthesizing: ModelEngine {                            // TTS
+    var sampleRate: Int { get }
+    func synthesize(_ text: String, parameters: AudioGenerationParameters, device: Device)
+        async throws -> [Float]
+    func synthesizeStream(_ text: String, parameters: AudioGenerationParameters)
+        -> AsyncThrowingStream<[Float], Error>
+}
+public protocol SpeechTransforming: ModelEngine {                      // STS
+    var sampleRate: Int { get }
+    func process(_ w: [Float], device: Device) async throws -> [Float]
+}
+public protocol Detecting: ModelEngine {                              // VAD
+    func detect(_ w: [Float], device: Device) async throws -> [DetectionEvent]
+}
+```
+A family conforms to one or several (omni → `TextEngine` + `Transcribing`).
+
+### Input / output sum types (D2: tagged enums + struct payloads)
+
+```swift
+public enum ModelInput: Sendable {
+    case text(TextRequest)             // messages + params + tools
+    case imageText(ImageTextRequest)   // images + messages
+    case video(VideoTextRequest)
+    case audio(AudioRequest)           // waveform [+ prompt]  (STT / omni)
+    case speak(SpeakRequest)           // text + voice         (TTS)
+    case transform(AudioWaveform)      // STS
+    case detect(AudioWaveform)         // VAD
+    // future: .imageGen, .videoGen, .segment
+}
+public struct TextRequest: Sendable {
+    public var messages: [ChatMessage]; public var parameters: GenerationParameters
+    public var tools: [Tool]?
+}
+// …ImageTextRequest / AudioRequest / SpeakRequest analogous (struct per case).
+
+public enum GenerationChunk: Sendable {           // streaming
+    case textDelta(String); case audioSamples([Float]); case detections([DetectionEvent])
+}
+public enum GenerationResult: Sendable {          // batch
+    case text(String); case transcript(TranscriptionResult)
+    case audio([Float]); case detections([DetectionEvent])
+}
+```
+
+### Unified `Model` (FFAI/Model.swift)
+
+```swift
+public final class Model {
+    public let engine: any ModelEngine
+    public let kind: ModelKind
+    public let capabilities: Set<Capability>
+    public let tokenizer: (any Tokenizer)?
+    public let vlModel: VisionModel?
+
+    public static func load(_ id: String, options:, device:) async throws -> Model  // ALL kinds
+
+    // Generic surface — validates input vs kind, throws ModelError.unsupportedInput on mismatch.
+    public func generate(_ input: ModelInput) async throws -> GenerationResult
+    public func generateStream(_ input: ModelInput) -> AsyncThrowingStream<GenerationChunk, Error>
+
+    // Typed convenience (wrap generate; same unsupportedInput guard).
+    public func generateText(_ messages: [ChatMessage], parameters: GenerationParameters) async throws -> String
+    public func transcribe(_ w: [Float], parameters: TranscribeParameters) async throws -> TranscriptionResult
+    public func synthesize(_ text: String, voice: String?, parameters: AudioGenerationParameters) async throws -> [Float]
+    public func detect(_ w: [Float]) async throws -> [DetectionEvent]
+}
+```
+`generate` dispatches by `engine as? <ModalityProtocol>`; the existing
+`Generation/Generate.driveGeneration` backs the text path.
+
+### Decisions needed before implementing
+
+- **T1** — rename `LanguageModel` → `TextEngine`, or keep `LanguageModel` as `: TextEngine` (less churn; ~40 conformers + many call sites)? *Recommend keep `LanguageModel`, refine to `: TextEngine`.*
+- **T2** — keep `forwardMulti` name (vs the plan's `forwardMany`)? *Recommend keep `forwardMulti` — it's the existing name across all engines.*
+- **T3** — `ChatMessage` / `Tool`: reuse the existing `Generation/ChatTemplate` types, or new? Need to reconcile.
+- **T4** — new types `TranscribeParameters`, `DetectionEvent` (small structs) — confirm names.
+- **T5** — `Model.generate` returning a sum type means the CLI `generate`/`transcribe`/`speak` commands switch on it (or use the typed convenience). Confirm the typed-convenience methods are the primary CLI entry.
