@@ -80,15 +80,17 @@ struct Qwen3VLMIntegrationTests {
         #expect(vlm.videoTokenId != nil)
     }
 
-    @Test("text — VL backbone chat-generates coherently")
+    @Test("text — VL backbone generates coherently (text-only prompt)")
     func textGeneration() async throws {
         let m = try await Self.loaded.value
+        // Hand-frame the chat turn (the image/video tests do the same) rather
+        // than go through `generate(messages:)`: the Qwen 3-VL chat template
+        // is geared for vision turns and degenerates on a text-only message.
+        let prompt =
+            "<|im_start|>user\nName three primary colors, comma-separated."
+            + "<|im_end|>\n<|im_start|>assistant\n"
         let r = try await m.generate(
-            messages: [
-                ChatMessage(
-                    role: .user,
-                    content: "Name three primary colors, comma-separated.")
-            ],
+            prompt: prompt,
             parameters: m.defaultGenerationParameters.with {
                 $0.maxTokens = 64
                 $0.temperature = 0
@@ -103,19 +105,22 @@ struct Qwen3VLMIntegrationTests {
         let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "Qwen 3-VL checkpoint is not a VLM")
 
-        // Build an image+text prompt: a run of `imageTokenCount`
-        // <|image_pad|> placeholders followed by a text question.
-        let imageTokenId = vlm.imageTokenId
-        let questionTokens = m.tokenizer.encode(
-            text: "<|im_start|>user\nDescribe this image.<|im_end|>\n"
-                + "<|im_start|>assistant\n")
-        let promptTokens =
-            Array(
-                repeating: imageTokenId,
-                count: vlm.imageTokenCount) + questionTokens
-
         // A real photograph — the golden-retriever fixture.
         let image = try VisionTestHelpers.dogImage()
+
+        // Build the standard Qwen 3-VL image prompt: the <|vision_start|> …
+        // <|vision_end|> markers wrapping a run of <|image_pad|> placeholders
+        // sized to the image's NATIVE-resolution token count (Qwen 3-VL is a
+        // native-resolution tower — `imageTokenCount` is only the nominal
+        // square count; the actual count comes from `encodeImage`).
+        let nImg = vlm.encodeImage(image).shape[0]
+        let preTokens = m.tokenizer.encode(
+            text: "<|im_start|>user\n<|vision_start|>")
+        let postTokens = m.tokenizer.encode(
+            text: "<|vision_end|>Describe this image.<|im_end|>\n"
+                + "<|im_start|>assistant\n")
+        let promptTokens =
+            preTokens + Array(repeating: vlm.imageTokenId, count: nImg) + postTokens
 
         let generated = try vlm.generate(
             promptTokens: promptTokens, image: image,
