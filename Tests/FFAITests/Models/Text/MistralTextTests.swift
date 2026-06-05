@@ -19,22 +19,23 @@
 // the Llama family. This file exists so the source-to-test mirror is
 // complete (every Models/Text/<X>Text.swift has a corresponding
 // Tests/FFAITests/Models/Text/<X>TextTests.swift) and asserts the
-// routing contract: `Mistral.variant(for:)` returns `LlamaDense.self`.
+// routing contract: `Mistral.variant(for:)` returns `MistralDense` (a thin
+// variant over the shared `LlamaDense` engine — Mistral is Llama-shaped).
 
 import Foundation
 import Testing
 
 @testable import FFAI
 
-@Suite("MistralText Routes Through LlamaDense")
+@Suite("MistralText Variant Routing")
 struct MistralTextTests {
 
-    @Test("Mistral.variant(for:) returns LlamaDense — Mistral has no own variant")
-    func routesThroughLlamaDense() throws {
+    @Test("Mistral.variant(for:) returns MistralDense")
+    func routesThroughMistralDense() throws {
         let cfg = ModelConfig(
             architecture: "MistralForCausalLM",
             modelType: "mistral", raw: [:])
         let v = try Mistral.variant(for: cfg)
-        #expect(String(describing: v) == String(describing: LlamaDense.self))
+        #expect(String(describing: v) == String(describing: MistralDense.self))
     }
 }

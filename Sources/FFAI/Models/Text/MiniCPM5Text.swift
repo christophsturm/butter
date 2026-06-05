@@ -14,20 +14,38 @@
 //
 // MiniCPM5Text — the TEXT component of the MiniCPM5 family. MiniCPM5-1B
 // declares a plain `LlamaForCausalLM` / `llama` architecture, so its text
-// backbone reuses the in-tree Llama dense stack. This is a thin adapter so
-// the `MiniCPM5` entrypoint composes its component stacks uniformly — the
-// seam where a future multimodal v5 adds vision / audio components.
+// backbone reuses the in-tree Llama dense stack via the `MiniCPM5Dense`
+// variant. This is the seam where a future multimodal v5 adds vision /
+// audio components alongside the text variant.
 
 import Foundation
 
-public enum MiniCPM5Text {
-    /// Load the text engine for a MiniCPM5 checkpoint via the Llama variant
-    /// loader (MiniCPM5-1B is a standard GQA Llama shape).
-    public static func load(
+// ─── Variant protocol ────────────────────────────────────────────────
+
+/// MiniCPM5's text engine is the shared `LlamaModel` (Llama-3-shaped).
+public typealias MiniCPM5Model = LlamaModel
+
+public protocol MiniCPM5Variant {
+    static var availableCapabilities: Set<Capability> { get }
+    static var defaultGenerationParameters: GenerationParameters { get }
+    static func loadModel(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
-    ) throws -> any LanguageModel {
-        try Llama.variant(for: config).loadModel(
+    ) throws -> MiniCPM5Model
+}
+
+/// The single MiniCPM5 text variant — the Llama dense backbone.
+/// MiniCPM5-1B is a standard GQA Llama shape, so it reuses `LlamaDense`.
+public enum MiniCPM5Dense: MiniCPM5Variant {
+    public static let availableCapabilities: Set<Capability> = Capability.textOnly
+    public static let defaultGenerationParameters =
+        LlamaDense.defaultGenerationParameters
+
+    public static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> MiniCPM5Model {
+        try LlamaDense.loadModel(
             config: config, weights: weights, options: options, device: device)
     }
 }

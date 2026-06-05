@@ -28,6 +28,12 @@ public enum Granite3 {
     public static let modelTypes: Set<String> = ["granite"]
     public static let architectures: Set<String> = ["GraniteForCausalLM"]
 
+    /// Pick the concrete text variant. Granite 3 ships a single dense
+    /// variant (`Granite3Dense`).
+    public static func variant(for _: ModelConfig) throws -> any Granite3Variant.Type {
+        Granite3Dense.self
+    }
+
     /// µP multipliers declared in a Granite 3.x `config.json`. Granite
     /// trains with maximal-update-parametrization, so these scale the
     /// embeddings, attention scores, residual branches, and final
@@ -40,5 +46,36 @@ public enum Granite3 {
             attention: config.float("attention_multiplier").map { Float($0) },
             residual: Float(config.float("residual_multiplier") ?? 1.0),
             logits: Float(config.float("logits_scaling") ?? 1.0))
+    }
+}
+
+// ─── Variant protocol ────────────────────────────────────────────────
+
+/// Granite 3's text engine is the shared `LlamaModel` (Llama-3-shaped).
+public typealias Granite3Model = LlamaModel
+
+public protocol Granite3Variant {
+    static var availableCapabilities: Set<Capability> { get }
+    static var defaultGenerationParameters: GenerationParameters { get }
+    static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Granite3Model
+}
+
+/// The single Granite 3 text variant — the Llama dense backbone with the
+/// four µP multipliers folded into the weights at load.
+public enum Granite3Dense: Granite3Variant {
+    public static let availableCapabilities: Set<Capability> = Capability.textOnly
+    public static let defaultGenerationParameters =
+        LlamaDense.defaultGenerationParameters
+
+    public static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Granite3Model {
+        try LlamaDense.loadModel(
+            config: config, weights: weights, options: options,
+            device: device, muP: Granite3.muP(from: config))
     }
 }

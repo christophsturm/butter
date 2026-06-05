@@ -46,7 +46,9 @@
 import Foundation
 import Metal
 
-public enum InternLM2Dense {
+public enum InternLM2Dense: InternLM2Variant {
+
+    public static let availableCapabilities: Set<Capability> = Capability.textOnly
 
     /// InternLM2 dense defaults — Llama-shaped, greedy-friendly.
     public static let defaultGenerationParameters = LlamaDense.defaultGenerationParameters

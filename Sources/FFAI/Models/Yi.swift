@@ -21,4 +21,40 @@ import Foundation
 public enum Yi {
     public static let modelTypes: Set<String> = ["yi"]
     public static let architectures: Set<String> = ["YiForCausalLM"]
+
+    /// Pick the concrete text variant. Yi ships a single dense variant
+    /// (`YiDense`).
+    public static func variant(for _: ModelConfig) throws -> any YiVariant.Type {
+        YiDense.self
+    }
+}
+
+// ─── Variant protocol ────────────────────────────────────────────────
+
+/// Yi's text engine is the shared `LlamaModel` (Llama-3-shaped).
+public typealias YiModel = LlamaModel
+
+public protocol YiVariant {
+    static var availableCapabilities: Set<Capability> { get }
+    static var defaultGenerationParameters: GenerationParameters { get }
+    static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> YiModel
+}
+
+/// The single Yi text variant — the Llama dense backbone (optional QKV
+/// biases auto-detected by `loadLinear`).
+public enum YiDense: YiVariant {
+    public static let availableCapabilities: Set<Capability> = Capability.textOnly
+    public static let defaultGenerationParameters =
+        LlamaDense.defaultGenerationParameters
+
+    public static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> YiModel {
+        try LlamaDense.loadModel(
+            config: config, weights: weights, options: options, device: device)
+    }
 }

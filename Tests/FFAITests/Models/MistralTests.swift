@@ -39,12 +39,12 @@ struct MistralRootTests {
         #expect(!Mistral.architectures.isEmpty)
     }
 
-    @Test("variant(for:) routes to LlamaDense (Mistral has no variants of its own)")
+    @Test("variant(for:) returns MistralDense (a thin variant over LlamaDense)")
     func variantDispatch() throws {
         let cfg = ModelConfig(
             architecture: "MistralForCausalLM",
             modelType: "mistral", raw: [:])
         let v = try Mistral.variant(for: cfg)
-        #expect(String(describing: v) == String(describing: LlamaDense.self))
+        #expect(String(describing: v) == String(describing: MistralDense.self))
     }
 }

@@ -569,42 +569,54 @@ public enum ModelRegistry {
         // every Mistral 7B / Nemo / Small checkpoint Just Works without
         // a separate dense engine.
         if let arch = config.architecture, Mistral.architectures.contains(arch) {
-            return try loadLlama(
+            return try loadMistral(
                 config: config, weights: weights,
                 options: options, device: device)
         }
         if let mt = config.modelType, Mistral.modelTypes.contains(mt) {
-            return try loadLlama(
+            return try loadMistral(
                 config: config, weights: weights,
                 options: options, device: device)
         }
-        // Llama-compatible families: SmolLM 1/2/3, OLMo 1/2, Granite 3,
-        // Yi, InternLM 2. Same weight layout + forward shape as Llama 3;
-        // optional QKV biases auto-detected by loadLinear. Each has its
-        // own family root under `Models/` (per the universal "one file
-        // per family root" rule) but they all dispatch through
-        // `loadLlama` until / unless they diverge from the Llama-3 shape.
+        // Llama-compatible families: SmolLM 1/2/3, OLMo 1, Yi. Same
+        // weight layout + forward shape as Llama 3; optional QKV biases
+        // auto-detected by loadLinear. Each has its own family root under
+        // `Models/` with a `<F>Dense` variant over `LlamaDense`, and its
+        // own `load<F>` helper, until / unless it diverges from the
+        // Llama-3 shape.
         //
         // NOTE: Starcoder 2 was previously in this set but is
         // structurally distinct (LayerNorm with bias, GELU-tanh
         // single-projection MLP with c_fc/c_proj names, `norm_epsilon`
         // config field). It now routes through its own loader; see
         // below.
-        let llamaCompatibleArchs: Set<String> =
-            SmolLM.architectures
-            .union(OLMo.olmo1Architectures)
-            .union(Yi.architectures)
-        let llamaCompatibleTypes: Set<String> =
-            SmolLM.modelTypes
-            .union(OLMo.olmo1ModelTypes)
-            .union(Yi.modelTypes)
-        if let arch = config.architecture, llamaCompatibleArchs.contains(arch) {
-            return try loadLlama(
+        if let arch = config.architecture, SmolLM.architectures.contains(arch) {
+            return try loadSmolLM(
                 config: config, weights: weights,
                 options: options, device: device)
         }
-        if let mt = config.modelType, llamaCompatibleTypes.contains(mt) {
-            return try loadLlama(
+        if let mt = config.modelType, SmolLM.modelTypes.contains(mt) {
+            return try loadSmolLM(
+                config: config, weights: weights,
+                options: options, device: device)
+        }
+        if let arch = config.architecture, OLMo.olmo1Architectures.contains(arch) {
+            return try loadOLMo1(
+                config: config, weights: weights,
+                options: options, device: device)
+        }
+        if let mt = config.modelType, OLMo.olmo1ModelTypes.contains(mt) {
+            return try loadOLMo1(
+                config: config, weights: weights,
+                options: options, device: device)
+        }
+        if let arch = config.architecture, Yi.architectures.contains(arch) {
+            return try loadYi(
+                config: config, weights: weights,
+                options: options, device: device)
+        }
+        if let mt = config.modelType, Yi.modelTypes.contains(mt) {
+            return try loadYi(
                 config: config, weights: weights,
                 options: options, device: device)
         }
@@ -900,26 +912,92 @@ public enum ModelRegistry {
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> Loaded {
-        let engine = try LlamaDense.loadModel(
-            config: config, weights: weights, options: options,
-            device: device, muP: Granite3.muP(from: config))
+        let variant = try Granite3.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights, options: options, device: device)
         return Loaded(
             engine: engine,
-            defaultGenerationParameters: LlamaDense.defaultGenerationParameters)
+            defaultGenerationParameters: variant.defaultGenerationParameters,
+            availableCapabilities: variant.availableCapabilities)
+    }
+
+    /// Mistral 7B / Nemo / Small (`MistralForCausalLM`). Same shape as
+    /// Llama 3 dense, so it reuses `LlamaDense` via the `MistralDense`
+    /// variant.
+    public static func loadMistral(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try Mistral.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights, options: options, device: device)
+        return Loaded(
+            engine: engine,
+            defaultGenerationParameters: variant.defaultGenerationParameters,
+            availableCapabilities: variant.availableCapabilities)
+    }
+
+    /// OLMo 1 (`OlmoForCausalLM`). Pre-norm Llama-shaped; reuses
+    /// `LlamaDense` via the `OLMoDense` variant. OLMo 2 (`olmo2`) is
+    /// post-norm with q/k-norm and routes through `loadOLMo2` instead.
+    public static func loadOLMo1(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try OLMo.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights, options: options, device: device)
+        return Loaded(
+            engine: engine,
+            defaultGenerationParameters: variant.defaultGenerationParameters,
+            availableCapabilities: variant.availableCapabilities)
+    }
+
+    /// Yi (`YiForCausalLM`). Same shape as Llama 3 dense, so it reuses
+    /// `LlamaDense` via the `YiDense` variant.
+    public static func loadYi(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try Yi.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights, options: options, device: device)
+        return Loaded(
+            engine: engine,
+            defaultGenerationParameters: variant.defaultGenerationParameters,
+            availableCapabilities: variant.availableCapabilities)
+    }
+
+    /// SmolLM 1 / 2 / 3 (`SmolLM*ForCausalLM`). Same shape as Llama 3
+    /// dense, so it reuses `LlamaDense` via the `SmolLMDense` variant.
+    public static func loadSmolLM(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try SmolLM.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights, options: options, device: device)
+        return Loaded(
+            engine: engine,
+            defaultGenerationParameters: variant.defaultGenerationParameters,
+            availableCapabilities: variant.availableCapabilities)
     }
 
     /// InternLM2 (`InternLM2ForCausalLM`). Llama-shaped forward; the
-    /// dedicated loader remaps InternLM2's tensor names and splits the
-    /// fused `wqkv` into q/k/v. See `Models/Text/InternLM2Text.swift`.
+    /// `InternLM2Dense` variant's loader remaps InternLM2's tensor names
+    /// and splits the fused `wqkv` into q/k/v. See
+    /// `Models/Text/InternLM2Text.swift`.
     public static func loadInternLM2(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> Loaded {
-        let engine = try InternLM2Dense.loadModel(
+        let variant = try InternLM2.variant(for: config)
+        let engine = try variant.loadModel(
             config: config, weights: weights, options: options, device: device)
         return Loaded(
             engine: engine,
-            defaultGenerationParameters: InternLM2Dense.defaultGenerationParameters)
+            defaultGenerationParameters: variant.defaultGenerationParameters,
+            availableCapabilities: variant.availableCapabilities)
     }
 
     /// OLMo 2 (`Olmo2ForCausalLM`). Post-norm + q/k-norm decoder; the

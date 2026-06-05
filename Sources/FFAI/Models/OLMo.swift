@@ -36,4 +36,43 @@ public enum OLMo {
     public static let olmo1Architectures: Set<String> = ["OlmoForCausalLM"]
     public static let olmo2ModelTypes: Set<String> = ["olmo2"]
     public static let olmo2Architectures: Set<String> = ["Olmo2ForCausalLM"]
+
+    /// Pick the concrete text variant for the OLMo 1 (`olmo`) path. OLMo 1
+    /// is pre-norm Llama-shaped and ships a single dense variant
+    /// (`OLMoDense`). OLMo 2 (`olmo2`) diverges and routes through its own
+    /// dedicated loader instead — it never reaches here.
+    public static func variant(for _: ModelConfig) throws -> any OLMoVariant.Type {
+        OLMoDense.self
+    }
+}
+
+// ─── Variant protocol ────────────────────────────────────────────────
+
+/// OLMo 1's text engine is the shared `LlamaModel` (Llama-3-shaped).
+public typealias OLMoModel = LlamaModel
+
+public protocol OLMoVariant {
+    static var availableCapabilities: Set<Capability> { get }
+    static var defaultGenerationParameters: GenerationParameters { get }
+    static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> OLMoModel
+}
+
+/// The OLMo 1 text variant — the Llama dense backbone. OLMo 1's
+/// pre-norm weights are byte-identical to Llama 3 dense (optional QKV
+/// biases auto-detected by `loadLinear`).
+public enum OLMoDense: OLMoVariant {
+    public static let availableCapabilities: Set<Capability> = Capability.textOnly
+    public static let defaultGenerationParameters =
+        LlamaDense.defaultGenerationParameters
+
+    public static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> OLMoModel {
+        try LlamaDense.loadModel(
+            config: config, weights: weights, options: options, device: device)
+    }
 }

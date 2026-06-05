@@ -23,4 +23,25 @@ import Foundation
 public enum InternLM2 {
     public static let modelTypes: Set<String> = ["internlm2"]
     public static let architectures: Set<String> = ["InternLM2ForCausalLM"]
+
+    /// Pick the concrete text variant. InternLM2 ships a single dense
+    /// variant (`InternLM2Dense`), whose loader remaps the native tensor
+    /// names and splits the fused `wqkv` — see `Models/Text/InternLM2Text.swift`.
+    public static func variant(for _: ModelConfig) throws -> any InternLM2Variant.Type {
+        InternLM2Dense.self
+    }
+}
+
+// ─── Variant protocol ────────────────────────────────────────────────
+
+/// InternLM2's text engine is the shared `LlamaModel` (Llama-3-shaped).
+public typealias InternLM2Model = LlamaModel
+
+public protocol InternLM2Variant {
+    static var availableCapabilities: Set<Capability> { get }
+    static var defaultGenerationParameters: GenerationParameters { get }
+    static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> InternLM2Model
 }

@@ -40,9 +40,41 @@ public enum Mistral {
     public static let modelTypes: Set<String> = ["mistral"]
     public static let architectures: Set<String> = ["MistralForCausalLM"]
 
-    public static func variant(for config: ModelConfig) throws -> any LlamaVariant.Type {
-        // Mistral has no architectural variants relevant to the
-        // dense-text path. Reuse Llama's dense loader.
-        return LlamaDense.self
+    /// Pick the concrete text variant. Mistral ships a single dense
+    /// variant (`MistralDense`).
+    public static func variant(for _: ModelConfig) throws -> any MistralVariant.Type {
+        MistralDense.self
+    }
+}
+
+// ─── Variant protocol ────────────────────────────────────────────────
+
+/// Mistral's text engine is the shared `LlamaModel` (Llama-3-shaped).
+public typealias MistralModel = LlamaModel
+
+public protocol MistralVariant {
+    static var availableCapabilities: Set<Capability> { get }
+    static var defaultGenerationParameters: GenerationParameters { get }
+    static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> MistralModel
+}
+
+/// The single Mistral text variant — the Llama dense backbone. Mistral
+/// 7B / Nemo / Small are byte-for-byte identical to Llama 3 dense except
+/// for `rope_theta` and the position cap, both of which flow through
+/// `LlamaDense` from `config.json`.
+public enum MistralDense: MistralVariant {
+    public static let availableCapabilities: Set<Capability> = Capability.textOnly
+    public static let defaultGenerationParameters =
+        LlamaDense.defaultGenerationParameters
+
+    public static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> MistralModel {
+        try LlamaDense.loadModel(
+            config: config, weights: weights, options: options, device: device)
     }
 }

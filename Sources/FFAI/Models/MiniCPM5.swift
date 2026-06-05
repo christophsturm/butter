@@ -27,9 +27,6 @@
 import Foundation
 
 public enum MiniCPM5 {
-    /// MiniCPM5-1B is text-only. Multimodal v5 variants will widen this.
-    public static let availableCapabilities: Set<Capability> = Capability.textOnly
-
     /// Whether a decoded `config.json` describes a MiniCPM5 checkpoint.
     ///
     /// MiniCPM5-1B declares `architectures: ["LlamaForCausalLM"]` +
@@ -44,18 +41,24 @@ public enum MiniCPM5 {
         return name.lowercased().contains("minicpm5")
     }
 
-    /// Load a MiniCPM5 checkpoint. Delegates the text engine to
-    /// `MiniCPM5Text`; the family is text-only today.
+    /// Pick the concrete text variant. MiniCPM5 ships a single dense
+    /// variant (`MiniCPM5Dense`); multimodal v5 variants will widen this.
+    public static func variant(for _: ModelConfig) throws -> any MiniCPM5Variant.Type {
+        MiniCPM5Dense.self
+    }
+
+    /// Load a MiniCPM5 checkpoint through its text variant; the family is
+    /// text-only today.
     public static func load(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> ModelRegistry.Loaded {
-        let engine = try MiniCPM5Text.load(
+        let variant = try MiniCPM5.variant(for: config)
+        let engine = try variant.loadModel(
             config: config, weights: weights, options: options, device: device)
         return ModelRegistry.Loaded(
             engine: engine,
-            defaultGenerationParameters:
-                try Llama.variant(for: config).defaultGenerationParameters,
-            availableCapabilities: availableCapabilities)
+            defaultGenerationParameters: variant.defaultGenerationParameters,
+            availableCapabilities: variant.availableCapabilities)
     }
 }

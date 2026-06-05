@@ -32,4 +32,40 @@ public enum SmolLM {
         "SmolLM2ForCausalLM",
         "SmolLM3ForCausalLM",
     ]
+
+    /// Pick the concrete text variant. All three SmolLM generations ship
+    /// a single dense variant (`SmolLMDense`).
+    public static func variant(for _: ModelConfig) throws -> any SmolLMVariant.Type {
+        SmolLMDense.self
+    }
+}
+
+// ─── Variant protocol ────────────────────────────────────────────────
+
+/// SmolLM's text engine is the shared `LlamaModel` (Llama-3-shaped).
+public typealias SmolLMModel = LlamaModel
+
+public protocol SmolLMVariant {
+    static var availableCapabilities: Set<Capability> { get }
+    static var defaultGenerationParameters: GenerationParameters { get }
+    static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> SmolLMModel
+}
+
+/// The single SmolLM text variant — the Llama dense backbone (optional
+/// QKV biases auto-detected by `loadLinear`).
+public enum SmolLMDense: SmolLMVariant {
+    public static let availableCapabilities: Set<Capability> = Capability.textOnly
+    public static let defaultGenerationParameters =
+        LlamaDense.defaultGenerationParameters
+
+    public static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> SmolLMModel {
+        try LlamaDense.loadModel(
+            config: config, weights: weights, options: options, device: device)
+    }
 }
