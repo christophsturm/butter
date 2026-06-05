@@ -8,7 +8,7 @@ How to port a new architecture into FFAI. Both in-tree families (`Llama`, `Qwen3
 
 ```text
 Models/
-├── <Family>.swift            ← family root (VL/multi-modal orchestrators only)
+├── <Family>.swift            ← family root: interface + error + routing (multi-capability families)
 ├── Text/<F>Text.swift        ← text inference (or <F>.swift for text-only families)
 ├── Vision/<F>Vision.swift    ← image + video tower (one per VL family)
 ├── Audio/STT/<F>.swift       ← speech-to-text
@@ -41,6 +41,21 @@ A **family** is a major architectural lineage. A **variant** is a shape inside a
 - **New variant.** Same family file, new struct conforming to the family's `Variant` protocol. Examples: `Qwen35Dense` alongside `Qwen3Dense`, `Qwen35MoE`, `Qwen35VL` — they go in `Models/Text/Qwen3xText.swift` and dispatch in `Qwen35.variant(for:)`.
 
 The convention is **one file per family per folder, not per variant**. A family file with five variant structs is fine; five files for one family is not.
+
+## The family-root contract
+
+Every family has ONE **root** that is the entry point: it defines the family's core interface, owns the error type, and routes to the back-end stacks. Each capability the family exposes is a **variant** (or orchestrator) that loads only the text / vision / audio components it needs, and **declares its own `availableCapabilities` and `defaultGenerationParameters`** (extending or overriding the family baseline). Components live in the per-modality files, never in the root:
+
+- **Root** (`Models/<F>.swift`, or `Text/<F>.swift` for a text-only family):
+  - `enum <F>` — `modelTypes` / `architectures` + `variant(for:)` (text-variant dispatch) + any cross-cutting detection it owns (e.g. `isOmni`).
+  - `protocol <F>Variant` — `availableCapabilities`, `defaultGenerationParameters`, `loadModel(...) -> <F>Model`.
+  - `enum <F>Error` — ONE unified family error (not a per-capability error type).
+  - A `typealias <F>Model = <Engine>` when the family reuses a shared engine (e.g. `Qwen2Model = LlamaModel`).
+- **Text component** (`Text/<F>Text.swift`): the concrete `<F>Variant` struct(s) — e.g. `<F>Dense`, `<F>MoE` — each declaring its capabilities + generation defaults and loading the text engine.
+- **Vision component** (`Vision/<F>Vision.swift`): the VL orchestrator enum (`<F>VL`) + the tower internals. The orchestrator declares `availableCapabilities` (`+ .imageIn`, `.videoIn`) and `defaultGenerationParameters`, loads the text backbone **through the family's text variant**, and splices via `VisionModel`.
+- **Audio / omni component** (`Audio/<sub>/<F>Audio.swift` or a shared omni engine): same shape — declare capabilities, load the audio tower + text backbone.
+
+The root never contains a tower body; it routes. Worked example: the **Qwen 2** family — `Models/Qwen2.swift` (root: `Qwen2` enum + `Qwen2Variant` + `Qwen2Error` + `isOmni`), `Text/Qwen2Text.swift` (`Qwen2Dense`, text-only caps + dense gen defaults), `Vision/Qwen2Vision.swift` (`Qwen2VL` orchestrator + tower), and Qwen2.5-Omni reusing the shared `QwenOmniModel`. `Qwen3` and `Granite4` follow the identical shape.
 
 ## Step 1 — read the reference
 

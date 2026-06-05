@@ -251,7 +251,7 @@ public enum ModelRegistry {
                     options: options, device: device)
                 return Loaded(
                     engine: vlm.engine,
-                    defaultGenerationParameters: LlamaDense.defaultGenerationParameters,
+                    defaultGenerationParameters: Qwen2VL.defaultGenerationParameters,
                     availableCapabilities: Qwen2VL.availableCapabilities,
                     vlModel: vlm)
             }
@@ -678,14 +678,15 @@ public enum ModelRegistry {
         }
         // Qwen 2 / 2.5 — Llama-shaped arch with QKV biases. The
         // bias-aware Linear in Layers.swift handles the layout
-        // transparently; just route the dispatch.
+        // transparently; the `Qwen2` family root dispatches its text
+        // variant (`Qwen2Dense`, over the Llama dense engine).
         if let arch = config.architecture, Qwen2.architectures.contains(arch) {
-            return try loadLlama(
+            return try loadQwen2(
                 config: config, weights: weights,
                 options: options, device: device)
         }
         if let mt = config.modelType, Qwen2.modelTypes.contains(mt) {
-            return try loadLlama(
+            return try loadQwen2(
                 config: config, weights: weights,
                 options: options, device: device)
         }
@@ -940,6 +941,21 @@ public enum ModelRegistry {
         options: LoadOptions, device: Device
     ) throws -> Loaded {
         let variant = try Starcoder2.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(
+            engine: engine,
+            defaultGenerationParameters: variant.defaultGenerationParameters,
+            availableCapabilities: variant.availableCapabilities)
+    }
+
+    public static func loadQwen2(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try Qwen2.variant(for: config)
         let engine = try variant.loadModel(
             config: config, weights: weights,
             options: options, device: device

@@ -12,39 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Qwen 2.x family — the 2-series and 2.5-series dense models. These
-// use the 3-series Llama-style architecture with one structural
-// difference: the QKV projections carry per-output biases, while
-// o_proj does not. The 3-series uses no biases anywhere.
-//
-// `loadLinear` in `Sources/FFAI/Layers.swift` was extended to detect
+// Qwen2Dense — the TEXT component of the Qwen 2 family (the `Qwen2Variant`
+// the `Qwen2` root dispatches to). Qwen 2.x ships the 3-series Llama-style
+// architecture with one structural difference: the QKV projections carry
+// per-output biases, while o_proj does not (the 3-series uses no biases
+// anywhere). `loadLinear` in `Sources/FFAI/Layers.swift` detects
 // `<base>.bias` automatically, so Qwen 2.x routes through the same
-// loader as the 3-series + Mistral7B with no extra plumbing. The only
-// thing this file adds is the model-type dispatch entry.
+// `LlamaDense` engine as the 3-series + Mistral7B with no extra plumbing.
 //
-// Quantized Qwen 2.x (mlx-community 4-bit) is supported transparently:
-// the mlx-community converter KEEPS the additive output biases on the
-// QKV projections (`q_proj.bias` next to `q_proj.{weight,scales,biases}`)
-// even after 4-bit conversion. `QuantizedLinear` carries an optional
-// `additiveBias` that's folded in after `Ops.dequantGemv` /
-// `Ops.dequantGemmDynamicM`, and `loadLinear` picks it up from the
-// bundle when present. Dropping these biases gave silent degenerate
-// output (DeepSeek-R1-Distill-Qwen-1.5B emitted token-15 "0" forever
-// before this fix). The per-group quant `biases` (plural) are a
-// different axis — the dequant offset applied during the gemv itself —
-// and have always been handled.
+// Quantized Qwen 2.x (mlx-community 4-bit) is supported transparently: the
+// converter KEEPS the additive output biases on the QKV projections
+// (`q_proj.bias` next to `q_proj.{weight,scales,biases}`) even after 4-bit
+// conversion. `QuantizedLinear` carries an optional `additiveBias` folded
+// in after the gemv, and `loadLinear` picks it up when present. Dropping
+// these biases gave silent degenerate output (DeepSeek-R1-Distill-Qwen-1.5B
+// emitted token-15 "0" forever before this fix). The per-group quant
+// `biases` (plural) are a different axis — the dequant offset applied
+// during the gemv itself — and have always been handled.
 
 import Foundation
 
-public enum Qwen2 {
-    /// Both 2.x and 2.5.x ship `model_type = "qwen2"`. The 2.5 refresh
-    /// changed weights + tokenizer but kept the same arch + config keys.
-    public static let modelTypes: Set<String> = ["qwen2"]
-    public static let architectures: Set<String> = ["Qwen2ForCausalLM"]
+/// The single Qwen 2 text variant. Text-only; reuses the `LlamaDense`
+/// engine (Qwen 2.x is a standard GQA Llama shape with QKV biases).
+public enum Qwen2Dense: Qwen2Variant {
+    public static let availableCapabilities: Set<Capability> = Capability.textOnly
 
-    public static func variant(for config: ModelConfig) throws -> any LlamaVariant.Type {
-        // No Qwen2-specific architectural variants relevant to dense
-        // text. The 3-series dense loader handles the shape + RoPE.
-        return LlamaDense.self
+    /// Qwen 2.x inherits the dense-attention generation defaults (the same
+    /// values the family previously got by routing through `LlamaDense`).
+    /// Declared here so the variant owns its parameters per the family
+    /// convention; override per-checkpoint via the model card if needed.
+    public static let defaultGenerationParameters =
+        LlamaDense.defaultGenerationParameters
+
+    /// Load the Qwen 2 text backbone via the `LlamaDense` engine. `weights`
+    /// must already be scoped to the text sub-tree (e.g. `language_model.`-
+    /// prefixed for a Qwen2-VL checkpoint).
+    public static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Qwen2Model {
+        try LlamaDense.loadModel(
+            config: config, weights: weights, options: options, device: device)
     }
 }

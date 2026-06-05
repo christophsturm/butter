@@ -14,15 +14,82 @@
 //
 // Qwen 2-VL — vision tower internals.
 //
-// This file contains `Qwen2VLVisionConfig`, `Qwen2VLVisionBlock`,
-// `Qwen2VLVisionModel`, `Qwen2VLComposedEncoder`, and all supporting
-// CPU / GPU helpers for the dynamic-resolution ViT (Conv3d patch embed,
-// LayerNorm pre-norms, M-RoPE, full bidirectional attention, patch merger).
-// The family orchestrator (load entry-point + token ids) lives in
-// `Models/Qwen2.swift`.
+// This file contains the `Qwen2VL` vision-language orchestrator (the
+// load entry-point + the `<|image_pad|>` / `<|video_pad|>` token ids the
+// splice needs) plus the tower internals: `Qwen2VLVisionConfig`,
+// `Qwen2VLVisionBlock`, `Qwen2VLVisionModel`, `Qwen2VLComposedEncoder`,
+// and all supporting CPU / GPU helpers for the dynamic-resolution ViT
+// (Conv3d patch embed, LayerNorm pre-norms, M-RoPE, full bidirectional
+// attention, patch merger). The family root (enum + `Qwen2Variant`
+// protocol + `Qwen2Error`) lives in `Models/Qwen2.swift`.
 
 import Foundation
 import Metal
+
+// ─── Qwen 2-VL orchestrator ──────────────────────────────────────────
+
+/// The Qwen2-VL vision-language orchestrator: ties the dynamic-resolution
+/// vision tower (below) to the Qwen 2 text backbone, joined by
+/// `VisionModel`'s cross-modal splice. Declares the capabilities + the
+/// generation defaults the VL checkpoint exposes (per the family
+/// convention — see `Qwen2Variant`).
+public enum Qwen2VL {
+    /// `image_token_id` default for Qwen 2-VL checkpoints.
+    public static let defaultImageTokenId = 151_655
+    /// `video_token_id` default for Qwen 2-VL checkpoints
+    /// (`<|video_pad|>` — same id as Qwen 2.5-VL).
+    public static let defaultVideoTokenId = 151_656
+
+    /// Capabilities a Qwen 2-VL checkpoint declares to the loader.
+    /// Text + image + video — the vision tower's Conv3d patch embed and
+    /// temporal-patch unfold handle both single-image and multi-frame
+    /// video paths.
+    public static let availableCapabilities: Set<Capability> =
+        Capability.textOnly.union([.imageIn, .videoIn])
+
+    /// Generation defaults for the VL path — the Qwen 2 text-variant
+    /// defaults (the VL checkpoint shares the Qwen 2 dense backbone).
+    public static let defaultGenerationParameters =
+        Qwen2Dense.defaultGenerationParameters
+
+    /// Build a `VisionModel` from a `Qwen2VLForConditionalGeneration`
+    /// checkpoint: the dynamic-resolution vision tower + the Qwen 2 text
+    /// backbone (via the `Qwen2Dense` text variant), joined by the splice.
+    public static func load(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> VisionModel {
+        guard let visionConfig = config.subConfig("vision_config") else {
+            throw Qwen2Error.missingConfig
+        }
+
+        // ── Text backbone ──
+        // Qwen2-VL stores text hyper-parameters at the top level (same
+        // layout as a standalone Qwen 2 checkpoint). Text weights are
+        // under `language_model.*`; the `Qwen2Dense` text variant loads
+        // the Qwen 2.x architecture (tied embeddings, SiLU MLP, GQA).
+        let textWeights = weights.prefixed("language_model.")
+        let textEngine = try Qwen2Dense.loadModel(
+            config: config, weights: textWeights, options: options, device: device)
+
+        // ── Vision tower ──
+        // Vision weights are under `vision_tower.*`.
+        let visionWeights = weights.prefixed("vision_tower.")
+        let vision = try Qwen2VLVisionModel.load(
+            visionConfig: visionConfig, textHidden: textEngine.hidden,
+            weights: visionWeights, dtype: textEngine.dtype,
+            quantization: config.quantization, device: device)
+
+        let imageTokenId = config.int("image_token_id") ?? defaultImageTokenId
+        let videoTokenId = config.int("video_token_id") ?? defaultVideoTokenId
+        return try VisionModel(
+            visionEncoder: vision.asVisionEncoder(),
+            engine: textEngine, imageTokenId: imageTokenId,
+            videoTokenId: videoTokenId,
+            normalization: .clip,
+            imageTokenCount: vision.mergedTokenCount)
+    }
+}
 
 // ─── Qwen 2-VL vision tower ──────────────────────────────────────────
 
@@ -56,7 +123,7 @@ struct Qwen2VLVisionConfig {
             let patchSize = c.int("patch_size"),
             let mergeSize = c.int("spatial_merge_size")
         else {
-            throw Qwen2VLError.missingConfig
+            throw Qwen2Error.missingConfig
         }
         // `mlp_ratio` scales the hidden dim to the MLP intermediate.
         let mlpRatio = c.float("mlp_ratio") ?? 4.0

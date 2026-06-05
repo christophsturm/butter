@@ -14,12 +14,12 @@
 //
 // Qwen2TextTests — unit coverage for `Sources/FFAI/Models/Text/Qwen2Text.swift`.
 //
-// Offline. Qwen 2 / 2.5 dense reuses the Llama dense engine (loadLinear
-// auto-detects the QKV projection biases the Qwen 2 line carries). The
-// file ships only the family enum dispatch entry — no concrete
-// variant, layer, or error type. Tests guard the family-metadata
-// surface and the `variant(for:)` contract: every Qwen 2 / 2.5 config
-// resolves to `LlamaDense`.
+// Offline. Qwen 2 / 2.5 dense is the `Qwen2Dense` variant, a thin adapter
+// over the Llama dense engine (loadLinear auto-detects the QKV projection
+// biases the Qwen 2 line carries). Tests guard the family-metadata surface
+// (on the `Qwen2` root) and the `variant(for:)` contract: every Qwen 2 /
+// 2.5 config resolves to `Qwen2Dense`, which declares text-only
+// capabilities + the dense generation defaults.
 
 import Foundation
 import Testing
@@ -39,12 +39,20 @@ struct Qwen2TextTests {
         #expect(Qwen2.architectures.contains("Qwen2ForCausalLM"))
     }
 
-    @Test("Qwen2.variant(for:) returns LlamaDense for any qwen2 config")
-    func routesThroughLlamaDense() throws {
+    @Test("Qwen2.variant(for:) returns Qwen2Dense for any qwen2 config")
+    func routesThroughQwen2Dense() throws {
         let cfg = ModelConfig(
             architecture: "Qwen2ForCausalLM",
             modelType: "qwen2", raw: [:])
         let v = try Qwen2.variant(for: cfg)
-        #expect(String(describing: v) == String(describing: LlamaDense.self))
+        #expect(String(describing: v) == String(describing: Qwen2Dense.self))
+    }
+
+    @Test("Qwen2Dense advertises text-only capabilities + dense gen defaults")
+    func variantContract() {
+        #expect(Qwen2Dense.availableCapabilities == Capability.textOnly)
+        #expect(
+            Qwen2Dense.defaultGenerationParameters.temperature
+                == LlamaDense.defaultGenerationParameters.temperature)
     }
 }

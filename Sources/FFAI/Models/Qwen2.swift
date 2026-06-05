@@ -12,77 +12,56 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Qwen 2-VL — Alibaba's Qwen2-VL vision-language model (the
-// `Qwen2VLForConditionalGeneration` checkpoints).
+// Qwen 2 family root — Alibaba's Qwen 2 / 2.5 line.
 //
-// Composition:
-//   • Qwen 2-VL vision tower — a dynamic-resolution ViT that is the
-//     predecessor to Qwen 2.5-VL and Qwen 3-VL, with:
-//       – patch-embed via a flattened Conv3d (each input patch is a
-//         `in_ch · temporalPatch · patch · patch` row, projected by a
-//         single GEMM),
-//       – LayerNorm (not RMSNorm) pre-norms,
-//       – 2D rotary position embedding (M-RoPE) over the patch grid,
-//       – full bidirectional attention on every block (no windowing),
-//       – a GELU-MLP feed-forward (`mlp.fc1` / `mlp.fc2`), not the
-//         SwiGLU used in Qwen 2.5-VL,
-//       – a patch-merger that pools each `mergeSize × mergeSize`
-//         neighbourhood and projects into the text hidden dim.
-//   • Qwen 2 text backbone — the existing LlamaDense engine (Qwen 2.x
-//     routes through LlamaDense), loaded from the top-level config with
-//     the `language_model.`-prefixed weight sub-tree.
+// This file is the **main model interface** for the family (the same shape
+// as `Qwen3.swift` / `Granite4.swift`):
+//   • the family enum `Qwen2` (modelTypes, architectures, text-variant
+//     dispatch, and the Qwen2.5-Omni ownership),
+//   • the `Qwen2Variant` protocol every concrete TEXT variant conforms to,
+//   • the unified `Qwen2Error` type the family's loaders raise.
 //
-// The two are joined by `VisionModel`'s cross-modal token splice: each
-// `<|image_pad|>` placeholder (`image_token_id`) in the prompt takes one
-// of the merged vision tokens.
-//
-// Key differences from Qwen 2.5-VL:
-//   – LayerNorm (with bias) not RMSNorm in the vision blocks.
-//   – GELU MLP (`fc1`/`fc2`) not SwiGLU (`gate_proj`/`up_proj`/`down_proj`).
-//   – No windowed attention schedule — all blocks use full attention.
-//   – No learned position embedding table — pure M-RoPE.
-//   – vision_config uses `embed_dim` (not `hidden_size`) and `mlp_ratio`
-//     (not `intermediate_size`).
-//   – Merger norm key is `merger.ln_q` (LayerNorm with bias, not RMSNorm).
-//   – Merger MLP keys are `merger.mlp.0` / `merger.mlp.2`.
-//
-// Coherence-first port: vision attention + M-RoPE run on the CPU.
-// The text M-RoPE is approximated by VisionModel's sequential scalar positions;
-// the splice itself is exact.
-//
-// The vision tower internals live in `Models/Vision/Qwen2Vision.swift` —
-// this file is the family orchestrator (load entrypoint + the
-// `<|image_pad|>` / `<|video_pad|>` token ids the splice needs).
+// Per-capability component stacks live in their own files, each declaring
+// the capabilities + generation defaults it requires:
+//   - text   — `Models/Text/Qwen2Text.swift` (`Qwen2Dense`, a thin variant
+//              over the in-tree Llama dense engine; Qwen 2.x is Llama-shaped
+//              with QKV biases that `loadLinear` handles transparently).
+//   - vision — `Models/Vision/Qwen2Vision.swift` (`Qwen2VL` orchestrator +
+//              the dynamic-resolution ViT tower) for Qwen2-VL.
+//   - audio  — Qwen2.5-Omni reuses the shared `QwenOmniModel` engine
+//              (`Models/Qwen3.swift`, the canonical omni home); this file
+//              owns only the `qwen2_5_omni*` detection (`isOmni`).
 
 import Foundation
-import Metal
 
-public enum Qwen2VLError: Error, CustomStringConvertible {
-    case missingConfig
-    case missingTensor(String)
+// ─── Family entry point ──────────────────────────────────────────────
 
-    public var description: String {
-        switch self {
-        case .missingConfig:
-            return "Qwen2VL: checkpoint config is missing required fields"
-        case .missingTensor(let name):
-            return "Qwen2VL: checkpoint is missing tensor '\(name)'"
-        }
+public enum Qwen2 {
+    /// Both 2.x and 2.5.x ship `model_type = "qwen2"`. The 2.5 refresh
+    /// changed weights + tokenizer but kept the same arch + config keys.
+    public static let modelTypes: Set<String> = ["qwen2"]
+    public static let architectures: Set<String> = ["Qwen2ForCausalLM"]
+
+    /// Pick the concrete TEXT variant for a config. Qwen 2.x ships a single
+    /// Llama-shaped dense variant; the Qwen2-VL vision path is the `Qwen2VL`
+    /// orchestrator (`Models/Vision/Qwen2Vision.swift`) and the Qwen2.5-Omni
+    /// path the shared `QwenOmniModel` engine (see `isOmni`).
+    public static func variant(for _: ModelConfig) throws -> any Qwen2Variant.Type {
+        Qwen2Dense.self
     }
-}
 
-// ─── Qwen2.5-Omni routing ────────────────────────────────────────────
-//
-// Qwen2.5-Omni (text + vision + audio-IN) reuses the SAME shared
-// `QwenOmniModel` engine as Qwen3-Omni (it lives in `Models/Qwen3.swift`,
-// the canonical omni home). The only family-specific piece is detection:
-// the Qwen 2.x family owns the `qwen2_5_omni*` model_type / architecture
-// strings here, and the shared engine's `QwenOmniModel.handles` unions
-// these with `Qwen3.omniModelTypes`. Loading goes through
-// `AudioModelRegistry` → `QwenOmniModel.load`, which composes the Qwen 2.5
-// text backbone + Whisper-style audio tower (and, once wired, the Qwen 2.5
-// vision tower) — the right back-end stacks for the checkpoint.
-extension Qwen2 {
+    // ─── Qwen2.5-Omni ownership ───────────────────────────────────────
+    //
+    // Qwen2.5-Omni (text + vision + audio-IN) reuses the SAME shared
+    // `QwenOmniModel` engine as Qwen3-Omni (it lives in `Models/Qwen3.swift`,
+    // the canonical omni home). The only family-specific piece is detection:
+    // the Qwen 2.x family owns the `qwen2_5_omni*` model_type / architecture
+    // strings here, and the shared engine's `QwenOmniModel.handles` unions
+    // these with `Qwen3.omniModelTypes`. Loading goes through
+    // `AudioModelRegistry` → `QwenOmniModel.load`, which composes the Qwen 2.5
+    // text backbone + Whisper-style audio tower (and, once wired, the Qwen 2.5
+    // vision tower) — the right back-end stacks for the checkpoint.
+
     /// Omni model_type / architecture strings owned by the Qwen 2.x family
     /// (Qwen2.5-Omni). Unioned into `QwenOmniModel.modelTypes` /
     /// `architectures` by the shared engine.
@@ -102,55 +81,43 @@ extension Qwen2 {
     }
 }
 
-public enum Qwen2VL {
-    /// `image_token_id` default for Qwen 2-VL checkpoints.
-    public static let defaultImageTokenId = 151_655
-    /// `video_token_id` default for Qwen 2-VL checkpoints
-    /// (`<|video_pad|>` — same id as Qwen 2.5-VL).
-    public static let defaultVideoTokenId = 151_656
+// ─── Variant protocol ────────────────────────────────────────────────
 
-    /// Capabilities a Qwen 2-VL checkpoint declares to the loader.
-    /// Text + image + video — the vision tower's Conv3d patch embed and
-    /// temporal-patch unfold handle both single-image and multi-frame
-    /// video paths.
-    public static let availableCapabilities: Set<Capability> =
-        Capability.textOnly.union([.imageIn, .videoIn])
+/// Qwen 2.x is Llama-shaped, so its text engine IS the in-tree
+/// `LlamaModel`. The alias keeps the family's public surface self-named
+/// while reusing the shared decoder.
+public typealias Qwen2Model = LlamaModel
 
-    /// Build a `VisionModel` from a `Qwen2VLForConditionalGeneration`
-    /// checkpoint: the dynamic-resolution vision tower + the Qwen 2
-    /// text backbone, joined by the cross-modal splice.
-    public static func load(
-        config: ModelConfig, weights: SafeTensorsBundle,
-        options: LoadOptions, device: Device
-    ) throws -> VisionModel {
-        guard let visionConfig = config.subConfig("vision_config") else {
-            throw Qwen2VLError.missingConfig
+/// Every concrete Qwen 2 TEXT variant declares the capabilities it exposes
+/// and the generation defaults it recommends (overriding / extending the
+/// family baseline), and loads its text stack. Mirrors `Qwen3Variant` /
+/// `Granite4Variant`.
+public protocol Qwen2Variant {
+    static var availableCapabilities: Set<Capability> { get }
+    static var defaultGenerationParameters: GenerationParameters { get }
+    static func loadModel(
+        config: ModelConfig,
+        weights: SafeTensorsBundle,
+        options: LoadOptions,
+        device: Device
+    ) throws -> Qwen2Model
+}
+
+// ─── Errors ──────────────────────────────────────────────────────────
+
+/// Unified Qwen 2 family error — raised by the text variant
+/// (`Qwen2Dense`) and the Qwen2-VL orchestrator + vision tower
+/// (`Models/Vision/Qwen2Vision.swift`).
+public enum Qwen2Error: Error, CustomStringConvertible {
+    case missingConfig
+    case missingTensor(String)
+
+    public var description: String {
+        switch self {
+        case .missingConfig:
+            return "Qwen2: checkpoint config is missing required fields"
+        case .missingTensor(let name):
+            return "Qwen2: checkpoint is missing tensor '\(name)'"
         }
-
-        // ── Text backbone ──
-        // Qwen2-VL stores text hyper-parameters at the top level (same
-        // layout as a standalone Qwen 2 checkpoint). Text weights are
-        // under `language_model.*`; the LlamaDense engine handles the
-        // Qwen 2.x architecture (tied embeddings, SiLU MLP, GQA).
-        let textWeights = weights.prefixed("language_model.")
-        let textEngine = try LlamaDense.loadModel(
-            config: config, weights: textWeights, options: options, device: device)
-
-        // ── Vision tower ──
-        // Vision weights are under `vision_tower.*`.
-        let visionWeights = weights.prefixed("vision_tower.")
-        let vision = try Qwen2VLVisionModel.load(
-            visionConfig: visionConfig, textHidden: textEngine.hidden,
-            weights: visionWeights, dtype: textEngine.dtype,
-            quantization: config.quantization, device: device)
-
-        let imageTokenId = config.int("image_token_id") ?? defaultImageTokenId
-        let videoTokenId = config.int("video_token_id") ?? defaultVideoTokenId
-        return try VisionModel(
-            visionEncoder: vision.asVisionEncoder(),
-            engine: textEngine, imageTokenId: imageTokenId,
-            videoTokenId: videoTokenId,
-            normalization: .clip,
-            imageTokenCount: vision.mergedTokenCount)
     }
 }

@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Qwen2Tests — root-file unit tests for `Sources/FFAI/Models/Qwen2.swift`.
+// Qwen2Tests — unit tests for the Qwen 2 family root + the `Qwen2VL`
+// orchestrator (`Models/Vision/Qwen2Vision.swift`).
 //
-// Offline. `Qwen2` is a VL-only orchestrator (no `model_type` set);
-// the file declares the image / video token defaults + capability set
-// + the `Qwen2VLError` cases. The `vision_config` decode surface is
-// already covered by `Tests/FFAITests/Models/Vision/Qwen2VisionConfigTests.swift`
+// Offline. The `Qwen2` root declares the text dispatch + the unified
+// `Qwen2Error`; `Qwen2VL` declares the image / video token defaults +
+// capability set + generation defaults. The `vision_config` decode surface
+// is covered by `Tests/FFAITests/Models/Vision/Qwen2VisionConfigTests.swift`
 // — this file focuses on the constants + error shape.
 
 import Foundation
@@ -43,11 +44,18 @@ struct Qwen2VLRootTests {
         #expect(caps.contains(.videoIn))
     }
 
-    @Test("Qwen2VLError stringifies every case with its payload")
-    func errorDescriptions() {
-        #expect(Qwen2VLError.missingConfig.description.contains("Qwen2VL"))
+    @Test("Qwen2VL declares the dense generation defaults")
+    func vlGenerationDefaults() {
         #expect(
-            Qwen2VLError.missingTensor("vision_tower.x").description
+            Qwen2VL.defaultGenerationParameters.temperature
+                == Qwen2Dense.defaultGenerationParameters.temperature)
+    }
+
+    @Test("Qwen2Error stringifies every case with its payload")
+    func errorDescriptions() {
+        #expect(Qwen2Error.missingConfig.description.contains("Qwen2"))
+        #expect(
+            Qwen2Error.missingTensor("vision_tower.x").description
                 .contains("vision_tower.x"))
     }
 }
