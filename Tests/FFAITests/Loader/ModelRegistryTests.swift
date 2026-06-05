@@ -174,4 +174,41 @@ struct ModelRegistryTests {
             ModelRegistry.entry(
                 for: cfg(architecture: "NotAFamily", modelType: "alien")) == nil)
     }
+
+    // ─── Catalog (single source for `ffai models`) ───────────────────
+
+    @Test("catalog covers every implemented kind, each non-empty")
+    func catalogCoversImplementedKinds() {
+        let kinds = Set(ModelRegistry.catalog.map(\.kind))
+        for kind in ModelKind.allCases where kind.isImplemented {
+            #expect(kinds.contains(kind), "catalog missing kind \(kind)")
+        }
+        for (_, entries) in ModelRegistry.catalog {
+            #expect(!entries.isEmpty)
+            for e in entries { #expect(!e.family.isEmpty) }
+        }
+    }
+
+    @Test("catalog includes the audio + VAD families folded into the registry")
+    func catalogIncludesAudioAndVAD() {
+        let families = Set(ModelRegistry.catalogEntries.map(\.family))
+        #expect(families.contains("Whisper STT"))      // stt
+        #expect(families.contains("Kokoro TTS"))       // tts
+        #expect(families.contains("Qwen-Omni"))        // omni
+        #expect(families.contains("DeepFilterNet"))    // sts
+        #expect(families.contains("Silero VAD"))       // vad
+        // …alongside the text/VL families that drive dispatch.
+        #expect(families.contains("Llama 3.x"))
+        #expect(families.contains("Qwen 2-VL"))
+    }
+
+    @Test("only text/VL entries carry a load closure; audio rows are catalog-only")
+    func loadablitySplit() {
+        for e in ModelRegistry.visionEntries + ModelRegistry.textEntries {
+            #expect(e.load != nil, "\(e.family) should be loadable")
+        }
+        for e in ModelRegistry.audioEntries {
+            #expect(e.load == nil, "\(e.family) is catalog-only for now")
+        }
+    }
 }

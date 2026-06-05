@@ -43,11 +43,14 @@ public struct ModelEntry: Sendable {
     /// model_type / architecture alone (runs in addition to the set
     /// membership check, OR'd in).
     let sniff: (@Sendable (ModelConfig) -> Bool)?
-    /// Load the checkpoint. The closure is the family's dispatch branch —
-    /// it self-validates and throws a typed family error on mismatch.
+    /// Load the checkpoint through the text/VL dispatch path. The closure
+    /// is the family's dispatch branch — it self-validates and throws a
+    /// typed family error on mismatch. `nil` for **catalog-only** rows: the
+    /// audio / VAD families list in `ffai models` but load through their own
+    /// (audio) registry until the unified-engine phase wires them here.
     let load:
-        @Sendable (ModelConfig, SafeTensorsBundle, LoadOptions, Device) throws ->
-            ModelRegistry.Loaded
+        (@Sendable (ModelConfig, SafeTensorsBundle, LoadOptions, Device) throws ->
+            ModelRegistry.Loaded)?
 
     public init(
         family: String,
@@ -57,8 +60,8 @@ public struct ModelEntry: Sendable {
         summary: String = "",
         repos: [String] = [],
         sniff: (@Sendable (ModelConfig) -> Bool)? = nil,
-        load: @escaping @Sendable (ModelConfig, SafeTensorsBundle, LoadOptions, Device)
-            throws -> ModelRegistry.Loaded
+        load: (@Sendable (ModelConfig, SafeTensorsBundle, LoadOptions, Device)
+            throws -> ModelRegistry.Loaded)? = nil
     ) {
         self.family = family
         self.kind = kind

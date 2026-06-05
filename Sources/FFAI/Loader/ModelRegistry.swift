@@ -151,19 +151,19 @@ public enum ModelRegistry {
         // fails with an actionable `visionModelNotIntegrated` rather than
         // falling through to a text loader.
         if VisionLanguageArchitectures.isVisionLanguage(config) {
-            guard let entry = visionEntries.first(where: { $0.matches(config) })
+            guard let load = visionEntries.first(where: { $0.matches(config) })?.load
             else {
                 throw ModelError.visionModelNotIntegrated(
                     config.architecture ?? config.modelType ?? "<unknown>")
             }
-            return try entry.load(config, weights, options, device)
+            return try load(config, weights, options, device)
         }
-        guard let entry = textEntries.first(where: { $0.matches(config) }) else {
+        guard let load = textEntries.first(where: { $0.matches(config) })?.load else {
             throw ModelError.unsupportedArchitecture(
                 config.architecture ?? config.modelType ?? "<unknown>"
             )
         }
-        return try entry.load(config, weights, options, device)
+        return try load(config, weights, options, device)
     }
 
     public static func loadLlama3(
