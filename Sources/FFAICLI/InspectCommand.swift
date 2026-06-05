@@ -198,7 +198,7 @@ struct InspectCommand: AsyncParsableCommand {
         let p = info.defaultGenerationParameters
         print("")
         print("┌─ Default generation parameters ────────────────────────")
-        print("│ maxTokens          \(p.maxTokens)")
+        print("│ maxTokens          \(p.maxTokens.map(String.init) ?? "none")")
         print("│ temperature        \(p.temperature)")
         print("│ topP               \(p.topP)")
         print("│ topK               \(p.topK)")
