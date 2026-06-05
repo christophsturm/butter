@@ -482,3 +482,88 @@ M2 tiling — both quality, not crashes), **finishing the GPU-preprocess wiring*
 (M4), the **unified multimodal input surface** (M3), and the **real-time/live**
 features (M5–M7) which are net-new. M1 is the highest-impact correctness item
 (7 VLMs silently distort non-square images today).
+
+---
+
+## 14. Plan-doc reconciliation (Q vs three named plans)
+
+Verified [`model-registry-and-inheritance-plan.md`](model-registry-and-inheritance-plan.md),
+[`qwen3-omni-30b-port-plan.md`](qwen3-omni-30b-port-plan.md), and
+[`gemma4-multimodal-plan.md`](gemma4-multimodal-plan.md) against code on
+`ek/fix-all-the-things` (2026-06-05).
+
+### 14.1 Registry / inheritance plan — Phases 0–4 DONE, Phase 5 PARTIAL, one functional deviation
+
+| Phase | Status | Evidence |
+|---|---|---|
+| 0 — pure moves | ✅ | `Loader/ModelRegistry.swift`, `FFAI/Model.swift` |
+| 1 — `ModelKind` + data-driven dispatch | ✅ | `ModelKind.swift`; `ModelEntry` table in `ModelRegistryTable.swift` (find-first-match replaces the ~75 branches) |
+| 2 — single catalog → CLI | ✅ | `CatalogEntry`/`CatalogGroup` deleted from `ModelsCommand.swift` (0 refs); CLI renders from `ModelRegistry.catalog` |
+| 3 — engine protocol layer | ✅ | `ModelType/` (`ModelEngine` + `TextEngine`/`Transcribing`/`Synthesizing`/`SpeechTransforming`/`Detecting`); `ModelInput`/`ModelOutput` sum types |
+| 4 — fold audio + VAD | ✅ | `audioEntries` in the table; `LoadedAudioModel`/`LoadedVADModel` **deleted** (only comment refs remain in `AudioStreaming.swift`) |
+| 5 — test-layout reconciliation + docs | ⚠️ **PARTIAL** | Docs done (`architecture.md` + `documentation/developing/adding-a-model.md` both reference `ModelEntry`/`ModelKind`/`ModelEngine`). **Outstanding: the `Tests/`-mirrors-`Sources/` sweep + dead-test removal** — overlaps directly with §8 (audio integration tests still deviate from the gold standard) |
+
+**Deviations to review** (most are documented/intentional; one is a real functional gap):
+
+- **[Functional gap — decide] No `.imageText` / `.video` case in `ModelInput`.** The Phase 3 API sketch (plan lines 200–209) proposed `.imageText` + `.video`; the shipped `ModelInput` (`ModelType/ModelIO.swift`) is `.text/.transcribe/.speak/.transform/.detect` only. Vision/omni multimodal is reached via `model.vlModel.generate(...)`, **not** the unified sum type — so `Model.generate(_:)` cannot service an image/video/omni request. (Same as §13 **M3**.) The plan's `.audio` also shipped as `.transcribe`. **This is the one substantive deviation worth a decision** — add the cases, or formally bless `vlModel` as the multimodal surface.
+- **[Intentional — T7] `ModelEngine` is a bare marker** (no structural requirements), vs the target-arch diagram's `ModelEngine: Module { capabilities; dtype }`. Capabilities moved to `Model` (`availableCapabilities` + runtime `enable`/`disable`), not the engine. This is what lets the 30+ heterogeneous audio/VAD classes conform for free — documented in resolved-decision T7.
+- **[Intentional — T6] `ModelOutput` / `ModelOutputChunk`** names (the plan's `GenerationResult`/`GenerationChunk` collided with existing text structs).
+- Typed convenience `generateText` was proposed; text actually uses the existing `generate(messages:)`. Minor.
+
+Net: the core goal — one `Model.load`, one registry, one `any ModelEngine` existential — **is achieved**. Residuals = Phase 5's test sweep + the missing multimodal `ModelInput` cases.
+
+### 14.2 Qwen3-Omni-30B port — NOT wired (milestones 1–4 outstanding)
+
+Only the quant (the plan's "Open questions / risk") was started — there is a local
+4-bit conversion. **None of the code milestones exist:**
+
+| Milestone | Artifact | State |
+|---|---|---|
+| 1 — audio encoder | `Models/Audio/Omni/Qwen3OmniAudio.swift` (conv2d stem + 32× `AudioEncoderLayer`) | **ABSENT** |
+| 2 — family entry | `Models/Qwen3Omni.swift` (text via `Qwen35Hybrid` + Qwen3-VL tower + audio) | **ABSENT** |
+| 3 — registry route | a `Qwen3Omni` entry ahead of the generic path | **ABSENT** |
+| 4 — integration test | `Tests/ModelIntegrationTests/Omni/Qwen3OmniIntegrationTests.swift` | **ABSENT** |
+
+**⚠️ Routing hazard:** `qwen3_omni` / `qwen3_omni_moe` / `Qwen3OmniMoeForConditionalGeneration`
+are **already claimed by the legacy `QwenOmniModel`** (`Qwen3.swift:71-87`, `isOmni(_:)`).
+The plan explicitly says that engine does **not** fit the 30B — it's a conv1d Whisper
+stem + Qwen3**Dense**, with no conv2d stem, no MoE backbone, no vision tower. So loading
+the quantized 30B-A3B omni checkpoint **today routes to the wrong handler** → expect a
+tensor-name/shape failure or incoherent output, not a clean "unsupported." Milestones 2/3
+specifically call for a fresh `Qwen3Omni` routed **before** the legacy claim.
+
+→ **Action:** build milestones 1–4 (the plan has the verified reuse map + tensor names +
+audio-encoder algorithm). If instead the intent is for the legacy `QwenOmniModel` to
+absorb the 30B, that needs an explicit decision + the conv2d/MoE/vision wiring added to it
+— today it silently claims a checkpoint it can't load.
+
+### 14.3 Gemma 4 multimodal — built + integrated; tests need consolidation
+
+The hard, novel piece (Conformer/USM audio encoder) is implemented + numerically validated,
+the 3-way splice + `.audioIn`/`.videoIn` capabilities landed, and the mel front-end is now
+calibrated (a `mel-front-end-vs-feature-extractor` test exists; session-plan notes it
+"bit-exact"). Integration tests cover every modality — but are **spread across 4 files with
+inconsistent load patterns**, which is the consolidation requested:
+
+| File | Checkpoint | Tests | Load pattern | Issue |
+|---|---|---|---|---|
+| `Omni/Gemma4OmniIntegrationTests.swift` (216 L) | omni (`gemma4_unified`) | load, text, encode-shapes, image, audio, video | ✅ load-once static `Task` (gold-standard shape) | inline `sine` (§8.2); `encode shapes` is a sub-stage test |
+| `Vision/Gemma4VisionIntegrationTests.swift` (255 L) | `gemma-4-e2b-it-4bit` | load, enable/disable, image, **vision-tower-vs-oracle**, videoIn, video | ❌ each `@Test` re-loads | numeric oracle parity → belongs in `FFAITests` |
+| `Vision/Gemma4MultimodalIntegrationTests.swift` (294 L) | `gemma-4-e2b-it-4bit` **(same)** | load, **audio-encode shapes**, **audio-encoder-vs-oracle**, **mel-vs-extractor**, audio | ❌ each `@Test` re-loads | 3 numeric oracle/sub-stage tests; inline sine |
+| `Text/Gemma4TextIntegrationTests.swift` (178 L) | E2B + 31B Dense + 26B-A4B MoE | text-gen per size | per-checkpoint | legitimately multi-checkpoint — keep |
+
+**Consolidation (→ MiniCPM45Omni shape):** merge `Gemma4VisionIntegrationTests` +
+`Gemma4MultimodalIntegrationTests` (both load the **same** `gemma-4-e2b-it-4bit`) into ONE
+suite that loads the e2b checkpoint **once** (static memoized `Task`) and runs
+`load → text → image → audio → video` coherence `@Test`s. Move the three numeric oracle
+tests (vision-tower, audio-encoder, mel-front-end) **down to `FFAITests`** — they are
+component-correctness tests, not integration coherence (§8 gold standard). Keep
+`Gemma4OmniIntegrationTests` as the separate **omni-checkpoint** suite (it already follows
+the pattern — just hoist its inline `sine` per §8.2). Keep `Gemma4TextIntegrationTests`
+for the 31B/26B size matrix (optionally fold its E2B-text case into the consolidated suite).
+
+**Plan residual:** audio/video coherence on the larger sizes (E4B/26B/31B) isn't separately
+tested — only their text path is (in `Gemma4TextIntegrationTests`).
+
+> If you want, I can do the §14.3 Gemma 4 test consolidation + the §8.2 `sine` move as a
+> follow-up change (it's a contained test-only refactor); say the word.
