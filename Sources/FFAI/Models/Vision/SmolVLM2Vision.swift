@@ -36,7 +36,7 @@
 //   1. loadVision: extract image patches → vision encoder → connector → [nPatches, textHidden]
 //   2. buildPrefillEmbeds: embed all input tokens, splice image features at image-token positions
 //   3. prefillWithEmbeds: run language backbone forward pass for each embedding row
-//   4. decode: standard LlamaModel token-by-token decode
+//   4. decode: standard Llama3Model token-by-token decode
 
 import Foundation
 import Metal
@@ -905,12 +905,12 @@ public final class SmolVLM2Connector: Module {
 
 // ─── SmolVLM2Model (implements LanguageModel) ─────────────────────────────────
 //
-// Wraps LlamaModel for the text backbone. Adds vision prefill capability:
+// Wraps Llama3Model for the text backbone. Adds vision prefill capability:
 // `forwardVisionPrefill` encodes an image tile and splices the visual features
 // into the residual stream before the normal KV-cache decode loop runs.
 
 public final class SmolVLM2Model: LanguageModel {
-    public let llamaModel: LlamaModel
+    public let llamaModel: Llama3Model
     public let visionEncoder: SmolVLM2VisionEncoder
     public let connector: SmolVLM2Connector
     public let cfg: SmolVLM2Config
@@ -927,7 +927,7 @@ public final class SmolVLM2Model: LanguageModel {
     public var dtype: DType { llamaModel.dtype }
 
     public init(
-        llamaModel: LlamaModel,
+        llamaModel: Llama3Model,
         visionEncoder: SmolVLM2VisionEncoder,
         connector: SmolVLM2Connector,
         cfg: SmolVLM2Config,
@@ -1147,8 +1147,8 @@ public final class SmolVLM2Model: LanguageModel {
         return logits
     }
 
-    /// Multi-token forward — delegates to LlamaModel's optimised
-    /// chunked path. SmolVLM2's text backbone is a LlamaModel, so the
+    /// Multi-token forward — delegates to Llama3Model's optimised
+    /// chunked path. SmolVLM2's text backbone is a Llama3Model, so the
     /// text-only AR prefill picks up the full TTFT win
     /// (batched Ops.gemm projections + one Ops.sdpaMulti per layer)
     /// for free. The vision-prefill image-substitution path stays as

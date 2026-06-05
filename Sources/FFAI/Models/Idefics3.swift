@@ -123,7 +123,7 @@ public struct Idefics3Dense: Idefics3Variant {
             hidden: tc.hiddenSize, quantization: quant
         )
 
-        var llamaLayers: [LlamaLayer] = []
+        var llamaLayers: [Llama3Layer] = []
         llamaLayers.reserveCapacity(tc.numHiddenLayers)
         for i in 0 ..< tc.numHiddenLayers {
             let p = "language_model.layers.\(i)"
@@ -148,7 +148,7 @@ public struct Idefics3Dense: Idefics3Variant {
                 weight: try remapped.tensor(named: "\(p).post_attention_layernorm.weight"),
                 eps: tc.rmsNormEps)
             llamaLayers.append(
-                LlamaLayer(
+                Llama3Layer(
                     qProj: qProj, kProj: kProj, vProj: vProj, oProj: oProj,
                     gateProj: gateProj, upProj: upProj, downProj: downProj,
                     inputNorm: inputNorm, postAttnNorm: postAttnNorm,
@@ -190,7 +190,7 @@ public struct Idefics3Dense: Idefics3Variant {
             activationDtype = embedTokens.weight.dtype
         }
 
-        let llamaModel = LlamaModel(
+        let llamaModel = Llama3Model(
             embedTokens: embedTokens, layers: llamaLayers,
             finalNorm: finalNorm, lmHead: lmHead,
             hidden: tc.hiddenSize, nLayers: tc.numHiddenLayers,

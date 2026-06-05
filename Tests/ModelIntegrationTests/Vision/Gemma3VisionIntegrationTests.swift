@@ -81,9 +81,7 @@ struct Gemma3VisionIntegrationTests {
         }
         let vlm = try #require(m.vlModel, "Gemma 3 VL checkpoint is not a VLM")
 
-        // Build the prompt with the Gemma 3 chat template. HF's
-        // `processing_gemma3.py` expands every `<image>` content item
-        // into:
+        // Build the prompt with the Gemma 3 chat template.
         //
         //     <start_of_image>(image_soft_token×N)<end_of_image>
         //

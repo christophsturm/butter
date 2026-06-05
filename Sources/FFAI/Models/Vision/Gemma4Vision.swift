@@ -460,7 +460,7 @@ final class Gemma4VLVisionModel: @unchecked Sendable {
             }
             // The four per-block norms apply the weight DIRECTLY — the
             // Gemma 4 VISION tower's RMSNorm is `normed * weight`, NOT the
-            // text tower's `(1 + weight)` fold (reference `vision.py`
+            // text tower's `(1 + weight)` fold.
             // RMSNorm: "weight applied directly"; `VisionRMSNorm`:
             // `normed * weight`). Folding +1 here over-scaled every block
             // and drove the per-block drift vs the mlx-vlm oracle.

@@ -19,7 +19,7 @@
 //
 // Marvis-TTS is built on Sesame's CSM architecture; FFAI's contribution
 // is the CSM acoustic model — the backbone + depth-decoder transformers
-// (built on FFAI's `LlamaLayer` blocks), the embedding tables and audio
+// (built on FFAI's `Llama3Layer` blocks), the embedding tables and audio
 // heads, and the frame-generation loop. The Mimi neural codec (the
 // waveform tail) is a separate codec port; this suite verifies the
 // model loads and `generateFrames` emits a finite Mimi code matrix —

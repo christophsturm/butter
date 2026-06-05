@@ -224,8 +224,7 @@ struct Gemma4Params {
     /// own. The donor is the **last** non-shared layer of the *same
     /// attention geometry* (`sliding_attention` / `full_attention`) —
     /// a sliding shared layer reuses the last sliding donor, a global
-    /// shared layer the last global donor. Matches `mlx_lm`'s
-    /// `gemma4_text.py` `previous_kvs` construction.
+    /// shared layer the last global donor.
     ///
     /// The shared layers' `k_proj` / `v_proj` / `k_norm` weights still
     /// ship in the checkpoint but are **dead** — the reference model
@@ -566,8 +565,7 @@ enum Gemma4Loader {
         let postNorm2 = try loadGemma4RMSNorm(
             base: "\(lp).post_feedforward_layernorm_2.weight", in: weights, eps: p.eps)
 
-        // Gemma 4 gating: top-K of the router logits, then softmax over
-        // just those K (gemma4_text.py).
+        // Gemma 4 gating: top-K of the router logits, then softmax over just those K.
         let router = MoERouter(
             nExperts: p.numExperts, topK: p.topKExperts,
             gatingMode: .topKThenSoftmax)
@@ -842,8 +840,7 @@ public final class Gemma4DenseMLP: Module {
 ///
 /// The router normalises its input with a learned `scale · hidden^(-0.5)`
 /// weight, picks the top-K experts, softmaxes their logits, and scales
-/// the combine weights by a learned per-expert factor. Mirrors
-/// `gemma4_text.py`.
+/// the combine weights by a learned per-expert factor.
 ///
 /// `forward` commits internally (the router needs its logits on the
 /// host for top-K), so the caller must refresh its command buffer.
@@ -1832,9 +1829,7 @@ public final class Gemma4Model: LanguageModel {
     // splice supplies a `[hidden]` row directly — a vision/audio encoder
     // soft token or a text-token embedding the VL model looked up.
     //
-    // CRITICAL — embed-scale placement. The reference
-    // (`mlx_vlm/models/gemma4/gemma4.py` `get_input_embeddings`) scales
-    // ONLY the text-token embeddings by `sqrt(hidden)`:
+    // CRITICAL — embed-scale placement:
     //
     //     inputs_embeds = embed_tokens(input_ids) * embed_scale
     //     inputs_embeds = masked_scatter(inputs_embeds, image_mask, image_features)

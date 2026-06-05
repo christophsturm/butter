@@ -53,6 +53,6 @@ struct Qwen2TextTests {
         #expect(Qwen2Dense.availableCapabilities == Capability.textOnly)
         #expect(
             Qwen2Dense.defaultGenerationParameters.temperature
-                == LlamaDense.defaultGenerationParameters.temperature)
+                == Llama3Dense.defaultGenerationParameters.temperature)
     }
 }

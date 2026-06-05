@@ -31,7 +31,7 @@
 //       4. GELU activation.
 //       5. linear_2: [textHidden → textHidden] — with optional bias.
 //
-//   • Mistral text backbone — the existing `LlamaDense` engine (Mistral
+//   • Mistral text backbone — the existing `Llama3Dense` engine (Mistral
 //     is architecturally identical to Llama). Weights live under
 //     `language_model.*` (prefixed bundle).
 //

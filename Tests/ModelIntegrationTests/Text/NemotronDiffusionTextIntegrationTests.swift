@@ -42,7 +42,7 @@ struct NemotronDiffusionTextIntegrationTests {
             try await Model.load(modelId, options: LoadOptions(maxContextLength: 4096))
         }
 
-        // Engine should be the tri-mode diffusion model, not Llama.
+        // Engine should be the tri-mode diffusion model, not Llama3.
         #expect(m.nemotronLabsDiffusion != nil)
         #expect(m.llama == nil)
 

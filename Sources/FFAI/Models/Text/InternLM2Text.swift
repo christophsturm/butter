@@ -15,7 +15,7 @@
 // InternLM 2 loader — Shanghai AI Lab's InternLM v2 dense decoder.
 //
 // InternLM2 is architecturally Llama-3-shaped (pre-norm, RoPE, GQA,
-// SwiGLU MLP), so it reuses `LlamaLayer` / `LlamaModel` for the forward
+// SwiGLU MLP), so it reuses `Llama3Layer` / `Llama3Model` for the forward
 // path. What it can't share is the *loader*: InternLM2 ships
 // non-standard tensor names and a single FUSED q/k/v projection.
 //
@@ -51,14 +51,14 @@ public enum InternLM2Dense: InternLM2Variant {
     public static let availableCapabilities: Set<Capability> = Capability.textOnly
 
     /// InternLM2 dense defaults — Llama-shaped, greedy-friendly.
-    public static let defaultGenerationParameters = LlamaDense.defaultGenerationParameters
+    public static let defaultGenerationParameters = Llama3Dense.defaultGenerationParameters
 
     public static func loadModel(
         config: ModelConfig,
         weights: SafeTensorsBundle,
         options: LoadOptions,
         device: Device
-    ) throws -> LlamaModel {
+    ) throws -> Llama3Model {
         guard let hidden = config.hiddenSize,
             let nLayers = config.numLayers,
             let nHeads = config.numAttentionHeads,
@@ -66,7 +66,7 @@ public enum InternLM2Dense: InternLM2Variant {
             let intermediate = config.intermediateSize,
             let eps = config.rmsNormEps
         else {
-            throw LlamaError.missingConfig
+            throw Llama3Error.missingConfig
         }
         let nKVHeads = config.numKeyValueHeads ?? nHeads
         let headDim = config.headDim ?? (hidden / nHeads)
@@ -79,7 +79,7 @@ public enum InternLM2Dense: InternLM2Variant {
             base: "model.tok_embeddings", in: weights,
             hidden: hidden, quantization: quant)
 
-        var layers: [LlamaLayer] = []
+        var layers: [Llama3Layer] = []
         layers.reserveCapacity(nLayers)
         for i in 0 ..< nLayers {
             let p = "model.layers.\(i)"
@@ -105,7 +105,7 @@ public enum InternLM2Dense: InternLM2Variant {
                 eps: Float(eps))
 
             layers.append(
-                LlamaLayer(
+                Llama3Layer(
                     qProj: qProj, kProj: kProj, vProj: vProj, oProj: oProj,
                     gateProj: gateProj, upProj: upProj, downProj: downProj,
                     inputNorm: inputNorm, postAttnNorm: postAttnNorm,
@@ -145,7 +145,7 @@ public enum InternLM2Dense: InternLM2Variant {
             activationDtype = embedTokens.weight.dtype
         }
 
-        return LlamaModel(
+        return Llama3Model(
             embedTokens: embedTokens, layers: layers,
             finalNorm: finalNorm, lmHead: lmHead,
             hidden: hidden, nLayers: nLayers, nHeads: nHeads,

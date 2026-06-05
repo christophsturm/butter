@@ -14,10 +14,10 @@
 //
 // LlamaTextTests — unit coverage for `Sources/FFAI/Models/Text/LlamaText.swift`.
 //
-// Offline. The Llama family root (Models/Llama.swift) is exercised in
+// Offline. The Llama family root (Models/Llama3.swift) is exercised in
 // Tests/FFAITests/Models/LlamaTests.swift; this file covers the
-// text-side concrete variant (`LlamaDense`) — its public capability +
-// generation-defaults surface, plus the loader's `LlamaError`
+// text-side concrete variant (`Llama3Dense`) — its public capability +
+// generation-defaults surface, plus the loader's `Llama3Error`
 // `missingConfig` rejection path when a config lacks the required
 // fields.
 
@@ -26,21 +26,21 @@ import Testing
 
 @testable import FFAI
 
-@Suite("LlamaDense Variant Surface")
+@Suite("Llama3Dense Variant Surface")
 struct LlamaTextTests {
 
-    @Test("LlamaDense advertises text in/out capabilities")
+    @Test("Llama3Dense advertises text in/out capabilities")
     func capabilities() {
-        #expect(LlamaDense.availableCapabilities.contains(.textIn))
-        #expect(LlamaDense.availableCapabilities.contains(.textOut))
+        #expect(Llama3Dense.availableCapabilities.contains(.textIn))
+        #expect(Llama3Dense.availableCapabilities.contains(.textOut))
         // Llama dense is text-only — never vision / audio.
-        #expect(!LlamaDense.availableCapabilities.contains(.imageIn))
-        #expect(!LlamaDense.availableCapabilities.contains(.audioIn))
+        #expect(!Llama3Dense.availableCapabilities.contains(.imageIn))
+        #expect(!Llama3Dense.availableCapabilities.contains(.audioIn))
     }
 
-    @Test("LlamaDense default generation parameters match the Llama card")
+    @Test("Llama3Dense default generation parameters match the Llama card")
     func defaultGenerationParameters() {
-        let p = LlamaDense.defaultGenerationParameters
+        let p = Llama3Dense.defaultGenerationParameters
         #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.6)
         #expect(p.topP == 1.0)
@@ -50,7 +50,7 @@ struct LlamaTextTests {
         #expect((p.prefillStepSize ?? 0) >= 256)
     }
 
-    @Test("LlamaDense.loadModel throws LlamaError.missingConfig on empty config")
+    @Test("Llama3Dense.loadModel throws Llama3Error.missingConfig on empty config")
     func missingConfigRejected() throws {
         // No fields set on the config — the guard at the top of
         // loadModel must short-circuit with missingConfig.
@@ -64,7 +64,7 @@ struct LlamaTextTests {
         // the error type via a direct cast — we don't need to
         // actually call loadModel.
         _ = cfg
-        let desc = LlamaError.missingConfig.description
+        let desc = Llama3Error.missingConfig.description
         // Family prefix + cause appear in the rendered description.
         #expect(desc.contains("Llama"))
         #expect(desc.contains("missing"))

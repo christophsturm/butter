@@ -231,8 +231,7 @@ public struct FireRedVADConfig: Sendable {
 /// One FSMN (Feedforward Sequential Memory Network) memory layer.
 ///
 /// Applies a depthwise-conv lookback filter and optional lookahead filter
-/// to the projected sequence, then adds the result residually. Matches
-/// `FSMN.forward` in the upstream `detect_model.py`.
+/// to the projected sequence, then adds the result residually.
 ///
 /// Weight layout per filter: `[P, 1, N]` (PyTorch depthwise conv1d with
 /// `groups=P`) stored as `[P, N]` floats after squeezing dim 1.
@@ -358,7 +357,7 @@ final class FireRedDFSMNBlock: Sendable {
 
 /// CPU Kaldi-style filterbank (80 mel bins, 25 ms / 10 ms frames, 16 kHz).
 ///
-/// Implements `KaldifeatFbank` from the upstream `audio_feat.py`:
+/// Implements `KaldifeatFbank`:
 ///   - `snip_edges=true`: frames start at sample 0, the last complete
 ///     frame ends at `len - frameLengthSamples`.
 ///   - `dither=0`: fully deterministic.

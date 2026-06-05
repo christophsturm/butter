@@ -119,12 +119,7 @@ func lfm2vlLoadVisionEncoder(
                 useExactGelu: true))
     }
 
-    // post_layernorm IS applied: mlx-vlm truncates the encoder to
-    // `vision_feature_layer + 1` layers, then takes the tower's
-    // `last_hidden_state = post_layernorm(encoder_outputs[-1])`
-    // (see mlx_vlm lfm2_vl `*_, hidden_states = self.vision_tower(...)` +
-    // siglip2 `vision.py` VisionTransformer.__call__). So post_layernorm
-    // runs over the truncated (26-layer) output.
+    // post_layernorm IS applied and runs over the truncated (26-layer) output.
     let postLN = LayerNorm(
         weight: try weights.tensor(named: "post_layernorm.weight"),
         bias: try weights.tensor(named: "post_layernorm.bias"),

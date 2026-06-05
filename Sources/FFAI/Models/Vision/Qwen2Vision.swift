@@ -896,7 +896,7 @@ public enum Qwen25VL {
         // weights under `language_model.model.*` / `language_model.norm`;
         // the text hyper-parameters live at the config top level. Route
         // the `language_model.`-prefixed sub-tree through the Llama dense
-        // engine (Qwen 2.x == LlamaDense).
+        // engine (Qwen 2.x == Llama3Dense).
         let textWeights = weights.prefixed("language_model.")
         let textEngine = try Qwen2.variant(for: config).loadModel(
             config: config, weights: textWeights, options: options, device: device)

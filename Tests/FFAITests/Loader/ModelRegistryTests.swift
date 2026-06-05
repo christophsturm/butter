@@ -71,13 +71,13 @@ struct ModelRegistryTests {
         #expect(String(describing: c).contains("audioOut"))
     }
 
-    @Test("LlamaError.missingConfig description")
+    @Test("Llama3Error.missingConfig description")
     func llamaMissingConfig() {
-        let e = LlamaError.missingConfig
+        let e = Llama3Error.missingConfig
         #expect(String(describing: e).contains("missing"))
     }
 
-    @Test("Llama.variant returns LlamaDense for any llama config")
+    @Test("Llama3.variant returns Llama3Dense for any llama config")
     func variantDispatch() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ffai-variant-\(UUID().uuidString)")
@@ -88,7 +88,7 @@ struct ModelRegistryTests {
             atomically: true, encoding: .utf8
         )
         let cfg = try ModelConfig.load(from: dir)
-        let v = try Llama.variant(for: cfg)
-        #expect(v is LlamaDense.Type)
+        let v = try Llama3.variant(for: cfg)
+        #expect(v is Llama3Dense.Type)
     }
 }

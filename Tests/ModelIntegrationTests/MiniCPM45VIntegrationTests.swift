@@ -99,10 +99,9 @@ struct MiniCPM45VIntegrationTests {
         let vlm = try #require(m.vlModel, "MiniCPM-V 4.5 is not a VLM")
 
         let image = try VisionTestHelpers.dogImage()
-        // MiniCPM-V image framing (processing_minicpmv.py): `<image>` +
-        // `placeholder × image_feature_size(64)` + `</image>`, inside a chat
-        // turn. The 64 placeholders (vlm.imageTokenId, `<|image_pad|>`) are
-        // replaced by the resampler's 64 image tokens.
+        // MiniCPM-V image framing: `<image>` + `placeholder × image_feature_size(64)` + `</image>`, 
+        // inside a chat turn. The 64 placeholders (vlm.imageTokenId, `<|image_pad|>`) are replaced 
+        // by the resampler's 64 image tokens.
         let nImg = vlm.encodeImage(image).shape[0]
         let pre = m.tokenizer.encode(text: "<|im_start|>user\n<image>")
         let post = m.tokenizer.encode(

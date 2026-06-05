@@ -84,9 +84,9 @@ public enum Qwen2 {
 // ─── Variant protocol ────────────────────────────────────────────────
 
 /// Qwen 2.x is Llama-shaped, so its text engine IS the in-tree
-/// `LlamaModel`. The alias keeps the family's public surface self-named
+/// `Llama3Model`. The alias keeps the family's public surface self-named
 /// while reusing the shared decoder.
-public typealias Qwen2Model = LlamaModel
+public typealias Qwen2Model = Llama3Model
 
 /// Every concrete Qwen 2 TEXT variant declares the capabilities it exposes
 /// and the generation defaults it recommends (overriding / extending the

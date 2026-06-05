@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Round-trip tests for the per-layer SRHT rotation that AURA Phase 5d.E
-// Stage 1a wires through Qwen3 and Llama. These pin two things the
+// Stage 1a wires through Qwen3 and Llama3. These pin two things the
 // model-level integration tests do NOT cover directly:
 //
 //   1. `Ops.auraRotatePerHead` truly inverts an SRHT rotation in the

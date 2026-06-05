@@ -14,15 +14,15 @@
 //
 // PixtralDense — the TEXT component of the Pixtral family. Pixtral-12B's
 // text backbone is Mistral, which is architecturally identical to Llama, so
-// it reuses the in-tree `LlamaDense` engine. This thin variant lets the
+// it reuses the in-tree `Llama3Dense` engine. This thin variant lets the
 // `Pixtral` VL orchestrator load its text stack through the family's own
 // variant (per the family-root convention) rather than reaching for
-// `LlamaDense` directly.
+// `Llama3Dense` directly.
 
 import Foundation
 
-/// Pixtral's text engine is the shared `LlamaModel` (Mistral == Llama-shaped).
-public typealias PixtralModel = LlamaModel
+/// Pixtral's text engine is the shared `Llama3Model` (Mistral == Llama-shaped).
+public typealias PixtralModel = Llama3Model
 
 public protocol PixtralVariant {
     static var availableCapabilities: Set<Capability> { get }
@@ -37,13 +37,13 @@ public protocol PixtralVariant {
 public enum PixtralDense: PixtralVariant {
     public static let availableCapabilities: Set<Capability> = Capability.textOnly
     public static let defaultGenerationParameters =
-        LlamaDense.defaultGenerationParameters
+        Llama3Dense.defaultGenerationParameters
 
     public static func loadModel(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> PixtralModel {
-        try LlamaDense.loadModel(
+        try Llama3Dense.loadModel(
             config: config, weights: weights, options: options, device: device)
     }
 }

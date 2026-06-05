@@ -15,12 +15,12 @@
 // MistralTextTests — unit coverage for `Sources/FFAI/Models/Text/MistralText.swift`.
 //
 // Offline. `MistralText.swift` ships no Swift declarations — Mistral 7B
-// / Nemo / Small route their dense-text path through `LlamaDense` from
+// / Nemo / Small route their dense-text path through `Llama3Dense` from
 // the Llama family. This file exists so the source-to-test mirror is
 // complete (every Models/Text/<X>Text.swift has a corresponding
 // Tests/FFAITests/Models/Text/<X>TextTests.swift) and asserts the
 // routing contract: `Mistral.variant(for:)` returns `MistralDense` (a thin
-// variant over the shared `LlamaDense` engine — Mistral is Llama-shaped).
+// variant over the shared `Llama3Dense` engine — Mistral is Llama-shaped).
 
 import Foundation
 import Testing

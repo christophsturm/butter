@@ -36,7 +36,7 @@
 //     per-image projection itself is a GPU GEMM.
 //   • Projector — CpuLinear.forwardBatch dispatches GPU GEMM; bias
 //     broadcast via Ops.add over a tiled bias tensor.
-//   • Gemma text backbone — same Ops.* kernels as Llama.
+//   • Gemma text backbone — same Ops.* kernels as Llama3.
 //   • setImagePixels(_:) is called before generation; it computes the
 //     vision features and stores them as a GPU Tensor. forward()
 //     substitutes the stored image embedding at image-token positions.

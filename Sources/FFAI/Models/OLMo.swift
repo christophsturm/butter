@@ -16,7 +16,7 @@
 // OLMo 1 (olmo) and OLMo 2 (olmo2) both ship with byte-identical
 // weights to Llama 3 dense + optional QKV biases that `loadLinear`
 // auto-detects, so the family root just declares dispatch metadata
-// and routes the loader through `LlamaDense`.
+// and routes the loader through `Llama3Dense`.
 
 import Foundation
 
@@ -28,7 +28,7 @@ public enum OLMo {
     ]
 
     // OLMo 1 (`olmo`) is genuinely pre-norm Llama-shaped and routes
-    // through `loadLlama`. OLMo 2 (`olmo2`) is post-norm with q/k-norm —
+    // through `loadLlama3`. OLMo 2 (`olmo2`) is post-norm with q/k-norm —
     // it diverges from the Llama layer and gets its own loader
     // (`Models/Text/OLMo2Text.swift`). Split the dispatch sets so each
     // path only claims its own architecture.
@@ -48,8 +48,8 @@ public enum OLMo {
 
 // ─── Variant protocol ────────────────────────────────────────────────
 
-/// OLMo 1's text engine is the shared `LlamaModel` (Llama-3-shaped).
-public typealias OLMoModel = LlamaModel
+/// OLMo 1's text engine is the shared `Llama3Model` (Llama-3-shaped).
+public typealias OLMoModel = Llama3Model
 
 public protocol OLMoVariant {
     static var availableCapabilities: Set<Capability> { get }
@@ -66,13 +66,13 @@ public protocol OLMoVariant {
 public enum OLMoDense: OLMoVariant {
     public static let availableCapabilities: Set<Capability> = Capability.textOnly
     public static let defaultGenerationParameters =
-        LlamaDense.defaultGenerationParameters
+        Llama3Dense.defaultGenerationParameters
 
     public static func loadModel(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> OLMoModel {
-        try LlamaDense.loadModel(
+        try Llama3Dense.loadModel(
             config: config, weights: weights, options: options, device: device)
     }
 }

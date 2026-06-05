@@ -34,7 +34,7 @@
 // ## Scope note
 //
 // FFAI's contribution is the **CSM acoustic model**: the backbone and
-// depth-decoder transformers (built on FFAI's `LlamaLayer` blocks — the
+// depth-decoder transformers (built on FFAI's `Llama3Layer` blocks — the
 // same dense-transformer code path the Llama family uses), the
 // text / audio-codebook embedding tables, the codebook-0 + per-codebook
 // audio heads, and the frame-generation loop.
@@ -53,7 +53,7 @@ import Tokenizers
 
 /// One CSM sub-transformer's hyper-parameters (backbone or depth
 /// decoder). Both are standard Llama dense transformers — the same
-/// shape FFAI's `LlamaLayer` consumes.
+/// shape FFAI's `Llama3Layer` consumes.
 public struct CSMTransformerConfig: Sendable {
     public let hidden: Int
     public let nLayers: Int
@@ -200,19 +200,19 @@ private func csmRoPEScaling(_ rs: [String: Any]?, headDim: Int)
 
 // ─── CSM transformer ─────────────────────────────────────────────────
 
-/// A CSM sub-transformer — a stack of FFAI `LlamaLayer` blocks plus a
-/// final RMSNorm. Unlike `LlamaModel` it has no embedding table or
+/// A CSM sub-transformer — a stack of FFAI `Llama3Layer` blocks plus a
+/// final RMSNorm. Unlike `Llama3Model` it has no embedding table or
 /// lm_head: it consumes an embedding-stream `[hidden]` row per timestep
 /// and returns the post-norm hidden state. The backbone and the depth
 /// decoder are both instances of this.
 public final class CSMTransformer: @unchecked Sendable {
     public let config: CSMTransformerConfig
-    public let layers: [LlamaLayer]
+    public let layers: [Llama3Layer]
     public let finalNorm: RMSNorm
     public let dtype: DType
 
     public init(
-        config: CSMTransformerConfig, layers: [LlamaLayer],
+        config: CSMTransformerConfig, layers: [Llama3Layer],
         finalNorm: RMSNorm, dtype: DType
     ) {
         self.config = config
@@ -724,19 +724,19 @@ extension MarvisModel {
             audioHead: audioHead, tokenizer: tokenizer, dtype: dtype)
     }
 
-    /// Build one CSM sub-transformer (a `LlamaLayer` stack + final norm)
+    /// Build one CSM sub-transformer (a `Llama3Layer` stack + final norm)
     /// from `base`-prefixed checkpoint weights.
     private static func buildTransformer(
         base: String, config c: CSMTransformerConfig,
         bundle: SafeTensorsBundle, dtype: DType,
         quantization q: ModelConfig.QuantizationConfig?
     ) throws -> CSMTransformer {
-        var layers: [LlamaLayer] = []
+        var layers: [Llama3Layer] = []
         layers.reserveCapacity(c.nLayers)
         for i in 0 ..< c.nLayers {
             let p = "\(base).layers.\(i)"
             layers.append(
-                LlamaLayer(
+                Llama3Layer(
                     qProj: try loadLinear(
                         base: "\(p).self_attn.q_proj", in: bundle, quantization: q),
                     kProj: try loadLinear(

@@ -15,7 +15,7 @@
 // Granite 3 family — IBM's Granite v3 dense text models (granite-3.0,
 // granite-3.1, granite-3.2). Llama-3-shaped weights with optional QKV
 // biases that `loadLinear` auto-detects; the family root just declares
-// the dispatch metadata and routes the loader through `LlamaDense`.
+// the dispatch metadata and routes the loader through `Llama3Dense`.
 //
 // Granite 4 (granite-4.0-h, GraniteMoeHybrid) is a different
 // architecture — Mamba 2 / attention / MoE stack-interleaved hybrid —
@@ -38,7 +38,7 @@ public enum Granite3 {
     /// trains with maximal-update-parametrization, so these scale the
     /// embeddings, attention scores, residual branches, and final
     /// logits — all default to identity for checkpoints that omit them.
-    /// `LlamaDense.loadModel(muP:)` folds them into the weights so the
+    /// `Llama3Dense.loadModel(muP:)` folds them into the weights so the
     /// shared Llama forward needs no Granite-specific code.
     public static func muP(from config: ModelConfig) -> MuPMultipliers {
         MuPMultipliers(
@@ -51,8 +51,8 @@ public enum Granite3 {
 
 // ─── Variant protocol ────────────────────────────────────────────────
 
-/// Granite 3's text engine is the shared `LlamaModel` (Llama-3-shaped).
-public typealias Granite3Model = LlamaModel
+/// Granite 3's text engine is the shared `Llama3Model` (Llama-3-shaped).
+public typealias Granite3Model = Llama3Model
 
 public protocol Granite3Variant {
     static var availableCapabilities: Set<Capability> { get }
@@ -68,13 +68,13 @@ public protocol Granite3Variant {
 public enum Granite3Dense: Granite3Variant {
     public static let availableCapabilities: Set<Capability> = Capability.textOnly
     public static let defaultGenerationParameters =
-        LlamaDense.defaultGenerationParameters
+        Llama3Dense.defaultGenerationParameters
 
     public static func loadModel(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> Granite3Model {
-        try LlamaDense.loadModel(
+        try Llama3Dense.loadModel(
             config: config, weights: weights, options: options,
             device: device, muP: Granite3.muP(from: config))
     }

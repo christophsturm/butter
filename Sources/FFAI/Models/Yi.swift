@@ -14,7 +14,7 @@
 //
 // Yi family — 01.ai's Yi dense text models. Llama-3-shaped weights
 // with optional QKV biases that `loadLinear` auto-detects; the family
-// root just declares dispatch metadata and routes through `LlamaDense`.
+// root just declares dispatch metadata and routes through `Llama3Dense`.
 
 import Foundation
 
@@ -31,8 +31,8 @@ public enum Yi {
 
 // ─── Variant protocol ────────────────────────────────────────────────
 
-/// Yi's text engine is the shared `LlamaModel` (Llama-3-shaped).
-public typealias YiModel = LlamaModel
+/// Yi's text engine is the shared `Llama3Model` (Llama-3-shaped).
+public typealias YiModel = Llama3Model
 
 public protocol YiVariant {
     static var availableCapabilities: Set<Capability> { get }
@@ -48,13 +48,13 @@ public protocol YiVariant {
 public enum YiDense: YiVariant {
     public static let availableCapabilities: Set<Capability> = Capability.textOnly
     public static let defaultGenerationParameters =
-        LlamaDense.defaultGenerationParameters
+        Llama3Dense.defaultGenerationParameters
 
     public static func loadModel(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> YiModel {
-        try LlamaDense.loadModel(
+        try Llama3Dense.loadModel(
             config: config, weights: weights, options: options, device: device)
     }
 }

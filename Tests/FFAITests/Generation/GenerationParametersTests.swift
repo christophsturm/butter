@@ -84,7 +84,7 @@ struct GenerationParametersTests {
     @Test("Per-family defaults table")
     func familyDefaults() {
         // Llama 3.x dense
-        let llama = LlamaDense.defaultGenerationParameters
+        let llama = Llama3Dense.defaultGenerationParameters
         #expect(llama.temperature == 0.6)
         #expect(llama.topP == 1.0)
         #expect(llama.topK == 0)

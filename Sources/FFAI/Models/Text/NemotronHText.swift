@@ -47,7 +47,7 @@
 // with a per-index `[any LayerCacheProtocol]`.
 //
 // Per-layer dataflow — every layer kind shares the same pre-norm +
-// residual skeleton (matches mlx-lm's `nemotron_h.py`):
+// residual skeleton:
 //
 //   residual = h
 //   h        = norm(h)               [hidden]  — RMSNorm, one per layer

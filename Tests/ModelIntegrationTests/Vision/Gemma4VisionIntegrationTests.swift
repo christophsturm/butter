@@ -91,8 +91,7 @@ struct Gemma4VisionIntegrationTests {
         let bos = try #require(
             m.tokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
         // Gemma 4 wraps the image soft-token run in begin/end-of-image
-        // markers (boi 255999, eoi 258882 — see mlx-vlm
-        // processing_gemma4.py `full_image_sequence`).
+        // markers (boi 255999, eoi 258882.
         let boiTokenId = 255999
         let eoiTokenId = 258882
         let userPrefix = m.tokenizer.encode(text: "<start_of_turn>user\n")
@@ -133,8 +132,7 @@ struct Gemma4VisionIntegrationTests {
     /// to a 42×57 patch grid → 266 soft tokens) and compare the
     /// `[266, 1536]` image soft tokens to the reference `embed_vision`
     /// output. Isolates the tower (patch-embed → blocks → pool → embed)
-    /// from preprocessing. Regenerate fixtures with
-    /// `gemma4-benchmark/dump_gemma4_vision.py` + `/tmp/dump_pixels.py`.
+    /// from preprocessing.
     @Test("vision tower matches the mlx-vlm oracle on the dog pixels")
     func visionTowerMatchesOracle() async throws {
         let pixelsPath = "/tmp/gemma4_pixels_oracle.f32"
@@ -192,9 +190,8 @@ struct Gemma4VisionIntegrationTests {
     /// temporal-patch fold — a video is a sequence of images, each run
     /// through the (variable-resolution) vision tower and wrapped per the
     /// reference's prompt format: `{mm:ss} <boi>{video_token × n}<eoi>`,
-    /// frames space-joined (transformers `processing_gemma4.py`). Note the
-    /// IMAGE markers (boi/eoi) wrap the frames but the placeholders are the
-    /// `video_token` (258884).
+    /// frames space-joined. Note the IMAGE markers (boi/eoi) wrap the 
+    // frames but the placeholders are the `video_token` (258884).
     @Test("load — checkpoint reports .videoIn capability")
     func loadVLCheckpointVideo() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {

@@ -14,14 +14,14 @@
 //
 // FastVLMDense — the TEXT component of the FastVLM family. FastVLM's text
 // backbone is Qwen 2 (Llama-shaped with QKV biases), so it reuses the
-// in-tree `LlamaDense` engine. This thin variant lets the `FastVLM` VL
+// in-tree `Llama3Dense` engine. This thin variant lets the `FastVLM` VL
 // orchestrator load its text stack through the family's own variant rather
-// than reaching for `LlamaDense` directly.
+// than reaching for `Llama3Dense` directly.
 
 import Foundation
 
-/// FastVLM's text engine is the shared `LlamaModel` (Qwen 2 == Llama-shaped).
-public typealias FastVLMModel = LlamaModel
+/// FastVLM's text engine is the shared `Llama3Model` (Qwen 2 == Llama-shaped).
+public typealias FastVLMModel = Llama3Model
 
 public protocol FastVLMVariant {
     static var availableCapabilities: Set<Capability> { get }
@@ -36,13 +36,13 @@ public protocol FastVLMVariant {
 public enum FastVLMDense: FastVLMVariant {
     public static let availableCapabilities: Set<Capability> = Capability.textOnly
     public static let defaultGenerationParameters =
-        LlamaDense.defaultGenerationParameters
+        Llama3Dense.defaultGenerationParameters
 
     public static func loadModel(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> FastVLMModel {
-        try LlamaDense.loadModel(
+        try Llama3Dense.loadModel(
             config: config, weights: weights, options: options, device: device)
     }
 }

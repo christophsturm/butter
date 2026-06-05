@@ -26,7 +26,7 @@
 // ## Scope note
 //
 // FFAI's contribution here is the **acoustic LLM**: the Llama backbone
-// reuses FFAI's existing `LlamaModel` engine (the same dense-transformer
+// reuses FFAI's existing `Llama3Model` engine (the same dense-transformer
 // code path Llama 3.x text models run on), plus the Orpheus token
 // protocol — prompt framing, the autoregressive code-token decode loop,
 // and SNAC code extraction.
@@ -122,18 +122,18 @@ public enum LlamaTTSError: Error, CustomStringConvertible {
 // ─── Model ───────────────────────────────────────────────────────────
 
 /// A loaded Orpheus-style TTS model. Owns the Llama acoustic backbone
-/// (FFAI's `LlamaModel` engine) and, when wired, a SNAC codec decoder.
+/// (FFAI's `Llama3Model` engine) and, when wired, a SNAC codec decoder.
 public final class LlamaTTSModel: @unchecked Sendable {
     public let config: LlamaTTSConfig
     /// The Llama acoustic backbone — a standard FFAI dense transformer.
-    public let backbone: LlamaModel
+    public let backbone: Llama3Model
     /// The text tokenizer (extended Llama vocabulary).
     public let tokenizer: any Tokenizer
     /// The SNAC codec decoder — `nil` until the codec port lands.
     public var snacDecoder: (any SNACDecoding)?
 
     public init(
-        config: LlamaTTSConfig, backbone: LlamaModel,
+        config: LlamaTTSConfig, backbone: Llama3Model,
         tokenizer: any Tokenizer,
         snacDecoder: (any SNACDecoding)? = nil
     ) {
@@ -349,7 +349,7 @@ extension LlamaTTSModel {
     }
 
     /// Load a LlamaTTS checkpoint from a resolved snapshot directory.
-    /// The Llama backbone reuses FFAI's `LlamaDense` loader; the SNAC
+    /// The Llama backbone reuses FFAI's `Llama3Dense` loader; the SNAC
     /// codec decoder is left unset (separate port — see scope note).
     public static func load(
         directory: URL,
@@ -361,7 +361,7 @@ extension LlamaTTSModel {
         let config = try ModelConfig.load(from: directory)
         let ttsConfig = LlamaTTSConfig.from(config)
         let bundle = try SafeTensorsBundle(directory: directory, device: device)
-        let backbone = try LlamaDense.loadModel(
+        let backbone = try Llama3Dense.loadModel(
             config: config, weights: bundle, options: options, device: device)
         let tokenizer = try await TokenizerLoader().load(from: directory)
         return LlamaTTSModel(

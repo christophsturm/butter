@@ -19,8 +19,8 @@
 //     dispatch). Mistral 7B / Nemo are byte-for-byte identical to
 //     Llama 3 dense except for `rope_theta` and the
 //     `max_position_embeddings` cap, both of which flow naturally
-//     through `LlamaDense` from `config.json` — so `variant(for:)`
-//     reuses `LlamaDense` rather than declaring a Mistral-specific
+//     through `Llama3Dense` from `config.json` — so `variant(for:)`
+//     reuses `Llama3Dense` rather than declaring a Mistral-specific
 //     variant. No `MistralVariant` protocol or `MistralError` type
 //     ships today.
 //
@@ -30,7 +30,7 @@
 // Related (separate family):
 //   - Models/Mistral3.swift — Mistral Small 3.1 vision-language
 //                             (`mistral3` model_type, ViT + MLP
-//                             projector + LlamaDense backbone)
+//                             projector + Llama3Dense backbone)
 
 import Foundation
 
@@ -49,8 +49,8 @@ public enum Mistral {
 
 // ─── Variant protocol ────────────────────────────────────────────────
 
-/// Mistral's text engine is the shared `LlamaModel` (Llama-3-shaped).
-public typealias MistralModel = LlamaModel
+/// Mistral's text engine is the shared `Llama3Model` (Llama-3-shaped).
+public typealias MistralModel = Llama3Model
 
 public protocol MistralVariant {
     static var availableCapabilities: Set<Capability> { get }
@@ -64,17 +64,17 @@ public protocol MistralVariant {
 /// The single Mistral text variant — the Llama dense backbone. Mistral
 /// 7B / Nemo / Small are byte-for-byte identical to Llama 3 dense except
 /// for `rope_theta` and the position cap, both of which flow through
-/// `LlamaDense` from `config.json`.
+/// `Llama3Dense` from `config.json`.
 public enum MistralDense: MistralVariant {
     public static let availableCapabilities: Set<Capability> = Capability.textOnly
     public static let defaultGenerationParameters =
-        LlamaDense.defaultGenerationParameters
+        Llama3Dense.defaultGenerationParameters
 
     public static func loadModel(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> MistralModel {
-        try LlamaDense.loadModel(
+        try Llama3Dense.loadModel(
             config: config, weights: weights, options: options, device: device)
     }
 }

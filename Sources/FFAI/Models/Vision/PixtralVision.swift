@@ -33,7 +33,7 @@ import Metal
 
 /// Merge Pixtral text-model defaults into the VLM's sparse `text_config`.
 /// The mlx-community VLM text_config only stores fields that differ from
-/// the class defaults; the standalone `LlamaDense` loader needs the full
+/// the class defaults; the standalone `Llama3Dense` loader needs the full
 /// set for Mistral (especially `rms_norm_eps`, `rope_theta`, etc.).
 func pixtralTextConfigWithDefaults(
     _ raw: [String: Any], vocabFallback: Int?

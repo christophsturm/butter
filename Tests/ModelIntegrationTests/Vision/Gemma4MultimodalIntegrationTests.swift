@@ -183,8 +183,6 @@ struct Gemma4MultimodalIntegrationTests {
     /// deterministic and FFAI now matches the reference bit-for-bit
     /// (periodic-Hann window, HTK norm=None filterbank, magnitude STFT,
     /// `pad_to_multiple_of=128` + mask-zeroing), so this is a strict gate.
-    /// Regenerate the fixture with
-    /// `gemma4-benchmark/dump_gemma4_sine_mel.py`. Skips if missing.
     @Test("mel front-end matches the Gemma 4 feature extractor on the test sine")
     func melFrontEndMatchesReference() throws {
         let oraclePath = "/tmp/gemma4_sine_mel_oracle.f32"
@@ -227,9 +225,9 @@ struct Gemma4MultimodalIntegrationTests {
     //
     // Gemma 4 wraps the audio soft-token run in `boa … eoa` markers
     // (`boa_token_id` 256000, `audio_token_id` 258881, `eoa_token_id`
-    // 258883 — see mlx-vlm `processing_gemma4.py`): the prompt carries one
-    // `audioTokenId` placeholder per encoder frame, and `spliceMultimodal`
-    // replaces each with the matching audio embedding row.
+    // 258883: the prompt carries one `audioTokenId` placeholder per encoder 
+    // frame, and `spliceMultimodal` replaces each with the matching audio
+    // embedding row.
     //
     // The `VisionModel` multimodal generate path is greedy (`runGreedy`),
     // the same surface the Gemma 4 vision integration test uses, so this is

@@ -934,12 +934,12 @@ final class Idefics3RemappedBundle {
 
 /// The assembled Idefics3 VLM: SigLIP vision encoder + pixel-shuffle
 /// connector + Llama-style text backbone. Implements the `LanguageModel`
-/// protocol by delegating to the internal `LlamaModel`.
+/// protocol by delegating to the internal `Llama3Model`.
 ///
 /// Vision prefill (`prefillWithImage`) drives the KV cache one token at a
 /// time, substituting image embeddings for image-placeholder tokens.
 public final class Idefics3Model: LanguageModel {
-    public let llamaModel: LlamaModel
+    public let llamaModel: Llama3Model
     public let visionEncoder: Idefics3VisionEncoder
     public let connector: Idefics3Connector
     public let cfg: Idefics3Config
@@ -956,7 +956,7 @@ public final class Idefics3Model: LanguageModel {
     public var dtype: DType { llamaModel.dtype }
 
     public init(
-        llamaModel: LlamaModel,
+        llamaModel: Llama3Model,
         visionEncoder: Idefics3VisionEncoder,
         connector: Idefics3Connector,
         cfg: Idefics3Config,
@@ -993,7 +993,7 @@ public final class Idefics3Model: LanguageModel {
 
     /// Command-buffer-aware forward — required by `LanguageModel` for
     /// command-buffer chaining across decode steps. Delegates to
-    /// LlamaModel's `forward(...:on:device:)`.
+    /// Llama3Model's `forward(...:on:device:)`.
     public func forward(
         tokenId: Int, position: Int,
         caches: [any LayerCacheProtocol],
@@ -1004,11 +1004,11 @@ public final class Idefics3Model: LanguageModel {
             caches: caches, on: cmd, device: device)
     }
 
-    /// Multi-token forward — delegates to LlamaModel's optimised
+    /// Multi-token forward — delegates to Llama3Model's optimised
     /// chunked path (Ops.gemm batched projections + one
     /// Ops.sdpaMulti(causal: true) per layer). Idefics3 gets the full
     /// TTFT win for the text-only AR prefill path for free,
-    /// since its text backbone IS a LlamaModel. Image-prefill
+    /// since its text backbone IS a Llama3Model. Image-prefill
     /// (vision-substitution) still routes through `prefillWithImage`
     /// which is its own block path.
     public func forwardMulti(

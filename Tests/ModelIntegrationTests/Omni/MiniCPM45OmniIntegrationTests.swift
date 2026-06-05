@@ -91,10 +91,9 @@ struct MiniCPM45OmniIntegrationTests {
         let vlm = try #require(m.vlModel, "MiniCPM-o is not a VLM")
 
         let image = try VisionTestHelpers.dogImage()
-        // MiniCPM-o image framing (processing_minicpmo.py): `<image>` +
-        // `<unk>×image_feature_size(64)` + `</image>`, inside a chat turn.
-        // The 64 `<unk>` (vlm.imageTokenId) placeholders are replaced by the
-        // resampler's 64 image tokens.
+        // MiniCPM-o image framing: `<image>` + `<unk>×image_feature_size(64)` + `</image>`,
+        // inside a chat turn. The 64 `<unk>` (vlm.imageTokenId) placeholders are replaced 
+        // by the resampler's 64 image tokens.
         let nImg = vlm.encodeImage(image).shape[0]
         let pre = m.tokenizer.encode(text: "<|im_start|>user\n<image>")
         let post = m.tokenizer.encode(
@@ -119,7 +118,7 @@ struct MiniCPM45OmniIntegrationTests {
         let audioTokenId = try #require(vlm.audioTokenId)
 
         let wav = Self.sine()
-        // MiniCPM-o audio framing (processing_minicpmo.py): `<|audio_start|>`
+        // MiniCPM-o audio framing: `<|audio_start|>`
         // + `<unk>×output_len` + `<|audio_end|>`. The placeholder count must
         // match the whisper-tower → projector → avg-pool(5) output length.
         let nAud = try vlm.encodeAudio(wav).shape[0]

@@ -119,7 +119,7 @@ public struct Qwen3Dense: Qwen3Variant {
             let oProj = try loadLinear(
                 base: "\(p).self_attn.o_proj", in: weights, quantization: quant)
 
-            // Per-head Q/K RMSNorm — the structural delta vs Llama.
+            // Per-head Q/K RMSNorm — the structural delta vs Llama3.
             let qNorm = RMSNorm(
                 weight: try weights.tensor(named: "\(p).self_attn.q_norm.weight"),
                 eps: Float(eps))
@@ -157,7 +157,7 @@ public struct Qwen3Dense: Qwen3Variant {
             weight: try weights.tensor(named: "model.norm.weight"),
             eps: Float(eps))
 
-        // LM head. Tied / quantized variants — same as Llama.
+        // LM head. Tied / quantized variants — same as Llama3.
         let lmHead: AnyLinear
         if !tieEmbed, weights.has("lm_head.weight") {
             lmHead = try loadLinear(base: "lm_head", in: weights, quantization: quant)
@@ -257,7 +257,7 @@ public final class Qwen3Layer: Module {
         return out
     }
 
-    /// Single-token forward pass. Same shape as LlamaLayer.forward but
+    /// Single-token forward pass. Same shape as Llama3Layer.forward but
     /// applies q_norm / k_norm to each head's [head_dim] vector before
     /// RoPE. All work queued on `cmd`, no commit/wait inside.
     func forward(
@@ -372,7 +372,7 @@ public final class Qwen3Layer: Module {
     }
 
     /// Chunked forward — process `nRows` tokens at once. See
-    /// `LlamaLayer.forwardMulti` for the design + perf notes; the only
+    /// `Llama3Layer.forwardMulti` for the design + perf notes; the only
     /// shape difference vs Llama is the per-head q_norm / k_norm step
     /// that Qwen 3 applies between projection and RoPE.
     ///
@@ -616,7 +616,7 @@ public final class Qwen3Model: LanguageModel {
     }
 
     /// Chunked multi-token forward — prefill fast path. See
-    /// `LlamaModel.forwardMulti` for the design notes; Qwen3's layer
+    /// `Llama3Model.forwardMulti` for the design notes; Qwen3's layer
     /// fast path differs only in the per-head q_norm / k_norm step.
     public func forwardMulti(
         tokenIds: [Int], startingAt position: Int,

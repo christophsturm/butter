@@ -21,7 +21,7 @@
 //   • `Phi3Dense` — `PhiVariant` conformance + the per-variant
 //     `loadModel` entry. Slices the fused `qkv_proj` and
 //     `gate_up_proj` weights into row-views that drop straight into
-//     `LlamaLayer`, then returns a `LlamaModel` engine.
+//     `Llama3Layer`, then returns a `Llama3Model` engine.
 
 import Foundation
 
@@ -45,7 +45,7 @@ public struct Phi3Dense: PhiVariant {
         weights: SafeTensorsBundle,
         options: LoadOptions,
         device: Device
-    ) throws -> LlamaModel {
+    ) throws -> Llama3Model {
         guard let hidden = config.hiddenSize,
             let nLayers = config.numLayers,
             let nHeads = config.numAttentionHeads,
@@ -100,7 +100,7 @@ public struct Phi3Dense: PhiVariant {
         )
 
         // Layers
-        var layers: [LlamaLayer] = []
+        var layers: [Llama3Layer] = []
         layers.reserveCapacity(nLayers)
 
         let qSize = nHeads * headDim
@@ -181,7 +181,7 @@ public struct Phi3Dense: PhiVariant {
                 eps: Float(eps))
 
             layers.append(
-                LlamaLayer(
+                Llama3Layer(
                     qProj: qProj, kProj: kProj, vProj: vProj, oProj: oProj,
                     gateProj: gateProj, upProj: upProj, downProj: downProj,
                     inputNorm: inputNorm, postAttnNorm: postAttnNorm,
@@ -222,7 +222,7 @@ public struct Phi3Dense: PhiVariant {
             activationDtype = embedTokens.weight.dtype
         }
 
-        return LlamaModel(
+        return Llama3Model(
             embedTokens: embedTokens, layers: layers,
             finalNorm: finalNorm, lmHead: lmHead,
             hidden: hidden, nLayers: nLayers, nHeads: nHeads,

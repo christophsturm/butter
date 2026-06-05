@@ -14,14 +14,14 @@
 //
 // Mistral3Dense — the TEXT component of the Mistral 3 family. Mistral
 // Small 3.1's text backbone is Mistral (Llama-shaped), so it reuses the
-// in-tree `LlamaDense` engine. This thin variant lets the `Mistral3` VL
+// in-tree `Llama3Dense` engine. This thin variant lets the `Mistral3` VL
 // orchestrator load its text stack through the family's own variant rather
-// than reaching for `LlamaDense` directly.
+// than reaching for `Llama3Dense` directly.
 
 import Foundation
 
-/// Mistral 3's text engine is the shared `LlamaModel` (Mistral == Llama-shaped).
-public typealias Mistral3Model = LlamaModel
+/// Mistral 3's text engine is the shared `Llama3Model` (Mistral == Llama-shaped).
+public typealias Mistral3Model = Llama3Model
 
 public protocol Mistral3Variant {
     static var availableCapabilities: Set<Capability> { get }
@@ -36,13 +36,13 @@ public protocol Mistral3Variant {
 public enum Mistral3Dense: Mistral3Variant {
     public static let availableCapabilities: Set<Capability> = Capability.textOnly
     public static let defaultGenerationParameters =
-        LlamaDense.defaultGenerationParameters
+        Llama3Dense.defaultGenerationParameters
 
     public static func loadModel(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> Mistral3Model {
-        try LlamaDense.loadModel(
+        try Llama3Dense.loadModel(
             config: config, weights: weights, options: options, device: device)
     }
 }

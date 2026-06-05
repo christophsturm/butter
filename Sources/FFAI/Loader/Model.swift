@@ -558,13 +558,13 @@ public enum ModelRegistry {
                 config: config, weights: weights,
                 options: options, device: device)
         }
-        if let arch = config.architecture, Llama.architectures.contains(arch) {
-            return try loadLlama(
+        if let arch = config.architecture, Llama3.architectures.contains(arch) {
+            return try loadLlama3(
                 config: config, weights: weights,
                 options: options, device: device)
         }
-        if let mt = config.modelType, Llama.modelTypes.contains(mt) {
-            return try loadLlama(
+        if let mt = config.modelType, Llama3.modelTypes.contains(mt) {
+            return try loadLlama3(
                 config: config, weights: weights,
                 options: options, device: device)
         }
@@ -585,7 +585,7 @@ public enum ModelRegistry {
         // Llama-compatible families: SmolLM 1/2/3, OLMo 1, Yi. Same
         // weight layout + forward shape as Llama 3; optional QKV biases
         // auto-detected by loadLinear. Each has its own family root under
-        // `Models/` with a `<F>Dense` variant over `LlamaDense`, and its
+        // `Models/` with a `<F>Dense` variant over `Llama3Dense`, and its
         // own `load<F>` helper, until / unless it diverges from the
         // Llama-3 shape.
         //
@@ -628,7 +628,7 @@ public enum ModelRegistry {
         // (embedding / attention / residual / logits scaling) that the
         // plain Llama path silently drops, giving degenerate output.
         // `loadGranite3` folds them into the weights via
-        // `LlamaDense.loadModel(muP:)`. See `Models/Granite3.swift`.
+        // `Llama3Dense.loadModel(muP:)`. See `Models/Granite3.swift`.
         if let arch = config.architecture, Granite3.architectures.contains(arch) {
             return try loadGranite3(
                 config: config, weights: weights,
@@ -893,11 +893,11 @@ public enum ModelRegistry {
         )
     }
 
-    public static func loadLlama(
+    public static func loadLlama3(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> Loaded {
-        let variant = try Llama.variant(for: config)
+        let variant = try Llama3.variant(for: config)
         let engine = try variant.loadModel(
             config: config, weights: weights,
             options: options, device: device
@@ -908,7 +908,7 @@ public enum ModelRegistry {
     }
 
     /// Granite 3.x dense (`GraniteForCausalLM`). Same shape as Llama 3
-    /// dense, so it reuses `LlamaDense` — but with the four µP
+    /// dense, so it reuses `Llama3Dense` — but with the four µP
     /// multipliers folded in via `loadModel(muP:)`. Granite 3 MoE
     /// (`GraniteMoeForCausalLM`) is a distinct arch and does not route
     /// here.
@@ -926,7 +926,7 @@ public enum ModelRegistry {
     }
 
     /// Mistral 7B / Nemo / Small (`MistralForCausalLM`). Same shape as
-    /// Llama 3 dense, so it reuses `LlamaDense` via the `MistralDense`
+    /// Llama 3 dense, so it reuses `Llama3Dense` via the `MistralDense`
     /// variant.
     public static func loadMistral(
         config: ModelConfig, weights: SafeTensorsBundle,
@@ -942,7 +942,7 @@ public enum ModelRegistry {
     }
 
     /// OLMo 1 (`OlmoForCausalLM`). Pre-norm Llama-shaped; reuses
-    /// `LlamaDense` via the `OLMoDense` variant. OLMo 2 (`olmo2`) is
+    /// `Llama3Dense` via the `OLMoDense` variant. OLMo 2 (`olmo2`) is
     /// post-norm with q/k-norm and routes through `loadOLMo2` instead.
     public static func loadOLMo1(
         config: ModelConfig, weights: SafeTensorsBundle,
@@ -958,7 +958,7 @@ public enum ModelRegistry {
     }
 
     /// Yi (`YiForCausalLM`). Same shape as Llama 3 dense, so it reuses
-    /// `LlamaDense` via the `YiDense` variant.
+    /// `Llama3Dense` via the `YiDense` variant.
     public static func loadYi(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
@@ -973,7 +973,7 @@ public enum ModelRegistry {
     }
 
     /// SmolLM 1 / 2 / 3 (`SmolLM*ForCausalLM`). Same shape as Llama 3
-    /// dense, so it reuses `LlamaDense` via the `SmolLMDense` variant.
+    /// dense, so it reuses `Llama3Dense` via the `SmolLMDense` variant.
     public static func loadSmolLM(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
@@ -1006,7 +1006,7 @@ public enum ModelRegistry {
 
     /// OLMo 2 (`Olmo2ForCausalLM`). Post-norm + q/k-norm decoder; the
     /// dedicated engine lives in `Models/Text/OLMo2Text.swift`. OLMo 1
-    /// stays on `loadLlama`.
+    /// stays on `loadLlama3`.
     public static func loadOLMo2(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
@@ -1256,7 +1256,7 @@ public enum ModelRegistry {
 /// High-level loaded model with tokenizer attached. The public API users
 /// touch.
 public final class Model: @unchecked Sendable {
-    /// The concrete model engine (LlamaModel, Qwen3Model, …). For a VLM
+    /// The concrete model engine (Llama3Model, Qwen3Model, …). For a VLM
     /// this is the text backbone — text-only generation works
     /// regardless of whether `.imageIn` is enabled.
     public let engine: any LanguageModel
@@ -1315,8 +1315,8 @@ public final class Model: @unchecked Sendable {
     public let defaultGenerationParameters: GenerationParameters
 
     /// Convenience accessor for tests + tools that want the Llama-typed
-    /// model. Returns nil if the loaded engine isn't Llama.
-    public var llama: LlamaModel? { engine as? LlamaModel }
+    /// model. Returns nil if the loaded engine isn't Llama3.
+    public var llama: Llama3Model? { engine as? Llama3Model }
 
     /// Convenience accessor for the Qwen3 engine.
     public var qwen3: Qwen3Model? { engine as? Qwen3Model }

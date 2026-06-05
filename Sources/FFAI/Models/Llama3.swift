@@ -17,37 +17,37 @@
 // This file is the **main model interface** for the family:
 //   • the family enum `Llama` (modelTypes, architectures, variant
 //     dispatch),
-//   • the `LlamaVariant` protocol every concrete variant conforms to,
-//   • the `LlamaError` type every loader / decode site raises.
+//   • the `Llama3Variant` protocol every concrete variant conforms to,
+//   • the `Llama3Error` type every loader / decode site raises.
 //
 // Concrete variants + the dense decoder + per-layer impl live under
 // `Models/Text/LlamaText.swift`:
-//   - `LlamaDense` — Llama 3 / 3.1 / 3.2 dense GQA transformer (the
+//   - `Llama3Dense` — Llama 3 / 3.1 / 3.2 dense GQA transformer (the
 //     only variant shipped today; 1B / 3B / 8B / 70B; 405B with
 //     quantization).
-//   - `LlamaLayer`, `LlamaModel` — per-layer + full-model impl.
+//   - `Llama3Layer`, `Llama3Model` — per-layer + full-model impl.
 
 import Foundation
 
 // ─── Family entry point ──────────────────────────────────────────────
 
-public enum Llama {
+public enum Llama3 {
     /// HuggingFace `model_type` strings this family handles.
     public static let modelTypes: Set<String> = ["llama"]
     /// HuggingFace `architectures[0]` strings this family handles.
     public static let architectures: Set<String> = ["LlamaForCausalLM"]
 
-    /// Pick the concrete variant for a config. Only `LlamaDense`
+    /// Pick the concrete variant for a config. Only `Llama3Dense`
     /// ships today; future variants (Llama 4 MoE, etc.) dispatch here.
-    public static func variant(for config: ModelConfig) throws -> any LlamaVariant.Type {
+    public static func variant(for config: ModelConfig) throws -> any Llama3Variant.Type {
         _ = config
-        return LlamaDense.self
+        return Llama3Dense.self
     }
 }
 
 // ─── Variant protocol ────────────────────────────────────────────────
 
-public protocol LlamaVariant {
+public protocol Llama3Variant {
     /// Capabilities a checkpoint of this variant exposes.
     static var availableCapabilities: Set<Capability> { get }
     /// Generation defaults for this variant. The user can override any
@@ -55,18 +55,18 @@ public protocol LlamaVariant {
     /// See `planning/roadmap.md` for which fields are honored today vs
     /// staged for planned (sampling kernels).
     static var defaultGenerationParameters: GenerationParameters { get }
-    /// Build a `LlamaModel` decoder from a checkpoint.
+    /// Build a `Llama3Model` decoder from a checkpoint.
     static func loadModel(
         config: ModelConfig,
         weights: SafeTensorsBundle,
         options: LoadOptions,
         device: Device
-    ) throws -> LlamaModel
+    ) throws -> Llama3Model
 }
 
 // ─── Errors ──────────────────────────────────────────────────────────
 
-public enum LlamaError: Error, CustomStringConvertible {
+public enum Llama3Error: Error, CustomStringConvertible {
     case missingConfig
     public var description: String {
         switch self {

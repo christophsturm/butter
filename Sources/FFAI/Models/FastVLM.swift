@@ -28,7 +28,7 @@
 //       – output: the conv_exp feature map [B, H, W, mm_hidden_size].
 //   • mlp2x_gelu projector — two linear layers with GELU activation,
 //     projecting from mm_hidden_size (3072) into the text hidden dim.
-//   • Qwen2 text backbone — the existing `LlamaDense` engine (Qwen2 is
+//   • Qwen2 text backbone — the existing `Llama3Dense` engine (Qwen2 is
 //     architecturally identical to Llama; QKV biases are auto-detected
 //     by `loadLinear`). Text weights live under `language_model.*`.
 //
@@ -136,7 +136,7 @@ public enum FastVLM {
 
         // ── Text backbone ──
         // Qwen2-0.5B weights live under `language_model.*`. Merge
-        // Qwen2/Llama defaults so the LlamaDense loader gets a complete
+        // Qwen2/Llama defaults so the Llama3Dense loader gets a complete
         // config (the VLM top-level config is sparse for text fields).
         let mergedTextConfig = ModelConfig(
             architecture: "Qwen2ForCausalLM",
@@ -195,7 +195,7 @@ public enum FastVLM {
 }
 
 /// Merge FastVLM text-model defaults into the VLM's top-level config.
-/// The `LlamaDense` loader needs a complete text config; the FastVLM
+/// The `Llama3Dense` loader needs a complete text config; the FastVLM
 /// top-level config stores the Qwen2 text fields directly (no nested
 /// `text_config`).
 func fastVLMTextConfigWithDefaults(
@@ -214,7 +214,7 @@ func fastVLMTextConfigWithDefaults(
         "tie_word_embeddings": true,
     ]
     // Checkpoint-declared fields override defaults. Exclude nested VLM
-    // keys that LlamaDense doesn't understand (vision_config, mm_*).
+    // keys that Llama3Dense doesn't understand (vision_config, mm_*).
     let excludeKeys: Set<String> = [
         "vision_config", "architectures",
         "model_type", "image_token_id",

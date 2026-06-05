@@ -42,7 +42,7 @@ import Metal
 public enum OLMo2Dense {
 
     /// OLMo 2 dense defaults — Llama-shaped, greedy-friendly baseline.
-    public static let defaultGenerationParameters = LlamaDense.defaultGenerationParameters
+    public static let defaultGenerationParameters = Llama3Dense.defaultGenerationParameters
 
     public static func loadModel(
         config: ModelConfig,
@@ -57,7 +57,7 @@ public enum OLMo2Dense {
             let intermediate = config.intermediateSize,
             let eps = config.rmsNormEps
         else {
-            throw LlamaError.missingConfig
+            throw Llama3Error.missingConfig
         }
         let nKVHeads = config.numKeyValueHeads ?? nHeads
         let headDim = config.headDim ?? (hidden / nHeads)

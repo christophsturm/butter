@@ -14,7 +14,7 @@
 //
 // Granite 3 family integration coverage — IBM's Granite v3 dense text
 // models (granite-3.0, granite-3.1, granite-3.2). Llama-3-shaped
-// weights routed through `LlamaDense`.
+// weights routed through `Llama3Dense`.
 //
 // Granite 4 (granite-4.0-h, GraniteMoeHybrid) is a different
 // architecture (Mamba 2 / attention / MoE hybrid) and has its own

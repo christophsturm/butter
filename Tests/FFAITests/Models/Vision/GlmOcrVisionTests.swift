@@ -201,14 +201,14 @@ struct GlmOcrTests {
         // This is a pure registry-table check — no GPU or file I/O needed.
         // Just confirm the arch is in the set that dispatchAndLoad would match.
         #expect(GlmOcr.architectures.contains("GlmOcrForConditionalGeneration"))
-        #expect(!Llama.architectures.contains("GlmOcrForConditionalGeneration"))
+        #expect(!Llama3.architectures.contains("GlmOcrForConditionalGeneration"))
         #expect(!Qwen3.architectures.contains("GlmOcrForConditionalGeneration"))
     }
 
     @Test("GlmOcr.modelTypes is recognised by ModelRegistry dispatch path")
     func registryRecognisesGlmOcrModelType() {
         #expect(GlmOcr.modelTypes.contains("glm_ocr"))
-        #expect(!Llama.modelTypes.contains("glm_ocr"))
+        #expect(!Llama3.modelTypes.contains("glm_ocr"))
         #expect(!Qwen3.modelTypes.contains("glm_ocr"))
     }
 

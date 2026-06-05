@@ -17,7 +17,7 @@
 // (smollm2), SmolLM 3 (smollm3). All three use byte-identical weights to
 // Llama 3 dense + optional QKV biases that `loadLinear` auto-detects, so
 // the family root just declares the dispatch metadata and routes the
-// loader through `LlamaDense` — no per-family forward code.
+// loader through `Llama3Dense` — no per-family forward code.
 
 import Foundation
 
@@ -42,8 +42,8 @@ public enum SmolLM {
 
 // ─── Variant protocol ────────────────────────────────────────────────
 
-/// SmolLM's text engine is the shared `LlamaModel` (Llama-3-shaped).
-public typealias SmolLMModel = LlamaModel
+/// SmolLM's text engine is the shared `Llama3Model` (Llama-3-shaped).
+public typealias SmolLMModel = Llama3Model
 
 public protocol SmolLMVariant {
     static var availableCapabilities: Set<Capability> { get }
@@ -59,13 +59,13 @@ public protocol SmolLMVariant {
 public enum SmolLMDense: SmolLMVariant {
     public static let availableCapabilities: Set<Capability> = Capability.textOnly
     public static let defaultGenerationParameters =
-        LlamaDense.defaultGenerationParameters
+        Llama3Dense.defaultGenerationParameters
 
     public static func loadModel(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> SmolLMModel {
-        try LlamaDense.loadModel(
+        try Llama3Dense.loadModel(
             config: config, weights: weights, options: options, device: device)
     }
 }

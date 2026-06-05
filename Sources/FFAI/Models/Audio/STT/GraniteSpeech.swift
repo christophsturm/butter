@@ -28,7 +28,7 @@
 //     for the multi-head / multi-layer loops). No GPU involvement here —
 //     encoder/projector are not in the hot decode loop.
 //   • LM backbone follows the same GPU token-by-token decode pattern as
-//     LlamaModel (single MTLCommandBuffer per token, KV cache, argmax/sample).
+//     Llama3Model (single MTLCommandBuffer per token, KV cache, argmax/sample).
 //
 // Weight key layout (from mlx-community/granite-4.0-1b-speech-5bit):
 //   encoder.*

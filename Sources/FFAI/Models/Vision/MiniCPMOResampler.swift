@@ -404,8 +404,7 @@ final class MiniCPMOResampler {
     // Standard `get_2d_sincos_pos_embed(embed_dim, (H, W))`: the embedding
     // dim is split in half — the first half encodes the H-grid index, the
     // second half the W-grid index — each via interleaved sin/cos of
-    // `position × frequency`. Reference: `get_2d_sincos_pos_embed` +
-    // `get_2d_sincos_pos_embed_from_grid` in `modeling_minicpmo.py`.
+    // `position × frequency`.
 
     /// Build the `[H·W, embedDim]` additive 2D sin-cos position embedding
     /// for a `gridH × gridW` patch grid, row-major over the grid (the

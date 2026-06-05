@@ -101,7 +101,7 @@ public struct GlmOcrDense: GlmOcrVariant {
     public static let availableCapabilities: Set<Capability> =
         Capability.textOnly.union([.imageIn])
     public static let defaultGenerationParameters =
-        LlamaDense.defaultGenerationParameters
+        Llama3Dense.defaultGenerationParameters
 
     public static func loadModel(
         config: ModelConfig, weights: SafeTensorsBundle,

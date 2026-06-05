@@ -18,7 +18,7 @@
 // per-output biases, while o_proj does not (the 3-series uses no biases
 // anywhere). `loadLinear` in `Sources/FFAI/Layers.swift` detects
 // `<base>.bias` automatically, so Qwen 2.x routes through the same
-// `LlamaDense` engine as the 3-series + Mistral7B with no extra plumbing.
+// `Llama3Dense` engine as the 3-series + Mistral7B with no extra plumbing.
 //
 // Quantized Qwen 2.x (mlx-community 4-bit) is supported transparently: the
 // converter KEEPS the additive output biases on the QKV projections
@@ -32,26 +32,26 @@
 
 import Foundation
 
-/// The single Qwen 2 text variant. Text-only; reuses the `LlamaDense`
+/// The single Qwen 2 text variant. Text-only; reuses the `Llama3Dense`
 /// engine (Qwen 2.x is a standard GQA Llama shape with QKV biases).
 public enum Qwen2Dense: Qwen2Variant {
     public static let availableCapabilities: Set<Capability> = Capability.textOnly
 
     /// Qwen 2.x inherits the dense-attention generation defaults (the same
-    /// values the family previously got by routing through `LlamaDense`).
+    /// values the family previously got by routing through `Llama3Dense`).
     /// Declared here so the variant owns its parameters per the family
     /// convention; override per-checkpoint via the model card if needed.
     public static let defaultGenerationParameters =
-        LlamaDense.defaultGenerationParameters
+        Llama3Dense.defaultGenerationParameters
 
-    /// Load the Qwen 2 text backbone via the `LlamaDense` engine. `weights`
+    /// Load the Qwen 2 text backbone via the `Llama3Dense` engine. `weights`
     /// must already be scoped to the text sub-tree (e.g. `language_model.`-
     /// prefixed for a Qwen2-VL checkpoint).
     public static func loadModel(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> Qwen2Model {
-        try LlamaDense.loadModel(
+        try Llama3Dense.loadModel(
             config: config, weights: weights, options: options, device: device)
     }
 }

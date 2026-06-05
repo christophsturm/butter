@@ -39,7 +39,7 @@ public struct ModelInfo: Sendable {
     /// `model_type` from `config.json`, e.g. `"gemma2"` or `"qwen2"`.
     public let modelType: String?
 
-    /// FFAI engine class name (e.g. `"LlamaModel"`, `"Gemma2Model"`).
+    /// FFAI engine class name (e.g. `"Llama3Model"`, `"Gemma2Model"`).
     /// Useful for "which family file is driving this" answers without
     /// having to enumerate every typed convenience accessor.
     public let family: String

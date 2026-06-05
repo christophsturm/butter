@@ -28,7 +28,7 @@ struct OLMoRootTests {
 
     @Test("OLMo2Dense default generation parameters match the Llama-shaped card")
     func defaultGenerationParameters() {
-        // OLMo2Dense reuses LlamaDense.defaultGenerationParameters.
+        // OLMo2Dense reuses Llama3Dense.defaultGenerationParameters.
         let p = OLMo2Dense.defaultGenerationParameters
         #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.6)

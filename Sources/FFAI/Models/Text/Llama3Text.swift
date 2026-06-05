@@ -13,22 +13,22 @@
 // limitations under the License.
 //
 // Llama text — concrete variants + the dense decoder for the Llama 3.x
-// family. The family enum (`enum Llama`), variant protocol
-// (`LlamaVariant`), and error type (`LlamaError`) live in
-// `Models/Llama.swift` (the family root / main interface). This file
+// family. The family enum (`enum Llama3`), variant protocol
+// (`Llama3Variant`), and error type (`Llama3Error`) live in
+// `Models/Llama3.swift` (the family root / main interface). This file
 // holds the text-only impl:
 //
-//   • `LlamaDense` — `LlamaVariant` conformance + the per-variant
+//   • `Llama3Dense` — `Llama3Variant` conformance + the per-variant
 //     `loadModel` entry,
-//   • `LlamaLayer` — one attention + MLP block,
-//   • `LlamaModel` — the full LanguageModel decoder.
+//   • `Llama3Layer` — one attention + MLP block,
+//   • `Llama3Model` — the full LanguageModel decoder.
 
 import Foundation
 import Metal
 
-// ─── LlamaDense — standard transformer ───────────────────────────────
+// ─── Llama3Dense — standard transformer ───────────────────────────────
 
-public struct LlamaDense: LlamaVariant {
+public struct Llama3Dense: Llama3Variant {
     public static let availableCapabilities: Set<Capability> = [.textIn, .textOut]
 
     /// Llama 3.x dense defaults. Tracks mlx-swift-lm's
@@ -48,7 +48,7 @@ public struct LlamaDense: LlamaVariant {
         weights: SafeTensorsBundle,
         options: LoadOptions,
         device: Device
-    ) throws -> LlamaModel {
+    ) throws -> Llama3Model {
         try loadModel(
             config: config, weights: weights, options: options,
             device: device, muP: .identity)
@@ -67,7 +67,7 @@ public struct LlamaDense: LlamaVariant {
         options: LoadOptions,
         device: Device,
         muP: MuPMultipliers
-    ) throws -> LlamaModel {
+    ) throws -> Llama3Model {
         guard let hidden = config.hiddenSize,
             let nLayers = config.numLayers,
             let nHeads = config.numAttentionHeads,
@@ -76,7 +76,7 @@ public struct LlamaDense: LlamaVariant {
             let intermediate = config.intermediateSize,
             let eps = config.rmsNormEps
         else {
-            throw LlamaError.missingConfig
+            throw Llama3Error.missingConfig
         }
         let nKVHeads = config.numKeyValueHeads ?? nHeads
         let theta = Float(config.ropeTheta ?? 500_000)
@@ -142,7 +142,7 @@ public struct LlamaDense: LlamaVariant {
         }
 
         // Layers
-        var layers: [LlamaLayer] = []
+        var layers: [Llama3Layer] = []
         layers.reserveCapacity(nLayers)
         for i in 0 ..< nLayers {
             let p = "model.layers.\(i)"
@@ -180,7 +180,7 @@ public struct LlamaDense: LlamaVariant {
                 eps: Float(eps))
 
             layers.append(
-                LlamaLayer(
+                Llama3Layer(
                     qProj: qProj, kProj: kProj, vProj: vProj, oProj: oProj,
                     gateProj: gateProj, upProj: upProj, downProj: downProj,
                     inputNorm: inputNorm, postAttnNorm: postAttnNorm,
@@ -235,7 +235,7 @@ public struct LlamaDense: LlamaVariant {
             activationDtype = embedTokens.weight.dtype
         }
 
-        return LlamaModel(
+        return Llama3Model(
             embedTokens: embedTokens, layers: layers,
             finalNorm: finalNorm, lmHead: lmHead,
             hidden: hidden, nLayers: nLayers, nHeads: nHeads,
@@ -251,7 +251,7 @@ public struct LlamaDense: LlamaVariant {
 
 // ─── Layer (attention + MLP) ─────────────────────────────────────────
 
-public final class LlamaLayer: Module {
+public final class Llama3Layer: Module {
     let qProj, kProj, vProj, oProj: AnyLinear
     let gateProj, upProj, downProj: AnyLinear
     let inputNorm, postAttnNorm: RMSNorm
@@ -422,7 +422,7 @@ public final class LlamaLayer: Module {
     ///
     /// **Cache compatibility.** AURA caches need Q π-rotation +
     /// post-SDPA π^T-unrotation; this fast path doesn't apply them.
-    /// `LlamaModel.forwardMulti` checks the cache type and falls back
+    /// `Llama3Model.forwardMulti` checks the cache type and falls back
     /// to the per-token loop when any layer's cache is `AURAQuantizedKVCache`.
     func forwardMulti(
         _ h: Tensor, startingAt position: Int,
@@ -432,7 +432,7 @@ public final class LlamaLayer: Module {
         let nRows = h.shape[0]
         precondition(
             h.shape == [nRows, hidden],
-            "LlamaLayer.forwardMulti: h shape \(h.shape) ≠ [nRows, hidden]")
+            "Llama3Layer.forwardMulti: h shape \(h.shape) ≠ [nRows, hidden]")
 
         // ── Attention ───────────────────────────────────────────────────
         let xNorm = Ops.rmsNormRows(
@@ -530,9 +530,9 @@ public final class LlamaLayer: Module {
 
 // ─── Whole model ─────────────────────────────────────────────────────
 
-public final class LlamaModel: LanguageModel {
+public final class Llama3Model: LanguageModel {
     public let embedTokens: AnyEmbedding
-    public let layers: [LlamaLayer]
+    public let layers: [Llama3Layer]
     public let finalNorm: RMSNorm
     public let lmHead: AnyLinear
 
@@ -553,7 +553,7 @@ public final class LlamaModel: LanguageModel {
     public let logitsScaling: Float
 
     init(
-        embedTokens: AnyEmbedding, layers: [LlamaLayer],
+        embedTokens: AnyEmbedding, layers: [Llama3Layer],
         finalNorm: RMSNorm, lmHead: AnyLinear,
         hidden: Int, nLayers: Int, nHeads: Int, nKVHeads: Int, headDim: Int,
         vocab: Int, maxContextWindow: Int, ropeTheta: Float, dtype: DType,
@@ -693,7 +693,7 @@ public final class LlamaModel: LanguageModel {
 
     /// Chunked multi-token forward — prefill fast path.
     /// Embeds `tokenIds.count` tokens, runs the layer stack with
-    /// `LlamaLayer.forwardMulti` (one `Ops.sdpaMulti(causal: true)`
+    /// `Llama3Layer.forwardMulti` (one `Ops.sdpaMulti(causal: true)`
     /// per layer + batched projections), and returns the
     /// **tail-position logits only** — the contract `Generate.swift`
     /// consumes (only the final position is sampled).
@@ -704,7 +704,7 @@ public final class LlamaModel: LanguageModel {
     ///   - **AURA caches** use a π-rotated K/V layout that the chunked
     ///     path doesn't implement.
     ///   - **`headDim != 128`** — `ffai_sdpa_multi` (the kernel
-    ///     `LlamaLayer.forwardMulti` dispatches) is head_dim-128 only.
+    ///     `Llama3Layer.forwardMulti` dispatches) is head_dim-128 only.
     ///     Llama 3.2 1B / 3B use head_dim=64; Qwen 2 uses head_dim=128
     ///     when wide and head_dim=64 when narrow. The single-token
     ///     `Ops.sdpaDecode` has variants at d64 / d128 / d256 / d512,
@@ -716,7 +716,7 @@ public final class LlamaModel: LanguageModel {
     ) -> Tensor {
         precondition(
             !tokenIds.isEmpty,
-            "LlamaModel.forwardMulti: tokenIds must be non-empty")
+            "Llama3Model.forwardMulti: tokenIds must be non-empty")
 
         // Fallback to per-token loop when the chunked SDPA fast path
         // can't apply — see doc comment.
@@ -743,7 +743,7 @@ public final class LlamaModel: LanguageModel {
         var h = embedTokens(idsTensor, on: cmd)
         precondition(
             h.shape == [n, hidden],
-            "LlamaModel.forwardMulti: embedding shape \(h.shape) ≠ [n, hidden]")
+            "Llama3Model.forwardMulti: embedding shape \(h.shape) ≠ [n, hidden]")
 
         // Layers — each runs its chunked forward over [N, hidden].
         for (i, layer) in layers.enumerated() {
@@ -766,7 +766,7 @@ public final class LlamaModel: LanguageModel {
     /// row is supplied directly (a vision-encoder token, or a text-token
     /// embedding the VL model looked up itself). Qwen 2 / 2.5 VL route
     /// their text backbone through the Llama dense engine, so the VL
-    /// splice needs this primitive on `LlamaModel`.
+    /// splice needs this primitive on `Llama3Model`.
     public var supportsEmbeddingInput: Bool { true }
 
     public func forward(
@@ -776,7 +776,7 @@ public final class LlamaModel: LanguageModel {
     ) -> Tensor {
         precondition(
             inputEmbedding.elementCount == hidden,
-            "LlamaModel.forward(inputEmbedding:): expected [\(hidden)], "
+            "Llama3Model.forward(inputEmbedding:): expected [\(hidden)], "
                 + "got \(inputEmbedding.shape)")
         var h = inputEmbedding.reshaped(to: [hidden])
         for (i, layer) in layers.enumerated() {
@@ -793,7 +793,7 @@ public final class LlamaModel: LanguageModel {
     /// is `forwardMulti(tokenIds:...)` minus the embedding gather: the
     /// `[seqLen, hidden]` residual block is supplied directly (spliced
     /// text-token + vision-token rows). Runs the chunk through
-    /// `LlamaLayer.forwardMulti` (one `Ops.sdpaMulti(causal: true)` per
+    /// `Llama3Layer.forwardMulti` (one `Ops.sdpaMulti(causal: true)` per
     /// layer + batched projections) and returns the **tail-position
     /// logits** — collapsing the legacy ~seqLen serial per-position
     /// dispatches into one command buffer. The biggest VLM-prefill win on
@@ -813,7 +813,7 @@ public final class LlamaModel: LanguageModel {
         let n = inputEmbeddings.shape.first ?? 0
         precondition(
             n > 0 && inputEmbeddings.shape == [n, hidden],
-            "LlamaModel.forwardMulti(inputEmbeddings:): expected "
+            "Llama3Model.forwardMulti(inputEmbeddings:): expected "
                 + "[seqLen, \(hidden)], got \(inputEmbeddings.shape)")
 
         // Same fast-path gating as the token-id `forwardMulti`: the chunked

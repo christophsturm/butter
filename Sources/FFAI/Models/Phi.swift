@@ -24,7 +24,7 @@
 // `Models/Text/PhiText.swift`:
 //   - `Phi3Dense` — Phi-3 / Phi-3.5 mini / small / medium dense GQA
 //     transformer with fused QKV + fused gate/up projections row-sliced
-//     into LlamaLayer views. Returns a `LlamaModel` engine.
+//     into Llama3Layer views. Returns a `Llama3Model` engine.
 
 import Foundation
 
@@ -49,7 +49,7 @@ public protocol PhiVariant {
         weights: SafeTensorsBundle,
         options: LoadOptions,
         device: Device
-    ) throws -> LlamaModel
+    ) throws -> Llama3Model
 }
 
 // ─── Errors ──────────────────────────────────────────────────────────

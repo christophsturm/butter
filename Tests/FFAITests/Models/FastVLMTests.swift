@@ -48,7 +48,7 @@ struct FastVLMRootTests {
     @Test("fastVLMTextConfigWithDefaults supplies Qwen 2-0.5B fallbacks")
     func textDefaultsHelper() {
         // An empty raw dict should fall back to every documented Qwen2
-        // default so the LlamaDense loader sees a complete text config.
+        // default so the Llama3Dense loader sees a complete text config.
         let merged = fastVLMTextConfigWithDefaults([:], vocabFallback: nil)
         #expect(merged["num_attention_heads"] as? Int == 14)
         #expect(merged["num_key_value_heads"] as? Int == 2)

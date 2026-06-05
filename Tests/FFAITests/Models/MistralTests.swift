@@ -16,7 +16,7 @@
 //
 // Offline. Mistral 7B / Nemo are byte-identical to Llama 3 dense; the
 // root file declares the dispatch metadata and routes
-// `variant(for:)` to `LlamaDense`. These tests guard the registry
+// `variant(for:)` to `Llama3Dense`. These tests guard the registry
 // surface + the variant dispatch shape.
 
 import Foundation
@@ -39,7 +39,7 @@ struct MistralRootTests {
         #expect(!Mistral.architectures.isEmpty)
     }
 
-    @Test("variant(for:) returns MistralDense (a thin variant over LlamaDense)")
+    @Test("variant(for:) returns MistralDense (a thin variant over Llama3Dense)")
     func variantDispatch() throws {
         let cfg = ModelConfig(
             architecture: "MistralForCausalLM",

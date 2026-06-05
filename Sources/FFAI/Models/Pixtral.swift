@@ -28,7 +28,7 @@
 //   • Multi-modal projector — two linear layers with GELU activation
 //     (`linear_1` → GELU → `linear_2`), projecting from the vision
 //     hidden dim into the text hidden dim.
-//   • Mistral text backbone — the existing `LlamaDense` engine (Mistral
+//   • Mistral text backbone — the existing `Llama3Dense` engine (Mistral
 //     is architecturally identical to Llama; it routes through the same
 //     dense loader). Text weights live under `language_model.*` in the
 //     mlx-community conversion.
@@ -47,7 +47,7 @@
 //
 // Coherence-first port: vision attention runs on the CPU (patch counts
 // are at most a few thousand). The text backbone runs through the existing
-// GPU-accelerated LlamaDense engine.
+// GPU-accelerated Llama3Dense engine.
 //
 // Vision tower internals (config structs, 2D RoPE, attention block,
 // encoder, projector, composed tower) live in `Models/Vision/PixtralVision.swift`.

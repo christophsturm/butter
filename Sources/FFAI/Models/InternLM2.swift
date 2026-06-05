@@ -16,7 +16,7 @@
 // Llama-3-shaped weights — some checkpoints use a fused `wqkv`
 // projection that `loadLinear` handles transparently via the
 // bias-aware Linear; the family root just declares dispatch metadata
-// and routes through `LlamaDense`.
+// and routes through `Llama3Dense`.
 
 import Foundation
 
@@ -34,8 +34,8 @@ public enum InternLM2 {
 
 // ─── Variant protocol ────────────────────────────────────────────────
 
-/// InternLM2's text engine is the shared `LlamaModel` (Llama-3-shaped).
-public typealias InternLM2Model = LlamaModel
+/// InternLM2's text engine is the shared `Llama3Model` (Llama-3-shaped).
+public typealias InternLM2Model = Llama3Model
 
 public protocol InternLM2Variant {
     static var availableCapabilities: Set<Capability> { get }

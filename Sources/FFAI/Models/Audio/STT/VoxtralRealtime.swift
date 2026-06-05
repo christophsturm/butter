@@ -1695,7 +1695,7 @@ public final class VoxtralRealtimeModel: @unchecked Sendable {
 ///
 /// Voxtral uses adjacent-pair interleaving: for each head, pairs (x[2i], x[2i+1])
 /// are rotated by (cos, sin) at position `startPos + row`.
-/// This differs from the split-half RoPE used in Llama.
+/// This differs from the split-half RoPE used in Llama3.
 private func voxtralInterleavedRoPE(
     vals: [Float], seqLen: Int, nHeads: Int,
     headDim: Int, startPos: Int,

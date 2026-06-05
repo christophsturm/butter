@@ -65,7 +65,7 @@
 // that we honour when present (and fall back to the interval rule when
 // it is absent).
 //
-// Per-layer dataflow (matches mlx-lm's `qwen3_5.py`):
+// Per-layer dataflow:
 //
 //   residual = h
 //   h        = input_layernorm(h)

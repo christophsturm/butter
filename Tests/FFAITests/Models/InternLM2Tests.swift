@@ -30,7 +30,7 @@ struct InternLM2RootTests {
 
     @Test("InternLM2Dense default generation parameters match the Llama-shaped card")
     func defaultGenerationParameters() {
-        // InternLM2Dense reuses LlamaDense.defaultGenerationParameters.
+        // InternLM2Dense reuses Llama3Dense.defaultGenerationParameters.
         let p = InternLM2Dense.defaultGenerationParameters
         #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.6)
