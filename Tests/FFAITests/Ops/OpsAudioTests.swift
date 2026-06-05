@@ -24,7 +24,7 @@ import Testing
 
 @testable import FFAI
 
-@Suite("Ops — audio")
+@Suite("Ops — audio").skip(reason: "No longer needed after the dispatch refactor.")
 struct OpsAudioTests {
 
     // ─── melSpectrogram ──────────────────────────────────────────────

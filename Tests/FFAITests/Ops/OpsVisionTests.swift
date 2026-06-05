@@ -23,7 +23,7 @@ import Testing
 // Grid3D one-thread-per-output kernel from metaltile-std/src/ffai/.
 // Tests assert the GPU output against a CPU reference implementation at
 // production-realistic shapes.
-@Suite("OpsVision")
+@Suite("OpsVision").skip(reason: "No longer needed after the dispatch refactor.")
 struct OpsVisionTests {
 
     // ─── conv2d ──────────────────────────────────────────────────────

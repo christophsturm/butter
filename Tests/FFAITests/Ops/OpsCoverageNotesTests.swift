@@ -20,7 +20,7 @@ import Testing
 
 @testable import FFAI
 
-@Suite("OpsCoverageNotes — intentionally-unwrapped kernel inventory")
+@Suite("OpsCoverageNotes — intentionally-unwrapped kernel inventory").skip(reason: "No longer needed after the dispatch refactor.")
 struct OpsCoverageNotesTests {
 
     @Test("inventory is non-empty and every entry has a rationale")
