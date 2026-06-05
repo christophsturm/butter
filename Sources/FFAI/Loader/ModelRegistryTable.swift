@@ -40,6 +40,8 @@ extension ModelRegistry {
     static let visionEntries: [ModelEntry] = [
         ModelEntry(
             family: "Gemma 3 VL", kind: .vlm,
+            summary: "SigLIP ViT + multi-modal projector + Gemma 3 text backbone.",
+            repos: ["mlx-community/gemma-3-4b-it-4bit", "mlx-community/gemma-3-27b-it-4bit"],
             architectures: ["Gemma3ForConditionalGeneration"],
             load: { c, w, o, d in
                 let vlm = try Gemma3VL.load(config: c, weights: w, options: o, device: d)
@@ -51,6 +53,7 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "LFM2-VL", kind: .vlm,
+            summary: "LiquidAI LFM2-VL — SigLIP2 ViT + LFM2 backbone + pixel-unshuffle projector.",
             architectures: ["Lfm2VlForConditionalGeneration"],
             load: { c, w, o, d in
                 let vlm = try LFM2VL.load(config: c, weights: w, options: o, device: d)
@@ -66,6 +69,11 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "Qwen 2.5-VL", kind: .vlm,
+            summary: "Dynamic-res windowed-attention ViT + Qwen 2.5 backbone.",
+            repos: [
+                "mlx-community/Qwen2.5-VL-3B-Instruct-4bit",
+                "mlx-community/Qwen2.5-VL-7B-Instruct-4bit",
+            ],
             architectures: ["Qwen2_5_VLForConditionalGeneration"],
             load: { c, w, o, d in
                 let vlm = try Qwen25VL.load(config: c, weights: w, options: o, device: d)
@@ -77,6 +85,11 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "Qwen 2-VL", kind: .vlm,
+            summary: "Dynamic-res full-attention ViT + Qwen 2 text backbone.",
+            repos: [
+                "mlx-community/Qwen2-VL-2B-Instruct-4bit",
+                "mlx-community/Qwen2-VL-7B-Instruct-4bit",
+            ],
             architectures: ["Qwen2VLForConditionalGeneration"],
             load: { c, w, o, d in
                 let vlm = try Qwen2VL.load(config: c, weights: w, options: o, device: d)
@@ -88,6 +101,11 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "Qwen 3-VL", kind: .vlm,
+            summary: "Dynamic-res full-attention ViT + Qwen 3 dense backbone.",
+            repos: [
+                "mlx-community/Qwen3-VL-2B-Instruct-4bit",
+                "mlx-community/Qwen3-VL-8B-Instruct-4bit",
+            ],
             architectures: ["Qwen3VLForConditionalGeneration"],
             load: { c, w, o, d in
                 let vlm = try Qwen3VL.load(config: c, weights: w, options: o, device: d)
@@ -99,6 +117,8 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "Qwen 3-VL-MoE", kind: .vlm,
+            summary: "Dynamic-res ViT + Qwen 3.5-shaped GDN ↔ attention MoE backbone.",
+            repos: ["mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit"],
             architectures: ["Qwen3VLMoeForConditionalGeneration"],
             load: { c, w, o, d in
                 let vlm = try Qwen3VLMoe.load(config: c, weights: w, options: o, device: d)
@@ -110,6 +130,8 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "Gemma 4 VL", kind: .vlm,
+            summary: "Bespoke Gemma 4 ViT + multi-modal embedder + Gemma 4 text backbone.",
+            repos: ["mlx-community/gemma-4-e4b-it-4bit", "mlx-community/gemma-4-31b-it-4bit"],
             architectures: ["Gemma4ForConditionalGeneration"],
             load: { c, w, o, d in
                 let vlm = try Gemma4VL.load(config: c, weights: w, options: o, device: d)
@@ -125,6 +147,8 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "Gemma 4 Omni", kind: .omni,
+            summary: "Encoder-free omni: raw-patch image + raw-640-frame audio + per-frame video onto the Gemma 4 backbone.",
+            repos: ["ekryski/gemma-4-12B-it-mlx-4bit"],
             modelTypes: ["gemma4_unified"],
             architectures: ["Gemma4UnifiedForConditionalGeneration"],
             load: { c, w, o, d in
@@ -140,6 +164,8 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "FastVLM", kind: .vlm,
+            summary: "Apple FastVLM — FastViTHD tower + mlp2x_gelu projector + Qwen2 backbone.",
+            repos: ["mlx-community/FastVLM-0.5B-bf16", "ekryski/FastVLM-0.5B-4bit"],
             modelTypes: FastVLM.modelTypes, architectures: FastVLM.architectures,
             load: { c, w, o, d in
                 let vlm = try FastVLM.load(config: c, weights: w, options: o, device: d)
@@ -151,6 +177,8 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "Pixtral", kind: .vlm,
+            summary: "Mistral Pixtral 12B — bespoke RoPE-2D ViT + Mistral text backbone.",
+            repos: ["mlx-community/pixtral-12b-4bit"],
             modelTypes: Pixtral.modelTypes,
             load: { c, w, o, d in
                 let vlm = try Pixtral.load(config: c, weights: w, options: o, device: d)
@@ -162,6 +190,11 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "Mistral 3 VL", kind: .vlm,
+            summary: "Mistral Small 3.1 / 3.2 — Pixtral ViT + patch-merger projector + Mistral backbone.",
+            repos: [
+                "mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit",
+                "mlx-community/Mistral-Small-3.2-24B-Instruct-2506-4bit",
+            ],
             modelTypes: Mistral3.modelTypes,
             load: { c, w, o, d in
                 let vlm = try Mistral3.load(config: c, weights: w, options: o, device: d)
@@ -173,6 +206,7 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "GLM-OCR", kind: .ocr,
+            summary: "Zhipu GLM-OCR — dynamic-resolution ViT + GLM-Lite text backbone (document OCR).",
             modelTypes: GlmOcr.modelTypes, architectures: GlmOcr.architectures,
             load: { c, w, o, d in
                 let variant = try GlmOcr.variant(for: c)
@@ -184,6 +218,8 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "Idefics3", kind: .vlm,
+            summary: "HuggingFace Idefics3 — Llama 3 backbone + SigLIP ViT + pixel-shuffle connector.",
+            repos: ["mlx-community/Idefics3-8B-Llama3-4bit"],
             modelTypes: Idefics3.modelTypes, architectures: Idefics3.architectures,
             load: { c, w, o, d in
                 let variant = try Idefics3.variant(for: c)
@@ -195,6 +231,11 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "PaliGemma", kind: .vlm,
+            summary: "Google PaliGemma 1 / 2 — SigLIP ViT + Gemma backbone (Gemma 2 on PG2).",
+            repos: [
+                "mlx-community/paligemma2-3b-mix-224-4bit",
+                "mlx-community/paligemma2-10b-mix-448-4bit",
+            ],
             modelTypes: Paligemma.modelTypes, architectures: Paligemma.architectures,
             load: { c, w, o, d in
                 let variant = try Paligemma.variant(for: c)
@@ -206,6 +247,8 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "MiniCPM-V 4.x", kind: .vlm,
+            summary: "MiniCPM-V 4.5 / 4.6 + MiniCPM-o — Qwen3 / 3.5 backbone + SigLIP, resampler / merger projector.",
+            repos: ["mlx-community/MiniCPM-V-4.6-4bit"],
             sniff: { MiniCPM4.handles($0) },
             load: { c, w, o, d in
                 let variant = try MiniCPM4.variant(for: c)
@@ -218,6 +261,8 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "Nemotron Nano VL", kind: .vlm,
+            summary: "NVIDIA Nemotron-H text backbone + ViT + projector (Nano VL).",
+            repos: ["nvidia/Nemotron-Nano-VL-8B-V1", "ekryski/Llama-3.1-Nemotron-Nano-VL-8B-V1-4bit"],
             sniff: { isNemotronVisionLanguage($0) },
             load: { c, w, o, d in
                 let vlm = try NemotronVL.load(config: c, weights: w, options: o, device: d)
@@ -229,6 +274,8 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "Nemotron-Labs-Diffusion VLM", kind: .vlm,
+            summary: "Tri-mode diffusion text backbone + Pixtral ViT vision tower.",
+            repos: ["nvidia/Nemotron-Labs-Diffusion-VLM-8B"],
             sniff: { isNemotronDiffusionVisionLanguage($0) },
             load: { c, w, o, d in
                 let vlm = try NemotronDiffusionVL.load(config: c, weights: w, options: o, device: d)
@@ -245,6 +292,7 @@ extension ModelRegistry {
         // which routes a vestigial-vision-config checkpoint to the text loader.
         ModelEntry(
             family: "Qwen 3.5-VL", kind: .vlm,
+            summary: "Qwen 3.5 GDN ↔ attention MoE backbone + dynamic-res ViT.",
             architectures: Qwen35.architectures,
             load: { c, w, o, d in
                 if w.has("model.visual.patch_embed.proj.weight")
@@ -263,6 +311,8 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "SmolVLM2", kind: .vlm,
+            summary: "HuggingFace SmolVLM 1 / 2 — SmolLM backbone + SigLIP-So400m ViT.",
+            repos: ["mlx-community/SmolVLM-Instruct-4bit", "mlx-community/SmolVLM2-2.2B-Instruct-mlx"],
             modelTypes: SmolVLM2.modelTypes, architectures: SmolVLM2.architectures,
             load: { c, w, o, d in
                 let variant = try SmolVLM2.variant(for: c)
@@ -282,68 +332,122 @@ extension ModelRegistry {
         // `_name_or_path` marker (`MiniCPM5.handles`).
         ModelEntry(
             family: "MiniCPM5", kind: .llm,
+            summary: "OpenBMB MiniCPM5-1B — Llama-shaped text (routed by name marker).",
             sniff: { MiniCPM5.handles($0) },
             load: { c, w, o, d in
                 try MiniCPM5.load(config: c, weights: w, options: o, device: d)
             }),
         ModelEntry(
             family: "Llama 3.x", kind: .llm,
+            summary: "Meta Llama 3 / 3.1 / 3.2 / 3.3 dense GQA transformer.",
+            repos: [
+                "unsloth/Llama-3.2-1B", "mlx-community/Llama-3.1-8B-Instruct-4bit",
+                "mlx-community/Llama-3.2-3B-Instruct-4bit",
+                "mlx-community/Llama-3.3-70B-Instruct-4bit",
+            ],
             modelTypes: Llama3.modelTypes, architectures: Llama3.architectures,
             load: { c, w, o, d in try ModelRegistry.loadLlama3(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "Mistral", kind: .llm,
+            summary: "Mistral 7B / Nemo / Small — Llama-shaped GQA (Llama-compatible loader).",
+            repos: [
+                "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+                "mlx-community/Mistral-7B-Instruct-v0.3-bf16",
+            ],
             modelTypes: Mistral.modelTypes, architectures: Mistral.architectures,
             load: { c, w, o, d in try ModelRegistry.loadMistral(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "SmolLM", kind: .llm,
+            summary: "HuggingFace SmolLM 1 / 2 / 3 — 135M–3B Llama-shaped models.",
+            repos: [
+                "mlx-community/SmolLM-135M-Instruct-4bit", "mlx-community/SmolLM3-3B-4bit",
+            ],
             modelTypes: SmolLM.modelTypes, architectures: SmolLM.architectures,
             load: { c, w, o, d in try ModelRegistry.loadSmolLM(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "OLMo 1", kind: .llm,
+            summary: "AI2 OLMo 1 — open pre-norm Llama-shaped research model.",
+            repos: ["mlx-community/OLMo-1B-hf-4bit-mlx", "mlx-community/OLMo-7B-hf-4bit-mlx"],
             modelTypes: OLMo.olmo1ModelTypes, architectures: OLMo.olmo1Architectures,
             load: { c, w, o, d in try ModelRegistry.loadOLMo1(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "Yi", kind: .llm,
+            summary: "01.AI Yi — Llama-shaped dense backbone.",
+            repos: ["mlx-community/Yi-1.5-6B-Chat-4bit", "mlx-community/Yi-1.5-9B-Chat-4bit"],
             modelTypes: Yi.modelTypes, architectures: Yi.architectures,
             load: { c, w, o, d in try ModelRegistry.loadYi(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "Granite 3.x", kind: .llm,
+            summary: "IBM Granite v3 dense — Llama-shaped GQA backbone with µP multipliers.",
+            repos: [
+                "mlx-community/granite-3.3-2b-instruct-4bit",
+                "mlx-community/granite-3.3-8b-instruct-4bit",
+            ],
             modelTypes: Granite3.modelTypes, architectures: Granite3.architectures,
             load: { c, w, o, d in try ModelRegistry.loadGranite3(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "InternLM2", kind: .llm,
+            summary: "Shanghai AI Lab InternLM 2 / 2.5 — Llama-shaped (fused wqkv remap).",
+            repos: ["mlx-community/internlm2_5-7b-chat-4bit"],
             modelTypes: InternLM2.modelTypes, architectures: InternLM2.architectures,
             load: { c, w, o, d in try ModelRegistry.loadInternLM2(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "OLMo 2", kind: .llm,
+            summary: "AI2 OLMo 2 — post-norm Llama shape with q/k-norm.",
+            repos: [
+                "mlx-community/OLMo-2-1124-7B-Instruct-4bit",
+                "mlx-community/OLMo-2-0325-32B-Instruct-4bit",
+            ],
             modelTypes: OLMo.olmo2ModelTypes, architectures: OLMo.olmo2Architectures,
             load: { c, w, o, d in try ModelRegistry.loadOLMo2(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "Starcoder 2", kind: .llm,
+            summary: "BigCode Starcoder 2 — code model (LayerNorm + GELU MLP, attention biases).",
+            repos: ["mlx-community/starcoder2-7b-4bit", "mlx-community/starcoder2-15b-4bit"],
             modelTypes: Starcoder2.modelTypes, architectures: Starcoder2.architectures,
             load: { c, w, o, d in try ModelRegistry.loadStarcoder2(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "Phi", kind: .llm,
+            summary: "Microsoft Phi-3 / 3.5 dense transformer.",
+            repos: [
+                "mlx-community/Phi-3-mini-4k-instruct-4bit",
+                "mlx-community/Phi-3.5-mini-instruct-4bit",
+            ],
             modelTypes: Phi.modelTypes, architectures: Phi.architectures,
             load: { c, w, o, d in try ModelRegistry.loadPhi(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "Qwen 2 / 2.5", kind: .llm,
+            summary: "Qwen 2 / 2.5 dense transformer (Llama-shaped + QKV biases).",
+            repos: [
+                "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+                "mlx-community/Qwen2.5-7B-Instruct-4bit",
+                "mlx-community/Qwen2.5-32B-Instruct-4bit",
+            ],
             modelTypes: Qwen2.modelTypes, architectures: Qwen2.architectures,
             load: { c, w, o, d in try ModelRegistry.loadQwen2(config: c, weights: w, options: o, device: d) }),
         // Gemma 2 before Gemma 3 before Gemma 4 (distinct model_types; order
         // is belt-and-suspenders).
         ModelEntry(
             family: "Gemma 2", kind: .llm,
+            summary: "Google Gemma 2 — Llama-shaped GQA + final-logit soft-cap.",
+            repos: [
+                "mlx-community/gemma-2-2b-it-4bit", "mlx-community/gemma-2-9b-it-4bit",
+                "mlx-community/gemma-2-27b-it-4bit",
+            ],
             modelTypes: Gemma2.modelTypes, architectures: Gemma2.architectures,
             load: { c, w, o, d in try ModelRegistry.loadGemma2(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "Gemma 3", kind: .llm,
+            summary: "Google Gemma 3 text decoder.",
+            repos: ["mlx-community/gemma-3-1b-it-4bit", "mlx-community/gemma-3-text-4b-it-4bit"],
             modelTypes: Gemma3.modelTypes, architectures: Gemma3.architectures,
             load: { c, w, o, d in try ModelRegistry.loadGemma3(config: c, weights: w, options: o, device: d) }),
         // Gemma 4 Omni drafter — loads + lists but can't generate standalone
         // (EAGLE/MTP draft model). Must precede the Gemma 4 entry.
         ModelEntry(
             family: "Gemma 4 drafter", kind: .llm,
+            summary: "EAGLE/MTP speculative-decoding drafter for Gemma 4 Omni — lists + quantizes but can't generate standalone.",
+            repos: ["ekryski/gemma-4-12B-it-assistant-mlx-4bit"],
             modelTypes: Gemma4.drafterModelTypes, architectures: Gemma4.drafterArchitectures,
             load: { c, _, _, _ in
                 throw ModelError.draftModelNotGeneratable(
@@ -351,46 +455,83 @@ extension ModelRegistry {
             }),
         ModelEntry(
             family: "Gemma 4", kind: .llm,
+            summary: "Gemma 4 — Dense / E-series PLE / 26B-A4B MoE variants.",
+            repos: [
+                "mlx-community/gemma-4-e2b-it-mxfp4", "mlx-community/gemma-4-e4b-it-4bit",
+                "mlx-community/gemma-4-26b-a4b-it-4bit",
+            ],
             modelTypes: Gemma4.modelTypes, architectures: Gemma4.architectures,
             load: { c, w, o, d in try ModelRegistry.loadGemma4(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "Qwen 3", kind: .llm,
+            summary: "Qwen 3 dense — per-head q/k RMSNorm before RoPE.",
+            repos: [
+                "mlx-community/Qwen3-0.6B-4bit", "mlx-community/Qwen3-8B-4bit",
+                "mlx-community/Qwen3-32B-4bit",
+            ],
             modelTypes: Qwen3.modelTypes, architectures: Qwen3.architectures,
             load: { c, w, o, d in try ModelRegistry.loadQwen3(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "Mamba 2", kind: .llm,
+            summary: "Dense Mamba 2 selective-SSM (no attention).",
+            repos: ["mlx-community/mamba2-370m-4bit", "mlx-community/mamba2-1.3b-4bit"],
             modelTypes: Mamba2.modelTypes, architectures: Mamba2.architectures,
             load: { c, w, o, d in try ModelRegistry.loadMamba2(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "FalconH1", kind: .llm,
+            summary: "Per-layer Mamba 2 + attention (within-layer hybrid). Raw bf16/f16 only.",
+            repos: [
+                "mlx-community/Falcon-H1-1.5B-Instruct-bf16",
+                "mlx-community/Falcon-H1-7B-Instruct-4bit",
+            ],
             modelTypes: FalconH1.modelTypes, architectures: FalconH1.architectures,
             load: { c, w, o, d in try ModelRegistry.loadFalconH1(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "NemotronH", kind: .llm,
+            summary: "Stack-interleaved Mamba 2 / attention / MLP. Raw bf16/f16 only.",
+            repos: ["nvidia/Nemotron-H-4B-Base-8K", "ekryski/Nemotron-H-4B-Base-8K-4bit"],
             modelTypes: NemotronH.modelTypes, architectures: NemotronH.architectures,
             load: { c, w, o, d in try ModelRegistry.loadNemotronH(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "Granite 4", kind: .llm,
+            summary: "Stack-interleaved Mamba 2 / attention + dense or MoE FFN.",
+            repos: ["mlx-community/granite-4.0-1b-4bit", "mlx-community/granite-4.0-h-tiny-4bit"],
             modelTypes: Granite4.modelTypes, architectures: Granite4.architectures,
             load: { c, w, o, d in try ModelRegistry.loadGranite4(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "Jamba", kind: .llm,
+            summary: "Mamba 1 + attention + dense / MoE FFN. Raw bf16/f16 only.",
+            repos: ["mlx-community/AI21-Jamba-Reasoning-3B-bf16"],
             modelTypes: Jamba.modelTypes, architectures: Jamba.architectures,
             load: { c, w, o, d in try ModelRegistry.loadJamba(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "Qwen 3.5", kind: .llm,
+            summary: "Qwen 3.5 / 3.6 — Gated Delta Net ↔ attention hybrid; dense or MoE FFN.",
+            repos: [
+                "mlx-community/Qwen3.5-0.8B-4bit", "mlx-community/Qwen3.5-9B-4bit",
+                "mlx-community/Qwen3.5-35B-A3B-4bit",
+            ],
             modelTypes: Qwen35.modelTypes, architectures: Qwen35.architectures,
             load: { c, w, o, d in try ModelRegistry.loadQwen35(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "GPT-OSS", kind: .llm,
+            summary: "OpenAI GPT-OSS — 32-expert MoE, sliding/full attention, learned sinks.",
+            repos: ["mlx-community/gpt-oss-20b-MXFP4-Q8", "mlx-community/gpt-oss-120b-4bit"],
             modelTypes: GPTOSS.modelTypes, architectures: GPTOSS.architectures,
             load: { c, w, o, d in try ModelRegistry.loadGPTOSS(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "LFM2", kind: .llm,
+            summary: "LiquidAI LFM2 / LFM2.5 — stack-interleaved short-conv + attention, optional MoE.",
+            repos: [
+                "mlx-community/LFM2-1.2B-4bit", "mlx-community/LFM2-8B-A1B-4bit",
+                "mlx-community/LFM2.5-1.2B-Instruct-4bit",
+            ],
             modelTypes: LFM2.modelTypes, architectures: LFM2.architectures,
             load: { c, w, o, d in try ModelRegistry.loadLFM2(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
             family: "Nemotron-Labs-Diffusion", kind: .llm,
+            summary: "Tri-mode — autoregressive / block diffusion / self-speculation.",
+            repos: ["nvidia/Nemotron-Labs-Diffusion-8B"],
             modelTypes: NemotronDiffusion.modelTypes, architectures: NemotronDiffusion.architectures,
             load: { c, w, o, d in try ModelRegistry.loadNemotronDiffusion(config: c, weights: w, options: o, device: d) }),
     ]

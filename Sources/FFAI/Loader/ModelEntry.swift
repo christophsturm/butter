@@ -55,10 +55,10 @@ public struct ModelEntry: Sendable {
     public init(
         family: String,
         kind: ModelKind,
-        modelTypes: Set<String> = [],
-        architectures: Set<String> = [],
         summary: String = "",
         repos: [String] = [],
+        modelTypes: Set<String> = [],
+        architectures: Set<String> = [],
         sniff: (@Sendable (ModelConfig) -> Bool)? = nil,
         load: (@Sendable (ModelConfig, SafeTensorsBundle, LoadOptions, Device)
             throws -> ModelRegistry.Loaded)? = nil
