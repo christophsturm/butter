@@ -60,7 +60,7 @@ public enum Gemma4 {
     /// architecture is kept OUT of `Gemma4.architectures` so it never
     /// auto-routes to standalone text generation — it cannot generate
     /// without the target model's hidden state (spec-decode, Phase 8.7).
-    /// `Gemma4OmniDrafter` provides a typed loader for tests + the future
+    /// `Gemma4Draft` provides a typed loader for tests + the future
     /// draft loop; the dispatcher recognizes these strings to raise an
     /// actionable error.
     public static let drafterModelTypes: Set<String> = ["gemma4_unified_assistant"]

@@ -40,7 +40,7 @@ import Foundation
 /// Decoded shape of the Gemma 4 Omni EAGLE drafter. The text dims come from
 /// the nested `text_config` (a 4-layer Gemma-4-shaped backbone); the EAGLE
 /// fields are top-level.
-public struct Gemma4OmniDrafterConfig: Sendable {
+public struct Gemma4DraftConfig: Sendable {
     /// Target backbone hidden size the drafter fuses (`backbone_hidden_size`,
     /// 3840). `pre_projection` consumes `2 · backboneHiddenSize`.
     public let backboneHiddenSize: Int
@@ -60,7 +60,7 @@ public struct Gemma4OmniDrafterConfig: Sendable {
     /// target).
     public let vocabSize: Int
 
-    public static func decode(_ config: ModelConfig) throws -> Gemma4OmniDrafterConfig {
+    public static func decode(_ config: ModelConfig) throws -> Gemma4DraftConfig {
         guard let backbone = config.int("backbone_hidden_size") else {
             throw Gemma4Error.missingConfig("backbone_hidden_size")
         }
@@ -70,7 +70,7 @@ public struct Gemma4OmniDrafterConfig: Sendable {
         else {
             throw Gemma4Error.missingConfig("text_config.hidden_size / num_hidden_layers")
         }
-        return Gemma4OmniDrafterConfig(
+        return Gemma4DraftConfig(
             backboneHiddenSize: backbone,
             hidden: hidden,
             numLayers: layers,
@@ -84,7 +84,7 @@ public struct Gemma4OmniDrafterConfig: Sendable {
 /// Namespace for the Gemma 4 Omni drafter. Generation is Phase 8.7; today
 /// this only surfaces the recognized config shape (the dispatcher rejects
 /// standalone generation via `ModelError.draftModelNotGeneratable`).
-public enum Gemma4OmniDrafter {
+public enum Gemma4Draft {
     /// Recognized architecture / model_type strings (forwarded from the
     /// Gemma 4 family). Kept here too so the spec-decode wiring can find them.
     public static var architectures: Set<String> { Gemma4.drafterArchitectures }
@@ -93,7 +93,7 @@ public enum Gemma4OmniDrafter {
     /// Decode the drafter config from a resolved checkpoint directory. Used
     /// by tests (and the future Phase 8.7 draft loop) to confirm the EAGLE
     /// shape without standing up a full generation engine.
-    public static func config(from directory: URL) throws -> Gemma4OmniDrafterConfig {
-        try Gemma4OmniDrafterConfig.decode(ModelConfig.load(from: directory))
+    public static func config(from directory: URL) throws -> Gemma4DraftConfig {
+        try Gemma4DraftConfig.decode(ModelConfig.load(from: directory))
     }
 }

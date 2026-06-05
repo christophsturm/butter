@@ -60,7 +60,7 @@ public enum ModelError: Error, CustomStringConvertible {
                 + "standalone — it is an EAGLE/MTP drafter that predicts tokens "
                 + "from the target model's hidden state for the target to verify. "
                 + "Load the target model (e.g. the Gemma 4 Omni 12B), or use the "
-                + "typed `Gemma4OmniDrafter.load(...)` for spec-decode wiring "
+                + "typed `Gemma4Draft.load(...)` for spec-decode wiring "
                 + "(Phase 8.7)."
         case .insufficientMemory(_, _, let detail):
             return "Insufficient memory: \(detail)"
@@ -736,7 +736,7 @@ public enum ModelRegistry {
         // `ffai models`, but cannot generate standalone (it needs the
         // target's hidden state), so reject it here with an actionable error
         // rather than handing back a model that emits garbage. The typed
-        // `Gemma4OmniDrafter.load(...)` is for tests + the Phase 8.7 draft loop.
+        // `Gemma4Draft.load(...)` is for tests + the Phase 8.7 draft loop.
         if let arch = config.architecture, Gemma4.drafterArchitectures.contains(arch) {
             throw ModelError.draftModelNotGeneratable(arch)
         }

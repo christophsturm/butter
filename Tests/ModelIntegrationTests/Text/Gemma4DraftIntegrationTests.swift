@@ -48,14 +48,14 @@ private let drafterAvailable: Bool =
         if: drafterAvailable,
         "Gemma 4 Omni drafter suite: google/gemma-4-12B-it-assistant is gated — needs access approval + a hosted/local conversion of ekryski/gemma-4-12B-it-assistant-mlx-4bit.")
 )
-struct Gemma4OmniDrafterIntegrationTests {
+struct Gemma4DraftIntegrationTests {
 
     @Test("EAGLE drafter config decodes to the expected shape")
     func config() async throws {
         let dir = try await ModelLoadLock.shared.loadSerially {
             try await ModelLocator().resolve(idOrPath: drafterPath)
         }
-        let cfg = try Gemma4OmniDrafter.config(from: dir)
+        let cfg = try Gemma4Draft.config(from: dir)
         #expect(cfg.backboneHiddenSize == 3840)
         #expect(cfg.hidden == 1024)
         #expect(cfg.numLayers == 4)

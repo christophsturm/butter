@@ -22,7 +22,7 @@ import Testing
 @testable import FFAI
 
 @Suite("Gemma4 Omni Drafter config")
-struct Gemma4OmniDrafterConfigTests {
+struct Gemma4DraftConfigTests {
 
     /// A faithful slice of `google/gemma-4-12B-it-assistant`'s config.json.
     private func drafterConfig() -> ModelConfig {
@@ -50,7 +50,7 @@ struct Gemma4OmniDrafterConfigTests {
 
     @Test("decodes the EAGLE drafter shape")
     func decodesDrafter() throws {
-        let cfg = try Gemma4OmniDrafterConfig.decode(drafterConfig())
+        let cfg = try Gemma4DraftConfig.decode(drafterConfig())
         #expect(cfg.backboneHiddenSize == 3840)  // pre_projection in = 2·3840
         #expect(cfg.hidden == 1024)
         #expect(cfg.numLayers == 4)
@@ -69,13 +69,13 @@ struct Gemma4OmniDrafterConfigTests {
             modelType: "gemma4_unified_assistant",
             raw: ["text_config": ["hidden_size": 1024, "num_hidden_layers": 4]])
         #expect(throws: (any Error).self) {
-            _ = try Gemma4OmniDrafterConfig.decode(bad)
+            _ = try Gemma4DraftConfig.decode(bad)
         }
     }
 
     @Test("drafter is recognized by the namespace forwarding")
     func recognized() {
-        #expect(Gemma4OmniDrafter.architectures.contains("Gemma4UnifiedAssistantForCausalLM"))
-        #expect(Gemma4OmniDrafter.modelTypes.contains("gemma4_unified_assistant"))
+        #expect(Gemma4Draft.architectures.contains("Gemma4UnifiedAssistantForCausalLM"))
+        #expect(Gemma4Draft.modelTypes.contains("gemma4_unified_assistant"))
     }
 }

@@ -19,13 +19,6 @@
 // `Model.load` path) so the cache layout is byte-identical to what
 // the runtime loader expects.
 //
-// Why a dedicated CLI command. Phase I.1 of `planning/session-plan.md`:
-// today the only way to pull a model is via `Model.load(...)`, which
-// also dispatches a prewarm forward pass and (for VLMs) the vision
-// tower init. That's a lot of GPU time for what's conceptually a
-// cache-warm step. `ffai download` is the cache-warm primitive:
-// network + disk only, no GPU.
-//
 // Typical use:
 //   ffai download mlx-community/Qwen3-1.7B-4bit
 //   ffai download mlx-community/Qwen3-1.7B-4bit mlx-community/Llama-3.2-1B-Instruct-4bit
