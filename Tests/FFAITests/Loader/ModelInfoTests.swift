@@ -84,7 +84,6 @@ struct ModelInfoTests {
             eosTokenIds: [2, 107],
             tieWordEmbeddings: true,
             supportsEmbeddingInput: true,
-            isVLM: false,
             imageTokenCount: nil
         )
         #expect(info.modelId == "test/test-1b")
@@ -156,7 +155,10 @@ struct ModelInfoTests {
             headDim: 128, vocab: 32000, maxContextWindow: 4096,
             quantization: quantization,
             defaultGenerationParameters: GenerationParameters(),
-            availableCapabilities: [.textIn, .textOut],
+            // `isVLM` is now computed from capabilities, so inject `.imageIn`
+            // when the caller asked for a VLM fixture.
+            availableCapabilities: isVLM
+                ? [.textIn, .textOut, .imageIn] : [.textIn, .textOut],
             enabledCapabilities: [.textIn, .textOut],
             parameterCount: 1_000_000,
             parameterBytes: 4_000_000,
@@ -164,7 +166,6 @@ struct ModelInfoTests {
             eosTokenIds: [2],
             tieWordEmbeddings: false,
             supportsEmbeddingInput: true,
-            isVLM: isVLM,
             imageTokenCount: imageTokenCount
         )
     }

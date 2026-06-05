@@ -111,12 +111,24 @@ public struct ModelInfo: Sendable {
     /// VLM-splice path. `true` for Gemma 2 / 3 / 4, Llama, Qwen 3.5 etc.
     public let supportsEmbeddingInput: Bool
 
-    // ── VLM ────────────────────────────────────────────────────────────
+    // ── Modality flags ──────────────────────────────────────────────────
+    //
+    // Derived from `availableCapabilities`, NOT stored — the capability set
+    // is the single source of truth for what the model can do. (The old
+    // stored `isVLM = vlModel != nil` actually under-reported the
+    // self-contained multimodal engines — Idefics3 / SmolVLM2 / GlmOcr have
+    // no `vlModel` wrapper yet are image-capable; reading the capability
+    // fixes that.)
 
-    /// `true` when the checkpoint is wrapped in a `VisionModel` (a vision
-    /// tower + cross-modal splice on top of the text engine). Mirrors
-    /// `Model.vlModel != nil`.
-    public let isVLM: Bool
+    /// Accepts image input — a vision-language model.
+    public var isVLM: Bool { availableCapabilities.contains(.imageIn) }
+    /// Accepts video input.
+    public var isVideoIn: Bool { availableCapabilities.contains(.videoIn) }
+    /// Accepts audio input — an omni or speech-to-text model. (A pure STT
+    /// model is `isAudioIn && !isAudioOut`.)
+    public var isAudioIn: Bool { availableCapabilities.contains(.audioIn) }
+    /// Produces audio output — a text-to-speech or omni model.
+    public var isAudioOut: Bool { availableCapabilities.contains(.audioOut) }
 
     /// Number of vision tokens spliced per image (e.g. 256 for Gemma 3 VL,
     /// 64 for MiniCPM-V 4.6). `nil` for non-VLM models.
@@ -168,7 +180,6 @@ extension Model {
             eosTokenIds: config.eosTokenIds,
             tieWordEmbeddings: config.tieWordEmbeddings,
             supportsEmbeddingInput: engine.supportsEmbeddingInput,
-            isVLM: vlModel != nil,
             imageTokenCount: vlModel?.imageTokenCount
         )
     }
