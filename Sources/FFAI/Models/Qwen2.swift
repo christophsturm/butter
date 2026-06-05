@@ -71,6 +71,37 @@ public enum Qwen2VLError: Error, CustomStringConvertible {
     }
 }
 
+// ─── Qwen2.5-Omni routing ────────────────────────────────────────────
+//
+// Qwen2.5-Omni (text + vision + audio-IN) reuses the SAME shared
+// `QwenOmniModel` engine as Qwen3-Omni (it lives in `Models/Qwen3.swift`,
+// the canonical omni home). The only family-specific piece is detection:
+// the Qwen 2.x family owns the `qwen2_5_omni*` model_type / architecture
+// strings here, and the shared engine's `QwenOmniModel.handles` unions
+// these with `Qwen3.omniModelTypes`. Loading goes through
+// `AudioModelRegistry` → `QwenOmniModel.load`, which composes the Qwen 2.5
+// text backbone + Whisper-style audio tower (and, once wired, the Qwen 2.5
+// vision tower) — the right back-end stacks for the checkpoint.
+extension Qwen2 {
+    /// Omni model_type / architecture strings owned by the Qwen 2.x family
+    /// (Qwen2.5-Omni). Unioned into `QwenOmniModel.modelTypes` /
+    /// `architectures` by the shared engine.
+    public static let omniModelTypes: Set<String> = [
+        "qwen2_5_omni", "qwen2_5_omni_thinker",
+    ]
+    public static let omniArchitectures: Set<String> = [
+        "Qwen2_5OmniForConditionalGeneration",
+    ]
+
+    /// Whether a config describes a **Qwen2.5-Omni** checkpoint. The omni
+    /// model is assembled by the shared `QwenOmniModel` engine; this is the
+    /// Qwen 2.x family's ownership of its omni model_type / architecture.
+    public static func isOmni(_ config: ModelConfig) -> Bool {
+        if let mt = config.modelType, omniModelTypes.contains(mt) { return true }
+        return config.architecture.map(omniArchitectures.contains) ?? false
+    }
+}
+
 public enum Qwen2VL {
     /// `image_token_id` default for Qwen 2-VL checkpoints.
     public static let defaultImageTokenId = 151_655

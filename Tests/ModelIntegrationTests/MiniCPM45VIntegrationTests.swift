@@ -19,8 +19,9 @@
 // ONCE (static memoized Task) and runs a per-capability inference pass —
 // modeled on `MiniCPM46VIntegrationTests` / `MiniCPM45OmniIntegrationTests`.
 //
-// There is no mlx-community 4-bit conversion of MiniCPM-V-4.5, so this runs
-// against the bf16 base (`openbmb/MiniCPM-V-4_5`, ~16 GB).
+// Runs against the FFAI 4-bit conversion (`ekryski/MiniCPM-V-4_5-4bit`):
+// there is no mlx-community 4-bit of MiniCPM-V-4.5, so it was quantized
+// from the `openbmb/MiniCPM-V-4_5` bf16 base via `ffai convert`.
 
 import Foundation
 import TestHelpers
@@ -36,7 +37,7 @@ import Testing
 )
 struct MiniCPM45VIntegrationTests {
 
-    static let modelId = "openbmb/MiniCPM-V-4_5"
+    static let modelId = "ekryski/MiniCPM-V-4_5-4bit"
 
     /// The checkpoint, loaded ONCE and shared across every `@Test`.
     static let loaded = Task { try await loadModel(modelId) }

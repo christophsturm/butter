@@ -33,12 +33,14 @@
 // lives in `Models/Vision/Qwen3Vision.swift` alongside the tower
 // internals.
 //
-// The **omni** path (Qwen2.5-Omni / Qwen3-Omni — text + vision + audio-IN)
-// lives at the bottom of this file: `QwenOmniModel` + `QwenOmniAudioConfig`
-// + `QwenOmniError`. It is detected via `Qwen3.isOmni(_:)` /
-// `QwenOmniModel.handles(_:)` and routed through `AudioModelRegistry`
-// (audio-in capable). Keeping it here makes this file the single root for
-// the whole Qwen 3 series, dense + VL + omni.
+// The **omni** path (Qwen3-Omni — text + vision + audio-IN) lives at the
+// bottom of this file: the shared `QwenOmniModel` engine +
+// `QwenOmniAudioConfig` + `QwenOmniError`. Qwen3-Omni is detected via
+// `Qwen3.isOmni(_:)` and routed through `AudioModelRegistry` (audio-in
+// capable). Keeping it here makes this file the single root for the whole
+// Qwen 3 series — dense + VL + omni. The same engine also backs earlier
+// Qwen omni checkpoints, which are detected + routed from their own family
+// root (see `Models/Qwen25.swift`).
 
 import Foundation
 import Metal
@@ -64,12 +66,25 @@ public enum Qwen3 {
         return Qwen3Dense.self
     }
 
-    /// Whether a config describes a Qwen-Omni checkpoint (text + vision +
-    /// audio-IN). The omni model is assembled by `QwenOmniModel` (below)
-    /// rather than the dense/VL text-variant dispatch, because its engine
-    /// composes per-modality encoders around the text backbone.
+    /// Omni model_type / architecture strings owned by the Qwen 3 family.
+    /// The shared `QwenOmniModel` unions these with the other families'
+    /// omni sets (see `Qwen2.omniModelTypes`) for its detector.
+    public static let omniModelTypes: Set<String> = [
+        "qwen3_omni", "qwen3_omni_moe",
+    ]
+    public static let omniArchitectures: Set<String> = [
+        "Qwen3OmniMoeForConditionalGeneration",
+    ]
+
+    /// Whether a config describes a **Qwen3-Omni** checkpoint (text +
+    /// vision + audio-IN). The omni model is assembled by the shared
+    /// `QwenOmniModel` engine (below) rather than the dense/VL text-variant
+    /// dispatch, because its engine composes per-modality encoders around
+    /// the text backbone. This is Qwen3-specific — earlier Qwen omni
+    /// variants are detected from their own family root.
     public static func isOmni(_ config: ModelConfig) -> Bool {
-        QwenOmniModel.handles(config)
+        if let mt = config.modelType, omniModelTypes.contains(mt) { return true }
+        return config.architecture.map(omniArchitectures.contains) ?? false
     }
 }
 
@@ -110,13 +125,15 @@ public enum Qwen3Error: Error, CustomStringConvertible {
 }
 
 // ════════════════════════════════════════════════════════════════════
-// Qwen-Omni — omni-modal path (relocated from Models/Audio/Omni/QwenOmni.swift)
+// Qwen-Omni — omni-modal path
 // ════════════════════════════════════════════════════════════════════
 
-// QwenOmni — Qwen's omni-modal family (Qwen2.5-Omni / Qwen3-Omni):
-// text + vision + audio in, text (and optionally audio) out. The model
-// is a Qwen text backbone fronted by per-modality encoders whose
-// outputs are spliced into the text token stream.
+// QwenOmni — the shared Qwen omni-modal engine: text + vision + audio in,
+// text (and optionally audio) out. The model is a Qwen text backbone
+// fronted by per-modality encoders whose outputs are spliced into the text
+// token stream. It backs Qwen3-Omni (routed from this file via
+// `Qwen3.isOmni`) and earlier Qwen omni checkpoints (routed from their own
+// family root — see `Models/Qwen25.swift`).
 //
 //   audio   ──audio encoder──▶ audio tokens ──┐
 //   image   ──vision encoder──▶ image tokens ─┼─▶ text backbone ──▶ text
@@ -196,7 +213,7 @@ public struct QwenOmniAudioConfig: Sendable {
         if let audio = config.nested("audio_config") {
             return (audio, config.nested("text_config"))
         }
-        // Qwen2.5-Omni nested-under-thinker layout.
+        // Thinker-nested layout (audio_config under thinker_config).
         if let thinker = config.nested("thinker_config"),
             let audio = thinker["audio_config"] as? [String: Any]
         {
@@ -207,8 +224,9 @@ public struct QwenOmniAudioConfig: Sendable {
 
     /// Build from a decoded `config.json`. Qwen-Omni nests the audio
     /// tower under `audio_config` (a Whisper-style block) and the text
-    /// backbone under `text_config`, both inside `thinker_config` for
-    /// Qwen2.5-Omni.
+    /// backbone under `text_config`, both inside `thinker_config` on the
+    /// thinker-nested layout (hoisted conversions lift them to the top
+    /// level).
     public static func from(_ config: ModelConfig) -> QwenOmniAudioConfig? {
         guard let located = locateConfigs(config) else { return nil }
         let audio = located.audio
@@ -584,20 +602,22 @@ extension QwenOmniModel: StreamingTranscriber {}
 // ─── Loading ─────────────────────────────────────────────────────────
 
 extension QwenOmniModel {
-    public static let modelTypes: Set<String> = [
-        "qwen2_5_omni", "qwen3_omni", "qwen2_5_omni_thinker",
-    ]
-    public static let architectures: Set<String> = [
-        "Qwen2_5OmniForConditionalGeneration",
-        "Qwen3OmniMoeForConditionalGeneration",
-    ]
+    // The shared engine spans every Qwen omni family; the per-family roots
+    // own the concrete strings (`Qwen3.omniModelTypes` here,
+    // `Qwen2.omniModelTypes` in `Models/Qwen2.swift`) and this is their
+    // union — so no single family's strings are duplicated here.
+    public static let modelTypes: Set<String> =
+        Qwen3.omniModelTypes.union(Qwen2.omniModelTypes)
+    public static let architectures: Set<String> =
+        Qwen3.omniArchitectures.union(Qwen2.omniArchitectures)
 
     /// Whether a decoded `config.json` describes a QwenOmni checkpoint.
+    /// Detection is delegated to the family roots (`Qwen3.isOmni` /
+    /// `Qwen2.isOmni`) so each version's ownership lives in its own file;
+    /// the structural fallback catches conversions that carry an
+    /// `audio_config` without a canonical model_type / architecture.
     public static func handles(_ config: ModelConfig) -> Bool {
-        if let mt = config.modelType, modelTypes.contains(mt) { return true }
-        if let arch = config.architecture, architectures.contains(arch) {
-            return true
-        }
+        if Qwen3.isOmni(config) || Qwen2.isOmni(config) { return true }
         // Fall back to structural detection — an `audio_config` block,
         // top-level or nested under `thinker_config`.
         return QwenOmniAudioConfig.locateConfigs(config) != nil
@@ -754,7 +774,8 @@ extension QwenOmniModel {
         guard let modelConfig else { return nil }
 
         // The text sub-config lives under `thinker_config.text_config`
-        // (Qwen2.5-Omni) or top-level `text_config` (hoisted conversions).
+        // (thinker-nested layout) or top-level `text_config` (hoisted
+        // conversions).
         let textRaw: [String: Any]?
         if let thinker = modelConfig.nested("thinker_config"),
             let text = thinker["text_config"] as? [String: Any]
