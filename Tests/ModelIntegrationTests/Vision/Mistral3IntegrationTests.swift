@@ -45,7 +45,7 @@ struct Mistral3IntegrationTests {
     @Test("load — Mistral3 checkpoint loads with vision capability")
     func loadVLCheckpoint() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
 
         // The checkpoint is a VLM — vlModel is present, .imageIn is
@@ -66,7 +66,7 @@ struct Mistral3IntegrationTests {
     @Test("enable / disable .imageIn — runtime capability flip")
     func capabilityFlip() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         #expect(m.availableCapabilities.contains(.imageIn))
         m.disable(.imageIn)
@@ -78,7 +78,7 @@ struct Mistral3IntegrationTests {
     @Test("image + text prompt — describes the dog photo")
     func imageTextGeneration() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "Mistral3 checkpoint is not a VLM")
 

@@ -41,7 +41,7 @@ struct MistralTextIntegrationTests {
         let maxTokens = 200
 
         // ── 1. Load ──────────────────────────────────────────────────────
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         // ── 2. Interfaces we expect ──────────────────────────────────────
         #expect(m.llama != nil, "Mistral 7B should load through the Llama engine")

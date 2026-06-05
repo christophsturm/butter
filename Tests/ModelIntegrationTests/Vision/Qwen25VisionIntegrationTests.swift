@@ -59,7 +59,7 @@ struct Qwen25VisionIntegrationTests {
     @Test("load — Qwen 2.5-VL checkpoint loads with vision capability")
     func loadVLCheckpoint() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
 
         // The checkpoint is a VLM — vlModel is present, .imageIn is
@@ -76,7 +76,7 @@ struct Qwen25VisionIntegrationTests {
     @Test("enable / disable .imageIn — runtime capability flip")
     func capabilityFlip() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         #expect(m.availableCapabilities.contains(.imageIn))
         m.disable(.imageIn)
@@ -88,7 +88,7 @@ struct Qwen25VisionIntegrationTests {
     @Test("image + text prompt — describes the dog photo")
     func imageTextGeneration() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "Qwen 2.5-VL checkpoint is not a VLM")
 
@@ -131,7 +131,7 @@ struct Qwen25VisionIntegrationTests {
     @Test("load — checkpoint reports .videoIn capability")
     func loadVLCheckpointVideo() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.videoModelId)
+            try await loadModel(Self.videoModelId)
         }
         // The Qwen 2.5-VL family declares text + vision + video.
         #expect(m.vlModel != nil)
@@ -147,7 +147,7 @@ struct Qwen25VisionIntegrationTests {
     @Test("video + text prompt — describes the cat clip")
     func videoTextGeneration() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.videoModelId)
+            try await loadModel(Self.videoModelId)
         }
         let vlm = try #require(m.vlModel, "Qwen 2.5-VL checkpoint is not a VLM")
         _ = try #require(vlm.videoTokenId, "Qwen 2.5-VL must be video-capable")

@@ -40,7 +40,7 @@ struct Gemma2TextIntegrationTests {
         let maxTokens = 200
 
         // ── 1. Load ──────────────────────────────────────────────────────
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         // ── 2. Interfaces we expect ──────────────────────────────────────
         #expect(m.gemma2 != nil, "Gemma 2 should load through the Gemma2 family")

@@ -47,7 +47,7 @@ struct LFM2TextIntegrationTests {
         let modelId = "mlx-community/LFM2-350M-4bit"
         let prompt = "The history of the printing press began when"
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         // Engine should be LFM2 (not Llama / a hybrid family).
         #expect(m.lfm2 != nil)
@@ -127,7 +127,7 @@ struct LFM2TextIntegrationTests {
         let modelId = "mlx-community/LFM2-8B-A1B-4bit"
         let prompt = "The history of the printing press began when"
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         #expect(m.lfm2 != nil)
         #expect(m.engine.headDim == 64)
@@ -185,7 +185,7 @@ struct LFM2TextIntegrationTests {
     func loadAndGenerateLFM25MoE() async throws {
         let modelId = "ekryski/LFM2.5-8B-A1B-4bit"
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         #expect(m.lfm2 != nil)
         #expect(m.engine.headDim == 64)

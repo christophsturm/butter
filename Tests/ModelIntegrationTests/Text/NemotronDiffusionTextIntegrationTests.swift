@@ -39,7 +39,7 @@ struct NemotronDiffusionTextIntegrationTests {
         // 4096-token context is plenty for the test prompts and keeps
         // the KV cache small; the checkpoint's YaRN window is 262144.
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(modelId, options: LoadOptions(maxContextLength: 4096))
+            try await loadModel(modelId, options: LoadOptions(maxContextLength: 4096))
         }
 
         // Engine should be the tri-mode diffusion model, not Llama3.

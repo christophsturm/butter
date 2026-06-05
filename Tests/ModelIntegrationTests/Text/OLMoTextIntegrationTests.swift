@@ -32,7 +32,7 @@ struct OLMoTextIntegrationTests {
     func olmo2() async throws {
         // ── 1. Load ──────────────────────────────────────────────────────
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load("mlx-community/OLMo-2-1124-7B-Instruct-4bit")
+            try await loadModel("mlx-community/OLMo-2-1124-7B-Instruct-4bit")
         }
 
         // ── 2. Interfaces we expect ──────────────────────────────────────

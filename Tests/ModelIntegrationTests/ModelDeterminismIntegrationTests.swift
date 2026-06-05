@@ -39,7 +39,7 @@ struct ModelDeterminismIntegrationTests {
     @Test("forwardSample(BOS) returns the same token on three back-to-back calls")
     func forwardSampleIsDeterministic() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load("mlx-community/Qwen3-1.7B-bf16")
+            try await loadModel("mlx-community/Qwen3-1.7B-bf16")
         }
         let qwen3 = try #require(m.qwen3, "determinism smoke: expected Qwen3 engine")
 
@@ -77,7 +77,7 @@ struct ModelDeterminismIntegrationTests {
     @Test("generate(prompt) returns the same token stream on three back-to-back calls")
     func multiTokenGenerateIsDeterministic() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load("mlx-community/Qwen3-1.7B-bf16")
+            try await loadModel("mlx-community/Qwen3-1.7B-bf16")
         }
 
         var streams: [[Int]] = []
@@ -106,7 +106,7 @@ struct ModelDeterminismIntegrationTests {
     @Test("layer-0 K cache contents are deterministic after 2 prefill forwards")
     func kvCacheIsDeterministic() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load("mlx-community/Qwen3-1.7B-bf16")
+            try await loadModel("mlx-community/Qwen3-1.7B-bf16")
         }
         let qwen3 = try #require(m.qwen3, "KV-cache determinism smoke: expected Qwen3 engine")
 

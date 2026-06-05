@@ -64,7 +64,7 @@ struct GlmOcrIntegrationTests {
     @Test("load — GLM-OCR checkpoint loads and is recognised as GlmOcrModel")
     func loadGlmOcrCheckpoint() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
 
         // Must be dispatched to GlmOcrModel.
@@ -93,7 +93,7 @@ struct GlmOcrIntegrationTests {
     @Test("image + text prompt — transcribes the testocr.png passage")
     func imageTextGeneration() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
 
         let model = try #require(m.engine as? GlmOcrModel, "expected GlmOcrModel engine")

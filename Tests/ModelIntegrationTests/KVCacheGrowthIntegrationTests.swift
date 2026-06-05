@@ -52,7 +52,7 @@ struct KVCacheGrowthIntegrationTests {
         // the production override path AND keeps the global untouched so
         // parallel unit suites aren't disturbed.
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(modelId, options: LoadOptions(initialKVCacheCapacity: 16))
+            try await loadModel(modelId, options: LoadOptions(initialKVCacheCapacity: 16))
         }
         #expect(m.qwen35 != nil)
 

@@ -49,7 +49,7 @@ struct EmbeddingPrefillIntegrationTests {
     @Test("batched forwardMulti(inputEmbeddings:) matches per-position forward(inputEmbedding:)")
     func batchedEmbeddingPrefillMatchesPerPosition() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         let engine = m.engine
         #expect(engine.supportsEmbeddingInput, "Qwen 2.5 backbone must support the splice")

@@ -49,7 +49,7 @@ struct NemotronHTextIntegrationTests {
         let modelId = "ekryski/Nemotron-H-4B-Base-8K-4bit"
         let prompt = "The history of the printing press began when"
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         // Engine should be NemotronH (not Llama / FalconH1 / Mamba 2).
         #expect(m.nemotronH != nil)

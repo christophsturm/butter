@@ -81,7 +81,7 @@ struct NemotronHVisionIntegrationTests {
             "Nemotron-VL checkpoint not cached locally — no mlx-style conversion published on HF yet"
         )
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
 
         // The checkpoint is a VLM — vlModel is present, .imageIn is
@@ -102,7 +102,7 @@ struct NemotronHVisionIntegrationTests {
             "Nemotron-VL checkpoint not cached locally — no mlx-style conversion published on HF yet"
         )
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         #expect(m.availableCapabilities.contains(.imageIn))
         m.disable(.imageIn)
@@ -118,7 +118,7 @@ struct NemotronHVisionIntegrationTests {
             "Nemotron-VL checkpoint not cached locally — no mlx-style conversion published on HF yet"
         )
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "Nemotron-VLM checkpoint is not a VLM")
 

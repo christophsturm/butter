@@ -44,7 +44,7 @@ struct FalconH1TextIntegrationTests {
         let modelId = "mlx-community/Falcon-H1-Tiny-90M-Instruct-4bit"
         let prompt = "Once upon a time, in a quiet village"
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         // Engine should be FalconH1 (not Llama / Qwen3 / Mamba 2).
         #expect(m.falconH1 != nil)

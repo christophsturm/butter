@@ -38,7 +38,7 @@ struct ModelInspectionIntegrationTests {
         let prompt = "Once upon a time, in a quiet"
 
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(modelId)
+            try await loadModel(modelId)
         }
 
         // Architecture sanity. This is the same surface

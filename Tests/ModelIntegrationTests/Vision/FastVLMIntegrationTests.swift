@@ -57,7 +57,7 @@ struct FastVLMIntegrationTests {
     @Test("load — FastVLM checkpoint loads with vision capability")
     func loadVLCheckpoint() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
 
         // The checkpoint is a VLM — vlModel is present, .imageIn is
@@ -77,7 +77,7 @@ struct FastVLMIntegrationTests {
     @Test("image + text prompt — describes the dog photo")
     func imageTextGeneration() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "FastVLM checkpoint is not a VLM")
 

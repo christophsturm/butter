@@ -39,7 +39,7 @@ struct Qwen2TextIntegrationTests {
         let maxTokens = 200
 
         // ── 1. Load ──────────────────────────────────────────────────────
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         // ── 2. Interfaces we expect ──────────────────────────────────────
         // Qwen 2.5 is Llama-shaped with bias-bearing QKV projections —

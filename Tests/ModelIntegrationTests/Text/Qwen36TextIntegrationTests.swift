@@ -46,7 +46,7 @@ struct Qwen36TextIntegrationTests {
         let modelId = "mlx-community/Qwen3.6-27B-4bit"
         let prompt = "The history of the printing press began when"
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         // Engine should be Qwen3.6 (routes through the same Qwen3.5
         // dense GDN-hybrid engine; every other family slot stays nil).

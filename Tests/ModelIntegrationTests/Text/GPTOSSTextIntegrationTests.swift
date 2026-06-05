@@ -61,7 +61,7 @@ struct GPTOSSTextIntegrationTests {
         let modelId = "loan-star/gpt-oss-20b-mlx-4Bit"
         let prompt = "The history of the printing press began when"
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         // Engine should be GPT-OSS (not a dense / hybrid family).
         #expect(m.gptOSS != nil)

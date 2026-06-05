@@ -47,7 +47,7 @@ struct Llama3TextIntegrationTests {
 
         // ── 1. Load ──────────────────────────────────────────────────────
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(modelId)
+            try await loadModel(modelId)
         }
 
         // ── 2. Interfaces we expect ──────────────────────────────────────

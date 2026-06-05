@@ -39,7 +39,7 @@ struct Gemma3TextIntegrationTests {
         let prompt = "Once upon a time, in a quiet village"
         let maxTokens = 200
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         // 1B canonical shapes (from HF config.json):
         //   hidden = 1152, nLayers = 26, nHeads = 4, nKVHeads = 1, headDim = 256.

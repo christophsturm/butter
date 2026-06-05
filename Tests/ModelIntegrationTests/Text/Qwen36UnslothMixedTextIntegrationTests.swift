@@ -111,7 +111,7 @@ struct Qwen36UnslothMixedTextIntegrationTests {
         modelId: String, expectMoE: Bool, label: String
     ) async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(modelId)
+            try await loadModel(modelId)
         }
         let q = try #require(
             m.qwen35,

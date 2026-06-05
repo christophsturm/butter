@@ -35,7 +35,7 @@ struct Granite3TextIntegrationTests {
     func granite3() async throws {
         // ── 1. Load ──────────────────────────────────────────────────────
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load("mlx-community/IBM-granite-3.2-2b-instruct-4bit")
+            try await loadModel("mlx-community/IBM-granite-3.2-2b-instruct-4bit")
         }
 
         // ── 2. Interfaces we expect ──────────────────────────────────────

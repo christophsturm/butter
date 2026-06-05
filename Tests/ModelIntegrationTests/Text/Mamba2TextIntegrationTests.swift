@@ -35,7 +35,7 @@ struct Mamba2TextIntegrationTests {
     @Test("load + greedy generate produces non-degenerate text")
     func loadAndGenerate() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load("mlx-community/mamba2-130m")
+            try await loadModel("mlx-community/mamba2-130m")
         }
 
         // Engine should be Mamba 2 (not Llama / Qwen3).
@@ -108,7 +108,7 @@ struct Mamba2TextIntegrationTests {
     @Test("4-bit — fused pre-gated RMSNorm + int4 out_proj decodes coherently")
     func loadAndGenerate4bit() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load("ekryski/mamba2-130m-4bit")
+            try await loadModel("ekryski/mamba2-130m-4bit")
         }
         #expect(m.mamba2 != nil)
         #expect(m.engine.hidden == 768)

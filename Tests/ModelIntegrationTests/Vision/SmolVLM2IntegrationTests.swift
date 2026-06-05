@@ -151,7 +151,7 @@ struct SmolVLM2IntegrationTests {
             "SmolVLM2 checkpoint not found in HF cache")
 
         // ─── Load model ──────────────────────────────────────────────────────
-        let m = try await Model.load(dir.path)
+        let m = try await loadModel(dir.path)
 
         // Verify the engine is a SmolVLM2Model
         let smolVLM2 = try #require(
@@ -275,7 +275,7 @@ struct SmolVLM2IntegrationTests {
         let dir = try #require(
             Self.snapshotDir(),
             "SmolVLM2 snapshot not found in HF cache — skip")
-        let m = try await Model.load(dir.path)
+        let m = try await loadModel(dir.path)
         // SmolVLM2Dense.availableCapabilities now includes .videoIn.
         // Note: Model.swift currently hardcodes .imageIn for SmolVLM2;
         // the family declaration is the ground truth checked here.
@@ -299,7 +299,7 @@ struct SmolVLM2IntegrationTests {
         let dir = try #require(
             Self.snapshotDir(),
             "SmolVLM2 snapshot not found in HF cache — skip")
-        let m = try await Model.load(dir.path)
+        let m = try await loadModel(dir.path)
         let smol = try #require(
             m.smolVLM2,
             "engine should be SmolVLM2Model for this checkpoint")

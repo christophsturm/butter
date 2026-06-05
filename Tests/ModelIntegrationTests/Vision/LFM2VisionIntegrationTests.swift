@@ -49,7 +49,7 @@ struct LFM2VisionIntegrationTests {
     @Test("load — LFM2-VL checkpoint loads with vision capability")
     func loadVLCheckpoint() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
 
         // The checkpoint is a VLM — vlModel is present, .imageIn is
@@ -70,7 +70,7 @@ struct LFM2VisionIntegrationTests {
     @Test("image + text prompt — describes the dog photo")
     func imageTextGeneration() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "LFM2-VL checkpoint is not a VLM")
 
@@ -118,7 +118,7 @@ struct LFM2VisionIntegrationTests {
     @Test("image + text prompt — STREAMING yields tokens incrementally")
     func imageTextGenerationStreaming() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "LFM2-VL checkpoint is not a VLM")
 

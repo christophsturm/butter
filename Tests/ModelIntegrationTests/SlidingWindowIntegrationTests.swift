@@ -60,7 +60,7 @@ struct SlidingWindowIntegrationTests {
             kvEviction: .window(maxSize: windowSize, keep: keep)
         )
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(modelId, options: opts)
+            try await loadModel(modelId, options: opts)
         }
 
         // Sanity: every layer cache reports the window we asked for,

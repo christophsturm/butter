@@ -31,7 +31,7 @@ struct InternLM2TextIntegrationTests {
     func internLM2() async throws {
         // ── 1. Load ──────────────────────────────────────────────────────
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load("mlx-community/internlm2_5-7b-chat-4bit")
+            try await loadModel("mlx-community/internlm2_5-7b-chat-4bit")
         }
 
         // ── 2. Interfaces we expect ──────────────────────────────────────

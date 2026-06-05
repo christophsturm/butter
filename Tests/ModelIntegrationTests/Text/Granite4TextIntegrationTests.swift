@@ -51,7 +51,7 @@ struct Granite4TextIntegrationTests {
         let modelId = "mlx-community/granite-4.0-h-350m-4bit"
         let prompt = "The history of the printing press began when"
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         // Engine should be Granite4 (not Llama / FalconH1 /
         // NemotronH / Mamba 2).

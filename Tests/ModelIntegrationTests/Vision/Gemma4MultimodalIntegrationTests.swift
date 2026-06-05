@@ -71,7 +71,7 @@ struct Gemma4MultimodalIntegrationTests {
     @Test("load — Gemma 4 multimodal checkpoint loads with audio + image capability")
     func loadMultimodalCheckpoint() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
 
         // The checkpoint is a VLM with an audio tower — vlModel present,
@@ -91,7 +91,7 @@ struct Gemma4MultimodalIntegrationTests {
     @Test("audio encode — front-end + encoder + embed_audio produce text-hidden soft tokens")
     func audioEncodeProducesSoftTokens() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "checkpoint is not a VLM")
         try #require(vlm.supportsAudio, "checkpoint has no audio tower")
@@ -238,7 +238,7 @@ struct Gemma4MultimodalIntegrationTests {
     @Test("audio + text prompt — transcribes the clean_001 speech clip coherently")
     func audioTextGeneration() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "checkpoint is not a VLM")
         let audioTokenId = try #require(vlm.audioTokenId, "no audio token id")

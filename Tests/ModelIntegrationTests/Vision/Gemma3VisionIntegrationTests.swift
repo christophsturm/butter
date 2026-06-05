@@ -43,7 +43,7 @@ struct Gemma3VisionIntegrationTests {
     @Test("load — Gemma 3 VL checkpoint loads with vision capability")
     func loadVLCheckpoint() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
 
         // The checkpoint is a VLM — vlModel is present, .imageIn is
@@ -61,7 +61,7 @@ struct Gemma3VisionIntegrationTests {
     @Test("enable / disable .imageIn — runtime capability flip")
     func capabilityFlip() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         // A VL checkpoint can toggle .imageIn at runtime.
         #expect(m.availableCapabilities.contains(.imageIn))
@@ -77,7 +77,7 @@ struct Gemma3VisionIntegrationTests {
     @Test("image + text prompt — describes the dog photo")
     func imageTextGeneration() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "Gemma 3 VL checkpoint is not a VLM")
 

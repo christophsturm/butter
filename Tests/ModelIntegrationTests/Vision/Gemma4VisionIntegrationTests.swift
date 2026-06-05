@@ -47,7 +47,7 @@ struct Gemma4VisionIntegrationTests {
     @Test("load — Gemma 4 VL checkpoint loads with vision capability")
     func loadVLCheckpoint() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
 
         // The checkpoint is a VLM — vlModel is present, .imageIn is
@@ -64,7 +64,7 @@ struct Gemma4VisionIntegrationTests {
     @Test("enable / disable .imageIn — runtime capability flip")
     func capabilityFlip() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         #expect(m.availableCapabilities.contains(.imageIn))
         m.disable(.imageIn)
@@ -76,7 +76,7 @@ struct Gemma4VisionIntegrationTests {
     @Test("image + text prompt — describes the dog photo")
     func imageTextGeneration() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "Gemma 4 VL checkpoint is not a VLM")
 
@@ -147,7 +147,7 @@ struct Gemma4VisionIntegrationTests {
                 .withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
         }
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "not a VLM")
 
@@ -195,7 +195,7 @@ struct Gemma4VisionIntegrationTests {
     @Test("load — checkpoint reports .videoIn capability")
     func loadVLCheckpointVideo() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         #expect(m.vlModel != nil)
         #expect(m.availableCapabilities.contains(.imageIn))
@@ -210,7 +210,7 @@ struct Gemma4VisionIntegrationTests {
     @Test("video + text prompt — identifies the cat in the cat video")
     func videoTextGeneration() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(Self.modelId)
+            try await loadModel(Self.modelId)
         }
         let vlm = try #require(m.vlModel, "Gemma 4 VL checkpoint is not a VLM")
         _ = try #require(vlm.videoTokenId, "no video token id")

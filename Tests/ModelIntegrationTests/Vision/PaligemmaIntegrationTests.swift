@@ -50,7 +50,7 @@ struct PaligemmaIntegrationTests {
         // is 2 years old and the test moves with the supported lineage.
         let modelId = "mlx-community/paligemma2-3b-mix-448-4bit"
 
-        let m = try await Model.load(modelId)
+        let m = try await loadModel(modelId)
 
         // Verify basic shapes from the PaliGemma 2 3B (Gemma 2 2B backbone)
         // published config. Gemma 2 2B = hidden 2304, 26 layers, 8 heads,

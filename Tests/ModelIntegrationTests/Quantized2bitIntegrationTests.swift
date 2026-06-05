@@ -52,7 +52,7 @@ struct Quantized2bitIntegrationTests {
         let prompt = "Once upon a time, in a quiet village"
         let maxTokens = 60
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         #expect(m.config.quantization?.bits == 2)
         #expect(m.config.quantization?.groupSize == 64)

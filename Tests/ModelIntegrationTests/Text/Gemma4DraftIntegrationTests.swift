@@ -67,7 +67,7 @@ struct Gemma4DraftIntegrationTests {
     @Test("dispatcher rejects standalone generation with an actionable error")
     func rejectsStandaloneGeneration() async throws {
         await #expect(throws: ModelError.self) {
-            _ = try await Model.load(drafterPath)
+            _ = try await loadModel(drafterPath)
         }
     }
 

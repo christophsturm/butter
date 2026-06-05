@@ -57,7 +57,7 @@ struct Gemma4TextIntegrationTests {
         let prompt = "Once upon a time, in a quiet village"
         let maxTokens = 200
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         // E2B canonical shapes (from HF text_config):
         //   hidden 1536, 35 layers, 8 heads, sliding head_dim 256,
@@ -129,7 +129,7 @@ struct Gemma4TextIntegrationTests {
         let modelId = "mlx-community/gemma-4-31b-it-4bit"
         let prompt = "Once upon a time, in a quiet village"
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
         let gemma4 = m.engine as? Gemma4Model
         #expect(gemma4 != nil)
         #expect(gemma4?.ple == nil, "31B is a dense (non-PLE) variant")
@@ -158,7 +158,7 @@ struct Gemma4TextIntegrationTests {
         let modelId = "mlx-community/gemma-4-26b-a4b-it-4bit"
         let prompt = "The capital of France is"
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
         let gemma4 = m.engine as? Gemma4Model
         #expect(gemma4 != nil, "expected Gemma4Model engine")
         // 26B-A4B has hidden_size_per_layer_input = 0 → MoE, not PLE.

@@ -356,7 +356,7 @@ struct ModelKVCacheMatrixIntegrationTests {
         // checkpoints actually expected on each machine.
         let opts = LoadOptions(kvCache: cell.kv)
         let model = try await ModelLoadLock.shared.loadSerially {
-            try await Model.load(cell.model.id, options: opts)
+            try await loadModel(cell.model.id, options: opts)
         }
 
         let result = try await model.generate(

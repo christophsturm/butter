@@ -53,7 +53,7 @@ struct JambaTextIntegrationTests {
         let modelId = "mlx-community/AI21-Jamba-Reasoning-3B-4bit"
         let prompt = "The history of the printing press began when"
 
-        let m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        let m = try await loadModel(modelId)
 
         // Engine should be Jamba (not Llama / FalconH1 / NemotronH /
         // Granite4 / Mamba 2).
