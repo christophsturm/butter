@@ -34,12 +34,11 @@
 //     `forward`, block-diffusion / self-speculation drive
 //     `forwardBlock` and `GenerateDiffusion`.
 //
-// Note: this family is also exported through the unified `enum
-// Nemotron` family root (`Models/Nemotron.swift`) which unions
-// modelTypes / architectures across NemotronH, NemotronVL, and
-// NemotronDiffusion for single-membership-check dispatch in the
-// registry. This `Models/NemotronDiffusion.swift` anchor keeps the
-// "every family has its own root file" rule uniform.
+// The Nemotron-Labs-Diffusion VLM orchestrator (`enum
+// NemotronDiffusionVL`) lives in
+// `Models/Vision/NemotronDiffusionVision.swift`. The sibling NemotronH
+// line (a different architecture) lives in `Models/Nemotron.swift` +
+// `Models/Text/NemotronHText.swift` + `Models/Vision/NemotronHVision.swift`.
 
 import Foundation
 

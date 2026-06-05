@@ -12,44 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// NemotronTests — root-file unit tests for `Sources/FFAI/Models/Nemotron.swift`.
+// NemotronTests — unit tests for the Nemotron family entry points.
 //
-// Offline. `enum Nemotron` is the unified family root that unions the
-// per-variant metadata across NemotronH (text + VL), NemotronDiffusion
-// (text + VL). These tests pin the union shape so the registry can
-// rely on "is this any Nemotron?" with one membership lookup.
-//
-// They also cover the per-variant family entry points
-// (`NemotronH`, `NemotronDiffusionVL`) declared in the same file and
-// the unified `NemotronHError` description shape.
+// Offline. Covers the `NemotronH` family root
+// (`Sources/FFAI/Models/Nemotron.swift`) — registration + variant
+// dispatch + the unified `NemotronHError` description shape — and the
+// `NemotronDiffusionVL` orchestrator
+// (`Sources/FFAI/Models/Vision/NemotronDiffusionVision.swift`)
+// registration + defaults. (The NemotronDiffusion text family root has
+// its own coverage; the two architectures are deliberately separate.)
 
 import Foundation
 import Testing
 
 @testable import FFAI
 
-@Suite("Nemotron Unified Family Root")
-struct NemotronUnifiedRootTests {
-
-    @Test("Nemotron.modelTypes is the union over every variant")
-    func modelTypesUnion() {
-        let union = Nemotron.modelTypes
-        #expect(NemotronH.modelTypes.isSubset(of: union))
-        #expect(NemotronVL.modelTypes.isSubset(of: union))
-        #expect(NemotronDiffusion.modelTypes.isSubset(of: union))
-        #expect(NemotronDiffusionVL.modelTypes.isSubset(of: union))
-    }
-
-    @Test("Nemotron.architectures is the union over every variant")
-    func architecturesUnion() {
-        let union = Nemotron.architectures
-        #expect(NemotronH.architectures.isSubset(of: union))
-        #expect(NemotronDiffusion.architectures.isSubset(of: union))
-        #expect(NemotronDiffusionVL.architectures.isSubset(of: union))
-        // NemotronVL deliberately ships an empty architectures set (the
-        // VL checkpoints route via the vision-config sniff) — but it
-        // SHOULD still be a subset of an empty set.
-    }
+@Suite("Nemotron Family Roots")
+struct NemotronFamilyRootTests {
 
     @Test("NemotronH owns nemotron_h + NemotronHForCausalLM")
     func nemotronHRegistration() {
