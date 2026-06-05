@@ -53,7 +53,7 @@ func lfm2vlLoadVisionEncoder(
         let numPatches = config.int("num_patches"),
         let patchSize = config.int("patch_size")
     else {
-        throw LFM2VLError.missingConfig
+        throw LFM2Error.missingConfig("vision_config")
     }
     let inChannels = config.int("num_channels") ?? 3
     let layerNormEps = Float(config.float("layer_norm_eps") ?? 1e-6)
@@ -591,7 +591,7 @@ func lfm2LoadModelQuantized(
         let nHeads = config.int("num_attention_heads") ?? config.int("num_heads"),
         let vocab = config.int("vocab_size")
     else {
-        throw LFM2VLError.missingConfig
+        throw LFM2Error.missingConfig("vision_config")
     }
     let nKVHeads = config.int("num_key_value_heads") ?? nHeads
     let headDim = config.int("head_dim") ?? (hidden / nHeads)
@@ -602,11 +602,11 @@ func lfm2LoadModelQuantized(
     let convBias = config.bool("conv_bias") ?? false
 
     guard convKernel >= 2 else {
-        throw LFM2VLError.unsupportedConfig(
+        throw LFM2Error.unsupportedConfig(
             "conv_L_cache (\(convKernel)) must be ≥ 2")
     }
     guard headDim == 64 || headDim == 128 || headDim == 256 || headDim == 512 else {
-        throw LFM2VLError.unsupportedConfig(
+        throw LFM2Error.unsupportedConfig(
             "head_dim \(headDim) — Ops.sdpaDecode supports {64,128,256,512}")
     }
 

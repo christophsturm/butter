@@ -22,8 +22,7 @@
 //   • the `LFM2Variant` protocol every concrete text variant conforms
 //     to,
 //   • the `LFM2Error` type the loader / decode site raises,
-//   • the VL family orchestrator `LFM2VL` (and its `LFM2VLError`
-//     type) — the SigLIP2 vision tower + pixel-unshuffle projector +
+//   • the VL family orchestrator //     type) — the SigLIP2 vision tower + pixel-unshuffle projector +
 //     LFM2 text backbone splice.
 //
 // Concrete text variants + the hybrid decoder + per-layer impl live
@@ -72,13 +71,18 @@ public protocol LFM2Variant {
 
 // ─── Errors ──────────────────────────────────────────────────────────
 
+/// Unified LFM2 family error — raised by the text loaders and the LFM2-VL
+/// orchestrator + vision tower (`Models/Vision/LFM2Vision.swift`).
 public enum LFM2Error: Error, CustomStringConvertible {
     case missingConfig(String)
+    case missingTensor(String)
     case unsupportedConfig(String)
     public var description: String {
         switch self {
         case .missingConfig(let f):
             return "LFM2: required config field missing: \(f)"
+        case .missingTensor(let name):
+            return "LFM2: checkpoint is missing tensor '\(name)'"
         case .unsupportedConfig(let m):
             return "LFM2: unsupported config: \(m)"
         }
@@ -94,25 +98,6 @@ public enum LFM2Error: Error, CustomStringConvertible {
 //   • multi-modal projector (LayerNorm → linear_1 (GELU) → linear_2),
 //   • LFM2 text backbone loaded from `language_model.`-prefixed
 //     weights.
-
-// ─── Errors ──────────────────────────────────────────────────────────
-
-public enum LFM2VLError: Error, CustomStringConvertible {
-    case missingConfig
-    case missingTensor(String)
-    case unsupportedConfig(String)
-
-    public var description: String {
-        switch self {
-        case .missingConfig:
-            return "LFM2VL: checkpoint config is missing required fields"
-        case .missingTensor(let name):
-            return "LFM2VL: checkpoint is missing tensor '\(name)'"
-        case .unsupportedConfig(let m):
-            return "LFM2VL: unsupported config: \(m)"
-        }
-    }
-}
 
 // ─── Family entry point ──────────────────────────────────────────────
 
@@ -136,7 +121,7 @@ public enum LFM2VL {
         guard let visionConfigRaw = config.nested("vision_config"),
             let textConfigRaw = config.nested("text_config")
         else {
-            throw LFM2VLError.missingConfig
+            throw LFM2Error.missingConfig("vision_config / text_config")
         }
 
         // ── Text backbone (LFM2 — quantized-aware) ──────────────────

@@ -35,7 +35,7 @@
 //
 // The **omni** path (Qwen3-Omni — text + vision + audio-IN) lives at the
 // bottom of this file: the shared `QwenOmniModel` engine +
-// `QwenOmniAudioConfig` + `QwenOmniError`. Qwen3-Omni is detected via
+// `QwenOmniAudioConfig` + `Qwen3Error` cases. Qwen3-Omni is detected via
 // `Qwen3.isOmni(_:)` and routed through `AudioModelRegistry` (audio-in
 // capable). Keeping it here makes this file the single root for the whole
 // Qwen 3 series — dense + VL + omni. The same engine also backs earlier
@@ -107,12 +107,20 @@ public protocol Qwen3Variant {
 
 // ─── Errors ──────────────────────────────────────────────────────────
 
-/// Unified Qwen 3 family error — raised by both the text loaders
-/// (`Qwen3Dense.loadModel`) and the Qwen 3-VL orchestrator (`Qwen3VL.load`
-/// in `Models/Vision/Qwen3Vision.swift`).
+/// Unified Qwen 3 family error — raised by the text loaders
+/// (`Qwen3Dense.loadModel`), the Qwen 3-VL orchestrator (`Qwen3VL.load` in
+/// `Models/Vision/Qwen3Vision.swift`), and the shared omni engine
+/// (`QwenOmniModel`, below).
 public enum Qwen3Error: Error, CustomStringConvertible {
     case missingConfig
     case missingTensor(String)
+    /// The omni text backbone is not loaded — `QwenOmniModel` was
+    /// constructed audio-only. `encodeAudio` works regardless.
+    case textBackboneUnavailable
+    /// `transcribe` / `transcribeStream` was called on an omni build before
+    /// a tokenizer was attached (the sync `load(directory:)` path can't run
+    /// the async tokenizer load).
+    case tokenizerUnavailable
 
     public var description: String {
         switch self {
@@ -120,6 +128,14 @@ public enum Qwen3Error: Error, CustomStringConvertible {
             return "Qwen3: required config field missing"
         case .missingTensor(let name):
             return "Qwen3: checkpoint is missing tensor '\(name)'"
+        case .textBackboneUnavailable:
+            return "QwenOmni: the text backbone is not loaded in this "
+                + "audio-only build; use encodeAudio to obtain audio "
+                + "feature tokens and run them through a Qwen3 model"
+        case .tokenizerUnavailable:
+            return "QwenOmni: no tokenizer attached — set `tokenizer` "
+                + "(the async registry loader does this) before calling "
+                + "transcribe / transcribeStream"
         }
     }
 }
@@ -268,30 +284,6 @@ public struct QwenOmniAudioConfig: Sendable {
 }
 
 // ─── QwenOmni model ──────────────────────────────────────────────────
-
-public enum QwenOmniError: Error, CustomStringConvertible {
-    /// The text backbone is not loaded — `QwenOmni` was constructed
-    /// audio-only. `encodeAudio` works regardless.
-    case textBackboneUnavailable
-    /// `transcribe` / `transcribeStream` was called before a tokenizer
-    /// was attached. The synchronous `load(directory:)` path can't run the
-    /// async tokenizer load, so the registry's async loader (or a caller)
-    /// must set `tokenizer` before driving the audio→text path.
-    case tokenizerUnavailable
-
-    public var description: String {
-        switch self {
-        case .textBackboneUnavailable:
-            return "QwenOmni: the text backbone is not loaded in this "
-                + "audio-only build; use encodeAudio to obtain audio "
-                + "feature tokens and run them through a Qwen3 model"
-        case .tokenizerUnavailable:
-            return "QwenOmni: no tokenizer attached — set `tokenizer` "
-                + "(the async registry loader does this) before calling "
-                + "transcribe / transcribeStream"
-        }
-    }
-}
 
 /// A loaded QwenOmni model. Owns the audio encoder (always available —
 /// the FFAI contribution) and, when wired, the text backbone +
@@ -449,10 +441,10 @@ extension QwenOmniModel {
         _ waveform: [Float], temperature: Float, device: Device
     ) throws -> TranscribeState {
         guard let backbone = textBackbone else {
-            throw QwenOmniError.textBackboneUnavailable
+            throw Qwen3Error.textBackboneUnavailable
         }
         guard let tokenizer = tokenizer else {
-            throw QwenOmniError.tokenizerUnavailable
+            throw Qwen3Error.tokenizerUnavailable
         }
 
         // 1. Encode the waveform → [nAudioTokens, textHidden] feature rows.

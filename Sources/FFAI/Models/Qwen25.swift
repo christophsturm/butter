@@ -44,16 +44,16 @@
 import Foundation
 import Metal
 
-public enum Qwen25VLError: Error, CustomStringConvertible {
+public enum Qwen25Error: Error, CustomStringConvertible {
     case missingConfig
     case missingTensor(String)
 
     public var description: String {
         switch self {
         case .missingConfig:
-            return "Qwen25VL: checkpoint config is missing required fields"
+            return "Qwen25: checkpoint config is missing required fields"
         case .missingTensor(let name):
-            return "Qwen25VL: checkpoint is missing tensor '\(name)'"
+            return "Qwen25: checkpoint is missing tensor '\(name)'"
         }
     }
 }
@@ -84,7 +84,7 @@ public enum Qwen25VL {
         options: LoadOptions, device: Device
     ) throws -> VisionModel {
         guard let visionConfig = config.subConfig("vision_config") else {
-            throw Qwen25VLError.missingConfig
+            throw Qwen25Error.missingConfig
         }
 
         // ── Text backbone ──

@@ -23,7 +23,7 @@
 //     structural fallback (audio_config presence), and rejects unrelated
 //     models.
 //   * AudioModelRegistry routes QwenOmni configs to Capability.omniAudio.
-//   * QwenOmniError.description includes the expected family prefix.
+//   * Qwen3Error.description includes the expected family prefix.
 
 import Foundation
 import Testing
@@ -186,9 +186,9 @@ struct QwenOmniTests {
 
     // ─── Error stringification ───────────────────────────────────────────
 
-    @Test("QwenOmniError.description — textBackboneUnavailable mentions QwenOmni")
+    @Test("Qwen3Error.description — textBackboneUnavailable mentions the omni context")
     func errorDescription() {
-        let err = QwenOmniError.textBackboneUnavailable
+        let err = Qwen3Error.textBackboneUnavailable
         #expect(err.description.contains("QwenOmni"))
         #expect(err.description.contains("audio"))
     }

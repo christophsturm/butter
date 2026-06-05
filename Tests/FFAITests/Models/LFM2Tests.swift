@@ -16,7 +16,7 @@
 //
 // Offline. The LFM2 text-family + layer-schedule + expert-bias routing
 // is covered in `Tests/FFAITests/Models/Text/LFM2TextTests.swift`; this
-// file focuses on `isMoE(_)` dispatch, `LFM2Error` + `LFM2VLError` shape,
+// file focuses on `isMoE(_)` dispatch, `LFM2Error` shape,
 // and the `LFM2VL` orchestrator's family constants.
 
 import Foundation
@@ -88,10 +88,10 @@ struct LFM2VLRootTests {
         #expect(LFM2VL.defaultImageTokenId == 396)
     }
 
-    @Test("LFM2VLError stringifies every case with its payload")
+    @Test("LFM2Error stringifies every case with its payload")
     func errorDescriptions() {
-        #expect(LFM2VLError.missingConfig.description.contains("LFM2VL"))
-        #expect(LFM2VLError.missingTensor("foo").description.contains("foo"))
-        #expect(LFM2VLError.unsupportedConfig("bad").description.contains("bad"))
+        #expect(LFM2Error.missingConfig("vision_config").description.contains("vision_config"))
+        #expect(LFM2Error.missingTensor("foo").description.contains("foo"))
+        #expect(LFM2Error.unsupportedConfig("bad").description.contains("bad"))
     }
 }

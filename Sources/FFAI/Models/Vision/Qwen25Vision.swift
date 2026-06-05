@@ -74,7 +74,7 @@ struct Qwen25VLVisionConfig {
             let patchSize = c.int("patch_size"),
             let mergeSize = c.int("spatial_merge_size")
         else {
-            throw Qwen25VLError.missingConfig
+            throw Qwen25Error.missingConfig
         }
         // `intermediate_size` / `out_hidden_size` are present on real
         // checkpoints; fall back to documented Qwen2.5-VL defaults.
