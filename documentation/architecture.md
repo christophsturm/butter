@@ -130,6 +130,17 @@ A `Model` has two `Capability` sets:
 
 Disabled modalities skip weight allocation entirely — the vision encoder of a 9B VL model is ~600MB you don't pay for if you only need text. The infrastructure has been in place since Phase 2; the vision-language and audio families now exercise it end-to-end.
 
+## One registry, one `Model`, every modality
+
+`Model.load(id)` is the single entry point for **every** kind — LLM, VLM, OCR, omni, STT, TTS, STS, VAD. It decodes `config.json`, asks the one `ModelRegistry` table which family claims it, and returns one generic `Model`. There is no separate audio or VAD loader.
+
+- **`ModelKind`** is the catalog label (`llm`/`vlm`/`ocr`/`omni`/`stt`/`tts`/`sts`/`vad`) the registry files each family under. It drives the `ffai models` catalog and `Model.generate` dispatch — it is *not* a substitute for `Capability` (the fine-grained runtime truth).
+- **`ModelEntry`** is one registry row: how to RECOGNISE a checkpoint (`model_type` / `architecture` / a `sniff` closure), how to LOAD it (a config+weights `load` for text/VL, or a directory `loadFromDirectory` for audio/VAD), and how to LIST it (`summary` / `repos` / `capabilities`). The table is the single source of truth for both the loader and the catalog.
+- **`Model.engine`** is type-erased to `any ModelEngine`. The modality protocols refine it: `LanguageModel: TextEngine` (text forward surface), `Transcribing` (STT), `Synthesizing` (TTS), `SpeechTransforming` (STS), `Detecting` (VAD). A family conforms to one or several (omni → `TextEngine` + `Transcribing`) — protocol composition, because the modality taxonomy is overlapping sets, not a tree.
+- **`Model.generate(_ : ModelInput)`** and **`generateStream(_:)`** are the generic surface; `ModelInput` / `ModelOutput` / `ModelOutputChunk` are modality-tagged enums. Typed convenience — `generate(messages:)`, `transcribe`, `synthesize`, `detect` — wraps the generic path and throws `ModelError.unsupportedInput` on a kind mismatch.
+
+Routing precedence (in `ModelRegistry.entry(for:)`): a vision-language checkpoint goes to the VL tier first (Gemma 4's VL/omni conversions carry a top-level `audio_config`, so VL must win over the audio sniffs); a VL config with no VL handler falls through to the audio tier (Qwen-Omni carries a `vision_config` but loads as audio); otherwise the audio tier's specific structural sniffs win over the generic text-architecture match (an Orpheus checkpoint is a `LlamaForCausalLM` but a TTS model), then the text tier.
+
 ## File layout
 
 ```
@@ -143,12 +154,28 @@ Sources/
                             MoELayer / DecoderLayer / VisionEncoderLayer /
                             AudioEncoderLayer
     Capability.swift        .textIn / .imageIn / .videoIn / .audioIn / .textOut / .audioOut
-    LanguageModel.swift     Protocol implemented by text-family models
-    VisionModel.swift       Protocol implemented by VL orchestrators
-    AudioModel.swift        Protocol implemented by audio families
+    ModelKind.swift         catalog kind: llm/vlm/ocr/omni/stt/tts/sts/vad
+    Model.swift             one generic Model wrapper for every kind
+    ModelType/              engine protocol-composition layer + unified I/O
+      ModelEngine.swift     ModelEngine marker + TextEngine / Transcribing /
+                            Synthesizing / SpeechTransforming / Detecting
+      ModelIO.swift         ModelInput / ModelOutput / ModelOutputChunk
+      ModelInference.swift  Model.generate(_:) / generateStream(_:) + typed
+                            transcribe / synthesize / detect convenience
+      EngineConformances.swift  audio/VAD families → modality protocols
+    LanguageModel.swift     text-engine protocol (: TextEngine); ~40 families
+    VisionModel.swift       VL orchestrator (composed, not a protocol)
+    AudioModel.swift        legacy TTS protocol (synthesize); superseded by
+                            the ModelType/ Synthesizing protocol
     FFAI.swift              Public umbrella + version
-    Loader/                 Model.load, ModelConfig, ModelLocator,
-                            ModelDownloader, ModelRegistry, Device, …
+    Loader/                 Model.load (one entry, every kind), ModelConfig,
+                            ModelLocator, ModelDownloader, Device, and the
+                            single ModelRegistry table —
+                            ModelRegistry.swift (dispatch + Loaded),
+                            ModelRegistryTable.swift (vision + text tiers),
+                            ModelRegistryAudio.swift (audio/VAD tier,
+                            directory-loaded), ModelEntry.swift (one row),
+                            RegistryQueries.swift (routing-query helpers)
     Converter/              ffai convert: ConvertDriver, SafeTensorsWriter,
                             QuantSpec
     Ops/                    Public GPU op wrappers (Ops.swift,

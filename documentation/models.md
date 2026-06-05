@@ -1,11 +1,10 @@
 # Supported Models
 
-FFAI runs every family below directly from HuggingFace through
-`Model.load("org/repo")` (or `AudioModel.load(...)` / `VADModel.load(...)`
-for the non-text-decoder contracts). The `ffai models` CLI lists the
-verified repo IDs per family; pass any other mlx-format conversion of a
-supported architecture and the loader picks it up via
-`ModelRegistry.dispatchAndLoad`.
+FFAI runs every family below directly from HuggingFace through one entry
+point — `Model.load("org/repo")` — for every kind (text, VL, STT, TTS,
+STS, VAD, omni). The `ffai models` CLI lists the verified repo IDs per
+family; pass any other mlx-format conversion of a supported architecture
+and the loader picks it up via the single `ModelRegistry` table.
 
 This page is the canonical landing for:
 
@@ -84,12 +83,15 @@ contract), **STS** (speech-to-speech).
 
 ### Audio dispatch
 
-The audio families do **not** route through `ModelRegistry` /
-`LanguageModel` — those describe a pure text-in / text-out causal
-decoder. STT is audio-in / text-out, TTS is text-in / audio-out. They
-load through [`AudioModelRegistry`](../Sources/FFAI/CLI/AudioModelRegistry.swift)
-which inspects `config.json`, picks the family, and reports the audio
-[`Capability`](../Sources/FFAI/Capability.swift) set.
+The audio families load through the same `Model.load` and single
+[`ModelRegistry`](../Sources/FFAI/Loader/ModelRegistry.swift) as every
+other kind, but they don't conform to `LanguageModel` (a pure text-in /
+text-out causal decoder). STT is audio-in / text-out, TTS is text-in /
+audio-out: each conforms to a modality protocol
+([`Transcribing`](../Sources/FFAI/ModelType/ModelEngine.swift) /
+`Synthesizing`) and is registered as a directory-loaded `ModelEntry` (in
+[`ModelRegistryAudio.swift`](../Sources/FFAI/Loader/ModelRegistryAudio.swift))
+that reports the audio [`Capability`](../Sources/FFAI/Capability.swift) set.
 
 Whisper, Kokoro and Qwen-Omni share the
 [`AudioEncoder`](../Sources/FFAI/AudioEncoder.swift) module (Whisper-style
@@ -104,10 +106,11 @@ the CPU path.
 ### VAD dispatch
 
 VAD models have a third contract — audio waveform in, per-frame
-speech-probability stream out. They load through
-[`VADModelRegistry`](../Sources/FFAI/CLI/VADModelRegistry.swift) which
-exposes `loadFromDirectory` / `fromPretrained` and a
-`detect(audio:sampleRate:)` returning a
+speech-probability stream out. They load through the same `Model.load`
+(routed by `model_type` to a `.vad` `ModelEntry`); the engine conforms to
+[`Detecting`](../Sources/FFAI/ModelType/ModelEngine.swift) and
+`Model.detect(_:)` returns `[DetectionEvent]`. The underlying family still
+exposes its native `detect(audio:sampleRate:)` returning a
 [`VADOutput`](../Sources/FFAI/VADOutput.swift).
 
 | Family | `model_type` | Notes |
@@ -171,7 +174,7 @@ let model = try await Model.load("mlx-community/Qwen3-14B-4bit")
 ```
 
 The loader resolves the snapshot, parses `config.json`, picks the right
-family via `ModelRegistry.dispatchAndLoad` and builds the variant. If
+family via the `ModelRegistry` table and builds the variant. If
 the architecture isn't in the registry yet, you get a
 `ModelError.unsupportedArchitecture(...)`.
 

@@ -37,7 +37,7 @@ For shared building blocks: cross-family helpers (e.g. the GEMM K-tile padding, 
 
 A **family** is a major architectural lineage. A **variant** is a shape inside a family.
 
-- **New family.** A different family file. Examples: Mistral, Phi, Gemma, Mamba, GPT-OSS — none of these share Llama's exact attention shape. New file under the appropriate folder (`Text/`, `Vision/`, `Audio/<sub>/`, or `Models/` root for a VL orchestrator), registered in `ModelRegistry.dispatchAndLoad`.
+- **New family.** A different family file. Examples: Mistral, Phi, Gemma, Mamba, GPT-OSS — none of these share Llama's exact attention shape. New file under the appropriate folder (`Text/`, `Vision/`, `Audio/<sub>/`, or `Models/` root for a VL orchestrator), registered as a `ModelEntry` row in the `ModelRegistry` table (see Step 5).
 - **New variant.** Same family file, new struct conforming to the family's `Variant` protocol. Examples: `Qwen35Dense` alongside `Qwen3Dense`, `Qwen35MoE`, `Qwen35VL` — they go in `Models/Text/Qwen3xText.swift` and dispatch in `Qwen35.variant(for:)`.
 
 The convention is **one file per family per folder, not per variant**. A family file with five variant structs is fine; five files for one family is not.
@@ -184,29 +184,63 @@ func defaultGenerationParameters() {
 
 ## Step 5 — register the family
 
-In `Sources/FFAI/Model.swift`, `ModelRegistry.dispatchAndLoad`:
+Registering a family = adding **one `ModelEntry` row** to the single
+`ModelRegistry` table. There is no if-chain to edit; the loader finds the first
+entry whose `matches(_:)` claims the config. An entry carries everything needed
+to RECOGNISE the checkpoint, LOAD it, and LIST it in `ffai models` — the table
+is the one source of truth for both the loader and the catalog.
+
+**Text / VL family** — add to `textEntries` (or `visionEntries`) in
+`Sources/FFAI/Loader/ModelRegistryTable.swift`. The `load` closure takes the
+pre-built, residency-pinned weights and returns a `ModelRegistry.Loaded`:
 
 ```swift
-if let arch = config.architecture, <Family>.architectures.contains(arch) {
-    return try load<Family>(config: config, weights: weights,
-                            options: options, device: device)
-}
-if let mt = config.modelType, <Family>.modelTypes.contains(mt) {
-    return try load<Family>(config: config, weights: weights,
-                            options: options, device: device)
-}
+ModelEntry(
+    family: "<Family>", kind: .llm,
+    summary: "One-line catalog blurb.",
+    repos: ["org/example-4bit"],
+    modelTypes: <Family>.modelTypes, architectures: <Family>.architectures,
+    load: { c, w, o, d in
+        let variant = try <Family>.variant(for: c)
+        let engine = try variant.loadModel(config: c, weights: w, options: o, device: d)
+        return Loaded(
+            engine: engine,
+            defaultGenerationParameters: variant.defaultGenerationParameters,
+            availableCapabilities: variant.availableCapabilities)
+    }),
 ```
 
-And a `load<Family>` helper that delegates to the variant's `loadModel` and returns a `ModelRegistry.Loaded` carrying both the engine and the variant's `defaultGenerationParameters`:
+Entry order is precedence (first match wins) — put a family with a more
+specific marker before a generic one (e.g. MiniCPM5's name-marker `sniff`
+before the generic Llama arch). Families not identifiable by
+`model_type` / `architecture` alone supply a `sniff: { <Family>.handles($0) }`
+closure.
+
+**Audio / VAD family** (STT / TTS / STS / VAD / omni) — add to `audioEntries`
+in `Sources/FFAI/Loader/ModelRegistryAudio.swift`. These load from the snapshot
+directory (they build their own weight bundle, sometimes async, and attach
+their own tokenizer), so they set `loadFromDirectory` instead of `load`, plus
+the family's `capabilities` and `kind`:
 
 ```swift
-public static func load<Family>(...) throws -> Loaded {
-    let variant = try <Family>.variant(for: config)
-    let engine = try variant.loadModel(...)
-    return Loaded(engine: engine,
-                  defaultGenerationParameters: variant.defaultGenerationParameters)
-}
+ModelEntry(
+    family: "<Family>", kind: .tts,
+    summary: "One-line catalog blurb.",
+    repos: ["org/example"],
+    capabilities: Capability.textToSpeech,
+    sniff: { <Family>Model.handles($0) },
+    loadFromDirectory: { dir, _, _, dev in
+        let m = try await <Family>Model.load(directory: dir, device: dev)
+        return await audioLoaded(m, Capability.textToSpeech, directory: dir)
+    }),
 ```
+
+Then conform the engine to its modality protocol in
+`Sources/FFAI/ModelType/EngineConformances.swift` — `Transcribing` (STT),
+`Synthesizing` (TTS), `SpeechTransforming` (STS), or `Detecting` (VAD). STT/TTS
+conformances are one-line markers (the families already conform to the
+`StreamingTranscriber` / `StreamingSynthesizer` contracts the protocols
+refine); `Model.transcribe` / `synthesize` / `detect` then work for free.
 
 ## Step 6 — verify correctness
 

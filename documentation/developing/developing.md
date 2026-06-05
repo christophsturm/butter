@@ -135,7 +135,7 @@ Kernels are Rust functions in metaltile, not Swift. The flow:
 See [adding-a-model.md](adding-a-model.md) for the full walk-through. TL;DR:
 
 1. New `Sources/FFAI/Models/<Family>.swift` with a `<Family>` enum declaring `modelTypes` + `architectures`, a `<Family>Variant` protocol, and one or more variant structs.
-2. Register the family in `Sources/FFAI/Model.swift` → `ModelRegistry.dispatchAndLoad`.
+2. Register the family as a `ModelEntry` row in the `ModelRegistry` table (`Loader/ModelRegistryTable.swift`, or `ModelRegistryAudio.swift` for audio).
 3. Add `Tests/ModelIntegrationTests/<Family>IntegrationTests.swift` — load the smallest published checkpoint, greedy-decode, and assert `expectCoherentOutput(...)`.
 
 ## Testing

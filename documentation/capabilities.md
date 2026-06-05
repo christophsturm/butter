@@ -43,19 +43,19 @@ Capability.omniAudio      // [.textIn, .audioIn, .textOut] — Qwen-Omni
 
 ## Audio models
 
-Audio models do not route through `Model` / `ModelRegistry` (which describe a text-in / text-out causal decoder). They load through [`AudioModelRegistry`](../Sources/FFAI/AudioModelRegistry.swift), which inspects `config.json`, picks the family (Whisper STT, SenseVoice STT, Kokoro TTS, Qwen-Omni), and reports the audio `Capability` set:
+Audio models load through the same `Model.load(_:)` as every other kind — one entry point, one `ModelRegistry`. The returned `Model` exposes the audio modality through typed convenience methods and reports the audio `Capability` set via `availableCapabilities`:
 
 ```swift
-let loaded = try AudioModelRegistry.load(directory: dir)
-switch loaded {
-case .whisper(let m):    ...   // .speechToText
-case .senseVoice(let m): ...   // .speechToText
-case .kokoro(let m):     ...   // .textToSpeech
-case .qwenOmni(let m):   ...   // .omniAudio
+let model = try await Model.load(dir)          // STT / TTS / STS / VAD / omni
+switch model.kind {
+case .stt:  let result = try await model.transcribe(waveform)   // .speechToText
+case .tts:  let samples = try await model.synthesize("Hello")   // .textToSpeech
+case .vad:  let events  = try await model.detect(waveform)      // detection only
+default:    break
 }
 ```
 
-`AudioModelRegistry.capabilities(forConfigAt:)` reports the capability set without loading weights — useful for a model picker.
+`ModelRegistry.capabilities(forConfigAt:)` reports the audio capability set without loading weights (`nil` for a non-audio config) — useful for a model picker.
 
 ## What each family declares
 
