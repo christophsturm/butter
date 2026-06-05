@@ -12,43 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// MiniCPM-V 4.6 — OpenBMB's `MiniCPMV4_6ForConditionalGeneration`
-// checkpoint (`model_type: minicpmv4_6`). An image/video VLM composed
-// of a **SigLIP2-400M** vision encoder + the **Qwen3.5** text backbone
-// (`qwen3_5_text`, which routes to the in-tree `Qwen35` family),
-// joined by a two-stage projector:
+// MiniCPM 4.x family root — OpenBMB's MiniCPM-V / MiniCPM-o 4.x line.
+// One entry point that dispatches by variant (like the Qwen3 root):
 //
-//   * `vit_merger` — a window cross-attention merger injected MID-stack
-//     after encoder layer `insert_layer_id` (default 6). Reduces a
-//     `(grid_h × grid_w)` patch grid by a `(2, 2)` factor and projects
-//     back to the encoder hidden dim.
-//   * `merger`     — the final 2×2 reduction + projection into the text
-//     hidden dim (`MergerBlock`: LayerNorm → Linear → GELU → Linear).
+//   • v4.5  (`MiniCPMV`, version 4.5)            — image + video.
+//        Qwen3-8B dense (`llm.model.*`) + SigLIP (`vpm.*`) + perceiver
+//        resampler (`resampler.*`) → 64 tokens/image.
+//   • v4.6  (`MiniCPMV4_6ForConditionalGeneration`) — image + video.
+//        SigLIP2-400M (`vision_tower.*`) + `vit_merger` (mid-stack window
+//        cross-attn merger) + final `merger` (2×2 → text hidden) + the
+//        Qwen3.5 text backbone.
+//   • o-4.5 (`MiniCPMO`, version 4.5)            — + audio-IN.
+//        Qwen3-8B dense (`language_model.model.*`) + SigLIP
+//        (`vision_tower.*`) + the SAME perceiver resampler + a
+//        Whisper-medium `audio_tower` + avg-pool + 4-bit projector. The TTS
+//        half (`tts.*`) is ignored — FFAI does audio-IN only.
 //
-// The vision tokens are spliced into the text embedding stream at every
-// `image_token_id` (248056) position by the shared `VisionModel`.
+// Component stacks live alongside the rest of the family:
+//   • text   — Qwen3.5 for 4.6 (`Models/Text/MiniCPM4Text.swift`); Qwen3
+//              dense for 4.5 / o (`Qwen3Dense`).
+//   • vision — `vit_merger` tower in `Models/Vision/MiniCPM4Vision.swift`
+//              (4.6); the resampler tower in
+//              `Models/Vision/MiniCPMOVision.swift` +
+//              `Models/Vision/MiniCPMOResampler.swift` (4.5 / o).
+//   • audio  — `Models/Audio/MiniCPM4Audio.swift` (o only).
 //
-// ─── v1 scope ────────────────────────────────────────────────────────
+// This file is the family orchestrator (variant detection + load
+// dispatch + public constants). The vision / audio token runs are spliced
+// into the text stream by the shared `VisionModel`.
 //
-// One 448×448 tile per image (single image, no LLaVA-UHD slicing). The
-// SigLIP patch grid is 32×32 = 1024 patches; `vit_merger` (2,2) reduces
-// it to 16×16 = 256; the final `merger` (2,2) reduces to 8×8 = 64
-// tokens — matching the checkpoint's `query_num: 64`. The shipped
-// `position_embedding` is `[4900, 1152]` (70×70 grid at the checkpoint
-// `image_size: 980`); it is bilinearly interpolated to the runtime
-// 32×32 grid once at load.
-//
-// The 4×-detail OCR mode (which skips `vit_merger`) and the multi-tile
-// LLaVA-UHD path are deferred — they layer on top of the same building
-// blocks.
-//
-// Reference: `mlx-vlm/mlx_vlm/models/minicpmv4_6/`
-// (`minicpmv4_6.py`, `vision.py`, `processing_minicpmv4_6.py`).
-//
-// Vision tower internals (config structs, SigLIP encoder, vit_merger,
-// merger, composed encoder, encode methods) live in
-// `Models/Vision/MiniCPM4Vision.swift`. This file is the family
-// orchestrator (load entrypoint + public constants).
+// Reference: `modeling_minicpmv.py` / `modeling_minicpmo.py` /
+// `processing_minicpm{v,o}.py` (HF `openbmb/MiniCPM-{V,o}-4_*`).
 
 import Foundation
 import Metal
@@ -56,51 +50,212 @@ import Metal
 // ─── Family entry point ──────────────────────────────────────────────
 
 public enum MiniCPM4 {
-    public static let modelTypes: Set<String> = ["minicpmv4_6"]
-    public static let architectures: Set<String> =
-        ["MiniCPMV4_6ForConditionalGeneration"]
+    /// Which concrete MiniCPM 4.x checkpoint a config describes.
+    public enum Variant: Sendable { case v45, v46, omni }
 
-    /// `image_token_id` default for MiniCPM-V-4.6 checkpoints — the
-    /// placeholder the chat template emits for each image.
-    /// Source: `openbmb/MiniCPM-V-4.6` config.json `image_token_id`.
-    public static let defaultImageTokenId = 248056
+    public static let modelTypes: Set<String> = [
+        "minicpmv", "minicpmv4_6", "minicpmo",
+    ]
+    public static let architectures: Set<String> = [
+        "MiniCPMV", "MiniCPMV4_6ForConditionalGeneration", "MiniCPMO",
+    ]
 
-    /// `video_token_id` default for MiniCPM-V-4.6 checkpoints — the
-    /// placeholder the chat template emits for each video frame token.
-    /// Source: `openbmb/MiniCPM-V-4.6` config.json `video_token_id`
-    /// (value 248057; declared separately from image_token_id).
-    public static let defaultVideoTokenId = 248057
+    // ── v4.5 / o-4.5 token ids (the resampler variants) ───────────────
+    // Distinct per-modality placeholder ids (the model's own `<|image_pad|>`
+    // / `<|video_pad|>` / `<|audio|>` vocab ids). The processor scatters
+    // image / video / audio features over a shared `<unk>` run, but the
+    // `VisionModel` splice validates + substitutes EACH modality by token
+    // id — a shared id makes an image run look like a video run. The
+    // placeholder id is only a splice marker (replaced by the encoder
+    // embedding before the LLM sees it), so distinct vocab ids are
+    // output-identical and let one prompt carry more than one modality.
+    public static let resamplerImageTokenId = 151_655  // <|image_pad|>
+    public static let resamplerVideoTokenId = 151_656  // <|video_pad|>
+    public static let omniAudioPlaceholderTokenId = 151_698  // <|audio|>
 
-    /// Capabilities a MiniCPM-V-4.6 checkpoint exposes. Text + image +
-    /// video — MiniCPM-V-4.6 encodes each video frame as an independent
-    /// image through the same SigLIP2 vision tower, producing
-    /// `outputTokenCount` merged tokens per frame. The video splice
-    /// concatenates the per-frame token runs and substitutes them at the
-    /// `video_token_id` placeholder positions.
+    // ── v4.6 token ids (`config.json` image/video_token_id) ───────────
+    // These keep the family-default names (the original `MiniCPM4` was the
+    // 4.6 checkpoint); the resampler variants carry their own ids above.
+    public static let defaultImageTokenId = 248_056
+    public static let defaultVideoTokenId = 248_057
+
+    /// Capabilities every MiniCPM 4.x checkpoint exposes (text + image +
+    /// video). Audio is added at load time for the omni variant when its
+    /// audio tower is wired (`vlm.supportsAudio`).
     public static let availableCapabilities: Set<Capability> =
         Capability.textOnly.union([.imageIn, .videoIn])
 
-    /// Runtime tile resolution for the v1 path. 448 = 32×32 patches at
-    /// `patch_size: 14`; `vit_merger` (2,2) → 16×16; `merger` (2,2) →
-    /// 8×8 = 64 tokens — matches `query_num: 64`.
+    /// Per-image / per-frame resampler token count (`query_num`, 64).
+    public static let defaultQueryNum = 64
+    /// Average-pool stride applied to the omni audio features
+    /// (`audio_pool_step`, 5).
+    public static let defaultAudioPoolStep = 5
+    /// Runtime single-tile image resolution. 448 = 32×32 patches at
+    /// `patch_size: 14`.
     public static let runtimeImageSize = 448
 
-    /// Build a `VisionModel` from a `MiniCPMV4_6ForConditionalGeneration`
-    /// checkpoint: SigLIP2-400M encoder + `vit_merger` + `merger` +
-    /// Qwen3.5 text backbone, joined by `VisionModel`'s cross-modal splice.
+    /// The `version` field the resampler variants (4.5 / o-4.5) carry.
+    public static let resamplerVersion = 4.5
+    /// Tolerance for the float `version` compare (config stores `4.5`).
+    private static let versionEpsilon = 0.05
+
+    /// Detect the variant a config describes; `nil` when it is not a
+    /// MiniCPM 4.x checkpoint.
+    public static func variant(for config: ModelConfig) -> Variant? {
+        if config.modelType == "minicpmo" || config.architecture == "MiniCPMO" {
+            return .omni
+        }
+        if config.modelType == "minicpmv4_6"
+            || config.architecture == "MiniCPMV4_6ForConditionalGeneration"
+        {
+            return .v46
+        }
+        // v4.5 — the bare `MiniCPMV` arch + `version ≈ 4.5` (the version
+        // gate keeps this from grabbing older `MiniCPMV` releases, which
+        // ride a non-Qwen3 backbone).
+        let isBareV =
+            config.modelType == "minicpmv" || config.architecture == "MiniCPMV"
+        if isBareV, let v = config.float("version"),
+            abs(v - resamplerVersion) < versionEpsilon
+        {
+            return .v45
+        }
+        return nil
+    }
+
+    /// Whether a decoded `config.json` describes a MiniCPM 4.x checkpoint.
+    public static func handles(_ config: ModelConfig) -> Bool {
+        variant(for: config) != nil
+    }
+
+    /// Generation defaults per variant: 4.6 rides the Qwen3.5 backbone;
+    /// 4.5 / o ride the Qwen3 dense backbone.
+    public static func defaultGenerationParameters(for config: ModelConfig)
+        -> GenerationParameters
+    {
+        switch variant(for: config) {
+        case .v46: return Qwen35Hybrid.defaultGenerationParameters
+        case .v45, .omni, .none: return Qwen3Dense.defaultGenerationParameters
+        }
+    }
+
+    /// Capabilities the loaded model exposes. Image + video are always
+    /// present; audio only when the omni checkpoint wired an audio tower
+    /// (`vlm.supportsAudio`).
+    public static func capabilities(for vlm: VisionModel) -> Set<Capability> {
+        var caps = availableCapabilities
+        if vlm.supportsAudio { caps.insert(.audioIn) }
+        return caps
+    }
+
+    /// Build a `VisionModel` for whichever MiniCPM 4.x variant the config
+    /// describes, joined by `VisionModel`'s cross-modal splice.
     public static func load(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> VisionModel {
+        switch variant(for: config) {
+        case .v46:
+            return try loadVitMerger(
+                config: config, weights: weights,
+                options: options, device: device)
+        case .v45:
+            return try loadResampler(
+                config: config, weights: weights, options: options,
+                textPrefix: "llm.", visionPrefix: "vpm.",
+                withAudio: false, device: device)
+        case .omni:
+            return try loadResampler(
+                config: config, weights: weights, options: options,
+                textPrefix: "language_model.", visionPrefix: "vision_tower.",
+                withAudio: true, device: device)
+        case .none:
+            throw MiniCPM4Error.unsupportedConfig(
+                "not a MiniCPM 4.x checkpoint")
+        }
+    }
+
+    // ── v4.5 / o-4.5 — resampler tower (+ optional audio) ──────────────
+    //
+    // Identical assembly for both: a Qwen3-8B dense LLM (config at the TOP
+    // level of config.json — no `text_config` sub-tree) + the SigLIP +
+    // perceiver resampler vision tower. They differ only in the weight
+    // prefixes (`llm.` / `vpm.` for 4.5; `language_model.` / `vision_tower.`
+    // for o) and whether the audio tower is wired.
+    private static func loadResampler(
+        config: ModelConfig, weights: SafeTensorsBundle, options: LoadOptions,
+        textPrefix: String, visionPrefix: String, withAudio: Bool,
+        device: Device
+    ) throws -> VisionModel {
+        guard let visionConfig = config.subConfig("vision_config") else {
+            throw MiniCPM4Error.missingConfig("vision_config")
+        }
+
+        // Text backbone — Qwen3-8B dense. `Qwen3Dense.loadModel` reads
+        // top-level config keys and probes `model.*` / `lm_head` in its
+        // bundle, so forward the config as the text config and re-wrap the
+        // bundle at the variant's text prefix. A `quantization` block (when
+        // present) is top-level, so embedding / linears / lm_head load
+        // quantized; the bf16 base loads full-precision.
+        let textConfig = ModelConfig(
+            architecture: "Qwen3ForCausalLM", modelType: "qwen3",
+            raw: config.raw)
+        let textEngine = try Qwen3Dense.loadModel(
+            config: textConfig, weights: weights.prefixed(textPrefix),
+            options: options, device: device)
+
+        let queryNum = config.int("query_num") ?? defaultQueryNum
+
+        // Vision tower — SigLIP encoder + perceiver resampler.
+        let vision = try MiniCPMOVision.load(
+            visionConfig: visionConfig,
+            runtimeImageSize: runtimeImageSize, textHidden: textEngine.hidden,
+            queryNum: queryNum,
+            visionWeights: weights.prefixed(visionPrefix),
+            resamplerWeights: weights.prefixed("resampler."),
+            quantization: config.quantization, device: device)
+
+        // Audio tower — Whisper encoder + projector + avg-pool. Only wired
+        // when the checkpoint declares an `audio_config` AND ships
+        // `audio_tower.*` tensors (every shipped MiniCPM-o does).
+        var audioTokenId: Int? = nil
+        var audioEncode:
+            (@Sendable (_ waveform: [Float], _ device: Device) -> Tensor)? = nil
+        if withAudio, let audioConfig = config.subConfig("audio_config"),
+            weights.has("audio_tower.conv1.weight")
+        {
+            let poolStep = config.int("audio_pool_step") ?? defaultAudioPoolStep
+            let audio = try MiniCPM4Audio.load(
+                weights: weights, audioConfig: audioConfig,
+                textHidden: textEngine.hidden, poolStep: poolStep,
+                quantization: config.quantization, device: device)
+            audioTokenId = omniAudioPlaceholderTokenId
+            audioEncode = { waveform, dev in
+                audio.encode(waveform: waveform, device: dev)
+            }
+        }
+
+        return try VisionModel(
+            visionEncoder: vision, engine: textEngine,
+            imageTokenId: resamplerImageTokenId,
+            videoTokenId: resamplerVideoTokenId,
+            normalization: .siglip,
+            imageTokenCount: vision.outputTokenCount,
+            audioTokenId: audioTokenId, audioEncode: audioEncode)
+    }
+
+    // ── v4.6 — SigLIP2-400M + vit_merger + merger + Qwen3.5 text ───────
+    private static func loadVitMerger(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> VisionModel {
         guard let visionConfig = config.subConfig("vision_config"),
             config.nested("text_config") != nil
         else {
-            throw MiniCPM4Error.missingConfig(
-                "vision_config / text_config")
+            throw MiniCPM4Error.missingConfig("vision_config / text_config")
         }
 
-        // ── Text backbone: Qwen3.5 from `text_config` ─────────────────
-        // Delegated to the `MiniCPM4Text` component (the family reuses the
+        // Text backbone: Qwen3.5 from `text_config` (the family reuses the
         // Qwen3.5 hybrid stack). mlx-community ships the text weights under
         // `language_model.model.*`; the Qwen3.5 loader probes that prefix
         // itself, so the full bundle is passed through unmodified.
@@ -108,36 +263,34 @@ public enum MiniCPM4 {
             config: config, weights: weights,
             options: options, device: device)
 
-        // ── Vision tower: SigLIP2 encoder + vit_merger + merger ───────
-        // All vision weights live at the top level — `vision_tower.*`
-        // (SigLIP encoder), `vit_merger.*` (window-attention merger),
-        // and `merger.*` (down-projection to text hidden) — with no
-        // `model.` wrapper in the mlx-community release.
-        let visionWeights = weights.prefixed("vision_tower.")
-        let mergerWeights = weights.prefixed("merger.")
-        let vitMergerWeights = weights.prefixed("vit_merger.")
+        // Vision tower: SigLIP2 encoder + `vit_merger` + `merger`. All
+        // vision weights live at the top level — `vision_tower.*`,
+        // `vit_merger.*`, `merger.*` — with no `model.` wrapper.
         let composed = try MiniCPM4ComposedEncoder.load(
             visionConfig: visionConfig,
             insertLayerId: config.int("insert_layer_id") ?? 6,
             mergerTimes: config.int("merger_times") ?? 1,
             runtimeImageSize: runtimeImageSize,
             textHidden: textEngine.hidden,
-            visionWeights: visionWeights,
-            mergerWeights: mergerWeights,
-            vitMergerOverride: vitMergerWeights,
+            visionWeights: weights.prefixed("vision_tower."),
+            mergerWeights: weights.prefixed("merger."),
+            vitMergerOverride: weights.prefixed("vit_merger."),
             device: device)
 
-        let imageTokenId = config.int("image_token_id") ?? defaultImageTokenId
-        let videoTokenId = config.int("video_token_id") ?? defaultVideoTokenId
         return try VisionModel(
             visionEncoder: composed, engine: textEngine,
-            imageTokenId: imageTokenId,
-            videoTokenId: videoTokenId,
+            imageTokenId: config.int("image_token_id") ?? defaultImageTokenId,
+            videoTokenId: config.int("video_token_id") ?? defaultVideoTokenId,
             normalization: .siglip,
             imageTokenCount: composed.outputTokenCount)
     }
 }
 
+// ─── Errors ──────────────────────────────────────────────────────────
+
+/// Unified MiniCPM 4.x family error — raised by the family orchestrator
+/// and its vision / audio component stacks (`MiniCPMOVision`,
+/// `MiniCPM4Audio`, `MiniCPM4ComposedEncoder`).
 public enum MiniCPM4Error: Error, CustomStringConvertible {
     case missingConfig(String)
     case unsupportedConfig(String)

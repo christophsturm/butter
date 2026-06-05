@@ -83,7 +83,7 @@ final class MiniCPMOVision: VisionEncoder {
             let nLayers = visionConfig.int("num_hidden_layers"),
             let nHeads = visionConfig.int("num_attention_heads")
         else {
-            throw MiniCPMOError.missingConfig(
+            throw MiniCPM4Error.missingConfig(
                 "vision_config hidden_size / image_size / patch_size / "
                     + "intermediate_size / num_hidden_layers / num_attention_heads")
         }

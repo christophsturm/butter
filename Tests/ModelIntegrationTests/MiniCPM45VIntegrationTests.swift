@@ -56,8 +56,8 @@ struct MiniCPM45VIntegrationTests {
         #expect(m.engine.hidden == 4096)
         let vlm = try #require(m.vlModel)
         #expect(vlm.imageTokenCount == 64)  // resampler query_num
-        #expect(vlm.imageTokenId == MiniCPMV45.imageTokenId)
-        #expect(vlm.videoTokenId == MiniCPMV45.videoTokenId)
+        #expect(vlm.imageTokenId == MiniCPM4.resamplerImageTokenId)
+        #expect(vlm.videoTokenId == MiniCPM4.resamplerVideoTokenId)
         #expect(!vlm.supportsAudio)
     }
 

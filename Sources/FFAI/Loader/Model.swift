@@ -425,57 +425,26 @@ public enum ModelRegistry {
                     defaultGenerationParameters: variant.defaultGenerationParameters,
                     availableCapabilities: variant.availableCapabilities)
             }
-            // MiniCPM-o 4.5 — the omni checkpoint (text + image + video +
-            // audio-IN). Qwen3-8B dense LLM (`language_model.model.*`) +
-            // SigLIP encoder + perceiver `resampler` (64 tokens/image) +
-            // Whisper-medium `audio_tower` + avg-pool + 4-bit projector,
-            // joined by the cross-modal splice. The TTS half is ignored.
-            if MiniCPMO.handles(config) {
-                let vlm = try MiniCPMO.load(
-                    config: config, weights: weights,
-                    options: options, device: device)
-                // Audio is gated on whether the checkpoint wired an audio
-                // tower (`vlm.supportsAudio`); image + video are always
-                // present on a MiniCPM-o conversion.
-                var caps = Capability.textOnly.union([.imageIn, .videoIn])
-                if vlm.supportsAudio { caps.insert(.audioIn) }
-                return Loaded(
-                    engine: vlm.engine,
-                    defaultGenerationParameters: Qwen3Dense.defaultGenerationParameters,
-                    availableCapabilities: caps,
-                    vlModel: vlm)
-            }
-            // MiniCPM-V 4.5 — the image + video VLM (no audio). Qwen3-8B
-            // dense LLM (`llm.model.*`) + SigLIP encoder + perceiver
-            // `resampler` (64 tokens/image, `vpm.*` / `resampler.*`), joined
-            // by the cross-modal splice. Shares the resampler vision tower
-            // with MiniCPM-o; gated on the bare `MiniCPMV` arch + `version
-            // 4.5` so it does not shadow the 4.6 (`MiniCPMV4_6…`) checkpoint.
-            if MiniCPMV45.handles(config) {
-                let vlm = try MiniCPMV45.load(
-                    config: config, weights: weights,
-                    options: options, device: device)
-                return Loaded(
-                    engine: vlm.engine,
-                    defaultGenerationParameters: Qwen3Dense.defaultGenerationParameters,
-                    availableCapabilities: MiniCPMV45.availableCapabilities,
-                    vlModel: vlm)
-            }
-            // MiniCPM-V 4.6 — SigLIP2-400M encoder + `vit_merger` (window
-            // cross-attn merger injected after encoder layer 6 in the
-            // default 16× mode) + final `merger` (2×2 reduction + project
-            // to text hidden) + Qwen 3.5 text backbone, joined by the
-            // splice. v1 ships a fixed 448×448 single-tile input.
-            if config.architecture == "MiniCPMV4_6ForConditionalGeneration"
-                || config.modelType == "minicpmv4_6"
-            {
+            // MiniCPM 4.x family — one entry point that dispatches by
+            // variant (`MiniCPM4.variant(for:)`):
+            //   • v4.5  — image + video. Qwen3-8B dense (`llm.*`) + SigLIP
+            //             (`vpm.*`) + perceiver resampler.
+            //   • v4.6  — image + video. SigLIP2-400M + `vit_merger` +
+            //             `merger` + Qwen3.5 text.
+            //   • o-4.5 — + audio-IN. Qwen3-8B dense (`language_model.*`) +
+            //             SigLIP + resampler + Whisper `audio_tower`.
+            // Capabilities (audio gated on `vlm.supportsAudio`) and the
+            // generation defaults (Qwen3.5 for 4.6, Qwen3 dense for 4.5 / o)
+            // are resolved per variant inside `MiniCPM4`.
+            if MiniCPM4.handles(config) {
                 let vlm = try MiniCPM4.load(
                     config: config, weights: weights,
                     options: options, device: device)
                 return Loaded(
                     engine: vlm.engine,
-                    defaultGenerationParameters: Qwen35Hybrid.defaultGenerationParameters,
-                    availableCapabilities: MiniCPM4.availableCapabilities,
+                    defaultGenerationParameters:
+                        MiniCPM4.defaultGenerationParameters(for: config),
+                    availableCapabilities: MiniCPM4.capabilities(for: vlm),
                     vlModel: vlm)
             }
             // Nemotron-VLM — NVIDIA's Nemotron Nano VL: a ViT tower +

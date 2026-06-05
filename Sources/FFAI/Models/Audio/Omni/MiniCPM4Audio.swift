@@ -101,7 +101,7 @@ final class MiniCPM4Audio: @unchecked Sendable {
             let nLayers = audioConfig.int("encoder_layers"),
             let nHeads = audioConfig.int("encoder_attention_heads")
         else {
-            throw MiniCPMOError.missingConfig(
+            throw MiniCPM4Error.missingConfig(
                 "audio_config d_model / encoder_layers / encoder_attention_heads")
         }
         let nMels = audioConfig.int("num_mel_bins") ?? 80
