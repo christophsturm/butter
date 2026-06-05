@@ -215,8 +215,13 @@ public enum ConvertDriver {
             throw ConvertDriverError.mkdirFailed(destDir, error)
         }
 
-        // ─── Load source tensors ─────────────────────────────────────
-        let bundle = try SafeTensorsBundle(directory: sourceDir, device: .shared)
+        // ─── Load source tensors (LAZY) ──────────────────────────────
+        // Lazy mode keeps the source mmap and materializes each tensor on
+        // demand in `tensor(named:)`, so a huge source model (e.g. a 60 GB
+        // bf16 MoE) is never fully resident — peak memory is one tensor
+        // (or one layer's stacked experts) at a time, not the whole model.
+        let bundle = try SafeTensorsBundle(
+            directory: sourceDir, device: .shared, lazy: true)
         guard !bundle.files.isEmpty else {
             throw ConvertDriverError.noSafetensorsFound(sourceDir)
         }

@@ -76,8 +76,31 @@ public final class SafeTensorsFile: @unchecked Sendable {
         public let buffer: MTLBuffer
     }
 
+    /// Metadata-only entry for the LAZY load path: the tensor's bytes are
+    /// NOT copied into an MTLBuffer at init. Instead the mmap is retained
+    /// and `tensor(named:)` materializes a fresh buffer on demand (and the
+    /// caller releases it). Used by the converter so a 60 GB source model
+    /// is never fully resident — peak memory is one tensor at a time.
+    public struct LazyEntry: @unchecked Sendable {
+        public let dtype: DType
+        public let shape: [Int]
+        /// Absolute byte offset of the tensor's data within the mmap'd file.
+        public let absStart: Int
+        /// Byte length of the tensor's data.
+        public let length: Int
+    }
+
     public let url: URL
     public let entries: [String: Entry]
+    /// Populated only in lazy mode (`entries` is empty then).
+    public let lazyEntries: [String: LazyEntry]
+    /// The device used to materialize lazy tensors on demand.
+    private let device: Device
+
+    /// Every tensor name this file holds, across the eager + lazy paths.
+    public var entryNames: [String] {
+        entries.isEmpty ? Array(lazyEntries.keys) : Array(entries.keys)
+    }
 
     /// The mmap is held only while we copy each tensor's bytes into a
     /// freshly-allocated `MTLBuffer` (the copy is unavoidable because
@@ -95,7 +118,8 @@ public final class SafeTensorsFile: @unchecked Sendable {
     /// expects this to be `false` after a successful `init`.
     internal var isMmapRetained: Bool { mappedBase != nil }
 
-    public init(url: URL, device: Device = .shared) throws {
+    public init(url: URL, device: Device = .shared, lazy: Bool = false) throws {
+        self.device = device
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw SafeTensorsError.fileNotFound(url)
         }
@@ -153,6 +177,7 @@ public final class SafeTensorsFile: @unchecked Sendable {
         // unmap in `deinit`. None of the MTLBuffer deallocators get to
         // call munmap directly (we'd unmap mid-execution).
         var parsed: [String: Entry] = [:]
+        var parsedLazy: [String: LazyEntry] = [:]
         for (name, value) in json {
             if name == "__metadata__" { continue }
             guard let dict = value as? [String: Any],
@@ -186,6 +211,17 @@ public final class SafeTensorsFile: @unchecked Sendable {
             }
             let absStart = dataStart + startNum.intValue
             let length = endNum.intValue - startNum.intValue
+
+            // LAZY: record metadata only, defer the buffer copy. The mmap
+            // is retained (see below) and `tensor(named:)` materializes
+            // each tensor on demand, so the full file is never resident.
+            if lazy {
+                parsedLazy[name] = LazyEntry(
+                    dtype: dtype, shape: shape,
+                    absStart: absStart, length: length)
+                continue
+            }
+
             let ptr = mapped.advanced(by: absStart)
             // Per-tensor MTLBuffer, offset 0. We copy from the mmap into
             // a freshly-allocated page-aligned shared buffer because
@@ -207,17 +243,27 @@ public final class SafeTensorsFile: @unchecked Sendable {
                 shape: shape, buffer: perTensorBuf)
         }
 
-        // All tensor bytes have been copied into MTLBuffers above; the
-        // mmap is no longer referenced by anything. Drop it now rather
-        // than holding it until `deinit` — for a 10 GB quantized
-        // checkpoint that's 10 GB of virtual address space freed
-        // immediately after load.
-        munmap(mapped, totalBytes)
-
         self.url = url
-        self.mappedBase = nil
-        self.mappedLength = 0
         self.entries = parsed
+        self.lazyEntries = parsedLazy
+        if lazy {
+            // Retain the mmap for on-demand materialization in
+            // `tensor(named:)`; freed in `deinit`. mmap'd pages are
+            // reclaimable by the OS, so this is virtual address space, not
+            // committed RAM — only the tensors actually materialized cost
+            // real memory.
+            self.mappedBase = mapped
+            self.mappedLength = totalBytes
+        } else {
+            // All tensor bytes have been copied into MTLBuffers above; the
+            // mmap is no longer referenced by anything. Drop it now rather
+            // than holding it until `deinit` — for a 10 GB quantized
+            // checkpoint that's 10 GB of virtual address space freed
+            // immediately after load.
+            munmap(mapped, totalBytes)
+            self.mappedBase = nil
+            self.mappedLength = 0
+        }
     }
 
     deinit {
@@ -230,11 +276,25 @@ public final class SafeTensorsFile: @unchecked Sendable {
         }
     }
 
-    /// Get a Tensor view over a named entry (no copy). Each tensor has
-    /// its own MTLBuffer at offset 0.
+    /// Get a Tensor view over a named entry. In the eager path each tensor
+    /// already has its own MTLBuffer at offset 0; in the lazy path the
+    /// tensor's bytes are copied out of the retained mmap into a fresh
+    /// buffer on demand (the caller owns + releases it).
     public func tensor(named: String) throws -> Tensor {
-        guard let e = entries[named] else { throw SafeTensorsError.missingTensor(named) }
-        return Tensor(buffer: e.buffer, offset: 0, shape: e.shape, dtype: e.dtype)
+        if let e = entries[named] {
+            return Tensor(buffer: e.buffer, offset: 0, shape: e.shape, dtype: e.dtype)
+        }
+        if let le = lazyEntries[named], let base = mappedBase {
+            let ptr = base.advanced(by: le.absStart)
+            guard
+                let buf = device.mtlDevice.makeBuffer(
+                    bytes: ptr, length: le.length, options: [.storageModeShared])
+            else {
+                throw SafeTensorsError.mtlBufferFailed
+            }
+            return Tensor(buffer: buf, offset: 0, shape: le.shape, dtype: le.dtype)
+        }
+        throw SafeTensorsError.missingTensor(named)
     }
 }
 
@@ -254,7 +314,10 @@ public final class SafeTensorsBundle: @unchecked Sendable {
     /// stores. `physicalKey(_:)` consults it.
     private let keyTranslation: [String: String]
 
-    public init(directory: URL, device: Device = .shared) throws {
+    /// `lazy: true` defers each tensor's MTLBuffer copy — the source mmap
+    /// is retained and `tensor(named:)` materializes on demand. Used by the
+    /// converter so a huge source model is never fully resident.
+    public init(directory: URL, device: Device = .shared, lazy: Bool = false) throws {
         self.directory = directory
         self.keyTranslation = [:]
 
@@ -318,8 +381,8 @@ public final class SafeTensorsBundle: @unchecked Sendable {
         var loaded: [SafeTensorsFile] = []
         var idx: [String: Int] = [:]
         for (i, url) in fileURLs.enumerated() {
-            let f = try SafeTensorsFile(url: url, device: device)
-            for name in f.entries.keys { idx[name] = i }
+            let f = try SafeTensorsFile(url: url, device: device, lazy: lazy)
+            for name in f.entryNames { idx[name] = i }
             loaded.append(f)
         }
         self.files = loaded
