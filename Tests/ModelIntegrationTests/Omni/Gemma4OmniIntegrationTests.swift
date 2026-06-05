@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Integration test for the Gemma 4 Omni encoder-free multimodal path:
-// image / audio / video → text on the real 4-bit checkpoint. Each modality
-// projects raw inputs (48×48 patches, 640-sample audio frames, per-frame
-// video) straight into the text backbone via the lightweight RMSNorm+Linear
-// embedders — no ViT / Conformer encoder.
+// Consolidated integration suite for the Gemma 4 Omni (`gemma4_unified`)
+// checkpoint: ONE @Suite that loads the model ONCE and exercises every
+// capability it supports — text, image, audio, video — with a per-modality
+// `@Test`. This is the canonical "omni" test shape: a single load shared
+// across all capability tests (see `loaded`), rather than one file +
+// reload per modality.
 //
-// Reuses the shared `gemma4OmniModelPath` / `gemma4OmniCacheAvailable`
-// resolver from `Gemma4OmniTextIntegrationTests`. Gated on the vision-suite
-// group (like the Gemma 4 VL suite) AND model availability.
+// The encoder-free omni path projects raw inputs (48×48 image patches,
+// 640-sample audio frames, per-frame video) straight into the Gemma4Dense
+// text backbone via lightweight RMSNorm+Linear embedders — no ViT /
+// Conformer encoder. Resolves the published `ekryski/gemma-4-12B-it-mlx-4bit`
+// conversion, preferring a local `ffai convert` output dir when present.
 
 import Foundation
 import TestHelpers
@@ -28,17 +31,41 @@ import Testing
 
 @testable import FFAI
 
-@Suite(
-    "Gemma4 Omni Multimodal Integration", .serialized,
-    .enabled(
-        if: IntegrationGroupGating.enableVisionSuites && gemma4OmniCacheAvailable,
-        "Gemma 4 Omni multimodal suite: needs the vision-suite group enabled and the omni 4-bit checkpoint cached.")
-)
-struct Gemma4OmniMultimodalIntegrationTests {
+/// Local `ffai convert` output, then the published HF repo.
+let gemma4OmniLocalDir =
+    ("~/.cache/ffai/converts/gemma-4-12B-it-mlx-4bit" as NSString)
+    .expandingTildeInPath
+let gemma4OmniHFCache =
+    ("~/.cache/huggingface/hub/models--ekryski--gemma-4-12B-it-mlx-4bit"
+        as NSString).expandingTildeInPath
 
-    // Image/audio/video placeholder ids + begin/end markers (omni config).
+/// Path to load: the local convert dir if present, else the HF repo id.
+let gemma4OmniModelPath: String =
+    FileManager.default.fileExists(atPath: gemma4OmniLocalDir)
+    ? gemma4OmniLocalDir : "ekryski/gemma-4-12B-it-mlx-4bit"
+
+/// True when the model is resolvable offline (local convert dir or HF cache).
+let gemma4OmniCacheAvailable: Bool =
+    FileManager.default.fileExists(atPath: gemma4OmniLocalDir)
+    || FileManager.default.fileExists(atPath: gemma4OmniHFCache)
+
+@Suite(
+    "Gemma4 Omni Integration", .serialized,
+    .enabled(
+        if: IntegrationGroupGating.enableOmniSuites && gemma4OmniCacheAvailable,
+        "Gemma 4 Omni suite: needs the omni-suite group enabled and the omni 4-bit checkpoint cached (or a local `ffai convert` output dir).")
+)
+struct Gemma4OmniIntegrationTests {
+
+    // Image/audio placeholder begin/end markers (omni config).
     static let boi = 255_999, eoi = 258_882
     static let boa = 256_000, eoa = 258_883
+
+    /// The omni checkpoint, loaded ONCE and shared across every `@Test`.
+    /// A lazily-started memoized `Task`: the first capability test that
+    /// awaits `.value` triggers the single load; the rest reuse it. A
+    /// skipped suite never accesses it, so no load happens when gated off.
+    static let loaded = Task { try await loadModel(gemma4OmniModelPath) }
 
     /// 0.5 s 440 Hz mono sine at 16 kHz — a non-degenerate signal for the
     /// raw-frame audio path (content doesn't matter; we gate on a positive
@@ -50,9 +77,42 @@ struct Gemma4OmniMultimodalIntegrationTests {
         }
     }
 
+    // MARK: - load + text
+
+    @Test("load — omni checkpoint loads as a VLM with full omni capabilities")
+    func load() async throws {
+        let m = try await Self.loaded.value
+        #expect(m.vlModel != nil)
+        #expect(m.availableCapabilities.contains(.imageIn))
+        #expect(m.availableCapabilities.contains(.audioIn))
+        #expect(m.availableCapabilities.contains(.videoIn))
+        #expect(m.engine.supportsEmbeddingInput)
+        // The omni text backbone is the 48-layer, 3840-hidden Gemma4Dense.
+        #expect(m.engine.hidden == 3840)
+        #expect(m.engine.nLayers == 48)
+    }
+
+    @Test("text — encoder-free backbone chat-generates coherently")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user,
+                    content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "gemma4-omni-text")
+    }
+
+    // MARK: - encode shapes
+
     @Test("encode shapes — image / audio / video project into the text hidden dim")
     func encodeShapes() async throws {
-        let m = try await loadModel(gemma4OmniModelPath)
+        let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "omni checkpoint is not a VLM")
         let hidden = m.engine.hidden
 
@@ -67,9 +127,11 @@ struct Gemma4OmniMultimodalIntegrationTests {
         #expect(vid.shape.count == 2 && vid.shape[0] > 0 && vid.shape[1] == hidden)
     }
 
+    // MARK: - image / audio / video → text
+
     @Test("image + text — describes the dog photo")
     func imageTextGeneration() async throws {
-        let m = try await loadModel(gemma4OmniModelPath)
+        let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "omni checkpoint is not a VLM")
 
         let image = try VisionTestHelpers.dogImage()
@@ -94,7 +156,7 @@ struct Gemma4OmniMultimodalIntegrationTests {
 
     @Test("audio + text — raw-frame audio path decodes coherently")
     func audioTextGeneration() async throws {
-        let m = try await loadModel(gemma4OmniModelPath)
+        let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "omni checkpoint is not a VLM")
         let audioTokenId = try #require(vlm.audioTokenId)
 
@@ -121,7 +183,7 @@ struct Gemma4OmniMultimodalIntegrationTests {
 
     @Test("video + text — identifies the cat video")
     func videoTextGeneration() async throws {
-        let m = try await loadModel(gemma4OmniModelPath)
+        let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "omni checkpoint is not a VLM")
         let videoTokenId = try #require(vlm.videoTokenId)
 
