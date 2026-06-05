@@ -99,7 +99,7 @@ extension Gemma4Variant {
         // Gemma 4: 4096-token prefill chunk is the audited family
         // optimum (pure-attention backbone, no SSM bottleneck).
         GenerationParameters(
-            maxTokens: 256, prefillStepSize: 4096,
+            prefillStepSize: 4096,
             temperature: 1.0, topP: 0.95, topK: 64,
             repetitionPenalty: 1.0)
     }

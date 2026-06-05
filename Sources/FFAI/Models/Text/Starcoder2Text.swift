@@ -56,7 +56,6 @@ public struct Starcoder2Dense: Starcoder2Variant {
     /// the rest of the dense Llama-family variants. Prefill step matches
     /// the Llama dense baseline.
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 1024,
         temperature: 0.6,
         topP: 1.0,

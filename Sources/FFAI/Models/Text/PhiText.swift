@@ -33,7 +33,6 @@ public struct Phi3Dense: PhiVariant {
     /// mirror Llama's family default so the user-facing surface is
     /// consistent across families.
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 1024,
         temperature: 0.6,
         topP: 1.0,

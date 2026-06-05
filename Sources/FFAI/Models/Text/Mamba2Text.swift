@@ -41,7 +41,6 @@ public struct Mamba2Dense: Mamba2Variant {
     /// 1.2 (base SSMs loop without a repetition penalty). Prefill step
     /// size is a non-op until chunked-prefill ships.
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 256,
         temperature: 0.7,
         topP: 0.9,

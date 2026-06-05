@@ -107,7 +107,6 @@ public final class LFM2ConvCache: LayerCacheProtocol, @unchecked Sendable {
 /// `loadLFM2` swaps in `lfm25DefaultGenerationParameters` for the LFM2.5
 /// collection (which recommends top-p instead of min-p).
 let lfm2DefaultGenerationParameters = GenerationParameters(
-    maxTokens: 256,
     prefillStepSize: 1024,
     temperature: 0.3,
     topP: 1.0,
@@ -122,7 +121,6 @@ let lfm2DefaultGenerationParameters = GenerationParameters(
 /// LFM2 greedy default. Integration tests still override `temperature: 0`
 /// for determinism.
 let lfm25DefaultGenerationParameters = GenerationParameters(
-    maxTokens: 256,
     prefillStepSize: 1024,
     temperature: 0.2,
     topP: 0.8,

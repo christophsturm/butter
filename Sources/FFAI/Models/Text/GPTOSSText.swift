@@ -73,7 +73,6 @@ public struct GPTOSSMoEVariant: GPTOSSVariant, ReasoningCapable {
     /// bottleneck). Reasoning defaults to `.none` (disabled until the
     /// caller explicitly opts in) per the FFAI convention.
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 2048,
         temperature: 1.0,
         topP: 1.0,

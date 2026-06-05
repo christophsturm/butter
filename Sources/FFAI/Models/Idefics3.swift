@@ -78,7 +78,6 @@ public enum Idefics3Error: Error, CustomStringConvertible {
 public struct Idefics3Dense: Idefics3Variant {
     public static let availableCapabilities: Set<Capability> = [.textIn, .textOut, .imageIn]
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 1024,
         temperature: 0.0,
         topP: 1.0,

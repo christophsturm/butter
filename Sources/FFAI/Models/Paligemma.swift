@@ -91,7 +91,6 @@ public struct PaligemmaStandard: PaligemmaVariant {
     /// Temperature 0 (greedy) matches the reference implementation's
     /// recommended inference mode for caption / answer tasks.
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 512,
         temperature: 0,
         topP: 1.0,

@@ -41,7 +41,6 @@ public struct NemotronDiffusionDense: NemotronDiffusionVariant {
     /// checkpoints. Greedy (temp 0) is the safe default for the
     /// tri-mode decode paths until GPU sampling filters land.
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 1024,
         temperature: 0.0,
         topP: 1.0,

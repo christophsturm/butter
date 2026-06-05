@@ -55,7 +55,6 @@ public struct JambaHybrid: JambaVariant {
     /// Jamba recommended sampling defaults (AI21 model card): temperature
     /// 0.4, top-p 0.95.
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 256,
         temperature: 0.4,
         topP: 0.95,

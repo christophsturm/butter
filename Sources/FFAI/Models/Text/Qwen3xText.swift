@@ -153,7 +153,6 @@ public struct Qwen35Hybrid: Qwen35Variant {
     /// (The card lists separate coding / non-thinking recipes; this is the
     /// general-purpose thinking default.)
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 1024,
         temperature: 1.0,
         topP: 0.95,

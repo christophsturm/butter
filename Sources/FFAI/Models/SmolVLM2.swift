@@ -88,7 +88,6 @@ public struct SmolVLM2Dense: SmolVLM2Variant {
         .textIn, .textOut, .imageIn, .videoIn,
     ]
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 1024,
         temperature: 0.0,
         topP: 1.0,

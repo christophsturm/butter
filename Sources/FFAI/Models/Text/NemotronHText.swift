@@ -128,7 +128,6 @@ public struct NemotronHHybrid: NemotronHVariant {
     /// card): temperature 0.6, top-p 0.95. (Non-reasoning instruct mode
     /// recommends greedy; we default to the reasoning-mode sampling.)
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 256,
         temperature: 0.6,
         topP: 0.95,

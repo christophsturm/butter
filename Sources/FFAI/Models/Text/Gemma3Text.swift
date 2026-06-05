@@ -79,7 +79,7 @@ import Metal
 public struct Gemma3Dense: Gemma3Variant {
     public static let availableCapabilities: Set<Capability> = [.textIn, .textOut]
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256, prefillStepSize: 1024,
+        prefillStepSize: 1024,
         temperature: 1.0, topP: 0.95, topK: 64,
         repetitionPenalty: 1.0
     )

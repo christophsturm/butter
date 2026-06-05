@@ -37,7 +37,6 @@ public struct Qwen3Dense: Qwen3Variant {
     /// attention. Qwen 3.5 hybrid / MoE will declare their own when
     /// those variants land in planned.
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 1024,
         temperature: 0.6,
         topP: 0.95,

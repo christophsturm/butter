@@ -37,7 +37,6 @@ public struct FalconH1Hybrid: FalconH1Variant {
     /// Falcon-H1 recommended defaults (TII deployment docs): temperature
     /// 0.1 (higher values degrade quality), top-p 0.95.
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 256,
         temperature: 0.1,
         topP: 0.95,

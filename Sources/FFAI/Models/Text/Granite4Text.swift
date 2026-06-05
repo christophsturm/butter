@@ -55,7 +55,6 @@ public struct Granite4Hybrid: Granite4Variant {
     /// Granite-4 recommended defaults (IBM): temperature 0.6, top-p 1.0,
     /// top-k 0, repetition-penalty 1.05.
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 256,
         temperature: 0.6,
         topP: 1.0,

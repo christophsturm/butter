@@ -36,7 +36,6 @@ public struct LlamaDense: LlamaVariant {
     /// mlx-swift-lm's per-family `defaultPrefillStepSize` (1024 for
     /// dense attention models).
     public static let defaultGenerationParameters = GenerationParameters(
-        maxTokens: 256,
         prefillStepSize: 1024,
         temperature: 0.6,
         topP: 1.0,
