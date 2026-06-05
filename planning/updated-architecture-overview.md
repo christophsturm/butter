@@ -441,3 +441,44 @@ Ranked by (impact × confidence) ÷ effort. Each is independently shippable.
 audio decoders being able to reach `LanguageModel.forwardSample` — do #1's wiring
 mindset first, then #2. #4 (test normalization) is independent and can run in
 parallel with everything.
+
+---
+
+## 13. Multi-modal support — status & remaining gaps (Q vs [`multi-modal-support.md`](multi-modal-support.md))
+
+Cross-checked the multi-modal spec against the code on `ek/fix-all-the-things`
+(2026-06-05). **Most of the big workstreams have landed since the spec was
+written** — streaming, the kernel backlog, MediaUtils, in-core media decode are
+done. The spec's §1 "does not work yet" list and §10 roadmap are **stale** in
+those areas. What's verified done vs what genuinely remains:
+
+### 13.1 Verified DONE (spec/roadmap now stale)
+
+| Spec item | Status | Evidence |
+|---|---|---|
+| **Streaming output across ALL modalities** (spec §7a, roadmap #9; Phase K) | ✅ DONE | `VisionModel.generateStream` + `generateMultimodalStream` (VisionModel.swift:527/544/564/738) stream text-out from image/video; `runSampled` (703) replaced greedy-only `runGreedy`. **11 `transcribeStream`** + **13 `synthesizeStream`** engine impls; unified `Model.generateStream(_:ModelInput)` covers text/STT/TTS/STS/VAD. The spec's "VLM streaming output — does NOT work" / "blocked on embedding-prefill entry point" and Phase K's "Streaming is text-only today" are both **outdated.** |
+| **VLM respects generation params** (roadmap #2) | ✅ DONE | `runGreedy`→`runSampled`; sampling (temp/top-p/top-k/min-p/rep-pen/seed) on the multimodal decode. |
+| **Kernel backlog K1–K7** (spec §12) | ✅ kernels exist | All 7 have Ops wrappers: `resizeNormalize` (K1/K2), `melSpectrogramMagnitude` (K3), `avgPool2dNHWC` (K4), `im2colPatch`/`patchUnfoldQwen` (K5), `posEmb2dAdd` (K6), `frameDiffLuma` (K7). The *kernels* are no longer a backlog — see 13.2 for the residual **wiring** gap. |
+| **Consolidated `MediaUtils`** (spec §4) | ✅ exists | `Media/MediaUtils.swift` is the GPU-first facade; geometry helpers (`smartResize`, `aspectPreservingSize`, video token math) live there. |
+| **In-core media decode** (spec §5, roadmap #7) | ✅ DONE | `VideoPreprocessing.decodeVideoFrames` (AVAssetImageGenerator, timestamps), image/audio decode in core — no longer test-only. |
+| **Registry consolidation** (session-plan I.2) | ✅ files done | `Loader/ModelRegistry.swift` + `ModelRegistryTable.swift` canonical; old `VADModelRegistry.swift` / `AudioModelRegistry.swift` removed. (CLI rename to `ffai model list` still pending — see 13.3.) |
+
+### 13.2 Genuinely REMAINING functional gaps (verified)
+
+| # | Gap | Verified state | Spec ref |
+|---|---|---|---|
+| **M1** | **`smart_resize` rollout incomplete** — only **3 towers** wired (`Qwen2Vision`, `Gemma4Vision`, `LFM2Vision` call `smartResize`). **Qwen2.5/3/3.5-VL, Pixtral, Mistral3, GLM-OCR still force fixed-square** → aspect distortion + token truncation (quality loss, not crash) | grep: `smartResize` only in those 3 vision files | §3, roadmap #4 (partial) |
+| **M2** | **Tile/slice splitting — NONE.** MiniCPM-V, Idefics3, SmolVLM2, LFM2-VL run single-tile (lose detail on large/non-square); FastVLM has no letterbox pad | grep: no `tileSplit`/`do_image_splitting` anywhere | §3, roadmap #5 |
+| **M3** | **No unified multimodal `ModelInput` case.** Image/video/omni reach inference only via `model.vlModel.generate(...)`; `ModelInput` (ModelIO.swift) covers text/transcribe/speak/transform/detect but **not vision/omni**. Each VLM caller hand-builds placeholder framing (see §8.1). Combined image+video+audio in one call (spec §8) also not surfaced — the 4 `VisionModel.generate` overloads each take one modality | VisionModel.swift:369/398/442/499 | §8, §2.2 |
+| **M4** | **GPU-preprocessing wiring incomplete** — kernels exist (13.1) but some models still CPU: Paligemma patch-embed (`concurrentPerform`, §4.2 C3), STT mel front-ends Parakeet/SenseVoice/Cohere (§4.2 C5), VisionEncoderLayer d32 `cpuAttention` (§4.2 C4) | §4.2 of this doc | §12, roadmap #8 (partial) |
+| **M5** | **Streaming audio INPUT — none.** Input is always a full `[Float]` waveform; no chunked/real-time ingest (sliding-window encoder + cached state) | — | §7b, roadmap #11 |
+| **M6** | **Live camera/mic capture — none.** No `AVCaptureSession`/`AVCaptureDevice` anywhere | grep: zero hits | §6, roadmap #11 |
+| **M7** | **Real-time video loop — none.** No KV-continuation + motion-gated frame loop; the `frameDiffLuma` (K7) kernel exists but is unwired into a streaming pipeline | — | §7c, roadmap #12 |
+| **M8** | **CLI raw-input `ffai model …` namespace** — per-modality subcommands + streaming-by-default exist (`SpeakCommand`/`TranscribeCommand`/`GenerateMediaCommands`), but the catalog is still `ffai models`/`ffai download`, not the `ffai model list/add/remove/search` namespace | CLI file list | §9, session-plan I.1/I.2/I.3–I.6 |
+
+**Net:** the streaming + kernel + decode foundations are done; the remaining
+multimodal work is **per-model processor fidelity** (M1 smart_resize rollout,
+M2 tiling — both quality, not crashes), **finishing the GPU-preprocess wiring**
+(M4), the **unified multimodal input surface** (M3), and the **real-time/live**
+features (M5–M7) which are net-new. M1 is the highest-impact correctness item
+(7 VLMs silently distort non-square images today).
