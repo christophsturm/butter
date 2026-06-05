@@ -120,7 +120,7 @@ struct GenerateImageCommand: AsyncParsableCommand {
         print("---")
         let stream = vlm.generateStream(
             promptTokens: promptTokens, image: image,
-            maxTokens: params.maxTokens, parameters: params,
+            maxTokens: params.maxTokens ?? max(0, m.engine.maxContextWindow - promptTokens.count - 1), parameters: params,
             eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
         let outcome = try await VLMStreamConsumer.consume(
             stream, tokenizer: m.tokenizer, streaming: common.streaming)
@@ -164,7 +164,7 @@ struct GenerateVideoCommand: AsyncParsableCommand {
             print("---")
             let stream = try vlm.generateStream(
                 promptTokens: promptTokens, videoFrames: frames,
-                maxTokens: params.maxTokens, parameters: params,
+                maxTokens: params.maxTokens ?? max(0, m.engine.maxContextWindow - promptTokens.count - 1), parameters: params,
                 eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
             let outcome = try await VLMStreamConsumer.consume(
                 stream, tokenizer: m.tokenizer, streaming: common.streaming)
@@ -207,7 +207,7 @@ struct GenerateAudioCommand: AsyncParsableCommand {
         print("---")
         let stream = try vlm.generateStream(
             promptTokens: promptTokens, audio: waveform,
-            maxTokens: params.maxTokens, parameters: params,
+            maxTokens: params.maxTokens ?? max(0, m.engine.maxContextWindow - promptTokens.count - 1), parameters: params,
             eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
         let outcome = try await VLMStreamConsumer.consume(
             stream, tokenizer: m.tokenizer, streaming: common.streaming)

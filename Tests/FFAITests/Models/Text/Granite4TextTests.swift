@@ -43,7 +43,7 @@ struct Granite4TextVariantTests {
     @Test("Granite4Hybrid default generation parameters match the IBM card")
     func defaultGenerationParameters() {
         let p = Granite4Hybrid.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.6)
         #expect(p.topP == 1.0)
         #expect(p.topK == 0)

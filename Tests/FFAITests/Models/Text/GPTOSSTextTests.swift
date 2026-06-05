@@ -67,7 +67,7 @@ struct GPTOSSTextVariantTests {
     @Test("default generation parameters match the OpenAI card (temp 1.0, reasoning medium)")
     func defaultGenerationParameters() {
         let p = GPTOSSMoEVariant.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 1.0)
         #expect(p.topP == 1.0)
         #expect(p.topK == 0)

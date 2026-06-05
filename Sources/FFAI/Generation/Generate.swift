@@ -245,7 +245,13 @@ extension Model {
         // capacity up to this ceiling. Without this, a 256K-context
         // model (e.g. Qwen3.6-27B) would otherwise pre-allocate ~17 GB
         // of KV before generating a token.
-        let generationBudget = promptTokens.count + params.maxTokens + 1
+        // `params.maxTokens == nil` means "no cap" — generate until EOS or
+        // the context window fills. Resolve it to the concrete number of
+        // tokens we can still emit given the prompt + the model's context
+        // ceiling, so the KV-cache budget + the decode loop have a bound.
+        let contextRoom = max(0, engine.maxContextWindow - promptTokens.count - 1)
+        let effectiveMaxTokens = params.maxTokens.map { min($0, contextRoom) } ?? contextRoom
+        let generationBudget = promptTokens.count + effectiveMaxTokens + 1
         let caches = try makeManagedCaches(generationBudget: generationBudget)
         // Gemma 3+, several Qwen variants, and a few llama-tuned models
         // publish `eos_token_id` as a *list* (model EOS plus end-of-turn
@@ -305,7 +311,7 @@ extension Model {
 
         Debug.log(
             .generate,
-            "begin prefill: \(promptTokens.count) tokens, maxTokens=\(params.maxTokens), path=\(path.rawValue)"
+            "begin prefill: \(promptTokens.count) tokens, maxTokens=\(params.maxTokens.map(String.init) ?? "uncapped")(effective \(effectiveMaxTokens)), path=\(path.rawValue)"
         )
 
         // ─── Prefill ─────────────────────────────────────────────────
@@ -396,7 +402,7 @@ extension Model {
         var perTokenWallclock: [Double] = []
         var lastStep = decodeStart
         var pos = promptTokens.count
-        for _ in 0 ..< params.maxTokens {
+        for _ in 0 ..< effectiveMaxTokens {
             try Task.checkCancellation()
             if stopSet.contains(nextToken) { break }
             generated.append(nextToken)

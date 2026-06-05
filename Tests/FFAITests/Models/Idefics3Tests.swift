@@ -47,7 +47,7 @@ struct Idefics3RootTests {
     @Test("Idefics3Dense default generation parameters match the model card")
     func defaultGenerationParameters() {
         let p = Idefics3Dense.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.0)
         #expect(p.topP == 1.0)
         #expect(p.topK == 0)

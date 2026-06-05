@@ -31,9 +31,13 @@ import Foundation
 public struct GenerationParameters: Sendable, Equatable {
     // ─── Length / stopping ───────────────────────────────────────────
 
-    /// Hard cap on generated tokens. The decode loop also stops at EOS
-    /// when `stopOnEOS` is true.
-    public var maxTokens: Int
+    /// Hard cap on generated tokens. **`nil` (the default) means NO cap** —
+    /// the model generates until it emits EOS (or runs out of context
+    /// window). There is deliberately no numeric default: a family's
+    /// `defaultGenerationParameters` must never silently cap output (or
+    /// thinking) length. Set it explicitly to bound a call — the CLI's
+    /// `--max-tokens`, or an integration test that wants a cheap run.
+    public var maxTokens: Int?
 
     /// Stop at the model's `eosTokenId` when set.
     public var stopOnEOS: Bool
@@ -94,7 +98,7 @@ public struct GenerationParameters: Sendable, Equatable {
     public var reasoningLevel: ReasoningLevel?
 
     public init(
-        maxTokens: Int = 256,
+        maxTokens: Int? = nil,
         stopOnEOS: Bool = true,
         extraStopTokens: Set<Int> = [],
         prefillStepSize: Int? = nil,

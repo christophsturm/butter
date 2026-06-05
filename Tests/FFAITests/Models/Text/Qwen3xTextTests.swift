@@ -43,7 +43,7 @@ struct Qwen35HybridTests {
     @Test("Qwen35Hybrid default generation parameters match the Qwen card")
     func defaultGenerationParameters() {
         let p = Qwen35Hybrid.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 1.0)
         #expect(p.topP == 0.95)
         #expect(p.topK == 20)

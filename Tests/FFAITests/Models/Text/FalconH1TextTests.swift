@@ -40,7 +40,7 @@ struct FalconH1TextTests {
     @Test("FalconH1Hybrid default generation parameters match the TII card")
     func defaultGenerationParameters() {
         let p = FalconH1Hybrid.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.1)
         #expect(p.topP == 0.95)
         #expect(p.topK == 0)

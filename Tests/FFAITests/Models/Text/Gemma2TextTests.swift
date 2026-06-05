@@ -39,7 +39,7 @@ struct Gemma2TextTests {
     func defaultGenerationParameters() {
         // Gemma defaults: temperature 1.0, top-p 0.95, top-k 64.
         let p = Gemma2Dense.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 1.0)
         #expect(p.topP == 0.95)
         #expect(p.topK == 64)

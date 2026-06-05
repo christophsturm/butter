@@ -40,7 +40,7 @@ struct Mamba2TextTests {
     @Test("Mamba2Dense default generation parameters match the upstream example")
     func defaultGenerationParameters() {
         let p = Mamba2Dense.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.7)
         #expect(p.topP == 0.9)
         #expect(p.topK == 0)

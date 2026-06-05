@@ -41,7 +41,7 @@ struct Starcoder2RootTests {
     @Test("Starcoder2Dense default generation parameters match the Starcoder2 card")
     func defaultGenerationParameters() {
         let p = Starcoder2Dense.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.6)
         #expect(p.topP == 1.0)
         #expect(p.topK == 0)

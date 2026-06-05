@@ -45,7 +45,7 @@ struct NemotronDiffusionTextTests {
     @Test("NemotronDiffusionDense default generation parameters are greedy")
     func defaultGenerationParameters() {
         let p = NemotronDiffusionDense.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.0)
         #expect(p.topP == 1.0)
         #expect((p.prefillStepSize ?? 0) >= 256)

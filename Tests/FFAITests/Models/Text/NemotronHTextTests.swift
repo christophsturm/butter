@@ -34,7 +34,7 @@ struct NemotronHTextTests {
     @Test("NemotronHHybrid default generation parameters match the NVIDIA card")
     func defaultGenerationParameters() {
         let p = NemotronHHybrid.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.6)
         #expect(p.topP == 0.95)
         #expect(p.topK == 0)

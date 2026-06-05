@@ -40,7 +40,7 @@ struct Qwen3TextTests {
         // Per the file header: temp 0.6, top-p 0.95, top-k 20,
         // min-p 0.0, rep-penalty 1.0, prefill chunk 1024.
         let p = Qwen3Dense.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.6)
         #expect(p.topP == 0.95)
         #expect(p.topK == 20)

@@ -41,7 +41,7 @@ struct JambaTextVariantTests {
     @Test("JambaHybrid default generation parameters match the AI21 card")
     func defaultGenerationParameters() {
         let p = JambaHybrid.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.4)
         #expect(p.topP == 0.95)
         #expect(p.topK == 0)

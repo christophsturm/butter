@@ -43,7 +43,7 @@ struct LFM2LayerScheduleTests {
         // LFM2.5 collection swaps to lfm25DefaultGenerationParameters
         // (temp 0.2 / top-p 0.8) at load time, which must differ.
         let p = LFM2Dense.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.3)
         #expect(p.topP == 1.0)
         #expect(p.topK == 0)

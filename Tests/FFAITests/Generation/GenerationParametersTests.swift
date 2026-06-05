@@ -26,7 +26,7 @@ struct GenerationParametersTests {
     @Test("Init defaults match the documented baseline")
     func initDefaults() {
         let p = GenerationParameters()
-        #expect(p.maxTokens == 256)
+        #expect(p.maxTokens == nil)
         #expect(p.stopOnEOS == true)
         #expect(p.extraStopTokens.isEmpty)
         // prefillStepSize is now Int? — nil means "use the engine's
@@ -90,7 +90,7 @@ struct GenerationParametersTests {
         #expect(llama.topK == 0)
         #expect(llama.repetitionPenalty == 1.0)
         #expect(llama.prefillStepSize == 1024)
-        #expect(llama.maxTokens == 256)
+        #expect(llama.maxTokens == nil)
 
         // Qwen 3 dense
         let qwen = Qwen3Dense.defaultGenerationParameters
@@ -100,7 +100,7 @@ struct GenerationParametersTests {
         #expect(qwen.minP == 0.0)
         #expect(qwen.repetitionPenalty == 1.0)
         #expect(qwen.prefillStepSize == 1024)
-        #expect(qwen.maxTokens == 256)
+        #expect(qwen.maxTokens == nil)
 
         // Family defaults must differ.
         #expect(llama != qwen)

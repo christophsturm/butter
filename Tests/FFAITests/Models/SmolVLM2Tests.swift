@@ -48,7 +48,7 @@ struct SmolVLM2RootTests {
     @Test("SmolVLM2Dense default generation parameters match the model card")
     func defaultGenerationParameters() {
         let p = SmolVLM2Dense.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.0)
         #expect(p.topP == 1.0)
         #expect(p.topK == 0)

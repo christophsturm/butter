@@ -52,7 +52,7 @@ struct Gemma4TextTests {
         let moe = Gemma4MoE.defaultGenerationParameters
         // Gemma defaults: temperature 1.0, top-p 0.95, top-k 64.
         for p in [dense, e, moe] {
-            #expect(p.maxTokens > 0)
+            #expect(p.maxTokens == nil)
             #expect(p.temperature == 1.0)
             #expect(p.topP == 0.95)
             #expect(p.topK == 64)

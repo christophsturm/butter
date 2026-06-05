@@ -85,7 +85,7 @@ struct Gemma4RootTests {
         // The default ships at the root via the protocol extension — pick
         // an arbitrary concrete variant; they all inherit the same value.
         let gp = Gemma4Dense.defaultGenerationParameters
-        #expect(gp.maxTokens > 0)
+        #expect(gp.maxTokens == nil)
         #expect(gp.temperature >= 0)
         #expect(gp.prefillStepSize == 4096)  // documented family optimum
     }

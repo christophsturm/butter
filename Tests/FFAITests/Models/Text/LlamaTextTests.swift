@@ -41,7 +41,7 @@ struct LlamaTextTests {
     @Test("LlamaDense default generation parameters match the Llama card")
     func defaultGenerationParameters() {
         let p = LlamaDense.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.6)
         #expect(p.topP == 1.0)
         #expect(p.topK == 0)

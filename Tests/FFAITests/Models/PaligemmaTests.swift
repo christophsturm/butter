@@ -49,7 +49,7 @@ struct PaligemmaRootTests {
     @Test("PaligemmaStandard.defaultGenerationParameters are greedy by default")
     func defaultGenParams() {
         let gp = PaligemmaStandard.defaultGenerationParameters
-        #expect(gp.maxTokens > 0)
+        #expect(gp.maxTokens == nil)
         // The reference recommends greedy for VQA/caption tasks.
         #expect(gp.temperature == 0)
         #expect(gp.topP == 1.0)

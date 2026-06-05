@@ -32,7 +32,7 @@ struct InternLM2RootTests {
     func defaultGenerationParameters() {
         // InternLM2Dense reuses LlamaDense.defaultGenerationParameters.
         let p = InternLM2Dense.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.6)
         #expect(p.topP == 1.0)
         #expect(p.topK == 0)

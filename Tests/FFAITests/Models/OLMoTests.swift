@@ -30,7 +30,7 @@ struct OLMoRootTests {
     func defaultGenerationParameters() {
         // OLMo2Dense reuses LlamaDense.defaultGenerationParameters.
         let p = OLMo2Dense.defaultGenerationParameters
-        #expect(p.maxTokens > 0)
+        #expect(p.maxTokens == nil)
         #expect(p.temperature == 0.6)
         #expect(p.topP == 1.0)
         #expect(p.topK == 0)
