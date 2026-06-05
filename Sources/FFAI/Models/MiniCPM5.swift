@@ -18,11 +18,19 @@
 // from a generic Llama at the architecture level. The loader therefore
 // routes here by a `_name_or_path` heuristic (see `handles`).
 //
-// This is intentionally a thin facade over the Llama stack today: it
-// delegates text loading to `MiniCPM5Text`. The named entrypoint exists so
-// that when multimodal v5 checkpoints arrive (OpenBMB ships omni variants
-// of each generation), they compose vision / audio components here the same
-// way `MiniCPM4` does — without re-plumbing the dispatch.
+// This file is the **main model interface** for the family (the same shape
+// as `Qwen2.swift` / `Qwen3.swift`):
+//   • the family enum `MiniCPM5` (variant dispatch + the `_name_or_path`
+//     `handles` heuristic + load),
+//   • the `MiniCPM5Variant` protocol every concrete TEXT variant conforms
+//     to (the `MiniCPM5Model` engine alias lives here too).
+//
+// It is intentionally a thin facade over the Llama stack today: the single
+// `MiniCPM5Dense` variant (in `Models/Text/MiniCPM5Text.swift`) delegates
+// text loading to `Llama3Dense`. The named entrypoint exists so that when
+// multimodal v5 checkpoints arrive (OpenBMB ships omni variants of each
+// generation), they compose vision / audio components here the same way
+// `MiniCPM4` does — without re-plumbing the dispatch.
 
 import Foundation
 
@@ -61,4 +69,22 @@ public enum MiniCPM5 {
             defaultGenerationParameters: variant.defaultGenerationParameters,
             availableCapabilities: variant.availableCapabilities)
     }
+}
+
+// ─── Variant protocol ────────────────────────────────────────────────
+
+/// MiniCPM5's text engine is the shared `Llama3Model` (Llama-3-shaped).
+public typealias MiniCPM5Model = Llama3Model
+
+/// Every concrete MiniCPM5 TEXT variant declares the capabilities it
+/// exposes and the generation defaults it recommends, and loads its text
+/// stack. Mirrors `Qwen2Variant` / `Qwen3Variant`. The concrete
+/// `MiniCPM5Dense` variant lives in `Models/Text/MiniCPM5Text.swift`.
+public protocol MiniCPM5Variant {
+    static var availableCapabilities: Set<Capability> { get }
+    static var defaultGenerationParameters: GenerationParameters { get }
+    static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> MiniCPM5Model
 }

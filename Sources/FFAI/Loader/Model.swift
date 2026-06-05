@@ -439,14 +439,14 @@ public enum ModelRegistry {
             // generation defaults (Qwen3.5 for 4.6, Qwen3 dense for 4.5 / o)
             // are resolved per variant inside `MiniCPM4`.
             if MiniCPM4.handles(config) {
-                let vlm = try MiniCPM4.load(
+                let variant = try MiniCPM4.variant(for: config)
+                let vlm = try variant.load(
                     config: config, weights: weights,
                     options: options, device: device)
                 return Loaded(
                     engine: vlm.engine,
-                    defaultGenerationParameters:
-                        MiniCPM4.defaultGenerationParameters(for: config),
-                    availableCapabilities: MiniCPM4.capabilities(for: vlm),
+                    defaultGenerationParameters: variant.defaultGenerationParameters,
+                    availableCapabilities: variant.capabilities(for: vlm),
                     vlModel: vlm)
             }
             // Nemotron-VLM — NVIDIA's Nemotron Nano VL: a ViT tower +

@@ -20,19 +20,11 @@
 
 import Foundation
 
-// ─── Variant protocol ────────────────────────────────────────────────
-
-/// MiniCPM5's text engine is the shared `Llama3Model` (Llama-3-shaped).
-public typealias MiniCPM5Model = Llama3Model
-
-public protocol MiniCPM5Variant {
-    static var availableCapabilities: Set<Capability> { get }
-    static var defaultGenerationParameters: GenerationParameters { get }
-    static func loadModel(
-        config: ModelConfig, weights: SafeTensorsBundle,
-        options: LoadOptions, device: Device
-    ) throws -> MiniCPM5Model
-}
+// ─── Text variant ────────────────────────────────────────────────────
+//
+// The `MiniCPM5Variant` protocol + the `MiniCPM5Model` engine alias live in
+// the family root (`Models/MiniCPM5.swift`); this file holds the single
+// concrete variant.
 
 /// The single MiniCPM5 text variant — the Llama dense backbone.
 /// MiniCPM5-1B is a standard GQA Llama shape, so it reuses `Llama3Dense`.
