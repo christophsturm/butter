@@ -882,7 +882,7 @@ public final class GPTOSSModel: LanguageModel {
 // Everything below was previously in Models/Text/GPTOSSMoEText.swift.
 // It is kept here so the GPT-OSS family lives in a single text file
 // (matching every other family-with-MoE), since the MoE block diverges
-// enough from the reusable Models/MoELayer.swift (MXFP4-sourced
+// enough from the reusable ModelLayers/MoELayer.swift (MXFP4-sourced
 // experts, biased router, clipped α-swish + (up+1) activation,
 // per-projection biases) that sharing the common implementation
 // would only bloat MoELayer.swift's surface.

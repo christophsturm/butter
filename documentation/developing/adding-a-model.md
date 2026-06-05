@@ -31,7 +31,7 @@ Models/
 
 The `Vision` / `Text` / `<Sub>` suffix on per-modality files is a SwiftPM constraint: object files are named by basename only, so `Text/<F>.swift` and `Vision/<F>.swift` would collide on `.o` output.
 
-For shared building blocks: cross-family helpers (e.g. the GEMM K-tile padding, patch-embed reshape) live in [`Vision/VisionTowerOps.swift`](../../Sources/FFAI/Models/Vision/VisionTowerOps.swift) as module-internal top-level functions. MoE routing + per-expert dispatch live in [`MoELayer.swift`](../../Sources/FFAI/Models/MoELayer.swift) so optimisations (expert co-location, SSD streaming) land in one place.
+For shared building blocks: cross-family helpers (e.g. the GEMM K-tile padding, patch-embed reshape) live in [`Vision/VisionTowerOps.swift`](../../Sources/FFAI/Models/Vision/VisionTowerOps.swift) as module-internal top-level functions. MoE routing + per-expert dispatch live in [`MoELayer.swift`](../../Sources/FFAI/ModelLayers/MoELayer.swift) so optimisations (expert co-location, SSD streaming) land in one place.
 
 ## Decide if it's a new family or a new variant
 

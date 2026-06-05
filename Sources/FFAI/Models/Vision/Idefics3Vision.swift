@@ -834,7 +834,8 @@ public final class Idefics3Connector: Module {
 }
 
 // ─── Remapped-bundle load helpers ────────────────────────────────────────────
-// Mirrors loadLinear / loadEmbedding from Layers.swift but accepts the
+// Mirrors loadLinear / loadEmbedding from ModelLayers/Linear.swift +
+// ModelLayers/Embedding.swift but accepts the
 // Idefics3RemappedBundle wrapper instead of SafeTensorsBundle directly.
 
 func loadIdefics3Linear(

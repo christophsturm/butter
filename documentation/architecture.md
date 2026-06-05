@@ -139,7 +139,8 @@ Sources/
     BufferPool.swift        Per-token activation slab allocator
     DType.swift             Supported tensor dtypes
     Module.swift            Parameter discovery protocol
-    Layers.swift            Linear / Embedding / RMSNorm / etc.
+    ModelLayers/            Linear / Embedding / RMSNorm / LayerNorm /
+                            MoELayer / DecoderLayer
     Capability.swift        .textIn / .imageIn / .videoIn / .audioIn / .textOut / .audioOut
     LanguageModel.swift     Protocol implemented by text-family models
     VisionModel.swift       Protocol implemented by VL orchestrators

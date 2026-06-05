@@ -693,7 +693,7 @@ public enum ModelRegistry {
                 options: options, device: device)
         }
         // Qwen 2 / 2.5 — Llama-shaped arch with QKV biases. The
-        // bias-aware Linear in Layers.swift handles the layout
+        // bias-aware Linear in ModelLayers/Linear.swift handles the layout
         // transparently; the `Qwen2` family root dispatches its text
         // variant (`Qwen2Dense`, over the Llama dense engine).
         if let arch = config.architecture, Qwen2.architectures.contains(arch) {

@@ -86,7 +86,7 @@
 //
 // The "E" layer kind ships with the Nemotron-Cascade-2-30B-A3B,
 // Nemotron-3 Nano/Super/Ultra (all 30B-A3B+) checkpoints. The MoE
-// block diverges enough from `Models/MoELayer.swift` (squared-ReLU
+// block diverges enough from `ModelLayers/MoELayer.swift` (squared-ReLU
 // experts with NO gate projection, sigmoid+bias router, raw-sigmoid
 // post-K renormalisation + routed_scaling, always-on dense shared
 // expert) that it lives next to the rest of the variants in this file

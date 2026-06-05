@@ -16,7 +16,7 @@
 // the `Qwen2` root dispatches to). Qwen 2.x ships the 3-series Llama-style
 // architecture with one structural difference: the QKV projections carry
 // per-output biases, while o_proj does not (the 3-series uses no biases
-// anywhere). `loadLinear` in `Sources/FFAI/Layers.swift` detects
+// anywhere). `loadLinear` in `Sources/FFAI/ModelLayers/Linear.swift` detects
 // `<base>.bias` automatically, so Qwen 2.x routes through the same
 // `Llama3Dense` engine as the 3-series + Mistral7B with no extra plumbing.
 //

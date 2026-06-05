@@ -741,7 +741,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
         }
     }
 
-    // `sliceStackedExperts(...)` lives in `Sources/FFAI/Layers.swift`
+    // `sliceStackedExperts(...)` lives in `Sources/FFAI/ModelLayers/Linear.swift`
     // as a top-level helper so every stacked-MoE family (Qwen3.5 /
     // 3.6, Jamba, LFM2, Granite4) can reuse it.
 }
