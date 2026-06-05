@@ -536,145 +536,6 @@ extension ModelRegistry {
             load: { c, w, o, d in try ModelRegistry.loadNemotronDiffusion(config: c, weights: w, options: o, device: d) }),
     ]
 
-    // ─── Audio / VAD tier (catalog-only for now) ─────────────────────
-    //
-    // These list in `ffai models` but load through `AudioModelRegistry` /
-    // `VADModelRegistry` until the unified-engine phase wires their `load`
-    // closures here. `load` is therefore nil; they're never consulted by
-    // `dispatchAndLoad`.
-
-    static let audioEntries: [ModelEntry] = [
-        // ── Speech-to-text ──
-        ModelEntry(
-            family: "Whisper STT", kind: .stt,
-            summary: "OpenAI Whisper — encoder + cross-attending text decoder.",
-            repos: [
-                "openai/whisper-tiny", "mlx-community/whisper-tiny-mlx",
-                "mlx-community/whisper-base-mlx", "mlx-community/whisper-small-mlx",
-                "mlx-community/whisper-medium-mlx", "mlx-community/whisper-large-v3-mlx",
-                "mlx-community/whisper-large-v3-turbo-4bit",
-            ]),
-        ModelEntry(
-            family: "SenseVoice", kind: .stt,
-            summary: "Alibaba SenseVoice — SAN-M encoder + CTC head (non-AR STT).",
-            repos: ["mlx-community/SenseVoiceSmall"]),
-        ModelEntry(
-            family: "Parakeet", kind: .stt,
-            summary: "NVIDIA Parakeet — FastConformer encoder + TDT/CTC decoder."),
-        ModelEntry(
-            family: "Qwen3-ASR", kind: .stt,
-            summary: "Qwen3-ASR — Qwen 3 backbone + audio encoder front-end.",
-            repos: [
-                "mlx-community/Qwen3-ASR-0.6B-4bit", "mlx-community/Qwen3-ASR-1.7B-4bit",
-            ]),
-        ModelEntry(
-            family: "FireRedASR2", kind: .stt,
-            summary: "FireRedTeam FireRedASR2-AED — conformer encoder + Llama decoder.",
-            repos: ["mlx-community/FireRedASR2-AED-mlx"]),
-        ModelEntry(
-            family: "Voxtral", kind: .stt,
-            summary: "Mistral Voxtral — realtime STT / TTS (streaming).",
-            repos: [
-                "mlx-community/Voxtral-Mini-3B-2507-bf16",
-                "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit",
-            ]),
-        ModelEntry(
-            family: "GLM-ASR", kind: .stt,
-            summary: "Zhipu GLM-ASR — conformer encoder + GLM text decoder."),
-        ModelEntry(
-            family: "Granite Speech", kind: .stt,
-            summary: "IBM Granite Speech — conformer encoder + QFormer projector + Granite LLM."),
-        ModelEntry(
-            family: "Cohere Transcribe", kind: .stt,
-            summary: "Cohere transcription model — audio encoder + Command text decoder."),
-
-        // ── Text-to-speech ──
-        ModelEntry(
-            family: "Kokoro TTS", kind: .tts,
-            summary: "Kokoro 82M — StyleTTS2 acoustic + iSTFTNet GPU vocoder tail.",
-            repos: ["mlx-community/Kokoro-82M-bf16", "hexgrad/Kokoro-82M"]),
-        ModelEntry(
-            family: "Orpheus (LlamaTTS)", kind: .tts,
-            summary: "Orpheus-style TTS — Llama 3 acoustic backbone + SNAC code decode loop.",
-            repos: ["mlx-community/orpheus-3b-0.1-ft-4bit"]),
-        ModelEntry(
-            family: "Marvis (CSM)", kind: .tts,
-            summary: "Sesame CSM-shaped dual-transformer TTS — Mimi-code frame generator.",
-            repos: ["Marvis-AI/marvis-tts-250m-v0.2-MLX-4bit", "sesame/csm-1b"]),
-        ModelEntry(
-            family: "Qwen3-TTS", kind: .tts,
-            summary: "Qwen3-TTS — talker + code predictor + ECAPA speaker + intrinsic codec.",
-            repos: ["mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit"]),
-        ModelEntry(
-            family: "Echo TTS", kind: .tts,
-            summary: "Echo TTS — compact neural-codec speech synthesizer."),
-        ModelEntry(
-            family: "Chatterbox TTS", kind: .tts,
-            summary: "Resemble AI Chatterbox — Llama-shaped TTS backbone + S3 tokenizer.",
-            repos: ["mlx-community/Chatterbox-TTS-4bit", "mlx-community/Chatterbox-Turbo-TTS-4bit"]),
-        ModelEntry(
-            family: "Moss TTS", kind: .tts,
-            summary: "Moss TTS — autoregressive neural-codec speech synthesizer."),
-        ModelEntry(
-            family: "Moss TTS Nano", kind: .tts,
-            summary: "Moss TTS Nano — compact on-device variant."),
-        ModelEntry(
-            family: "Pocket TTS", kind: .tts,
-            summary: "Pocket TTS — compact StyleTTS2-style on-device synth.",
-            repos: ["mlx-community/pocket-tts-4bit"]),
-        ModelEntry(
-            family: "Soprano TTS", kind: .tts,
-            summary: "Soprano 80M — compact StyleTTS2-flavored on-device synth.",
-            repos: ["mlx-community/Soprano-80M-bf16", "ekryski/Soprano-1.1-80M-4bit"]),
-        ModelEntry(
-            family: "StyleTTS2", kind: .tts,
-            summary: "StyleTTS2 — style-diffusion acoustic model + iSTFTNet vocoder."),
-        ModelEntry(
-            family: "FishSpeech", kind: .tts,
-            summary: "FishAudio FishSpeech — GQA dual-autoregressive neural-codec TTS."),
-
-        // ── Omni (audio path) ──
-        ModelEntry(
-            family: "Qwen-Omni", kind: .omni,
-            summary: "Whisper-style audio encoder + Qwen text backbone (omni-modal).",
-            repos: [
-                "Qwen/Qwen2.5-Omni-7B",
-                "mlx-community/Qwen3-Omni-30B-A3B-Instruct-4bit",
-            ]),
-        ModelEntry(
-            family: "LFM Audio", kind: .omni,
-            summary: "LiquidAI LFM Audio — omni-modal audio-in path."),
-
-        // ── Speech-to-speech (enhancement / separation / segmentation) ──
-        ModelEntry(
-            family: "DeepFilterNet", kind: .sts,
-            summary: "DeepFilterNet — real-time speech enhancement / denoise."),
-        ModelEntry(
-            family: "MossFormer2-SE", kind: .sts,
-            summary: "MossFormer2 — speech enhancement / source separation."),
-        ModelEntry(
-            family: "SAM Audio", kind: .sts,
-            summary: "SAM Audio — promptable audio segmentation."),
-
-        // ── Voice activity / diarization ──
-        ModelEntry(
-            family: "Silero VAD", kind: .vad,
-            summary: "Streaming VAD — STFT + small gated-conv encoder.",
-            repos: ["snakers4/silero-vad"]),
-        ModelEntry(
-            family: "SmartTurn VAD", kind: .vad,
-            summary: "Conversational endpoint / turn detection (Pipecat).",
-            repos: ["pipecat-ai/smart-turn-v3"]),
-        ModelEntry(
-            family: "Sortformer", kind: .vad,
-            summary: "NVIDIA Sortformer — multi-speaker diarization."),
-        ModelEntry(
-            family: "TenVAD", kind: .vad,
-            summary: "TEN-framework lightweight VAD (native macOS framework)."),
-        ModelEntry(
-            family: "FireRedVAD", kind: .vad,
-            summary: "FireRedTeam DFSMN-based VAD."),
-    ]
 
     /// Every registered family — the VL + text loadable entries plus the
     /// catalog-only audio / VAD rows. The single source of truth behind the
@@ -695,14 +556,35 @@ extension ModelRegistry {
         }
     }
 
-    /// The entry that WOULD load `config` — VL tier when the config is a
-    /// vision-language checkpoint, else the text tier. `nil` means: a VL
-    /// config with no specific handler (→ `visionModelNotIntegrated`), or a
-    /// non-VL config no family claims (→ `unsupportedArchitecture`).
-    /// Exposed for routing tests (no weights needed).
+    /// The entry that WOULD load `config`, across every tier — the single
+    /// routing predicate the unified `Model.load` and the routing tests use.
+    /// `nil` means no family claims it.
+    ///
+    /// Precedence (preserves the pre-unification behavior + folds in audio):
+    ///   1. A **VL** checkpoint (`isVisionLanguage`) routes to the VL tier;
+    ///      Gemma 4's VL/omni conversions carry a top-level `audio_config`,
+    ///      so the VL tier MUST win over the audio structural sniffs for
+    ///      them — hence the VL gate is checked first.
+    ///   2. A VL checkpoint with no VL handler may still be an omni-audio
+    ///      model (Qwen-Omni configs carry a `vision_config` but load through
+    ///      the audio path) — try the audio tier before giving up.
+    ///   3. A non-VL checkpoint: the audio tier's specific structural sniffs
+    ///      (`audio_config` / `talker_config` / name markers) win over the
+    ///      generic text architecture match (e.g. an Orpheus checkpoint is a
+    ///      `LlamaForCausalLM` but a TTS model), then the text tier.
+    ///
+    /// A non-nil result whose `loadFromDirectory` is set is an audio / VAD
+    /// family; otherwise it's a text/VL family with a `load` closure.
     public static func entry(for config: ModelConfig) -> ModelEntry? {
         if VisionLanguageArchitectures.isVisionLanguage(config) {
-            return visionEntries.first { $0.matches(config) }
+            if let vl = visionEntries.first(where: { $0.matches(config) }) {
+                return vl
+            }
+            // VL config, no VL handler → maybe an omni-audio family.
+            return audioEntries.first { $0.matches(config) }
+        }
+        if let audio = audioEntries.first(where: { $0.matches(config) }) {
+            return audio
         }
         return textEntries.first { $0.matches(config) }
     }

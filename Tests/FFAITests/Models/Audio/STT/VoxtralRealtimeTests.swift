@@ -25,7 +25,7 @@ struct VoxtralRealtimeTests {
 
     // ─── Registry detection ──────────────────────────────────────────
 
-    @Test("AudioModelRegistry — detects VoxtralRealtime from model_type")
+    @Test("the registry — detects VoxtralRealtime from model_type")
     func registryDetectsByModelType() {
         let config = ModelConfig(
             architecture: nil,
@@ -51,11 +51,11 @@ struct VoxtralRealtimeTests {
                 ] as [String: Any],
             ])
         #expect(VoxtralRealtimeModel.handles(config))
-        #expect(AudioModelRegistry.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.speechToText)
+        #expect(ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.capabilities(for: config) == Capability.speechToText)
     }
 
-    @Test("AudioModelRegistry — non-voxtral config is not detected")
+    @Test("the registry — non-voxtral config is not detected")
     func registryIgnoresOtherModelTypes() {
         let config = ModelConfig(
             architecture: "LlamaForCausalLM",
@@ -64,13 +64,13 @@ struct VoxtralRealtimeTests {
         #expect(!VoxtralRealtimeModel.handles(config))
     }
 
-    @Test("AudioModelRegistry — VoxtralRealtime is speechToText capability")
+    @Test("the registry — VoxtralRealtime is speechToText capability")
     func voxtralCapabilityIsSpeechToText() {
         let config = ModelConfig(
             architecture: nil,
             modelType: "voxtral_realtime",
             raw: ["model_type": "voxtral_realtime"])
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.speechToText)
+        #expect(ModelRegistry.capabilities(for: config) == Capability.speechToText)
     }
 
     // ─── Config parsing ──────────────────────────────────────────────

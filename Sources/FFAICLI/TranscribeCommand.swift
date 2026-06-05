@@ -54,11 +54,10 @@ struct TranscribeCommand: AsyncParsableCommand {
 
         print("ffai \(FFAI.version) — loading \(model)…")
         let loadStart = Date()
-        let dir = try await ModelLocator().resolve(idOrPath: model)
-        let loaded = try await AudioModelRegistry.load(directory: dir)
+        let m = try await Model.load(model)
         print("loaded in \(String(format: "%.2f", Date().timeIntervalSince(loadStart)))s")
 
-        guard let transcriber = loaded.transcriber else {
+        guard m.engine is any Transcribing else {
             throw ValidationError(
                 "\(model) is not a speech-to-text model (no transcribe path).")
         }
@@ -68,7 +67,7 @@ struct TranscribeCommand: AsyncParsableCommand {
 
         print("---")
         let start = Date()
-        let stream = transcriber.transcribeStream(
+        let stream = m.transcribeStream(
             waveform, maxNewTokens: maxNewTokens, temperature: temperature)
         var text = ""
         for try await chunk in stream {

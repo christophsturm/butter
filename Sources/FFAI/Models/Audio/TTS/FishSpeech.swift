@@ -622,7 +622,7 @@ public final class FishSpeechModel: Module, AudioModel, @unchecked Sendable {
     // ─── Static loader ────────────────────────────────────────────────
 
     /// Whether a decoded `config.json` describes a FishSpeech checkpoint.
-    /// Used by `AudioModelRegistry` to route the snapshot here.
+    /// Used by `ModelRegistry` to route the snapshot here.
     public static func handles(_ config: ModelConfig) -> Bool {
         if let mt = config.modelType { return FishSpeech.modelTypes.contains(mt) }
         return false

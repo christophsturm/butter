@@ -149,9 +149,9 @@ struct FishSpeechTests {
         #expect(FishSpeech.modelTypes.contains("fish_qwen3_omni"))
     }
 
-    @Test("AudioModelRegistry dispatches fish_speech model_type")
+    @Test("the registry dispatches fish_speech model_type")
     func registryDispatchesFishSpeech() {
-        // AudioModelRegistry.load requires a real SafeTensorsBundle and directory.
+        // the registry.load requires a real SafeTensorsBundle and directory.
         // We only check the dispatch logic path here — the model_type in the
         // config matches FishSpeech.modelTypes. Full load is in the integration test.
         let raw: [String: Any] = ["model_type": "fish_speech"]

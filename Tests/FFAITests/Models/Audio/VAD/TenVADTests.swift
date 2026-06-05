@@ -18,7 +18,7 @@ import Testing
 @testable import FFAI
 
 // Unit tests for TenVAD — config decoding, post-processing logic, and
-// VADModelRegistry detection. These run purely on in-process data (no
+// the registry detection. These run purely on in-process data (no
 // checkpoint, no network) so they are fast + offline.
 //
 // The full checkpoint-load + forward path is covered by
@@ -145,7 +145,7 @@ struct TenVADTests {
         #expect(segments.count == 2)
     }
 
-    // ─── VADModelRegistry detection ─────────────────────────────────
+    // ─── the registry detection ─────────────────────────────────
 
     @Test("AudioModelKind — tenVAD model_type set contains expected strings")
     func audioModelKindTenVAD() {
@@ -155,32 +155,32 @@ struct TenVADTests {
         #expect(types.contains("tenvad"))
     }
 
-    @Test("VADModelRegistry.detectKind — recognizes ten_vad model_type")
+    @Test("ModelRegistry.detectVADKind — recognizes ten_vad model_type")
     func registryDetectKindTenVAD() throws {
         let dir = try writeTempConfig(
             ["model_type": "ten_vad"],
             named: "ten-vad-checkpoint")
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .tenVAD)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .tenVAD)
     }
 
-    @Test("VADModelRegistry.detectKind — recognizes ten-vad model_type")
+    @Test("ModelRegistry.detectVADKind — recognizes ten-vad model_type")
     func registryDetectKindTenVADDash() throws {
         let dir = try writeTempConfig(
             ["model_type": "ten-vad"],
             named: "ten-vad-checkpoint-2")
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .tenVAD)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .tenVAD)
     }
 
-    @Test("VADModelRegistry.detectKind — falls back to directory name for ten-vad")
+    @Test("ModelRegistry.detectVADKind — falls back to directory name for ten-vad")
     func registryDetectKindTenVADByName() throws {
         // No config.json — detection falls back to directory name.
         let base = FileManager.default.temporaryDirectory
         let dir = base.appendingPathComponent("models--TEN-framework--ten-vad-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .tenVAD)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .tenVAD)
     }
 
     // ─── TenVADModel.frameworkBinary ────────────────────────────────

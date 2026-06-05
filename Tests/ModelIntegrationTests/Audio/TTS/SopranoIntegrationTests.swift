@@ -163,16 +163,16 @@ struct SopranoIntegrationTests {
         #expect(model.sampleRate == 32_000)
     }
 
-    @Test("registry — AudioModelRegistry routes Soprano-80M checkpoint to .soprano")
+    @Test("registry — the registry routes Soprano-80M checkpoint to .soprano")
     func registry_routesSoprano80M() async throws {
         let dir = try await resolveSoprano80MCheckpoint()
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        guard case .soprano = loaded else {
-            Issue.record("AudioModelRegistry did not route to .soprano; got \(loaded)")
+        let loaded = try await Model.load(dir.path)
+        guard loaded.engine is SopranoModel else {
+            Issue.record("the registry did not route to .soprano; got \(loaded)")
             return
         }
-        #expect(loaded.capabilities == Capability.textToSpeech)
-        print("[Soprano-80M] Registry routed correctly, capabilities=\(loaded.capabilities)")
+        #expect(loaded.availableCapabilities == Capability.textToSpeech)
+        print("[Soprano-80M] Registry routed correctly, capabilities=\(loaded.availableCapabilities)")
     }
 
     @Test("synthesize — Soprano-80M produces non-empty waveform with sane RMS for 'Hello world.'")
@@ -254,15 +254,15 @@ struct SopranoIntegrationTests {
                 + "hasDecoderConfig=\(model.config.hasDecoderConfig)")
     }
 
-    @Test("registry — AudioModelRegistry routes Soprano-1.1 checkpoint to .soprano")
+    @Test("registry — the registry routes Soprano-1.1 checkpoint to .soprano")
     func registry_routesSoprano11() async throws {
         let dir = try await resolveSoprano11Checkpoint()
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        guard case .soprano = loaded else {
-            Issue.record("AudioModelRegistry did not route to .soprano; got \(loaded)")
+        let loaded = try await Model.load(dir.path)
+        guard loaded.engine is SopranoModel else {
+            Issue.record("the registry did not route to .soprano; got \(loaded)")
             return
         }
-        #expect(loaded.capabilities == Capability.textToSpeech)
+        #expect(loaded.availableCapabilities == Capability.textToSpeech)
     }
 
     @Test("synthesize — Soprano-1.1 throws decoderNotAvailable (LLM-only checkpoint)")

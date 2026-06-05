@@ -163,7 +163,7 @@ struct SmartTurnEncoderLayer {
 // ─── SmartTurn model ─────────────────────────────────────────────────
 
 /// Loaded SmartTurn model. Audio-in / endpoint-probability-out — a VAD
-/// family, reached via `VADModelRegistry`, not `ModelRegistry`.
+/// family, a VAD family — loaded through `ModelRegistry` / `Model.load`.
 public final class SmartTurnModel: @unchecked Sendable {
     public let config: SmartTurnConfig
 

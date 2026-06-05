@@ -36,7 +36,7 @@
 // The **omni** path (Qwen3-Omni — text + vision + audio-IN) lives at the
 // bottom of this file: the shared `QwenOmniModel` engine +
 // `QwenOmniAudioConfig` + `Qwen3Error` cases. Qwen3-Omni is detected via
-// `Qwen3.isOmni(_:)` and routed through `AudioModelRegistry` (audio-in
+// `Qwen3.isOmni(_:)` and routed through `ModelRegistry` (audio-in
 // capable). Keeping it here makes this file the single root for the whole
 // Qwen 3 series — dense + VL + omni. The same engine also backs earlier
 // Qwen omni checkpoints, which are detected + routed from their own family

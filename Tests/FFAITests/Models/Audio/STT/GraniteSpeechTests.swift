@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // GraniteSpeechTests — fast unit tests for GraniteSpeech config parsing
-// and AudioModelRegistry dispatch. No GPU work, no model loading.
+// and the registry dispatch. No GPU work, no model loading.
 
 import Foundation
 import Testing
@@ -185,9 +185,9 @@ struct GraniteSpeechTests {
         #expect(GraniteSpeech.architectures.contains("GraniteSpeechForConditionalGeneration"))
     }
 
-    // MARK: - AudioModelRegistry dispatch tests
+    // MARK: - the registry dispatch tests
 
-    @Test("AudioModelRegistry dispatches granite_speech model_type")
+    @Test("the registry dispatches granite_speech model_type")
     func registryDispatchesModelType() async throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("gs-reg-mt-\(UUID().uuidString)")
@@ -202,7 +202,7 @@ struct GraniteSpeechTests {
         #expect(GraniteSpeech.modelTypes.contains(raw.modelType ?? ""))
     }
 
-    @Test("AudioModelRegistry dispatches GraniteSpeechForConditionalGeneration architecture")
+    @Test("the registry dispatches GraniteSpeechForConditionalGeneration architecture")
     func registryDispatchesArchitecture() async throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("gs-reg-arch-\(UUID().uuidString)")
@@ -215,7 +215,7 @@ struct GraniteSpeechTests {
         #expect(GraniteSpeech.architectures.contains(raw.architecture ?? ""))
     }
 
-    @Test("AudioModelRegistry rejects unknown model_type")
+    @Test("registry rejects unknown model_type")
     func registryUnknownModelType() async throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("gs-reg-unk-\(UUID().uuidString)")
@@ -227,7 +227,7 @@ struct GraniteSpeechTests {
         try Self.writeEmptyBundle(to: dir)
 
         do {
-            _ = try await AudioModelRegistry.load(directory: dir)
+            _ = try await Model.load(dir.path)
             Issue.record("expected ModelError.unsupportedArchitecture")
         } catch ModelError.unsupportedArchitecture {
             // Correct.

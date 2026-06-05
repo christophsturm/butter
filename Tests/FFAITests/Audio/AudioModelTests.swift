@@ -187,7 +187,7 @@ struct AudioModelTests {
 
     // ─── Registry detection ──────────────────────────────────────────
 
-    @Test("AudioModelRegistry — detects Whisper from model_type")
+    @Test("the registry — detects Whisper from model_type")
     func registryDetectsWhisper() {
         let config = ModelConfig(
             architecture: "WhisperForConditionalGeneration",
@@ -198,14 +198,14 @@ struct AudioModelTests {
                 "decoder_layers": 4, "decoder_attention_heads": 6,
                 "vocab_size": 51865,
             ])
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.speechToText)
         #expect(WhisperModel.handles(config))
     }
 
-    @Test("AudioModelRegistry — detects Kokoro from istftnet block")
+    @Test("the registry — detects Kokoro from istftnet block")
     func registryDetectsKokoro() {
         let config = ModelConfig(
             architecture: nil, modelType: "kokoro",
@@ -217,13 +217,13 @@ struct AudioModelTests {
                     "gen_istft_hop_size": 5,
                 ],
             ])
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.textToSpeech)
     }
 
-    @Test("AudioModelRegistry — detects QwenOmni from audio_config")
+    @Test("the registry — detects QwenOmni from audio_config")
     func registryDetectsQwenOmni() {
         let config = ModelConfig(
             architecture: "Qwen2_5OmniForConditionalGeneration",
@@ -237,13 +237,13 @@ struct AudioModelTests {
                 ],
                 "text_config": ["hidden_size": 3584],
             ])
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.omniAudio)
     }
 
-    @Test("AudioModelRegistry — detects LlamaTTS from the orpheus type")
+    @Test("the registry — detects LlamaTTS from the orpheus type")
     func registryDetectsLlamaTTS() {
         let config = ModelConfig(
             architecture: "LlamaForCausalLM", modelType: "orpheus",
@@ -252,14 +252,14 @@ struct AudioModelTests {
                 "num_hidden_layers": 28, "num_attention_heads": 24,
                 "vocab_size": 156_940, "sample_rate": 24_000,
             ])
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
         #expect(LlamaTTSModel.handles(config))
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.textToSpeech)
     }
 
-    @Test("AudioModelRegistry — detects LlamaTTS structurally")
+    @Test("the registry — detects LlamaTTS structurally")
     func registryDetectsLlamaTTSStructural() {
         // A plain LlamaForCausalLM with the Orpheus-extended vocabulary
         // and a TTS sample_rate is detected even without an explicit
@@ -273,7 +273,7 @@ struct AudioModelTests {
         #expect(LlamaTTSModel.handles(config))
     }
 
-    @Test("AudioModelRegistry — detects Marvis / CSM")
+    @Test("the registry — detects Marvis / CSM")
     func registryDetectsMarvis() {
         let config = ModelConfig(
             architecture: "CSMForConditionalGeneration", modelType: "csm",
@@ -289,14 +289,14 @@ struct AudioModelTests {
                     "intermediate_size": 8192,
                 ],
             ])
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
         #expect(MarvisModel.handles(config))
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.textToSpeech)
     }
 
-    @Test("AudioModelRegistry — detects Qwen3TTS from talker_config")
+    @Test("the registry — detects Qwen3TTS from talker_config")
     func registryDetectsQwen3TTS() {
         let config = ModelConfig(
             architecture: "Qwen3TTSForConditionalGeneration",
@@ -311,10 +311,10 @@ struct AudioModelTests {
                 "speaker_encoder_config": ["enc_dim": 1024],
                 "sample_rate": 24_000,
             ])
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
         #expect(Qwen3TTSModel.handles(config))
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.textToSpeech)
     }
 
@@ -374,13 +374,13 @@ struct AudioModelTests {
         #expect(planes[2].count == 8)
     }
 
-    @Test("AudioModelRegistry — text-only config is not an audio model")
+    @Test("the registry — text-only config is not an audio model")
     func registryRejectsTextModel() {
         let config = ModelConfig(
             architecture: "LlamaForCausalLM", modelType: "llama",
             raw: ["model_type": "llama", "hidden_size": 2048])
-        #expect(!AudioModelRegistry.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == nil)
+        #expect(!ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.capabilities(for: config) == nil)
     }
 
     // ─── Config parsing ──────────────────────────────────────────────

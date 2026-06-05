@@ -17,7 +17,7 @@
 //
 //   1. Config is decoded correctly (nToken, hiddenDim, sampleRate, voices).
 //   2. Weight count > 0 (safetensors shards are present and parseable).
-//   3. AudioModelRegistry detects the checkpoint as StyleTTS2 / textToSpeech.
+//   3. the registry detects the checkpoint as StyleTTS2 / textToSpeech.
 //   4. generatePlaceholder() returns a non-empty Float waveform with sane RMS.
 //
 // The full acoustic synthesize() path requires the ALBERT + prosody predictor
@@ -65,16 +65,16 @@ struct StyleTTS2IntegrationTests {
             Self.cachedSnapshotDir,
             "StyleTTS2: kitten-tts-nano-0.8-fp16 not cached at ~/.cache/huggingface/hub/")
 
-        // ── 1. Load via AudioModelRegistry ──────────────────────────────
-        let loaded = try await AudioModelRegistry.load(directory: dir)
+        // ── 1. Load via the registry ──────────────────────────────
+        let loaded = try await Model.load(dir.path)
 
-        guard case .styleTTS2(let model) = loaded else {
+        guard let model = loaded.engine as? StyleTTS2Model else {
             Issue.record("expected LoadedAudioModel.styleTTS2, got \(loaded)")
             return
         }
 
         // ── 2. Registry detection ────────────────────────────────────────
-        let caps = AudioModelRegistry.capabilities(forConfigAt: dir)
+        let caps = ModelRegistry.capabilities(forConfigAt: dir)
         #expect(
             caps == Capability.textToSpeech,
             "expected textToSpeech capability for kitten-tts checkpoint")
@@ -151,8 +151,8 @@ struct StyleTTS2IntegrationTests {
         let dir = try #require(
             Self.cachedSnapshotDir,
             "StyleTTS2 vocoder: kitten-tts checkpoint not cached")
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        guard case .styleTTS2(let model) = loaded else {
+        let loaded = try await Model.load(dir.path)
+        guard let model = loaded.engine as? StyleTTS2Model else {
             Issue.record("expected LoadedAudioModel.styleTTS2, got \(loaded)")
             return
         }
@@ -193,8 +193,8 @@ struct StyleTTS2IntegrationTests {
         let dir = try #require(
             Self.cachedSnapshotDir,
             "StyleTTS2 stream: kitten-tts checkpoint not cached")
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        guard case .styleTTS2(let model) = loaded else {
+        let loaded = try await Model.load(dir.path)
+        guard let model = loaded.engine as? StyleTTS2Model else {
             Issue.record("expected LoadedAudioModel.styleTTS2, got \(loaded)")
             return
         }
@@ -235,26 +235,14 @@ struct StyleTTS2IntegrationTests {
         }
     }
 
-    @Test("AudioModelRegistry.load throws for non-audio directory")
-    func registryRejectsTextModel() async throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ffai-s2tts-int-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        try FileManager.default.createDirectory(
-            at: dir,
-            withIntermediateDirectories: true)
-        try #"{"model_type": "llama", "architectures": ["LlamaForCausalLM"]}"#
-            .write(
-                to: dir.appendingPathComponent("config.json"),
-                atomically: true, encoding: .utf8)
-
-        do {
-            _ = try await AudioModelRegistry.load(directory: dir)
-            Issue.record("expected ModelError.unsupportedArchitecture")
-        } catch ModelError.unsupportedArchitecture {
-            // Correct.
-        } catch {
-            Issue.record("unexpected error: \(error)")
-        }
+    @Test("registry — a plain text config is not routed to an audio family")
+    func registryRejectsTextModel() throws {
+        // A bare LlamaForCausalLM config routes to the text tier (`.llm`),
+        // never to a TTS / audio family — `Model.load` would take the text
+        // path, not the audio `loadFromDirectory`.
+        let config = ModelConfig(
+            architecture: "LlamaForCausalLM", modelType: "llama", raw: [:])
+        #expect(!ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.entry(for: config)?.kind == .llm)
     }
 }

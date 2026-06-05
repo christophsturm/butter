@@ -352,7 +352,7 @@ func reflectPadRight(_ x: [Float], pad: Int) -> [Float] {
 
 /// Loaded SileroVAD model. Audio-in / speech-probability-out — this is
 /// a VAD family, so it does not conform to `LanguageModel` and is
-/// reached via `VADModelRegistry`, not `ModelRegistry`.
+/// a VAD family — loaded through `ModelRegistry` / `Model.load`.
 public final class SileroVADModel: @unchecked Sendable {
     public let config: SileroVADConfig
     let branch16k: SileroVADBranch

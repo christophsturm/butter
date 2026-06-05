@@ -106,7 +106,7 @@ struct SmartTurnTests {
         #expect(err.description.contains("empty"))
     }
 
-    // ─── VADModelRegistry detection ─────────────────────────────────────
+    // ─── the registry detection ─────────────────────────────────────
 
     @Test("AudioModelKind.smartTurn — modelTypes contains expected strings")
     func audioModelKindSmartTurn() {
@@ -116,32 +116,32 @@ struct SmartTurnTests {
         #expect(types.contains("smart-turn"))
     }
 
-    @Test("VADModelRegistry.detectKind — recognizes smart_turn model_type")
+    @Test("ModelRegistry.detectVADKind — recognizes smart_turn model_type")
     func registryDetectKindSmartTurn() throws {
         let dir = try writeTempConfig(
             ["model_type": "smart_turn"],
             named: "smart-turn-checkpoint")
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .smartTurn)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .smartTurn)
     }
 
-    @Test("VADModelRegistry.detectKind — recognizes smart_turn_v3 model_type")
+    @Test("ModelRegistry.detectVADKind — recognizes smart_turn_v3 model_type")
     func registryDetectKindSmartTurnV3() throws {
         let dir = try writeTempConfig(
             ["model_type": "smart_turn_v3"],
             named: "smart-turn-v3-checkpoint")
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .smartTurn)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .smartTurn)
     }
 
-    @Test("VADModelRegistry.detectKind — falls back to directory name for smart-turn")
+    @Test("ModelRegistry.detectVADKind — falls back to directory name for smart-turn")
     func registryDetectKindSmartTurnByName() throws {
         let base = FileManager.default.temporaryDirectory
         let dir = base.appendingPathComponent(
             "models--pipecat-ai--smart-turn-v3-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .smartTurn)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .smartTurn)
     }
 
     // ─── Loader rejection paths ─────────────────────────────────────────

@@ -124,10 +124,10 @@ struct QwenOmniIntegrationTests {
             try await ModelLocator().resolve(idOrPath: Self.repoId)
         }
         let loaded = try await ModelLoadLock.shared.loadSerially {
-            try await AudioModelRegistry.load(directory: dir)
+            try await Model.load(dir.path)
         }
-        guard case .qwenOmni(let model) = loaded else {
-            Issue.record("AudioModelRegistry did not route to .qwenOmni")
+        guard let model = loaded.engine as? QwenOmniModel else {
+            Issue.record("the registry did not route to .qwenOmni")
             return
         }
         guard model.hasTextBackbone, model.tokenizer != nil else {

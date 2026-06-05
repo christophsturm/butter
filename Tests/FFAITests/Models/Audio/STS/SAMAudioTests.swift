@@ -135,7 +135,7 @@ struct SAMAudioTests {
         #expect(SAMAudio.modelTypes.contains("sam_audio"))
     }
 
-    @Test("AudioModelRegistry.handles returns true for sam_audio model_type")
+    @Test("ModelRegistry.handlesAudio returns true for sam_audio model_type")
     func registryRoutesByModelType() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ffai-samaudio-\(UUID().uuidString)")
@@ -152,11 +152,11 @@ struct SAMAudioTests {
 
         let config = try ModelConfig.load(from: dir)
         #expect(SAMAudio.handles(config))
-        #expect(AudioModelRegistry.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.speechToSpeech)
+        #expect(ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.capabilities(for: config) == Capability.speechToSpeech)
     }
 
-    @Test("AudioModelRegistry.handles returns false for unknown model_type")
+    @Test("ModelRegistry.handlesAudio returns false for unknown model_type")
     func registryRejectsUnknown() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ffai-samaudio-unk-\(UUID().uuidString)")
@@ -173,8 +173,8 @@ struct SAMAudioTests {
 
         let config = try ModelConfig.load(from: dir)
         #expect(!SAMAudio.handles(config))
-        #expect(!AudioModelRegistry.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == nil)
+        #expect(!ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.capabilities(for: config) == nil)
     }
 
     // ─── Capability ───────────────────────────────────────────────────────

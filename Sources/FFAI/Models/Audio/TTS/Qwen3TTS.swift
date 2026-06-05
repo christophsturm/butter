@@ -33,7 +33,7 @@
 // Qwen3TTS lands in stages. This file is **stage 1**: the config
 // decoding + family detection + registry plumbing. It decodes the
 // nested `talker_config` / `tokenizer_config` / `speaker_encoder_config`
-// blocks so `AudioModelRegistry` recognizes a Qwen3TTS checkpoint and
+// blocks so `ModelRegistry` recognizes a Qwen3TTS checkpoint and
 // reports `textToSpeech`, and it pins down the typed surface
 // (`Qwen3TTSModel`, the talker hyper-parameters) the later stages build
 // on.

@@ -191,17 +191,17 @@ struct LFMAudioTests {
         #expect(!LFMAudioModel.handles(llama))
     }
 
-    @Test("AudioModelRegistry — detects LFMAudio and reports omniAudio")
+    @Test("the registry — detects LFMAudio and reports omniAudio")
     func registryDetectsLFMAudio() {
         let config = ModelConfig(
             architecture: "Lfm2AudioForConditionalGeneration",
             modelType: "lfm_audio",
             raw: makeRawConfig())
-        #expect(AudioModelRegistry.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.omniAudio)
+        #expect(ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.capabilities(for: config) == Capability.omniAudio)
     }
 
-    @Test("AudioModelRegistry — LFMAudio does not shadow Whisper or QwenOmni")
+    @Test("the registry — LFMAudio does not shadow Whisper or QwenOmni")
     func registryNoShadowing() {
         let whisper = ModelConfig(
             architecture: "WhisperForConditionalGeneration",
@@ -211,9 +211,9 @@ struct LFMAudioTests {
                 "encoder_attention_heads": 8, "decoder_layers": 6,
                 "decoder_attention_heads": 8, "vocab_size": 51865,
             ])
-        #expect(AudioModelRegistry.handles(whisper))
+        #expect(ModelRegistry.handlesAudio(whisper))
         #expect(
-            AudioModelRegistry.capabilities(for: whisper)
+            ModelRegistry.capabilities(for: whisper)
                 == Capability.speechToText)
 
         let qwenOmni = ModelConfig(
@@ -228,10 +228,10 @@ struct LFMAudioTests {
                 ],
                 "text_config": ["hidden_size": 3584],
             ])
-        #expect(AudioModelRegistry.handles(qwenOmni))
+        #expect(ModelRegistry.handlesAudio(qwenOmni))
         // QwenOmni is checked before LFMAudio in the registry.
         #expect(
-            AudioModelRegistry.capabilities(for: qwenOmni)
+            ModelRegistry.capabilities(for: qwenOmni)
                 == Capability.omniAudio)
         #expect(!LFMAudioModel.handles(qwenOmni))
     }

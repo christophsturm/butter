@@ -98,11 +98,11 @@ struct PocketTTSIntegrationTests {
                 + "sampleRate=\(model.sampleRate)")
     }
 
-    @Test("registry — AudioModelRegistry routes PocketTTS checkpoint to .pocketTTS")
+    @Test("registry — the registry routes PocketTTS checkpoint to .pocketTTS")
     func registry_routesPocketTTS() async throws {
         let dir = try await resolveCheckpoint()
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        #expect(loaded.capabilities == Capability.textToSpeech)
+        let loaded = try await Model.load(dir.path)
+        #expect(loaded.availableCapabilities == Capability.textToSpeech)
     }
 
     @Test("synthesizeStream — surfaces synthesisNotWired until the pipeline lands")

@@ -58,7 +58,7 @@ public enum Qwen2 {
     // the Qwen 2.x family owns the `qwen2_5_omni*` model_type / architecture
     // strings here, and the shared engine's `QwenOmniModel.handles` unions
     // these with `Qwen3.omniModelTypes`. Loading goes through
-    // `AudioModelRegistry` → `QwenOmniModel.load`, which composes the Qwen 2.5
+    // `ModelRegistry` → `QwenOmniModel.load`, which composes the Qwen 2.5
     // text backbone + Whisper-style audio tower (and, once wired, the Qwen 2.5
     // vision tower) — the right back-end stacks for the checkpoint.
 

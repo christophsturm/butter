@@ -25,7 +25,7 @@ struct Qwen3ASRTests {
 
     // ─── Registry detection ──────────────────────────────────────────
 
-    @Test("AudioModelRegistry — detects Qwen3ASR from model_type")
+    @Test("the registry — detects Qwen3ASR from model_type")
     func registryDetectsQwen3ASRByModelType() {
         let config = ModelConfig(
             architecture: "Qwen3ASRForConditionalGeneration",
@@ -44,13 +44,13 @@ struct Qwen3ASRTests {
                 ],
             ])
         #expect(Qwen3ASRModel.handles(config))
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.speechToText)
     }
 
-    @Test("AudioModelRegistry — detects Qwen3ASR from architecture")
+    @Test("the registry — detects Qwen3ASR from architecture")
     func registryDetectsQwen3ASRByArchitecture() {
         // Some mlx-community conversions omit model_type but keep the
         // architecture string.
@@ -67,7 +67,7 @@ struct Qwen3ASRTests {
         #expect(Qwen3ASRModel.handles(config))
     }
 
-    @Test("AudioModelRegistry — Qwen3ASR is speechToText capability")
+    @Test("the registry — Qwen3ASR is speechToText capability")
     func qwen3ASRCapability() {
         let config = ModelConfig(
             architecture: nil, modelType: "qwen3_asr",
@@ -79,11 +79,11 @@ struct Qwen3ASRTests {
                 ],
             ])
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.speechToText)
     }
 
-    @Test("AudioModelRegistry — Qwen3ASR takes priority over QwenOmni")
+    @Test("the registry — Qwen3ASR takes priority over QwenOmni")
     func qwen3ASRPriorityOverQwenOmni() {
         // A Qwen3ASR config also has nested audio/text configs, but must be
         // routed to Qwen3ASR — not QwenOmni — based on model_type.
@@ -99,11 +99,11 @@ struct Qwen3ASRTests {
         #expect(Qwen3ASRModel.handles(config))
         // Qwen3ASR capability is speechToText — not omniAudio.
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 != Capability.omniAudio)
     }
 
-    @Test("AudioModelRegistry — text-only config is not Qwen3ASR")
+    @Test("the registry — text-only config is not Qwen3ASR")
     func textOnlyNotQwen3ASR() {
         let config = ModelConfig(
             architecture: "LlamaForCausalLM", modelType: "llama",

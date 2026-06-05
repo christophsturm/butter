@@ -19,7 +19,7 @@
 // Validates:
 //   * CohereTranscribeConfig.from(_:) parses config shapes correctly.
 //   * CohereTranscribeModel.handles(_:) fires on the expected config signatures.
-//   * AudioModelRegistry routes CohereTranscribe configs to Capability.speechToText.
+//   * the registry routes CohereTranscribe configs to Capability.speechToText.
 //   * computeMelFeatures (via encodeAudio path) produces finite outputs.
 
 import Foundation
@@ -156,27 +156,27 @@ struct CohereTranscribeTests {
         #expect(!CohereTranscribeModel.handles(config))
     }
 
-    @Test("AudioModelRegistry.handles — true for CohereTranscribe config")
+    @Test("ModelRegistry.handlesAudio — true for CohereTranscribe config")
     func registryHandlesCohereTranscribe() {
         let config = ModelConfig(
             architecture: "CohereTranscribeForConditionalGeneration",
             modelType: "cohere_transcribe",
             raw: ["model_type": "cohere_transcribe"])
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
     }
 
-    @Test("AudioModelRegistry.capabilities — CohereTranscribe maps to speechToText")
+    @Test("ModelRegistry.capabilities — CohereTranscribe maps to speechToText")
     func registryCapabilitySpeechToText() {
         let config = ModelConfig(
             architecture: "CohereTranscribeForConditionalGeneration",
             modelType: "cohere_transcribe",
             raw: ["model_type": "cohere_transcribe"])
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.speechToText)
     }
 
-    @Test("AudioModelRegistry.handles — false for text-only model")
+    @Test("ModelRegistry.handlesAudio — false for text-only model")
     func registryFalseForTextModel() {
         let config = ModelConfig(
             architecture: nil, modelType: "qwen3",

@@ -33,7 +33,7 @@
 //
 // ## Scope note — STAGED PORT
 //
-// This file is stage 1: config decoding, `AudioModelRegistry` detection,
+// This file is stage 1: config decoding, `ModelRegistry` detection,
 // checkpoint weight-bundle retention, and the top-level `MossTTSModel`
 // scaffold. The full delay-pattern autoregressive generation loop and the
 // MOSS audio codec decoder (MOSS-Audio-Tokenizer) are follow-on stages.

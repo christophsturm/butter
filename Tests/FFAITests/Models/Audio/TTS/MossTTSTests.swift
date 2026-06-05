@@ -226,26 +226,26 @@ struct MossTTSTests {
         #expect(!MossTTSModel.handles(config))
     }
 
-    // ─── AudioModelRegistry integration ──────────────────────────────
+    // ─── the registry integration ──────────────────────────────
 
-    @Test("AudioModelRegistry — handles MOSS-TTS from model_type")
+    @Test("the registry — handles MOSS-TTS from model_type")
     func registryHandlesMossTTS() {
         let config = ModelConfig(
             architecture: nil,
             modelType: "moss_tts",
             raw: ["model_type": "moss_tts"])
-        #expect(AudioModelRegistry.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.textToSpeech)
+        #expect(ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.capabilities(for: config) == Capability.textToSpeech)
     }
 
-    @Test("AudioModelRegistry — does not handle unrelated models")
+    @Test("the registry — does not handle unrelated models")
     func registryDoesNotHandleQwen3() {
         let config = ModelConfig(
             architecture: "Qwen3ForCausalLM",
             modelType: "qwen3",
             raw: ["model_type": "qwen3", "hidden_size": 4_096])
-        #expect(!AudioModelRegistry.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == nil)
+        #expect(!ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.capabilities(for: config) == nil)
     }
 
     // ─── Staged synthesis error ───────────────────────────────────────

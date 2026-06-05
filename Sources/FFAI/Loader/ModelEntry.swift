@@ -35,6 +35,13 @@ public struct ModelEntry: Sendable {
     public let modelTypes: Set<String>
     /// `config.json` `architectures[0]` strings this family dispatches on.
     public let architectures: Set<String>
+    /// Declared / maximum capabilities for this family — the catalog-level
+    /// answer to "what can it do". The precise per-checkpoint set still
+    /// flows from the `load` closure's `Loaded.availableCapabilities` (a VL
+    /// family may gate `.audioIn` on what the weights wired); this is the
+    /// static declaration the routing-query API (`ModelRegistry.entry(for:)`)
+    /// and the audio capability tests read.
+    public let capabilities: Set<Capability>
     /// One-line catalog summary for `ffai models`.
     public let summary: String
     /// Example HuggingFace repo ids that load + decode through FFAI.
@@ -43,13 +50,21 @@ public struct ModelEntry: Sendable {
     /// model_type / architecture alone (runs in addition to the set
     /// membership check, OR'd in).
     let sniff: (@Sendable (ModelConfig) -> Bool)?
-    /// Load the checkpoint through the text/VL dispatch path. The closure
-    /// is the family's dispatch branch — it self-validates and throws a
-    /// typed family error on mismatch. `nil` for **catalog-only** rows: the
-    /// audio / VAD families list in `ffai models` but load through their own
-    /// (audio) registry until the unified-engine phase wires them here.
+    /// Load the checkpoint through the text/VL dispatch path (config +
+    /// pre-built, residency-pinned weights). The closure is the family's
+    /// dispatch branch — it self-validates and throws a typed family error
+    /// on mismatch. `nil` for the directory-loaded audio / VAD families,
+    /// which set `loadFromDirectory` instead.
     let load:
         (@Sendable (ModelConfig, SafeTensorsBundle, LoadOptions, Device) throws ->
+            ModelRegistry.Loaded)?
+    /// Load the checkpoint from its resolved snapshot directory — the audio /
+    /// VAD path. These families build their own weight bundles internally
+    /// (and some load asynchronously / attach their own tokenizer), so they
+    /// take the directory rather than a pre-built bundle. `nil` for the
+    /// text/VL families, which set `load` instead.
+    let loadFromDirectory:
+        (@Sendable (URL, ModelConfig, LoadOptions, Device) async throws ->
             ModelRegistry.Loaded)?
 
     public init(
@@ -57,20 +72,25 @@ public struct ModelEntry: Sendable {
         kind: ModelKind,
         summary: String = "",
         repos: [String] = [],
+        capabilities: Set<Capability> = Capability.textOnly,
         modelTypes: Set<String> = [],
         architectures: Set<String> = [],
         sniff: (@Sendable (ModelConfig) -> Bool)? = nil,
         load: (@Sendable (ModelConfig, SafeTensorsBundle, LoadOptions, Device)
-            throws -> ModelRegistry.Loaded)? = nil
+            throws -> ModelRegistry.Loaded)? = nil,
+        loadFromDirectory: (@Sendable (URL, ModelConfig, LoadOptions, Device)
+            async throws -> ModelRegistry.Loaded)? = nil
     ) {
         self.family = family
         self.kind = kind
+        self.capabilities = capabilities
         self.modelTypes = modelTypes
         self.architectures = architectures
         self.summary = summary
         self.repos = repos
         self.sniff = sniff
         self.load = load
+        self.loadFromDirectory = loadFromDirectory
     }
 
     /// Whether this entry handles `config` — by `model_type`,

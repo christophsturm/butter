@@ -20,7 +20,7 @@ import Testing
 // Unit tests for the voice-activity-detection (VAD) model families —
 // SileroVAD and SmartTurn. These exercise config decoding, the
 // published per-branch geometry, weight-key remapping, and the
-// `VADModelRegistry` architecture detection. The full checkpoint-load +
+// `the registry` architecture detection. The full checkpoint-load +
 // forward path is covered by the ModelTests integration suites; these
 // run purely on in-process data so they are fast + offline.
 @Suite("VAD models")
@@ -249,7 +249,7 @@ struct VADModelTests {
                 == "encoder.layer_norm.weight")
     }
 
-    // ─── VADModelRegistry detection ──────────────────────────────────
+    // ─── the registry detection ──────────────────────────────────
 
     @Test("AudioModelKind — model_type sets map each VAD architecture")
     func audioModelKindModelTypes() {
@@ -259,22 +259,22 @@ struct VADModelTests {
         #expect(AudioModelKind.sortformer.modelTypes.contains("sortformer"))
     }
 
-    @Test("VADModelRegistry.detectKind — dispatches by config model_type")
+    @Test("ModelRegistry.detectVADKind — dispatches by config model_type")
     func registryDetectKindByConfig() throws {
         let dir = try writeTempConfig(
             ["model_type": "silero_vad"],
             named: "some-checkpoint")
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .sileroVAD)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .sileroVAD)
 
         let dir2 = try writeTempConfig(
             ["model_type": "smart_turn_v3"],
             named: "another-checkpoint")
         defer { try? FileManager.default.removeItem(at: dir2) }
-        #expect(try VADModelRegistry.detectKind(in: dir2) == .smartTurn)
+        #expect(try ModelRegistry.detectVADKind(in: dir2) == .smartTurn)
     }
 
-    @Test("VADModelRegistry.detectKind — falls back to directory name")
+    @Test("ModelRegistry.detectVADKind — falls back to directory name")
     func registryDetectKindByName() throws {
         // No config.json at all — detection must fall back to the
         // directory name heuristic.
@@ -283,17 +283,17 @@ struct VADModelTests {
             "models--mlx-community--smart-turn-v3-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .smartTurn)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .smartTurn)
     }
 
-    @Test("VADModelRegistry.detectKind — rejects an unknown architecture")
+    @Test("ModelRegistry.detectVADKind — rejects an unknown architecture")
     func registryDetectKindUnknown() throws {
         let dir = try writeTempConfig(
             ["model_type": "not_a_vad_model"],
             named: "mystery-model")
         defer { try? FileManager.default.removeItem(at: dir) }
         #expect(throws: AudioModelError.self) {
-            _ = try VADModelRegistry.detectKind(in: dir)
+            _ = try ModelRegistry.detectVADKind(in: dir)
         }
     }
 

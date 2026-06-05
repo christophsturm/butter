@@ -58,9 +58,9 @@ struct GraniteSpeechIntegrationTests {
         let modelID = "mlx-community/granite-4.0-1b-speech-5bit"
 
         let dir = try await ModelLocator().resolve(idOrPath: modelID)
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        guard case .graniteSpeech(let model) = loaded else {
-            Issue.record("AudioModelRegistry did not route to .graniteSpeech; got \(loaded)")
+        let loaded = try await Model.load(dir.path)
+        guard let model = loaded.engine as? GraniteSpeechModel else {
+            Issue.record("the registry did not route to .graniteSpeech; got \(loaded)")
             return
         }
 
@@ -101,9 +101,9 @@ struct GraniteSpeechIntegrationTests {
     func transcribeStreaming() async throws {
         let modelID = "mlx-community/granite-4.0-1b-speech-5bit"
         let dir = try await ModelLocator().resolve(idOrPath: modelID)
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        guard case .graniteSpeech(let model) = loaded else {
-            Issue.record("AudioModelRegistry did not route to .graniteSpeech")
+        let loaded = try await Model.load(dir.path)
+        guard let model = loaded.engine as? GraniteSpeechModel else {
+            Issue.record("the registry did not route to .graniteSpeech")
             return
         }
 

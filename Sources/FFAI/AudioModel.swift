@@ -13,8 +13,8 @@
 // limitations under the License.
 //
 // AudioModel — protocol + shared types for TTS / audio-generation
-// families. The runtime registry is `AudioModelRegistry` in
-// `AudioModelRegistry.swift`; this file declares the model-facing protocol
+// families. The runtime registry is `ModelRegistry` in
+// `ModelRegistry.swift`; this file declares the model-facing protocol
 // + generation-parameter struct + error enum that audio families implement.
 //
 // Audio models differ from `LanguageModel` in that their primary output is

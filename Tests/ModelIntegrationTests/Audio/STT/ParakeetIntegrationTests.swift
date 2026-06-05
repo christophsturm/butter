@@ -221,15 +221,15 @@ struct ParakeetIntegrationTests {
             "streamed transcript '\(streamedTrimmed)' must equal batch '\(batch)'")
     }
 
-    @Test("registry — Parakeet routes through AudioModelRegistry")
+    @Test("registry — Parakeet routes through the registry")
     func registry_routesParakeet() async throws {
         let dir = try await resolveParakeetDir()
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        guard case .parakeet = loaded else {
-            Issue.record("AudioModelRegistry did not route to Parakeet")
+        let loaded = try await Model.load(dir.path)
+        guard loaded.engine is ParakeetModel else {
+            Issue.record("the registry did not route to Parakeet")
             return
         }
-        #expect(loaded.capabilities.contains(.audioIn))
-        #expect(loaded.capabilities.contains(.textOut))
+        #expect(loaded.availableCapabilities.contains(.audioIn))
+        #expect(loaded.availableCapabilities.contains(.textOut))
     }
 }

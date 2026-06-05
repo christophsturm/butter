@@ -36,7 +36,7 @@
 //
 // ## Scope note — STAGED PORT
 //
-// Stage 1 ships: config decoding, `AudioModelRegistry` detection,
+// Stage 1 ships: config decoding, `ModelRegistry` detection,
 // checkpoint weight-bundle retention, and the `PocketTTSModel` scaffold.
 // The full synthesis pipeline — flow LM autoregressive decoding, sentencepiece
 // tokenization, and Mimi codec decode — is a follow-on stage. Until it

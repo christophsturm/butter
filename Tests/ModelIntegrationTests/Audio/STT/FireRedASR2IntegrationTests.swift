@@ -257,16 +257,16 @@ struct FireRedASR2IntegrationTests {
             "streamed transcript \(streamedTrimmed.debugDescription) must equal batch \(batchTrimmed.debugDescription)")
     }
 
-    @Test("registry — AudioModelRegistry routes to .fireRedASR2")
+    @Test("registry — the registry routes to .fireRedASR2")
     func registryRoutes() async throws {
         let dir = try await resolveDir()
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        guard case .fireRedASR2 = loaded else {
+        let loaded = try await Model.load(dir.path)
+        guard loaded.engine is FireRedASR2Model else {
             Issue.record(
-                "AudioModelRegistry did not route to .fireRedASR2; got \(loaded)")
+                "the registry did not route to .fireRedASR2; got \(loaded)")
             return
         }
-        #expect(loaded.capabilities.contains(.audioIn))
-        #expect(loaded.capabilities.contains(.textOut))
+        #expect(loaded.availableCapabilities.contains(.audioIn))
+        #expect(loaded.availableCapabilities.contains(.textOut))
     }
 }

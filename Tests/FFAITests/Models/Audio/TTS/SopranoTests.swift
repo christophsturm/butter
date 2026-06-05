@@ -19,7 +19,7 @@
 //   • hasDecoderConfig — true for 80M, false for 1.1-style config.
 //   • Registry detection — model_type, SopranoForCausalLM architecture,
 //     Qwen3ForCausalLM + soprano model_type combo, negative cases.
-//   • AudioModelRegistry integration — handles + capabilities.
+//   • the registry integration — handles + capabilities.
 //   • SopranoError descriptions — all cases carry useful text.
 //   • Text cleaning — cleanTextForSoprano, number normalisation.
 //   • SopranoConfig.stopTokenId — always 3.
@@ -287,28 +287,28 @@ struct SopranoTests {
         #expect(SopranoModel.architectures.contains("SopranoForCausalLM"))
     }
 
-    // ─── AudioModelRegistry integration ──────────────────────────────
+    // ─── the registry integration ──────────────────────────────
 
-    @Test("AudioModelRegistry — handles Soprano from model_type soprano")
+    @Test("the registry — handles Soprano from model_type soprano")
     func registryHandlesSoprano() {
         let config = ModelConfig(
             architecture: "SopranoForCausalLM", modelType: "soprano",
             raw: ["model_type": "soprano"])
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
     }
 
-    @Test("AudioModelRegistry — capabilities for Soprano is textToSpeech")
+    @Test("the registry — capabilities for Soprano is textToSpeech")
     func registryCapabilitiesSoprano() {
         let config = ModelConfig(
             architecture: "SopranoForCausalLM", modelType: "soprano",
             raw: ["model_type": "soprano"])
-        let caps = AudioModelRegistry.capabilities(for: config)
+        let caps = ModelRegistry.capabilities(for: config)
         #expect(caps == Capability.textToSpeech)
         #expect(caps?.contains(.audioOut) == true)
         #expect(caps?.contains(.textIn) == true)
     }
 
-    @Test("AudioModelRegistry — does not handle plain Qwen3 as Soprano")
+    @Test("the registry — does not handle plain Qwen3 as Soprano")
     func registryDoesNotHandlePlainQwen3AsSoprano() {
         let config = ModelConfig(
             architecture: "Qwen3ForCausalLM", modelType: "qwen3",

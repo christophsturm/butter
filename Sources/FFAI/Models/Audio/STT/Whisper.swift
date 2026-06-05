@@ -192,7 +192,7 @@ public final class WhisperModel: @unchecked Sendable {
     public let config: WhisperConfig
     public let encoder: AudioEncoder
 
-    /// The snapshot tokenizer, attached by `AudioModelRegistry.load` (the
+    /// The snapshot tokenizer, attached by `ModelRegistry.load` (the
     /// model decodes to token ids; the tokenizer renders them to text). When
     /// present, `decodeTokens` produces real text; when nil it falls back to
     /// the deterministic space-joined token-id rendering.

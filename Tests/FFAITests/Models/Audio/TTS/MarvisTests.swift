@@ -23,7 +23,7 @@
 //   * MarvisModel.handles(_:) accepts canonical model_types,
 //     architectures, and structural fallback (audio_num_codebooks +
 //     depth_decoder_config / backbone_flavor).
-//   * AudioModelRegistry routes Marvis configs to Capability.textToSpeech.
+//   * the registry routes Marvis configs to Capability.textToSpeech.
 //   * MarvisError.description renders the family prefix.
 
 import Foundation
@@ -159,14 +159,14 @@ struct MarvisTests {
         #expect(!MarvisModel.handles(config))
     }
 
-    // ─── AudioModelRegistry routing ──────────────────────────────────────
+    // ─── the registry routing ──────────────────────────────────────
 
-    @Test("AudioModelRegistry.capabilities — Marvis maps to textToSpeech")
+    @Test("ModelRegistry.capabilities — Marvis maps to textToSpeech")
     func registryCapability() {
         let config = ModelConfig(
             architecture: nil, modelType: "csm",
             raw: ["model_type": "csm"])
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.textToSpeech)
+        #expect(ModelRegistry.capabilities(for: config) == Capability.textToSpeech)
     }
 
     // ─── Error stringification ───────────────────────────────────────────

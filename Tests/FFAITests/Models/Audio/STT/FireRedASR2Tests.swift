@@ -19,7 +19,7 @@
 // Validates:
 //   * FireRedASR2Config.from(_:) parses config shapes correctly.
 //   * FireRedASR2Model.handles(_:) fires on the expected config signatures.
-//   * AudioModelRegistry routes FireRedASR2 configs to Capability.speechToText.
+//   * the registry routes FireRedASR2 configs to Capability.speechToText.
 //   * FireRedASR2Tokenizer.decode applies SentencePiece and special-token rules.
 //   * FireRedASR2Model.kaldiFbank produces finite, correctly-shaped features.
 
@@ -146,32 +146,32 @@ struct FireRedASR2Tests {
         #expect(!FireRedASR2Model.handles(config))
     }
 
-    @Test("AudioModelRegistry.handles — true for FireRedASR2 config")
+    @Test("ModelRegistry.handlesAudio — true for FireRedASR2 config")
     func registryHandlesFireRedASR2() {
         let config = ModelConfig(
             architecture: "FireRedASR2ForConditionalGeneration",
             modelType: "fireredasr2",
             raw: ["model_type": "fireredasr2"])
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
     }
 
-    @Test("AudioModelRegistry.capabilities — FireRedASR2 maps to speechToText")
+    @Test("ModelRegistry.capabilities — FireRedASR2 maps to speechToText")
     func registryCapabilitySpeechToText() {
         let config = ModelConfig(
             architecture: "FireRedASR2ForConditionalGeneration",
             modelType: "fireredasr2",
             raw: ["model_type": "fireredasr2"])
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.speechToText)
     }
 
-    @Test("AudioModelRegistry.handles — false for text-only model")
+    @Test("ModelRegistry.handlesAudio — false for text-only model")
     func registryFalseForTextModel() {
         let config = ModelConfig(
             architecture: nil, modelType: "qwen3",
             raw: ["model_type": "qwen3", "hidden_size": 2048])
-        #expect(!AudioModelRegistry.handles(config))
+        #expect(!ModelRegistry.handlesAudio(config))
     }
 
     // ─── Tokenizer ───────────────────────────────────────────────────────

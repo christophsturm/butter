@@ -181,19 +181,19 @@ struct ChatterboxTests {
 
     // ─── Registry detection ───────────────────────────────────────────
 
-    @Test("AudioModelRegistry — detects Chatterbox from model_type")
+    @Test("the registry — detects Chatterbox from model_type")
     func registryDetectsChatterboxFromModelType() {
         let config = ModelConfig(
             architecture: nil, modelType: "chatterbox",
             raw: ["model_type": "chatterbox"])
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
         #expect(ChatterboxModel.handles(config))
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.textToSpeech)
     }
 
-    @Test("AudioModelRegistry — detects Chatterbox Turbo from model_type")
+    @Test("the registry — detects Chatterbox Turbo from model_type")
     func registryDetectsChatterboxTurboFromModelType() {
         let config = ModelConfig(
             architecture: "chatterbox_turbo", modelType: "chatterbox_turbo",
@@ -201,14 +201,14 @@ struct ChatterboxTests {
                 "model_type": "chatterbox_turbo",
                 "architecture": "chatterbox_turbo",
             ])
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
         #expect(ChatterboxModel.handles(config))
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.textToSpeech)
     }
 
-    @Test("AudioModelRegistry — detects Chatterbox from architecture field")
+    @Test("the registry — detects Chatterbox from architecture field")
     func registryDetectsFromArchitecture() {
         // Some Turbo checkpoints set architecture = "chatterbox_turbo"
         // while omitting model_type.
@@ -218,7 +218,7 @@ struct ChatterboxTests {
         #expect(ChatterboxModel.handles(config))
     }
 
-    @Test("AudioModelRegistry — detects Chatterbox structurally from t3 block")
+    @Test("the registry — detects Chatterbox structurally from t3 block")
     func registryDetectsStructurallyFromT3Block() {
         // A config without model_type but with a t3 block containing
         // speech_tokens_dict_size in the expected range.
@@ -234,7 +234,7 @@ struct ChatterboxTests {
         #expect(ChatterboxModel.handles(config))
     }
 
-    @Test("AudioModelRegistry — detects Chatterbox structurally from t3_config block")
+    @Test("the registry — detects Chatterbox structurally from t3_config block")
     func registryDetectsFromT3ConfigBlock() {
         let config = ModelConfig(
             architecture: nil, modelType: nil,
@@ -248,13 +248,13 @@ struct ChatterboxTests {
         #expect(ChatterboxModel.handles(config))
     }
 
-    @Test("AudioModelRegistry — does not detect unrelated models")
+    @Test("the registry — does not detect unrelated models")
     func registryDoesNotDetectLlama() {
         let config = ModelConfig(
             architecture: "LlamaForCausalLM", modelType: "llama",
             raw: ["model_type": "llama", "hidden_size": 2048])
         #expect(!ChatterboxModel.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == nil)
+        #expect(ModelRegistry.capabilities(for: config) == nil)
     }
 
     // ─── Staged synthesis error ───────────────────────────────────────

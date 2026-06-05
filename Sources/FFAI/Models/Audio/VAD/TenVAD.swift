@@ -202,7 +202,7 @@ private final class TenVADNative {
 // ─── TenVADModel ─────────────────────────────────────────────────────
 
 /// Loaded TEN-VAD model. Audio-in / speech-probability-out — reached via
-/// `VADModelRegistry`, not `ModelRegistry`. `fromPretrained` downloads
+/// `ModelRegistry`, not `ModelRegistry`. `fromPretrained` downloads
 /// the `TEN-framework/ten-vad` HuggingFace snapshot and links the
 /// macOS framework binary that ships inside it.
 public final class TenVADModel: @unchecked Sendable {

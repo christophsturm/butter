@@ -446,7 +446,7 @@ public enum SAMAudio {
     public static let capability: Set<Capability> = Capability.speechToSpeech
 
     /// Returns true when `config` describes a SAMAudio checkpoint.
-    /// Used by `AudioModelRegistry` for dispatch.
+    /// Used by `ModelRegistry` for dispatch.
     public static func handles(_ config: ModelConfig) -> Bool {
         if let mt = config.modelType, modelTypes.contains(mt) { return true }
         if let arch = config.architecture, architectures.contains(arch) { return true }

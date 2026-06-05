@@ -20,7 +20,7 @@
 //   * SenseVoiceConfig.from(_:) parses nested encoder_conf / frontend_conf.
 //   * SenseVoiceModel.handles(_:) accepts both model_types and structural
 //     fallback (tp_blocks marker).
-//   * AudioModelRegistry routes SenseVoice configs to Capability.speechToText.
+//   * the registry routes SenseVoice configs to Capability.speechToText.
 //   * SenseVoiceFrontEnd CPU helpers (Hamming window, nextPowerOfTwo,
 //     low-frame-rate stacking) return numerically-sane outputs.
 
@@ -158,14 +158,14 @@ struct SenseVoiceTests {
         #expect(!SenseVoiceModel.handles(config))
     }
 
-    // ─── AudioModelRegistry routing ──────────────────────────────────────
+    // ─── the registry routing ──────────────────────────────────────
 
-    @Test("AudioModelRegistry.capabilities — SenseVoice maps to speechToText")
+    @Test("ModelRegistry.capabilities — SenseVoice maps to speechToText")
     func registryCapability() {
         let config = ModelConfig(
             architecture: nil, modelType: "sensevoice",
             raw: ["model_type": "sensevoice"])
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.speechToText)
+        #expect(ModelRegistry.capabilities(for: config) == Capability.speechToText)
     }
 
     // ─── SenseVoiceFrontEnd CPU helpers ─────────────────────────────────

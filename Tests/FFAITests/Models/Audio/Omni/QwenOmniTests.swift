@@ -22,7 +22,7 @@
 //   * QwenOmniModel.handles(_:) accepts both Qwen-Omni model_types and
 //     structural fallback (audio_config presence), and rejects unrelated
 //     models.
-//   * AudioModelRegistry routes QwenOmni configs to Capability.omniAudio.
+//   * the registry routes QwenOmni configs to Capability.omniAudio.
 //   * Qwen3Error.description includes the expected family prefix.
 
 import Foundation
@@ -173,14 +173,14 @@ struct QwenOmniTests {
         #expect(!QwenOmniModel.handles(config))
     }
 
-    // ─── AudioModelRegistry routing ──────────────────────────────────────
+    // ─── the registry routing ──────────────────────────────────────
 
-    @Test("AudioModelRegistry.capabilities — QwenOmni maps to omniAudio")
+    @Test("ModelRegistry.capabilities — QwenOmni maps to omniAudio")
     func registryCapabilityOmni() {
         let config = ModelConfig(
             architecture: nil, modelType: "qwen3_omni",
             raw: ["model_type": "qwen3_omni"])
-        let caps = AudioModelRegistry.capabilities(for: config)
+        let caps = ModelRegistry.capabilities(for: config)
         #expect(caps == Capability.omniAudio)
     }
 

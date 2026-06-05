@@ -174,11 +174,11 @@ struct SenseVoiceIntegrationTests {
     @Test("registry — SenseVoice routes through the audio registry")
     func registry_routesSenseVoice() async throws {
         let dir = try await resolveDir()
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        guard case .senseVoice = loaded else {
-            Issue.record("AudioModelRegistry did not route to SenseVoice")
+        let loaded = try await Model.load(dir.path)
+        guard loaded.engine is SenseVoiceModel else {
+            Issue.record("the registry did not route to SenseVoice")
             return
         }
-        #expect(loaded.capabilities == Capability.speechToText)
+        #expect(loaded.availableCapabilities == Capability.speechToText)
     }
 }

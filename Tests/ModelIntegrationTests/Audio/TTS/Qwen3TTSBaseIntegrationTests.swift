@@ -88,17 +88,17 @@ struct Qwen3TTSBaseIntegrationTests {
         #expect(withVoice.count > withoutVoice.count)
     }
 
-    @Test("registry — VyvoTTS routes through AudioModelRegistry")
+    @Test("registry — VyvoTTS routes through the registry")
     func registry_routesVyvoTTS() async throws {
         let locator = ModelLocator()
         let dir = try await locator.resolve(
             idOrPath: "mlx-community/VyvoTTS-EN-Beta-4bit")
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        guard case .qwen3TTSBase = loaded else {
-            Issue.record("AudioModelRegistry did not route to Qwen3TTSBase")
+        let loaded = try await Model.load(dir.path)
+        guard loaded.engine is Qwen3TTSBaseModel else {
+            Issue.record("the registry did not route to Qwen3TTSBase")
             return
         }
-        #expect(loaded.capabilities == Capability.textToSpeech)
+        #expect(loaded.availableCapabilities == Capability.textToSpeech)
     }
 
     @Test("generateCodes — greedy decode emits finite SNAC code planes")

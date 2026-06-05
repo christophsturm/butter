@@ -18,7 +18,7 @@
 //
 // SmartTurn-v3 is tiny (~8M params, a few MB on disk) so the
 // integration suite stays fast. The model is loaded via
-// `VADModelRegistry` to exercise the registry's architecture-detection
+// `the registry` to exercise the registry's architecture-detection
 // + dispatch path, then `predictEndpoint` is run on an in-process clip
 // (no audio fixture needed) and the utterance-level "turn complete"
 // probability is asserted to be a real, finite, in-range result.
@@ -67,16 +67,16 @@ struct SmartTurnIntegrationTests {
         return clip
     }
 
-    /// Load the SmartTurn model through `VADModelRegistry`, holding the
+    /// Load the SmartTurn model through `the registry`, holding the
     /// global model-load lock. A load failure throws — it is NOT caught
     /// and skipped, so a broken loader fails the suite.
     private func loadSmartTurn() async throws -> SmartTurnModel {
         let loaded = try await ModelLoadLock.shared.loadSerially {
-            try await VADModelRegistry.fromPretrained(Self.repoId)
+            try await Model.load(Self.repoId)
         }
-        guard case .smartTurn(let model) = loaded else {
+        guard let model = loaded.engine as? SmartTurnModel else {
             Issue.record(
-                "VADModelRegistry resolved \(Self.repoId) to \(loaded.kind), expected .smartTurn")
+                "Model.load resolved \(Self.repoId) to kind \(loaded.kind), expected a SmartTurn VAD engine")
             throw SmartTurnError.invalidAudio("registry dispatched to the wrong family")
         }
         return model

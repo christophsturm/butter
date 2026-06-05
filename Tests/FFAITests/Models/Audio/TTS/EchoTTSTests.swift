@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // EchoTTSTests — unit tests for EchoTTS config parsing and registry
-// detection. Exercises the config decode path and the AudioModelRegistry
+// detection. Exercises the config decode path and the the registry
 // `handles` + `capabilities` surface on synthetic config dictionaries.
 // All tests run offline (no checkpoint load, no GPU forward pass).
 
@@ -239,7 +239,7 @@ struct EchoTTSTests {
         #expect(!EchoTTSModel.handles(config))
     }
 
-    @Test("AudioModelRegistry — detects EchoTTS and reports textToSpeech")
+    @Test("the registry — detects EchoTTS and reports textToSpeech")
     func registryDetectsEchoTTS() {
         let config = ModelConfig(
             architecture: nil, modelType: "echo_tts",
@@ -248,19 +248,19 @@ struct EchoTTSTests {
                 "dit": ["latent_size": 80, "speaker_patch_size": 4],
                 "sampler": [:],
             ])
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.textToSpeech)
     }
 
-    @Test("AudioModelRegistry — text-only config is not an audio model")
+    @Test("the registry — text-only config is not an audio model")
     func registryRejectsTextModel() {
         let config = ModelConfig(
             architecture: "LlamaForCausalLM", modelType: "llama",
             raw: ["model_type": "llama", "hidden_size": 2048])
-        #expect(!AudioModelRegistry.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == nil)
+        #expect(!ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.capabilities(for: config) == nil)
     }
 
     // ─── EchoTTSError ────────────────────────────────────────────────────

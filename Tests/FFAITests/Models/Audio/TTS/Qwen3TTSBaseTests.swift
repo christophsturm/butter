@@ -20,7 +20,7 @@
 //  • Config parses required Qwen3 transformer fields.
 //  • `handles` correctly accepts VyvoTTS-style checkpoints and rejects
 //    plain text Qwen3 checkpoints and the 12Hz Flash variant.
-//  • `AudioModelRegistry.handles` routes consistently with the model's
+//  • `ModelRegistry.handlesAudio` routes consistently with the model's
 //    own `handles`.
 //  • Detection does NOT collide with the Qwen3TTS (12Hz Flash) family,
 //    which is distinguished by `talker_config` + `speaker_encoder_config`.
@@ -232,29 +232,29 @@ struct Qwen3TTSBaseTests {
 
     // ── Registry ──────────────────────────────────────────────────────
 
-    @Test("AudioModelRegistry.handles returns true for VyvoTTS config")
+    @Test("ModelRegistry.handlesAudio returns true for VyvoTTS config")
     func registry_handles_vyvoTTS() throws {
         let cfg = try makeConfig(vyvoTTSJSON)
-        #expect(AudioModelRegistry.handles(cfg) == true)
+        #expect(ModelRegistry.handlesAudio(cfg) == true)
     }
 
-    @Test("AudioModelRegistry.handles returns false for plain text Qwen3")
+    @Test("ModelRegistry.handlesAudio returns false for plain text Qwen3")
     func registry_handles_plainQwen3Rejected() throws {
         let cfg = try makeConfig(plainQwen3JSON)
-        #expect(AudioModelRegistry.handles(cfg) == false)
+        #expect(ModelRegistry.handlesAudio(cfg) == false)
     }
 
-    @Test("AudioModelRegistry.capabilities returns textToSpeech for VyvoTTS")
+    @Test("ModelRegistry.capabilities returns textToSpeech for VyvoTTS")
     func registry_capabilities_textToSpeech() throws {
         let cfg = try makeConfig(vyvoTTSJSON)
-        let caps = AudioModelRegistry.capabilities(for: cfg)
+        let caps = ModelRegistry.capabilities(for: cfg)
         #expect(caps == Capability.textToSpeech)
     }
 
-    @Test("AudioModelRegistry.capabilities returns nil for plain Qwen3 text model")
+    @Test("ModelRegistry.capabilities returns nil for plain Qwen3 text model")
     func registry_capabilities_nilForTextModel() throws {
         let cfg = try makeConfig(plainQwen3JSON)
-        let caps = AudioModelRegistry.capabilities(for: cfg)
+        let caps = ModelRegistry.capabilities(for: cfg)
         #expect(caps == nil)
     }
 

@@ -246,7 +246,7 @@ public final class SenseVoiceEncoderLayer: Module {
 public final class SenseVoiceModel: @unchecked Sendable {
     public let config: SenseVoiceConfig
 
-    /// The snapshot tokenizer, attached by `AudioModelRegistry.load`. NOTE:
+    /// The snapshot tokenizer, attached by `ModelRegistry.load`. NOTE:
     /// SenseVoice (FunASR) ships a `tokens.txt` / SentencePiece vocab, not a
     /// HuggingFace `tokenizer.json`, so `TokenizerLoader` usually can't load
     /// it — `tokenizer` then stays nil and `decodeTokens` falls back to the

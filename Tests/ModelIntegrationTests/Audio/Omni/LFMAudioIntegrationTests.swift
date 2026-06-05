@@ -190,21 +190,21 @@ struct LFMAudioIntegrationTests {
 
     // ── Registry load path ───────────────────────────────────────────────
 
-    @Test("AudioModelRegistry.load — returns .lfmAudio case for LFMAudio checkpoint")
+    @Test("the registry.load — returns .lfmAudio case for LFMAudio checkpoint")
     func registryLoad_returnsLFMAudioCase() async throws {
         let dir = try await ModelLoadLock.shared.loadSerially {
             try await ModelLocator().resolve(idOrPath: Self.repoId)
         }
         let loaded = try await ModelLoadLock.shared.loadSerially {
-            try await AudioModelRegistry.load(directory: dir)
+            try await Model.load(dir.path)
         }
-        guard case .lfmAudio(let model) = loaded else {
+        guard let model = loaded.engine as? LFMAudioModel else {
             Issue.record("Expected .lfmAudio but got \(loaded)")
             return
         }
-        #expect(loaded.capabilities == Capability.omniAudio)
+        #expect(loaded.availableCapabilities == Capability.omniAudio)
         #expect(model.blocks.count == model.config.encoder.nLayers)
-        print("AudioModelRegistry correctly loaded LFMAudio (\(model.config.modelType))")
+        print("the registry correctly loaded LFMAudio (\(model.config.modelType))")
     }
 
     // ── Streaming transcription ──────────────────────────────────────────
@@ -218,10 +218,10 @@ struct LFMAudioIntegrationTests {
             try await ModelLocator().resolve(idOrPath: Self.repoId)
         }
         let loaded = try await ModelLoadLock.shared.loadSerially {
-            try await AudioModelRegistry.load(directory: dir)
+            try await Model.load(dir.path)
         }
-        guard case .lfmAudio(let model) = loaded else {
-            Issue.record("AudioModelRegistry did not route to .lfmAudio")
+        guard let model = loaded.engine as? LFMAudioModel else {
+            Issue.record("the registry did not route to .lfmAudio")
             return
         }
         #expect(model.tokenizer != nil, "registry must attach a tokenizer")

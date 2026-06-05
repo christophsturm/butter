@@ -19,7 +19,7 @@
 // speech-probability stream plus optional post-processed speech
 // segments. Unlike the causal-LM families (`LanguageModel`), VAD models
 // are audio-in / probability-out, so they don't flow through
-// `ModelRegistry` / `Model`. They live under `VADModelRegistry`
+// `ModelRegistry` / `Model`. They live under `ModelRegistry`
 // instead and expose their own `loadFromDirectory` / `fromPretrained`
 // entry points.
 

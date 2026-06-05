@@ -115,16 +115,26 @@ public enum ModelRegistry {
     /// flow into the `Model` so callers can read them off without
     /// knowing the concrete family.
     public struct Loaded {
-        public let engine: any LanguageModel
+        /// The loaded engine, type-erased to `ModelEngine`. A
+        /// `LanguageModel` for text/VL families; a `Transcribing` /
+        /// `Synthesizing` / `Detecting` / `SpeechTransforming` for the audio
+        /// / VAD families.
+        public let engine: any ModelEngine
         public let defaultGenerationParameters: GenerationParameters
         /// Capabilities the loaded variant supports. Text-only families
-        /// report `Capability.textOnly`; VL variants add `.imageIn`.
+        /// report `Capability.textOnly`; VL variants add `.imageIn`;
+        /// audio families report their modality set (e.g. `textToSpeech`).
         public let availableCapabilities: Set<Capability>
         /// The composed vision-language model, when the checkpoint is a
-        /// VLM. `nil` for text-only families. The `engine` is the VL
+        /// VLM. `nil` for text-only / audio families. The `engine` is the VL
         /// model's text backbone, so text-only generation works
         /// regardless; `vlModel` adds the cross-modal image path.
         public let vlModel: VisionModel?
+        /// The tokenizer the directory loaders (audio / VAD) resolved and,
+        /// for STT/omni, attached to the engine. `nil` for the text/VL
+        /// path, where `Model.load` loads the tokenizer itself, and for the
+        /// tokenizer-less kinds (VAD / STS).
+        public let tokenizer: (any Tokenizer)?
         /// Catalog kind of the matched family. The family `load` closures
         /// don't set this (it'd duplicate the `ModelEntry.kind` they're
         /// declared with); `dispatchAndLoad` stamps it from the matched
@@ -132,16 +142,18 @@ public enum ModelRegistry {
         public var kind: ModelKind = .llm
 
         public init(
-            engine: any LanguageModel,
-            defaultGenerationParameters: GenerationParameters,
+            engine: any ModelEngine,
+            defaultGenerationParameters: GenerationParameters = GenerationParameters(),
             availableCapabilities: Set<Capability> = Capability.textOnly,
             vlModel: VisionModel? = nil,
+            tokenizer: (any Tokenizer)? = nil,
             kind: ModelKind = .llm
         ) {
             self.engine = engine
             self.defaultGenerationParameters = defaultGenerationParameters
             self.availableCapabilities = availableCapabilities
             self.vlModel = vlModel
+            self.tokenizer = tokenizer
             self.kind = kind
         }
     }

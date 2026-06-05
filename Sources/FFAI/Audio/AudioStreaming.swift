@@ -63,65 +63,12 @@ public protocol StreamingSynthesizer: Sendable {
     ) -> AsyncThrowingStream<Tensor, Error>
 }
 
-extension LoadedAudioModel {
-    /// The loaded model as a speech-to-text streamer, or nil if it isn't a
-    /// transcription model. Mirrors the `speechToText` / `omniAudio`
-    /// buckets in `capabilities(for:)`.
-    public var transcriber: (any StreamingTranscriber)? {
-        switch self {
-        case .graniteSpeech(let m): return m
-        case .whisper(let m): return m
-        case .senseVoice(let m): return m
-        case .parakeet(let m): return m
-        case .qwen3ASR(let m): return m
-        case .fireRedASR2(let m): return m
-        case .glmASR(let m): return m
-        case .cohereTranscribe(let m): return m
-        case .voxtralRealtime(let m): return m
-        case .qwenOmni(let m): return m
-        case .lfmAudio(let m): return m
-        default: return nil
-        }
-    }
-
-    /// The loaded model as a tokenizer-attachable, or nil if its decode
-    /// path doesn't need the snapshot tokenizer wired at load. The registry
-    /// uses this for a single uniform attach instead of per-branch wiring.
-    var tokenizerAttachable: (any TokenizerAttachable)? {
-        switch self {
-        case .glmASR(let m): return m
-        case .qwen3ASR(let m): return m
-        case .qwenOmni(let m): return m
-        case .lfmAudio(let m): return m
-        case .whisper(let m): return m
-        case .senseVoice(let m): return m
-        default: return nil
-        }
-    }
-
-    /// The loaded model as a text-to-speech streamer, or nil if it isn't a
-    /// synthesis model. Mirrors the `textToSpeech` bucket in
-    /// `capabilities(for:)`. Cases are added as each model gains a
-    /// `synthesizeStream(text:voice:speed:)` conformance (rollout).
-    public var synthesizer: (any StreamingSynthesizer)? {
-        switch self {
-        case .kokoro(let m): return m
-        case .styleTTS2(let m): return m
-        case .llamaTTS(let m): return m
-        case .marvis(let m): return m
-        case .qwen3TTS(let m): return m
-        case .qwen3TTSBase(let m): return m
-        case .echoTTS(let m): return m
-        case .chatterbox(let m): return m
-        case .mossTTS(let m): return m
-        case .mossTTSNano(let m): return m
-        case .pocketTTS(let m): return m
-        case .soprano(let m): return m
-        case .fishSpeech(let m): return m
-        default: return nil
-        }
-    }
-}
+// The loaded-model → transcriber / synthesizer accessors that used to live
+// here (on the deleted `LoadedAudioModel` enum) are now on the unified
+// `Model`: `model.engine as? any Transcribing` / `any Synthesizing`, surfaced
+// through `Model.transcribeStream` / `synthesizeStream` (see
+// `ModelType/ModelInference.swift`). The tokenizer attach the registry did
+// via `tokenizerAttachable` now happens in `ModelRegistry.audioLoaded`.
 
 // MARK: - GraniteSpeech (reference STT conformance)
 

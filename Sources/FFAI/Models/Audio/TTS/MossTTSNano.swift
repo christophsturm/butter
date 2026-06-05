@@ -33,7 +33,7 @@
 //
 // ## Scope note — STAGED PORT
 //
-// This file is stage 1: config decoding, `AudioModelRegistry` detection,
+// This file is stage 1: config decoding, `ModelRegistry` detection,
 // checkpoint weight-bundle retention, and the top-level `MossTTSNanoModel`
 // scaffold. The full local-transformer generation loop and the MOSS Nano
 // audio codec decoder are follow-on stages. Until they land, `synthesize`

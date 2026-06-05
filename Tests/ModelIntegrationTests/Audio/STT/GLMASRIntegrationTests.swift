@@ -230,18 +230,18 @@ struct GLMASRIntegrationTests {
             "streamed transcript \(streamedTrimmed.debugDescription) must equal batch \(batch.debugDescription)")
     }
 
-    @Test("registry — AudioModelRegistry routes checkpoint to .glmASR")
+    @Test("registry — the registry routes checkpoint to .glmASR")
     func registryRoutes() async throws {
         let dir = try await resolveDir()
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        guard case .glmASR = loaded else {
+        let loaded = try await Model.load(dir.path)
+        guard loaded.engine is GLMASRModel else {
             Issue.record(
-                "AudioModelRegistry did not route to .glmASR; got \(loaded)")
+                "the registry did not route to .glmASR; got \(loaded)")
             return
         }
-        #expect(loaded.capabilities == Capability.speechToText)
+        #expect(loaded.availableCapabilities == Capability.speechToText)
         print(
             "[GLM-ASR integration] registry routed correctly, "
-                + "capabilities=\(loaded.capabilities)")
+                + "capabilities=\(loaded.availableCapabilities)")
     }
 }

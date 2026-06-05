@@ -245,19 +245,19 @@ struct MossTTSNanoTests {
         #expect(!MossTTSNanoModel.handles(config))
     }
 
-    // ─── AudioModelRegistry integration ──────────────────────────────
+    // ─── the registry integration ──────────────────────────────
 
-    @Test("AudioModelRegistry — handles MOSS-TTS-Nano from model_type")
+    @Test("the registry — handles MOSS-TTS-Nano from model_type")
     func registryHandlesMossTTSNano() {
         let config = ModelConfig(
             architecture: nil,
             modelType: "moss_tts_nano",
             raw: ["model_type": "moss_tts_nano"])
-        #expect(AudioModelRegistry.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.textToSpeech)
+        #expect(ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.capabilities(for: config) == Capability.textToSpeech)
     }
 
-    @Test("AudioModelRegistry — routes to .mossTTSNano, not .mossTTS")
+    @Test("the registry — routes to .mossTTSNano, not .mossTTS")
     func registryRoutesToNano() {
         // A Nano config must never be matched by the 8B MOSS-TTS family
         // because MossTTSNanoModel.handles is checked first in the registry.

@@ -31,7 +31,7 @@
 //
 // FFAI's current contribution is the **model scaffold**: config decoding,
 // weight loading from safetensors, and the `handles` / load plumbing for
-// the AudioModelRegistry. The full diffusion forward pass (the DiT
+// the ModelRegistry. The full diffusion forward pass (the DiT
 // transformer, Euler CFG sampler, and Fish S1 DAC codec) is a large
 // operator set that requires batch matrix multiply, multi-head attention
 // with softmax, and streaming audio decode — operators beyond what the

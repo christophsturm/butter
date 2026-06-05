@@ -177,14 +177,14 @@ struct Qwen3TTSTests {
         #expect(!Qwen3TTSModel.handles(config))
     }
 
-    // ─── AudioModelRegistry routing ──────────────────────────────────────
+    // ─── the registry routing ──────────────────────────────────────
 
-    @Test("AudioModelRegistry.capabilities — Qwen3TTS maps to textToSpeech")
+    @Test("ModelRegistry.capabilities — Qwen3TTS maps to textToSpeech")
     func registryCapability() {
         let config = ModelConfig(
             architecture: nil, modelType: "qwen3_tts",
             raw: Self.canonicalRaw())
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.textToSpeech)
+        #expect(ModelRegistry.capabilities(for: config) == Capability.textToSpeech)
     }
 
     // ─── Error stringification ───────────────────────────────────────────

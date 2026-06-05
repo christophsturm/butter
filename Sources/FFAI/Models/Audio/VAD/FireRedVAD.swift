@@ -935,7 +935,7 @@ enum FireRedVADPostprocessor {
 // ─── FireRedVADModel ──────────────────────────────────────────────────
 
 /// Loaded FireRedVAD model. Audio-in / speech-probability-out — reached
-/// via `VADModelRegistry`, not `ModelRegistry`. `fromPretrained` downloads
+/// via `ModelRegistry`, not `ModelRegistry`. `fromPretrained` downloads
 /// the `FireRedTeam/FireRedVAD` HuggingFace snapshot and loads weights
 /// directly from the PyTorch `.pth.tar` archive (no mlx-community
 /// conversion needed).

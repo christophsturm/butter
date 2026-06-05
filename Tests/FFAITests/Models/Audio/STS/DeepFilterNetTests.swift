@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // DeepFilterNetTests — unit tests for config parsing, DSP helpers, and
-// AudioModelRegistry detection.  No weights required; all tests run offline.
+// the registry detection.  No weights required; all tests run offline.
 
 import Foundation
 import Testing
@@ -155,9 +155,9 @@ struct DeepFilterNetTests {
         #expect(out.allSatisfy { abs($0) < 1e-5 })
     }
 
-    // MARK: - AudioModelRegistry detection
+    // MARK: - the registry detection
 
-    @Test("AudioModelRegistry.handles returns true for DeepFilterNet model_type")
+    @Test("ModelRegistry.handlesAudio returns true for DeepFilterNet model_type")
     func registryDetectsDeepFilterNet() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("dfn-test-\(UUID().uuidString)")
@@ -168,12 +168,12 @@ struct DeepFilterNetTests {
             atomically: true, encoding: .utf8
         )
         let cfg = try ModelConfig.load(from: dir)
-        #expect(AudioModelRegistry.handles(cfg))
-        let caps = AudioModelRegistry.capabilities(for: cfg)
+        #expect(ModelRegistry.handlesAudio(cfg))
+        let caps = ModelRegistry.capabilities(for: cfg)
         #expect(caps == Capability.speechToSpeech)
     }
 
-    @Test("AudioModelRegistry.handles returns false for unrelated model_type")
+    @Test("ModelRegistry.handlesAudio returns false for unrelated model_type")
     func registryRejectsLLM() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("dfn-llm-\(UUID().uuidString)")
@@ -184,7 +184,7 @@ struct DeepFilterNetTests {
             atomically: true, encoding: .utf8
         )
         let cfg = try ModelConfig.load(from: dir)
-        #expect(!AudioModelRegistry.handles(cfg))
+        #expect(!ModelRegistry.handlesAudio(cfg))
     }
 
     @Test("DeepFilterNetModel.handles recognises all registered model_type strings")

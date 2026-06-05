@@ -150,9 +150,9 @@ struct StyleTTS2Tests {
         #expect(StyleTTS2Model.handles(mc) == false)
     }
 
-    // ─── AudioModelRegistry ────────────────────────────────────────────
+    // ─── the registry ────────────────────────────────────────────
 
-    @Test("AudioModelRegistry.handles() returns true for kitten_tts")
+    @Test("ModelRegistry.handlesAudio() returns true for kitten_tts")
     func registryHandles() throws {
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -163,10 +163,10 @@ struct StyleTTS2Tests {
                 atomically: true, encoding: .utf8)
 
         let mc = try ModelConfig.load(from: dir)
-        #expect(AudioModelRegistry.handles(mc) == true)
+        #expect(ModelRegistry.handlesAudio(mc) == true)
     }
 
-    @Test("AudioModelRegistry.capabilities returns textToSpeech for kitten_tts")
+    @Test("ModelRegistry.capabilities returns textToSpeech for kitten_tts")
     func registryCapabilities() throws {
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -177,11 +177,11 @@ struct StyleTTS2Tests {
                 atomically: true, encoding: .utf8)
 
         let mc = try ModelConfig.load(from: dir)
-        let caps = AudioModelRegistry.capabilities(for: mc)
+        let caps = ModelRegistry.capabilities(for: mc)
         #expect(caps == Capability.textToSpeech)
     }
 
-    @Test("AudioModelRegistry.capabilities(forConfigAt:) resolves kitten_tts directory")
+    @Test("ModelRegistry.capabilities(forConfigAt:) resolves kitten_tts directory")
     func registryCapabilitiesFromDir() throws {
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -191,7 +191,7 @@ struct StyleTTS2Tests {
                 to: dir.appendingPathComponent("config.json"),
                 atomically: true, encoding: .utf8)
 
-        let caps = AudioModelRegistry.capabilities(forConfigAt: dir)
+        let caps = ModelRegistry.capabilities(forConfigAt: dir)
         #expect(caps == Capability.textToSpeech)
     }
 

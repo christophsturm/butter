@@ -19,7 +19,7 @@ import Testing
 
 // Unit tests for the Sortformer speaker-diarization family — config
 // decoding, published architecture defaults, segment post-processing,
-// and the `VADModelRegistry` dispatch. Full checkpoint-load + forward is
+// and the `the registry` dispatch. Full checkpoint-load + forward is
 // covered by the ModelTests integration suite; these run purely on
 // in-process data so they are fast + offline.
 //
@@ -219,7 +219,7 @@ struct SortformerTests {
         #expect(c.processor.featureSize == 128)
     }
 
-    // ─── VADModelRegistry — Sortformer dispatch ──────────────────────
+    // ─── the registry — Sortformer dispatch ──────────────────────
 
     @Test("AudioModelKind.sortformer — model_type set contains expected strings")
     func sortformerModelTypeSet() {
@@ -228,25 +228,25 @@ struct SortformerTests {
         #expect(kinds.contains("diar_sortformer"))
     }
 
-    @Test("VADModelRegistry.detectKind — dispatches sortformer by config model_type")
+    @Test("ModelRegistry.detectVADKind — dispatches sortformer by config model_type")
     func registryDetectSortformerByConfig() throws {
         let dir = try writeTempConfig(
             ["model_type": "sortformer"],
             named: "test-sortformer")
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .sortformer)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .sortformer)
     }
 
-    @Test("VADModelRegistry.detectKind — dispatches diar_sortformer by config model_type")
+    @Test("ModelRegistry.detectVADKind — dispatches diar_sortformer by config model_type")
     func registryDetectDiarSortformerByConfig() throws {
         let dir = try writeTempConfig(
             ["model_type": "diar_sortformer"],
             named: "test-diar-sortformer")
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .sortformer)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .sortformer)
     }
 
-    @Test("VADModelRegistry.detectKind — falls back to sortformer by directory name")
+    @Test("ModelRegistry.detectVADKind — falls back to sortformer by directory name")
     func registryDetectSortformerByName() throws {
         let base = FileManager.default.temporaryDirectory
         let dir = base.appendingPathComponent(
@@ -255,10 +255,10 @@ struct SortformerTests {
             at: dir,
             withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .sortformer)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .sortformer)
     }
 
-    @Test("VADModelRegistry.detectKind — falls back to sortformer by diar in name")
+    @Test("ModelRegistry.detectVADKind — falls back to sortformer by diar in name")
     func registryDetectDiarByName() throws {
         let base = FileManager.default.temporaryDirectory
         let dir = base.appendingPathComponent(
@@ -267,7 +267,7 @@ struct SortformerTests {
             at: dir,
             withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .sortformer)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .sortformer)
     }
 
     // ─── SortformerModel.probsToSegments ────────────────────────────

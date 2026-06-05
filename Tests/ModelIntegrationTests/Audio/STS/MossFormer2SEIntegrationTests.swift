@@ -22,7 +22,7 @@
 //
 // Tests verified here:
 //   1. Config loads and decodes correct values from the cached checkpoint.
-//   2. AudioModelRegistry routes the checkpoint directory to .mossFormer2SE.
+//   2. the registry routes the checkpoint directory to .mossFormer2SE.
 //   3. enhance() on a 1-second synthetic 48 kHz waveform returns a non-empty
 //      output with the same length as the input (within ±hopLength samples).
 //
@@ -112,7 +112,7 @@ struct MossFormer2SEIntegrationTests {
                 + "outCF=\(se.outChannelsFinal), nBlocks=\(se.numBlocks)")
     }
 
-    @Test("registry — AudioModelRegistry routes checkpoint to .mossFormer2SE (config only)")
+    @Test("registry — the registry routes checkpoint to .mossFormer2SE (config only)")
     func registryRoutesFromConfig() throws {
         let snap = try #require(
             Self.resolveCheckpoint(),
@@ -120,8 +120,8 @@ struct MossFormer2SEIntegrationTests {
         let modelConfig = try ModelConfig.load(from: snap)
         // Detection is config-only; no weights needed.
         #expect(MossFormer2SEModel.handles(modelConfig))
-        #expect(AudioModelRegistry.handles(modelConfig))
-        #expect(AudioModelRegistry.capabilities(for: modelConfig) == Capability.speechToSpeech)
+        #expect(ModelRegistry.handlesAudio(modelConfig))
+        #expect(ModelRegistry.capabilities(for: modelConfig) == Capability.speechToSpeech)
         print("[MossFormer2SE] Registry detection: OK, capabilities=\(Capability.speechToSpeech)")
     }
 

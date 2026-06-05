@@ -399,6 +399,28 @@ public final class Model: @unchecked Sendable {
                     .load,
                     "config: arch=\(config.architecture ?? "?") model_type=\(config.modelType ?? "?") hidden=\(config.hiddenSize ?? 0) layers=\(config.numLayers ?? 0)"
                 )
+                // Audio / VAD families load from the directory (they build
+                // their own weight bundles internally — some async — and
+                // attach their own tokenizer), so they bypass the top-level
+                // bundle build + residency pin and the LoRA hook below.
+                if let entry = ModelRegistry.entry(for: config),
+                    let dirLoad = entry.loadFromDirectory
+                {
+                    var loaded = try await dirLoad(dir, config, options, device)
+                    loaded.kind = entry.kind
+                    return Model(
+                        engine: loaded.engine, kind: loaded.kind,
+                        tokenizer: loaded.tokenizer, config: config,
+                        modelDirectory: dir,
+                        availableCapabilities: loaded.availableCapabilities,
+                        enabledCapabilities: options.capabilities,
+                        defaultGenerationParameters: loaded.defaultGenerationParameters,
+                        loadOptions: options,
+                        vlModel: loaded.vlModel,
+                        residencyDevice: device)
+                }
+
+                // Text / VL path: pre-built, residency-pinned weights.
                 let bundle = try SafeTensorsBundle(directory: dir, device: device)
                 // Pin every weight buffer in a persistent MTLResidencySet
                 // so prefill / decode dispatches skip per-allocation

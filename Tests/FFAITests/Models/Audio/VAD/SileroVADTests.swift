@@ -14,7 +14,7 @@
 //
 // SileroVADTests — unit tests for the SileroVAD family: branch / model
 // config decoding, post-processing logic, the weight-key remap, and the
-// VADModelRegistry detection path. All tests run offline, no checkpoint
+// the registry detection path. All tests run offline, no checkpoint
 // required — the full forward path is covered by the integration suite.
 
 import Foundation
@@ -166,30 +166,30 @@ struct SileroVADTests {
         #expect(err.description.contains("conv1.weight"))
     }
 
-    // ─── VADModelRegistry detection ─────────────────────────────────────
+    // ─── the registry detection ─────────────────────────────────────
 
     @Test("AudioModelKind.sileroVAD — modelTypes contains silero_vad")
     func audioModelKindSilero() {
         #expect(AudioModelKind.sileroVAD.modelTypes.contains("silero_vad"))
     }
 
-    @Test("VADModelRegistry.detectKind — recognizes silero_vad model_type")
+    @Test("ModelRegistry.detectVADKind — recognizes silero_vad model_type")
     func registryDetectKindSilero() throws {
         let dir = try writeTempConfig(
             ["model_type": "silero_vad"],
             named: "silero-vad-checkpoint")
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .sileroVAD)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .sileroVAD)
     }
 
-    @Test("VADModelRegistry.detectKind — falls back to directory name for silero")
+    @Test("ModelRegistry.detectVADKind — falls back to directory name for silero")
     func registryDetectKindSileroByName() throws {
         let base = FileManager.default.temporaryDirectory
         let dir = base.appendingPathComponent(
             "models--mlx-community--silero-vad-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .sileroVAD)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .sileroVAD)
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────

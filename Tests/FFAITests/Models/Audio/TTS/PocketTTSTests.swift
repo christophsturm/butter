@@ -18,7 +18,7 @@
 //   • Config decoding — from canonical and minimal config.json payloads.
 //   • Sub-config decoding: FlowLM, Transformer, LookupTable, Seanet, Mimi.
 //   • Registry detection — model_type, structural paths, negative cases.
-//   • AudioModelRegistry integration — handles + capabilities.
+//   • the registry integration — handles + capabilities.
 //   • Staged synthesis error — synthesize() throws PocketTTSError.synthesisNotWired.
 //
 // These tests are fast and offline — no checkpoint weights are loaded.
@@ -297,32 +297,32 @@ struct PocketTTSTests {
         #expect(!PocketTTSModel.handles(config))
     }
 
-    // ─── AudioModelRegistry integration ──────────────────────────────
+    // ─── the registry integration ──────────────────────────────
 
-    @Test("AudioModelRegistry — handles PocketTTS from model_type")
+    @Test("the registry — handles PocketTTS from model_type")
     func registryHandlesPocketTTS() {
         let config = ModelConfig(
             architecture: nil, modelType: "pocket_tts",
             raw: ["model_type": "pocket_tts"])
-        #expect(AudioModelRegistry.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.textToSpeech)
+        #expect(ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.capabilities(for: config) == Capability.textToSpeech)
     }
 
-    @Test("AudioModelRegistry — does not handle unrelated models")
+    @Test("the registry — does not handle unrelated models")
     func registryDoesNotHandleLlama() {
         let config = ModelConfig(
             architecture: "LlamaForCausalLM", modelType: "llama",
             raw: ["model_type": "llama"])
-        #expect(!AudioModelRegistry.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == nil)
+        #expect(!ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.capabilities(for: config) == nil)
     }
 
-    @Test("AudioModelRegistry — capabilities for PocketTTS is textToSpeech")
+    @Test("the registry — capabilities for PocketTTS is textToSpeech")
     func registryCapabilities() {
         let config = ModelConfig(
             architecture: nil, modelType: "pocket_tts",
             raw: ["model_type": "pocket_tts"])
-        let caps = AudioModelRegistry.capabilities(for: config)
+        let caps = ModelRegistry.capabilities(for: config)
         #expect(caps == Capability.textToSpeech)
         #expect(caps?.contains(.audioOut) == true)
         #expect(caps?.contains(.textIn) == true)

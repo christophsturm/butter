@@ -59,11 +59,10 @@ struct SpeakCommand: AsyncParsableCommand {
 
         print("ffai \(FFAI.version) — loading \(model)…")
         let loadStart = Date()
-        let dir = try await ModelLocator().resolve(idOrPath: model)
-        let loaded = try await AudioModelRegistry.load(directory: dir)
+        let m = try await Model.load(model)
         print("loaded in \(String(format: "%.2f", Date().timeIntervalSince(loadStart)))s")
 
-        guard let synthesizer = loaded.synthesizer else {
+        guard m.engine is any Synthesizing, let sampleRate = m.audioSampleRate else {
             throw ValidationError(
                 "\(model) is not a text-to-speech model (no synthesis path).")
         }
@@ -72,7 +71,7 @@ struct SpeakCommand: AsyncParsableCommand {
         let start = Date()
         var samples: [Float] = []
         var segments = 0
-        let stream = synthesizer.synthesizeStream(text: text, voice: voice, speed: speed)
+        let stream = m.synthesizeStream(text: text, voice: voice, speed: speed)
         for try await chunk in stream {
             samples.append(contentsOf: chunk.toFloatArray())
             segments += 1
@@ -85,12 +84,12 @@ struct SpeakCommand: AsyncParsableCommand {
 
         let outURL = URL(fileURLWithPath: out)
         try WavWriter.write(
-            samples: samples, sampleRate: synthesizer.sampleRate, to: outURL)
+            samples: samples, sampleRate: sampleRate, to: outURL)
         print("---")
-        let seconds = Double(samples.count) / Double(synthesizer.sampleRate)
+        let seconds = Double(samples.count) / Double(sampleRate)
         print(
             "wrote \(outURL.path) — \(String(format: "%.2f", seconds))s of audio "
-                + "(\(samples.count) samples @ \(synthesizer.sampleRate) Hz) "
+                + "(\(samples.count) samples @ \(sampleRate) Hz) "
                 + "in \(String(format: "%.2f", Date().timeIntervalSince(start)))s")
     }
 }

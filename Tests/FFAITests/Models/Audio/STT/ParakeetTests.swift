@@ -18,7 +18,7 @@
 // Validates:
 //   * ParakeetConfig.from(_:) parses V2 and V3 config shapes correctly.
 //   * ParakeetModel.handles(_:) fires on real config signatures.
-//   * AudioModelRegistry.handles(_:) routes Parakeet configs.
+//   * ModelRegistry.handlesAudio(_:) routes Parakeet configs.
 //   * ParakeetFrontEnd.logMelFeatures produces finite, correctly-shaped output.
 //   * ParakeetTokeniser.decode handles BPE boundary markers.
 
@@ -213,18 +213,18 @@ struct ParakeetTests {
         #expect(!ParakeetModel.handles(makeConfig(raw)))
     }
 
-    // ─── AudioModelRegistry detection ────────────────────────────────
+    // ─── the registry detection ────────────────────────────────
 
-    @Test("AudioModelRegistry.handles — true for Parakeet config")
+    @Test("ModelRegistry.handlesAudio — true for Parakeet config")
     func registry_handlesParakeet() {
         let raw = rawParakeetConfig()
-        #expect(AudioModelRegistry.handles(makeConfig(raw)))
+        #expect(ModelRegistry.handlesAudio(makeConfig(raw)))
     }
 
-    @Test("AudioModelRegistry.handles — false for text model")
+    @Test("ModelRegistry.handlesAudio — false for text model")
     func registry_handlesTextModel_false() {
         let raw: [String: Any] = ["model_type": "qwen3", "hidden_size": 2048]
-        #expect(!AudioModelRegistry.handles(makeConfig(raw)))
+        #expect(!ModelRegistry.handlesAudio(makeConfig(raw)))
     }
 
     // ─── Front-end ────────────────────────────────────────────────────

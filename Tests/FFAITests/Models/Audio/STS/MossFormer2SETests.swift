@@ -19,7 +19,7 @@
 //   • Registry detection — model_type path and structural path.
 //   • Negative detection — unrelated configs are not matched.
 //   • Capability set verification.
-//   • AudioModelRegistry routes correctly.
+//   • the registry routes correctly.
 //
 // These tests are fast and offline — no checkpoint weights are loaded.
 
@@ -169,26 +169,26 @@ struct MossFormer2SETests {
         #expect(!MossFormer2SEModel.handles(config))
     }
 
-    // ─── AudioModelRegistry integration ──────────────────────────────
+    // ─── the registry integration ──────────────────────────────
 
-    @Test("AudioModelRegistry — handles MossFormer2SE from model_type")
+    @Test("the registry — handles MossFormer2SE from model_type")
     func registryHandlesMossFormer2SE() {
         let config = ModelConfig(
             architecture: nil,
             modelType: "mossformer2_se",
             raw: ["model_type": "mossformer2_se"])
-        #expect(AudioModelRegistry.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.speechToSpeech)
+        #expect(ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.capabilities(for: config) == Capability.speechToSpeech)
     }
 
-    @Test("AudioModelRegistry — does not handle unrelated models")
+    @Test("the registry — does not handle unrelated models")
     func registryDoesNotHandleQwen3() {
         let config = ModelConfig(
             architecture: "Qwen3ForCausalLM",
             modelType: "qwen3",
             raw: ["model_type": "qwen3", "hidden_size": 4_096])
-        #expect(!AudioModelRegistry.handles(config))
-        #expect(AudioModelRegistry.capabilities(for: config) == nil)
+        #expect(!ModelRegistry.handlesAudio(config))
+        #expect(ModelRegistry.capabilities(for: config) == nil)
     }
 
     // ─── Capability set ───────────────────────────────────────────────

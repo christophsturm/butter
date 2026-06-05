@@ -21,7 +21,7 @@
 //     config layout (including the nested istftnet block).
 //   * KokoroModel.handles(_:) accepts both kokoro and style_tts2
 //     model_types and structural fallback (istftnet + n_token).
-//   * AudioModelRegistry routes Kokoro configs to Capability.textToSpeech.
+//   * the registry routes Kokoro configs to Capability.textToSpeech.
 //   * KokoroModel.availableVoices catalogue has the expected default and
 //     covers multiple language prefixes.
 //   * KokoroError.description renders the expected family prefix.
@@ -148,14 +148,14 @@ struct KokoroTests {
         #expect(prefixes.count >= 3)
     }
 
-    // ─── AudioModelRegistry routing ──────────────────────────────────────
+    // ─── the registry routing ──────────────────────────────────────
 
-    @Test("AudioModelRegistry.capabilities — Kokoro maps to textToSpeech")
+    @Test("ModelRegistry.capabilities — Kokoro maps to textToSpeech")
     func registryCapability() {
         let config = ModelConfig(
             architecture: nil, modelType: "kokoro",
             raw: ["model_type": "kokoro"])
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.textToSpeech)
+        #expect(ModelRegistry.capabilities(for: config) == Capability.textToSpeech)
     }
 
     // ─── Error stringification ───────────────────────────────────────────

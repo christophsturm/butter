@@ -22,7 +22,7 @@
 //   * LlamaTTSModel.handles(_:) accepts canonical model_types,
 //     architectures, and structural fallback (Llama + audio vocab +
 //     sample_rate).
-//   * AudioModelRegistry routes LlamaTTS configs to Capability.textToSpeech.
+//   * the registry routes LlamaTTS configs to Capability.textToSpeech.
 //   * LlamaTTSModel.deinterleaveSNACCodes turns 7-token frames into 3
 //     SNAC code planes with the expected per-position offsets.
 //   * LlamaTTSError descriptions render the family prefix.
@@ -118,14 +118,14 @@ struct LlamaTTSTests {
         #expect(!LlamaTTSModel.handles(config))
     }
 
-    // ─── AudioModelRegistry routing ──────────────────────────────────────
+    // ─── the registry routing ──────────────────────────────────────
 
-    @Test("AudioModelRegistry.capabilities — LlamaTTS maps to textToSpeech")
+    @Test("ModelRegistry.capabilities — LlamaTTS maps to textToSpeech")
     func registryCapability() {
         let config = ModelConfig(
             architecture: nil, modelType: "orpheus",
             raw: ["model_type": "orpheus"])
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.textToSpeech)
+        #expect(ModelRegistry.capabilities(for: config) == Capability.textToSpeech)
     }
 
     // ─── SNAC code de-interleave ────────────────────────────────────────

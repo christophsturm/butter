@@ -164,15 +164,15 @@ struct FishSpeechIntegrationTests {
     @Test("registry — FishSpeech routes through the audio registry as a synthesizer")
     func registry_routesFishSpeech() async throws {
         let dir = try await resolveDirectory()
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        guard case .fishSpeech = loaded else {
-            Issue.record("AudioModelRegistry did not route to FishSpeech; got \(loaded)")
+        let loaded = try await Model.load(dir.path)
+        guard loaded.engine is FishSpeechModel else {
+            Issue.record("the registry did not route to FishSpeech; got \(loaded)")
             return
         }
-        #expect(loaded.capabilities.contains(.audioOut))
+        #expect(loaded.availableCapabilities.contains(.audioOut))
         // It must surface as a StreamingSynthesizer (the `speak` CLI path).
-        #expect(loaded.synthesizer != nil)
-        #expect(loaded.transcriber == nil)
+        #expect(loaded.engine is any Synthesizing)
+        #expect(!(loaded.engine is any Transcribing))
     }
 
     @Test("synthesizeStream — streamed waveform equals a single synthesize")

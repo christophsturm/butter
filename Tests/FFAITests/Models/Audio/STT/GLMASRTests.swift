@@ -25,7 +25,7 @@ struct GLMASRTests {
 
     // ─── Registry detection ──────────────────────────────────────────
 
-    @Test("AudioModelRegistry — detects GLM-ASR from model_type")
+    @Test("the registry — detects GLM-ASR from model_type")
     func registryDetectsGLMASRByModelType() {
         let config = ModelConfig(
             architecture: "GlmasrModel",
@@ -38,13 +38,13 @@ struct GLMASRTests {
                 "max_whisper_length": 1500,
             ])
         #expect(GLMASRModel.handles(config))
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.speechToText)
     }
 
-    @Test("AudioModelRegistry — detects GLM-ASR from architecture")
+    @Test("the registry — detects GLM-ASR from architecture")
     func registryDetectsGLMASRByArchitecture() {
         // Some mlx-community conversions omit model_type but keep the
         // architecture string.
@@ -53,20 +53,20 @@ struct GLMASRTests {
             modelType: nil,
             raw: ["architectures": ["GlmasrModel"]])
         #expect(GLMASRModel.handles(config))
-        #expect(AudioModelRegistry.handles(config))
+        #expect(ModelRegistry.handlesAudio(config))
     }
 
-    @Test("AudioModelRegistry — GLM-ASR is speechToText capability")
+    @Test("the registry — GLM-ASR is speechToText capability")
     func glmASRCapability() {
         let config = ModelConfig(
             architecture: nil, modelType: "glmasr",
             raw: ["model_type": "glmasr"])
         #expect(
-            AudioModelRegistry.capabilities(for: config)
+            ModelRegistry.capabilities(for: config)
                 == Capability.speechToText)
     }
 
-    @Test("AudioModelRegistry — text-only config is not GLM-ASR")
+    @Test("the registry — text-only config is not GLM-ASR")
     func textOnlyNotGLMASR() {
         let config = ModelConfig(
             architecture: "LlamaForCausalLM", modelType: "llama",
@@ -74,7 +74,7 @@ struct GLMASRTests {
         #expect(!GLMASRModel.handles(config))
     }
 
-    @Test("AudioModelRegistry — Whisper config is not GLM-ASR")
+    @Test("the registry — Whisper config is not GLM-ASR")
     func whisperNotGLMASR() {
         let config = ModelConfig(
             architecture: "WhisperForConditionalGeneration",

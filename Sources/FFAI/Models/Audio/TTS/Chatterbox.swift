@@ -33,7 +33,7 @@
 // ## Scope note — STAGED PORT
 //
 // Chatterbox lands in stages. This file is **stage 1**: config decoding,
-// `AudioModelRegistry` detection, checkpoint weight-bundle retention, and
+// `ModelRegistry` detection, checkpoint weight-bundle retention, and
 // the top-level `ChatterboxModel` scaffold. Until the T3 backbone, S3Gen
 // flow decoder, VoiceEncoder, and HiFi-GAN vocoder stages land,
 // `synthesize` throws `ChatterboxError.synthesisNotWired` — see the error

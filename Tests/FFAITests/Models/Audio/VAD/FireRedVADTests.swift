@@ -235,7 +235,7 @@ struct FireRedVADTests {
         #expect(segments.count == 1)
     }
 
-    // ─── VADModelRegistry detection ──────────────────────────────────
+    // ─── the registry detection ──────────────────────────────────
 
     @Test("AudioModelKind — fireRedVAD modelTypes contains expected strings")
     func audioModelKindFireRedVAD() {
@@ -245,25 +245,25 @@ struct FireRedVADTests {
         #expect(types.contains("fireredvad"))
     }
 
-    @Test("VADModelRegistry.detectKind — recognizes firered_vad model_type")
+    @Test("ModelRegistry.detectVADKind — recognizes firered_vad model_type")
     func registryDetectKindFireRedVAD() throws {
         let dir = try writeTempConfig(
             ["model_type": "firered_vad"],
             named: "firered-vad-checkpoint")
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .fireRedVAD)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .fireRedVAD)
     }
 
-    @Test("VADModelRegistry.detectKind — recognizes firered-vad model_type (dash variant)")
+    @Test("ModelRegistry.detectVADKind — recognizes firered-vad model_type (dash variant)")
     func registryDetectKindFireRedVADDash() throws {
         let dir = try writeTempConfig(
             ["model_type": "firered-vad"],
             named: "firered-vad-checkpoint-2")
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .fireRedVAD)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .fireRedVAD)
     }
 
-    @Test("VADModelRegistry.detectKind — falls back to directory name for FireRedVAD")
+    @Test("ModelRegistry.detectVADKind — falls back to directory name for FireRedVAD")
     func registryDetectKindFireRedVADByName() throws {
         // No config.json — detection must fall back to the directory name.
         let base = FileManager.default.temporaryDirectory
@@ -271,7 +271,7 @@ struct FireRedVADTests {
             "models--FireRedTeam--FireRedVAD-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try VADModelRegistry.detectKind(in: dir) == .fireRedVAD)
+        #expect(try ModelRegistry.detectVADKind(in: dir) == .fireRedVAD)
     }
 
     @Test("FireRedVADModel.loadFromDirectory — throws missingWeight when pth.tar is absent")

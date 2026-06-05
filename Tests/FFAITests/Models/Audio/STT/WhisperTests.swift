@@ -13,14 +13,14 @@
 // limitations under the License.
 //
 // WhisperTests — unit tests for the OpenAI Whisper STT family: config
-// parsing, registry detection, AudioModelRegistry routing, and pure-CPU
+// parsing, registry detection, the registry routing, and pure-CPU
 // helpers (pad_or_trim). All tests run offline, no checkpoint required.
 //
 // Validates:
 //   * WhisperConfig.from(_:) parses the canonical HF Whisper config layout.
 //   * WhisperModel.handles(_:) accepts whisper model_type / arch and
 //     rejects unrelated configs.
-//   * AudioModelRegistry routes Whisper configs to Capability.speechToText.
+//   * the registry routes Whisper configs to Capability.speechToText.
 //   * WhisperModel.padOrTrim pads short clips and trims long ones to the
 //     exact 30 s analysis window the encoder is trained on.
 
@@ -150,14 +150,14 @@ struct WhisperTests {
         #expect(!WhisperModel.handles(config))
     }
 
-    // ─── AudioModelRegistry routing ──────────────────────────────────────
+    // ─── the registry routing ──────────────────────────────────────
 
-    @Test("AudioModelRegistry.capabilities — Whisper maps to speechToText")
+    @Test("ModelRegistry.capabilities — Whisper maps to speechToText")
     func registryCapability() {
         let config = ModelConfig(
             architecture: nil, modelType: "whisper",
             raw: ["model_type": "whisper"])
-        #expect(AudioModelRegistry.capabilities(for: config) == Capability.speechToText)
+        #expect(ModelRegistry.capabilities(for: config) == Capability.speechToText)
     }
 
     // ─── padOrTrim ──────────────────────────────────────────────────────

@@ -248,18 +248,18 @@ struct CohereTranscribeIntegrationTests {
             "streamed transcript '\(streamedTrimmed)' must equal batch '\(batch)'")
     }
 
-    @Test("registry — AudioModelRegistry routes checkpoint to .cohereTranscribe")
+    @Test("registry — the registry routes checkpoint to .cohereTranscribe")
     func registryRoutes() async throws {
         let dir = try await resolveDir()
-        let loaded = try await AudioModelRegistry.load(directory: dir)
-        guard case .cohereTranscribe = loaded else {
+        let loaded = try await Model.load(dir.path)
+        guard loaded.engine is CohereTranscribeModel else {
             Issue.record(
-                "AudioModelRegistry did not route to .cohereTranscribe; got \(loaded)")
+                "the registry did not route to .cohereTranscribe; got \(loaded)")
             return
         }
-        #expect(loaded.capabilities == Capability.speechToText)
+        #expect(loaded.availableCapabilities == Capability.speechToText)
         print(
             "[CohereTranscribe integration] registry routed correctly, "
-                + "capabilities=\(loaded.capabilities)")
+                + "capabilities=\(loaded.availableCapabilities)")
     }
 }
