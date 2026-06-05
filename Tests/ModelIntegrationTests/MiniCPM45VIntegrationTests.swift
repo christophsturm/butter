@@ -19,9 +19,14 @@
 // ONCE (static memoized Task) and runs a per-capability inference pass —
 // modeled on `MiniCPM46VIntegrationTests` / `MiniCPM45OmniIntegrationTests`.
 //
-// Runs against the FFAI 4-bit conversion (`ekryski/MiniCPM-V-4_5-4bit`):
-// there is no mlx-community 4-bit of MiniCPM-V-4.5, so it was quantized
-// from the `openbmb/MiniCPM-V-4_5` bf16 base via `ffai convert`.
+// Runs against the FFAI 4-bit conversion, referenced LOCALLY from the
+// `ffai convert` output cache (`~/.cache/ffai/converts/…`). There is no
+// mlx-community 4-bit of MiniCPM-V-4.5, so quantize the `openbmb/MiniCPM-V-4_5`
+// bf16 base once:
+//
+//   ffai convert openbmb/MiniCPM-V-4_5 --bits 4 --embedding-bits 4 --lm-head-bits 4
+//
+// `Model.load` takes an id-or-path, so the test points at the local dir.
 
 import Foundation
 import TestHelpers
@@ -37,7 +42,11 @@ import Testing
 )
 struct MiniCPM45VIntegrationTests {
 
-    static let modelId = "ekryski/MiniCPM-V-4_5-4bit"
+    /// Local `ffai convert` output for the 4-bit MiniCPM-V-4.5 (no HF
+    /// upload — referenced straight from the converts cache).
+    static let modelId = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".cache/ffai/converts/openbmb--MiniCPM-V-4_5-4bit")
+        .path
 
     /// The checkpoint, loaded ONCE and shared across every `@Test`.
     static let loaded = Task { try await loadModel(modelId) }
