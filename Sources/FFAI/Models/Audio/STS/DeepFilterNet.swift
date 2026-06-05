@@ -1525,3 +1525,10 @@ extension DeepFilterNetModel {
         return try applyBatchNorm(y, B: B, C: outC, T: T, F: F, prefix: "\(prefix).1")
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension DeepFilterNetModel: SpeechTransforming {
+    public func process(_ waveform: [Float], device: Device) async throws -> [Float] {
+        try enhance(waveform: waveform)
+    }
+}

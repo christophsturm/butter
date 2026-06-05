@@ -398,3 +398,6 @@ extension MossTTSNanoModel {
         return MossTTSNanoModel(config: config, weights: bundle)
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension MossTTSNanoModel: Synthesizing {}

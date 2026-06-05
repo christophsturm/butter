@@ -1116,3 +1116,10 @@ public final class SortformerModel: @unchecked Sendable {
         return try loadFromDirectory(dir, device: device)
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension SortformerModel: Detecting {
+    public func detect(_ waveform: [Float], sampleRate: Int) throws -> [DetectionEvent] {
+        detect(audio: waveform, sampleRate: sampleRate).detectionEvents
+    }
+}

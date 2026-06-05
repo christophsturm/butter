@@ -342,3 +342,6 @@ extension Qwen3TTSModel {
         return Qwen3TTSModel(config: qc, weights: bundle)
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension Qwen3TTSModel: Synthesizing {}

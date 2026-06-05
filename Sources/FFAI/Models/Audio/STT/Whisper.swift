@@ -789,3 +789,6 @@ extension WhisperModel {
 // `transcribeStream(_:maxNewTokens:temperature:)` with the exact protocol
 // shape — conformance is a marker.
 extension WhisperModel: StreamingTranscriber {}
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension WhisperModel: Transcribing {}

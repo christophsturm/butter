@@ -1988,3 +1988,6 @@ extension VoxtralRealtimeModel {
 // VoxtralRealtimeModel ships `transcribeStream(_:maxNewTokens:temperature:)`
 // with the exact `StreamingTranscriber` shape — conformance is a marker.
 extension VoxtralRealtimeModel: StreamingTranscriber {}
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension VoxtralRealtimeModel: Transcribing {}

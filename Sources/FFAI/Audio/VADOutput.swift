@@ -173,3 +173,45 @@ public struct DiarizationOutput: Sendable {
         }
     }
 }
+
+// MARK: - Unified-engine detection mapping (ModelType/ModelEngine.swift)
+// The three concrete VAD output types map down to `[DetectionEvent]` for the
+// unified `Model.detect(_:)` surface.
+
+extension VADOutput {
+    /// Each post-processed speech run becomes a `"speech"` detection event.
+    var detectionEvents: [DetectionEvent] {
+        segments.map {
+            DetectionEvent(
+                startSample: $0.startSample, endSample: $0.endSample,
+                sampleRate: $0.sampleRate, label: "speech", score: 1.0)
+        }
+    }
+}
+
+extension DiarizationOutput {
+    /// Each speaker run becomes a `"speaker"` event tagged with its speaker
+    /// index; sample indices are derived from the segment's seconds.
+    var detectionEvents: [DetectionEvent] {
+        segments.map {
+            DetectionEvent(
+                startSample: Int($0.startSeconds * Double(sampleRate)),
+                endSample: Int($0.endSeconds * Double(sampleRate)),
+                sampleRate: sampleRate, label: "speaker", score: 1.0,
+                speaker: $0.speaker)
+        }
+    }
+}
+
+extension VADEndpointOutput {
+    /// A single `"endpoint"` event when the turn-end threshold was crossed;
+    /// empty otherwise. Instantaneous, so `startSample == endSample == 0`.
+    func detectionEvents(sampleRate: Int) -> [DetectionEvent] {
+        guard prediction == 1 else { return [] }
+        return [
+            DetectionEvent(
+                startSample: 0, endSample: 0, sampleRate: sampleRate,
+                label: "endpoint", score: probability)
+        ]
+    }
+}

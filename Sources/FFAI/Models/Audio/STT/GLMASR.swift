@@ -1366,3 +1366,6 @@ extension GLMASRModel {
 // `transcribeStream(_:maxNewTokens:temperature:)` above already matches the
 // `StreamingTranscriber` protocol shape — the conformance is a marker.
 extension GLMASRModel: StreamingTranscriber {}
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension GLMASRModel: Transcribing {}

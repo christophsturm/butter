@@ -1899,3 +1899,10 @@ extension MossFormer2SEModel {
         return try load(directory: dir, device: device)
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension MossFormer2SEModel: SpeechTransforming {
+    public func process(_ waveform: [Float], device: Device) async throws -> [Float] {
+        try enhance(waveform: waveform)
+    }
+}

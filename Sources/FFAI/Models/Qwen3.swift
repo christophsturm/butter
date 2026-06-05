@@ -804,3 +804,6 @@ extension QwenOmniModel {
             options: LoadOptions(), device: .shared)
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension QwenOmniModel: Transcribing {}

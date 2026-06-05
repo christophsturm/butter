@@ -1537,3 +1537,6 @@ extension Qwen3ASRModel {
         return t
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension Qwen3ASRModel: Transcribing {}

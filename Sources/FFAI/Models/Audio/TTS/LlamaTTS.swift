@@ -369,3 +369,6 @@ extension LlamaTTSModel {
             tokenizer: tokenizer)
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension LlamaTTSModel: Synthesizing {}

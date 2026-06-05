@@ -2227,3 +2227,6 @@ extension CohereTranscribeModel {
 // CohereTranscribeModel ships `transcribeStream(_:maxNewTokens:temperature:)`
 // with the exact `StreamingTranscriber` shape — conformance is a marker.
 extension CohereTranscribeModel: StreamingTranscriber {}
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension CohereTranscribeModel: Transcribing {}

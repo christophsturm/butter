@@ -1873,3 +1873,6 @@ extension FireRedASR2Model {
 // FireRedASR2's beam-search decode isn't tappable for per-token deltas, so the
 // stream yields the full batch transcript once (see the method's doc comment).
 extension FireRedASR2Model: StreamingTranscriber {}
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension FireRedASR2Model: Transcribing {}

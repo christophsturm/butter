@@ -1876,3 +1876,6 @@ private func lfmAudioDepthwiseConv1dWeight(
     }
     return floats
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension LFMAudioModel: Transcribing {}

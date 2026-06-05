@@ -416,3 +416,10 @@ public final class TenVADModel: @unchecked Sendable {
         return try loadFromDirectory(dir, device: device)
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension TenVADModel: Detecting {
+    public func detect(_ waveform: [Float], sampleRate: Int) throws -> [DetectionEvent] {
+        try detect(audio: waveform, sampleRate: sampleRate).detectionEvents
+    }
+}

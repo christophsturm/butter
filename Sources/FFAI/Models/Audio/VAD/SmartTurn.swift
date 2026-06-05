@@ -494,3 +494,10 @@ public final class SmartTurnModel: @unchecked Sendable {
         return try loadFromDirectory(dir, device: device)
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension SmartTurnModel: Detecting {
+    public func detect(_ waveform: [Float], sampleRate: Int) throws -> [DetectionEvent] {
+        predictEndpoint(audio: waveform).detectionEvents(sampleRate: sampleRate)
+    }
+}

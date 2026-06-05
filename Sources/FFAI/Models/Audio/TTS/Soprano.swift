@@ -1410,3 +1410,6 @@ extension SopranoModel {
 // protocol shape — conformance is a marker. The streamed signal is a
 // single-chunk re-emission of the full `synthesize(text:)` waveform.
 extension SopranoModel: StreamingSynthesizer {}
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension SopranoModel: Synthesizing {}

@@ -1280,3 +1280,6 @@ extension SenseVoiceModel {
 // `transcribeStream(_:maxNewTokens:temperature:)` with the exact protocol
 // shape (single-pass CTC → one yield) — conformance is a marker.
 extension SenseVoiceModel: StreamingTranscriber {}
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension SenseVoiceModel: Transcribing {}

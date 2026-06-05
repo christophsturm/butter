@@ -678,3 +678,6 @@ extension ChatterboxModel {
         return ChatterboxModel(config: chatterboxConfig, weights: bundle)
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension ChatterboxModel: Synthesizing {}

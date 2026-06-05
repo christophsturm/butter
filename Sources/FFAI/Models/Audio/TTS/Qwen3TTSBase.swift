@@ -522,3 +522,6 @@ extension Qwen3TTSBaseModel {
             tokenizer: tokenizer)
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension Qwen3TTSBaseModel: Synthesizing {}

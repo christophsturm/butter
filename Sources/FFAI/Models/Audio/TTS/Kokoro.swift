@@ -528,3 +528,6 @@ extension KokoroModel {
             phonemeVocab: phonemeVocab, dtype: dtype)
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension KokoroModel: Synthesizing {}

@@ -520,3 +520,6 @@ extension PocketTTSModel {
         return PocketTTSModel(config: config, weights: bundle)
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension PocketTTSModel: Synthesizing {}

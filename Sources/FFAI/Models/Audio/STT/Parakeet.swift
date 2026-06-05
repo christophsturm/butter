@@ -1790,3 +1790,6 @@ extension ParakeetModel {
         )
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension ParakeetModel: Transcribing {}

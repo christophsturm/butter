@@ -730,3 +730,8 @@ public final class SAMAudioModel: @unchecked Sendable {
         return SAMAudioConfig()
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+// SAM-Audio's promptable `segment(...)` doesn't fit the uniform STS contract,
+// so it's a plain `ModelEngine` reached via `model.engine as?`.
+extension SAMAudioModel: ModelEngine {}

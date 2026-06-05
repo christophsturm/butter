@@ -554,3 +554,10 @@ public final class SileroVADModel: @unchecked Sendable {
         return try loadFromDirectory(dir, device: device)
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension SileroVADModel: Detecting {
+    public func detect(_ waveform: [Float], sampleRate: Int) throws -> [DetectionEvent] {
+        try detect(audio: waveform, sampleRate: sampleRate).detectionEvents
+    }
+}

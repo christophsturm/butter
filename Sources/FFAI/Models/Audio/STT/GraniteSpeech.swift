@@ -2462,3 +2462,6 @@ public struct TranscriptionParameters: Sendable {
         self.temperature = temperature
     }
 }
+
+// MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
+extension GraniteSpeechModel: Transcribing {}
