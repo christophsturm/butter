@@ -100,19 +100,11 @@ public enum MiniCPM4 {
         }
 
         // ── Text backbone: Qwen3.5 from `text_config` ─────────────────
-        // mlx-community's MiniCPM-V 4.6-4bit conversion stores text
-        // weights as `language_model.model.{embed_tokens, layers.*, norm}.weight`
-        // (outer `language_model.` wrapping the inner `model.`). The
-        // Qwen3.5 loader already probes the `language_model.model.`
-        // prefix candidate, so we hand the full bundle through
-        // unmodified — Qwen3.5 picks the right prefix from its own
-        // `prefixCandidates` automatically. The earlier
-        // `prefixed("model.language_model.").withAddedPrefix("model.")`
-        // chain assumed an internal layout no mlx-community release
-        // actually ships; on the real bundle no key carries the
-        // `model.language_model.` prefix, so the strip returned an
-        // empty view and the Qwen3.5 loader crashed at `embed_tokens.weight`.
-        let textEngine = try Qwen35Hybrid.loadModel(
+        // Delegated to the `MiniCPM4Text` component (the family reuses the
+        // Qwen3.5 hybrid stack). mlx-community ships the text weights under
+        // `language_model.model.*`; the Qwen3.5 loader probes that prefix
+        // itself, so the full bundle is passed through unmodified.
+        let textEngine = try MiniCPM4Text.load(
             config: config, weights: weights,
             options: options, device: device)
 

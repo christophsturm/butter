@@ -539,6 +539,16 @@ public enum ModelRegistry {
             throw ModelError.visionModelNotIntegrated(
                 config.architecture ?? config.modelType ?? "<unknown>")
         }
+        // MiniCPM5 declares a plain `LlamaForCausalLM` / `llama` arch
+        // (indistinguishable from generic Llama), so route by its
+        // `_name_or_path` marker to the named MiniCPM5 entrypoint BEFORE the
+        // generic Llama branch. Thin facade today (text-only); the seam for
+        // a future multimodal v5.
+        if MiniCPM5.handles(config) {
+            return try MiniCPM5.load(
+                config: config, weights: weights,
+                options: options, device: device)
+        }
         if let arch = config.architecture, Llama.architectures.contains(arch) {
             return try loadLlama(
                 config: config, weights: weights,
