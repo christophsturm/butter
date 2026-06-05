@@ -140,7 +140,8 @@ Sources/
     DType.swift             Supported tensor dtypes
     Module.swift            Parameter discovery protocol
     ModelLayers/            Linear / Embedding / RMSNorm / LayerNorm /
-                            MoELayer / DecoderLayer
+                            MoELayer / DecoderLayer / VisionEncoderLayer /
+                            AudioEncoderLayer
     Capability.swift        .textIn / .imageIn / .videoIn / .audioIn / .textOut / .audioOut
     LanguageModel.swift     Protocol implemented by text-family models
     VisionModel.swift       Protocol implemented by VL orchestrators
@@ -148,6 +149,8 @@ Sources/
     FFAI.swift              Public umbrella + version
     Loader/                 Model.load, ModelConfig, ModelLocator,
                             ModelDownloader, ModelRegistry, Device, …
+    Converter/              ffai convert: ConvertDriver, SafeTensorsWriter,
+                            QuantSpec
     Ops/                    Public GPU op wrappers (Ops.swift,
                             OpsValidation.swift, QuantizedOps.swift, …)
     KVCache/                Raw / affine / AURA caches, eviction policy,
