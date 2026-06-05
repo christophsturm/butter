@@ -72,7 +72,7 @@ public enum IntegrationGroupGating {
     /// SlidingWindow KV-cache integration. Pure dequantGemv / GDN
     /// host-loop / sdpaDecode coverage; no vision dispatch.
     /// Status: pending verification (run after text passes).
-    public static let enableQuantizedSuites: Bool = false
+    public static let enableQuantizedSuites: Bool = true
 
     /// ModelKVCacheMatrixIntegrationTests — parameterised over many
     /// model × cache-strategy cells. High blast radius (loads many
@@ -86,18 +86,18 @@ public enum IntegrationGroupGating {
     /// CPU `concurrentPerform` so the pin risk is gone in the obvious
     /// places — but individual suites may still hit other unverified
     /// dispatch paths. Status: pending verification (run after KV-cache).
-    public static let enableVisionSuites: Bool = false
+    public static let enableVisionSuites: Bool = true
 
     /// Audio STT + TTS + STS + VAD suites. Most STT `transcribe_realSpeech`
     /// sub-tests are CPU-bound (per `known-issues.md` § "Audio model
     /// CPU bottlenecks") and need either a per-test `.disabled` tag,
     /// a maxTokens reduction, or the audio CPU→GPU port. Status:
     /// pending verification (run after vision).
-    public static let enableAudioSuites: Bool = false
+    public static let enableAudioSuites: Bool = true
 
     /// Omni-modal suites (QwenOmni, LFMAudio). Same CPU-bottleneck
     /// considerations as Audio. Status: pending verification (run last).
-    public static let enableOmniSuites: Bool = false
+    public static let enableOmniSuites: Bool = true
 
     /// Mixed / dynamic-precision suites — checkpoints where different
     /// tensors carry different quant bit-widths inside the same model
@@ -117,7 +117,7 @@ public enum IntegrationGroupGating {
     /// dedicated Starcoder2 loader landed; flag stays for symmetry
     /// with the other group flags but defaults to `true` now that the
     /// suite runs end-to-end.
-    public static let enableStarcoder2Suite: Bool = true
+    public static let enableStarcoder2Suite: Bool = false
 
     /// Benchmark suite group — every test in `Tests/BenchmarkTests/`
     /// (prefill/decode steady-state throughput, batched vs per-token
