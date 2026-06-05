@@ -59,23 +59,7 @@
 import Foundation
 import Metal
 
-// ─── Errors ──────────────────────────────────────────────────────────
-
-public enum Mistral3Error: Error, CustomStringConvertible {
-    case missingConfig
-    case missingTensor(String)
-
-    public var description: String {
-        switch self {
-        case .missingConfig:
-            return "Mistral3: checkpoint config is missing required fields"
-        case .missingTensor(let name):
-            return "Mistral3: checkpoint is missing tensor '\(name)'"
-        }
-    }
-}
-
-// ─── Family registry ─────────────────────────────────────────────────
+// ─── Family entry point ──────────────────────────────────────────────
 
 public enum Mistral3 {
     /// `model_type` values that identify a Mistral3 checkpoint.
@@ -187,5 +171,21 @@ public enum Mistral3 {
             engine: textEngine, imageTokenId: imageTokenId,
             normalization: .clip,
             imageTokenCount: mergedPatches)
+    }
+}
+
+// ─── Errors ──────────────────────────────────────────────────────────
+
+public enum Mistral3Error: Error, CustomStringConvertible {
+    case missingConfig
+    case missingTensor(String)
+
+    public var description: String {
+        switch self {
+        case .missingConfig:
+            return "Mistral3: checkpoint config is missing required fields"
+        case .missingTensor(let name):
+            return "Mistral3: checkpoint is missing tensor '\(name)'"
+        }
     }
 }

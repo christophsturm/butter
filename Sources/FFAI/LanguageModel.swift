@@ -35,16 +35,10 @@ public protocol LanguageModel: Module {
     /// Default prefill chunk size — the number of prompt tokens this
     /// family's `forwardMulti(...)` consumes per dispatch when the
     /// caller doesn't override `GenerationParameters.prefillStepSize`.
-    /// Tuned per family in mlx-swift-lm; defaults to 1024 (the
-    /// generic dense Llama/Mistral/Phi/Qwen3 value). Larger values
-    /// trade peak memory (the [N, hidden] activation chunk) for
-    /// fewer dispatches; smaller values keep memory flatter at the
-    /// cost of more commit cycles.
-    ///
-    /// Currently-tuned overrides:
-    /// - GPT-OSS 20B: 2048
-    /// - Qwen 3.5 MoE: 4096
-    /// - Gemma 4 (sliding window every-other-layer): 4096
+    /// Tuned per family and every model overrides this value. Larger 
+    /// values trade peak memory (the [N, hidden] activation chunk) for
+    /// fewer dispatches; smaller values keep memory flatter at the cost
+    /// of more commit cycles.
     var defaultPrefillStepSize: Int { get }
 
     /// Whether this family requires a leading `<bos>` token on every
