@@ -55,9 +55,9 @@ struct LFM2TextIntegrationTests {
         #expect(m.falconH1 == nil)
 
         // head_dim 64, GQA, hybrid conv/attention stack.
-        #expect(m.engine.headDim == 64)
-        #expect(m.engine.nLayers > 0)
-        #expect(m.engine.nKVHeads <= m.engine.nHeads)
+        #expect(m.textEngine.headDim == 64)
+        #expect(m.textEngine.nLayers > 0)
+        #expect(m.textEngine.nKVHeads <= m.textEngine.nHeads)
 
         if let l = m.lfm2 {
             // Stack is a genuine mix of conv and attention layers.
@@ -75,8 +75,8 @@ struct LFM2TextIntegrationTests {
         }
 
         // ── Cache kinds match the layer kinds, index-for-index ────────
-        let caches = m.engine.makeLayerCaches()
-        #expect(caches.count == m.engine.nLayers)
+        let caches = m.textEngine.makeLayerCaches()
+        #expect(caches.count == m.textEngine.nLayers)
         if let l = m.lfm2 {
             for (i, layer) in l.layers.enumerated() {
                 switch (layer as? LFM2Layer)?.kind {
@@ -93,8 +93,8 @@ struct LFM2TextIntegrationTests {
         // ── Forward-shape smoke test ──────────────────────────────────
         // One token through the full heterogeneous stack. Logits should
         // be finite and non-degenerate (the model is trained).
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
-        #expect(logits.elementCount == m.engine.vocab)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
+        #expect(logits.elementCount == m.textEngine.vocab)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
         #expect(top[0].1.isFinite)
@@ -107,7 +107,7 @@ struct LFM2TextIntegrationTests {
         )
         #expect(result.tokensPerSecond > 0)
 
-        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        let decoded = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("LFM2-350M decoded output: \(decoded)")
 
         expectCoherentOutput(
@@ -130,10 +130,10 @@ struct LFM2TextIntegrationTests {
         let m = try await loadModel(modelId)
 
         #expect(m.lfm2 != nil)
-        #expect(m.engine.headDim == 64)
+        #expect(m.textEngine.headDim == 64)
         // LFM2 (original, 65536 vocab) gets LiquidAI's LFM2 card defaults
         // (temp 0.3 / min-p 0.15); the LFM2.5 collection gets its own.
-        #expect(m.engine.vocab == 65_536)
+        #expect(m.textEngine.vocab == 65_536)
         #expect(m.defaultGenerationParameters.temperature == 0.3)
         #expect(m.defaultGenerationParameters.minP == 0.15)
 
@@ -148,9 +148,9 @@ struct LFM2TextIntegrationTests {
             #expect(moeCount < l.layers.count)
         }
 
-        let caches = m.engine.makeLayerCaches()
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
-        #expect(logits.elementCount == m.engine.vocab)
+        let caches = m.textEngine.makeLayerCaches()
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
+        #expect(logits.elementCount == m.textEngine.vocab)
         let top = Sampling.topN(logits, n: 5)
         #expect(top[0].1.isFinite)
         #expect(top[0].1 > top[4].1)
@@ -159,7 +159,7 @@ struct LFM2TextIntegrationTests {
             prompt: prompt,
             parameters: m.defaultGenerationParameters.with { $0.maxTokens = 200; $0.seed = 42 }
         )
-        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        let decoded = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("LFM2-8B-A1B decoded output: \(decoded)")
 
         expectCoherentOutput(
@@ -188,9 +188,9 @@ struct LFM2TextIntegrationTests {
         let m = try await loadModel(modelId)
 
         #expect(m.lfm2 != nil)
-        #expect(m.engine.headDim == 64)
+        #expect(m.textEngine.headDim == 64)
         // Distinguishing feature vs LFM2-8B-A1B: the larger 128000 vocab.
-        #expect(m.engine.vocab == 128_000)
+        #expect(m.textEngine.vocab == 128_000)
 
         // LFM2.5 ships LiquidAI's recommended sampling defaults
         // (config-aware in loadLFM2, keyed on the 128000 vocab).
@@ -217,7 +217,7 @@ struct LFM2TextIntegrationTests {
             messages: [ChatMessage(role: .user, content: "What is the capital of France?")],
             parameters: GenerationParameters(maxTokens: 200, temperature: 0)
         )
-        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        let decoded = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("LFM2.5-8B-A1B decoded output: \(decoded)")
 
         expectCoherentOutput(

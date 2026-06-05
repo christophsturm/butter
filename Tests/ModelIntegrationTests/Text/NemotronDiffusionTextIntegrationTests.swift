@@ -47,12 +47,12 @@ struct NemotronDiffusionTextIntegrationTests {
         #expect(m.llama == nil)
 
         // Shapes match the published 3B config.
-        #expect(m.engine.hidden == 3072)
-        #expect(m.engine.nLayers == 26)
-        #expect(m.engine.nHeads == 32)
-        #expect(m.engine.nKVHeads == 8)
-        #expect(m.engine.headDim == 128)
-        #expect(m.engine.vocab == 131_072)
+        #expect(m.textEngine.hidden == 3072)
+        #expect(m.textEngine.nLayers == 26)
+        #expect(m.textEngine.nHeads == 32)
+        #expect(m.textEngine.nKVHeads == 8)
+        #expect(m.textEngine.headDim == 128)
+        #expect(m.textEngine.vocab == 131_072)
         if let nd = m.nemotronLabsDiffusion {
             #expect(nd.maskTokenId == 100)
             #expect(nd.blockSize == 32)
@@ -70,8 +70,8 @@ struct NemotronDiffusionTextIntegrationTests {
         #expect(m.hasLoRA, "LoRA should reattach from the model directory")
 
         // Single-token forward: finite, non-degenerate logits.
-        let caches = m.engine.makeLayerCaches()
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let caches = m.textEngine.makeLayerCaches()
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
         #expect(top[0].1.isFinite)

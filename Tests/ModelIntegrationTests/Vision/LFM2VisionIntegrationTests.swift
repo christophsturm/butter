@@ -56,8 +56,8 @@ struct LFM2VisionIntegrationTests {
         // available, and the text backbone is an LFM2 hybrid engine.
         #expect(m.vlModel != nil)
         #expect(m.availableCapabilities.contains(.imageIn))
-        #expect(m.engine.hidden == 2048)  // LFM2-1.6B text hidden
-        #expect(m.engine.supportsEmbeddingInput)  // VLM splice prerequisite
+        #expect(m.textEngine.hidden == 2048)  // LFM2-1.6B text hidden
+        #expect(m.textEngine.supportsEmbeddingInput)  // VLM splice prerequisite
 
         let vlm = try #require(m.vlModel)
         // `imageTokenCount` is the NOMINAL square count (256 patches →
@@ -83,9 +83,9 @@ struct LFM2VisionIntegrationTests {
         // correct (they match the reference distribution).
         let imageTokenId = vlm.imageTokenId
         let bos = try #require(
-            m.tokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
-        let userPrefix = m.tokenizer.encode(text: "<|im_start|>user\n")
-        let userSuffix = m.tokenizer.encode(
+            m.textTokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
+        let userPrefix = m.textTokenizer.encode(text: "<|im_start|>user\n")
+        let userSuffix = m.textTokenizer.encode(
             text: "Describe this image.<|im_end|>\n<|im_start|>assistant\n")
 
         // The shared golden-retriever fixture.
@@ -110,7 +110,7 @@ struct LFM2VisionIntegrationTests {
         expectCoherentOutput(
             generated, minTokens: 8,
             label: "LFM2-VL image+text")
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("LFM2-VL generated: \(text)")
         VisionTestHelpers.expectMentionsDog(text, label: "LFM2-VL")
     }
@@ -124,9 +124,9 @@ struct LFM2VisionIntegrationTests {
 
         let imageTokenId = vlm.imageTokenId
         let bos = try #require(
-            m.tokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
-        let userPrefix = m.tokenizer.encode(text: "<|im_start|>user\n")
-        let userSuffix = m.tokenizer.encode(
+            m.textTokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
+        let userPrefix = m.textTokenizer.encode(text: "<|im_start|>user\n")
+        let userSuffix = m.textTokenizer.encode(
             text: "Describe this image.<|im_end|>\n<|im_start|>assistant\n")
         let image = try VisionTestHelpers.dogImage()
         let imageTokens = vlm.encodeImage(image).shape[0]
@@ -157,7 +157,7 @@ struct LFM2VisionIntegrationTests {
             "streaming must yield exactly one token per chunk")
         expectCoherentOutput(
             collected, minTokens: 8, label: "LFM2-VL streaming")
-        let text = m.tokenizer.decode(tokens: collected, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: collected, skipSpecialTokens: true)
         print("LFM2-VL streamed: \(text)")
         VisionTestHelpers.expectMentionsDog(text, label: "LFM2-VL streaming")
     }

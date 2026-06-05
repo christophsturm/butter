@@ -54,7 +54,7 @@ struct Gemma4VisionIntegrationTests {
         // available, and the text backbone supports the splice.
         #expect(m.vlModel != nil)
         #expect(m.availableCapabilities.contains(.imageIn))
-        #expect(m.engine.supportsEmbeddingInput)  // VLM splice prerequisite
+        #expect(m.textEngine.supportsEmbeddingInput)  // VLM splice prerequisite
 
         let vlm = try #require(m.vlModel)
         // The vision tower contributes a positive run of soft tokens.
@@ -89,13 +89,13 @@ struct Gemma4VisionIntegrationTests {
         // doesn't auto-prepend it the way Generate.swift does, so the
         // prompt carries an explicit leading <bos>.
         let bos = try #require(
-            m.tokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
+            m.textTokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
         // Gemma 4 wraps the image soft-token run in begin/end-of-image
         // markers (boi 255999, eoi 258882.
         let boiTokenId = 255999
         let eoiTokenId = 258882
-        let userPrefix = m.tokenizer.encode(text: "<start_of_turn>user\n")
-        let userSuffix = m.tokenizer.encode(
+        let userPrefix = m.textTokenizer.encode(text: "<start_of_turn>user\n")
+        let userSuffix = m.textTokenizer.encode(
             text: "\nDescribe this image.<end_of_turn>\n<start_of_turn>model\n")
 
         // A real photograph — the golden-retriever fixture. Gemma 4's image
@@ -121,7 +121,7 @@ struct Gemma4VisionIntegrationTests {
         expectCoherentOutput(
             generated, minTokens: 8,
             label: "Gemma 4 VL image+text")
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("Gemma 4 VL generated: \(text)")
         VisionTestHelpers.expectMentionsDog(text, label: "Gemma 4 VL")
     }
@@ -222,10 +222,10 @@ struct Gemma4VisionIntegrationTests {
         // `frameSuffix` closures — the test no longer decodes frames or
         // computes the per-frame token count.
         let bos = try #require(
-            m.tokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
+            m.textTokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
         let boiTokenId = 255999
         let eoiTokenId = 258882
-        let tokenizer = m.tokenizer
+        let tokenizer = m.textTokenizer
         let userPrefix = tokenizer.encode(text: "<start_of_turn>user\n")
         let userSuffix = tokenizer.encode(
             text: "\nWhat animal is in this video?<end_of_turn>\n"
@@ -244,7 +244,7 @@ struct Gemma4VisionIntegrationTests {
             parameters: m.defaultGenerationParameters.with { $0.seed = 42 },
             eosTokenId: m.config.eosTokenId,
             eosTokenIds: m.config.eosTokenIds)
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("Gemma 4 video → text: \(text)")
 
         expectCoherentOutput(generated, minTokens: 4, label: "gemma4-video")

@@ -44,16 +44,16 @@ struct ModelInspectionIntegrationTests {
         // Architecture sanity. This is the same surface
         // InspectCommand prints — any field NaN'd / nil-d here
         // would also corrupt the inspect display.
-        #expect(m.engine.hidden > 0)
-        #expect(m.engine.nLayers > 0)
-        #expect(m.engine.nHeads >= m.engine.nKVHeads)
-        #expect(m.engine.headDim > 0)
-        #expect(m.engine.vocab > 0)
+        #expect(m.textEngine.hidden > 0)
+        #expect(m.textEngine.nLayers > 0)
+        #expect(m.textEngine.nHeads >= m.textEngine.nKVHeads)
+        #expect(m.textEngine.headDim > 0)
+        #expect(m.textEngine.vocab > 0)
 
         // Tokenizer round-trips the prompt — same path inspect uses.
-        let tokens = m.tokenizer.encode(text: prompt)
+        let tokens = m.textTokenizer.encode(text: prompt)
         #expect(!tokens.isEmpty)
-        let roundtrip = m.tokenizer.decode(tokens: tokens, skipSpecialTokens: false)
+        let roundtrip = m.textTokenizer.decode(tokens: tokens, skipSpecialTokens: false)
         #expect(
             roundtrip.contains("quiet"),
             "tokenizer round-trip should preserve a recognizable substring of the prompt; got \"\(roundtrip)\""
@@ -62,8 +62,8 @@ struct ModelInspectionIntegrationTests {
         // Per-layer KV cache layout — inspect prints `bytesAllocated`
         // and the layer 0 stride. Asserting just on the totals
         // (per-test specifics live in the family tests above).
-        let caches = m.engine.makeLayerCaches()
-        #expect(caches.count == m.engine.nLayers)
+        let caches = m.textEngine.makeLayerCaches()
+        #expect(caches.count == m.textEngine.nLayers)
         let totalBytes = caches.reduce(0) { $0 + $1.bytesAllocated }
         #expect(totalBytes > 0)
 
@@ -71,7 +71,7 @@ struct ModelInspectionIntegrationTests {
         // logits + decoded strings. Asserts no NaN, no inf.
         var lastLogits: Tensor?
         for (i, t) in tokens.enumerated() {
-            lastLogits = m.engine.forward(tokenId: t, position: i, caches: caches)
+            lastLogits = m.textEngine.forward(tokenId: t, position: i, caches: caches)
         }
         guard let l = lastLogits else {
             Issue.record("inspect should have run prefill on a non-empty prompt")

@@ -62,15 +62,15 @@ struct Starcoder2TextIntegrationTests {
         //   hidden = 3072, nLayers = 30, nHeads = 24, nKVHeads = 2
         //   (12:1 GQA), head_dim = 128 (derived: 3072/24), vocab =
         //   49_152, intermediate = 12_288 (= 4 · hidden), tied embed.
-        #expect(m.engine.hidden == 3072)
-        #expect(m.engine.nLayers == 30)
-        #expect(m.engine.nHeads == 24)
-        #expect(m.engine.nKVHeads == 2)
-        #expect(m.engine.headDim == 128)
-        #expect(m.engine.vocab == 49_152)
+        #expect(m.textEngine.hidden == 3072)
+        #expect(m.textEngine.nLayers == 30)
+        #expect(m.textEngine.nHeads == 24)
+        #expect(m.textEngine.nKVHeads == 2)
+        #expect(m.textEngine.headDim == 128)
+        #expect(m.textEngine.vocab == 49_152)
 
         // ── 3. Errors we expect ─────────────────────────────────────────
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 30)
         for (i, c) in caches.enumerated() {
             if !(c is KVCache) {
@@ -79,7 +79,7 @@ struct Starcoder2TextIntegrationTests {
         }
 
         // ── 4. Forward pass produces expected output ────────────────────
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 49_152)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
@@ -95,7 +95,7 @@ struct Starcoder2TextIntegrationTests {
         )
         #expect(result.tokensPerSecond > 0)
 
-        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        let decoded = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("Starcoder2-3B decoded output: \(decoded)")
 
         expectCoherentOutput(

@@ -53,15 +53,15 @@ struct Phi3TextIntegrationTests {
         // Phi-3 mini canonical shapes (3.8B parameters): hidden = 3072,
         // nLayers = 32, nHeads = 32, nKVHeads = 32 (MHA), headDim = 96,
         // intermediate = 8192, vocab = 32_064.
-        #expect(m.engine.hidden == 3072)
-        #expect(m.engine.nLayers == 32)
-        #expect(m.engine.nHeads == 32)
-        #expect(m.engine.nKVHeads == 32)
-        #expect(m.engine.headDim == 96)
-        #expect(m.engine.vocab == 32_064)
+        #expect(m.textEngine.hidden == 3072)
+        #expect(m.textEngine.nLayers == 32)
+        #expect(m.textEngine.nHeads == 32)
+        #expect(m.textEngine.nKVHeads == 32)
+        #expect(m.textEngine.headDim == 96)
+        #expect(m.textEngine.vocab == 32_064)
 
         // ── 3. Errors we expect ─────────────────────────────────────────
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 32)
         for (i, c) in caches.enumerated() {
             if !(c is KVCache) {
@@ -77,7 +77,7 @@ struct Phi3TextIntegrationTests {
         // be one of {64,128,256,512}` until the head_dim=96 kernel
         // specialization lands in metaltile. Suite stays ENABLED so the
         // gap stays visible. Tracked as a follow-up.
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 32_064)
         let top = Sampling.topN(logits, n: 5)
         #expect(top[0].1.isFinite)

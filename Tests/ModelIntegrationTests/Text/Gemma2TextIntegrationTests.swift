@@ -47,12 +47,12 @@ struct Gemma2TextIntegrationTests {
         #expect(m.llama == nil)
         #expect(m.qwen3 == nil)
         // Gemma 2 2B canonical shapes (from the published config).
-        #expect(m.engine.hidden == 2304)
-        #expect(m.engine.nLayers == 26)
-        #expect(m.engine.nHeads == 8)
-        #expect(m.engine.nKVHeads == 4)
-        #expect(m.engine.headDim == 256)
-        #expect(m.engine.vocab == 256_000)
+        #expect(m.textEngine.hidden == 2304)
+        #expect(m.textEngine.nLayers == 26)
+        #expect(m.textEngine.nHeads == 8)
+        #expect(m.textEngine.nKVHeads == 4)
+        #expect(m.textEngine.headDim == 256)
+        #expect(m.textEngine.vocab == 256_000)
 
         // Sliding-window alternation: odd layers (0, 2, 4, …) are sliding;
         // even layers (1, 3, 5, …) are full attention. Spot-check both.
@@ -69,11 +69,11 @@ struct Gemma2TextIntegrationTests {
         // Both subtypes conform to `LayerCacheProtocol`; we just assert
         // the count matches nLayers (a mis-sized cache array is a
         // forward-time crash, so check up-front).
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 26)
 
         // ── 4. Forward pass produces expected output ────────────────────
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 256_000)
         let top = Sampling.topN(logits, n: 5)
         #expect(top[0].1.isFinite)
@@ -89,7 +89,7 @@ struct Gemma2TextIntegrationTests {
             minTokens: 32,
             label: "Gemma 2 2B-it 4bit"
         )
-        let text = m.tokenizer.decode(
+        let text = m.textTokenizer.decode(
             tokens: result.generatedTokens,
             skipSpecialTokens: true)
         print("Gemma 2 2B-it generated: \(text)")

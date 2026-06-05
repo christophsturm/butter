@@ -163,7 +163,7 @@ public struct BenchRunner {
             )
         }
         let raw = try String(contentsOf: corpus, encoding: .utf8)
-        var tokens = model.tokenizer.encode(text: raw)
+        var tokens = model.textTokenizer.encode(text: raw)
         if tokens.count > options.wikitext2MaxTokens {
             tokens = Array(tokens.prefix(options.wikitext2MaxTokens))
         }
@@ -185,10 +185,10 @@ public struct BenchRunner {
             kld = kldResult.meanKLDivergence
         }
 
-        let weightsBytes = model.engine.parameters().reduce(0) { $0 + $1.1.byteCount }
+        let weightsBytes = model.textEngine.parameters().reduce(0) { $0 + $1.1.byteCount }
         let stats = GenerationStats(
             promptTokens: tokens.count, generatedTokens: 0,
-            contextSize: model.engine.maxContextWindow,
+            contextSize: model.textEngine.maxContextWindow,
             prefillTimeS: 0, decodeTimeS: 0, timeToFirstTokenMs: 0,
             steadyTokensPerSecond: nil,
             baselineGPUBytes: memTracker.baseline.gpuBytes,

@@ -75,11 +75,11 @@ public enum Perplexity {
         precondition(
             tokens.count >= 2,
             "Perplexity.compute requires at least 2 tokens (one context + one target)")
-        let caches = model.engine.makeLayerCaches(maxSeq: nil, device: device)
+        let caches = model.textEngine.makeLayerCaches(maxSeq: nil, device: device)
         var nll = 0.0
         var scored = 0
         for t in 0 ..< (tokens.count - 1) {
-            let logits = model.engine.forward(
+            let logits = model.textEngine.forward(
                 tokenId: tokens[t], position: t,
                 caches: caches, device: device)
             let target = tokens[t + 1]
@@ -113,16 +113,16 @@ public enum Perplexity {
         precondition(
             tokens.count >= 2,
             "klDivergence requires at least 2 tokens")
-        let refCaches = reference.engine.makeLayerCaches(maxSeq: nil, device: device)
-        let candCaches = candidate.engine.makeLayerCaches(maxSeq: nil, device: device)
+        let refCaches = reference.textEngine.makeLayerCaches(maxSeq: nil, device: device)
+        let candCaches = candidate.textEngine.makeLayerCaches(maxSeq: nil, device: device)
 
         var totalKL = 0.0
         var scored = 0
         for t in 0 ..< (tokens.count - 1) {
-            let refLogits = reference.engine.forward(
+            let refLogits = reference.textEngine.forward(
                 tokenId: tokens[t], position: t,
                 caches: refCaches, device: device)
-            let candLogits = candidate.engine.forward(
+            let candLogits = candidate.textEngine.forward(
                 tokenId: tokens[t], position: t,
                 caches: candCaches, device: device)
             // Skip positions where vocab sizes mismatch (defensive — KL

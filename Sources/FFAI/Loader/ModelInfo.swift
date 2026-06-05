@@ -44,6 +44,12 @@ public struct ModelInfo: Sendable {
     /// having to enumerate every typed convenience accessor.
     public let family: String
 
+    /// Catalog kind the registry filed the model under (`.llm`, `.vlm`,
+    /// `.stt`, `.tts`, `.vad`, …). The shape fields below are meaningful
+    /// only for text/VL kinds (a text engine backs them); for audio / VAD
+    /// engines they read as `0` / `.f32`.
+    public let kind: ModelKind
+
     // ── Architecture shape ──────────────────────────────────────────────
 
     /// Activation dtype the engine runs in (f32 / f16 / bf16).
@@ -142,11 +148,18 @@ extension Model {
     /// `engine.parameters()` to sum the weight footprint. Callers that
     /// need this repeatedly should cache it themselves.
     public var info: ModelInfo {
+        // Shape + weight-footprint fields come from the text engine. For a
+        // non-text engine (STT / TTS / VAD / STS) there is no `LanguageModel`
+        // forward surface, so they read as 0 / .f32 — the identity +
+        // capability + tokenization fields below still apply.
+        let lm = languageModel
         var paramCount = 0
         var paramBytes = 0
-        for (_, t) in engine.parameters() {
-            paramCount += t.elementCount
-            paramBytes += t.byteCount
+        if let lm {
+            for (_, t) in lm.parameters() {
+                paramCount += t.elementCount
+                paramBytes += t.byteCount
+            }
         }
         // VLM image-token count is exposed on VisionModel; it's also
         // mirror-stored on PaligemmaModel / Gemma3VLComposedEncoder /
@@ -162,14 +175,15 @@ extension Model {
             architecture: config.architecture,
             modelType: config.modelType,
             family: String(describing: type(of: engine)),
-            dtype: engine.dtype,
-            hidden: engine.hidden,
-            nLayers: engine.nLayers,
-            nHeads: engine.nHeads,
-            nKVHeads: engine.nKVHeads,
-            headDim: engine.headDim,
-            vocab: engine.vocab,
-            maxContextWindow: engine.maxContextWindow,
+            kind: kind,
+            dtype: lm?.dtype ?? .f32,
+            hidden: lm?.hidden ?? 0,
+            nLayers: lm?.nLayers ?? 0,
+            nHeads: lm?.nHeads ?? 0,
+            nKVHeads: lm?.nKVHeads ?? 0,
+            headDim: lm?.headDim ?? 0,
+            vocab: lm?.vocab ?? 0,
+            maxContextWindow: lm?.maxContextWindow ?? 0,
             quantization: config.quantization,
             defaultGenerationParameters: defaultGenerationParameters,
             availableCapabilities: availableCapabilities,
@@ -179,7 +193,7 @@ extension Model {
             bosTokenId: config.bosTokenId,
             eosTokenIds: config.eosTokenIds,
             tieWordEmbeddings: config.tieWordEmbeddings,
-            supportsEmbeddingInput: engine.supportsEmbeddingInput,
+            supportsEmbeddingInput: lm?.supportsEmbeddingInput ?? false,
             imageTokenCount: vlModel?.imageTokenCount
         )
     }

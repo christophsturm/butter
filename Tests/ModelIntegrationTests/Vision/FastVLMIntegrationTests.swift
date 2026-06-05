@@ -64,8 +64,8 @@ struct FastVLMIntegrationTests {
         // available, and the text backbone is a Qwen2-0.5B engine.
         #expect(m.vlModel != nil)
         #expect(m.availableCapabilities.contains(.imageIn))
-        #expect(m.engine.hidden == 896)  // Qwen2-0.5B text hidden
-        #expect(m.engine.supportsEmbeddingInput)  // VLM splice prerequisite
+        #expect(m.textEngine.hidden == 896)  // Qwen2-0.5B text hidden
+        #expect(m.textEngine.supportsEmbeddingInput)  // VLM splice prerequisite
 
         let vlm = try #require(m.vlModel)
         // 1024px input: 4× stem + 4 stride-2 PEs → 16×16 = 256 tokens.
@@ -87,7 +87,7 @@ struct FastVLMIntegrationTests {
         // Here we assemble the token stream directly: 256 image placeholders
         // followed by a tokenized question.
         let imageTokenId = vlm.imageTokenId  // -200
-        let questionTokens = m.tokenizer.encode(
+        let questionTokens = m.textTokenizer.encode(
             text: "What animal is in the image?\nAssistant:")
         let promptTokens =
             Array(
@@ -105,7 +105,7 @@ struct FastVLMIntegrationTests {
         expectCoherentOutput(
             generated, minTokens: 4,
             label: "FastVLM image+text")
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("FastVLM generated: \(text)")
         VisionTestHelpers.expectMentionsDog(text, label: "FastVLM")
     }

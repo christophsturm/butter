@@ -19,7 +19,10 @@
 import Foundation
 import Metal
 
-public protocol LanguageModel: Module {
+// `LanguageModel` refines `TextEngine` (→ `ModelEngine`) so every text /
+// VL backbone is usable as the unified `Model.engine` existential without
+// renaming the protocol or touching its ~40 conformers (T1).
+public protocol LanguageModel: Module, TextEngine {
     var hidden: Int { get }
     var nLayers: Int { get }
     var nHeads: Int { get }

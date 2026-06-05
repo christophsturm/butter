@@ -86,10 +86,10 @@ struct Gemma4OmniIntegrationTests {
         #expect(m.availableCapabilities.contains(.imageIn))
         #expect(m.availableCapabilities.contains(.audioIn))
         #expect(m.availableCapabilities.contains(.videoIn))
-        #expect(m.engine.supportsEmbeddingInput)
+        #expect(m.textEngine.supportsEmbeddingInput)
         // The omni text backbone is the 48-layer, 3840-hidden Gemma4Dense.
-        #expect(m.engine.hidden == 3840)
-        #expect(m.engine.nLayers == 48)
+        #expect(m.textEngine.hidden == 3840)
+        #expect(m.textEngine.nLayers == 48)
     }
 
     @Test("text — encoder-free backbone chat-generates coherently")
@@ -114,7 +114,7 @@ struct Gemma4OmniIntegrationTests {
     func encodeShapes() async throws {
         let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "omni checkpoint is not a VLM")
-        let hidden = m.engine.hidden
+        let hidden = m.textEngine.hidden
 
         let img = vlm.encodeImage(try VisionTestHelpers.dogImage())
         #expect(img.shape.count == 2 && img.shape[0] > 0 && img.shape[1] == hidden)
@@ -136,9 +136,9 @@ struct Gemma4OmniIntegrationTests {
 
         let image = try VisionTestHelpers.dogImage()
         let nImg = vlm.encodeImage(image).shape[0]
-        let bos = try #require(m.tokenizer.bosTokenId ?? m.config.bosTokenId)
-        let pre = m.tokenizer.encode(text: "<start_of_turn>user\n")
-        let suf = m.tokenizer.encode(
+        let bos = try #require(m.textTokenizer.bosTokenId ?? m.config.bosTokenId)
+        let pre = m.textTokenizer.encode(text: "<start_of_turn>user\n")
+        let suf = m.textTokenizer.encode(
             text: "\nDescribe this image.<end_of_turn>\n<start_of_turn>model\n")
         let span =
             [Self.boi] + Array(repeating: vlm.imageTokenId, count: nImg) + [Self.eoi]
@@ -148,7 +148,7 @@ struct Gemma4OmniIntegrationTests {
             promptTokens: prompt, image: image, maxTokens: 96,
             parameters: m.defaultGenerationParameters.with { $0.temperature = 0 },
             eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("Gemma 4 Omni image → text: \(text)")
         expectCoherentOutput(generated, minTokens: 6, label: "gemma4-omni-image")
         VisionTestHelpers.expectMentionsDog(text, label: "Gemma 4 Omni")
@@ -163,9 +163,9 @@ struct Gemma4OmniIntegrationTests {
         let wav = Self.sine()
         let nAud = try vlm.encodeAudio(wav).shape[0]
         #expect(nAud > 0)
-        let bos = try #require(m.tokenizer.bosTokenId ?? m.config.bosTokenId)
-        let pre = m.tokenizer.encode(text: "<start_of_turn>user\n")
-        let suf = m.tokenizer.encode(
+        let bos = try #require(m.textTokenizer.bosTokenId ?? m.config.bosTokenId)
+        let pre = m.textTokenizer.encode(text: "<start_of_turn>user\n")
+        let suf = m.textTokenizer.encode(
             text: "\nWhat do you hear?<end_of_turn>\n<start_of_turn>model\n")
         let span =
             [Self.boa] + Array(repeating: audioTokenId, count: nAud) + [Self.eoa]
@@ -177,7 +177,7 @@ struct Gemma4OmniIntegrationTests {
             eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
         print(
             "Gemma 4 Omni audio → text: "
-                + m.tokenizer.decode(tokens: generated, skipSpecialTokens: true))
+                + m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true))
         expectCoherentOutput(generated, minTokens: 3, label: "gemma4-omni-audio")
     }
 
@@ -189,16 +189,16 @@ struct Gemma4OmniIntegrationTests {
 
         let frames = try VisionTestHelpers.catVideoFrames(maxFrames: 3)
         let perFrame = vlm.encodeImage(frames[0]).shape[0]
-        let bos = try #require(m.tokenizer.bosTokenId ?? m.config.bosTokenId)
-        let pre = m.tokenizer.encode(text: "<start_of_turn>user\n")
-        let suf = m.tokenizer.encode(
+        let bos = try #require(m.textTokenizer.bosTokenId ?? m.config.bosTokenId)
+        let pre = m.textTokenizer.encode(text: "<start_of_turn>user\n")
+        let suf = m.textTokenizer.encode(
             text: "\nWhat animal is in this video?<end_of_turn>\n<start_of_turn>model\n")
         var span: [Int] = []
         for i in 0 ..< frames.count {
-            span += m.tokenizer.encode(text: "00:0\(i) ")
+            span += m.textTokenizer.encode(text: "00:0\(i) ")
             span += [Self.boi]
             span += Array(repeating: videoTokenId, count: perFrame)
-            span += [Self.eoi] + m.tokenizer.encode(text: " ")
+            span += [Self.eoi] + m.textTokenizer.encode(text: " ")
         }
         let prompt = [bos] + pre + span + suf
 
@@ -206,7 +206,7 @@ struct Gemma4OmniIntegrationTests {
             promptTokens: prompt, videoFrames: frames, maxTokens: 64,
             parameters: m.defaultGenerationParameters.with { $0.temperature = 0 },
             eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("Gemma 4 Omni video → text: \(text)")
         expectCoherentOutput(generated, minTokens: 4, label: "gemma4-omni-video")
         #expect(

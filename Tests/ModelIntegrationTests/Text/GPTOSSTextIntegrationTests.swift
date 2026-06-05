@@ -69,12 +69,12 @@ struct GPTOSSTextIntegrationTests {
         #expect(m.qwen3 == nil)
 
         // Shapes from the published GPT-OSS-20B config.
-        #expect(m.engine.hidden == 2880)
-        #expect(m.engine.nLayers == 24)
-        #expect(m.engine.nHeads == 64)
-        #expect(m.engine.nKVHeads == 8)
-        #expect(m.engine.headDim == 64)
-        #expect(m.engine.vocab == 201_088)
+        #expect(m.textEngine.hidden == 2880)
+        #expect(m.textEngine.nLayers == 24)
+        #expect(m.textEngine.nHeads == 64)
+        #expect(m.textEngine.nKVHeads == 8)
+        #expect(m.textEngine.headDim == 64)
+        #expect(m.textEngine.vocab == 201_088)
 
         if let g = m.gptOSS {
             // The alternating sliding/full attention schedule.
@@ -93,7 +93,7 @@ struct GPTOSSTextIntegrationTests {
         }
 
         // ── Per-layer cache kinds match the attention schedule ────────
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 24)
         if let g = m.gptOSS {
             for (i, kind) in g.attnKinds.enumerated() {
@@ -125,12 +125,12 @@ struct GPTOSSTextIntegrationTests {
         // truncation samples incoherent tail tokens on a RAW completion
         // prompt — mlx-lm reproduces the identical word-salad. The forward
         // pass is verified bit-for-bit coherent here.)
-        let refIds = m.tokenizer.encode(
+        let refIds = m.textTokenizer.encode(
             text: "The history of the printing press began when")
-        let refCaches = m.engine.makeLayerCaches()
+        let refCaches = m.textEngine.makeLayerCaches()
         var promptLogits: Tensor!
         for (pos, id) in refIds.enumerated() {
-            promptLogits = m.engine.forward(
+            promptLogits = m.textEngine.forward(
                 tokenId: id, position: pos, caches: refCaches)
         }
         #expect(promptLogits.elementCount == 201_088)
@@ -159,7 +159,7 @@ struct GPTOSSTextIntegrationTests {
         )
         #expect(result.tokensPerSecond > 0)
 
-        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        let decoded = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("GPT-OSS-20B decoded output: \(decoded)")
 
         expectCoherentOutput(

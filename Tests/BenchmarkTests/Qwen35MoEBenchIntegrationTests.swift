@@ -61,7 +61,7 @@ struct Qwen35MoEBenchIntegrationTests {
         }
 
         let prompt = "The history of the printing press began when"
-        let promptTokens = m.tokenizer.encode(text: prompt)
+        let promptTokens = m.textTokenizer.encode(text: prompt)
         let promptLen = promptTokens.count
 
         // Warm.
@@ -105,7 +105,7 @@ struct Qwen35MoEBenchIntegrationTests {
         let m = try await loadModel()
         let qwen = try #require(m.qwen35, "expected Qwen35Model engine")
         let seed = "The quick brown fox"
-        var encoded = m.tokenizer.encode(text: seed)
+        var encoded = m.textTokenizer.encode(text: seed)
         while encoded.count < 8 { encoded.append(0) }
         encoded = Array(encoded.prefix(8))
         let caches = qwen.makeLayerCaches()
@@ -125,7 +125,7 @@ struct Qwen35MoEBenchIntegrationTests {
         let m = try await loadModel()
         let qwen = try #require(m.qwen35, "expected Qwen35Model engine")
         let seed = "The quick brown fox jumps over the lazy dog. "
-        let seedEncoded = m.tokenizer.encode(text: seed)
+        let seedEncoded = m.textTokenizer.encode(text: seed)
         var encoded = seedEncoded
         while encoded.count < 128 { encoded.append(contentsOf: seedEncoded) }
         encoded = Array(encoded.prefix(128))
@@ -161,7 +161,7 @@ struct Qwen35MoEBenchIntegrationTests {
         let qwen = try #require(m.qwen35, "expected Qwen35Model engine")
         let seed =
             "The history of the printing press began when European craftsmen of the 15th century combined movable metal type with oil based ink screw presses paper to mass produce printed books pamphlets and broadsheets revolutionising communication"
-        let seedEncoded = m.tokenizer.encode(text: seed)
+        let seedEncoded = m.textTokenizer.encode(text: seed)
         let targetT = 32_768
         var encoded = seedEncoded
         while encoded.count < targetT {
@@ -221,7 +221,7 @@ struct Qwen35MoEBenchIntegrationTests {
 
         let seed =
             "The history of the printing press began when European craftsmen of the 15th century combined movable metal type with oil based ink screw presses paper to mass produce printed books pamphlets and broadsheets revolutionising communication"
-        let seedEncoded = m.tokenizer.encode(text: seed)
+        let seedEncoded = m.textTokenizer.encode(text: seed)
         var encoded = seedEncoded
         while encoded.count < targetT {
             encoded.append(contentsOf: seedEncoded)

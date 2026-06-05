@@ -74,7 +74,7 @@ struct SpecDecodeVerifyCostBench {
 
             def
             """
-        let promptTokens = m.tokenizer.encode(text: prompt)
+        let promptTokens = m.textTokenizer.encode(text: prompt)
         let promptLen = promptTokens.count
         let device = Device.shared
 

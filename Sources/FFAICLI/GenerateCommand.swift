@@ -119,21 +119,21 @@ struct GenerateTextCommand: AsyncParsableCommand {
 
     /// `--verbose`: run prefill once and print the top-5 next tokens.
     private func runVerbose(model m: Model) throws {
-        let promptTokens = m.tokenizer.encode(text: prompt)
+        let promptTokens = m.textTokenizer.encode(text: prompt)
         print("prompt tokens: \(promptTokens)")
         // Size the cache to the probe prompt, not the model's full
         // context window (long-context models would otherwise allocate
         // tens of GB for this sanity check).
-        let verifyCacheDepth = max(1, Swift.min(m.engine.maxContextWindow, promptTokens.count + 1))
-        let caches = m.engine.makeLayerCaches(maxSeq: verifyCacheDepth)
+        let verifyCacheDepth = max(1, Swift.min(m.textEngine.maxContextWindow, promptTokens.count + 1))
+        let caches = m.textEngine.makeLayerCaches(maxSeq: verifyCacheDepth)
         var lastLogits: Tensor?
         for (i, t) in promptTokens.enumerated() {
-            lastLogits = m.engine.forward(tokenId: t, position: i, caches: caches)
+            lastLogits = m.textEngine.forward(tokenId: t, position: i, caches: caches)
         }
         if let l = lastLogits {
             print("top-5 next tokens:")
             for (id, v) in Sampling.topN(l, n: 5) {
-                let s = m.tokenizer.decode(tokens: [id], skipSpecialTokens: false)
+                let s = m.textTokenizer.decode(tokens: [id], skipSpecialTokens: false)
                 print("  \(id) (\(String(format: "%.4f", v)))  \"\(s)\"")
             }
         }
@@ -212,7 +212,7 @@ struct GenerateTextCommand: AsyncParsableCommand {
             print("")
             let promptTokens =
                 chatMessages.flatMap { try? model.renderChatTemplate(messages: $0) }
-                ?? model.tokenizer.encode(text: prompt)
+                ?? model.textTokenizer.encode(text: prompt)
             return GenerationResult(
                 promptTokens: promptTokens,
                 generatedTokens: generated, text: text,

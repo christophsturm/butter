@@ -50,8 +50,8 @@ struct Gemma3VisionIntegrationTests {
         // available, and the text backbone is a Gemma 3 4B engine.
         #expect(m.vlModel != nil)
         #expect(m.availableCapabilities.contains(.imageIn))
-        #expect(m.engine.hidden == 2560)  // 4B text hidden
-        #expect(m.engine.supportsEmbeddingInput)  // VLM splice prerequisite
+        #expect(m.textEngine.hidden == 2560)  // 4B text hidden
+        #expect(m.textEngine.supportsEmbeddingInput)  // VLM splice prerequisite
 
         let vlm = try #require(m.vlModel)
         // SigLIP-896 / patch-14 → 64×64 patches, pooled 4×4 → 256 tokens.
@@ -100,9 +100,9 @@ struct Gemma3VisionIntegrationTests {
         //   • `<end_of_image>`   = `eoi_token_index` → id 256000
         //   • `<image_soft_token>` = `image_token_index` → id 262144
         let imageTokenId = vlm.imageTokenId
-        let header = m.tokenizer.encode(
+        let header = m.textTokenizer.encode(
             text: "<bos><start_of_turn>user\n<start_of_image>")
-        let trailer = m.tokenizer.encode(
+        let trailer = m.textTokenizer.encode(
             text: "<end_of_image>Describe this image.<end_of_turn>\n"
                 + "<start_of_turn>model\n")
         let promptTokens =
@@ -126,7 +126,7 @@ struct Gemma3VisionIntegrationTests {
         expectCoherentOutput(
             generated, minTokens: 8,
             label: "Gemma 3 VL image+text")
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("Gemma 3 VL generated: \(text)")
         VisionTestHelpers.expectMentionsDog(text, label: "Gemma 3 VL")
     }

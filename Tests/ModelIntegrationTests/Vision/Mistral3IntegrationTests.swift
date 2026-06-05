@@ -52,7 +52,7 @@ struct Mistral3IntegrationTests {
         // available, and the text backbone supports the splice.
         #expect(m.vlModel != nil)
         #expect(m.availableCapabilities.contains(.imageIn))
-        #expect(m.engine.supportsEmbeddingInput)
+        #expect(m.textEngine.supportsEmbeddingInput)
 
         let vlm = try #require(m.vlModel)
         // The vision tower contributes a positive run of merged patch tokens.
@@ -86,7 +86,7 @@ struct Mistral3IntegrationTests {
         // token (id = 10 by default) as the image placeholder in its
         // prompt format; one placeholder per merged patch.
         let imageTokenId = vlm.imageTokenId
-        let questionTokens = m.tokenizer.encode(
+        let questionTokens = m.textTokenizer.encode(
             text: "\nDescribe this image.")
         let promptTokens =
             Array(
@@ -105,7 +105,7 @@ struct Mistral3IntegrationTests {
         expectCoherentOutput(
             generated, minTokens: 8,
             label: "Mistral3 image+text")
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("Mistral3 generated: \(text)")
         // Content gate: the caption should mention a dog.
         VisionTestHelpers.expectMentionsDog(text, label: "Mistral3")

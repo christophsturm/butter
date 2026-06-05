@@ -208,17 +208,17 @@ struct InspectCommand: AsyncParsableCommand {
         print("└────────────────────────────────────────────────────────")
 
         // ─── Tokenizer ───────────────────────────────────────────
-        let promptTokens = m.tokenizer.encode(text: prompt)
+        let promptTokens = m.textTokenizer.encode(text: prompt)
         print("")
         print("┌─ Tokenizer ────────────────────────────────────────────")
         print("│ probe prompt       \"\(prompt)\"")
         print("│ prompt tokens      \(promptTokens.count): \(promptTokens)")
         let perTokenDecoded = promptTokens.map { id -> String in
-            let s = m.tokenizer.decode(tokens: [id], skipSpecialTokens: false)
+            let s = m.textTokenizer.decode(tokens: [id], skipSpecialTokens: false)
             return "\(id)=\"\(s)\""
         }
         print("│ per-token          \(perTokenDecoded.joined(separator: ", "))")
-        let roundtrip = m.tokenizer.decode(tokens: promptTokens, skipSpecialTokens: false)
+        let roundtrip = m.textTokenizer.decode(tokens: promptTokens, skipSpecialTokens: false)
         print("│ roundtrip          \"\(roundtrip)\"")
         print("└────────────────────────────────────────────────────────")
 
@@ -286,8 +286,8 @@ struct InspectCommand: AsyncParsableCommand {
         // estimate so the "how much would a real session cost" signal —
         // exactly the number that flags a runaway long-context cache —
         // survives without being allocated.
-        let inspectCacheDepth = max(1, Swift.min(m.engine.maxContextWindow, promptTokens.count + 1))
-        let caches = m.engine.makeLayerCaches(maxSeq: inspectCacheDepth)
+        let inspectCacheDepth = max(1, Swift.min(m.textEngine.maxContextWindow, promptTokens.count + 1))
+        let caches = m.textEngine.makeLayerCaches(maxSeq: inspectCacheDepth)
         let bytesAllocated = caches.reduce(0) { $0 + $1.bytesAllocated }
 
         // Full-context footprint estimate — what a session at the
@@ -301,7 +301,7 @@ struct InspectCommand: AsyncParsableCommand {
             if let kv = cache as? any KVCacheProtocol {
                 attnLayerCount += 1
                 fullContextBytes +=
-                    kv.nKVHeads * m.engine.maxContextWindow * kv.headDim
+                    kv.nKVHeads * m.textEngine.maxContextWindow * kv.headDim
                     * 2 /* K + V */ * kv.dtype.byteSize
             } else {
                 fullContextBytes += cache.bytesAllocated
@@ -313,7 +313,7 @@ struct InspectCommand: AsyncParsableCommand {
         print("│ scheme             \(opts.kvCache)")
         print("│ eviction policy    \(opts.kvEviction)")
         print("│ per-layer caches   \(caches.count) (\(attnLayerCount) seq-scaling attention)")
-        print("│ max context window \(m.engine.maxContextWindow)")
+        print("│ max context window \(m.textEngine.maxContextWindow)")
         print(
             "│ full-ctx footprint \(formatBytes(fullContextBytes))  ← a session at full window")
         print(
@@ -333,7 +333,7 @@ struct InspectCommand: AsyncParsableCommand {
         print("┌─ Top-\(topK) next tokens ──────────────────────────────────")
         var lastLogits: Tensor?
         for (i, t) in promptTokens.enumerated() {
-            lastLogits = m.engine.forward(tokenId: t, position: i, caches: caches)
+            lastLogits = m.textEngine.forward(tokenId: t, position: i, caches: caches)
         }
         guard let l = lastLogits else {
             print("│ (no prompt tokens — nothing to forward)")
@@ -343,7 +343,7 @@ struct InspectCommand: AsyncParsableCommand {
         let top = Sampling.topN(l, n: topK)
         var anyNaN = false
         for (id, value) in top {
-            let s = m.tokenizer.decode(tokens: [id], skipSpecialTokens: false)
+            let s = m.textTokenizer.decode(tokens: [id], skipSpecialTokens: false)
             let valueStr: String
             if value.isNaN {
                 valueStr = "NaN"
@@ -383,7 +383,7 @@ struct InspectCommand: AsyncParsableCommand {
             return
         }
         let parts: [String] = ids.map { id in
-            let decoded = m.tokenizer.decode(tokens: [id], skipSpecialTokens: false)
+            let decoded = m.textTokenizer.decode(tokens: [id], skipSpecialTokens: false)
             return "\(id) \"\(decoded)\""
         }
         print("│ \(padded) \(parts.joined(separator: ", "))")

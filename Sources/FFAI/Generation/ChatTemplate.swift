@@ -149,7 +149,7 @@ extension Model {
         // `chat_template.jinja` shipped alongside the model, passed as a
         // literal override. One of the two must exist.
         let standalone = standaloneChatTemplate
-        guard tokenizer.hasChatTemplate || standalone != nil else {
+        guard tokenizer?.hasChatTemplate == true || standalone != nil else {
             throw ChatTemplateError.noTemplateOnTokenizer
         }
         var additional: [String: any Sendable] = options.extraContext
@@ -159,7 +159,7 @@ extension Model {
         }
         let templateMessages = messages.map { $0.asTemplateMessage }
         do {
-            return try tokenizer.applyChatTemplate(
+            return try textTokenizer.applyChatTemplate(
                 messages: templateMessages,
                 chatTemplate: standalone.map { ChatTemplateArgument.literal($0) },
                 addGenerationPrompt: options.addGenerationPrompt,

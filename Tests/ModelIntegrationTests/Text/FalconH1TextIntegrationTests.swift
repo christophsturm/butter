@@ -53,12 +53,12 @@ struct FalconH1TextIntegrationTests {
         #expect(m.mamba2 == nil)
 
         // Shapes from the published Tiny-90M config.
-        #expect(m.engine.hidden == 512)
-        #expect(m.engine.nLayers == 24)
-        #expect(m.engine.nHeads == 8)
-        #expect(m.engine.nKVHeads == 2)
-        #expect(m.engine.headDim == 64)
-        #expect(m.engine.vocab == 32_768)
+        #expect(m.textEngine.hidden == 512)
+        #expect(m.textEngine.nLayers == 24)
+        #expect(m.textEngine.nHeads == 8)
+        #expect(m.textEngine.nKVHeads == 2)
+        #expect(m.textEngine.headDim == 64)
+        #expect(m.textEngine.vocab == 32_768)
         if let fh1 = m.falconH1 {
             // Mamba 2 mixer geometry — d_ssm = mamba_n_heads * mamba_d_head.
             #expect(fh1.dSSM == 768)
@@ -76,10 +76,10 @@ struct FalconH1TextIntegrationTests {
         // ── Forward-shape smoke test ──────────────────────────────────
         // One BOS-style token through the full hybrid stack. Logits
         // should be finite and non-degenerate (the model is trained).
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 24)
         #expect(caches.allSatisfy { $0 is FalconH1LayerCache })
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 32_768)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
@@ -96,7 +96,7 @@ struct FalconH1TextIntegrationTests {
         #expect(result.tokensPerSecond > 0)
 
         // Print the actual decoded text for manual inspection.
-        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        let decoded = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("FalconH1 Tiny-90M decoded output: \(decoded)")
 
         expectCoherentOutput(

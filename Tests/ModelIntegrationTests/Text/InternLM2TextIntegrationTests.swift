@@ -43,12 +43,12 @@ struct InternLM2TextIntegrationTests {
 
         // InternLM 2.5 7B canonical: hidden=4096, nLayers=32, nHeads=32,
         // nKVHeads=8 (4:1 GQA), head_dim=128 (4096/32), vocab=92_544.
-        #expect(m.engine.hidden == 4096)
-        #expect(m.engine.nLayers == 32)
-        #expect(m.engine.nHeads == 32)
-        #expect(m.engine.nKVHeads == 8)
-        #expect(m.engine.headDim == 128)
-        #expect(m.engine.vocab == 92_544)
+        #expect(m.textEngine.hidden == 4096)
+        #expect(m.textEngine.nLayers == 32)
+        #expect(m.textEngine.nHeads == 32)
+        #expect(m.textEngine.nKVHeads == 8)
+        #expect(m.textEngine.headDim == 128)
+        #expect(m.textEngine.vocab == 92_544)
 
         // ── 3. Errors we expect ─────────────────────────────────────────
         // Cache-kind alignment + fused-`wqkv` projection split happens
@@ -56,7 +56,7 @@ struct InternLM2TextIntegrationTests {
         // regressed we'd see a load-time throw rather than a forward-time
         // shape mismatch. The forward smoke test below is the
         // belt-and-braces check.
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 32)
         for (i, c) in caches.enumerated() {
             if !(c is KVCache) {
@@ -65,7 +65,7 @@ struct InternLM2TextIntegrationTests {
         }
 
         // ── 4. Forward pass produces expected output ────────────────────
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 92_544)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)

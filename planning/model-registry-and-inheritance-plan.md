@@ -248,10 +248,13 @@ public final class Model {
 `generate` dispatches by `engine as? <ModalityProtocol>`; the existing
 `Generation/Generate.driveGeneration` backs the text path.
 
-### Decisions needed before implementing
+### Decisions — RESOLVED at implementation (2026-06-05)
 
-- **T1** — rename `LanguageModel` → `TextEngine`, or keep `LanguageModel` as `: TextEngine` (less churn; ~40 conformers + many call sites)? *Recommend keep `LanguageModel`, refine to `: TextEngine`.*
-- **T2** — keep `forwardMulti` name (vs the plan's `forwardMany`)? *Recommend keep `forwardMulti` — it's the existing name across all engines.*
-- **T3** — `ChatMessage` / `Tool`: reuse the existing `Generation/ChatTemplate` types, or new? Need to reconcile.
-- **T4** — new types `TranscribeParameters`, `DetectionEvent` (small structs) — confirm names.
-- **T5** — `Model.generate` returning a sum type means the CLI `generate`/`transcribe`/`speak` commands switch on it (or use the typed convenience). Confirm the typed-convenience methods are the primary CLI entry.
+- **T1 — RESOLVED: keep `LanguageModel`, refine to `: TextEngine`.** `protocol LanguageModel: Module, TextEngine`. Zero churn on the ~40 conformers + call sites; `LanguageModel` stays the name everywhere. `TextEngine: ModelEngine` is the modality marker.
+- **T2 — RESOLVED: keep `forwardMulti`.** Existing name across all engines; no rename.
+- **T3 — RESOLVED: reuse `Generation/ChatTemplate.ChatMessage`.** No new chat type. `Tool` does not exist yet (chat template passes `tools: nil`); `TextRequest` omits tools for now — added when tool-calling is wired. The unified text path delegates to the existing `generate(messages:)` / `generateStream(messages:)`.
+- **T4 — RESOLVED:** introduced `TranscribeParameters { maxNewTokens, temperature }` (maps 1:1 onto `StreamingTranscriber`'s args) and `DetectionEvent { startSample, endSample, sampleRate, label, score, speaker? }` (the common shape the three VAD output types — `VADOutput`, `VADEndpointOutput`, `DiarizationOutput` — map down to). `SynthesizeParameters { voice?, speed }` added for symmetry on the TTS side.
+- **T5 — RESOLVED: typed-convenience methods are the primary CLI entry.** `transcribe`/`transcribeStream`/`synthesize`/`synthesizeStream`/`detect` on `Model` are what `ffai transcribe` / `ffai speak` call; the generic `generate(_:)` / `generateStream(_:)` sum-type surface is the programmatic API. CLI never switches on the output enum.
+- **T6 (new, naming collision) — RESOLVED:** the plan's proposed `GenerationResult` / `GenerationChunk` *enum* names already exist as **structs** in `Generation/Generate.swift` (the text-generation batch/stream result). To avoid clobbering the deeply-wired text path, the unified modality sum types are named **`ModelOutput`** (batch) and **`ModelOutputChunk`** (streaming); input is **`ModelInput`**. The existing `GenerationResult`/`GenerationChunk` structs are untouched.
+- **T7 (new, engine type) — RESOLVED:** `ModelEngine` is a minimal marker protocol (no structural requirements) so all 30+ heterogeneous audio/VAD concrete types conform for free. `Model.engine` retypes to `any ModelEngine`; a `Model.languageModel: (any LanguageModel)?` accessor (and internal `requireLanguageModel()`) backs the text/VL call sites. `Model.tokenizer` becomes optional (VAD/STS carry none). `ModelInfo` gains `kind` and tolerates a non-text engine (shape fields read from `languageModel` when present).
+- **STS/SAMAudio — RESOLVED:** `SpeechTransforming { process(_:) async throws -> [Float] }` covers the waveform→waveform denoisers (DeepFilterNet, MossFormer2-SE). SAMAudio's promptable `segment(waveform:description:)` does not fit a uniform waveform→waveform contract, so it is reached via `model.engine as? SAMAudioModel` (kind `.sts`, capabilities `speechToSpeech`) rather than forced into `SpeechTransforming`.

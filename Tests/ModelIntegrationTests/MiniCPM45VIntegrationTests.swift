@@ -61,9 +61,9 @@ struct MiniCPM45VIntegrationTests {
         #expect(m.availableCapabilities.contains(.videoIn))
         // No audio — this is the V checkpoint, not the omni.
         #expect(!m.availableCapabilities.contains(.audioIn))
-        #expect(m.engine.supportsEmbeddingInput)
+        #expect(m.textEngine.supportsEmbeddingInput)
         // Qwen3-8B dense backbone.
-        #expect(m.engine.hidden == 4096)
+        #expect(m.textEngine.hidden == 4096)
         let vlm = try #require(m.vlModel)
         #expect(vlm.imageTokenCount == 64)  // resampler query_num
         #expect(vlm.imageTokenId == MiniCPM4.resamplerImageTokenId)
@@ -86,7 +86,7 @@ struct MiniCPM45VIntegrationTests {
                 $0.maxTokens = 64
                 $0.temperature = 0
             })
-        let text = m.tokenizer.decode(tokens: r.generatedTokens, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: r.generatedTokens, skipSpecialTokens: true)
         print("MiniCPM-V 4.5 text → \(text)")
         expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "minicpmv45-text")
     }
@@ -103,15 +103,15 @@ struct MiniCPM45VIntegrationTests {
         // inside a chat turn. The 64 placeholders (vlm.imageTokenId, `<|image_pad|>`) are replaced 
         // by the resampler's 64 image tokens.
         let nImg = vlm.encodeImage(image).shape[0]
-        let pre = m.tokenizer.encode(text: "<|im_start|>user\n<image>")
-        let post = m.tokenizer.encode(
+        let pre = m.textTokenizer.encode(text: "<|im_start|>user\n<image>")
+        let post = m.textTokenizer.encode(
             text: "</image>\nDescribe this image.<|im_end|>\n<|im_start|>assistant\n")
         let prompt = pre + Array(repeating: vlm.imageTokenId, count: nImg) + post
 
         let generated = try vlm.generate(
             promptTokens: prompt, image: image, maxTokens: 200,
             eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("MiniCPM-V 4.5 image → \(text)")
         expectCoherentOutput(generated, minTokens: 8, label: "MiniCPM-V 4.5 image")
         VisionTestHelpers.expectMentionsDog(text, label: "MiniCPM-V 4.5")
@@ -130,22 +130,22 @@ struct MiniCPM45VIntegrationTests {
         // run; the splice substitutes per-frame video tokens IN ORDER.
         let frames = try VisionTestHelpers.catVideoFrames(maxFrames: 3)
         let perFrame = vlm.encodeImage(frames[0]).shape[0]
-        let pre = m.tokenizer.encode(text: "<|im_start|>user\n")
-        let post = m.tokenizer.encode(
+        let pre = m.textTokenizer.encode(text: "<|im_start|>user\n")
+        let post = m.textTokenizer.encode(
             text: "\nWhat animal is in this video?<|im_end|>\n"
                 + "<|im_start|>assistant\n")
         var span: [Int] = []
         for _ in frames {
-            span += m.tokenizer.encode(text: "<image>")
+            span += m.textTokenizer.encode(text: "<image>")
             span += Array(repeating: videoTokenId, count: perFrame)
-            span += m.tokenizer.encode(text: "</image>")
+            span += m.textTokenizer.encode(text: "</image>")
         }
         let prompt = pre + span + post
 
         let generated = try vlm.generate(
             promptTokens: prompt, videoFrames: frames, maxTokens: 96,
             eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("MiniCPM-V 4.5 video → \(text)")
         expectCoherentOutput(generated, minTokens: 4, label: "MiniCPM-V 4.5 video")
         #expect(

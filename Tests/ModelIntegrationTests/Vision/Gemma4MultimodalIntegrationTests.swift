@@ -80,7 +80,7 @@ struct Gemma4MultimodalIntegrationTests {
         let vlm = try #require(m.vlModel, "checkpoint is not a VLM")
         #expect(m.availableCapabilities.contains(.imageIn))
         #expect(m.availableCapabilities.contains(.audioIn))
-        #expect(m.engine.supportsEmbeddingInput)
+        #expect(m.textEngine.supportsEmbeddingInput)
 
         // The audio tower actually loaded — `supportsAudio` is true exactly
         // when both an `audioTokenId` and the audioEncode hook are wired.
@@ -105,8 +105,8 @@ struct Gemma4MultimodalIntegrationTests {
         #expect(audioTokens.shape.count == 2)
         #expect(audioTokens.shape[0] > 0, "expected a positive run of audio soft tokens")
         #expect(
-            audioTokens.shape[1] == m.engine.hidden,
-            "audio soft tokens must project into the text hidden dim (\(audioTokens.shape[1]) != \(m.engine.hidden))")
+            audioTokens.shape[1] == m.textEngine.hidden,
+            "audio soft tokens must project into the text hidden dim (\(audioTokens.shape[1]) != \(m.textEngine.hidden))")
     }
 
     /// Numerically validate the audio encoder against the mlx-vlm oracle.
@@ -259,9 +259,9 @@ struct Gemma4MultimodalIntegrationTests {
         // one — the prompt carries an explicit leading <bos> (the image path
         // needs this too).
         let bos = try #require(
-            m.tokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
-        let userPrefix = m.tokenizer.encode(text: "<start_of_turn>user\n")
-        let userSuffix = m.tokenizer.encode(
+            m.textTokenizer.bosTokenId ?? m.config.bosTokenId, "no BOS token id")
+        let userPrefix = m.textTokenizer.encode(text: "<start_of_turn>user\n")
+        let userSuffix = m.textTokenizer.encode(
             text: "\nTranscribe this audio.<end_of_turn>\n<start_of_turn>model\n")
         let audioSpan =
             [Self.boaTokenId]
@@ -276,7 +276,7 @@ struct Gemma4MultimodalIntegrationTests {
             eosTokenId: m.config.eosTokenId,
             eosTokenIds: m.config.eosTokenIds)
 
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("Gemma 4 audio → text: \(text)")
 
         // Coherent (non-degenerate) decode — the audio path must not produce

@@ -146,9 +146,9 @@ extension Model {
     /// helper idempotent and safe for families whose post-processor
     /// does add one.
     internal func encodePrompt(_ prompt: String) -> [Int] {
-        var tokens = tokenizer.encode(text: prompt)
-        guard engine.requiresLeadingBOS,
-            let bos = tokenizer.bosTokenId ?? config.bosTokenId
+        var tokens = textTokenizer.encode(text: prompt)
+        guard textEngine.requiresLeadingBOS,
+            let bos = textTokenizer.bosTokenId ?? config.bosTokenId
         else { return tokens }
         if tokens.first != bos {
             tokens.insert(bos, at: 0)
@@ -249,7 +249,7 @@ extension Model {
         // the context window fills. Resolve it to the concrete number of
         // tokens we can still emit given the prompt + the model's context
         // ceiling, so the KV-cache budget + the decode loop have a bound.
-        let contextRoom = max(0, engine.maxContextWindow - promptTokens.count - 1)
+        let contextRoom = max(0, textEngine.maxContextWindow - promptTokens.count - 1)
         let effectiveMaxTokens = params.maxTokens.map { min($0, contextRoom) } ?? contextRoom
         let generationBudget = promptTokens.count + effectiveMaxTokens + 1
         let caches = try makeManagedCaches(generationBudget: generationBudget)
@@ -262,7 +262,7 @@ extension Model {
             if params.stopOnEOS { s.formUnion(eosIds) }
             return s
         }()
-        let weightsBytes = engine.parameters().reduce(0) { $0 + $1.1.byteCount }
+        let weightsBytes = textEngine.parameters().reduce(0) { $0 + $1.1.byteCount }
         let memTracker = PhaseMemoryTracker()
         // Energy (per-task kernel counter) + thermal state, sampled at
         // the same phase boundaries as memory. Both are best-effort and
@@ -294,15 +294,15 @@ extension Model {
         func sampleNext(tokenId t: Int, position i: Int) -> Int {
             switch path {
             case .greedyGPU:
-                return engine.forwardSample(tokenId: t, position: i, caches: caches)
+                return textEngine.forwardSample(tokenId: t, position: i, caches: caches)
             case .gpuCategorical:
                 let u = Float(Double.random(in: 0 ..< 1, using: &rng))
-                return engine.forwardSampleCategorical(
+                return textEngine.forwardSampleCategorical(
                     tokenId: t, position: i, caches: caches,
                     temperature: params.temperature, uniformDraw: u
                 )
             case .cpuSample:
-                let logits = engine.forward(tokenId: t, position: i, caches: caches)
+                let logits = textEngine.forward(tokenId: t, position: i, caches: caches)
                 return Sampling.sample(
                     logits, parameters: params,
                     rng: &rng, tokenHistory: tokenHistory)
@@ -317,7 +317,7 @@ extension Model {
         // ─── Prefill ─────────────────────────────────────────────────
         //
         // .6: chunked prefill. Pre-warm the KV cache for all but
-        // the last prompt position by calling `engine.forwardMulti(...)`
+        // the last prompt position by calling `textEngine.forwardMulti(...)`
         // in `prefillStepSize`-sized chunks (default 1024). Then sample
         // the final position via the existing fused-kernel `sampleNext`
         // path — that's the only position whose logits we actually need.
@@ -342,14 +342,14 @@ extension Model {
             let chunkSize = max(
                 1,
                 params.prefillStepSize
-                    ?? engine.defaultPrefillStepSize)
+                    ?? textEngine.defaultPrefillStepSize)
             var pos = 0
             while pos < n - 1 {
                 try Task.checkCancellation()
                 let end = min(pos + chunkSize, n - 1)
                 let chunk = Array(promptTokens[pos ..< end])
                 let cmd = Device.shared.makeCommandBuffer()
-                _ = engine.forwardMulti(
+                _ = textEngine.forwardMulti(
                     tokenIds: chunk, startingAt: pos,
                     caches: caches, on: cmd,
                     device: Device.shared)
@@ -381,7 +381,7 @@ extension Model {
             energyTracker.endDecode()
             let stats = makeStats(
                 promptTokens: promptTokens, generatedCount: 0,
-                contextSize: engine.maxContextWindow, prefillTime: 0, decodeTime: 0,
+                contextSize: textEngine.maxContextWindow, prefillTime: 0, decodeTime: 0,
                 ttftMs: 0, perTokenWallclock: [],
                 memTracker: memTracker, energyTracker: energyTracker, caches: caches,
                 weightsBytes: weightsBytes, splitTokens: nil
@@ -406,7 +406,7 @@ extension Model {
             try Task.checkCancellation()
             if stopSet.contains(nextToken) { break }
             generated.append(nextToken)
-            let chunkText = tokenizer.decode(
+            let chunkText = textTokenizer.decode(
                 tokens: [nextToken],
                 skipSpecialTokens: true)
             continuation.yield(
@@ -441,7 +441,7 @@ extension Model {
         let split = ThinkingSplit.split(tokens: generated, model: self)
         let stats = makeStats(
             promptTokens: promptTokens, generatedCount: generated.count,
-            contextSize: engine.maxContextWindow, prefillTime: prefillTime,
+            contextSize: textEngine.maxContextWindow, prefillTime: prefillTime,
             decodeTime: decodeTime, ttftMs: ttftMs,
             perTokenWallclock: perTokenWallclock,
             memTracker: memTracker, energyTracker: energyTracker, caches: caches,

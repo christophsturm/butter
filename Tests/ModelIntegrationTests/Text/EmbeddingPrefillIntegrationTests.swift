@@ -51,14 +51,14 @@ struct EmbeddingPrefillIntegrationTests {
         let m = try await ModelLoadLock.shared.loadSerially {
             try await loadModel(Self.modelId)
         }
-        let engine = m.engine
+        let engine = m.textEngine
         #expect(engine.supportsEmbeddingInput, "Qwen 2.5 backbone must support the splice")
         #expect(engine.headDim == 128, "this guard targets the fused head_dim-128 path")
 
         // Build a text-only embedding stream — the same kind of contiguous
         // `[seqLen, hidden]` block `VisionModel.assembleEmbeddingBlock`
         // packs, minus the vision rows.
-        let promptTokens = m.tokenizer.encode(
+        let promptTokens = m.textTokenizer.encode(
             text: "A photograph of a dog standing in a grassy field near a calm lake at dawn.")
         precondition(
             promptTokens.count >= 4,

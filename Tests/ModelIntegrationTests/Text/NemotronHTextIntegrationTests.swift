@@ -57,12 +57,12 @@ struct NemotronHTextIntegrationTests {
         #expect(m.mamba2 == nil)
 
         // Shapes from the published Nemotron-H-4B-Base config.
-        #expect(m.engine.hidden == 3072)
-        #expect(m.engine.nLayers == 52)
-        #expect(m.engine.nHeads == 32)
-        #expect(m.engine.nKVHeads == 8)
-        #expect(m.engine.headDim == 128)
-        #expect(m.engine.vocab == 131_072)
+        #expect(m.textEngine.hidden == 3072)
+        #expect(m.textEngine.nLayers == 52)
+        #expect(m.textEngine.nHeads == 32)
+        #expect(m.textEngine.nKVHeads == 8)
+        #expect(m.textEngine.headDim == 128)
+        #expect(m.textEngine.vocab == 131_072)
         if let nh = m.nemotronH {
             // Mamba 2 mixer geometry — d_inner = mamba_num_heads * mamba_head_dim.
             #expect(nh.mambaNHeads == 112)
@@ -86,7 +86,7 @@ struct NemotronHTextIntegrationTests {
         // ── Forward-shape smoke test ──────────────────────────────────
         // One token through the full heterogeneous stack. Logits should
         // be finite and non-degenerate (the model is trained).
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 52)
         // Cache kinds match the layer kinds, index-for-index.
         if let nh = m.nemotronH {
@@ -103,7 +103,7 @@ struct NemotronHTextIntegrationTests {
                 }
             }
         }
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 131_072)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
@@ -120,7 +120,7 @@ struct NemotronHTextIntegrationTests {
         #expect(result.tokensPerSecond > 0)
 
         // Print the actual decoded text for manual inspection.
-        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        let decoded = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("NemotronH-4B decoded output: \(decoded)")
 
         expectCoherentOutput(

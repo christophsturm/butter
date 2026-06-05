@@ -53,8 +53,8 @@ enum MultimodalPrompt {
 
         guard model.supportsChatTemplate else {
             // No template — best-effort raw framing.
-            let bos = model.tokenizer.bosTokenId ?? model.config.bosTokenId
-            let textTokens = model.tokenizer.encode(text: userText)
+            let bos = model.textTokenizer.bosTokenId ?? model.config.bosTokenId
+            let textTokens = model.textTokenizer.encode(text: userText)
             return (bos.map { [$0] } ?? []) + mediaRun + textTokens
         }
 

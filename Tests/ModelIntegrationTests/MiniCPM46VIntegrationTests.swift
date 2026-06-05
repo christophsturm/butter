@@ -69,8 +69,8 @@ struct MiniCPM46VIntegrationTests {
         #expect(m.vlModel != nil)
         #expect(m.availableCapabilities.contains(.imageIn))
         #expect(m.availableCapabilities.contains(.videoIn))
-        #expect(m.engine.hidden == 1024)
-        #expect(m.engine.supportsEmbeddingInput)
+        #expect(m.textEngine.hidden == 1024)
+        #expect(m.textEngine.supportsEmbeddingInput)
         // Qwen 3.5 is the text backbone (`qwen3_5_text` text_config).
         #expect(m.qwen35 != nil)
 
@@ -136,13 +136,13 @@ struct MiniCPM46VIntegrationTests {
         // degenerate emit-only-space loop (token 220 = `Ġ`), which is
         // exactly how this test had been failing.
         let imageTokenId = vlm.imageTokenId
-        let header = m.tokenizer.encode(text: "<|im_start|>user\n")
+        let header = m.textTokenizer.encode(text: "<|im_start|>user\n")
         // The chat_template.jinja with the default `enable_thinking=false`
         // appends `<think>\n\n</think>\n\n` after `<|im_start|>assistant\n`.
         // Skipping that opener leaves the model in an undefined state
         // (the Qwen3.5 backbone was fine-tuned with the marker present)
         // and it loops on newlines as the lowest-perplexity continuation.
-        let trailer = m.tokenizer.encode(
+        let trailer = m.textTokenizer.encode(
             text: "\nDescribe this image briefly.<|im_end|>\n"
                 + "<|im_start|>assistant\n<think>\n\n</think>\n\n")
         let promptTokens =
@@ -165,7 +165,7 @@ struct MiniCPM46VIntegrationTests {
         expectCoherentOutput(
             generated, minTokens: 16,
             label: "MiniCPM-V 4.6 image+text")
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("MiniCPM-V 4.6 generated: \(text)")
     }
 
@@ -191,11 +191,11 @@ struct MiniCPM46VIntegrationTests {
         //   <|video_pad|> × (frames · imageTokenCount)
         //   \nWhat's in this video?<|im_end|>\n
         //   <|im_start|>assistant\n<think>\n\n</think>\n\n
-        let header = m.tokenizer.encode(text: "<|im_start|>user\n")
+        let header = m.textTokenizer.encode(text: "<|im_start|>user\n")
         // Mirror the image-path opener (`<think>\n\n</think>\n\n` after
         // `<|im_start|>assistant\n`) so video-mode generation gets the
         // same assistant-turn signal the backbone was fine-tuned on.
-        let trailer = m.tokenizer.encode(
+        let trailer = m.textTokenizer.encode(
             text: "\nWhat's in this video?<|im_end|>\n"
                 + "<|im_start|>assistant\n<think>\n\n</think>\n\n")
 
@@ -212,7 +212,7 @@ struct MiniCPM46VIntegrationTests {
         expectCoherentOutput(
             generated, minTokens: 8,
             label: "MiniCPM-V 4.6 video+text")
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("MiniCPM-V 4.6 video generated: \(text)")
         VisionTestHelpers.expectMentionsCat(text, label: "MiniCPM-V 4.6 video")
     }

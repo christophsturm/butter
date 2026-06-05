@@ -100,7 +100,7 @@ extension Model {
         -> DiffusionResult
     {
         let resolvedMode = mode ?? loadOptions.diffusionMode
-        let promptTokens = tokenizer.encode(text: prompt)
+        let promptTokens = textTokenizer.encode(text: prompt)
         let generated: (tokens: [Int], nfe: Int)
         switch resolvedMode {
         case .autoregressive:
@@ -124,7 +124,7 @@ extension Model {
     )
         -> DiffusionResult
     {
-        let promptTokens = tokenizer.encode(text: prompt)
+        let promptTokens = textTokenizer.encode(text: prompt)
         let generated = driveDiffusion(promptTokens: promptTokens, params: parameters)
         return makeResult(promptTokens: promptTokens, generated: generated)
     }
@@ -137,7 +137,7 @@ extension Model {
     )
         -> DiffusionResult
     {
-        let promptTokens = tokenizer.encode(text: prompt)
+        let promptTokens = textTokenizer.encode(text: prompt)
         let generated = driveSelfSpeculative(promptTokens: promptTokens, params: parameters)
         return makeResult(promptTokens: promptTokens, generated: generated)
     }
@@ -148,7 +148,7 @@ extension Model {
         promptTokens: [Int],
         generated: (tokens: [Int], nfe: Int)
     ) -> DiffusionResult {
-        let text = tokenizer.decode(tokens: generated.tokens, skipSpecialTokens: true)
+        let text = textTokenizer.decode(tokens: generated.tokens, skipSpecialTokens: true)
         return DiffusionResult(
             promptTokens: promptTokens,
             generatedTokens: generated.tokens,

@@ -67,7 +67,7 @@ public enum ThinkingSplit {
         let mt = (model.config.modelType ?? "").lowercased()
         if mt.contains("gpt-oss") || mt.contains("gpt_oss") { return .harmony }
         if mt.contains("gemma3") || mt.contains("gemma4") { return .gemmaChannel }
-        if chatMLMarkers(tokenizer: model.tokenizer) != nil { return .chatML }
+        if chatMLMarkers(tokenizer: model.textTokenizer) != nil { return .chatML }
         return .none
     }
 
@@ -79,7 +79,7 @@ public enum ThinkingSplit {
     public static func split(tokens: [Int], model: Model) -> Split? {
         split(
             tokens: tokens, format: detectFormat(model: model),
-            tokenizer: model.tokenizer)
+            tokenizer: model.textTokenizer)
     }
 
     /// Split using an explicit format — bypasses auto-detection.

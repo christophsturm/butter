@@ -56,15 +56,15 @@ struct Llama3TextIntegrationTests {
         #expect(m.jamba == nil)
         #expect(m.starcoder2 == nil)
         // Sanity: shapes match the published Llama 3.2 1B config.
-        #expect(m.engine.hidden == 2048)
-        #expect(m.engine.nLayers == 16)
-        #expect(m.engine.nHeads == 32)
-        #expect(m.engine.nKVHeads == 8)
-        #expect(m.engine.headDim == 64)
-        #expect(m.engine.vocab == 128_256)
+        #expect(m.textEngine.hidden == 2048)
+        #expect(m.textEngine.nLayers == 16)
+        #expect(m.textEngine.nHeads == 32)
+        #expect(m.textEngine.nKVHeads == 8)
+        #expect(m.textEngine.headDim == 64)
+        #expect(m.textEngine.vocab == 128_256)
 
         // ── 3. Errors we expect ─────────────────────────────────────────
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 16)
         for (i, c) in caches.enumerated() {
             if !(c is KVCache) {
@@ -74,7 +74,7 @@ struct Llama3TextIntegrationTests {
 
         // ── 4. Forward pass produces expected output ────────────────────
         // Single-token forward: BOS → finite, non-zero, ordered logits.
-        let logits = m.engine.forward(tokenId: bosTokenId, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: bosTokenId, position: 0, caches: caches)
         #expect(logits.elementCount == 128_256)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)

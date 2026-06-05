@@ -62,7 +62,7 @@ struct KVCacheGrowthIntegrationTests {
         )
         #expect(result.tokensPerSecond > 0)
 
-        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        let decoded = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("KV-growth decode output: \(decoded)")
 
         // Same coherence bar as the dense Qwen3.5 suite (0.8B greedy

@@ -48,12 +48,12 @@ struct ModelDeterminismIntegrationTests {
         var sampled: [Int] = []
         var topFivePerRun: [[(Int, Float)]] = []
         for _ in 0 ..< 3 {
-            let caches = m.engine.makeLayerCaches()
-            let logits = m.engine.forward(tokenId: 0, position: 0, caches: caches)
+            let caches = m.textEngine.makeLayerCaches()
+            let logits = m.textEngine.forward(tokenId: 0, position: 0, caches: caches)
             topFivePerRun.append(Sampling.topN(logits, n: 5))
             let token = qwen3.forwardSample(
                 tokenId: 0, position: 0,
-                caches: m.engine.makeLayerCaches(),
+                caches: m.textEngine.makeLayerCaches(),
                 device: .shared)
             sampled.append(token)
         }
@@ -111,11 +111,11 @@ struct ModelDeterminismIntegrationTests {
         let qwen3 = try #require(m.qwen3, "KV-cache determinism smoke: expected Qwen3 engine")
 
         // First 5 prompt tokens (no BOS for Qwen3): "The capital of France is".
-        let promptTokens = m.tokenizer.encode(text: "The capital of France is")
+        let promptTokens = m.textTokenizer.encode(text: "The capital of France is")
 
         var hashes: [[UInt64]] = []
         for run in 0 ..< 3 {
-            let caches = m.engine.makeLayerCaches()
+            let caches = m.textEngine.makeLayerCaches()
             for (pos, t) in promptTokens.enumerated() {
                 _ = qwen3.forwardSample(
                     tokenId: t, position: pos,

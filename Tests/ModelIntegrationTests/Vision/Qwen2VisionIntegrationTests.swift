@@ -57,7 +57,7 @@ struct Qwen2VisionIntegrationTests {
         // available, and the text backbone supports the splice.
         #expect(m.vlModel != nil)
         #expect(m.availableCapabilities.contains(.imageIn))
-        #expect(m.engine.supportsEmbeddingInput)  // VLM splice prerequisite
+        #expect(m.textEngine.supportsEmbeddingInput)  // VLM splice prerequisite
 
         let vlm = try #require(m.vlModel)
         // The vision tower contributes a positive run of merged tokens.
@@ -94,9 +94,9 @@ struct Qwen2VisionIntegrationTests {
         // markers inside the user turn — Qwen's real chat layout.
         let imageTokenId = vlm.imageTokenId
         let nImageTokens = vlm.encodeImage(image).shape[0]
-        let preTokens = m.tokenizer.encode(
+        let preTokens = m.textTokenizer.encode(
             text: "<|im_start|>user\n<|vision_start|>")
-        let postTokens = m.tokenizer.encode(
+        let postTokens = m.textTokenizer.encode(
             text: "<|vision_end|>Describe this image.<|im_end|>\n"
                 + "<|im_start|>assistant\n")
         let promptTokens =
@@ -113,7 +113,7 @@ struct Qwen2VisionIntegrationTests {
         expectCoherentOutput(
             generated, minTokens: 8,
             label: "Qwen 2-VL image+text")
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("Qwen 2-VL generated: \(text)")
         VisionTestHelpers.expectMentionsDog(text, label: "Qwen 2-VL")
     }
@@ -151,9 +151,9 @@ struct Qwen2VisionIntegrationTests {
         // them into temporal patches, and inserts exactly the matching number
         // of `<|video_pad|>` placeholders between the markers — the test no
         // longer decodes frames or hand-computes the placeholder count.
-        let preTokens = m.tokenizer.encode(
+        let preTokens = m.textTokenizer.encode(
             text: "<|im_start|>user\n<|vision_start|>")
-        let postTokens = m.tokenizer.encode(
+        let postTokens = m.textTokenizer.encode(
             text: "<|vision_end|>What's in this video?<|im_end|>\n"
                 + "<|im_start|>assistant\n")
 
@@ -171,7 +171,7 @@ struct Qwen2VisionIntegrationTests {
         expectCoherentOutput(
             generated, minTokens: 8,
             label: "Qwen 2-VL video+text")
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("Qwen 2-VL video generated: \(text)")
         VisionTestHelpers.expectMentionsCat(text, label: "Qwen 2-VL video")
     }

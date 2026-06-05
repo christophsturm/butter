@@ -87,7 +87,7 @@ struct SpecDecodeBenchTests {
 
             def
             """
-        let promptTokens = m.tokenizer.encode(text: prompt)
+        let promptTokens = m.textTokenizer.encode(text: prompt)
         let promptLen = promptTokens.count
         precondition(promptLen >= 4, "need at least 4 prompt tokens")
         print("SpecDecodeBench prompt=\(promptLen) tokens")

@@ -60,9 +60,9 @@ struct SmolLMTextIntegrationTests {
         // SmolLM2 360M canonical: hidden=960, nLayers=32, nHeads=15,
         // nKVHeads=5, headDim=64. Verifies the head_dim=64 SDPA path
         // (same kernel Llama 3.2 1B uses).
-        #expect(m.engine.hidden == 960)
-        #expect(m.engine.nLayers == 32)
-        #expect(m.engine.headDim == 64)
+        #expect(m.textEngine.hidden == 960)
+        #expect(m.textEngine.nLayers == 32)
+        #expect(m.textEngine.headDim == 64)
         let result = try await m.generate(
             prompt: "Once upon a time, in a quiet village",
             parameters: m.defaultGenerationParameters.with { $0.maxTokens = 200; $0.seed = 42 }
@@ -80,7 +80,7 @@ struct SmolLMTextIntegrationTests {
             try await loadModel("mlx-community/SmolLM3-3B-4bit")
         }
         // SmolLM3 3B: hidden=2048, nLayers=36, nHeads=16, nKVHeads=4.
-        #expect(m.engine.hidden == 2048)
+        #expect(m.textEngine.hidden == 2048)
         let result = try await m.generate(
             prompt: "Once upon a time, in a quiet village",
             parameters: m.defaultGenerationParameters.with { $0.maxTokens = 200; $0.seed = 42 }

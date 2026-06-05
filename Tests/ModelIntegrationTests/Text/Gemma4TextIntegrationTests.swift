@@ -62,10 +62,10 @@ struct Gemma4TextIntegrationTests {
         // E2B canonical shapes (from HF text_config):
         //   hidden 1536, 35 layers, 8 heads, sliding head_dim 256,
         //   1 sliding KV head.
-        #expect(m.engine.hidden == 1536)
-        #expect(m.engine.nLayers == 35)
-        #expect(m.engine.nHeads == 8)
-        #expect(m.engine.headDim == 256)
+        #expect(m.textEngine.hidden == 1536)
+        #expect(m.textEngine.nLayers == 35)
+        #expect(m.textEngine.nHeads == 8)
+        #expect(m.textEngine.headDim == 256)
 
         // Resolved as the PLE (Gemma4E) variant.
         let gemma4 = m.engine as? Gemma4Model
@@ -75,7 +75,7 @@ struct Gemma4TextIntegrationTests {
         // Per-layer cache geometry: sliding layers windowed, global
         // layers unbounded. E2B layer_types: every 5th layer (idx 4, 9,
         // 14, 19, 24, 29, 34) is full_attention ⇒ 7 global, 28 sliding.
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         var slidingCount = 0
         var globalCount = 0
         for (i, c) in caches.enumerated() {

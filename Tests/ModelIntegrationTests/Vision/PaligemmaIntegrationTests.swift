@@ -29,7 +29,7 @@
 //      using SigLIP-style mean 0.5 / std 0.5 (PaliGemma normalization).
 //   3. Call pg.setImagePixels(pixels) once.
 //   4. Build promptTokens = [imageTokenId × 1024] + textTokens.
-//   5. Drive the standard greedy decode via m.engine.forward + argmax.
+//   5. Drive the standard greedy decode via m.textEngine.forward + argmax.
 //   6. Assert the decoded transcript recovers phrases from testocr.png.
 //
 // This test is NOT run automatically (see CLAUDE.md → make test-integration).
@@ -55,12 +55,12 @@ struct PaligemmaIntegrationTests {
         // Verify basic shapes from the PaliGemma 2 3B (Gemma 2 2B backbone)
         // published config. Gemma 2 2B = hidden 2304, 26 layers, 8 heads,
         // 4 KV heads (GQA 2×), head_dim 256.
-        #expect(m.engine.hidden == 2304)
-        #expect(m.engine.nLayers == 26)
-        #expect(m.engine.nHeads == 8)
-        #expect(m.engine.nKVHeads == 4)
-        #expect(m.engine.headDim == 256)
-        #expect(m.engine.vocab == 257216)
+        #expect(m.textEngine.hidden == 2304)
+        #expect(m.textEngine.nLayers == 26)
+        #expect(m.textEngine.nHeads == 8)
+        #expect(m.textEngine.nKVHeads == 4)
+        #expect(m.textEngine.headDim == 256)
+        #expect(m.textEngine.vocab == 257216)
 
         let pg = try #require(
             m.engine as? PaligemmaModel,
@@ -97,7 +97,7 @@ struct PaligemmaIntegrationTests {
         // tokenizer.encode does NOT auto-prepend BOS on its own here —
         // we splice it in explicitly so the prompt structure is right
         // regardless of how the tokenizer is configured.
-        let textTokens = m.tokenizer.encode(text: "ocr en\n")
+        let textTokens = m.textTokenizer.encode(text: "ocr en\n")
         let promptTokens =
             Array(repeating: imageTokenId, count: numImageTokens)
             + [bosId] + textTokens.filter { $0 != bosId }
@@ -106,11 +106,11 @@ struct PaligemmaIntegrationTests {
         // ceiling. PaligemmaModel.forward injects the precomputed image
         // features at imageTokenIndex positions; non-image positions
         // route to Gemma2Model's embed lookup.
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         var generated: [Int] = []
         var nextToken = 0
         for (pos, tok) in promptTokens.enumerated() {
-            let logits = m.engine.forward(
+            let logits = m.textEngine.forward(
                 tokenId: tok, position: pos,
                 caches: caches,
                 device: Device.shared)
@@ -123,13 +123,13 @@ struct PaligemmaIntegrationTests {
         for _ in 0 ..< 200 {
             if stopSet.contains(nextToken) { break }
             generated.append(nextToken)
-            nextToken = m.engine.forwardSample(
+            nextToken = m.textEngine.forwardSample(
                 tokenId: nextToken, position: pos,
                 caches: caches, device: Device.shared)
             pos += 1
         }
 
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("PaliGemma generated (\(generated.count) tokens): \(text)")
         VisionTestHelpers.expectRecognizesOCRText(text, label: "PaliGemma OCR")
     }

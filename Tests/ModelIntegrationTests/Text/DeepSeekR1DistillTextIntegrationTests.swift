@@ -44,11 +44,11 @@ struct DeepSeekR1DistillTextIntegrationTests {
         // 8B shape sanity:
         //   hidden = 4096, nLayers = 32, nHeads = 32, nKVHeads = 8,
         //   headDim = 128, intermediate = 14336.
-        #expect(m.engine.hidden == 4096)
-        #expect(m.engine.nLayers == 32)
-        #expect(m.engine.nHeads == 32)
-        #expect(m.engine.nKVHeads == 8)
-        #expect(m.engine.headDim == 128)
+        #expect(m.textEngine.hidden == 4096)
+        #expect(m.textEngine.nLayers == 32)
+        #expect(m.textEngine.nHeads == 32)
+        #expect(m.textEngine.nKVHeads == 8)
+        #expect(m.textEngine.headDim == 128)
 
         let result = try await m.generate(
             prompt: prompt,
@@ -77,11 +77,11 @@ struct DeepSeekR1DistillTextIntegrationTests {
         // 1.5B shape sanity (per the HF config):
         //   hidden = 1536, nLayers = 28, nHeads = 12, nKVHeads = 2,
         //   headDim = 128, intermediate = 8960.
-        #expect(m.engine.hidden == 1536)
-        #expect(m.engine.nLayers == 28)
-        #expect(m.engine.nHeads == 12)
-        #expect(m.engine.nKVHeads == 2)
-        #expect(m.engine.headDim == 128)
+        #expect(m.textEngine.hidden == 1536)
+        #expect(m.textEngine.nLayers == 28)
+        #expect(m.textEngine.nHeads == 12)
+        #expect(m.textEngine.nKVHeads == 2)
+        #expect(m.textEngine.headDim == 128)
         #expect(
             m.llama != nil,
             "R1-Distill-Qwen should load through the 3-series engine after bias-aware Linear")

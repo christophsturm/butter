@@ -124,8 +124,8 @@ struct Qwen36UnslothMixedTextIntegrationTests {
                 + "heads=\(q.nHeads) kv=\(q.nKVHeads) headDim=\(q.headDim) "
                 + "hasMoE=\(q.hasMoE) dtype=\(q.dtype)")
 
-        let caches = m.engine.makeLayerCaches()
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let caches = m.textEngine.makeLayerCaches()
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == q.vocab)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)

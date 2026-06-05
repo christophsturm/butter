@@ -60,16 +60,16 @@ struct Quantized2bitIntegrationTests {
         // Qwen3.5-0.8B (text_config): hidden=1024, nLayers=24, nHeads=8,
         // nKVHeads=2, headDim=256. Confirms the Qwen3.5-VL loader bound
         // weights through the language_model.* sub-tree correctly.
-        #expect(m.engine.hidden == 1024)
-        #expect(m.engine.nLayers == 24)
-        #expect(m.engine.nHeads == 8)
-        #expect(m.engine.nKVHeads == 2)
-        #expect(m.engine.headDim == 256)
+        #expect(m.textEngine.hidden == 1024)
+        #expect(m.textEngine.nLayers == 24)
+        #expect(m.textEngine.nHeads == 8)
+        #expect(m.textEngine.nKVHeads == 2)
+        #expect(m.textEngine.headDim == 256)
 
         // Forward at position 0 — exercises dequant_gemv_int2 (per-token
         // linear projections) and dequant_gather_int2 (embedding lookup).
-        let caches = m.engine.makeLayerCaches()
-        let logits = m.engine.forward(tokenId: 0, position: 0, caches: caches)
+        let caches = m.textEngine.makeLayerCaches()
+        let logits = m.textEngine.forward(tokenId: 0, position: 0, caches: caches)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
         for (_, score) in top { #expect(score.isFinite, "int2 logit non-finite: \(score)") }

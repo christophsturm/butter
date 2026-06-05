@@ -64,11 +64,11 @@ struct JambaTextIntegrationTests {
         #expect(m.mamba2 == nil)
 
         // Shapes from the published AI21-Jamba-Reasoning-3B config.
-        #expect(m.engine.hidden == 2560)
-        #expect(m.engine.nLayers == 28)
-        #expect(m.engine.nHeads == 20)
-        #expect(m.engine.nKVHeads == 1)
-        #expect(m.engine.vocab == 65_536)
+        #expect(m.textEngine.hidden == 2560)
+        #expect(m.textEngine.nLayers == 28)
+        #expect(m.textEngine.nHeads == 20)
+        #expect(m.textEngine.nKVHeads == 1)
+        #expect(m.textEngine.vocab == 65_536)
         if let j = m.jamba {
             // Mamba 1 mixer geometry — d_inner = mamba_expand * hidden.
             #expect(j.dInner == 5120)
@@ -89,7 +89,7 @@ struct JambaTextIntegrationTests {
         // ── Forward-shape smoke test ──────────────────────────────────
         // One token through the full heterogeneous stack. Logits should
         // be finite and non-degenerate (the model is trained).
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 28)
         // Cache kinds match the layer kinds, index-for-index.
         if let j = m.jamba {
@@ -104,7 +104,7 @@ struct JambaTextIntegrationTests {
                 }
             }
         }
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 65_536)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
@@ -121,7 +121,7 @@ struct JambaTextIntegrationTests {
         #expect(result.tokensPerSecond > 0)
 
         // Print the actual decoded text for manual inspection.
-        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        let decoded = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("Jamba-3B decoded output: \(decoded)")
 
         // 200 tokens at temperature=0 + a 3B hybrid (Mamba 2 + attention

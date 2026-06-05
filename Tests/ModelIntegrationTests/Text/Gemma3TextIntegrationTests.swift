@@ -43,17 +43,17 @@ struct Gemma3TextIntegrationTests {
 
         // 1B canonical shapes (from HF config.json):
         //   hidden = 1152, nLayers = 26, nHeads = 4, nKVHeads = 1, headDim = 256.
-        #expect(m.engine.hidden == 1152)
-        #expect(m.engine.nLayers == 26)
-        #expect(m.engine.nHeads == 4)
-        #expect(m.engine.nKVHeads == 1)
-        #expect(m.engine.headDim == 256)
+        #expect(m.textEngine.hidden == 1152)
+        #expect(m.textEngine.nLayers == 26)
+        #expect(m.textEngine.nHeads == 4)
+        #expect(m.textEngine.nKVHeads == 1)
+        #expect(m.textEngine.headDim == 256)
 
         // Verify per-layer KV cache eviction policy: sliding layers
         // get .window(slidingWindow), global layers stay unbounded.
         // Pattern is `(i + 1) % slidingWindowPattern == 0` ⇒ global.
         // 1B default sliding_window_pattern = 6.
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         var slidingCount = 0
         var globalCount = 0
         for (i, c) in caches.enumerated() {

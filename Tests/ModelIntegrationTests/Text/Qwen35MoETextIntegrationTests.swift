@@ -61,11 +61,11 @@ struct Qwen35MoETextIntegrationTests {
         #expect(m.graniteMoeHybrid == nil)
 
         // Shapes from the published Qwen3.5-35B-A3B-4bit `text_config`.
-        #expect(m.engine.hidden == 2048)
-        #expect(m.engine.nLayers == 40)
-        #expect(m.engine.nHeads == 16)
-        #expect(m.engine.nKVHeads == 2)
-        #expect(m.engine.vocab == 248_320)
+        #expect(m.textEngine.hidden == 2048)
+        #expect(m.textEngine.nLayers == 40)
+        #expect(m.textEngine.nHeads == 16)
+        #expect(m.textEngine.nKVHeads == 2)
+        #expect(m.textEngine.vocab == 248_320)
         if let q = m.qwen35 {
             // GDN mixer geometry — Qwen3.5 MoE inherits head_dim 256 and
             // full_attention_interval = 4.
@@ -83,7 +83,7 @@ struct Qwen35MoETextIntegrationTests {
         }
 
         // ── Cache-kind alignment ──────────────────────────────────────
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 40)
         if let q = m.qwen35 {
             for (i, layer) in q.layers.enumerated() {
@@ -101,7 +101,7 @@ struct Qwen35MoETextIntegrationTests {
         // ── Forward-shape smoke test ──────────────────────────────────
         // One token through the full heterogeneous MoE stack. Logits
         // should be finite and non-degenerate (the model is trained).
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 248_320)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
@@ -115,7 +115,7 @@ struct Qwen35MoETextIntegrationTests {
         )
         #expect(result.tokensPerSecond > 0)
 
-        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        let decoded = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("Qwen3.5-35B-A3B decoded output: \(decoded)")
 
         expectCoherentOutput(

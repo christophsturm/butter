@@ -58,11 +58,11 @@ struct Qwen36TextIntegrationTests {
         #expect(m.graniteMoeHybrid == nil)
 
         // Shapes from the published Qwen3.6-27B-4bit `text_config`.
-        #expect(m.engine.hidden == 5120)
-        #expect(m.engine.nLayers == 64)
-        #expect(m.engine.nHeads == 24)
-        #expect(m.engine.nKVHeads == 4)
-        #expect(m.engine.vocab == 248_320)
+        #expect(m.textEngine.hidden == 5120)
+        #expect(m.textEngine.nLayers == 64)
+        #expect(m.textEngine.nHeads == 24)
+        #expect(m.textEngine.nKVHeads == 4)
+        #expect(m.textEngine.vocab == 248_320)
         if let q = m.qwen35 {
             // GDN mixer geometry — Qwen3.6 inherits the same head_dim 256
             // and full_attention_interval = 4 as Qwen3.5.
@@ -80,7 +80,7 @@ struct Qwen36TextIntegrationTests {
         }
 
         // ── Cache-kind alignment ──────────────────────────────────────
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 64)
         if let q = m.qwen35 {
             for (i, layer) in q.layers.enumerated() {
@@ -98,7 +98,7 @@ struct Qwen36TextIntegrationTests {
         // ── Forward-shape smoke test ──────────────────────────────────
         // One token through the full heterogeneous stack. Logits should
         // be finite and non-degenerate (the model is trained).
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 248_320)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
@@ -113,7 +113,7 @@ struct Qwen36TextIntegrationTests {
         #expect(result.tokensPerSecond > 0)
 
         // Print the actual decoded text for manual inspection.
-        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        let decoded = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("Qwen3.6-27B decoded output: \(decoded)")
 
         expectCoherentOutput(

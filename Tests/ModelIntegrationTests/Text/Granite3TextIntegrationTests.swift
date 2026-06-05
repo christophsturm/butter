@@ -49,16 +49,16 @@ struct Granite3TextIntegrationTests {
         // Granite 3.2 2B canonical (same dim as 3.0/3.1 — only the
         // training data + alignment changed). head_dim is derived as
         // hidden / num_attention_heads (config field is absent).
-        #expect(m.engine.hidden == 2048)
-        #expect(m.engine.nLayers == 40)
-        #expect(m.engine.nHeads == 32)
-        #expect(m.engine.nKVHeads == 8)
-        #expect(m.engine.headDim == 64)  // 2048 / 32
-        #expect(m.engine.vocab == 49155)
+        #expect(m.textEngine.hidden == 2048)
+        #expect(m.textEngine.nLayers == 40)
+        #expect(m.textEngine.nHeads == 32)
+        #expect(m.textEngine.nKVHeads == 8)
+        #expect(m.textEngine.headDim == 64)  // 2048 / 32
+        #expect(m.textEngine.vocab == 49155)
 
         // ── 3. Errors we expect ─────────────────────────────────────────
         // Cache-kind alignment — every Llama layer expects a KVCache.
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 40)
         for (i, c) in caches.enumerated() {
             if !(c is KVCache) {
@@ -67,7 +67,7 @@ struct Granite3TextIntegrationTests {
         }
 
         // ── 4. Forward pass produces expected output ────────────────────
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 49155)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)

@@ -65,7 +65,7 @@ struct SlidingWindowIntegrationTests {
 
         // Sanity: every layer cache reports the window we asked for,
         // not the model's max_position_embeddings.
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         for c in caches {
             guard let kv = c as? any KVCacheProtocol else { continue }
             #expect(

@@ -88,7 +88,7 @@ struct NemotronHVisionIntegrationTests {
         // available, and the text backbone supports the splice.
         #expect(m.vlModel != nil)
         #expect(m.availableCapabilities.contains(.imageIn))
-        #expect(m.engine.supportsEmbeddingInput)  // VLM splice prerequisite
+        #expect(m.textEngine.supportsEmbeddingInput)  // VLM splice prerequisite
 
         let vlm = try #require(m.vlModel)
         // The vision tower contributes a positive run of projected tokens.
@@ -125,7 +125,7 @@ struct NemotronHVisionIntegrationTests {
         // Build an image+text prompt: a run of `imageTokenCount`
         // image-placeholder tokens followed by a text question.
         let imageTokenId = vlm.imageTokenId
-        let questionTokens = m.tokenizer.encode(text: "Describe this image.")
+        let questionTokens = m.textTokenizer.encode(text: "Describe this image.")
         let promptTokens =
             Array(
                 repeating: imageTokenId,
@@ -143,7 +143,7 @@ struct NemotronHVisionIntegrationTests {
         expectCoherentOutput(
             generated, minTokens: 8,
             label: "Nemotron-VLM image+text")
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("Nemotron-VLM generated: \(text)")
         VisionTestHelpers.expectMentionsDog(text, label: "Nemotron-VLM")
     }

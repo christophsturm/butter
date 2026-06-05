@@ -57,15 +57,15 @@ struct MiniCPM5TextIntegrationTests {
         #expect(m.starcoder2 == nil)
 
         // Shapes from the published MiniCPM5-1B-MLX config.
-        #expect(m.engine.hidden == 1536)
-        #expect(m.engine.nLayers == 24)
-        #expect(m.engine.nHeads == 16)
-        #expect(m.engine.nKVHeads == 2)
-        #expect(m.engine.headDim == 128)
-        #expect(m.engine.vocab == 130_560)
+        #expect(m.textEngine.hidden == 1536)
+        #expect(m.textEngine.nLayers == 24)
+        #expect(m.textEngine.nHeads == 16)
+        #expect(m.textEngine.nKVHeads == 2)
+        #expect(m.textEngine.headDim == 128)
+        #expect(m.textEngine.vocab == 130_560)
 
         // ── 3. Errors we expect ─────────────────────────────────────────
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 24)
         for (i, c) in caches.enumerated() {
             if !(c is KVCache) {
@@ -74,7 +74,7 @@ struct MiniCPM5TextIntegrationTests {
         }
 
         // ── 4. Forward pass produces expected output ────────────────────
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 130_560)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
@@ -87,7 +87,7 @@ struct MiniCPM5TextIntegrationTests {
         )
         #expect(result.tokensPerSecond > 0)
 
-        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        let decoded = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("MiniCPM5-1B-MLX decoded output: \(decoded)")
 
         expectCoherentOutput(

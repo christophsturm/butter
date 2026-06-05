@@ -148,8 +148,8 @@ struct Idefics3IntegrationTests {
         #expect(idefics3.cfg.imageTokenId == 49153, "image_token_id")
 
         // ─── Pure text forward (sanity check without image) ──────────────────
-        let caches = m.engine.makeLayerCaches()
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let caches = m.textEngine.makeLayerCaches()
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         let topTokens = Sampling.topN(logits, n: 5)
         #expect(topTokens.count == 5)
         #expect(topTokens[0].1.isFinite)
@@ -183,13 +183,13 @@ struct Idefics3IntegrationTests {
         let imageTokenCount = expectedImageTokens
 
         // Construct token sequence: BOS + imageTokenId×N + text tokens
-        let textTokens = m.tokenizer.encode(text: "Describe this image.")
+        let textTokens = m.textTokenizer.encode(text: "Describe this image.")
         var promptTokenIds = [1]  // BOS
         promptTokenIds += [Int](repeating: imageTokenId, count: imageTokenCount)
         promptTokenIds += textTokens
 
         // Prefill with image embeddings then check logits
-        let freshCaches = m.engine.makeLayerCaches()
+        let freshCaches = m.textEngine.makeLayerCaches()
         let lastLogits = idefics3.prefillWithImage(
             tokenIds: promptTokenIds,
             imageEmbeds: imageEmbeds,
@@ -210,14 +210,14 @@ struct Idefics3IntegrationTests {
         for step in 0 ..< 32 {
             if nextToken == eosId { break }
             generatedTokens.append(nextToken)
-            nextToken = m.engine.forwardSample(
+            nextToken = m.textEngine.forwardSample(
                 tokenId: nextToken,
                 position: promptTokenIds.count + step,
                 caches: freshCaches
             )
         }
 
-        let generatedText = m.tokenizer.decode(
+        let generatedText = m.textTokenizer.decode(
             tokens: generatedTokens,
             skipSpecialTokens: true)
 

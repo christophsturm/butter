@@ -125,17 +125,24 @@ public enum ModelRegistry {
         /// model's text backbone, so text-only generation works
         /// regardless; `vlModel` adds the cross-modal image path.
         public let vlModel: VisionModel?
+        /// Catalog kind of the matched family. The family `load` closures
+        /// don't set this (it'd duplicate the `ModelEntry.kind` they're
+        /// declared with); `dispatchAndLoad` stamps it from the matched
+        /// entry after the load returns.
+        public var kind: ModelKind = .llm
 
         public init(
             engine: any LanguageModel,
             defaultGenerationParameters: GenerationParameters,
             availableCapabilities: Set<Capability> = Capability.textOnly,
-            vlModel: VisionModel? = nil
+            vlModel: VisionModel? = nil,
+            kind: ModelKind = .llm
         ) {
             self.engine = engine
             self.defaultGenerationParameters = defaultGenerationParameters
             self.availableCapabilities = availableCapabilities
             self.vlModel = vlModel
+            self.kind = kind
         }
     }
 
@@ -151,19 +158,26 @@ public enum ModelRegistry {
         // fails with an actionable `visionModelNotIntegrated` rather than
         // falling through to a text loader.
         if VisionLanguageArchitectures.isVisionLanguage(config) {
-            guard let load = visionEntries.first(where: { $0.matches(config) })?.load
+            guard let entry = visionEntries.first(where: { $0.matches(config) }),
+                let load = entry.load
             else {
                 throw ModelError.visionModelNotIntegrated(
                     config.architecture ?? config.modelType ?? "<unknown>")
             }
-            return try load(config, weights, options, device)
+            var loaded = try load(config, weights, options, device)
+            loaded.kind = entry.kind
+            return loaded
         }
-        guard let load = textEntries.first(where: { $0.matches(config) })?.load else {
+        guard let entry = textEntries.first(where: { $0.matches(config) }),
+            let load = entry.load
+        else {
             throw ModelError.unsupportedArchitecture(
                 config.architecture ?? config.modelType ?? "<unknown>"
             )
         }
-        return try load(config, weights, options, device)
+        var loaded = try load(config, weights, options, device)
+        loaded.kind = entry.kind
+        return loaded
     }
 
     public static func loadLlama3(

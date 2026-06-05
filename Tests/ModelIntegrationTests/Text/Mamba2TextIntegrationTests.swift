@@ -44,11 +44,11 @@ struct Mamba2TextIntegrationTests {
         #expect(m.qwen3 == nil)
 
         // Shapes from the published 130M config.
-        #expect(m.engine.hidden == 768)
-        #expect(m.engine.nLayers == 24)
-        #expect(m.engine.nHeads == 24)
-        #expect(m.engine.headDim == 64)
-        #expect(m.engine.vocab == 50_288)
+        #expect(m.textEngine.hidden == 768)
+        #expect(m.textEngine.nLayers == 24)
+        #expect(m.textEngine.nHeads == 24)
+        #expect(m.textEngine.headDim == 64)
+        #expect(m.textEngine.vocab == 50_288)
         if let mamba = m.mamba2 {
             #expect(mamba.stateDim == 128)
             #expect(mamba.convKernel == 4)
@@ -60,8 +60,8 @@ struct Mamba2TextIntegrationTests {
         // Forward one BOS-style token. Logits should be finite and
         // non-uniform (the model has been pre-trained — top tokens
         // should pull ahead of the noise floor).
-        let caches = m.engine.makeLayerCaches()
-        let logits = m.engine.forward(tokenId: 0, position: 0, caches: caches)
+        let caches = m.textEngine.makeLayerCaches()
+        let logits = m.textEngine.forward(tokenId: 0, position: 0, caches: caches)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
         #expect(top[0].1.isFinite)
@@ -111,14 +111,14 @@ struct Mamba2TextIntegrationTests {
             try await loadModel("ekryski/mamba2-130m-4bit")
         }
         #expect(m.mamba2 != nil)
-        #expect(m.engine.hidden == 768)
-        #expect(m.engine.nLayers == 24)
+        #expect(m.textEngine.hidden == 768)
+        #expect(m.textEngine.nLayers == 24)
 
         let result = try await m.generate(
             prompt: "The quick brown fox jumps over the",
             parameters: m.defaultGenerationParameters.with { $0.maxTokens = 64; $0.seed = 42 }
         )
-        let text = m.tokenizer.decode(tokens: result.generatedTokens)
+        let text = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("Mamba2-130M-4bit generated: \(text)")
         #expect(result.tokensPerSecond > 0)
         expectCoherentOutput(

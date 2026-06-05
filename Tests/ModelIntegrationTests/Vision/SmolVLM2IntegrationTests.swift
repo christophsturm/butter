@@ -179,8 +179,8 @@ struct SmolVLM2IntegrationTests {
         #expect(smolVLM2.cfg.imageTokenId == 49190, "image_token_id")
 
         // ─── Pure text forward (sanity check without image) ──────────────────
-        let caches = m.engine.makeLayerCaches()
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let caches = m.textEngine.makeLayerCaches()
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         let topTokens = Sampling.topN(logits, n: 5)
         #expect(topTokens.count == 5)
         #expect(topTokens[0].1.isFinite)
@@ -216,13 +216,13 @@ struct SmolVLM2IntegrationTests {
 
         // Construct token sequence: BOS + imageTokenId×N + text tokens
         // "Describe this image." — we just run a short prompt for coherence check
-        let textTokens = m.tokenizer.encode(text: "Describe this image.")
+        let textTokens = m.textTokenizer.encode(text: "Describe this image.")
         var promptTokenIds = [1]  // BOS
         promptTokenIds += [Int](repeating: imageTokenId, count: imageTokenCount)
         promptTokenIds += textTokens
 
         // Prefill with image embeddings + generate short sequence
-        let freshCaches = m.engine.makeLayerCaches()
+        let freshCaches = m.textEngine.makeLayerCaches()
         let lastLogits = smolVLM2.prefillWithImage(
             tokenIds: promptTokenIds,
             imageEmbeds: imageEmbeds,
@@ -243,14 +243,14 @@ struct SmolVLM2IntegrationTests {
         for step in 0 ..< 32 {
             if nextToken == eosId { break }
             generatedTokens.append(nextToken)
-            nextToken = m.engine.forwardSample(
+            nextToken = m.textEngine.forwardSample(
                 tokenId: nextToken,
                 position: promptTokenIds.count + step,
                 caches: freshCaches
             )
         }
 
-        let generatedText = m.tokenizer.decode(
+        let generatedText = m.textTokenizer.decode(
             tokens: generatedTokens,
             skipSpecialTokens: true)
 
@@ -330,9 +330,9 @@ struct SmolVLM2IntegrationTests {
         // Prompt structure mirrors the SmolVLM2 chat template:
         //   User: <image>…(×N) What's in this video?
         //   Assistant:
-        let textBefore = m.tokenizer.encode(
+        let textBefore = m.textTokenizer.encode(
             text: "User: ")
-        let textAfter = m.tokenizer.encode(
+        let textAfter = m.textTokenizer.encode(
             text: " What's in this video?\nAssistant:")
 
         let promptTokens =
@@ -342,7 +342,7 @@ struct SmolVLM2IntegrationTests {
 
         // Run prefill with the concatenated video frame embeddings,
         // then greedy-decode up to 200 tokens.
-        let freshCaches = m.engine.makeLayerCaches()
+        let freshCaches = m.textEngine.makeLayerCaches()
         let lastLogits = smol.prefillWithImage(
             tokenIds: promptTokens,
             imageEmbeds: videoEmbeds,
@@ -365,13 +365,13 @@ struct SmolVLM2IntegrationTests {
         for step in 0 ..< 200 {
             if stopSet.contains(nextToken) { break }
             generatedTokens.append(nextToken)
-            nextToken = m.engine.forwardSample(
+            nextToken = m.textEngine.forwardSample(
                 tokenId: nextToken,
                 position: promptTokens.count + step,
                 caches: freshCaches)
         }
 
-        let text = m.tokenizer.decode(
+        let text = m.textTokenizer.decode(
             tokens: generatedTokens,
             skipSpecialTokens: true)
         print("SmolVLM2 video generated: \(text)")

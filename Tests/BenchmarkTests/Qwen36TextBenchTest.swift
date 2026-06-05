@@ -106,23 +106,23 @@ struct Qwen36TextBenchTest {
             "The quick brown fox jumps over the lazy dog. "
             + "Pack my box with five dozen liquor jugs. "
         var text = ""
-        var tokens = m.tokenizer.encode(text: base)
+        var tokens = m.textTokenizer.encode(text: base)
         while tokens.count < targetPromptTokens {
             text += base
-            tokens = m.tokenizer.encode(text: text)
+            tokens = m.textTokenizer.encode(text: text)
         }
         if tokens.count > targetPromptTokens {
             tokens = Array(tokens.prefix(targetPromptTokens))
         }
         print("\(label): prompt=\(tokens.count) tokens")
 
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
 
         // ── Prefill ──────────────────────────────────────────────────
         let prefillStart = Date()
         var lastLogits: Tensor!
         for (i, tok) in tokens.enumerated() {
-            lastLogits = m.engine.forward(tokenId: tok, position: i, caches: caches)
+            lastLogits = m.textEngine.forward(tokenId: tok, position: i, caches: caches)
         }
         let prefillSecs = Date().timeIntervalSince(prefillStart)
         let prefillMs = prefillSecs * 1000
@@ -140,7 +140,7 @@ struct Qwen36TextBenchTest {
         var pos = tokens.count
         for _ in 0 ..< decodeSteps {
             let t0 = Date()
-            lastLogits = m.engine.forward(tokenId: nextTok, position: pos, caches: caches)
+            lastLogits = m.textEngine.forward(tokenId: nextTok, position: pos, caches: caches)
             logits = lastLogits.toFloatArray()
             nextTok = logits.enumerated().max(by: { $0.element < $1.element })!.offset
             pos += 1
@@ -195,7 +195,7 @@ struct Qwen36TextBenchTest {
         // Seed prompt — 32 tokens. Tile until we hit targetT, then trim.
         let seed =
             "The history of the printing press began when European craftsmen of the 15th century combined movable metal type with oil based ink screw presses paper to mass produce printed books pamphlets and broadsheets revolutionising communication"
-        let seedEncoded = m.tokenizer.encode(text: seed)
+        let seedEncoded = m.textTokenizer.encode(text: seed)
         var encoded = seedEncoded
         while encoded.count < targetT {
             encoded.append(contentsOf: seedEncoded)
@@ -274,7 +274,7 @@ struct Qwen36TextBenchTest {
         }
         let qwen = try #require(m.qwen35, "expected Qwen35Model engine, got \(type(of: m.engine))")
         let prompt = "The history of the printing press began when"
-        let encoded = m.tokenizer.encode(text: prompt)
+        let encoded = m.textTokenizer.encode(text: prompt)
         precondition(
             encoded.count >= 4,
             "forwardManyEquivalence: prompt encoded to \(encoded.count) tokens; need ≥ 4")
@@ -334,25 +334,25 @@ struct Qwen36TextBenchTest {
         // token; compare against the mlx-swift-lm-produced baseline
         // first-token = 11.
         let prompt = "The history of the printing press began when"
-        let tokenizer = m.tokenizer
+        let tokenizer = m.textTokenizer
         let encoded = tokenizer.encode(text: prompt)
         print("encoded prompt (\(encoded.count) tokens): \(encoded.prefix(20))")
 
         // Run the prefill manually so we can sample the first token
         // before any maxTokens-loop kicks in.
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         var lastLogits: Tensor!
         let prefillStart = Date()
         for (i, tok) in encoded.enumerated() {
-            lastLogits = m.engine.forward(tokenId: tok, position: i, caches: caches)
+            lastLogits = m.textEngine.forward(tokenId: tok, position: i, caches: caches)
         }
         let prefillSecs = Date().timeIntervalSince(prefillStart)
         print("prefill \(encoded.count) tokens: \(String(format: "%.3f", prefillSecs))s")
 
         let logits = lastLogits.toFloatArray()
         precondition(
-            logits.count == m.engine.vocab,
-            "logits length \(logits.count) != vocab \(m.engine.vocab)")
+            logits.count == m.textEngine.vocab,
+            "logits length \(logits.count) != vocab \(m.textEngine.vocab)")
         let argmax = logits.enumerated().max(by: { $0.element < $1.element })!.offset
         print("first-token argmax = \(argmax)")
         print("decoded first token: \(tokenizer.decode(tokens: [argmax]))")

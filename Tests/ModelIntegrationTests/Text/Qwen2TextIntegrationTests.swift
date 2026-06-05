@@ -51,15 +51,15 @@ struct Qwen2TextIntegrationTests {
         #expect(m.qwen3 == nil)
         #expect(m.qwen35 == nil)
         // Qwen 2.5 0.5B canonical shapes. GQA: 2 KV heads.
-        #expect(m.engine.hidden == 896)
-        #expect(m.engine.nLayers == 24)
-        #expect(m.engine.nHeads == 14)
-        #expect(m.engine.nKVHeads == 2)
-        #expect(m.engine.headDim == 64)
-        #expect(m.engine.vocab == 151_936)
+        #expect(m.textEngine.hidden == 896)
+        #expect(m.textEngine.nLayers == 24)
+        #expect(m.textEngine.nHeads == 14)
+        #expect(m.textEngine.nKVHeads == 2)
+        #expect(m.textEngine.headDim == 64)
+        #expect(m.textEngine.vocab == 151_936)
 
         // ── 3. Errors we expect ─────────────────────────────────────────
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 24)
         for (i, c) in caches.enumerated() {
             if !(c is KVCache) {
@@ -68,7 +68,7 @@ struct Qwen2TextIntegrationTests {
         }
 
         // ── 4. Forward pass produces expected output ────────────────────
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 151_936)
         let top = Sampling.topN(logits, n: 5)
         #expect(top[0].1.isFinite)

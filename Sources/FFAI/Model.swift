@@ -26,6 +26,11 @@ public enum ModelError: Error, CustomStringConvertible {
     case unsupportedModelType(String)
     case capabilityNotAvailable(Capability)
     case visionModelNotIntegrated(String)
+    /// A `ModelInput` was passed to `Model.generate` / a typed convenience
+    /// method that the loaded model's `kind` can't service — e.g. `.speak`
+    /// to an LLM, or `.text` to a VAD model. Carries the model's kind and a
+    /// short description of the rejected input.
+    case unsupportedInput(kind: ModelKind, input: String)
     /// A speculative-decoding draft / assistant model (e.g. the Gemma 4
     /// Omni `gemma4_unified_assistant` EAGLE drafter) was loaded as a
     /// standalone generation model. It cannot generate on its own — it
@@ -47,6 +52,8 @@ public enum ModelError: Error, CustomStringConvertible {
         case .unsupportedArchitecture(let a): return "Unsupported architecture: \(a)"
         case .unsupportedModelType(let m): return "Unsupported model_type: \(m)"
         case .capabilityNotAvailable(let c): return "Capability not available: \(c)"
+        case .unsupportedInput(let kind, let input):
+            return "Unsupported input for a \(kind.rawValue) model: \(input)"
         case .visionModelNotIntegrated(let a):
             return "Vision-language checkpoint '\(a)' detected. The FFAI "
                 + "vision foundation (VisionEncoder, ImagePreprocessing, "
@@ -77,14 +84,54 @@ public enum ModelError: Error, CustomStringConvertible {
 /// High-level loaded model with tokenizer attached. The public API users
 /// touch.
 public final class Model: @unchecked Sendable {
-    /// The concrete model engine (Llama3Model, Qwen3Model, …). For a VLM
-    /// this is the text backbone — text-only generation works
-    /// regardless of whether `.imageIn` is enabled.
-    public let engine: any LanguageModel
-    public let tokenizer: any Tokenizer
+    /// The concrete model engine, type-erased to the unified `ModelEngine`
+    /// existential — a `LanguageModel` (LLM / VLM text backbone), a
+    /// `Transcribing` (STT), a `Synthesizing` (TTS), a `Detecting` (VAD), or
+    /// a `SpeechTransforming` (STS). For a text/VL model this is the text
+    /// engine; use `languageModel` / `textEngine` to recover the typed text
+    /// surface, or the typed convenience accessors (`llama`, `qwen3`, …) for
+    /// a specific family.
+    public let engine: any ModelEngine
+    /// The catalog kind the registry filed this model under. The dispatch
+    /// key for `generate(_:)` / `generateStream(_:)`.
+    public let kind: ModelKind
+    /// The model's tokenizer. `nil` for kinds that don't tokenize text
+    /// (VAD, STS, and some pure audio transforms).
+    public let tokenizer: (any Tokenizer)?
     public let config: ModelConfig
     public let modelDirectory: URL
     public let availableCapabilities: Set<Capability>
+
+    /// The engine viewed as a text `LanguageModel`, or `nil` for non-text
+    /// kinds (STT / TTS / STS / VAD). The shim every existing text/VL call
+    /// site recovers the forward / cache surface through.
+    public var languageModel: (any LanguageModel)? { engine as? any LanguageModel }
+
+    /// The text engine, for the text/VL code paths. Precondition-fails on a
+    /// non-text kind — a caller bug; guard on `kind` / `languageModel` first.
+    /// The convenience shim text commands (generate / inspect / bench) reach
+    /// the forward / cache surface through; programmatic callers that may hold
+    /// a non-text model should use the optional `languageModel` instead.
+    public var textEngine: any LanguageModel {
+        guard let lm = engine as? any LanguageModel else {
+            preconditionFailure(
+                "Model.textEngine on a non-text engine (kind=\(kind.rawValue))")
+        }
+        return lm
+    }
+
+    /// The tokenizer, for the text/VL code paths. Precondition-fails when the
+    /// model carries none (VAD / STS) — a caller bug; text generation is only
+    /// reached for kinds that tokenize. Programmatic callers that may hold a
+    /// non-text model should use the optional `tokenizer` instead.
+    public var textTokenizer: any Tokenizer {
+        guard let t = tokenizer else {
+            preconditionFailure(
+                "Model.textTokenizer on a model with no tokenizer "
+                    + "(kind=\(kind.rawValue))")
+        }
+        return t
+    }
 
     /// The model's chat template, when it ships as a standalone
     /// `chat_template.jinja` file (the newer HF convention) rather than a
@@ -95,7 +142,7 @@ public final class Model: @unchecked Sendable {
     /// reasoning models that only ship the standalone file (e.g.
     /// LiquidAI/LFM2.5) still format correctly through `generate(messages:)`.
     public var standaloneChatTemplate: String? {
-        guard !tokenizer.hasChatTemplate else { return nil }
+        guard tokenizer?.hasChatTemplate != true else { return nil }
         let url = modelDirectory.appendingPathComponent("chat_template.jinja")
         return try? String(contentsOf: url, encoding: .utf8)
     }
@@ -104,7 +151,7 @@ public final class Model: @unchecked Sendable {
     /// tokenizer carries a template or a standalone `chat_template.jinja`
     /// was found alongside the model.
     public var supportsChatTemplate: Bool {
-        tokenizer.hasChatTemplate || standaloneChatTemplate != nil
+        tokenizer?.hasChatTemplate == true || standaloneChatTemplate != nil
     }
 
     /// The `LoadOptions` this model was loaded with. Retained so the
@@ -224,7 +271,8 @@ public final class Model: @unchecked Sendable {
     private let residencyDevice: Device
 
     init(
-        engine: any LanguageModel, tokenizer: any Tokenizer, config: ModelConfig,
+        engine: any ModelEngine, kind: ModelKind = .llm,
+        tokenizer: (any Tokenizer)?, config: ModelConfig,
         modelDirectory: URL,
         availableCapabilities: Set<Capability>,
         enabledCapabilities: Set<Capability>,
@@ -235,6 +283,7 @@ public final class Model: @unchecked Sendable {
         residencyDevice: Device = .shared
     ) {
         self.engine = engine
+        self.kind = kind
         self.tokenizer = tokenizer
         self.config = config
         self.modelDirectory = modelDirectory
@@ -375,7 +424,8 @@ public final class Model: @unchecked Sendable {
                 }
                 let tokenizer = try await TokenizerLoader().load(from: dir)
                 return Model(
-                    engine: loaded.engine, tokenizer: tokenizer, config: config,
+                    engine: loaded.engine, kind: loaded.kind, tokenizer: tokenizer,
+                    config: config,
                     modelDirectory: dir,
                     availableCapabilities: loaded.availableCapabilities,
                     enabledCapabilities: options.capabilities,
@@ -417,8 +467,11 @@ public final class Model: @unchecked Sendable {
     /// kernel shapes, not cache depth, so a depth of a few slots
     /// compiles exactly the same pipeline states.
     public func prewarm() async {
-        let cache = engine.makeLayerCaches(maxSeq: Self.prewarmCacheDepth)
-        _ = engine.forward(tokenId: 0, position: 0, caches: cache)
+        // Prewarm is a text-engine concept (compile the decode PSOs). Audio /
+        // VAD engines have no token-forward path — skip.
+        guard let lm = languageModel else { return }
+        let cache = lm.makeLayerCaches(maxSeq: Self.prewarmCacheDepth)
+        _ = lm.forward(tokenId: 0, position: 0, caches: cache)
     }
 
     /// Cache depth used by `prewarm()`. A single position-0 forward
@@ -442,11 +495,12 @@ public final class Model: @unchecked Sendable {
     public func resolvedKVContextCeiling(
         generationBudget: Int? = nil, device: Device = .shared
     ) throws -> Int {
-        var ceiling = engine.maxContextWindow
+        let lm = textEngine
+        var ceiling = lm.maxContextWindow
         if let mc = loadOptions.maxContextLength { ceiling = Swift.min(ceiling, mc) }
         if let gb = generationBudget { ceiling = Swift.min(ceiling, gb) }
         ceiling = try MemoryBudget.clampContext(
-            requestedCeiling: ceiling, engine: engine,
+            requestedCeiling: ceiling, engine: lm,
             options: loadOptions, device: device)
         return Swift.max(1, ceiling)
     }
@@ -463,6 +517,7 @@ public final class Model: @unchecked Sendable {
     public func makeManagedCaches(
         generationBudget: Int? = nil, device: Device = .shared
     ) throws -> [any LayerCacheProtocol] {
+        let lm = textEngine
         let ceiling = try resolvedKVContextCeiling(
             generationBudget: generationBudget, device: device)
 
@@ -470,7 +525,7 @@ public final class Model: @unchecked Sendable {
         // the global default, touching no shared state.
         guard loadOptions.preallocateKVCache || loadOptions.initialKVCacheCapacity != nil
         else {
-            return engine.makeLayerCaches(maxSeq: ceiling, device: device)
+            return lm.makeLayerCaches(maxSeq: ceiling, device: device)
         }
 
         // Override path: `preallocateKVCache` collapses to "start at the
@@ -489,7 +544,7 @@ public final class Model: @unchecked Sendable {
             ? ceiling
             : Swift.max(1, loadOptions.initialKVCacheCapacity ?? saved)
         defer { KVCache.defaultInitialCapacity = saved }
-        return engine.makeLayerCaches(maxSeq: ceiling, device: device)
+        return lm.makeLayerCaches(maxSeq: ceiling, device: device)
     }
 }
 

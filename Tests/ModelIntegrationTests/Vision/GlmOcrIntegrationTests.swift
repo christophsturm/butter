@@ -71,20 +71,20 @@ struct GlmOcrIntegrationTests {
         #expect(m.engine is GlmOcrModel, "expected engine to be GlmOcrModel")
 
         // Sanity-check text backbone shapes (from the cached config).
-        #expect(m.engine.hidden == 1536)
-        #expect(m.engine.nLayers == 16)
-        #expect(m.engine.nHeads == 16)
-        #expect(m.engine.nKVHeads == 8)
-        #expect(m.engine.headDim == 128)
-        #expect(m.engine.vocab == 59392)
+        #expect(m.textEngine.hidden == 1536)
+        #expect(m.textEngine.nLayers == 16)
+        #expect(m.textEngine.nHeads == 16)
+        #expect(m.textEngine.nKVHeads == 8)
+        #expect(m.textEngine.headDim == 128)
+        #expect(m.textEngine.vocab == 59392)
 
         // Checkpoint should declare 4-bit quantization.
         #expect(m.config.quantization?.bits == 4)
         #expect(m.config.quantization?.groupSize == 64)
 
         // Single-token forward pass should produce finite logits.
-        let caches = m.engine.makeLayerCaches()
-        let logits = m.engine.forward(tokenId: 0, position: 0, caches: caches)
+        let caches = m.textEngine.makeLayerCaches()
+        let logits = m.textEngine.forward(tokenId: 0, position: 0, caches: caches)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
         #expect(top[0].1.isFinite)
@@ -112,7 +112,7 @@ struct GlmOcrIntegrationTests {
         // For a coherence-first test we just use a flat sequence of image
         // token placeholders followed by the OCR instruction.
         let imageTokenId = model.imageTokenId
-        let questionTokens = m.tokenizer.encode(
+        let questionTokens = m.textTokenizer.encode(
             text: "\nTranscribe the text in this image exactly.")
 
         // How many image placeholders? Each vision patch is one token;
@@ -140,7 +140,7 @@ struct GlmOcrIntegrationTests {
         #expect(!generated.isEmpty)
 
         // Decode and print for human inspection.
-        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("GlmOcr generated: \(text)")
 
         // Coherence first — not stuck / degenerate.

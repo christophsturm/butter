@@ -47,15 +47,15 @@ struct OLMoTextIntegrationTests {
         // OLMo 2 7B canonical: hidden=4096, nLayers=32, nHeads=32,
         // nKVHeads=32 (MHA, not GQA), head_dim=128 (4096/32),
         // vocab=100_352.
-        #expect(m.engine.hidden == 4096)
-        #expect(m.engine.nLayers == 32)
-        #expect(m.engine.nHeads == 32)
-        #expect(m.engine.nKVHeads == 32)
-        #expect(m.engine.headDim == 128)
-        #expect(m.engine.vocab == 100_352)
+        #expect(m.textEngine.hidden == 4096)
+        #expect(m.textEngine.nLayers == 32)
+        #expect(m.textEngine.nHeads == 32)
+        #expect(m.textEngine.nKVHeads == 32)
+        #expect(m.textEngine.headDim == 128)
+        #expect(m.textEngine.vocab == 100_352)
 
         // ── 3. Errors we expect ─────────────────────────────────────────
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 32)
         for (i, c) in caches.enumerated() {
             if !(c is KVCache) {
@@ -64,7 +64,7 @@ struct OLMoTextIntegrationTests {
         }
 
         // ── 4. Forward pass produces expected output ────────────────────
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 100_352)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)

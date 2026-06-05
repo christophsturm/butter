@@ -61,12 +61,12 @@ struct Granite4TextIntegrationTests {
         #expect(m.mamba2 == nil)
 
         // Shapes from the published granite-4.0-h-350m config.
-        #expect(m.engine.hidden == 768)
-        #expect(m.engine.nLayers == 32)
-        #expect(m.engine.nHeads == 12)
-        #expect(m.engine.nKVHeads == 4)
-        #expect(m.engine.headDim == 64)
-        #expect(m.engine.vocab == 100_352)
+        #expect(m.textEngine.hidden == 768)
+        #expect(m.textEngine.nLayers == 32)
+        #expect(m.textEngine.nHeads == 12)
+        #expect(m.textEngine.nKVHeads == 4)
+        #expect(m.textEngine.headDim == 64)
+        #expect(m.textEngine.vocab == 100_352)
         if let g = m.graniteMoeHybrid {
             // Mamba 2 mixer geometry — d_inner = mamba_n_heads * mamba_d_head.
             #expect(g.mambaNHeads == 48)
@@ -94,7 +94,7 @@ struct Granite4TextIntegrationTests {
         // ── Forward-shape smoke test ──────────────────────────────────
         // One token through the full heterogeneous stack. Logits should
         // be finite and non-degenerate (the model is trained).
-        let caches = m.engine.makeLayerCaches()
+        let caches = m.textEngine.makeLayerCaches()
         #expect(caches.count == 32)
         // Cache kinds match the layer kinds, index-for-index.
         if let g = m.graniteMoeHybrid {
@@ -109,7 +109,7 @@ struct Granite4TextIntegrationTests {
                 }
             }
         }
-        let logits = m.engine.forward(tokenId: 1, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 100_352)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
@@ -126,7 +126,7 @@ struct Granite4TextIntegrationTests {
         #expect(result.tokensPerSecond > 0)
 
         // Print the actual decoded text for manual inspection.
-        let decoded = m.tokenizer.decode(tokens: result.generatedTokens)
+        let decoded = m.textTokenizer.decode(tokens: result.generatedTokens)
         print("Granite4-350M decoded output: \(decoded)")
 
         // Granite4-350M is a tiny hybrid (Mamba 2 + MoE + attn)
