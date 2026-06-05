@@ -109,4 +109,67 @@ struct MiniCPM45OmniIntegrationTests {
         expectCoherentOutput(generated, minTokens: 8, label: "MiniCPM-o image")
         VisionTestHelpers.expectMentionsDog(text, label: "MiniCPM-o")
     }
+
+    // MARK: - audio → text
+
+    @Test("audio + text — raw-frame audio path decodes coherently")
+    func audioTextGeneration() async throws {
+        let m = try await Self.loaded.value
+        let vlm = try #require(m.vlModel, "MiniCPM-o is not a VLM")
+        let audioTokenId = try #require(vlm.audioTokenId)
+
+        let wav = Self.sine()
+        // MiniCPM-o audio framing (processing_minicpmo.py): `<|audio_start|>`
+        // + `<unk>×output_len` + `<|audio_end|>`. The placeholder count must
+        // match the whisper-tower → projector → avg-pool(5) output length.
+        let nAud = try vlm.encodeAudio(wav).shape[0]
+        #expect(nAud > 0)
+        let pre = m.tokenizer.encode(text: "<|im_start|>user\n<|audio_start|>")
+        let post = m.tokenizer.encode(
+            text: "<|audio_end|>\nWhat do you hear?<|im_end|>\n<|im_start|>assistant\n")
+        let prompt = pre + Array(repeating: audioTokenId, count: nAud) + post
+
+        let generated = try vlm.generate(
+            promptTokens: prompt, audio: wav, maxTokens: 64,
+            eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
+        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        print("MiniCPM-o audio → \(text)")
+        expectCoherentOutput(generated, minTokens: 3, label: "MiniCPM-o audio")
+    }
+
+    // MARK: - video → text
+
+    @Test("video + text — identifies the cat video")
+    func videoTextGeneration() async throws {
+        let m = try await Self.loaded.value
+        let vlm = try #require(m.vlModel, "MiniCPM-o is not a VLM")
+        let videoTokenId = try #require(vlm.videoTokenId)
+
+        // MiniCPM-o encodes each video frame as an independent image (64
+        // resampler tokens/frame). Frame each `<image>`-wrapped placeholder
+        // run; the splice substitutes per-frame video tokens IN ORDER.
+        let frames = try VisionTestHelpers.catVideoFrames(maxFrames: 3)
+        let perFrame = vlm.encodeImage(frames[0]).shape[0]
+        let pre = m.tokenizer.encode(text: "<|im_start|>user\n")
+        let post = m.tokenizer.encode(
+            text: "\nWhat animal is in this video?<|im_end|>\n"
+                + "<|im_start|>assistant\n")
+        var span: [Int] = []
+        for _ in frames {
+            span += m.tokenizer.encode(text: "<image>")
+            span += Array(repeating: videoTokenId, count: perFrame)
+            span += m.tokenizer.encode(text: "</image>")
+        }
+        let prompt = pre + span + post
+
+        let generated = try vlm.generate(
+            promptTokens: prompt, videoFrames: frames, maxTokens: 96,
+            eosTokenId: m.config.eosTokenId, eosTokenIds: m.config.eosTokenIds)
+        let text = m.tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+        print("MiniCPM-o video → \(text)")
+        expectCoherentOutput(generated, minTokens: 4, label: "MiniCPM-o video")
+        #expect(
+            text.lowercased().contains("cat"),
+            "video caption should mention a cat — got: \(text)")
+    }
 }
