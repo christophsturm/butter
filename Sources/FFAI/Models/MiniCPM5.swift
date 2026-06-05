@@ -34,6 +34,8 @@
 
 import Foundation
 
+// ─── Family entry point ──────────────────────────────────────────────
+
 public enum MiniCPM5 {
     /// Whether a decoded `config.json` describes a MiniCPM5 checkpoint.
     ///
@@ -87,4 +89,23 @@ public protocol MiniCPM5Variant {
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
     ) throws -> MiniCPM5Model
+}
+
+// ─── Errors ──────────────────────────────────────────────────────────
+
+/// Unified MiniCPM5 family error — the family's error vocabulary, raised by
+/// the family orchestrator and its (future) vision / audio component stacks.
+/// Mirrors `MiniCPM4Error`; the text-only stack delegates to `Llama3Dense`
+/// today, so these surface once a multimodal v5 variant is wired.
+public enum MiniCPM5Error: Error, CustomStringConvertible {
+    case missingConfig(String)
+    case unsupportedConfig(String)
+    public var description: String {
+        switch self {
+        case .missingConfig(let f):
+            return "MiniCPM5: required config field missing: \(f)"
+        case .unsupportedConfig(let m):
+            return "MiniCPM5: unsupported config: \(m)"
+        }
+    }
 }
