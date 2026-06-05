@@ -18,9 +18,6 @@
 // `MiniCPM4Merger`, `MiniCPM4ComposedEncoder`, and all encode methods
 // live here. The family orchestrator (load entrypoint, public constants,
 // `MiniCPM4Error`) lives in `Models/MiniCPM4.swift`.
-//
-// Reference: `mlx-vlm/mlx_vlm/models/minicpmv4_6/`
-// (`minicpmv4_6.py`, `vision.py`, `processing_minicpmv4_6.py`).
 
 import Foundation
 import Metal
@@ -32,8 +29,6 @@ import Metal
 //
 //   1. windows + window_self_attention(LN(windows))   [num_windows, 4, h]
 //   2. window-mean(1) used as a residual on the merged-and-projected output
-//
-// Reference: `VitMerger` in `mlx-vlm/models/minicpmv4_6/minicpmv4_6.py`.
 
 final class MiniCPM4ViTMerger {
     /// Per-token LayerNorm applied before the window self-attention.

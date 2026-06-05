@@ -16,7 +16,7 @@
 //
 // Offline. `Qwen25VL` is a VL-only orchestrator (no `model_type` set);
 // the file declares the image / video token defaults + capability set
-// + the `Qwen25Error` cases. The `vision_config` decode surface is
+// + the `Qwen2Error` cases. The `vision_config` decode surface is
 // already covered by `Tests/FFAITests/Models/Vision/Qwen25VisionConfigTests.swift`.
 
 import Foundation
@@ -42,11 +42,11 @@ struct Qwen25VLRootTests {
         #expect(caps.contains(.videoIn))
     }
 
-    @Test("Qwen25Error stringifies every case with its payload")
+    @Test("Qwen2Error stringifies every case with its payload")
     func errorDescriptions() {
-        #expect(Qwen25Error.missingConfig.description.contains("Qwen25"))
+        #expect(Qwen2Error.missingConfig.description.contains("Qwen2"))
         #expect(
-            Qwen25Error.missingTensor("vision_tower.x").description
+            Qwen2Error.missingTensor("vision_tower.x").description
                 .contains("vision_tower.x"))
     }
 }

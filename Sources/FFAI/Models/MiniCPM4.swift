@@ -41,8 +41,6 @@
 // dispatch + public constants). The vision / audio token runs are spliced
 // into the text stream by the shared `VisionModel`.
 //
-// Reference: `modeling_minicpmv.py` / `modeling_minicpmo.py` /
-// `processing_minicpm{v,o}.py` (HF `openbmb/MiniCPM-{V,o}-4_*`).
 
 import Foundation
 import Metal

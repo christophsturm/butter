@@ -94,7 +94,6 @@ struct Gemma4AudioConfig {
 
 // ─── Gemma 4 audio tower — Conformer / USM speech encoder ─────────────
 //
-// Faithful Swift port of mlx_vlm's `gemma4/audio.py` (`AudioEncoder`).
 // Same idioms as the Gemma 4 vision tower (`Gemma4Vision.swift`):
 // token-major `[nFrames, hidden]` activations, GPU GEMMs through a
 // `projectRows` helper, GPU element-wise Ops, and CPU attention via
@@ -116,7 +115,7 @@ struct Gemma4AudioConfig {
 /// quantized) linear, then clamps the output to `[output_min,
 /// output_max]`. The four bounds are scalar tensors loaded from the
 /// checkpoint; they default to ±inf so clamping is a no-op until real
-/// values are present. Mirrors `vision.py`'s `ClippableLinear`.
+/// values are present.
 final class Gemma4AudioClippableLinear {
     let linear: AnyLinear
     let inputMin: Float

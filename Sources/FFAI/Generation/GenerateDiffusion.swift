@@ -27,10 +27,6 @@
 // diffusion-draft the block bidirectionally, then AR-verify it causally;
 // accept the longest matching prefix plus one bonus token and roll the
 // KV cache back to the accepted length.
-//
-// Both ports follow `modeling_nemotron_labs_diffusion.py`
-// (`generate` / `linear_spec_generate`). Greedy (temperature 0) only in
-// this first cut — the integration contract is coherent text.
 
 import Foundation
 

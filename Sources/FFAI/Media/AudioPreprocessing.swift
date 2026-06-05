@@ -78,7 +78,6 @@ public struct AudioFrontEndConfig: Sendable {
     /// (320 samples), 10 ms hop (160 samples), FFT length 512
     /// (next pow2 ≥ 320), 128 Mel bins, `fMax = 8000 Hz`, HTK Mel scale.
     /// Mirrors `transformers` `Gemma4AudioFeatureExtractor`
-    /// (`feature_extraction_gemma4.py`).
     public static let gemma4 = AudioFrontEndConfig(
         sampleRate: 16_000, nFFT: 512, hopLength: 160, nMels: 128,
         fMin: 0, fMax: 8000)

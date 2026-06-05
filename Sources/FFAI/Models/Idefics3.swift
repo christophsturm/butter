@@ -19,8 +19,6 @@
 // string "Idefics3ForConditionalGeneration".
 //
 // Reference:
-//   mlx-swift-lm: Libraries/MLXVLM/Models/Idefics3.swift
-//   mlx-vlm: mlx_vlm/models/idefics3.py
 //   HuggingFace: HuggingFaceM4/Idefics3-8B-Llama3
 //
 // Design mirrors SmolVLM2.swift exactly — Idefics3 is the ancestor and
