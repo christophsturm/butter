@@ -76,6 +76,10 @@ public enum Qwen25VL {
     public static let availableCapabilities: Set<Capability> =
         Capability.textOnly.union([.imageIn, .videoIn])
 
+    /// Generation defaults — the Qwen 2.5 text variant's (`Qwen25Dense`).
+    public static let defaultGenerationParameters =
+        Qwen25Dense.defaultGenerationParameters
+
     /// Build a `VisionModel` from a `Qwen2_5_VLForConditionalGeneration`
     /// checkpoint: the dynamic-resolution vision tower + the Qwen 2.x
     /// text backbone, joined by the cross-modal splice.
@@ -94,7 +98,7 @@ public enum Qwen25VL {
         // the `language_model.`-prefixed sub-tree through the Llama dense
         // engine (Qwen 2.x == LlamaDense).
         let textWeights = weights.prefixed("language_model.")
-        let textEngine = try LlamaDense.loadModel(
+        let textEngine = try Qwen25Dense.loadModel(
             config: config, weights: textWeights, options: options, device: device)
 
         // ── Vision tower ──

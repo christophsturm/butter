@@ -107,6 +107,14 @@ public enum FastVLM {
     /// Not stored in config.json — hardcoded in the reference processor.
     public static let defaultImageTokenId = -200
 
+    /// Capabilities the FastVLM checkpoint exposes (text + image).
+    public static let availableCapabilities: Set<Capability> =
+        Capability.textOnly.union([.imageIn])
+
+    /// Generation defaults — the FastVLM text variant's (`FastVLMDense`).
+    public static let defaultGenerationParameters =
+        FastVLMDense.defaultGenerationParameters
+
     /// Build a `VisionModel` from a FastVLM checkpoint: the FastViTHD tower
     /// + the mlp2x_gelu projector + the Qwen2 text backbone, joined by
     /// the cross-modal token splice.
@@ -130,7 +138,7 @@ public enum FastVLM {
                 config.raw,
                 vocabFallback: config.int("vocab_size")))
         let textWeights = weights.prefixed("language_model.")
-        let textEngine = try LlamaDense.loadModel(
+        let textEngine = try FastVLMDense.loadModel(
             config: mergedTextConfig, weights: textWeights,
             options: options, device: device)
 

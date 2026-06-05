@@ -93,6 +93,14 @@ public enum Mistral3 {
     /// Default spatial merge size (2×2 pooling in the patch merger).
     public static let defaultSpatialMergeSize = 2
 
+    /// Capabilities the Mistral 3 VL checkpoint exposes (text + image).
+    public static let availableCapabilities: Set<Capability> =
+        Capability.textOnly.union([.imageIn])
+
+    /// Generation defaults — the Mistral 3 text variant's (`Mistral3Dense`).
+    public static let defaultGenerationParameters =
+        Mistral3Dense.defaultGenerationParameters
+
     /// Build a `VisionModel` from a Mistral3 checkpoint: the Pixtral 2D-RoPE ViT
     /// + the Mistral3 patch-merger projector + the Mistral text backbone,
     /// joined by the cross-modal splice.
@@ -117,7 +125,7 @@ public enum Mistral3 {
                 textConfig.raw,
                 vocabFallback: config.int("vocab_size")))
         let textWeights = weights.prefixed("language_model.")
-        let textEngine = try LlamaDense.loadModel(
+        let textEngine = try Mistral3Dense.loadModel(
             config: mergedTextConfig, weights: textWeights,
             options: options, device: device)
 

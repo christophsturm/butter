@@ -89,6 +89,14 @@ public enum Pixtral {
     /// The tokenizer's `[IMG]` special token resolves to id 10.
     public static let defaultImageTokenId = 10
 
+    /// Capabilities the Pixtral VL checkpoint exposes (text + image).
+    public static let availableCapabilities: Set<Capability> =
+        Capability.textOnly.union([.imageIn])
+
+    /// Generation defaults — the Pixtral text variant's (`PixtralDense`).
+    public static let defaultGenerationParameters =
+        PixtralDense.defaultGenerationParameters
+
     /// Build a `VisionModel` from a Pixtral checkpoint: the custom 2D-RoPE
     /// ViT + the multi-modal projector + the Mistral text backbone,
     /// joined by the cross-modal splice.
@@ -114,7 +122,7 @@ public enum Pixtral {
                 textConfig.raw,
                 vocabFallback: config.int("vocab_size")))
         let textWeights = weights.prefixed("language_model.")
-        let textEngine = try LlamaDense.loadModel(
+        let textEngine = try PixtralDense.loadModel(
             config: mergedTextConfig, weights: textWeights,
             options: options, device: device)
 

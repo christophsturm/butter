@@ -27,8 +27,9 @@
 //   multi_modal_projector.linear_1.{weight,bias}   (quantized in 4bit)
 //   multi_modal_projector.linear_2.{weight,bias}   (quantized in 4bit)
 //
-// The family orchestrator (load entry-point + `image_token_index` default)
-// lives in `Models/LFM2.swift`.
+// This file also hosts the `LFM2VL` family orchestrator (load entry-point
+// + `image_token_index` default); the family root (text enum + variant
+// protocol + error) lives in `Models/LFM2.swift`.
 
 import Foundation
 import Metal
@@ -809,4 +810,132 @@ private func lfm2vlWriteFloats(
     default: fatalError("LFM2VL: unsupported dtype \(dtype)")
     }
     return t
+}
+
+// ─── LFM2-VL orchestrator ────────────────────────────────────────────
+//
+// LFM2-VL (`Lfm2VlForConditionalGeneration`) composes:
+//   • SigLIP2 vision tower (standard ViT, OIHW patch embed),
+//   • pixel-unshuffle collapsing a `downsample_factor²` patch
+//     neighbourhood into one super-patch,
+//   • multi-modal projector (LayerNorm → linear_1 (GELU) → linear_2),
+//   • LFM2 text backbone loaded from `language_model.`-prefixed
+//     weights.
+
+// ─── Family entry point ──────────────────────────────────────────────
+
+public enum LFM2VL {
+    /// Architecture string the checkpoint declares.
+    public static let architectures: Set<String> =
+        ["Lfm2VlForConditionalGeneration"]
+
+    /// `image_token_index` for LFM2-VL checkpoints.
+    public static let defaultImageTokenId = 396
+
+    /// Build a `VisionModel` from a `Lfm2VlForConditionalGeneration`
+    /// checkpoint: SigLIP2 vision tower + pixel-unshuffle projector +
+    /// LFM2 text backbone, joined by the cross-modal splice.
+    public static func load(
+        config: ModelConfig,
+        weights: SafeTensorsBundle,
+        options: LoadOptions,
+        device: Device
+    ) throws -> VisionModel {
+        guard let visionConfigRaw = config.nested("vision_config"),
+            let textConfigRaw = config.nested("text_config")
+        else {
+            throw LFM2Error.missingConfig("vision_config / text_config")
+        }
+
+        // ── Text backbone (LFM2 — quantized-aware) ──────────────────
+        // Re-wrap the text_config sub-dict as a flat ModelConfig so the
+        // standalone text-backbone loader resolves the right fields.
+        // LFM2VL text checkpoints may be quantized (4-bit); use the
+        // quantized-aware loader that calls loadLinear / loadEmbedding.
+        let textConfig = ModelConfig(
+            architecture: "Lfm2ForCausalLM",
+            modelType: "lfm2",
+            raw: textConfigRaw)
+        let textWeights = weights.prefixed("language_model.")
+        // Propagate the top-level quantization block into the text config
+        // so loadLinear sees it (HF VLM configs put it at the top level).
+        let quant = config.quantization
+        let textEngine = try lfm2LoadModelQuantized(
+            config: textConfig, weights: textWeights,
+            quantization: quant, device: device)
+
+        // ── SigLIP2 vision tower ─────────────────────────────────────
+        let visionConfig = ModelConfig(
+            architecture: nil,
+            modelType: visionConfigRaw["model_type"] as? String,
+            raw: visionConfigRaw)
+
+        // The config's `vision_feature_layer` controls how many encoder
+        // layers run. -2 (the published default) means use the second-to-last
+        // layer's output. Map to a concrete layer count:
+        //   actualLayer = numHiddenLayers + visionFeatureLayer  (when < 0)
+        //   numLayers   = actualLayer + 1
+        let numHiddenLayers = visionConfig.int("num_hidden_layers") ?? 27
+        let visionFeatureLayerRaw = config.int("vision_feature_layer") ?? -2
+        let activeLayers: Int
+        if visionFeatureLayerRaw < 0 && visionFeatureLayerRaw > -numHiddenLayers {
+            let actual = numHiddenLayers + visionFeatureLayerRaw
+            activeLayers = actual + 1
+        } else {
+            activeLayers = numHiddenLayers
+        }
+
+        let visionWeights = weights.prefixed("vision_tower.")
+        let visionEncoder = try lfm2vlLoadVisionEncoder(
+            config: visionConfig, activeLayers: activeLayers,
+            weights: visionWeights, device: device)
+
+        // ── Multi-modal projector (pixel-unshuffle + MLP) ────────────
+        let downsample = config.int("downsample_factor") ?? 2
+        let projHidden = config.int("projector_hidden_size") ?? 2560
+        let visionHidden = visionConfig.int("hidden_size") ?? 1152
+        // Input dim after pixel-unshuffle: visionHidden * downsample²
+        let unshuffledDim = visionHidden * downsample * downsample
+        let projWeights = weights.prefixed("multi_modal_projector.")
+        let projector = try LFM2VLProjector.load(
+            unshuffledDim: unshuffledDim,
+            projHidden: projHidden,
+            textHidden: textEngine.hidden,
+            downsampleFactor: downsample,
+            weights: projWeights,
+            quantization: quant,
+            device: device)
+
+        // imageTokenCount = numPatches / downsample² (after pixel-unshuffle)
+        let numPatches = visionConfig.int("num_patches") ?? 256
+        let imageTokenCount = numPatches / (downsample * downsample)
+
+        // Compose the vision tower + projector behind a VisionEncoder
+        // facade so VisionModel's splice sees a single encode surface.
+        let numPatches1D = Int(Double(numPatches).squareRoot().rounded())
+        let patchSize = visionConfig.int("patch_size") ?? 16
+        let imageSize = numPatches1D * patchSize  // natural resolution (256)
+        // The processor's aspect-preserving resize caps the patch grid at
+        // `max_num_patches` (1024), NOT at `num_patches` (256, the posEmb
+        // table size). Top config wins; fall back to the vision sub-config.
+        let maxNumPatches =
+            config.int("max_num_patches")
+            ?? visionConfig.int("max_num_patches") ?? 1024
+        let composed = LFM2VLComposedTower(
+            encoder: visionEncoder,
+            projector: projector,
+            imageSize: imageSize,
+            imageTokenCount: imageTokenCount,
+            maxNumPatches: maxNumPatches,
+            textHidden: textEngine.hidden,
+            dtype: textEngine.dtype)
+
+        let imageTokenId = config.int("image_token_index") ?? defaultImageTokenId
+        return try VisionModel(
+            visionEncoder: composed.asVisionEncoder(),
+            engine: textEngine,
+            imageTokenId: imageTokenId,
+            normalization: .siglip,
+            imageTokenCount: imageTokenCount)
+    }
 }

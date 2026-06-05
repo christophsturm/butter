@@ -238,7 +238,7 @@ public enum ModelRegistry {
                     options: options, device: device)
                 return Loaded(
                     engine: vlm.engine,
-                    defaultGenerationParameters: LlamaDense.defaultGenerationParameters,
+                    defaultGenerationParameters: Qwen25VL.defaultGenerationParameters,
                     availableCapabilities: Qwen25VL.availableCapabilities,
                     vlModel: vlm)
             }
@@ -335,8 +335,8 @@ public enum ModelRegistry {
                     options: options, device: device)
                 return Loaded(
                     engine: vlm.engine,
-                    defaultGenerationParameters: LlamaDense.defaultGenerationParameters,
-                    availableCapabilities: Capability.textOnly.union([.imageIn]),
+                    defaultGenerationParameters: FastVLM.defaultGenerationParameters,
+                    availableCapabilities: FastVLM.availableCapabilities,
                     vlModel: vlm)
             }
             if let mt = config.modelType, FastVLM.modelTypes.contains(mt) {
@@ -345,8 +345,8 @@ public enum ModelRegistry {
                     options: options, device: device)
                 return Loaded(
                     engine: vlm.engine,
-                    defaultGenerationParameters: LlamaDense.defaultGenerationParameters,
-                    availableCapabilities: Capability.textOnly.union([.imageIn]),
+                    defaultGenerationParameters: FastVLM.defaultGenerationParameters,
+                    availableCapabilities: FastVLM.availableCapabilities,
                     vlModel: vlm)
             }
             // Pixtral — Mistral AI's Pixtral-12B vision-language model.
@@ -361,8 +361,8 @@ public enum ModelRegistry {
                     options: options, device: device)
                 return Loaded(
                     engine: vlm.engine,
-                    defaultGenerationParameters: LlamaDense.defaultGenerationParameters,
-                    availableCapabilities: Capability.textOnly.union([.imageIn]),
+                    defaultGenerationParameters: Pixtral.defaultGenerationParameters,
+                    availableCapabilities: Pixtral.availableCapabilities,
                     vlModel: vlm)
             }
             // Mistral3 — Mistral Small 3.1 vision-language model. Shares
@@ -375,8 +375,8 @@ public enum ModelRegistry {
                     options: options, device: device)
                 return Loaded(
                     engine: vlm.engine,
-                    defaultGenerationParameters: LlamaDense.defaultGenerationParameters,
-                    availableCapabilities: Capability.textOnly.union([.imageIn]),
+                    defaultGenerationParameters: Mistral3.defaultGenerationParameters,
+                    availableCapabilities: Mistral3.availableCapabilities,
                     vlModel: vlm)
             }
             // Idefics3 — HuggingFace Idefics3 (SmolVLM ancestor). SigLIP
