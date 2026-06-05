@@ -99,7 +99,11 @@ struct MiniCPM46VIntegrationTests {
 
     // MARK: - text
 
-    @Test("text — Qwen 3.5 backbone chat-generates coherently")
+    // KNOWN-FAILING CANARY: MiniCPM-V 4.6's Qwen 3.5 backbone (like the bare
+    // Qwen 3.5-VL) degenerates on pure text-only generation; image + video
+    // are coherent. Kept per the team decision to keep surfacing the VL
+    // text-only path until investigated; expected to fail in the bisect.
+    @Test("text — VL backbone text-only generation (known-failing canary)")
     func textGeneration() async throws {
         let m = try await Self.loaded.value
         let r = try await m.generate(

@@ -79,7 +79,11 @@ struct Qwen35VLMIntegrationTests {
         #expect(vlm.videoTokenId != nil)
     }
 
-    @Test("text — Qwen 3.5 hybrid backbone chat-generates coherently")
+    // KNOWN-FAILING CANARY: the Qwen 3.5-VL checkpoint degenerates on pure
+    // text-only generation (image + video are coherent — see those tests).
+    // Kept, per the team decision, to keep surfacing the VL text-only path
+    // until it's investigated; it is expected to fail in the bisect today.
+    @Test("text — VL backbone text-only generation (known-failing canary)")
     func textGeneration() async throws {
         let m = try await Self.loaded.value
         let r = try await m.generate(
@@ -102,19 +106,21 @@ struct Qwen35VLMIntegrationTests {
         let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "Qwen 3.5-VL checkpoint is not a VLM")
 
-        // Build an image+text prompt: a run of `imageTokenCount`
-        // <|image_pad|> placeholders followed by a text question.
-        let imageTokenId = vlm.imageTokenId
-        let questionTokens = m.tokenizer.encode(
-            text: "<|im_start|>user\nDescribe this image.<|im_end|>\n"
-                + "<|im_start|>assistant\n")
-        let promptTokens =
-            Array(
-                repeating: imageTokenId,
-                count: vlm.imageTokenCount) + questionTokens
-
         // A real photograph — the golden-retriever fixture.
         let image = try VisionTestHelpers.dogImage()
+
+        // Qwen 3.5-VL shares the Qwen 3-VL native-resolution tower: size the
+        // <|image_pad|> run to the image's NATIVE encoded token count and wrap
+        // it in the <|vision_start|> … <|vision_end|> markers (the nominal
+        // `imageTokenCount` with no markers is malformed → degenerate output).
+        let nImg = vlm.encodeImage(image).shape[0]
+        let preTokens = m.tokenizer.encode(
+            text: "<|im_start|>user\n<|vision_start|>")
+        let postTokens = m.tokenizer.encode(
+            text: "<|vision_end|>Describe this image.<|im_end|>\n"
+                + "<|im_start|>assistant\n")
+        let promptTokens =
+            preTokens + Array(repeating: vlm.imageTokenId, count: nImg) + postTokens
 
         let generated = try vlm.generate(
             promptTokens: promptTokens, image: image,
