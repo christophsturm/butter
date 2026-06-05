@@ -390,24 +390,26 @@ public enum ModelRegistry {
             if GlmOcr.modelTypes.contains(config.modelType ?? "")
                 || GlmOcr.architectures.contains(config.architecture ?? "")
             {
-                let m = try GlmOcr.load(
+                let variant = try GlmOcr.variant(for: config)
+                let m = try variant.loadModel(
                     config: config, weights: weights,
                     options: options, device: device)
                 return Loaded(
                     engine: m,
-                    defaultGenerationParameters: LlamaDense.defaultGenerationParameters,
-                    availableCapabilities: Capability.textOnly.union([.imageIn]))
+                    defaultGenerationParameters: variant.defaultGenerationParameters,
+                    availableCapabilities: variant.availableCapabilities)
             }
             if Idefics3.modelTypes.contains(config.modelType ?? "")
                 || Idefics3.architectures.contains(config.architecture ?? "")
             {
-                let m = try Idefics3Dense.loadModel(
+                let variant = try Idefics3.variant(for: config)
+                let m = try variant.loadModel(
                     config: config, weights: weights,
                     options: options, device: device)
                 return Loaded(
                     engine: m,
-                    defaultGenerationParameters: Idefics3Dense.defaultGenerationParameters,
-                    availableCapabilities: Idefics3Dense.availableCapabilities)
+                    defaultGenerationParameters: variant.defaultGenerationParameters,
+                    availableCapabilities: variant.availableCapabilities)
             }
             // PaliGemma — SigLIP + Gemma backbone. Engine is itself a
             // PaligemmaModel exposing setImagePixels(_:) + standard
@@ -519,22 +521,24 @@ public enum ModelRegistry {
             // splice; returns a plain `Loaded` whose `engine` is the
             // composite `SmolVLM2Model` and exposes `.imageIn`.
             if let arch = config.architecture, SmolVLM2.architectures.contains(arch) {
-                let engine = try SmolVLM2Dense.loadModel(
+                let variant = try SmolVLM2.variant(for: config)
+                    let engine = try variant.loadModel(
                     config: config, weights: weights,
                     options: options, device: device)
-                return Loaded(
+                    return Loaded(
                     engine: engine,
-                    defaultGenerationParameters: SmolVLM2Dense.defaultGenerationParameters,
-                    availableCapabilities: SmolVLM2Dense.availableCapabilities)
+                    defaultGenerationParameters: variant.defaultGenerationParameters,
+                    availableCapabilities: variant.availableCapabilities)
             }
             if let mt = config.modelType, SmolVLM2.modelTypes.contains(mt) {
-                let engine = try SmolVLM2Dense.loadModel(
+                let variant = try SmolVLM2.variant(for: config)
+                    let engine = try variant.loadModel(
                     config: config, weights: weights,
                     options: options, device: device)
-                return Loaded(
+                    return Loaded(
                     engine: engine,
-                    defaultGenerationParameters: SmolVLM2Dense.defaultGenerationParameters,
-                    availableCapabilities: SmolVLM2Dense.availableCapabilities)
+                    defaultGenerationParameters: variant.defaultGenerationParameters,
+                    availableCapabilities: variant.availableCapabilities)
             }
             // Other VL families — the FFAI vision foundation
             // (VisionEncoder, ImagePreprocessing, VisionModel splice,

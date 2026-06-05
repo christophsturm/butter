@@ -39,9 +39,24 @@ public enum Idefics3 {
     public static let modelTypes: Set<String> = ["idefics3"]
     public static let architectures: Set<String> = ["Idefics3ForConditionalGeneration"]
 
-    public static func variant(for config: ModelConfig) throws -> Idefics3Dense.Type {
+    public static func variant(for _: ModelConfig) throws -> any Idefics3Variant.Type {
         return Idefics3Dense.self
     }
+}
+
+// ─── Variant protocol ──────────────────────────────────────────────────────────
+
+/// Idefics3 is a self-contained multimodal engine (`Idefics3Model` bundles
+/// the SigLIP tower + pixel-shuffle connector + Llama text backbone), so the
+/// variant's `loadModel` returns that engine directly rather than a separate
+/// text model.
+public protocol Idefics3Variant {
+    static var availableCapabilities: Set<Capability> { get }
+    static var defaultGenerationParameters: GenerationParameters { get }
+    static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Idefics3Model
 }
 
 public enum Idefics3Error: Error, CustomStringConvertible {
@@ -60,7 +75,7 @@ public enum Idefics3Error: Error, CustomStringConvertible {
 
 // ─── Dense variant ───────────────────────────────────────────────────────────
 
-public struct Idefics3Dense {
+public struct Idefics3Dense: Idefics3Variant {
     public static let availableCapabilities: Set<Capability> = [.textIn, .textOut, .imageIn]
     public static let defaultGenerationParameters = GenerationParameters(
         maxTokens: 256,

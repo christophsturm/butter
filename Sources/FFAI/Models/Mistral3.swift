@@ -101,6 +101,13 @@ public enum Mistral3 {
     public static let defaultGenerationParameters =
         Mistral3Dense.defaultGenerationParameters
 
+    /// Pick the concrete text variant. Mistral 3 ships a single Mistral
+    /// dense backbone (`Mistral3Dense`); the orchestrator (`load`) wraps it
+    /// with the Pixtral ViT + patch-merger projector.
+    public static func variant(for _: ModelConfig) throws -> any Mistral3Variant.Type {
+        Mistral3Dense.self
+    }
+
     /// Build a `VisionModel` from a Mistral3 checkpoint: the Pixtral 2D-RoPE ViT
     /// + the Mistral3 patch-merger projector + the Mistral text backbone,
     /// joined by the cross-modal splice.
@@ -125,7 +132,7 @@ public enum Mistral3 {
                 textConfig.raw,
                 vocabFallback: config.int("vocab_size")))
         let textWeights = weights.prefixed("language_model.")
-        let textEngine = try Mistral3Dense.loadModel(
+        let textEngine = try Mistral3.variant(for: config).loadModel(
             config: mergedTextConfig, weights: textWeights,
             options: options, device: device)
 

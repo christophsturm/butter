@@ -97,6 +97,13 @@ public enum Pixtral {
     public static let defaultGenerationParameters =
         PixtralDense.defaultGenerationParameters
 
+    /// Pick the concrete text variant. Pixtral ships a single Mistral dense
+    /// backbone (`PixtralDense`); the orchestrator (`load`) wraps it with
+    /// the 2D-RoPE ViT + projector.
+    public static func variant(for _: ModelConfig) throws -> any PixtralVariant.Type {
+        PixtralDense.self
+    }
+
     /// Build a `VisionModel` from a Pixtral checkpoint: the custom 2D-RoPE
     /// ViT + the multi-modal projector + the Mistral text backbone,
     /// joined by the cross-modal splice.
@@ -122,7 +129,7 @@ public enum Pixtral {
                 textConfig.raw,
                 vocabFallback: config.int("vocab_size")))
         let textWeights = weights.prefixed("language_model.")
-        let textEngine = try PixtralDense.loadModel(
+        let textEngine = try Pixtral.variant(for: config).loadModel(
             config: mergedTextConfig, weights: textWeights,
             options: options, device: device)
 

@@ -115,6 +115,13 @@ public enum FastVLM {
     public static let defaultGenerationParameters =
         FastVLMDense.defaultGenerationParameters
 
+    /// Pick the concrete text variant. FastVLM ships a single Qwen 2 dense
+    /// backbone (`FastVLMDense`); the orchestrator (`load`) wraps it with
+    /// the FastViTHD tower + projector.
+    public static func variant(for _: ModelConfig) throws -> any FastVLMVariant.Type {
+        FastVLMDense.self
+    }
+
     /// Build a `VisionModel` from a FastVLM checkpoint: the FastViTHD tower
     /// + the mlp2x_gelu projector + the Qwen2 text backbone, joined by
     /// the cross-modal token splice.
@@ -138,7 +145,7 @@ public enum FastVLM {
                 config.raw,
                 vocabFallback: config.int("vocab_size")))
         let textWeights = weights.prefixed("language_model.")
-        let textEngine = try FastVLMDense.loadModel(
+        let textEngine = try FastVLM.variant(for: config).loadModel(
             config: mergedTextConfig, weights: textWeights,
             options: options, device: device)
 

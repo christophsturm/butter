@@ -58,6 +58,15 @@ public enum Qwen25Error: Error, CustomStringConvertible {
     }
 }
 
+public enum Qwen25 {
+    /// Pick the concrete text variant. Qwen 2.5 ships a single Qwen 2 dense
+    /// backbone (`Qwen25Dense`); the `Qwen25VL` orchestrator wraps it with
+    /// the dynamic-resolution ViT. Mirrors `Qwen2` / `Qwen2VL`.
+    public static func variant(for _: ModelConfig) throws -> any Qwen25Variant.Type {
+        Qwen25Dense.self
+    }
+}
+
 public enum Qwen25VL {
     /// `image_token_id` default for Qwen 2.5-VL checkpoints
     /// (`<|image_pad|>`).
@@ -98,7 +107,7 @@ public enum Qwen25VL {
         // the `language_model.`-prefixed sub-tree through the Llama dense
         // engine (Qwen 2.x == LlamaDense).
         let textWeights = weights.prefixed("language_model.")
-        let textEngine = try Qwen25Dense.loadModel(
+        let textEngine = try Qwen25.variant(for: config).loadModel(
             config: config, weights: textWeights, options: options, device: device)
 
         // ── Vision tower ──

@@ -81,6 +81,37 @@ public enum GlmOcrError: Error, CustomStringConvertible {
     }
 }
 
+// ─── Variant protocol ─────────────────────────────────────────────────
+
+/// GLM-OCR is a self-contained multimodal engine (`GlmOcrModel` bundles the
+/// dynamic-resolution ViT + the GLM-OCR text backbone), so the variant's
+/// `loadModel` returns that engine directly rather than a separate text
+/// model.
+public protocol GlmOcrVariant {
+    static var availableCapabilities: Set<Capability> { get }
+    static var defaultGenerationParameters: GenerationParameters { get }
+    static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> GlmOcrModel
+}
+
+/// The single GLM-OCR variant — the composed ViT + text engine.
+public struct GlmOcrDense: GlmOcrVariant {
+    public static let availableCapabilities: Set<Capability> =
+        Capability.textOnly.union([.imageIn])
+    public static let defaultGenerationParameters =
+        LlamaDense.defaultGenerationParameters
+
+    public static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> GlmOcrModel {
+        try GlmOcr.load(
+            config: config, weights: weights, options: options, device: device)
+    }
+}
+
 // ─── Family registry ─────────────────────────────────────────────────
 
 public enum GlmOcr {
@@ -94,6 +125,12 @@ public enum GlmOcr {
     public static let defaultImageTokenId = 59280
     /// Default `eos_token_id` (first in list) for GLM-OCR checkpoints.
     public static let defaultEosTokenId = 59246
+
+    /// Pick the concrete variant. GLM-OCR ships a single self-contained
+    /// multimodal variant (`GlmOcrDense`).
+    public static func variant(for _: ModelConfig) throws -> any GlmOcrVariant.Type {
+        GlmOcrDense.self
+    }
 
     /// Build a `GlmOcrModel` from a `GlmOcrForConditionalGeneration`
     /// checkpoint: the dynamic-resolution ViT + the GLM-OCR text backbone,

@@ -37,9 +37,23 @@ public enum SmolVLM2 {
     public static let modelTypes: Set<String> = ["smolvlm"]
     public static let architectures: Set<String> = ["SmolVLMForConditionalGeneration"]
 
-    public static func variant(for config: ModelConfig) throws -> SmolVLM2Dense.Type {
+    public static func variant(for _: ModelConfig) throws -> any SmolVLM2Variant.Type {
         return SmolVLM2Dense.self
     }
+}
+
+// ─── Variant protocol ──────────────────────────────────────────────────────────
+
+/// SmolVLM2 is a self-contained multimodal engine (`SmolVLM2Model` bundles
+/// the SigLIP tower + pixel-shuffle connector + Llama text backbone), so the
+/// variant's `loadModel` returns that engine directly.
+public protocol SmolVLM2Variant {
+    static var availableCapabilities: Set<Capability> { get }
+    static var defaultGenerationParameters: GenerationParameters { get }
+    static func loadModel(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> SmolVLM2Model
 }
 
 public enum SmolVLM2Error: Error, CustomStringConvertible {
@@ -58,7 +72,7 @@ public enum SmolVLM2Error: Error, CustomStringConvertible {
 
 // ─── Dense variant ───────────────────────────────────────────────────────────
 
-public struct SmolVLM2Dense {
+public struct SmolVLM2Dense: SmolVLM2Variant {
     /// Capabilities a SmolVLM2 checkpoint exposes. Text + image + video.
     ///
     /// SmolVLM2 does not declare a separate `video_token_id` in its
