@@ -81,8 +81,10 @@ regenerate-kernels: ## run `tile build --emit` to regenerate metallib + Swift wr
 # Production-parity defaults. The 2026-05-19 GPU-pin root cause —
 # wrong-dispatch-shape Ops wrappers — is fixed at the source (see the
 # post-mortem in papers/ and OpsValidation in Sources/FFAI/). Test
-# runs now use the same FFAI_MAX_COMMAND_BUFFERS=16 cap as production,
-# so anything that passes in CI is proven safe under production load.
+# runs use the same in-flight command-buffer cap as production — the
+# code default in MetalTileLibrary.defaultMaxCommandBufferCount — so
+# anything that passes in CI is proven safe under production load. To
+# set a custom command buffer count use FFAI_MAX_COMMAND_BUFFERS=16.
 #
 # Defense in depth still in place:
 #
@@ -104,8 +106,8 @@ regenerate-kernels: ## run `tile build --emit` to regenerate metallib + Swift wr
 #
 # Targets:
 # - `make test-unit`         — FFAITests + MetalTileSwiftTests at the
-#                              production cap (FFAI_MAX_COMMAND_BUFFERS=16),
-#                              serialized (`--no-parallel`, the Swift Testing
+#                              production cap (the code default), serialized
+#                              (`--no-parallel`, the Swift Testing
 #                              global serializer) so concurrent GPU
 #                              command-buffer submission can't flake the
 #                              GPU-correctness tests. Reliable gate.
@@ -137,7 +139,7 @@ test-unit: regenerate-kernels ## unit + Metal tests, serialized (--no-parallel) 
 	@# isolation. --no-parallel makes the gate reliable (verified 6/6 green vs
 	@# ~50% flake parallel; ~8s vs ~3s). The uncapped-parallel canary that
 	@# surfaces the dispatch-race class lives in `make test-stress`.
-	FFAI_MAX_COMMAND_BUFFERS=16 swift test --no-parallel --filter "FFAITests|MetalTileSwiftTests"
+	swift test --no-parallel --filter "FFAITests|MetalTileSwiftTests"
 
 .PHONY: test-integration
 test-integration: regenerate-kernels ## end-to-end model tests; production cap + ModelLoadLock; matches release.yml
@@ -145,21 +147,21 @@ test-integration: regenerate-kernels ## end-to-end model tests; production cap +
 	@# Model.load() across suites so multi-GB checkpoints load one at a
 	@# time. --num-workers 1 caps Swift Testing's cross-suite parallelism
 	@# to one model resident at a time (memory pressure, not GPU).
-	FFAI_MAX_COMMAND_BUFFERS=16 swift test --parallel --num-workers 1 --filter "ModelIntegrationTests"
+	swift test --parallel --num-workers 1 --filter "ModelIntegrationTests"
 
 .PHONY: test-stress
 test-stress: regenerate-kernels ## canary; production cap with uncapped parallelism — run after touching dispatch code
-	@echo "Stress mode. Running unit + integration at FFAI_MAX_COMMAND_BUFFERS=16"
+	@echo "Stress mode. Running unit + integration at the production cap (code default)"
 	@echo "with no --num-workers cap on integration. If anything regresses our"
 	@echo "wrapper-precondition / PSOCache / ModelLoadLock defenses, this is"
 	@echo "where it surfaces."
 	@echo ""
-	FFAI_MAX_COMMAND_BUFFERS=16 swift test --filter "FFAITests|MetalTileSwiftTests"
-	FFAI_MAX_COMMAND_BUFFERS=16 swift test --filter "ModelIntegrationTests"
+	swift test --filter "FFAITests|MetalTileSwiftTests"
+	swift test --filter "ModelIntegrationTests"
 
 .PHONY: coverage
 coverage: ## swift test with coverage report (unit suite only, matches ci.yml)
-	FFAI_MAX_COMMAND_BUFFERS=16 ./scripts/coverage.sh
+	./scripts/coverage.sh
 
 .PHONY: integration-bisect
 integration-bisect: regenerate-kernels ## run each ModelIntegrationTests/*IntegrationTests suite alone; tag GPU-pinned exits
