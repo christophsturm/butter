@@ -425,6 +425,26 @@ public enum ModelRegistry {
                     defaultGenerationParameters: variant.defaultGenerationParameters,
                     availableCapabilities: variant.availableCapabilities)
             }
+            // MiniCPM-o 4.5 — the omni checkpoint (text + image + video +
+            // audio-IN). Qwen3-8B dense LLM (`language_model.model.*`) +
+            // SigLIP encoder + perceiver `resampler` (64 tokens/image) +
+            // Whisper-medium `audio_tower` + avg-pool + 4-bit projector,
+            // joined by the cross-modal splice. The TTS half is ignored.
+            if MiniCPMO.handles(config) {
+                let vlm = try MiniCPMO.load(
+                    config: config, weights: weights,
+                    options: options, device: device)
+                // Audio is gated on whether the checkpoint wired an audio
+                // tower (`vlm.supportsAudio`); image + video are always
+                // present on a MiniCPM-o conversion.
+                var caps = Capability.textOnly.union([.imageIn, .videoIn])
+                if vlm.supportsAudio { caps.insert(.audioIn) }
+                return Loaded(
+                    engine: vlm.engine,
+                    defaultGenerationParameters: Qwen3Dense.defaultGenerationParameters,
+                    availableCapabilities: caps,
+                    vlModel: vlm)
+            }
             // MiniCPM-V 4.6 — SigLIP2-400M encoder + `vit_merger` (window
             // cross-attn merger injected after encoder layer 6 in the
             // default 16× mode) + final `merger` (2×2 reduction + project
