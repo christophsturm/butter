@@ -67,15 +67,6 @@ struct Gemma4OmniIntegrationTests {
     /// skipped suite never accesses it, so no load happens when gated off.
     static let loaded = Task { try await loadModel(gemma4OmniModelPath) }
 
-    /// 0.5 s 440 Hz mono sine at 16 kHz — a non-degenerate signal for the
-    /// raw-frame audio path (content doesn't matter; we gate on a positive
-    /// soft-token run + coherent decode).
-    static func sine(seconds: Double = 0.5) -> [Float] {
-        let n = Int(seconds * 16_000)
-        return (0 ..< n).map {
-            0.3 * Float(sin(2.0 * .pi * 440.0 * Double($0) / 16_000.0))
-        }
-    }
 
     // MARK: - load + text
 
@@ -120,7 +111,7 @@ struct Gemma4OmniIntegrationTests {
         #expect(img.shape.count == 2 && img.shape[0] > 0 && img.shape[1] == hidden)
 
         try #require(vlm.supportsAudio)
-        let aud = try vlm.encodeAudio(Self.sine())  // ~13 frames at 640 samples
+        let aud = try vlm.encodeAudio(AudioTestHelpers.tone())  // ~13 frames at 640 samples
         #expect(aud.shape.count == 2 && aud.shape[0] > 0 && aud.shape[1] == hidden)
 
         let vid = try vlm.encodeVideo(VisionTestHelpers.catVideoFrames(maxFrames: 2))
@@ -160,7 +151,7 @@ struct Gemma4OmniIntegrationTests {
         let vlm = try #require(m.vlModel, "omni checkpoint is not a VLM")
         let audioTokenId = try #require(vlm.audioTokenId)
 
-        let wav = Self.sine()
+        let wav = AudioTestHelpers.tone()
         let nAud = try vlm.encodeAudio(wav).shape[0]
         #expect(nAud > 0)
         let bos = try #require(m.textTokenizer.bosTokenId ?? m.config.bosTokenId)

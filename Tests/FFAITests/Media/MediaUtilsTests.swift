@@ -220,3 +220,37 @@ struct MediaVideoGeometryTests {
         }
     }
 }
+
+// Unit tests for `MediaUtils.sineWave` — the shared synthetic-tone generator
+// that backs `AudioTestHelpers.tone(...)` so test waveforms and production
+// preprocessing come from one place.
+@Suite("MediaUtils sineWave")
+struct MediaUtilsSineWaveTests {
+
+    @Test("sample count = round(seconds · sampleRate)")
+    func sampleCount() {
+        #expect(MediaUtils.sineWave(seconds: 0.5, sampleRate: 16_000).count == 8_000)
+        #expect(MediaUtils.sineWave(seconds: 1.0, sampleRate: 24_000).count == 24_000)
+    }
+
+    @Test("non-positive duration yields an empty waveform")
+    func emptyForNonPositive() {
+        #expect(MediaUtils.sineWave(seconds: 0).isEmpty)
+        #expect(MediaUtils.sineWave(seconds: -1).isEmpty)
+    }
+
+    @Test("first sample is 0 and samples stay within ±amplitude")
+    func boundedAndPhased() {
+        let w = MediaUtils.sineWave(frequency: 440, seconds: 0.1, amplitude: 0.3)
+        #expect(abs(w.first ?? 1) < 1e-6)  // sin(0) == 0
+        #expect(w.allSatisfy { abs($0) <= 0.3 + 1e-6 })
+        #expect(w.contains { abs($0) > 0.05 })  // non-degenerate signal
+    }
+
+    @Test("AudioTestHelpers.tone delegates to MediaUtils.sineWave")
+    func helperDelegates() {
+        let viaHelper = AudioTestHelpers.tone(frequency: 330, seconds: 0.05)
+        let direct = MediaUtils.sineWave(frequency: 330, seconds: 0.05)
+        #expect(viaHelper == direct)
+    }
+}

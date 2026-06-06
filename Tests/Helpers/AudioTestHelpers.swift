@@ -88,4 +88,33 @@ public enum AudioTestHelpers {
             sourceLocation: sourceLocation
         )
     }
+
+    // MARK: - Synthetic signals
+
+    /// A non-degenerate synthetic tone for audio-in / omni / TTS-spectrogram
+    /// tests — `seconds` of a `frequency`-Hz sine at `sampleRate`. Delegates
+    /// to the production `MediaUtils.sineWave` so tests and models share one
+    /// signal generator (no test-only DSP that drifts from production).
+    public static func tone(
+        frequency: Double = 440, seconds: Double = 0.5,
+        sampleRate: Int = 16_000, amplitude: Float = 0.3
+    ) -> [Float] {
+        MediaUtils.sineWave(
+            frequency: frequency, seconds: seconds,
+            sampleRate: sampleRate, amplitude: amplitude)
+    }
+
+    /// A VAD-shaped clip: `silenceSeconds` of silence, a `toneSeconds` tone
+    /// burst, then `silenceSeconds` of silence — exercises a detector's
+    /// speech/non-speech transition. Built on `tone(...)` / `MediaUtils`.
+    public static func vadClip(
+        toneSeconds: Double = 0.5, silenceSeconds: Double = 0.25,
+        frequency: Double = 440, sampleRate: Int = 16_000
+    ) -> [Float] {
+        let silence = [Float](
+            repeating: 0, count: max(0, Int(silenceSeconds * Double(sampleRate))))
+        return silence
+            + tone(frequency: frequency, seconds: toneSeconds, sampleRate: sampleRate)
+            + silence
+    }
 }

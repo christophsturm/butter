@@ -38,13 +38,6 @@ struct MiniCPM45OmniIntegrationTests {
     /// The omni checkpoint, loaded ONCE and shared across every `@Test`.
     static let loaded = Task { try await loadModel(modelId) }
 
-    /// 0.5 s 440 Hz mono sine at 16 kHz — a non-degenerate audio signal.
-    static func sine(seconds: Double = 0.5) -> [Float] {
-        let n = Int(seconds * 16_000)
-        return (0 ..< n).map {
-            0.3 * Float(sin(2.0 * .pi * 440.0 * Double($0) / 16_000.0))
-        }
-    }
 
     // MARK: - load
 
@@ -117,7 +110,7 @@ struct MiniCPM45OmniIntegrationTests {
         let vlm = try #require(m.vlModel, "MiniCPM-o is not a VLM")
         let audioTokenId = try #require(vlm.audioTokenId)
 
-        let wav = Self.sine()
+        let wav = AudioTestHelpers.tone()  // 0.5 s 440 Hz mono @16 kHz
         // MiniCPM-o audio framing: `<|audio_start|>`
         // + `<unk>×output_len` + `<|audio_end|>`. The placeholder count must
         // match the whisper-tower → projector → avg-pool(5) output length.

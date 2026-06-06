@@ -510,4 +510,23 @@ extension MediaUtils {
             fatalError("copyFloats: unsupported dtype \(t.dtype)")
         }
     }
+
+    // ─── Synthetic signal generation ─────────────────────────────────
+
+    /// Generate `seconds` of a mono `frequency`-Hz sine tone at
+    /// `sampleRate`, scaled by `amplitude`. A pure-CPU fixture / test
+    /// signal generator (the model's real audio front-end — mel / STFT —
+    /// runs on the GPU). Shared by `AudioTestHelpers.tone(...)` so test
+    /// waveforms and production preprocessing come from one place, with no
+    /// test-only DSP that can drift. Returns `[]` for a non-positive
+    /// duration.
+    public static func sineWave(
+        frequency: Double = 440, seconds: Double = 0.5,
+        sampleRate: Int = 16_000, amplitude: Float = 0.3
+    ) -> [Float] {
+        let n = Int(seconds * Double(sampleRate))
+        guard n > 0 else { return [] }
+        let step = 2.0 * Double.pi * frequency / Double(sampleRate)
+        return (0 ..< n).map { amplitude * Float(sin(step * Double($0))) }
+    }
 }
