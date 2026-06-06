@@ -86,6 +86,46 @@ public struct SpeakRequest: Sendable {
     }
 }
 
+/// A vision / omni request routed through the composed `VisionModel`
+/// (image / video / audio-in → text). Carries at most one media modality —
+/// `videoFrames` takes precedence over `audio` over `image`; pass all three
+/// empty/nil to run the VLM backbone text-only. Output is text (the same
+/// `.text` / `.textDelta` the LLM path emits).
+///
+/// NOTE: unlike `.text` (which takes chat `messages` and renders the
+/// template), this is **token-based** — `promptTokens` is the chat-rendered
+/// prompt with the family's media placeholder run already spliced in (e.g.
+/// `<image>` + N placeholders + `</image>`). The message-based form, where
+/// vision uses the exact same `messages` parameter as `.text`, is blocked on
+/// per-family multimodal prompt-framing (`updated-architecture-overview.md`
+/// §13 M1–M3); until that lands the caller builds `promptTokens` itself.
+public struct VisionRequest: Sendable {
+    public var promptTokens: [Int]
+    public var image: RGBImage?
+    public var videoFrames: [RGBImage]
+    public var audio: [Float]?
+    public var maxTokens: Int
+    public var parameters: GenerationParameters?
+    public var eosTokenId: Int?
+    public var eosTokenIds: [Int]
+
+    public init(
+        promptTokens: [Int], image: RGBImage? = nil,
+        videoFrames: [RGBImage] = [], audio: [Float]? = nil,
+        maxTokens: Int = 512, parameters: GenerationParameters? = nil,
+        eosTokenId: Int? = nil, eosTokenIds: [Int] = []
+    ) {
+        self.promptTokens = promptTokens
+        self.image = image
+        self.videoFrames = videoFrames
+        self.audio = audio
+        self.maxTokens = maxTokens
+        self.parameters = parameters
+        self.eosTokenId = eosTokenId
+        self.eosTokenIds = eosTokenIds
+    }
+}
+
 // MARK: - Input
 
 /// Modality-tagged input for `Model.generate(_:)` / `generateStream(_:)`.
@@ -94,6 +134,9 @@ public struct SpeakRequest: Sendable {
 public enum ModelInput: Sendable {
     /// Text / chat generation (LLM, VLM text path).
     case text(TextRequest)
+    /// Vision / omni generation routed through the composed `VisionModel`
+    /// (image / video / audio-in → text). Available only when `vlModel != nil`.
+    case vision(VisionRequest)
     /// Speech-to-text transcription (STT, omni audio-in).
     case transcribe(TranscribeRequest)
     /// Text-to-speech synthesis (TTS).

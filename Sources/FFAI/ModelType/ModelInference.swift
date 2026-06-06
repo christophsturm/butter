@@ -42,6 +42,13 @@ extension Model {
                 parameters: req.parameters)
             return .text(result)
 
+        case .vision(let req):
+            // Drain the VLM stream into a GenerationResult — the same
+            // collect-the-stream batch path the text case uses.
+            let result = try await collectStream(
+                try visionStream(req), promptTokens: req.promptTokens)
+            return .text(result)
+
         case .transcribe(let req):
             let engine = try transcribingEngine(for: input)
             let transcript = try await engine.transcribe(
@@ -84,6 +91,12 @@ extension Model {
                             messages: req.messages,
                             templateOptions: req.templateOptions ?? .init(),
                             parameters: req.parameters)
+                        for try await chunk in stream {
+                            continuation.yield(.textDelta(chunk))
+                        }
+
+                    case .vision(let req):
+                        let stream = try visionStream(req)
                         for try await chunk in stream {
                             continuation.yield(.textDelta(chunk))
                         }
@@ -212,6 +225,32 @@ extension Model {
             throw unsupportedInput("detect")
         }
         return e
+    }
+
+    /// Resolve a `.vision` request to the matching composed-`VisionModel`
+    /// token stream. Routes by the one present media modality (videoFrames →
+    /// audio → image; all empty/nil runs the backbone text-only). Throws
+    /// `unsupportedInput` when the model isn't a VLM / omni (`vlModel == nil`).
+    private func visionStream(_ req: VisionRequest) throws
+        -> AsyncThrowingStream<GenerationChunk, Error>
+    {
+        guard let vlm = vlModel else { throw unsupportedInput("vision") }
+        if !req.videoFrames.isEmpty {
+            return try vlm.generateStream(
+                promptTokens: req.promptTokens, videoFrames: req.videoFrames,
+                maxTokens: req.maxTokens, parameters: req.parameters,
+                eosTokenId: req.eosTokenId, eosTokenIds: req.eosTokenIds)
+        }
+        if let audio = req.audio {
+            return try vlm.generateStream(
+                promptTokens: req.promptTokens, audio: audio,
+                maxTokens: req.maxTokens, parameters: req.parameters,
+                eosTokenId: req.eosTokenId, eosTokenIds: req.eosTokenIds)
+        }
+        return vlm.generateStream(
+            promptTokens: req.promptTokens, image: req.image,
+            maxTokens: req.maxTokens, parameters: req.parameters,
+            eosTokenId: req.eosTokenId, eosTokenIds: req.eosTokenIds)
     }
 
     private func unsupportedInput(_ what: String) -> ModelError {
