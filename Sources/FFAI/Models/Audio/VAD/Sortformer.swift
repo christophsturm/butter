@@ -1087,8 +1087,8 @@ public final class SortformerModel: @unchecked Sendable {
 
     /// Load from a local snapshot directory containing `config.json` and
     /// one or more `.safetensors` weight files.
-    public static func loadFromDirectory(
-        _ directory: URL,
+    public static func load(
+        directory: URL,
         device: Device = .shared
     ) throws -> SortformerModel {
         let configURL = directory.appendingPathComponent("config.json")
@@ -1113,7 +1113,7 @@ public final class SortformerModel: @unchecked Sendable {
         device: Device = .shared
     ) async throws -> SortformerModel {
         let dir = try await ModelLocator().resolve(idOrPath: idOrPath)
-        return try loadFromDirectory(dir, device: device)
+        return try load(directory: dir, device: device)
     }
 }
 

@@ -367,8 +367,8 @@ public final class SmartTurnModel: @unchecked Sendable {
     }
 
     /// Load a SmartTurn checkpoint from a local snapshot directory.
-    public static func loadFromDirectory(
-        _ directory: URL,
+    public static func load(
+        directory: URL,
         device: Device = .shared
     ) throws -> SmartTurnModel {
         var config = SmartTurnConfig()
@@ -491,7 +491,7 @@ public final class SmartTurnModel: @unchecked Sendable {
         device: Device = .shared
     ) async throws -> SmartTurnModel {
         let dir = try await ModelLocator().resolve(idOrPath: idOrPath)
-        return try loadFromDirectory(dir, device: device)
+        return try load(directory: dir, device: device)
     }
 }
 

@@ -218,7 +218,7 @@ struct DFNBatchNorm: Sendable {
 ///
 /// **Offline enhance:**
 /// ```swift
-/// let model = try DeepFilterNetModel.load(from: URL(fileURLWithPath: "path/to/v3"))
+/// let model = try DeepFilterNetModel.load(directory: URL(fileURLWithPath: "path/to/v3"))
 /// let enhanced = try model.enhance(waveform: noisyPCM)
 /// ```
 ///
@@ -361,7 +361,7 @@ public final class DeepFilterNetModel: @unchecked Sendable {
     ///   - device: Metal device (for the SafeTensors loader; weights are then copied
     ///     to host Float arrays).
     public static func load(
-        from directory: URL,
+        directory: URL,
         subfolder: String? = nil,
         device: Device = .shared
     ) throws -> DeepFilterNetModel {
@@ -434,7 +434,7 @@ public final class DeepFilterNetModel: @unchecked Sendable {
     ) async throws -> DeepFilterNetModel {
         let locator = ModelLocator()
         let dir = try await locator.resolve(idOrPath: idOrPath)
-        return try load(from: dir, subfolder: subfolder, device: device)
+        return try load(directory: dir, subfolder: subfolder, device: device)
     }
 
     // MARK: - Detection

@@ -60,7 +60,7 @@ struct SortformerIntegrationTests {
             try await ModelLocator().resolve(idOrPath: Self.repoId)
         }
         return try await ModelLoadLock.shared.loadSerially {
-            try SortformerModel.loadFromDirectory(dir)
+            try SortformerModel.load(directory: dir)
         }
     }
 

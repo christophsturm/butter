@@ -146,14 +146,14 @@ struct SmartTurnTests {
 
     // ─── Loader rejection paths ─────────────────────────────────────────
 
-    @Test("SmartTurnModel.loadFromDirectory — throws when snapshot is empty")
+    @Test("SmartTurnModel.load(directory:) — throws when snapshot is empty")
     func loadFromDirectoryEmpty() throws {
         let base = FileManager.default.temporaryDirectory
         let dir = base.appendingPathComponent("empty-smart-turn-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         #expect(throws: Error.self) {
-            _ = try SmartTurnModel.loadFromDirectory(dir)
+            _ = try SmartTurnModel.load(directory: dir)
         }
     }
 

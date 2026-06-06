@@ -384,8 +384,8 @@ public final class TenVADModel: @unchecked Sendable {
     ///
     /// Throws `TenVADError.frameworkNotFound` if the ten_vad framework
     /// binary is not present under the snapshot's `lib/macOS/` path.
-    public static func loadFromDirectory(
-        _ directory: URL,
+    public static func load(
+        directory: URL,
         device _: Device = .shared
     ) throws -> TenVADModel {
         // config.json is optional; published defaults are sufficient.
@@ -413,7 +413,7 @@ public final class TenVADModel: @unchecked Sendable {
         device: Device = .shared
     ) async throws -> TenVADModel {
         let dir = try await ModelLocator().resolve(idOrPath: idOrPath)
-        return try loadFromDirectory(dir, device: device)
+        return try load(directory: dir, device: device)
     }
 }
 

@@ -274,14 +274,14 @@ struct FireRedVADTests {
         #expect(try ModelRegistry.detectVADKind(in: dir) == .fireRedVAD)
     }
 
-    @Test("FireRedVADModel.loadFromDirectory — throws missingWeight when pth.tar is absent")
+    @Test("FireRedVADModel.load(directory:) — throws missingWeight when pth.tar is absent")
     func loadFromDirectoryMissingCheckpoint() throws {
         let base = FileManager.default.temporaryDirectory
         let dir = base.appendingPathComponent("empty-fireredvad-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         #expect(throws: Error.self) {
-            _ = try FireRedVADModel.loadFromDirectory(dir)
+            _ = try FireRedVADModel.load(directory: dir)
         }
     }
 

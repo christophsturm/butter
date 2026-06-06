@@ -1384,8 +1384,8 @@ public final class FireRedVADModel: @unchecked Sendable {
     ///
     /// When an mlx-community safetensors conversion appears, update this
     /// method to detect `*.safetensors` and load via `SafeTensorsBundle`.
-    public static func loadFromDirectory(
-        _ directory: URL,
+    public static func load(
+        directory: URL,
         device _: Device = .shared
     ) throws -> FireRedVADModel {
         // Optional config.json — use published defaults if absent.
@@ -1516,7 +1516,7 @@ public final class FireRedVADModel: @unchecked Sendable {
         device: Device = .shared
     ) async throws -> FireRedVADModel {
         let dir = try await ModelLocator().resolve(idOrPath: idOrPath)
-        return try loadFromDirectory(dir, device: device)
+        return try load(directory: dir, device: device)
     }
 }
 

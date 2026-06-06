@@ -219,16 +219,16 @@ struct TenVADTests {
         #expect(found == binaryURL)
     }
 
-    // ─── TenVADModel.loadFromDirectory — missing framework ──────────
+    // ─── TenVADModel.load(directory:) — missing framework ──────────
 
-    @Test("TenVADModel.loadFromDirectory — throws when framework binary is absent")
+    @Test("TenVADModel.load(directory:) — throws when framework binary is absent")
     func loadFromDirectoryMissingFramework() throws {
         let base = FileManager.default.temporaryDirectory
         let dir = base.appendingPathComponent("empty-ten-vad-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         #expect(throws: TenVADError.self) {
-            _ = try TenVADModel.loadFromDirectory(dir)
+            _ = try TenVADModel.load(directory: dir)
         }
     }
 

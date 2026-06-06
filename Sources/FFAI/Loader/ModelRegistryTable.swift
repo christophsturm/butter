@@ -866,7 +866,7 @@ extension ModelRegistry {
             capabilities: Capability.speechToSpeech,
             sniff: { DeepFilterNetModel.handles($0) },
             loadFromDirectory: { dir, _, _, dev in
-                let m = try DeepFilterNetModel.load(from: dir, device: dev)
+                let m = try DeepFilterNetModel.load(directory: dir, device: dev)
                 return await audioLoaded(m, Capability.speechToSpeech, directory: dir)
             }),
         ModelEntry(
@@ -909,7 +909,7 @@ extension ModelRegistry {
             capabilities: [],
             modelTypes: ["silero_vad"],
             loadFromDirectory: { dir, _, _, dev in
-                let m = try SileroVADModel.loadFromDirectory(dir, device: dev)
+                let m = try SileroVADModel.load(directory: dir, device: dev)
                 return await audioLoaded(m, [], directory: dir)
             }),
         ModelEntry(
@@ -919,7 +919,7 @@ extension ModelRegistry {
             capabilities: [],
             modelTypes: ["smart_turn", "smart_turn_v3", "smart-turn"],
             loadFromDirectory: { dir, _, _, dev in
-                let m = try SmartTurnModel.loadFromDirectory(dir, device: dev)
+                let m = try SmartTurnModel.load(directory: dir, device: dev)
                 return await audioLoaded(m, [], directory: dir)
             }),
         ModelEntry(
@@ -928,7 +928,7 @@ extension ModelRegistry {
             capabilities: [],
             modelTypes: ["sortformer", "diar_sortformer"],
             loadFromDirectory: { dir, _, _, dev in
-                let m = try SortformerModel.loadFromDirectory(dir, device: dev)
+                let m = try SortformerModel.load(directory: dir, device: dev)
                 return await audioLoaded(m, [], directory: dir)
             }),
         ModelEntry(
@@ -937,7 +937,7 @@ extension ModelRegistry {
             capabilities: [],
             modelTypes: ["ten_vad", "ten-vad", "tenvad"],
             loadFromDirectory: { dir, _, _, dev in
-                let m = try TenVADModel.loadFromDirectory(dir, device: dev)
+                let m = try TenVADModel.load(directory: dir, device: dev)
                 return await audioLoaded(m, [], directory: dir)
             }),
         ModelEntry(
@@ -946,7 +946,7 @@ extension ModelRegistry {
             capabilities: [],
             modelTypes: ["firered_vad", "firered-vad", "fireredvad"],
             loadFromDirectory: { dir, _, _, dev in
-                let m = try FireRedVADModel.loadFromDirectory(dir, device: dev)
+                let m = try FireRedVADModel.load(directory: dir, device: dev)
                 return await audioLoaded(m, [], directory: dir)
             }),
     ]

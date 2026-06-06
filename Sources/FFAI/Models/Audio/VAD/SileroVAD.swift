@@ -511,8 +511,8 @@ public final class SileroVADModel: @unchecked Sendable {
     }
 
     /// Load a SileroVAD checkpoint from a local snapshot directory.
-    public static func loadFromDirectory(
-        _ directory: URL,
+    public static func load(
+        directory: URL,
         device: Device = .shared
     ) throws -> SileroVADModel {
         // config.json is optional — every field has a published default.
@@ -551,7 +551,7 @@ public final class SileroVADModel: @unchecked Sendable {
     ) async throws -> SileroVADModel {
         let locator = ModelLocator()
         let dir = try await locator.resolve(idOrPath: idOrPath)
-        return try loadFromDirectory(dir, device: device)
+        return try load(directory: dir, device: device)
     }
 }
 
