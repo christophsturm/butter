@@ -45,77 +45,10 @@ import Testing
 )
 struct Gemma4TextIntegrationTests {
 
-    @Test("Gemma4E (E2B): load + greedy generate produces coherent output")
-    func loadAndGenerateE2B() async throws {
-        let modelId = "mlx-community/gemma-4-e2b-it-4bit"
-        // Open-ended prompt: a short factual question ("The capital of
-        // France is") elicits a 2-token answer ("Paris.") and the model
-        // correctly stops, which can't exercise the coherence checker's
-        // `minTokens` budget. A story opener keeps the model generating
-        // sustained prose across every architectural path (sliding +
-        // global attention, PLE, KV sharing, soft-capping).
-        let prompt = "Once upon a time, in a quiet village"
-        let maxTokens = 200
-
-        let m = try await loadModel(modelId)
-
-        // E2B canonical shapes (from HF text_config):
-        //   hidden 1536, 35 layers, 8 heads, sliding head_dim 256,
-        //   1 sliding KV head.
-        #expect(m.textEngine.hidden == 1536)
-        #expect(m.textEngine.nLayers == 35)
-        #expect(m.textEngine.nHeads == 8)
-        #expect(m.textEngine.headDim == 256)
-
-        // Resolved as the PLE (Gemma4E) variant.
-        let gemma4 = m.engine as? Gemma4Model
-        #expect(gemma4 != nil, "expected Gemma4Model engine")
-        #expect(gemma4?.ple != nil, "E2B is a PLE variant — Gemma4PLE must be present")
-
-        // Per-layer cache geometry: sliding layers windowed, global
-        // layers unbounded. E2B layer_types: every 5th layer (idx 4, 9,
-        // 14, 19, 24, 29, 34) is full_attention ⇒ 7 global, 28 sliding.
-        let caches = m.textEngine.makeLayerCaches()
-        var slidingCount = 0
-        var globalCount = 0
-        for (i, c) in caches.enumerated() {
-            guard let kv = c as? any KVCacheProtocol else { continue }
-            let isGlobal = (i + 1) % 5 == 0
-            switch kv.eviction {
-            case .window:
-                #expect(!isGlobal, "layer \(i): expected global (.unbounded)")
-                slidingCount += 1
-            case .unbounded:
-                #expect(isGlobal, "layer \(i): expected sliding (.window)")
-                globalCount += 1
-            }
-        }
-        #expect(globalCount == 7)
-        #expect(slidingCount == 28)
-
-        // Greedy decode must produce coherent text. Two first-light bugs
-        // were fixed: (1) a missing leading `<bos>` — Gemma 4 is
-        // BOS-critical, but unlike Gemma 3 its `tokenizer.json`
-        // post-processor's `single` template is bare (no `<bos>`), so
-        // `Tokenizer.encode` returned none and the residual stream was
-        // wrong from token 0; `Gemma4Model.requiresLeadingBOS` now
-        // drives `Generate.encodePrompt` to prepend it. (2) a Gemma
-        // 3-style `(1 + weight)` RMSNorm fold applied at load — Gemma 4
-        // dropped that convention, so the fold doubled every norm scale.
-        // Global-layer attention runs the d512 `Ops.sdpaDecode` GPU
-        // kernel (no host readback).
-        let result = try await m.generate(
-            prompt: prompt,
-            parameters: m.defaultGenerationParameters.with { $0.maxTokens = maxTokens; $0.seed = 42 }
-        )
-        print("Gemma 4 E2B decoded: \"\(prompt)\(result.text)\"")
-        #expect(result.tokensPerSecond > 0)
-        expectCoherentOutput(
-            result.generatedTokens,
-            minTokens: 32,
-            label: "Gemma 4 E2B-it 4bit"
-        )
-    }
+    // E2B (`gemma-4-e2b-it-4bit`) load + text + image + audio + video +
+    // backbone-shape / cache-geometry coverage now lives in the consolidated
+    // `Gemma4IntegrationTests` (loaded once there). This suite keeps only the
+    // larger sizes that the combined e2b suite can't cover in one load.
 
     @Test("Gemma4Dense (31B): load + greedy generate produces coherent output")
     func loadAndGenerateDense() async throws {
