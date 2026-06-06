@@ -104,17 +104,27 @@ public enum AudioTestHelpers {
             sampleRate: sampleRate, amplitude: amplitude)
     }
 
-    /// A VAD-shaped clip: `silenceSeconds` of silence, a `toneSeconds` tone
-    /// burst, then `silenceSeconds` of silence — exercises a detector's
-    /// speech/non-speech transition. Built on `tone(...)` / `MediaUtils`.
-    public static func vadClip(
-        toneSeconds: Double = 0.5, silenceSeconds: Double = 0.25,
-        frequency: Double = 440, sampleRate: Int = 16_000
+    /// A voice-like VAD clip: `silenceMs` of silence, a `burstMs` two-tone
+    /// burst (fundamental `baseHz` + its 2nd harmonic, so the spectrum is
+    /// broadband-ish like speech and trips a detector), then `silenceMs` of
+    /// silence. The two-tone mix + silence→burst→silence envelope are what
+    /// VAD / turn detectors key on. Each tone comes from `MediaUtils.sineWave`
+    /// so the signal source is shared with production preprocessing.
+    public static func voiceLikeClip(
+        sampleRate: Int = 16_000, silenceMs: Int = 600, burstMs: Int = 1200,
+        baseHz: Double = 200,
+        fundamentalAmplitude: Float = 0.4, harmonicAmplitude: Float = 0.2
     ) -> [Float] {
         let silence = [Float](
-            repeating: 0, count: max(0, Int(silenceSeconds * Double(sampleRate))))
-        return silence
-            + tone(frequency: frequency, seconds: toneSeconds, sampleRate: sampleRate)
-            + silence
+            repeating: 0, count: max(0, sampleRate * silenceMs / 1000))
+        let burstSeconds = Double(burstMs) / 1000.0
+        let fundamental = MediaUtils.sineWave(
+            frequency: baseHz, seconds: burstSeconds,
+            sampleRate: sampleRate, amplitude: fundamentalAmplitude)
+        let harmonic = MediaUtils.sineWave(
+            frequency: 2 * baseHz, seconds: burstSeconds,
+            sampleRate: sampleRate, amplitude: harmonicAmplitude)
+        let burst = zip(fundamental, harmonic).map(+)
+        return silence + burst + silence
     }
 }

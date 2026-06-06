@@ -25,18 +25,13 @@ import Testing
 @Suite("Gemma4 audio front-end")
 struct Gemma4AudioFrontendTests {
 
-    /// 1 s of a 440 Hz sine at 16 kHz, amplitude 0.5.
+    /// 1 s of a 440 Hz sine at 16 kHz, amplitude 0.5 — via the shared
+    /// production generator (`MediaUtils.sineWave`).
     private func sineWaveform(seconds: Double = 1.0, hz: Double = 440)
         -> [Float]
     {
-        let sr = 16_000
-        let n = Int(Double(sr) * seconds)
-        var x = [Float](repeating: 0, count: n)
-        let twoPi = 2.0 * Double.pi
-        for i in 0 ..< n {
-            x[i] = Float(0.5 * sin(twoPi * hz * Double(i) / Double(sr)))
-        }
-        return x
+        MediaUtils.sineWave(
+            frequency: hz, seconds: seconds, sampleRate: 16_000, amplitude: 0.5)
     }
 
     @Test("1 s sine → ~100 frames × 128 mels, finite, mask length matches")

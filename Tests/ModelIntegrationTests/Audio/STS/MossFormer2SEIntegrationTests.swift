@@ -80,15 +80,9 @@ struct MossFormer2SEIntegrationTests {
 
     /// A 1-second 48 kHz mono sine-wave waveform at 440 Hz.
     /// Used as a stand-in for clean speech when no WAV fixture is available.
-    private static func syntheticWaveform(
-        sampleRate: Int = 48_000,
-        durationSeconds: Float = 1.0,
-        frequency: Float = 440.0
-    ) -> [Float] {
-        let numSamples = Int(Float(sampleRate) * durationSeconds)
-        return (0 ..< numSamples).map { i -> Float in
-            0.5 * sin(2.0 * Float.pi * frequency * Float(i) / Float(sampleRate))
-        }
+    private static func syntheticWaveform(sampleRate: Int = 48_000) -> [Float] {
+        AudioTestHelpers.tone(
+            seconds: 1.0, sampleRate: sampleRate, amplitude: 0.5)
     }
 
     // ─── Tests ───────────────────────────────────────────────────────

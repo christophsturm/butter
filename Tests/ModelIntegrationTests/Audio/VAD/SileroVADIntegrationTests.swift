@@ -41,28 +41,10 @@ struct SileroVADIntegrationTests {
     /// The published SileroVAD checkpoint.
     static let repoId = "mlx-community/silero-vad"
 
-    /// Build a mono 16 kHz clip: `silenceMs` of silence, then a tone
-    /// burst of `burstMs`, then `silenceMs` of silence again. The tone
-    /// is a 200 Hz sine at moderate amplitude — energetic enough to
-    /// trip the speech detector, while the silence regions stay near
-    /// zero.
-    private func syntheticClip(
-        sampleRate: Int = 16000,
-        silenceMs: Int = 600,
-        burstMs: Int = 1200
-    ) -> [Float] {
-        let silenceN = sampleRate * silenceMs / 1000
-        let burstN = sampleRate * burstMs / 1000
-        var clip = [Float](repeating: 0, count: silenceN)
-        let twoPiF = 2 * Float.pi * 200
-        for i in 0 ..< burstN {
-            let t = Float(i) / Float(sampleRate)
-            // Mix two tones so the spectrum is broadband-ish, like voice.
-            clip.append(0.4 * sinf(twoPiF * t) + 0.2 * sinf(2 * twoPiF * t))
-        }
-        clip.append(contentsOf: [Float](repeating: 0, count: silenceN))
-        return clip
-    }
+    /// A mono 16 kHz silence→two-tone-burst→silence clip energetic enough
+    /// to trip the speech detector — `AudioTestHelpers.voiceLikeClip`
+    /// defaults (200 Hz fundamental, 600 ms silence, 1200 ms burst).
+    private func syntheticClip() -> [Float] { AudioTestHelpers.voiceLikeClip() }
 
     /// Load the SileroVAD model, holding the global model-load lock. A
     /// load failure throws — it is NOT caught and skipped, so a broken
