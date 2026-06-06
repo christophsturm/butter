@@ -41,7 +41,7 @@ import Testing
 @testable import FFAI
 
 @Suite(
-    "NemotronH Vision Integration", .serialized,
+    "NemotronH Integration", .serialized,
     .enabled(
         if: IntegrationGroupGating.enableVisionSuites,
         IntegrationGroupGating.visionSkipReason)

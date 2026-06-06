@@ -33,7 +33,7 @@ import Testing
 @testable import FFAI
 
 @Suite(
-    "Idefics3 Vision Integration", .serialized,
+    "Idefics3 Integration", .serialized,
     .enabled(
         if: IntegrationGroupGating.enableVisionSuites,
         IntegrationGroupGating.visionSkipReason)
@@ -221,19 +221,12 @@ struct Idefics3IntegrationTests {
         #expect(prefillTop[0].1.isFinite, "prefill logits should be finite")
         #expect(prefillTop[0].1 != 0, "prefill logits should be non-zero")
 
-        // Decode a few tokens greedily
-        var generatedTokens: [Int] = []
-        var nextToken = Sampling.argmax(lastLogits)
+        // Decode a few tokens greedily (shared engine-internal-vision tail).
         let eosId = m.config.eosTokenId ?? 2
-        for step in 0 ..< 32 {
-            if nextToken == eosId { break }
-            generatedTokens.append(nextToken)
-            nextToken = m.textEngine.forwardSample(
-                tokenId: nextToken,
-                position: promptTokenIds.count + step,
-                caches: freshCaches
-            )
-        }
+        let generatedTokens = greedyDecodeAfterPrefill(
+            lastLogits: lastLogits, textEngine: m.textEngine,
+            promptLength: promptTokenIds.count, stopTokens: [eosId],
+            maxTokens: 32, caches: freshCaches)
 
         let generatedText = m.textTokenizer.decode(
             tokens: generatedTokens,

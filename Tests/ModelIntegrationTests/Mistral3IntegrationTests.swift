@@ -33,7 +33,7 @@ import Testing
 @testable import FFAI
 
 @Suite(
-    "Mistral3 Vision Integration", .serialized,
+    "Mistral3 Integration", .serialized,
     .enabled(
         if: IntegrationGroupGating.enableVisionSuites,
         IntegrationGroupGating.visionSkipReason)

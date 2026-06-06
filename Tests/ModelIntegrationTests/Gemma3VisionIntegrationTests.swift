@@ -31,7 +31,7 @@ import Testing
 @testable import FFAI
 
 @Suite(
-    "Gemma3 Vision Integration", .serialized,
+    "Gemma3 Integration", .serialized,
     .enabled(
         if: IntegrationGroupGating.enableVisionSuites,
         IntegrationGroupGating.visionSkipReason)

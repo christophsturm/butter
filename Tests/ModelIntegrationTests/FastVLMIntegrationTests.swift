@@ -36,7 +36,7 @@ import Testing
 @testable import FFAI
 
 @Suite(
-    "FastVLM Vision Integration", .serialized,
+    "FastVLM Integration", .serialized,
     .enabled(
         if: IntegrationGroupGating.enableVisionSuites,
         IntegrationGroupGating.visionSkipReason)

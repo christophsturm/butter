@@ -40,7 +40,7 @@ import Testing
 
 @testable import FFAI
 
-@Suite("Paligemma Vision Integration", .serialized)
+@Suite("Paligemma Integration", .serialized)
 struct PaligemmaIntegrationTests {
 
     static let modelId = "mlx-community/paligemma2-3b-mix-448-4bit"
@@ -125,45 +125,22 @@ struct PaligemmaIntegrationTests {
         // features at imageTokenIndex positions; non-image positions
         // route to Gemma2Model's embed lookup.
         let caches = m.textEngine.makeLayerCaches()
-        var generated: [Int] = []
-        var nextToken = 0
+        // Per-position prefill: PaligemmaModel.forward injects the precomputed
+        // image features at imageTokenIndex positions; non-image positions
+        // route to Gemma2Model's embed lookup. The last position's logits seed
+        // the shared greedy-decode tail.
+        var lastLogits: Tensor!
         for (pos, tok) in promptTokens.enumerated() {
-            let logits = m.textEngine.forward(
-                tokenId: tok, position: pos,
-                caches: caches,
-                device: Device.shared)
-            if pos == promptTokens.count - 1 {
-                nextToken = argmaxOnHost(logits)
-            }
+            lastLogits = m.textEngine.forward(
+                tokenId: tok, position: pos, caches: caches, device: Device.shared)
         }
-        let stopSet: Set<Int> = Set(m.config.eosTokenIds)
-        var pos = promptTokens.count
-        for _ in 0 ..< 200 {
-            if stopSet.contains(nextToken) { break }
-            generated.append(nextToken)
-            nextToken = m.textEngine.forwardSample(
-                tokenId: nextToken, position: pos,
-                caches: caches, device: Device.shared)
-            pos += 1
-        }
+        let generated = greedyDecodeAfterPrefill(
+            lastLogits: lastLogits, textEngine: m.textEngine,
+            promptLength: promptTokens.count,
+            stopTokens: Set(m.config.eosTokenIds), maxTokens: 200, caches: caches)
 
         let text = m.textTokenizer.decode(tokens: generated, skipSpecialTokens: true)
         print("PaliGemma generated (\(generated.count) tokens): \(text)")
         VisionTestHelpers.expectRecognizesOCRText(text, label: "PaliGemma OCR")
     }
-}
-
-/// Host-side argmax for the final-position logits. Used by the
-/// PaliGemma integration test for the first decoded token (prefill tail);
-/// every subsequent step uses `engine.forwardSample` which keeps the
-/// argmax on-GPU.
-private func argmaxOnHost(_ logits: Tensor) -> Int {
-    let arr = logits.toFloatArray()
-    var bestIdx = 0
-    var bestVal: Float = -.infinity
-    for (i, v) in arr.enumerated() where v > bestVal {
-        bestIdx = i
-        bestVal = v
-    }
-    return bestIdx
 }

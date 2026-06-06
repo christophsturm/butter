@@ -39,7 +39,7 @@ import Testing
 @testable import FFAI
 
 @Suite(
-    "GlmOcr Vision Integration", .serialized,
+    "GlmOcr Integration", .serialized,
     .enabled(
         if: IntegrationGroupGating.enableVisionSuites,
         IntegrationGroupGating.visionSkipReason)

@@ -37,7 +37,7 @@ import Testing
 @testable import FFAI
 
 @Suite(
-    "LFM2 Vision Integration", .serialized,
+    "LFM2 Integration", .serialized,
     .enabled(
         if: IntegrationGroupGating.enableVisionSuites,
         IntegrationGroupGating.visionSkipReason)

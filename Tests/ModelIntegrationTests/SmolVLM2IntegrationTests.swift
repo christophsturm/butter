@@ -35,7 +35,7 @@ import Testing
 @testable import FFAI
 
 @Suite(
-    "SmolVLM2 Vision Integration (image + video)", .serialized,
+    "SmolVLM2 Integration", .serialized,
     .enabled(
         if: IntegrationGroupGating.enableVisionSuites,
         IntegrationGroupGating.visionSkipReason)
@@ -258,19 +258,12 @@ struct SmolVLM2IntegrationTests {
         #expect(prefillTop[0].1.isFinite, "prefill logits should be finite")
         #expect(prefillTop[0].1 != 0, "prefill logits should be non-zero")
 
-        // Decode a few tokens
-        var generatedTokens: [Int] = []
-        var nextToken = Sampling.argmax(lastLogits)
+        // Decode a few tokens (shared engine-internal-vision tail).
         let eosId = m.config.eosTokenId ?? 2
-        for step in 0 ..< 32 {
-            if nextToken == eosId { break }
-            generatedTokens.append(nextToken)
-            nextToken = m.textEngine.forwardSample(
-                tokenId: nextToken,
-                position: promptTokenIds.count + step,
-                caches: freshCaches
-            )
-        }
+        let generatedTokens = greedyDecodeAfterPrefill(
+            lastLogits: lastLogits, textEngine: m.textEngine,
+            promptLength: promptTokenIds.count, stopTokens: [eosId],
+            maxTokens: 32, caches: freshCaches)
 
         let generatedText = m.textTokenizer.decode(
             tokens: generatedTokens,
@@ -375,21 +368,13 @@ struct SmolVLM2IntegrationTests {
         #expect(topK[0].1.isFinite, "top logit should be finite")
         #expect(topK[0].1 != 0, "top logit should be non-zero")
 
-        // Greedy decode.
-        var generatedTokens: [Int] = []
-        var nextToken = Sampling.argmax(lastLogits)
+        // Greedy decode (shared engine-internal-vision tail).
         let eosId = m.config.eosTokenId ?? 2
-        let stopSet: Set<Int> = Set(m.config.eosTokenIds)
-            .union([eosId])
-
-        for step in 0 ..< 200 {
-            if stopSet.contains(nextToken) { break }
-            generatedTokens.append(nextToken)
-            nextToken = m.textEngine.forwardSample(
-                tokenId: nextToken,
-                position: promptTokens.count + step,
-                caches: freshCaches)
-        }
+        let stopSet = Set(m.config.eosTokenIds).union([eosId])
+        let generatedTokens = greedyDecodeAfterPrefill(
+            lastLogits: lastLogits, textEngine: m.textEngine,
+            promptLength: promptTokens.count, stopTokens: stopSet,
+            maxTokens: 200, caches: freshCaches)
 
         let text = m.textTokenizer.decode(
             tokens: generatedTokens,
