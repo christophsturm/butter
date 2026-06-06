@@ -43,14 +43,32 @@ import Testing
 @Suite("Paligemma Vision Integration", .serialized)
 struct PaligemmaIntegrationTests {
 
+    static let modelId = "mlx-community/paligemma2-3b-mix-448-4bit"
+
+    /// The checkpoint, loaded ONCE and shared across every `@Test`.
+    static let loaded = Task { try await loadModel(modelId) }
+
+    @Test("text — VL backbone generates coherently (text-only prompt)")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user, content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "paligemma-text")
+    }
+
     @Test("load + image+text generation recovers OCR passage")
     func loadAndGenerate() async throws {
         // PaliGemma 2 — the 2024 refresh using the Gemma 2 text backbone.
         // The original PaliGemma 1 (mlx-community/paligemma-3b-mix-448-8bit)
         // is 2 years old and the test moves with the supported lineage.
-        let modelId = "mlx-community/paligemma2-3b-mix-448-4bit"
-
-        let m = try await loadModel(modelId)
+        let m = try await Self.loaded.value
 
         // Verify basic shapes from the PaliGemma 2 3B (Gemma 2 2B backbone)
         // published config. Gemma 2 2B = hidden 2304, 26 layers, 8 heads,

@@ -40,6 +40,26 @@ import Testing
 )
 struct Idefics3IntegrationTests {
 
+    static let modelId = "mlx-community/Idefics3-8B-Llama3-4bit"
+
+    /// The checkpoint, loaded ONCE and shared across every `@Test`.
+    static let loaded = Task { try await loadModel(modelId) }
+
+    @Test("text — VL backbone generates coherently (text-only prompt)")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user, content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "idefics3-text")
+    }
+
     /// Load dog.jpeg from the test Fixtures directory.
     /// Returns nil if the file cannot be found or decoded.
     /// Output format: [height, width, channels] Float32, normalized with
@@ -115,9 +135,7 @@ struct Idefics3IntegrationTests {
         // integration runner can pull it on demand. Falling back to
         // the local path resolver only when the HF load itself fails
         // would mask real load bugs; just use the id directly.
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel("mlx-community/Idefics3-8B-Llama3-4bit")
-        }
+        let m = try await Self.loaded.value
 
         // Verify the engine is an Idefics3Model
         let idefics3 = try #require(

@@ -48,6 +48,31 @@ struct SmolVLM2IntegrationTests {
     /// valid. 4 frames is a lightweight integration sweep.
     static let frameCount = 4
 
+    /// The checkpoint, loaded ONCE and shared across every `@Test`.
+    /// `snapshotDir()` is nil when the checkpoint isn't cached, so this
+    /// yields `nil` and each test `#require`s it (skipping when absent).
+    static let loaded = Task { () -> Model? in
+        guard let dir = Self.snapshotDir() else { return nil }
+        return try await loadModel(dir.path)
+    }
+
+    @Test("text — VL backbone generates coherently (text-only prompt)")
+    func textGeneration() async throws {
+        let m = try #require(
+            await Self.loaded.value,
+            "SmolVLM2 checkpoint not found in HF cache")
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user, content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "smolvlm2-text")
+    }
+
     /// Resize an `RGBImage` to `size × size` and apply SmolVLM2
     /// normalization (mean=0.5, std=0.5 → `pixel * 2 - 1`).
     /// Returns a flat HWC Float32 array (`size * size * 3` elements).
@@ -146,12 +171,9 @@ struct SmolVLM2IntegrationTests {
 
     @Test("load SmolVLM2-500M + shape check + image encode + generate")
     func loadAndGenerate() async throws {
-        let dir = try #require(
-            Self.snapshotDir(),
+        let m = try #require(
+            await Self.loaded.value,
             "SmolVLM2 checkpoint not found in HF cache")
-
-        // ─── Load model ──────────────────────────────────────────────────────
-        let m = try await loadModel(dir.path)
 
         // Verify the engine is a SmolVLM2Model
         let smolVLM2 = try #require(
@@ -272,10 +294,9 @@ struct SmolVLM2IntegrationTests {
 
     @Test("load — SmolVLM2 family declares videoIn capability")
     func loadCheckpoint() async throws {
-        let dir = try #require(
-            Self.snapshotDir(),
+        let m = try #require(
+            await Self.loaded.value,
             "SmolVLM2 snapshot not found in HF cache — skip")
-        let m = try await loadModel(dir.path)
         // SmolVLM2Dense.availableCapabilities now includes .videoIn.
         // Note: Model.swift currently hardcodes .imageIn for SmolVLM2;
         // the family declaration is the ground truth checked here.
@@ -296,10 +317,9 @@ struct SmolVLM2IntegrationTests {
 
     @Test("video + text prompt — describes the cat clip")
     func videoTextGeneration() async throws {
-        let dir = try #require(
-            Self.snapshotDir(),
+        let m = try #require(
+            await Self.loaded.value,
             "SmolVLM2 snapshot not found in HF cache — skip")
-        let m = try await loadModel(dir.path)
         let smol = try #require(
             m.smolVLM2,
             "engine should be SmolVLM2Model for this checkpoint")
