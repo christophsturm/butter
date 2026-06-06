@@ -48,6 +48,9 @@ struct GlmOcrIntegrationTests {
 
     static let modelId = "mlx-community/GLM-OCR-4bit"
 
+    /// The checkpoint, loaded ONCE and shared across every `@Test`.
+    static let loaded = Task { try await loadModel(modelId) }
+
     // ── Load the OCR fixture (testocr.png) ────────────────────────────
 
     /// Load `Resources/testocr.png` resized to 336×336 (GLM-OCR's
@@ -63,9 +66,7 @@ struct GlmOcrIntegrationTests {
 
     @Test("load — GLM-OCR checkpoint loads and is recognised as GlmOcrModel")
     func loadGlmOcrCheckpoint() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
 
         // Must be dispatched to GlmOcrModel.
         #expect(m.engine is GlmOcrModel, "expected engine to be GlmOcrModel")
@@ -90,11 +91,24 @@ struct GlmOcrIntegrationTests {
         #expect(top[0].1.isFinite)
     }
 
+    @Test("text — GLM backbone generates coherently (text-only prompt)")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user, content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "glmocr-text")
+    }
+
     @Test("image + text prompt — transcribes the testocr.png passage")
     func imageTextGeneration() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
 
         let model = try #require(m.engine as? GlmOcrModel, "expected GlmOcrModel engine")
 

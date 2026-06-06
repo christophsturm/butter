@@ -46,11 +46,12 @@ struct LFM2VisionIntegrationTests {
 
     static let modelId = "mlx-community/LFM2-VL-1.6B-4bit"
 
+    /// The checkpoint, loaded ONCE and shared across every `@Test`.
+    static let loaded = Task { try await loadModel(modelId) }
+
     @Test("load — LFM2-VL checkpoint loads with vision capability")
     func loadVLCheckpoint() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
 
         // The checkpoint is a VLM — vlModel is present, .imageIn is
         // available, and the text backbone is an LFM2 hybrid engine.
@@ -67,11 +68,24 @@ struct LFM2VisionIntegrationTests {
         #expect(vlm.imageTokenId == 396)
     }
 
+    @Test("text — VL backbone generates coherently (text-only prompt)")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user, content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "lfm2vl-text")
+    }
+
     @Test("image + text prompt — describes the dog photo")
     func imageTextGeneration() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "LFM2-VL checkpoint is not a VLM")
 
         // Build the LFM2-VL chat prompt:
@@ -117,9 +131,7 @@ struct LFM2VisionIntegrationTests {
 
     @Test("image + text prompt — STREAMING yields tokens incrementally")
     func imageTextGenerationStreaming() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "LFM2-VL checkpoint is not a VLM")
 
         let imageTokenId = vlm.imageTokenId

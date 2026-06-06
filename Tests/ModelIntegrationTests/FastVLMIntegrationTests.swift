@@ -54,11 +54,12 @@ struct FastVLMIntegrationTests {
     // contracted vision-correctness signal for FastVLM.
     static let modelId = "mlx-community/FastVLM-0.5B-bf16"
 
+    /// The checkpoint, loaded ONCE and shared across every `@Test`.
+    static let loaded = Task { try await loadModel(modelId) }
+
     @Test("load — FastVLM checkpoint loads with vision capability")
     func loadVLCheckpoint() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
 
         // The checkpoint is a VLM — vlModel is present, .imageIn is
         // available, and the text backbone is a Qwen2-0.5B engine.
@@ -74,11 +75,24 @@ struct FastVLMIntegrationTests {
         #expect(vlm.imageTokenId == -200)
     }
 
+    @Test("text — VL backbone generates coherently (text-only prompt)")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user, content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "fastvlm-text")
+    }
+
     @Test("image + text prompt — describes the dog photo")
     func imageTextGeneration() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "FastVLM checkpoint is not a VLM")
 
         // Build an image+text prompt.

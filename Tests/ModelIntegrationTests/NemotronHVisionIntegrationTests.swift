@@ -50,6 +50,9 @@ struct NemotronHVisionIntegrationTests {
 
     static let modelId = "mlx-community/Llama-3.1-Nemotron-Nano-VL-8B-V1-4bit"
 
+    /// The checkpoint, loaded ONCE and shared across every `@Test`.
+    static let loaded = Task { try await loadModel(modelId) }
+
     /// True when an mlx-style Nemotron-VL conversion is already cached
     /// locally — checks the standard HF cache layout `models--<org>--<name>`
     /// plus the alternate `mlx-audio/` mirror. Returns `false` when no
@@ -80,9 +83,7 @@ struct NemotronHVisionIntegrationTests {
             nemotronVLIsCached(),
             "Nemotron-VL checkpoint not cached locally — no mlx-style conversion published on HF yet"
         )
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
 
         // The checkpoint is a VLM — vlModel is present, .imageIn is
         // available, and the text backbone supports the splice.
@@ -101,14 +102,27 @@ struct NemotronHVisionIntegrationTests {
             nemotronVLIsCached(),
             "Nemotron-VL checkpoint not cached locally — no mlx-style conversion published on HF yet"
         )
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
         #expect(m.availableCapabilities.contains(.imageIn))
         m.disable(.imageIn)
         #expect(!m.isEnabled(.imageIn))
         m.enable(.imageIn)
         #expect(m.isEnabled(.imageIn))
+    }
+
+    @Test("text — VL backbone generates coherently (text-only prompt)")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user, content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "nemotronvl-text")
     }
 
     @Test("image + text prompt — describes the dog photo")
@@ -117,9 +131,7 @@ struct NemotronHVisionIntegrationTests {
             nemotronVLIsCached(),
             "Nemotron-VL checkpoint not cached locally — no mlx-style conversion published on HF yet"
         )
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "Nemotron-VLM checkpoint is not a VLM")
 
         // Build an image+text prompt: a run of `imageTokenCount`
