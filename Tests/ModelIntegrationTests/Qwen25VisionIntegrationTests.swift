@@ -36,7 +36,7 @@ import Testing
 @testable import FFAI
 
 @Suite(
-    "Qwen2.5 Vision Integration (image + video)", .serialized,
+    "Qwen 2.5-VL Integration", .serialized,
     .enabled(
         if: IntegrationGroupGating.enableVisionSuites,
         IntegrationGroupGating.visionSkipReason)
@@ -56,11 +56,14 @@ struct Qwen25VisionIntegrationTests {
     /// arithmetic exact.
     static let frameCount = 8
 
+    /// The image checkpoint (3B) and the video checkpoint (7B), each loaded
+    /// ONCE and shared across the tests that use them.
+    static let loaded = Task { try await loadModel(modelId) }
+    static let loadedVideo = Task { try await loadModel(videoModelId) }
+
     @Test("load — Qwen 2.5-VL checkpoint loads with vision capability")
     func loadVLCheckpoint() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
 
         // The checkpoint is a VLM — vlModel is present, .imageIn is
         // available, and the text backbone supports the splice.
@@ -75,9 +78,7 @@ struct Qwen25VisionIntegrationTests {
 
     @Test("enable / disable .imageIn — runtime capability flip")
     func capabilityFlip() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
         #expect(m.availableCapabilities.contains(.imageIn))
         m.disable(.imageIn)
         #expect(!m.isEnabled(.imageIn))
@@ -85,11 +86,24 @@ struct Qwen25VisionIntegrationTests {
         #expect(m.isEnabled(.imageIn))
     }
 
+    @Test("text — VL backbone generates coherently (text-only prompt)")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user, content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "qwen25vl-text")
+    }
+
     @Test("image + text prompt — describes the dog photo")
     func imageTextGeneration() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "Qwen 2.5-VL checkpoint is not a VLM")
 
         // A real photograph — the golden-retriever fixture.
@@ -130,9 +144,7 @@ struct Qwen25VisionIntegrationTests {
 
     @Test("load — checkpoint reports .videoIn capability")
     func loadVLCheckpointVideo() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.videoModelId)
-        }
+        let m = try await Self.loadedVideo.value
         // The Qwen 2.5-VL family declares text + vision + video.
         #expect(m.vlModel != nil)
         #expect(m.availableCapabilities.contains(.imageIn))
@@ -146,9 +158,7 @@ struct Qwen25VisionIntegrationTests {
 
     @Test("video + text prompt — describes the cat clip")
     func videoTextGeneration() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.videoModelId)
-        }
+        let m = try await Self.loadedVideo.value
         let vlm = try #require(m.vlModel, "Qwen 2.5-VL checkpoint is not a VLM")
         _ = try #require(vlm.videoTokenId, "Qwen 2.5-VL must be video-capable")
 

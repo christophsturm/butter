@@ -42,11 +42,12 @@ struct Mistral3IntegrationTests {
 
     static let modelId = "mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit"
 
+    /// The checkpoint, loaded ONCE and shared across every `@Test`.
+    static let loaded = Task { try await loadModel(modelId) }
+
     @Test("load — Mistral3 checkpoint loads with vision capability")
     func loadVLCheckpoint() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
 
         // The checkpoint is a VLM — vlModel is present, .imageIn is
         // available, and the text backbone supports the splice.
@@ -65,9 +66,7 @@ struct Mistral3IntegrationTests {
 
     @Test("enable / disable .imageIn — runtime capability flip")
     func capabilityFlip() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
         #expect(m.availableCapabilities.contains(.imageIn))
         m.disable(.imageIn)
         #expect(!m.isEnabled(.imageIn))
@@ -75,11 +74,24 @@ struct Mistral3IntegrationTests {
         #expect(m.isEnabled(.imageIn))
     }
 
+    @Test("text — VL backbone generates coherently (text-only prompt)")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user, content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "mistral3-text")
+    }
+
     @Test("image + text prompt — describes the dog photo")
     func imageTextGeneration() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "Mistral3 checkpoint is not a VLM")
 
         // Build an image+text prompt. Mistral3 uses the `[IMG]` special

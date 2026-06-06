@@ -40,11 +40,12 @@ struct Gemma3VisionIntegrationTests {
 
     static let modelId = "mlx-community/gemma-3-4b-it-4bit"
 
+    /// The checkpoint, loaded ONCE and shared across every `@Test`.
+    static let loaded = Task { try await loadModel(modelId) }
+
     @Test("load — Gemma 3 VL checkpoint loads with vision capability")
     func loadVLCheckpoint() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
 
         // The checkpoint is a VLM — vlModel is present, .imageIn is
         // available, and the text backbone is a Gemma 3 4B engine.
@@ -60,9 +61,7 @@ struct Gemma3VisionIntegrationTests {
 
     @Test("enable / disable .imageIn — runtime capability flip")
     func capabilityFlip() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
         // A VL checkpoint can toggle .imageIn at runtime.
         #expect(m.availableCapabilities.contains(.imageIn))
         m.disable(.imageIn)
@@ -74,11 +73,24 @@ struct Gemma3VisionIntegrationTests {
         #expect(m.isEnabled(.textIn))
     }
 
+    @Test("text — VL backbone generates coherently (text-only prompt)")
+    func textGeneration() async throws {
+        let m = try await Self.loaded.value
+        let r = try await m.generate(
+            messages: [
+                ChatMessage(
+                    role: .user, content: "Name three primary colors, comma-separated.")
+            ],
+            parameters: m.defaultGenerationParameters.with {
+                $0.maxTokens = 64
+                $0.temperature = 0
+            })
+        expectCoherentOutput(r.generatedTokens, minTokens: 4, label: "gemma3vl-text")
+    }
+
     @Test("image + text prompt — describes the dog photo")
     func imageTextGeneration() async throws {
-        let m = try await ModelLoadLock.shared.loadSerially {
-            try await loadModel(Self.modelId)
-        }
+        let m = try await Self.loaded.value
         let vlm = try #require(m.vlModel, "Gemma 3 VL checkpoint is not a VLM")
 
         // Build the prompt with the Gemma 3 chat template.
