@@ -832,4 +832,4 @@ extension StyleTTS2Model {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension StyleTTS2Model: Synthesizing {}
+extension StyleTTS2Model: Speaking {}

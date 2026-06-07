@@ -341,4 +341,4 @@ extension MossTTSModel {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension MossTTSModel: Synthesizing {}
+extension MossTTSModel: Speaking {}

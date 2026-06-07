@@ -864,4 +864,4 @@ extension FishSpeechModel: StreamingSynthesizer {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension FishSpeechModel: Synthesizing {}
+extension FishSpeechModel: Speaking {}

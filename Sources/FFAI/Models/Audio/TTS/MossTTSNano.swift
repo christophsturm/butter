@@ -400,4 +400,4 @@ extension MossTTSNanoModel {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension MossTTSNanoModel: Synthesizing {}
+extension MossTTSNanoModel: Speaking {}

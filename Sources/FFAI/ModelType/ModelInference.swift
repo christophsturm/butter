@@ -21,7 +21,7 @@
 // request. The text path delegates to the existing `generate(messages:)` /
 // `generateStream(messages:)` (so the rich `GenerationResult` / streaming
 // behaviour is unchanged); audio paths route through the modality protocols
-// (`Transcribing` / `Synthesizing` / `SpeechTransforming` / `Detecting`).
+// (`Transcribing` / `Speaking` / `SpeechTransforming` / `Detecting`).
 
 import Foundation
 import Metal
@@ -182,7 +182,7 @@ extension Model {
     public func synthesizeStream(
         text: String, voice: String? = nil, speed: Float = 1.0
     ) -> AsyncThrowingStream<Tensor, Error> {
-        guard let engine = engine as? any Synthesizing else {
+        guard let engine = engine as? any Speaking else {
             return errorStream(unsupportedInput("speak"))
         }
         return engine.synthesizeStream(text: text, voice: voice, speed: speed)
@@ -190,7 +190,7 @@ extension Model {
 
     /// The synthesis sample rate, or `nil` if this isn't a synthesis model.
     /// `ffai speak` reads this for the WAV header.
-    public var audioSampleRate: Int? { (engine as? any Synthesizing)?.sampleRate }
+    public var audioSampleRate: Int? { (engine as? any Speaking)?.sampleRate }
 
     /// Detect audio events (VAD / diarization / endpointing).
     public func detect(
@@ -208,8 +208,8 @@ extension Model {
         }
         return e
     }
-    private func synthesizingEngine(for input: ModelInput) throws -> any Synthesizing {
-        guard let e = engine as? any Synthesizing else {
+    private func synthesizingEngine(for input: ModelInput) throws -> any Speaking {
+        guard let e = engine as? any Speaking else {
             throw unsupportedInput("speak")
         }
         return e

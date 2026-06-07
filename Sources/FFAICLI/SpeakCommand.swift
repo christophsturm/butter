@@ -62,7 +62,7 @@ struct SpeakCommand: AsyncParsableCommand {
         let m = try await Model.load(model)
         print("loaded in \(String(format: "%.2f", Date().timeIntervalSince(loadStart)))s")
 
-        guard m.engine is any Synthesizing, let sampleRate = m.audioSampleRate else {
+        guard m.engine is any Speaking, let sampleRate = m.audioSampleRate else {
             throw ValidationError(
                 "\(model) is not a text-to-speech model (no synthesis path).")
         }

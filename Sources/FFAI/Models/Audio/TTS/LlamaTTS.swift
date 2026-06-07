@@ -371,4 +371,4 @@ extension LlamaTTSModel {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension LlamaTTSModel: Synthesizing {}
+extension LlamaTTSModel: Speaking {}

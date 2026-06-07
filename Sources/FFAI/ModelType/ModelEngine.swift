@@ -25,7 +25,7 @@
 //   ModelEngine                     (marker — the existential `Model.engine` holds)
 //   ├─ TextEngine        → TextGenerating: Module, TextEngine   (LLM / VLM backbone)
 //   ├─ Transcribing      → STT / omni-audio-in  (refines StreamingTranscriber)
-//   ├─ Synthesizing      → TTS                  (refines StreamingSynthesizer)
+//   ├─ Speaking      → TTS                  (refines StreamingSynthesizer)
 //   ├─ SpeechTransforming→ STS denoise / separate
 //   └─ Detecting         → VAD / diarization / endpointing
 //
@@ -123,7 +123,7 @@ public struct SynthesizeParameters: Sendable {
 /// marker; the batch `synthesize(...)` default concatenates the streamed
 /// segments — equal to a single-shot synthesis of the joined text, per
 /// `StreamingSynthesizer`'s contract.
-public protocol Synthesizing: ModelEngine, StreamingSynthesizer {
+public protocol Speaking: ModelEngine, StreamingSynthesizer {
     /// Buffered synthesis — runs synthesis to completion and returns the full
     /// waveform as flat `Float` samples at `sampleRate`. Default concatenates
     /// `synthesizeStream`.
@@ -131,7 +131,7 @@ public protocol Synthesizing: ModelEngine, StreamingSynthesizer {
         async throws -> [Float]
 }
 
-extension Synthesizing {
+extension Speaking {
     public func synthesize(_ text: String, parameters: SynthesizeParameters)
         async throws -> [Float]
     {

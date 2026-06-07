@@ -573,4 +573,4 @@ extension EchoTTSModel {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension EchoTTSModel: Synthesizing {}
+extension EchoTTSModel: Speaking {}

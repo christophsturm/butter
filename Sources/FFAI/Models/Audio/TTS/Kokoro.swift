@@ -530,4 +530,4 @@ extension KokoroModel {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension KokoroModel: Synthesizing {}
+extension KokoroModel: Speaking {}

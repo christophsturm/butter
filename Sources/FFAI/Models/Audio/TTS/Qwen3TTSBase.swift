@@ -524,4 +524,4 @@ extension Qwen3TTSBaseModel {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension Qwen3TTSBaseModel: Synthesizing {}
+extension Qwen3TTSBaseModel: Speaking {}

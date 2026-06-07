@@ -1412,4 +1412,4 @@ extension SopranoModel {
 extension SopranoModel: StreamingSynthesizer {}
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension SopranoModel: Synthesizing {}
+extension SopranoModel: Speaking {}

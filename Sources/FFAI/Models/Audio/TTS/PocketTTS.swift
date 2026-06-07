@@ -522,4 +522,4 @@ extension PocketTTSModel {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension PocketTTSModel: Synthesizing {}
+extension PocketTTSModel: Speaking {}

@@ -65,7 +65,7 @@ public protocol StreamingSynthesizer: Sendable {
 
 // The loaded-model → transcriber / synthesizer accessors that used to live
 // here (on the deleted `LoadedAudioModel` enum) are now on the unified
-// `Model`: `model.engine as? any Transcribing` / `any Synthesizing`, surfaced
+// `Model`: `model.engine as? any Transcribing` / `any Speaking`, surfaced
 // through `Model.transcribeStream` / `synthesizeStream` (see
 // `ModelType/ModelInference.swift`). The tokenizer attach the registry did
 // via `tokenizerAttachable` now happens in `ModelRegistry.audioLoaded`.

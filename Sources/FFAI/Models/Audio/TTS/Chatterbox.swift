@@ -680,4 +680,4 @@ extension ChatterboxModel {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension ChatterboxModel: Synthesizing {}
+extension ChatterboxModel: Speaking {}

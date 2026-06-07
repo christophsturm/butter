@@ -809,4 +809,4 @@ extension MarvisModel {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension MarvisModel: Synthesizing {}
+extension MarvisModel: Speaking {}

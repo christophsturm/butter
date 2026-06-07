@@ -171,7 +171,7 @@ struct FishSpeechIntegrationTests {
         }
         #expect(loaded.availableCapabilities.contains(.audioOut))
         // It must surface as a StreamingSynthesizer (the `speak` CLI path).
-        #expect(loaded.engine is any Synthesizing)
+        #expect(loaded.engine is any Speaking)
         #expect(!(loaded.engine is any Transcribing))
     }
 
