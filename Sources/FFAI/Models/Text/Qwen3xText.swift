@@ -23,7 +23,7 @@
 //
 //   • `Qwen35Hybrid` — the single variant (dense-vs-MoE is decided per
 //     checkpoint from `num_experts` inside `loadModel`),
-//   • `Qwen35Model` — the full LanguageModel decoder.
+//   • `Qwen35Model` — the full TextGenerating decoder.
 //
 // This file is named `Qwen3xText.swift` rather than `Qwen35Text.swift`
 // because the same architecture covers both the Qwen 3.5 line (where
@@ -106,7 +106,7 @@
 // runs the embedding + every layer on internal `workCmd` buffers
 // (committed by the layers / refreshed after each committing layer) and
 // queues ONLY the final `norm` + `lm_head` onto the caller's pristine
-// `cmd` — preserving the `LanguageModel` "does not commit the caller's
+// `cmd` — preserving the `TextGenerating` "does not commit the caller's
 // `cmd`" contract so `forwardSample` / `forwardSampleCategorical`
 // compose their output kernels cleanly. This is the Jamba pattern.
 //
@@ -2917,7 +2917,7 @@ private func qwen35ApplyFFN(
 // `forwardManyAllLogits` verify forward, so conformance is declaration-only.
 extension Qwen35Model: SpeculativeVerifier {}
 
-public final class Qwen35Model: LanguageModel {
+public final class Qwen35Model: TextGenerating {
     public let embedTokens: AnyEmbedding
     /// Heterogeneous layer stack — each entry is a GDN or attention
     /// hybrid layer, ordered by `layer_types`.
@@ -3115,7 +3115,7 @@ public final class Qwen35Model: LanguageModel {
             h: h, finalNorm: finalNorm, lmHead: lmHead, on: cmd)
     }
 
-    /// LanguageModel-protocol entry point for chunked prefill. Delegates
+    /// TextGenerating-protocol entry point for chunked prefill. Delegates
     /// to `forwardMany` (Tom's optimised batched-T path:
     /// `Qwen35AttentionLayer.decodeMany` + fused `Qwen35GDNMixer`
     /// chunked-T + per-row blit-back for legacy layer kinds).

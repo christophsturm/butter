@@ -21,7 +21,7 @@
 //   • `Llama3Dense` — `Llama3Variant` conformance + the per-variant
 //     `loadModel` entry,
 //   • `Llama3Layer` — one attention + MLP block,
-//   • `Llama3Model` — the full LanguageModel decoder.
+//   • `Llama3Model` — the full TextGenerating decoder.
 
 import Foundation
 import Metal
@@ -530,7 +530,7 @@ public final class Llama3Layer: Module {
 
 // ─── Whole model ─────────────────────────────────────────────────────
 
-public final class Llama3Model: LanguageModel {
+public final class Llama3Model: TextGenerating {
     public let embedTokens: AnyEmbedding
     public let layers: [Llama3Layer]
     public let finalNorm: RMSNorm
@@ -687,7 +687,7 @@ public final class Llama3Model: LanguageModel {
     }
 
     // `forwardSample` and `forwardSampleCategorical` come from
-    // `LanguageModel`'s default extension — they compose
+    // `TextGenerating`'s default extension — they compose
     // `forward(...on cmd:)` above with the appropriate output kernel on
     // the same command buffer. No family-specific override needed.
 

@@ -21,7 +21,7 @@
 //   • `Qwen3Dense` — `Qwen3Variant` conformance + the per-variant
 //     `loadModel` entry,
 //   • `Qwen3Layer` — one attention + MLP block,
-//   • `Qwen3Model` — the full LanguageModel decoder.
+//   • `Qwen3Model` — the full TextGenerating decoder.
 
 import Foundation
 import Metal
@@ -500,7 +500,7 @@ public final class Qwen3Layer: Module {
 
 // ─── Qwen3Model ──────────────────────────────────────────────────────
 
-public final class Qwen3Model: LanguageModel {
+public final class Qwen3Model: TextGenerating {
     public let embedTokens: AnyEmbedding
     public let layers: [Qwen3Layer]
     public let finalNorm: RMSNorm
@@ -566,7 +566,7 @@ public final class Qwen3Model: LanguageModel {
     }
 
     /// Primitive: queue a single-token forward pass onto the caller's
-    /// command buffer. No commit. The `LanguageModel` default
+    /// command buffer. No commit. The `TextGenerating` default
     /// extension composes this with the appropriate output kernel
     /// (`argmax` for forwardSample, `softmax_categorical_sample` for
     /// forwardSampleCategorical) on the same cmdbuf.
@@ -707,7 +707,7 @@ public final class Qwen3Model: LanguageModel {
     }
 
     // `forward`, `forwardSample`, `forwardSampleCategorical` come from
-    // LanguageModel's default extension — they wrap `forward(...on cmd:)`
+    // TextGenerating's default extension — they wrap `forward(...on cmd:)`
     // above with a 1-commit-per-token cmdbuf and the appropriate
     // output kernel.
 }

@@ -21,7 +21,7 @@
 //   • `Starcoder2Dense` — `Starcoder2Variant` conformance + the
 //     per-variant `loadModel` entry,
 //   • `Starcoder2Layer` — one attention + GELU MLP block,
-//   • `Starcoder2Model` — the full LanguageModel decoder.
+//   • `Starcoder2Model` — the full TextGenerating decoder.
 //
 // Architecture deltas vs Llama 3:
 //
@@ -323,7 +323,7 @@ public final class Starcoder2Layer: Module {
 
 // ─── Starcoder2Model — whole decoder ──────────────────────────────────
 
-public final class Starcoder2Model: LanguageModel {
+public final class Starcoder2Model: TextGenerating {
     public let embedTokens: AnyEmbedding
     public let layers: [Starcoder2Layer]
     public let finalNorm: LayerNorm

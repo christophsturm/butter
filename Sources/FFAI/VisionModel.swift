@@ -27,7 +27,7 @@
 // `VisionEncoder.swift`) plus the already-shipped text engine — and
 // declares its image-placeholder token id.
 //
-// The text backbone is driven through `LanguageModel.forward(
+// The text backbone is driven through `TextGenerating.forward(
 // inputEmbedding:...)` — the embedding-input primitive the VL-target
 // families implement. Decode after prefill is ordinary token-id forward.
 
@@ -71,13 +71,13 @@ public enum VisionModelError: Error, CustomStringConvertible {
 }
 
 /// A loaded vision-language model: a `VisionEncoder` + a text
-/// `LanguageModel` engine + the image-placeholder token id its chat
+/// `TextGenerating` engine + the image-placeholder token id its chat
 /// template uses.
 public final class VisionModel: @unchecked Sendable {
     /// The vision tower.
     public let visionEncoder: VisionEncoder
     /// The text backbone (Gemma3Model, Qwen3Model, …).
-    public let engine: any LanguageModel
+    public let engine: any TextGenerating
     /// Token id the chat template emits as an image placeholder. Each
     /// occurrence is replaced by one vision token.
     public let imageTokenId: Int
@@ -111,7 +111,7 @@ public final class VisionModel: @unchecked Sendable {
     public var supportsAudio: Bool { audioTokenId != nil && audioEncode != nil }
 
     public init(
-        visionEncoder: VisionEncoder, engine: any LanguageModel,
+        visionEncoder: VisionEncoder, engine: any TextGenerating,
         imageTokenId: Int,
         videoTokenId: Int? = nil,
         normalization: ImageNormalization,

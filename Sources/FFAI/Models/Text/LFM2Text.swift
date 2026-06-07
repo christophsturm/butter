@@ -949,7 +949,7 @@ public final class LFM2Layer: Module, DecoderLayer {
 
 // ─── LFM2Model ───────────────────────────────────────────────────────
 
-public final class LFM2Model: LanguageModel {
+public final class LFM2Model: TextGenerating {
     public let embedTokens: AnyEmbedding
     /// Heterogeneous layer stack — conv or attention, ordered by the
     /// `layer_types` / `full_attn_idxs` schedule.

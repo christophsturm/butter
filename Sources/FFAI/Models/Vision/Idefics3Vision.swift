@@ -931,22 +931,22 @@ final class Idefics3RemappedBundle {
     }
 }
 
-// ─── Idefics3Model (implements LanguageModel) ─────────────────────────────────
+// ─── Idefics3Model (implements TextGenerating) ─────────────────────────────────
 
 /// The assembled Idefics3 VLM: SigLIP vision encoder + pixel-shuffle
-/// connector + Llama-style text backbone. Implements the `LanguageModel`
+/// connector + Llama-style text backbone. Implements the `TextGenerating`
 /// protocol by delegating to the internal `Llama3Model`.
 ///
 /// Vision prefill (`prefillWithImage`) drives the KV cache one token at a
 /// time, substituting image embeddings for image-placeholder tokens.
-public final class Idefics3Model: LanguageModel {
+public final class Idefics3Model: TextGenerating {
     public let llamaModel: Llama3Model
     public let visionEncoder: Idefics3VisionEncoder
     public let connector: Idefics3Connector
     public let cfg: Idefics3Config
     public let device: Device
 
-    // LanguageModel conformance — delegate to the Llama backbone
+    // TextGenerating conformance — delegate to the Llama backbone
     public var hidden: Int { llamaModel.hidden }
     public var nLayers: Int { llamaModel.nLayers }
     public var nHeads: Int { llamaModel.nHeads }
@@ -992,7 +992,7 @@ public final class Idefics3Model: LanguageModel {
             caches: caches, device: device)
     }
 
-    /// Command-buffer-aware forward — required by `LanguageModel` for
+    /// Command-buffer-aware forward — required by `TextGenerating` for
     /// command-buffer chaining across decode steps. Delegates to
     /// Llama3Model's `forward(...:on:device:)`.
     public func forward(

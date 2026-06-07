@@ -20,7 +20,7 @@
 //
 //   • `Gemma3Dense` — `Gemma3Variant` conformance + the per-variant
 //     `loadModel` entry,
-//   • `Gemma3Model` — the full LanguageModel decoder.
+//   • `Gemma3Model` — the full TextGenerating decoder.
 //
 // The smallest Gemma 3 ships as a 1B variant; 4B/12B/27B exist for the
 // VL track.
@@ -598,7 +598,7 @@ public final class Gemma3Layer: Module {
 
 // MARK: - Gemma3Model
 
-public final class Gemma3Model: LanguageModel {
+public final class Gemma3Model: TextGenerating {
     public let embedTokens: AnyEmbedding
     public let layers: [Gemma3Layer]
     public let finalNorm: RMSNorm

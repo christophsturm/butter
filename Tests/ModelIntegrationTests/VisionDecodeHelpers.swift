@@ -37,7 +37,7 @@ import Foundation
 /// (excluding the stop token).
 func greedyDecodeAfterPrefill(
     lastLogits: Tensor,
-    textEngine: any LanguageModel,
+    textEngine: any TextGenerating,
     promptLength: Int,
     stopTokens: Set<Int>,
     maxTokens: Int,

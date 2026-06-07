@@ -291,7 +291,7 @@ public final class OLMo2Layer: Module {
 
 // ─── OLMo2Model — whole decoder ───────────────────────────────────────
 
-public final class OLMo2Model: LanguageModel {
+public final class OLMo2Model: TextGenerating {
     public let embedTokens: AnyEmbedding
     public let layers: [OLMo2Layer]
     public let finalNorm: RMSNorm

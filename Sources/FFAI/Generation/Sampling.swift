@@ -14,7 +14,7 @@
 //
 // Sampling — CPU sampling pipeline over a vocab-sized logits tensor.
 //
-// The greedy fast path is handled by Ops.argmax + LanguageModel.forwardSample
+// The greedy fast path is handled by Ops.argmax + TextGenerating.forwardSample
 // (single 4-byte readback, no logits cross CPU↔GPU). When the user picks
 // non-greedy sampling — temperature > 0 with any of top-K / top-P / min-P /
 // repetition-penalty — we read the full vocab to CPU once per token and run

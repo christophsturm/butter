@@ -26,7 +26,7 @@
 //   - `Gemma4Dense` — 31B Gemma-style backbone, no PLE, dense MLP.
 //   - `Gemma4E`     — E2B / E4B; adds Per-Layer Embeddings.
 //   - `Gemma4MoE`   — 26B-A4B; mixture-of-experts feed-forward.
-//   - `Gemma4Model` — the full LanguageModel decoder.
+//   - `Gemma4Model` — the full TextGenerating decoder.
 //
 // The Gemma 4 VL vision-language orchestrator (`enum Gemma4VL`) — which
 // ties the Gemma 4 text backbone to the bespoke Gemma 4 ViT vision

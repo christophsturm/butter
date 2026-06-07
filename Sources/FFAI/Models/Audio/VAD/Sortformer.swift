@@ -862,7 +862,7 @@ private func sortformerSpeakerSigmoids(
 ///
 /// Produces per-frame, per-speaker speech-activity probabilities from raw
 /// audio. This is a VAD-family model: reached via `ModelRegistry`, not
-/// `ModelRegistry`. No `LanguageModel` protocol conformance.
+/// `ModelRegistry`. No `TextGenerating` protocol conformance.
 public final class SortformerModel: @unchecked Sendable {
     public let config: SortformerConfig
 

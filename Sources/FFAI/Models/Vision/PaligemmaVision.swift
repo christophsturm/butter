@@ -599,7 +599,7 @@ final class SigLIPLayer: @unchecked Sendable {
 ///      0..<numImageTokens resolve to the stored image embeddings automatically.
 // PaligemmaModel stores read-only vision weights + a mutex-protected mutable
 // field (imageFeatures). @unchecked Sendable is safe given the NSLock guard.
-public final class PaligemmaModel: LanguageModel, @unchecked Sendable {
+public final class PaligemmaModel: TextGenerating, @unchecked Sendable {
     // ── Text backbone ───────────────────────────────────────────────────
     /// The PaliGemma 2 text decoder. The shared `Gemma2Model` handles
     /// the 4 norms per layer, alternating sliding / full attention,
@@ -643,7 +643,7 @@ public final class PaligemmaModel: LanguageModel, @unchecked Sendable {
     /// Lock protecting `imageFeatures` for thread safety.
     private let featuresLock = NSLock()
 
-    // ── LanguageModel-protocol forwarding properties ────────────────────
+    // ── TextGenerating-protocol forwarding properties ────────────────────
     // These delegate straight to the text engine so external callers
     // (tests, the Model wrapper, the generation loop) see the same
     // surface they always have. The bespoke text-layer fields the old
@@ -840,7 +840,7 @@ public final class PaligemmaModel: LanguageModel, @unchecked Sendable {
         featuresLock.unlock()
     }
 
-    // MARK: - LanguageModel
+    // MARK: - TextGenerating
 
     /// Single-token forward. For positions that correspond to an image
     /// token (`tokenId == imageTokenIndex`) the stored vision embedding

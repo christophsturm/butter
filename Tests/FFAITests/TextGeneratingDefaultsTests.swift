@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// LanguageModelDefaultsTests — verifies the default extension methods
-// in `LanguageModel` compose correctly on top of the single primitive
+// TextGeneratingDefaultsTests — verifies the default extension methods
+// in `TextGenerating` compose correctly on top of the single primitive
 // `forward(...on cmd:)`. The key contract being pinned:
 //
 //   - `forwardSample` queues forward + argmax on ONE command buffer.
@@ -33,14 +33,14 @@ import Testing
 
 @testable import FFAI
 
-@Suite("LanguageModel default extension")
-final class LanguageModelDefaultsTests {
+@Suite("TextGenerating default extension")
+final class TextGeneratingDefaultsTests {
 
     /// Minimal mock model. `forward(on cmd:)` is the only primitive;
     /// it records every command buffer it's invoked with so the test
     /// can prove the default impls reuse one cmdbuf instead of
     /// allocating a second.
-    final class CountingModel: LanguageModel, @unchecked Sendable {
+    final class CountingModel: TextGenerating, @unchecked Sendable {
         let hidden = 4
         let nLayers = 0
         let nHeads = 1

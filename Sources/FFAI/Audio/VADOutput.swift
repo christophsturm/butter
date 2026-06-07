@@ -17,7 +17,7 @@
 //
 // VAD models consume an audio waveform and emit a per-frame
 // speech-probability stream plus optional post-processed speech
-// segments. Unlike the causal-LM families (`LanguageModel`), VAD models
+// segments. Unlike the causal-LM families (`TextGenerating`), VAD models
 // are audio-in / probability-out, so they don't flow through
 // `ModelRegistry` / `Model`. They live under `ModelRegistry`
 // instead and expose their own `loadFromDirectory` / `fromPretrained`

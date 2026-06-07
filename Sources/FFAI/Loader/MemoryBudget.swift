@@ -103,7 +103,7 @@ public enum MemoryBudget {
 
     /// Total bytes of the model's resident weights (sum of every
     /// parameter tensor's byte count — packed u32 for quantized).
-    public static func weightBytes(engine: any LanguageModel) -> Int {
+    public static func weightBytes(engine: any TextGenerating) -> Int {
         engine.parameters().reduce(0) { $0 + $1.1.byteCount }
     }
 
@@ -111,7 +111,7 @@ public enum MemoryBudget {
     /// position across the whole model: assumes EVERY layer is a raw
     /// fp16/bf16 attention layer holding K + V. Real footprints (hybrid
     /// models, quantized / AURA caches) are smaller.
-    public static func kvBytesPerContextToken(engine: any LanguageModel) -> Int {
+    public static func kvBytesPerContextToken(engine: any TextGenerating) -> Int {
         kvBytesPerContextToken(
             nLayers: engine.nLayers, nKVHeads: engine.nKVHeads,
             headDim: engine.headDim, bytesPerElement: engine.dtype.byteSize)
@@ -145,7 +145,7 @@ public enum MemoryBudget {
     /// 0 when weights + margin already exhaust the budget (the model
     /// can't run at any context on this machine / budget).
     public static func maxFittingContext(
-        engine: any LanguageModel, options: LoadOptions, device: Device = .shared
+        engine: any TextGenerating, options: LoadOptions, device: Device = .shared
     ) -> Int {
         maxFittingContext(
             budget: budgetBytes(options: options, device: device),
@@ -159,7 +159,7 @@ public enum MemoryBudget {
     /// run at any usable context here).
     public static func clampContext(
         requestedCeiling: Int,
-        engine: any LanguageModel,
+        engine: any TextGenerating,
         options: LoadOptions,
         device: Device = .shared
     ) throws -> Int {

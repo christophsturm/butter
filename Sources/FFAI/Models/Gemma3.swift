@@ -26,7 +26,7 @@
 // Concrete variants + the dense decoder + per-layer impl live under
 // `Models/Text/Gemma3Text.swift`:
 //   - `Gemma3Dense` — the 1B / 4B / 12B / 27B Gemma 3 text decoder.
-//   - `Gemma3Model` — the full LanguageModel decoder.
+//   - `Gemma3Model` — the full TextGenerating decoder.
 //
 // The Gemma 3 VL vision-language orchestrator (`enum Gemma3VL`) — which
 // ties the Gemma 3 text backbone to the SigLIP ViT vision tower —

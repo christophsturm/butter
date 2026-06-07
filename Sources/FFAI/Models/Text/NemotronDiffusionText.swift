@@ -459,7 +459,7 @@ private func nemotronBlockProject(
 
 // ─── NemotronDiffusionModel ──────────────────────────────────────
 
-public final class NemotronDiffusionModel: LanguageModel {
+public final class NemotronDiffusionModel: TextGenerating {
     public let embedTokens: AnyEmbedding
     public let layers: [NemotronDiffusionLayer]
     public let finalNorm: RMSNorm
@@ -662,7 +662,7 @@ public final class NemotronDiffusionModel: LanguageModel {
             preallocate: true, device: device)
     }
 
-    /// Single-token AR forward — the `LanguageModel` primitive that
+    /// Single-token AR forward — the `TextGenerating` primitive that
     /// `Generate.swift` composes for autoregressive decoding.
     public func forward(
         tokenId: Int, position: Int,
@@ -707,10 +707,10 @@ public final class NemotronDiffusionModel: LanguageModel {
         return logits
     }
 
-    /// Multi-token forward (LanguageModel protocol) — prefill
+    /// Multi-token forward (TextGenerating protocol) — prefill
     /// fast path. NemotronDiffusion already ships a block-batched
     /// forward (`forwardBlock`) used by the diffusion + self-spec
-    /// modes; this is the thin LanguageModel-protocol adapter that
+    /// modes; this is the thin TextGenerating-protocol adapter that
     /// wraps it for the AR-prefill path.
     ///
     /// `forwardBlock` does the full chunked work — batched embed,

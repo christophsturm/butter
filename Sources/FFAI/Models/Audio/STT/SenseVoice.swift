@@ -39,7 +39,7 @@
 // FBANK cost is dwarfed by the 70-block encoder GEMMs.
 //
 // Like `WhisperModel`, this file does NOT route through `ModelRegistry`
-// / `LanguageModel`; it is loaded via `SenseVoiceModel.load(...)` and
+// / `TextGenerating`; it is loaded via `SenseVoiceModel.load(...)` and
 // exposes a `transcribe(...)` surface.
 
 import Foundation

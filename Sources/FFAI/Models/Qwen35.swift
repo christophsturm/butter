@@ -27,7 +27,7 @@
 // hybrid architecture and the same `qwen3_5*` model_type strings):
 //   - `Qwen35Hybrid` — the single variant; dense-vs-MoE is decided per
 //     checkpoint inside `loadModel` from `num_experts`.
-//   - `Qwen35Model` — the full LanguageModel decoder.
+//   - `Qwen35Model` — the full TextGenerating decoder.
 //
 // The Qwen 3-VL-MoE vision-language orchestrator (`enum Qwen3VLMoe`) —
 // which ties the Qwen 3.5-MoE text backbone to the shared Qwen 3-VL ViT

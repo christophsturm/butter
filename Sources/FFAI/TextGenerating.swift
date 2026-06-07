@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// LanguageModel — common surface every text-generating model conforms
+// TextGenerating — common surface every text-generating model conforms
 // to. Lets Generate.swift and the CLI work against any model family
 // without knowing the concrete type.
 
 import Foundation
 import Metal
 
-// `LanguageModel` refines `TextEngine` (→ `ModelEngine`) so every text /
+// `TextGenerating` refines `TextEngine` (→ `ModelEngine`) so every text /
 // VL backbone is usable as the unified `Model.engine` existential without
 // renaming the protocol or touching its ~40 conformers (T1).
-public protocol LanguageModel: Module, TextEngine {
+public protocol TextGenerating: Module, TextEngine {
     var hidden: Int { get }
     var nLayers: Int { get }
     var nHeads: Int { get }
@@ -194,9 +194,9 @@ public protocol LanguageModel: Module, TextEngine {
     func textEmbedding(tokenId: Int, device: Device) -> Tensor
 }
 
-extension LanguageModel {
+extension TextGenerating {
     /// Default prefill chunk size matches mlx-swift-lm's generic
-    /// `LanguageModel` default (1024 — Llama / Mistral / Phi / Qwen3
+    /// `TextGenerating` default (1024 — Llama / Mistral / Phi / Qwen3
     /// dense). GPT-OSS, Qwen 3.5 MoE, Gemma 4 override this per the
     /// values benched in mlx-swift-lm.
     public var defaultPrefillStepSize: Int { 1024 }

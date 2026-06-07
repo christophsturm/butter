@@ -343,7 +343,7 @@ public final class Gemma2Layer: Module {
 
 // MARK: - Gemma2Model
 
-public final class Gemma2Model: LanguageModel {
+public final class Gemma2Model: TextGenerating {
     public let embedTokens: AnyEmbedding
     public let layers: [Gemma2Layer]
     public let finalNorm: RMSNorm

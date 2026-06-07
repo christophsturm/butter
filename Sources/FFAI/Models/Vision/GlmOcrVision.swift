@@ -15,7 +15,7 @@
 // GlmOcr vision tower internals — ViT + text engine + GPU-dispatching helpers.
 //
 // This file contains GlmOcrTextLayer, GlmOcrModel (the full engine which
-// implements LanguageModel), GlmOcrVisionTower, GlmOcrVisionBlock, and all
+// implements TextGenerating), GlmOcrVisionTower, GlmOcrVisionBlock, and all
 // supporting helpers — CpuLinear (Ops.gemm / Ops.dequantGemv wrapper),
 // cpuRMSNorm (host-side small-element scaling that feeds Ops.gemm), patch
 // unfold (load-time prep), and dtype conversion (also load-time) — plus
@@ -25,7 +25,7 @@
 // dispatches to the GPU; only the per-row scale / small-element setup
 // stays host-side where Metal launch overhead would dominate.
 //
-// Per the GLM-OCR design: the engine itself is a LanguageModel (not a
+// Per the GLM-OCR design: the engine itself is a TextGenerating (not a
 // VisionModel splice), so GlmOcrModel owns both the ViT and the text decoder —
 // the whole file stays together rather than splitting the engine from the
 // tower.
@@ -163,11 +163,11 @@ public final class GlmOcrTextLayer: Module {
 
 // ─── GlmOcrModel ─────────────────────────────────────────────────────
 
-/// GLM-OCR vision-language model engine. Implements `LanguageModel` for
+/// GLM-OCR vision-language model engine. Implements `TextGenerating` for
 /// the text-only decode path (compatible with `Generate.swift`) and
 /// exposes `generate(image:promptTokens:maxTokens:device:)` for the
 /// multi-modal prefill + decode path.
-public final class GlmOcrModel: LanguageModel {
+public final class GlmOcrModel: TextGenerating {
     public let embedTokens: AnyEmbedding
     public let layers: [GlmOcrTextLayer]
     public let finalNorm: RMSNorm
@@ -243,9 +243,9 @@ public final class GlmOcrModel: LanguageModel {
             dtype: dtype, device: device)
     }
 
-    // MARK: - Text-only forward (LanguageModel protocol)
+    // MARK: - Text-only forward (TextGenerating protocol)
 
-    /// Command-buffer-aware variant — required by `LanguageModel`.
+    /// Command-buffer-aware variant — required by `TextGenerating`.
     /// The internal forward constructs its own command buffer; the
     /// caller-supplied `cmd` is currently ignored.
     public func forward(
@@ -475,7 +475,7 @@ public final class GlmOcrModel: LanguageModel {
     }
 
     /// Look up the embedding for a single token id, returning `[hidden]`.
-    /// `public` to satisfy the `LanguageModel` protocol requirement.
+    /// `public` to satisfy the `TextGenerating` protocol requirement.
     public func textEmbedding(tokenId: Int, device: Device) -> Tensor {
         let cmd = device.makeCommandBuffer()
         let tokenBuf = device.makeBuffer(length: 4)

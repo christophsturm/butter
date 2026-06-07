@@ -1109,7 +1109,7 @@ private func graniteMoEKey(_ k: String) -> String {
 
 // ─── Granite4Model ───────────────────────────────────────────
 
-public final class Granite4Model: LanguageModel {
+public final class Granite4Model: TextGenerating {
     public let embedTokens: AnyEmbedding
     /// Heterogeneous layer stack — each entry is a Mamba or attention
     /// hybrid layer, ordered by `layer_types`.

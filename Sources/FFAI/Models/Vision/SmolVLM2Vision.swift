@@ -15,7 +15,7 @@
 // SmolVLM2 — vision tower internals.
 //
 // Config structs, CPU-path vision ops, `SmolVLM2VisionEncoder`,
-// `SmolVLM2Connector`, and `SmolVLM2Model` (the `LanguageModel`-conforming
+// `SmolVLM2Connector`, and `SmolVLM2Model` (the `TextGenerating`-conforming
 // engine) live here. SmolVLM2 is unusual in that it does not route through
 // `VisionModel` — the engine handles vision prefill internally.
 //
@@ -903,20 +903,20 @@ public final class SmolVLM2Connector: Module {
     }
 }
 
-// ─── SmolVLM2Model (implements LanguageModel) ─────────────────────────────────
+// ─── SmolVLM2Model (implements TextGenerating) ─────────────────────────────────
 //
 // Wraps Llama3Model for the text backbone. Adds vision prefill capability:
 // `forwardVisionPrefill` encodes an image tile and splices the visual features
 // into the residual stream before the normal KV-cache decode loop runs.
 
-public final class SmolVLM2Model: LanguageModel {
+public final class SmolVLM2Model: TextGenerating {
     public let llamaModel: Llama3Model
     public let visionEncoder: SmolVLM2VisionEncoder
     public let connector: SmolVLM2Connector
     public let cfg: SmolVLM2Config
     public let device: Device
 
-    // LanguageModel conformance — delegate to the Llama backbone
+    // TextGenerating conformance — delegate to the Llama backbone
     public var hidden: Int { llamaModel.hidden }
     public var nLayers: Int { llamaModel.nLayers }
     public var nHeads: Int { llamaModel.nHeads }

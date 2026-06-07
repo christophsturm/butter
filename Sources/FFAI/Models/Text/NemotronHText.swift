@@ -23,7 +23,7 @@
 //   • `NemotronHHybrid` — the single variant (dense / MoE FFN mix is
 //     decided per checkpoint from `hybrid_override_pattern` +
 //     `num_experts`),
-//   • `NemotronHModel` — the full LanguageModel decoder.
+//   • `NemotronHModel` — the full TextGenerating decoder.
 //
 // ─── Architecture ────────────────────────────────────────────────────
 //
@@ -1060,7 +1060,7 @@ private func buildNemotronHMoELayer(
 
 // ─── NemotronHModel ──────────────────────────────────────────────────
 
-public final class NemotronHModel: LanguageModel {
+public final class NemotronHModel: TextGenerating {
     public let embedTokens: AnyEmbedding
     /// Heterogeneous layer stack — each entry is a Mamba / attention /
     /// MLP layer, ordered by the `hybrid_override_pattern`.

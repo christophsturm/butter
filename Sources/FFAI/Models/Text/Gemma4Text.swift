@@ -19,7 +19,7 @@
 //
 //   • `Gemma4Dense` / `Gemma4E` / `Gemma4MoE` — `Gemma4Variant`
 //     conformances + the per-variant `loadModel` entries,
-//   • `Gemma4Model` — the full LanguageModel decoder.
+//   • `Gemma4Model` — the full TextGenerating decoder.
 //
 // A dense / PLE / MoE attention family. Three checkpoint shapes ship
 // under the single `gemma4` / `gemma4_text` model_type, distinguished
@@ -1550,7 +1550,7 @@ enum Gemma4Ops {
 
 // MARK: - Gemma4Model
 
-public final class Gemma4Model: LanguageModel {
+public final class Gemma4Model: TextGenerating {
     public let embedTokens: AnyEmbedding
     public let layers: [Gemma4Layer]
     public let finalNorm: RMSNorm

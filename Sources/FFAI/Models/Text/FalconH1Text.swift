@@ -714,7 +714,7 @@ public final class FalconH1LayerCache: LayerCacheProtocol, @unchecked Sendable {
 
 // ─── FalconH1Model ───────────────────────────────────────────────────
 
-public final class FalconH1Model: LanguageModel {
+public final class FalconH1Model: TextGenerating {
     public let embedTokens: AnyEmbedding
     /// Heterogeneous-capable layer stack. FalconH1 is homogeneous, but
     /// the array is `[any DecoderLayer]` so the decode loop exercises
@@ -803,7 +803,7 @@ public final class FalconH1Model: LanguageModel {
     }
 
     /// Queue a single-token forward pass onto `cmd`. No commit. The
-    /// `LanguageModel` default extension composes this with the output
+    /// `TextGenerating` default extension composes this with the output
     /// kernel for the 1-commit-per-token decode path.
     ///
     /// Walks `[any DecoderLayer]` in lockstep with the per-layer caches —

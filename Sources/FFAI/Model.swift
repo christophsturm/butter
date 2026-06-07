@@ -85,7 +85,7 @@ public enum ModelError: Error, CustomStringConvertible {
 /// touch.
 public final class Model: @unchecked Sendable {
     /// The concrete model engine, type-erased to the unified `ModelEngine`
-    /// existential — a `LanguageModel` (LLM / VLM text backbone), a
+    /// existential — a `TextGenerating` (LLM / VLM text backbone), a
     /// `Transcribing` (STT), a `Synthesizing` (TTS), a `Detecting` (VAD), or
     /// a `SpeechTransforming` (STS). For a text/VL model this is the text
     /// engine; use `languageModel` / `textEngine` to recover the typed text
@@ -102,18 +102,18 @@ public final class Model: @unchecked Sendable {
     public let modelDirectory: URL
     public let availableCapabilities: Set<Capability>
 
-    /// The engine viewed as a text `LanguageModel`, or `nil` for non-text
+    /// The engine viewed as a text `TextGenerating`, or `nil` for non-text
     /// kinds (STT / TTS / STS / VAD). The shim every existing text/VL call
     /// site recovers the forward / cache surface through.
-    public var languageModel: (any LanguageModel)? { engine as? any LanguageModel }
+    public var languageModel: (any TextGenerating)? { engine as? any TextGenerating }
 
     /// The text engine, for the text/VL code paths. Precondition-fails on a
     /// non-text kind — a caller bug; guard on `kind` / `languageModel` first.
     /// The convenience shim text commands (generate / inspect / bench) reach
     /// the forward / cache surface through; programmatic callers that may hold
     /// a non-text model should use the optional `languageModel` instead.
-    public var textEngine: any LanguageModel {
-        guard let lm = engine as? any LanguageModel else {
+    public var textEngine: any TextGenerating {
+        guard let lm = engine as? any TextGenerating else {
             preconditionFailure(
                 "Model.textEngine on a non-text engine (kind=\(kind.rawValue))")
         }

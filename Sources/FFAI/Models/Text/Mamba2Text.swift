@@ -21,7 +21,7 @@
 //   • `Mamba2Dense` — `Mamba2Variant` conformance + the per-variant
 //     `loadModel` entry,
 //   • `Mamba2Layer` — one selective-SSM mixer block,
-//   • `Mamba2Model` — the full LanguageModel decoder.
+//   • `Mamba2Model` — the full TextGenerating decoder.
 //
 // Ships the dense decode path: one MTLCommandBuffer per token,
 // constant-memory recurrent state via `Mamba2LayerCache`, `n_groups=1`
@@ -359,7 +359,7 @@ public final class Mamba2Layer: Module {
 
 // ─── Mamba2Model ─────────────────────────────────────────────────────
 
-public final class Mamba2Model: LanguageModel {
+public final class Mamba2Model: TextGenerating {
     public let embedTokens: AnyEmbedding
     public let layers: [Mamba2Layer]
     public let finalNorm: RMSNorm
@@ -419,7 +419,7 @@ public final class Mamba2Model: LanguageModel {
     }
 
     /// Primitive: queue a single-token forward pass onto the caller's
-    /// command buffer. No commit. The `LanguageModel` default
+    /// command buffer. No commit. The `TextGenerating` default
     /// extension composes this with the appropriate output kernel on
     /// the same cmdbuf (argmax for forwardSample, softmax-categorical
     /// for forwardSampleCategorical), giving Mamba 2 the 1-commit-per-
@@ -462,7 +462,7 @@ public final class Mamba2Model: LanguageModel {
     }
 
     // `forward`, `forwardSample`, `forwardSampleCategorical` come from
-    // LanguageModel's default extension — they wrap `forward(...on cmd:)`
+    // TextGenerating's default extension — they wrap `forward(...on cmd:)`
     // with a single command buffer and the appropriate output kernel.
 
     /// Multi-token forward — Mamba 2 is **inherently sequential**. The

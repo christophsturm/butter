@@ -116,7 +116,7 @@ public enum ModelRegistry {
     /// knowing the concrete family.
     public struct Loaded {
         /// The loaded engine, type-erased to `ModelEngine`. A
-        /// `LanguageModel` for text/VL families; a `Transcribing` /
+        /// `TextGenerating` for text/VL families; a `Transcribing` /
         /// `Synthesizing` / `Detecting` / `SpeechTransforming` for the audio
         /// / VAD families.
         public let engine: any ModelEngine

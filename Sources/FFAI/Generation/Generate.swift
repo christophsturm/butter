@@ -322,7 +322,7 @@ extension Model {
         // the final position via the existing fused-kernel `sampleNext`
         // path — that's the only position whose logits we actually need.
         //
-        // The default `forwardMulti` implementation in `LanguageModel`
+        // The default `forwardMulti` implementation in `TextGenerating`
         // falls back to a per-token loop, so families that haven't
         // overridden it retain today's behaviour exactly. Optimised
         // families (Llama, …) override `forwardMulti` with a single

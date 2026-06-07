@@ -31,7 +31,7 @@
 // `Models/Text/Qwen3xText.swift` (covers BOTH Qwen 3.5 AND Qwen 3.6):
 //   - `Qwen35Hybrid` — the single variant; dense-vs-MoE is decided per
 //     checkpoint inside `loadModel` from `num_experts`.
-//   - `Qwen35Model` — the full LanguageModel decoder.
+//   - `Qwen35Model` — the full TextGenerating decoder.
 //
 // The Qwen 3-VL-MoE vision-language orchestrator (`enum Qwen3VLMoe`)
 // lives in `Models/Vision/Qwen3Vision.swift` alongside its dense

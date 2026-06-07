@@ -29,10 +29,10 @@ import Testing
 @Suite("VisionModel")
 struct VisionModelTests {
 
-    /// Minimal `LanguageModel` stub — supports the embedding-input
+    /// Minimal `TextGenerating` stub — supports the embedding-input
     /// surface a `VisionModel` needs. `textEmbedding` returns a tagged
     /// constant row per token id so the splice ordering is checkable.
-    final class StubEngine: LanguageModel {
+    final class StubEngine: TextGenerating {
         let hidden: Int
         let nLayers = 1, nHeads = 1, nKVHeads = 1, headDim = 8
         let vocab = 1000, maxContextWindow = 4096
@@ -117,7 +117,7 @@ struct VisionModelTests {
     @Test("VisionModel — rejects an engine without embedding-input support")
     func rejectsUnsupportedEngine() {
         // A text-only engine (supportsEmbeddingInput == false) can't VLM.
-        final class TextOnly: LanguageModel {
+        final class TextOnly: TextGenerating {
             let hidden = 8, nLayers = 1, nHeads = 1, nKVHeads = 1
             let headDim = 8, vocab = 100, maxContextWindow = 64
             let dtype: DType = .f32

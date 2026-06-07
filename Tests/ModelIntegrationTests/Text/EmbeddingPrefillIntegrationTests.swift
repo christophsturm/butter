@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Numerics guard for the batched VLM-prefill primitive
-// `LanguageModel.forwardMulti(inputEmbeddings:)` — the entry point a
+// `TextGenerating.forwardMulti(inputEmbeddings:)` — the entry point a
 // `VisionModel` uses to prefill the spliced embedding stream in one (or a
 // few) command buffers instead of one dispatch per position.
 //

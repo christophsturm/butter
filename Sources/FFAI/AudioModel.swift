@@ -17,7 +17,7 @@
 // `ModelRegistry.swift`; this file declares the model-facing protocol
 // + generation-parameter struct + error enum that audio families implement.
 //
-// Audio models differ from `LanguageModel` in that their primary output is
+// Audio models differ from `TextGenerating` in that their primary output is
 // waveform samples (or quantized audio codes), not text tokens. They may
 // internally use an LLM backbone for semantic token generation but expose
 // a `synthesize(...)` entry point instead of `generate(...)`.

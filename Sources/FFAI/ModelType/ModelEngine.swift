@@ -23,7 +23,7 @@
 // `ModelEngine` marker, and a family conforms to one or several:
 //
 //   ModelEngine                     (marker — the existential `Model.engine` holds)
-//   ├─ TextEngine        → LanguageModel: Module, TextEngine   (LLM / VLM backbone)
+//   ├─ TextEngine        → TextGenerating: Module, TextEngine   (LLM / VLM backbone)
 //   ├─ Transcribing      → STT / omni-audio-in  (refines StreamingTranscriber)
 //   ├─ Synthesizing      → TTS                  (refines StreamingSynthesizer)
 //   ├─ SpeechTransforming→ STS denoise / separate
@@ -46,10 +46,10 @@ public protocol ModelEngine {}
 // MARK: - Text (LLM / VLM)
 
 /// Text-generation engines (LLM backbones + the text backbone of a VLM). The
-/// existing `LanguageModel` protocol refines this (T1: kept the name, added
-/// `: TextEngine`), so every one of the ~40 `LanguageModel` conformers is a
+/// existing `TextGenerating` protocol refines this (T1: kept the name, added
+/// `: TextEngine`), so every one of the ~40 `TextGenerating` conformers is a
 /// `TextEngine` — and thus a `ModelEngine` — with zero churn. The text
-/// forward / cache surface stays on `LanguageModel`; `TextEngine` is the
+/// forward / cache surface stays on `TextGenerating`; `TextEngine` is the
 /// modality marker `Model` dispatches on.
 public protocol TextEngine: ModelEngine {}
 

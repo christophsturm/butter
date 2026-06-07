@@ -23,7 +23,7 @@
 //   • `GPTOSSAttentionKind`, `GPTOSSAttention`, `GPTOSSExpert`,
 //     `GPTOSSMoELayer`, `buildGPTOSSMoE` — the per-layer impl,
 //     MXFP4-to-affine-int4 codec, and biased-router MoE FFN,
-//   • `GPTOSSModel` — the full LanguageModel decoder, with the Jamba-
+//   • `GPTOSSModel` — the full TextGenerating decoder, with the Jamba-
 //     style command-buffer discipline (every layer commits, so per-
 //     layer work runs on internal `workCmd` buffers).
 
@@ -680,7 +680,7 @@ func gptOSSHostRMSNorm(
 
 // ─── GPTOSSModel ─────────────────────────────────────────────────────
 
-public final class GPTOSSModel: LanguageModel {
+public final class GPTOSSModel: TextGenerating {
     public let embedTokens: AnyEmbedding
     public let layers: [GPTOSSLayer]
     public let finalNorm: RMSNorm
@@ -770,7 +770,7 @@ public final class GPTOSSModel: LanguageModel {
     }
 
     /// Queue a single-token forward pass. **Does not commit `cmd`** —
-    /// the `LanguageModel` default `forwardSample` extension composes
+    /// the `TextGenerating` default `forwardSample` extension composes
     /// the output kernel onto `cmd` and commits once.
     ///
     /// CRITICAL — command-buffer contract (the Jamba discipline). Every

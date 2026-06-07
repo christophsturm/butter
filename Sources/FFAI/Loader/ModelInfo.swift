@@ -149,7 +149,7 @@ extension Model {
     /// need this repeatedly should cache it themselves.
     public var info: ModelInfo {
         // Shape + weight-footprint fields come from the text engine. For a
-        // non-text engine (STT / TTS / VAD / STS) there is no `LanguageModel`
+        // non-text engine (STT / TTS / VAD / STS) there is no `TextGenerating`
         // forward surface, so they read as 0 / .f32 — the identity +
         // capability + tokenization fields below still apply.
         let lm = languageModel

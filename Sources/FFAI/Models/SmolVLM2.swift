@@ -22,7 +22,7 @@
 // Upstream Python impl: transformers models/idefics3 (SmolVLM2 = Idefics3)
 //
 // SmolVLM2 is unusual — it does not go through VisionModel. The engine
-// (`SmolVLM2Model`) implements `LanguageModel` directly and handles vision
+// (`SmolVLM2Model`) implements `TextGenerating` directly and handles vision
 // prefill internally. The vision tower internals (config structs, CPU vision
 // ops, encoder layers, `SmolVLM2VisionEncoder`, `SmolVLM2Connector`,
 // `SmolVLM2Model`) live in `Models/Vision/SmolVLM2Vision.swift`. This file

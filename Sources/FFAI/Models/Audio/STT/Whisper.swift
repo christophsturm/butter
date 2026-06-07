@@ -30,7 +30,7 @@
 // follow-up.
 //
 // This file deliberately does NOT route through `ModelRegistry` /
-// `LanguageModel` — those describe a pure text-in/text-out decoder.
+// `TextGenerating` — those describe a pure text-in/text-out decoder.
 // Whisper is loaded via `Whisper.load(...)` and exposes a
 // `transcribe(...)` surface instead.
 

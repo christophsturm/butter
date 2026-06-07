@@ -1068,7 +1068,7 @@ private func jambaApplyFFN(
 
 // ─── JambaModel ──────────────────────────────────────────────────────
 
-public final class JambaModel: LanguageModel {
+public final class JambaModel: TextGenerating {
     public let embedTokens: AnyEmbedding
     /// Heterogeneous layer stack — each entry is a Mamba 1 or attention
     /// hybrid layer, ordered by `layers_block_type`.
