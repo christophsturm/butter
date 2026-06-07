@@ -418,7 +418,7 @@ public final class TenVADModel: @unchecked Sendable {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension TenVADModel: Detecting {
+extension TenVADModel: VoiceActivating {
     public func detect(_ waveform: [Float], sampleRate: Int) throws -> [DetectionEvent] {
         try detect(audio: waveform, sampleRate: sampleRate).detectionEvents
     }

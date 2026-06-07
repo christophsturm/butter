@@ -1118,7 +1118,7 @@ public final class SortformerModel: @unchecked Sendable {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension SortformerModel: Detecting {
+extension SortformerModel: VoiceActivating {
     public func detect(_ waveform: [Float], sampleRate: Int) throws -> [DetectionEvent] {
         detect(audio: waveform, sampleRate: sampleRate).detectionEvents
     }

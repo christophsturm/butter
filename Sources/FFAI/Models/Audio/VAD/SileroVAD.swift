@@ -556,7 +556,7 @@ public final class SileroVADModel: @unchecked Sendable {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension SileroVADModel: Detecting {
+extension SileroVADModel: VoiceActivating {
     public func detect(_ waveform: [Float], sampleRate: Int) throws -> [DetectionEvent] {
         try detect(audio: waveform, sampleRate: sampleRate).detectionEvents
     }

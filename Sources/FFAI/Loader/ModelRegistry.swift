@@ -117,7 +117,7 @@ public enum ModelRegistry {
     public struct Loaded {
         /// The loaded engine, type-erased to `ModelEngine`. A
         /// `TextGenerating` for text/VL families; a `Transcribing` /
-        /// `Speaking` / `Detecting` / `SpeechTransforming` for the audio
+        /// `Speaking` / `VoiceActivating` / `SpeechTransforming` for the audio
         /// / VAD families.
         public let engine: any ModelEngine
         public let defaultGenerationParameters: GenerationParameters

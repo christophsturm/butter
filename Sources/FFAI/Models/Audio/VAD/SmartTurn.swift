@@ -496,7 +496,7 @@ public final class SmartTurnModel: @unchecked Sendable {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension SmartTurnModel: Detecting {
+extension SmartTurnModel: VoiceActivating {
     public func detect(_ waveform: [Float], sampleRate: Int) throws -> [DetectionEvent] {
         predictEndpoint(audio: waveform).detectionEvents(sampleRate: sampleRate)
     }

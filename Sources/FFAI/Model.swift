@@ -86,7 +86,7 @@ public enum ModelError: Error, CustomStringConvertible {
 public final class Model: @unchecked Sendable {
     /// The concrete model engine, type-erased to the unified `ModelEngine`
     /// existential — a `TextGenerating` (LLM / VLM text backbone), a
-    /// `Transcribing` (STT), a `Speaking` (TTS), a `Detecting` (VAD), or
+    /// `Transcribing` (STT), a `Speaking` (TTS), a `VoiceActivating` (VAD), or
     /// a `SpeechTransforming` (STS). For a text/VL model this is the text
     /// engine; use `languageModel` / `textEngine` to recover the typed text
     /// surface, or the typed convenience accessors (`llama`, `qwen3`, …) for

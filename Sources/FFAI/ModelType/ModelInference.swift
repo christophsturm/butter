@@ -21,7 +21,7 @@
 // request. The text path delegates to the existing `generate(messages:)` /
 // `generateStream(messages:)` (so the rich `GenerationResult` / streaming
 // behaviour is unchanged); audio paths route through the modality protocols
-// (`Transcribing` / `Speaking` / `SpeechTransforming` / `Detecting`).
+// (`Transcribing` / `Speaking` / `SpeechTransforming` / `VoiceActivating`).
 
 import Foundation
 import Metal
@@ -220,8 +220,8 @@ extension Model {
         }
         return e
     }
-    private func detectingEngine(for input: ModelInput) throws -> any Detecting {
-        guard let e = engine as? any Detecting else {
+    private func detectingEngine(for input: ModelInput) throws -> any VoiceActivating {
+        guard let e = engine as? any VoiceActivating else {
             throw unsupportedInput("detect")
         }
         return e

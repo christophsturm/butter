@@ -27,7 +27,7 @@
 //   ├─ Transcribing      → STT / omni-audio-in  (refines StreamingTranscriber)
 //   ├─ Speaking      → TTS                  (refines StreamingSynthesizer)
 //   ├─ SpeechTransforming→ STS denoise / separate
-//   └─ Detecting         → VAD / diarization / endpointing
+//   └─ VoiceActivating         → VAD / diarization / endpointing
 //
 // `ModelEngine` deliberately carries NO structural requirements: the 30+
 // heterogeneous audio / VAD concrete types (`@unchecked Sendable` classes,
@@ -199,7 +199,7 @@ public struct DetectionEvent: Sendable, Equatable {
 /// Voice-activity / diarization / endpointing engines — audio in, detected
 /// events out (no generative output). The three concrete VAD output types map
 /// into `[DetectionEvent]` in each family's conformance.
-public protocol Detecting: ModelEngine {
+public protocol VoiceActivating: ModelEngine {
     /// Detect events in an input waveform.
     func detect(_ waveform: [Float], sampleRate: Int) throws -> [DetectionEvent]
 }

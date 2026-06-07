@@ -1537,7 +1537,7 @@ private enum PickleVal {
 }
 
 // MARK: - Unified-engine modality conformance (ModelType/ModelEngine.swift)
-extension FireRedVADModel: Detecting {
+extension FireRedVADModel: VoiceActivating {
     public func detect(_ waveform: [Float], sampleRate: Int) throws -> [DetectionEvent] {
         try detect(audio: waveform, sampleRate: sampleRate).detectionEvents
     }
