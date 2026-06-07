@@ -139,7 +139,7 @@ public enum ModelRegistry {
         /// don't set this (it'd duplicate the `ModelEntry.kind` they're
         /// declared with); `dispatchAndLoad` stamps it from the matched
         /// entry after the load returns.
-        public var kind: ModelKind = .llm
+        public var kind: ModelType = .llm
 
         public init(
             engine: any ModelEngine,
@@ -147,7 +147,7 @@ public enum ModelRegistry {
             availableCapabilities: Set<Capability> = Capability.textOnly,
             vlModel: VisionModel? = nil,
             tokenizer: (any Tokenizer)? = nil,
-            kind: ModelKind = .llm
+            kind: ModelType = .llm
         ) {
             self.engine = engine
             self.defaultGenerationParameters = defaultGenerationParameters
@@ -595,9 +595,9 @@ public enum AudioModelError: Error, CustomStringConvertible {
 
 extension ModelRegistry {
 
-    /// The `ModelKind`s that denote an audio family (anything `Model.load`
+    /// The `ModelType`s that denote an audio family (anything `Model.load`
     /// routes through the audio `loadFromDirectory` path).
-    static let audioKinds: Set<ModelKind> = [.stt, .tts, .sts, .vad, .omni]
+    static let audioKinds: Set<ModelType> = [.stt, .tts, .sts, .vad, .omni]
 
     /// The declared capability set of the AUDIO family that would load
     /// `config`, or `nil` when `config` is not an audio family (it's a

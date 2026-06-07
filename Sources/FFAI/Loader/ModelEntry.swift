@@ -30,7 +30,7 @@ public struct ModelEntry: Sendable {
     /// Human-facing family name (e.g. "Qwen 3"). Catalog display + logs.
     public let family: String
     /// Primary catalog category.
-    public let kind: ModelKind
+    public let kind: ModelType
     /// `config.json` `model_type` strings this family dispatches on.
     public let modelTypes: Set<String>
     /// `config.json` `architectures[0]` strings this family dispatches on.
@@ -69,7 +69,7 @@ public struct ModelEntry: Sendable {
 
     public init(
         family: String,
-        kind: ModelKind,
+        kind: ModelType,
         summary: String = "",
         repos: [String] = [],
         capabilities: Set<Capability> = Capability.textOnly,

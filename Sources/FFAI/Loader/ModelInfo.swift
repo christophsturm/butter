@@ -48,7 +48,7 @@ public struct ModelInfo: Sendable {
     /// `.stt`, `.tts`, `.vad`, …). The shape fields below are meaningful
     /// only for text/VL kinds (a text engine backs them); for audio / VAD
     /// engines they read as `0` / `.f32`.
-    public let kind: ModelKind
+    public let kind: ModelType
 
     // ── Architecture shape ──────────────────────────────────────────────
 

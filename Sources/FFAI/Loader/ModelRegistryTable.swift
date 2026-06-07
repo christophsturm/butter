@@ -545,10 +545,10 @@ extension ModelRegistry {
         visionEntries + textEntries + audioEntries
     }
 
-    /// All registered families grouped by `ModelKind` in catalog display
+    /// All registered families grouped by `ModelType` in catalog display
     /// order (empty kinds omitted). Backs `ffai models`.
-    public static var catalog: [(kind: ModelKind, entries: [ModelEntry])] {
-        let order: [ModelKind] = [.llm, .vlm, .ocr, .omni, .stt, .tts, .sts, .vad]
+    public static var catalog: [(kind: ModelType, entries: [ModelEntry])] {
+        let order: [ModelType] = [.llm, .vlm, .ocr, .omni, .stt, .tts, .sts, .vad]
         return order.compactMap { kind in
             let entries = catalogEntries
                 .filter { $0.kind == kind }

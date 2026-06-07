@@ -30,7 +30,7 @@ public enum ModelError: Error, CustomStringConvertible {
     /// method that the loaded model's `kind` can't service — e.g. `.speak`
     /// to an LLM, or `.text` to a VAD model. Carries the model's kind and a
     /// short description of the rejected input.
-    case unsupportedInput(kind: ModelKind, input: String)
+    case unsupportedInput(kind: ModelType, input: String)
     /// A speculative-decoding draft / assistant model (e.g. the Gemma 4
     /// Omni `gemma4_unified_assistant` EAGLE drafter) was loaded as a
     /// standalone generation model. It cannot generate on its own — it
@@ -94,7 +94,7 @@ public final class Model: @unchecked Sendable {
     public let engine: any ModelEngine
     /// The catalog kind the registry filed this model under. The dispatch
     /// key for `generate(_:)` / `generateStream(_:)`.
-    public let kind: ModelKind
+    public let kind: ModelType
     /// The model's tokenizer. `nil` for kinds that don't tokenize text
     /// (VAD, STS, and some pure audio transforms).
     public let tokenizer: (any Tokenizer)?
@@ -202,9 +202,7 @@ public final class Model: @unchecked Sendable {
     public var nemotronH: NemotronHModel? { engine as? NemotronHModel }
 
     /// Convenience accessor for the Granite4 hybrid engine.
-    public var graniteMoeHybrid: Granite4Model? {
-        engine as? Granite4Model
-    }
+    public var graniteMoeHybrid: Granite4Model? { engine as? Granite4Model }
 
     /// Convenience accessor for the Jamba hybrid engine.
     public var jamba: JambaModel? { engine as? JambaModel }
@@ -222,9 +220,7 @@ public final class Model: @unchecked Sendable {
     public var lfm2: LFM2Model? { engine as? LFM2Model }
 
     /// Convenience accessor for the Nemotron-Labs-Diffusion engine.
-    public var nemotronLabsDiffusion: NemotronDiffusionModel? {
-        engine as? NemotronDiffusionModel
-    }
+    public var nemotronLabsDiffusion: NemotronDiffusionModel? { engine as? NemotronDiffusionModel }
 
     /// Convenience accessor for the Starcoder 2 engine. Returns nil if
     /// the loaded engine isn't Starcoder 2. Note: Starcoder 2 was
@@ -271,7 +267,7 @@ public final class Model: @unchecked Sendable {
     private let residencyDevice: Device
 
     init(
-        engine: any ModelEngine, kind: ModelKind = .llm,
+        engine: any ModelEngine, kind: ModelType = .llm,
         tokenizer: (any Tokenizer)?, config: ModelConfig,
         modelDirectory: URL,
         availableCapabilities: Set<Capability>,

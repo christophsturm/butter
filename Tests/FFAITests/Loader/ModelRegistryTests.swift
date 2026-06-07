@@ -180,7 +180,7 @@ struct ModelRegistryTests {
     @Test("catalog covers every implemented kind, each non-empty")
     func catalogCoversImplementedKinds() {
         let kinds = Set(ModelRegistry.catalog.map(\.kind))
-        for kind in ModelKind.allCases where kind.isImplemented {
+        for kind in ModelType.allCases where kind.isImplemented {
             #expect(kinds.contains(kind), "catalog missing kind \(kind)")
         }
         for (_, entries) in ModelRegistry.catalog {

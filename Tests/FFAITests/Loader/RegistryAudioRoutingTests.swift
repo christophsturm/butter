@@ -100,7 +100,7 @@ struct RegistryAudioRoutingTests {
     @Test("catalog covers every audio kind")
     func catalogCoversAudioKinds() {
         let kinds = Set(ModelRegistry.catalog.map { $0.kind })
-        for k in [ModelKind.stt, .tts, .sts, .vad, .omni] {
+        for k in [ModelType.stt, .tts, .sts, .vad, .omni] {
             #expect(kinds.contains(k), "catalog missing \(k)")
         }
     }

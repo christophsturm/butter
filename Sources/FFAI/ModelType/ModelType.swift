@@ -12,20 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// ModelKind — the primary, human-facing category of a model. The registry
-// tags every supported family with a `ModelKind`; it's the grouping key for
+// ModelType — the primary, human-facing category of a model. The registry
+// tags every supported family with a `ModelType`; it's the grouping key for
 // the `ffai models` catalog and `ffai inspect`.
 //
-// `ModelKind` is NOT a substitute for `Capability` — capabilities are the
+// `ModelType` is NOT a substitute for `Capability` — capabilities are the
 // fine-grained runtime truth (and overlap: an OCR model has the same
-// `imageIn`/`textOut` capabilities as a VLM). `ModelKind` is the single
+// `imageIn`/`textOut` capabilities as a VLM). `ModelType` is the single
 // catalog label a model is filed under. Detection-only kinds (vad) have no
 // output `Capability` at all, so the kind cannot be derived from
 // capabilities alone — the registry assigns it explicitly.
 
 import Foundation
 
-public enum ModelKind: String, Sendable, Hashable, CaseIterable, Codable {
+public enum ModelType: String, Sendable, Hashable, CaseIterable, Codable {
     // ── Understanding (X → text) ─────────────────────────────────────
     /// Text-only large language model.
     case llm

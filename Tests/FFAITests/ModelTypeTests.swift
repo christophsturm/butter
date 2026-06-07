@@ -12,36 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// ModelKindTests — unit tests for `Sources/FFAI/ModelKind.swift`.
+// ModelTypeTests — unit tests for `Sources/FFAI/ModelType.swift`.
 
 import Foundation
 import Testing
 
 @testable import FFAI
 
-@Suite("ModelKind")
-struct ModelKindTests {
+@Suite("ModelType")
+struct ModelTypeTests {
     @Test("every case has a non-empty catalog title")
     func titles() {
-        for kind in ModelKind.allCases {
+        for kind in ModelType.allCases {
             #expect(!kind.title.isEmpty)
         }
     }
 
     @Test("implemented kinds are the 8 shipping today; reserved are not")
     func implementedFlags() {
-        let implemented = ModelKind.allCases.filter(\.isImplemented)
+        let implemented = ModelType.allCases.filter(\.isImplemented)
         #expect(Set(implemented) == [.llm, .vlm, .ocr, .omni, .stt, .tts, .sts, .vad])
         // The reserved generative kinds aren't wired yet.
-        #expect(!ModelKind.tti.isImplemented)
-        #expect(!ModelKind.segmentation.isImplemented)
+        #expect(!ModelType.tti.isImplemented)
+        #expect(!ModelType.segmentation.isImplemented)
     }
 
     @Test("raw values round-trip through Codable")
     func codableRoundTrip() throws {
-        for kind in ModelKind.allCases {
+        for kind in ModelType.allCases {
             let data = try JSONEncoder().encode(kind)
-            let decoded = try JSONDecoder().decode(ModelKind.self, from: data)
+            let decoded = try JSONDecoder().decode(ModelType.self, from: data)
             #expect(decoded == kind)
         }
     }
