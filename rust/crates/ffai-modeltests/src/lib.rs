@@ -1851,19 +1851,27 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // scatter) with NO host sync — the prerequisite for CUDA-graphing
                         // the forward (kill the host-launch GPU idle, the real 3-5× lever).
                         let mut moe_dev: Option<(Tensor, Tensor, Tensor)> = None; // (offsets, sorted_tok, sorted_wt)
+                        // NEMOTRON_Q4_DEVDESC: fully-on-device MoE (descriptors+gather+scatter
+                        // all device) → SKIP the host triples reconstruction entirely. mt =
+                        // s*top_k is deterministic (every token picks exactly top_k experts) so
+                        // NO dl is needed → the MoE region is host-sync-free (graph-capturable).
+                        let devdesc_skip = is_cuda && std::env::var("NEMOTRON_Q4_DEVDESC").is_ok();
                         let (triples, mt): (Vec<(u32, usize, f32)>, usize) = if devsort {
                             let bias_dev = up(&bias[..]);
                             let rl_dev = pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64, matmul(d, gate_w, &xn).unwrap());
                             let (st_dev, sw_dev, off_dev) = ffai_ops::moe_route_sort_device(d, &rl_dev, &bias_dev, n_exp, top_k, scale_f).unwrap();
-                            let rdu = |t: &Tensor, n: usize| -> Vec<u32> { let mut b = vec![0u8; n*4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); b.chunks(4).map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect() };
-                            let offs = rdu(&off_dev, n_exp + 1);
-                            let m = offs[n_exp] as usize;
-                            let stok = rdu(&st_dev, m);
-                            let swt = dl(&sw_dev, m);
-                            let mut tr = Vec::with_capacity(m);
-                            for e in 0..n_exp { for r in offs[e] as usize..offs[e+1] as usize { tr.push((e as u32, stok[r] as usize, swt[r])); } }
-                            // route_sort is now STABLE (within-expert token order matches a host
-                            // stable_sort) → no host re-sort needed; tr already in canonical order.
+                            let m = s * top_k;
+                            let tr: Vec<(u32, usize, f32)> = if devdesc_skip {
+                                Vec::new() // host-free: descriptors/gather/scatter consume device tensors
+                            } else {
+                                let rdu = |t: &Tensor, n: usize| -> Vec<u32> { let mut b = vec![0u8; n*4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); b.chunks(4).map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect() };
+                                let offs = rdu(&off_dev, n_exp + 1);
+                                let stok = rdu(&st_dev, m);
+                                let swt = dl(&sw_dev, m);
+                                let mut tr = Vec::with_capacity(m);
+                                for e in 0..n_exp { for r in offs[e] as usize..offs[e+1] as usize { tr.push((e as u32, stok[r] as usize, swt[r])); } }
+                                tr
+                            };
                             moe_dev = Some((off_dev, st_dev, sw_dev));
                             (tr, m)
                         } else {
@@ -1935,8 +1943,11 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // rest Q4. Validated argmax==1104@S2048 (exact-early restores the
                         // razor 1104/1776 near-tie that pure-Q4 flips; gap 0.125, robust).
                         // exact-LAST-K failed at all K (early error propagates irreducibly).
-                        let q4_firstexact: usize = std::env::var("NEMOTRON_Q4_GROUPED_FIRSTEXACT")
-                            .ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+                        // devdesc is host-free (empty triples) → the per-expert exact path is
+                        // unavailable; force firstexact=0 (all layers Q4; validated 1104).
+                        let q4_firstexact: usize = if devdesc_skip { 0 } else {
+                            std::env::var("NEMOTRON_Q4_GROUPED_FIRSTEXACT")
+                                .ok().and_then(|v| v.parse().ok()).unwrap_or(4) };
                         let q4_layer_ok = moe_idx >= q4_firstexact
                             && moe_idx < n_moe_layers.saturating_sub(q4_lastexact);
                         // DEFAULT-ON for CUDA (escape: NEMOTRON_Q4_GROUPED_OFF=1): Q4-native
@@ -2187,9 +2198,11 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // f16 slab, no dequant). ONE launch per up/down. Device gather
                             // gives xs_f16; on-device relu²(1/256)+det-scatter(×256).
                             let xs_f16 = xs_dev_f16_opt.as_ref().unwrap().clone();
+                            // Host g_starts/expert_ids only for the host-descriptor path; the
+                            // devdesc path builds them on-device (triples is empty there).
                             let mut g_starts: Vec<usize> = vec![0];
                             let mut expert_ids: Vec<usize> = Vec::new();
-                            { let mut gi=0usize; while gi<mt { let eid=triples[gi].0 as usize; expert_ids.push(eid);
+                            if !triples.is_empty() { let mut gi=0usize; while gi<mt { let eid=triples[gi].0 as usize; expert_ids.push(eid);
                                 let mut g2=gi+1; while g2<mt && triples[g2].0 as usize==eid {g2+=1;} g_starts.push(g2); gi=g2; } }
                             // NEMOTRON_Q4_DEVDESC=1: build tile descriptors ON DEVICE from the
                             // routing offsets (no host g_starts, FIXED launch) → the GEMM is
