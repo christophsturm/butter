@@ -1687,6 +1687,9 @@ const MOE_GROUPED_GEMM_MMA_SRC: &str = r#"
 __device__ __forceinline__ unsigned pk2(__half a, __half b){
     return (unsigned)__half_as_ushort(a) | ((unsigned)__half_as_ushort(b) << 16);
 }
+// cp.async one 16B (8-half) chunk shared<-global; src-size 0 → zero-fill (OOB mask)
+#define CPA(SD, SP, V) asm volatile("cp.async.cg.shared.global [%0],[%1],16,%2;\n" \
+    :: "r"(SD), "l"(SP), "r"((V)?16:0))
 extern "C" __global__ void moe_grouped_gemm_mma(
     const __half* __restrict__ A,                       // [mt, K]
     const __half* __restrict__ W_base,                  // [n_exp, N, K] contiguous
@@ -1696,36 +1699,45 @@ extern "C" __global__ void moe_grouped_gemm_mma(
     __half* __restrict__ out,                           // [mt, N]
     int N, int K)
 {
-    // 4 warps/block: BM=64 rows (16/warp) × BN=64 cols, BK=64 K-staging (4
-    // mma-k-substeps per shared load → 4× fewer __syncthreads + ILP). ~16KB shared.
-    const int BM=64, BN=64, BK=64, NS=8, NKS=4;
+    // 4 warps/block, BM=64×BN=64, BK=64. cp.async DOUBLE-BUFFERED: load K-tile
+    // c+1 while the mma consumes tile c (hides HBM latency — the real GEMM lever).
+    const int BM=64, BN=64, BK=64, NS=8, NKS=4, U=BK/8;  // U=8 uint4/row
     int bx = blockIdx.x, by = blockIdx.y;
     int tok0 = tok0_arr[bx], gend = gend_arr[bx], n0 = by * BN;
     const __half* W = W_base + (long)eid_arr[bx] * N * K;
     int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tid4 = lane & 3;
     int wrow = warp * 16;
 
-    __shared__ __half As[BM][BK];
-    __shared__ __half Ws[BN][BK];
+    __shared__ __half As[2][BM][BK];
+    __shared__ __half Ws[2][BN][BK];
     float oc[NS][4];
     for (int s=0;s<NS;s++){ oc[s][0]=oc[s][1]=oc[s][2]=oc[s][3]=0.f; }
-
     int nchunk = K / BK;
+
+#define LOAD_CHUNK(C, BUF) do { int kc=(C)*BK; \
+    for (int e=tid; e<BM*U; e+=128){ int r=e/U, k8=(e%U)*8; int t=tok0+r; int v=(t<gend); \
+        unsigned sd=(unsigned)__cvta_generic_to_shared(&As[BUF][r][k8]); \
+        const __half* sp=&A[(long)(v?t:tok0)*K + kc + k8]; CPA(sd, sp, v); } \
+    for (int e=tid; e<BN*U; e+=128){ int r=e/U, k8=(e%U)*8; int nn=n0+r; int v=(nn<N); \
+        unsigned sd=(unsigned)__cvta_generic_to_shared(&Ws[BUF][r][k8]); \
+        const __half* sp=&W[(long)(v?nn:n0)*K + kc + k8]; CPA(sd, sp, v); } \
+    } while(0)
+
+    LOAD_CHUNK(0, 0); asm volatile("cp.async.commit_group;\n");
     for (int c=0;c<nchunk;c++){
-        int kc = c*BK;
-        for (int e=tid; e<BM*BK; e+=128){ int r=e>>6,k=e&63; int t=tok0+r;
-            As[r][k] = (t<gend) ? A[(long)t*K + kc + k] : __float2half(0.f); }
-        for (int e=tid; e<BN*BK; e+=128){ int r=e>>6,k=e&63; int nn=n0+r;
-            Ws[r][k] = (nn<N) ? W[(long)nn*K + kc + k] : __float2half(0.f); }
+        if (c+1<nchunk){ LOAD_CHUNK(c+1, (c+1)&1); asm volatile("cp.async.commit_group;\n");
+                         asm volatile("cp.async.wait_group 1;\n"); }
+        else { asm volatile("cp.async.wait_group 0;\n"); }
         __syncthreads();
+        int buf = c&1;
         for (int ks=0; ks<NKS; ks++){ int ko=ks*16;
-            unsigned a0=pk2(As[wrow+gid][ko+2*tid4],   As[wrow+gid][ko+2*tid4+1]);
-            unsigned a1=pk2(As[wrow+gid+8][ko+2*tid4], As[wrow+gid+8][ko+2*tid4+1]);
-            unsigned a2=pk2(As[wrow+gid][ko+2*tid4+8], As[wrow+gid][ko+2*tid4+9]);
-            unsigned a3=pk2(As[wrow+gid+8][ko+2*tid4+8],As[wrow+gid+8][ko+2*tid4+9]);
+            unsigned a0=pk2(As[buf][wrow+gid][ko+2*tid4],   As[buf][wrow+gid][ko+2*tid4+1]);
+            unsigned a1=pk2(As[buf][wrow+gid+8][ko+2*tid4], As[buf][wrow+gid+8][ko+2*tid4+1]);
+            unsigned a2=pk2(As[buf][wrow+gid][ko+2*tid4+8], As[buf][wrow+gid][ko+2*tid4+9]);
+            unsigned a3=pk2(As[buf][wrow+gid+8][ko+2*tid4+8],As[buf][wrow+gid+8][ko+2*tid4+9]);
             for (int s=0;s<NS;s++){ int nb=s*8;
-                unsigned b0=pk2(Ws[nb+gid][ko+2*tid4],   Ws[nb+gid][ko+2*tid4+1]);
-                unsigned b1=pk2(Ws[nb+gid][ko+2*tid4+8], Ws[nb+gid][ko+2*tid4+9]);
+                unsigned b0=pk2(Ws[buf][nb+gid][ko+2*tid4],   Ws[buf][nb+gid][ko+2*tid4+1]);
+                unsigned b1=pk2(Ws[buf][nb+gid][ko+2*tid4+8], Ws[buf][nb+gid][ko+2*tid4+9]);
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                     "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
                     :"+f"(oc[s][0]),"+f"(oc[s][1]),"+f"(oc[s][2]),"+f"(oc[s][3])
