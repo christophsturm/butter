@@ -685,7 +685,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_grouped_gemm_cutlass, moe_q4_grouped_mma, moe_q4_grouped_mma_dev, moe_router_device, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_grouped_gemm_cutlass, moe_q4_grouped_mma, moe_q4_grouped_mma_dev, moe_router_device, moe_scatter_add_det_dev, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -2232,8 +2232,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 // device token-idx + weight tensors → atomic scatter, NO host
                                 // tidx_h/wts_h (host-sync-free, toward graph capture).
                                 let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
-                                let dn_f32 = cast_f16_f32(d, &dn_out).unwrap(); // atomic scatter reads f32
-                                moe_scatter_add(d, &dn_f32, st_dev, sw_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                                // DETERMINISTIC device scatter (device CSR build) → host-sync-
+                                // free AND argmax-stable (the atomic scatter flipped 1104/1776).
+                                moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
                             } else {
                                 let wts_h: Vec<f32> = triples.iter().map(|(_,_,w)| *w).collect();
                                 let tidx_h: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();

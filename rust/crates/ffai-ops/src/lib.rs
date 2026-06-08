@@ -3957,6 +3957,64 @@ pub fn moe_scatter_add_det(
     )
 }
 
+// Stable token-CSR scan: one thread per output token scans ALL mt sorted rows in
+// ASCENDING row order, appending matching rows into tok_rows[toff[t]..]. No atomics
+// → deterministic row order per token (== the host CSR moe_scatter_add_det builds).
+const MOE_TOKEN_CSR_SRC: &str = r#"
+extern "C" __global__ void moe_token_csr(
+    const unsigned* __restrict__ sorted_tok, const unsigned* __restrict__ toff,
+    unsigned* __restrict__ tok_rows, int mt, int s)
+{
+    int t = blockIdx.x*blockDim.x + threadIdx.x; if (t >= s) return;
+    unsigned pos = toff[t];
+    for (int r = 0; r < mt; r++) { if (sorted_tok[r] == (unsigned)t) { tok_rows[pos] = (unsigned)r; pos++; } }
+}
+"#;
+
+/// DETERMINISTIC fully-on-device scatter-add (no host sync): builds the per-token
+/// CSR (toff, tok_rows) ON DEVICE from `sorted_tok` (hist→prefix→stable scan) then
+/// runs the deterministic moe_scatter_add_det kernel. Same result as the host
+/// `moe_scatter_add_det` but host-sync-free → graph-capturable.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_scatter_add_det_dev(
+    dev: &dyn Device,
+    dn: &Tensor,
+    sorted_tok: &Tensor,
+    wts: &Tensor,
+    acc: &Tensor,
+    s: usize,
+    mt: usize,
+    hid: usize,
+    unscale: f32,
+    in_f16: bool,
+) -> Result<()> {
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let counts = Tensor::new(dev.upload(&vec![0u8; s * 4]).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![s], DType::U32);
+    dev.dispatch_raw_cuda(MOE_HIST_SRC, "moe_hist.cu", "moe_hist",
+        &[(sorted_tok.buffer.as_ref(), sorted_tok.offset), (counts.buffer.as_ref(), 0)],
+        &[i(mt as i32)], [(mt as u32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+    let toff = Tensor::empty(dev, vec![s + 1], DType::U32)?;
+    let cursor = Tensor::empty(dev, vec![s], DType::U32)?;
+    dev.dispatch_raw_cuda(MOE_PREFIX_SRC, "moe_prefix.cu", "moe_prefix",
+        &[(counts.buffer.as_ref(), 0), (toff.buffer.as_ref(), 0), (cursor.buffer.as_ref(), 0)],
+        &[i(s as i32)], [1, 1, 1], [32, 1, 1], 0, false)?;
+    let tok_rows = Tensor::empty(dev, vec![mt], DType::U32)?;
+    dev.dispatch_raw_cuda(MOE_TOKEN_CSR_SRC, "moe_token_csr.cu", "moe_token_csr",
+        &[(sorted_tok.buffer.as_ref(), sorted_tok.offset), (toff.buffer.as_ref(), 0), (tok_rows.buffer.as_ref(), 0)],
+        &[i(mt as i32), i(s as i32)], [(s as u32).div_ceil(128), 1, 1], [128, 1, 1], 0, false)?;
+    let s_i = (s as i32).to_le_bytes().to_vec();
+    let hid_i = (hid as i32).to_le_bytes().to_vec();
+    let uscale_f = unscale.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        MOE_SCATTER_ADD_DET_SRC, "moe_scatter_add_det.cu",
+        if in_f16 { "moe_scatter_add_det_f16" } else { "moe_scatter_add_det_f32" },
+        &[(dn.buffer.as_ref(), 0), (toff.buffer.as_ref(), 0), (tok_rows.buffer.as_ref(), 0),
+          (wts.buffer.as_ref(), 0), (acc.buffer.as_ref(), 0)],
+        &[s_i, hid_i, uscale_f],
+        [s as u32, (hid as u32).div_ceil(128), 1], [128, 1, 1], 0, false)?;
+    Ok(())
+}
+
 /// Raw CUDA source for `relu2_scale_f16`: `out[i] = max(0, (float)in[i])^2 * scale`
 /// where `in` and `out` are __half (f16). Fuses the cast-to-f32, relu, square,
 /// scale, and cast-back-to-f16 that the MoE prefill loop previously did by
