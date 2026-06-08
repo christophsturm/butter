@@ -1536,6 +1536,37 @@ pub fn quantize_nvfp4(w: &[f32], m: usize, k: usize) -> (Vec<u32>, Vec<u8>, f32)
     (codes, scales, global)
 }
 
+/// Dequantize a [`quantize_nvfp4`] tensor back to row-major `[m, k]` f32 (for
+/// host reference / FP4-sim round-trips). `codes` `[m·k/8]` u32, `scales`
+/// `[m·k/16]` UE4M3 bytes, `global` f32.
+pub fn dequantize_nvfp4(codes: &[u32], scales: &[u8], global: f32, m: usize, k: usize) -> Vec<f32> {
+    let nblk = k / 16;
+    let mut out = vec![0f32; m * k];
+    for r in 0..m {
+        for b in 0..nblk {
+            let bs = dec_ue4m3(scales[r * nblk + b]) * global;
+            for i in 0..16 {
+                let elem = b * 16 + i;
+                let word = elem / 8;
+                let nib = elem % 8;
+                let code = (codes[r * (k / 8) + word] >> (nib * 4)) & 0xf;
+                let sign = if code & 8 != 0 { -1.0 } else { 1.0 };
+                out[r * k + elem] = sign * E2M1_LUT[(code & 7) as usize] * bs;
+            }
+        }
+    }
+    out
+}
+
+/// Round-trip a row-major `[m, k]` f32 buffer through NVFP4 quantize→dequantize —
+/// i.e. inject exactly the E2M1+UE4M3 block-16 quantization noise the native FP4
+/// GEMM would see, without any kernel. Used to de-risk argmax before building the
+/// real FP4 path (`NEMOTRON_FP4_SIM`).
+pub fn nvfp4_roundtrip(w: &[f32], m: usize, k: usize) -> Vec<f32> {
+    let (codes, scales, global) = quantize_nvfp4(w, m, k);
+    dequantize_nvfp4(&codes, &scales, global, m, k)
+}
+
 /// Prefill linear: `out[r, :] = weight · input[r, :]` for a block of rows in
 /// one dispatch — `weight` is `[out_dim, in_dim]`, `input` is `[n_rows, in_dim]`,
 /// result `[n_rows, out_dim]`. Dispatches the 32×32-tiled Reduction kernel

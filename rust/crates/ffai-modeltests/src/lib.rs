@@ -685,7 +685,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_grouped_gemm_cutlass, moe_q4_grouped_mma, moe_q4_grouped_mma_dev, moe_router_device, moe_scatter_add_det_dev, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_grouped_gemm_cutlass, moe_q4_grouped_mma, moe_q4_grouped_mma_dev, moe_router_device, moe_scatter_add_det_dev, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, nvfp4_roundtrip, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -2218,15 +2218,28 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // graph-capturable. Validated to match the host-descriptor path.
                             let devdesc = devdesc_skip && moe_dev.is_some();
                             let off_dev_ref = moe_dev.as_ref().map(|(o,_,_)| o);
+                            // NEMOTRON_FP4_SIM: round-trip the MoE activations through NVFP4
+                            // (e2m1+ue4m3 block-16) to inject EXACTLY the FP4-GEMM quant noise
+                            // (no new mma kernel) → de-risk argmax 1104@S2048 BEFORE building the
+                            // native FP4 path. Weights stay Q4 (~same err as NVFP4 weights); the
+                            // NEW noise is the f16→FP4 activations, which this exercises.
+                            let fp4_sim = std::env::var("NEMOTRON_FP4_SIM").is_ok() && is_cuda;
+                            let fp4rt = |t: &Tensor, rows: usize, kk: usize| -> Tensor {
+                                let hf = dl(&cast_f16_f32(d, t).unwrap(), rows * kk);
+                                let rt = nvfp4_roundtrip(&hf, rows, kk);
+                                cast_f32_f16(d, &upm(&rt, vec![rows, kk])).unwrap()
+                            };
+                            let xs_in = if fp4_sim { fp4rt(&xs_f16, mt, hid) } else { xs_f16.clone() };
                             // UP: [mt,inter] = xs[mt,hid] · Wup_q4[eid; inter,hid]  (n=inter,k=hid)
                             let up_out = if devdesc {
                                 pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
-                                    moe_q4_grouped_mma_dev(d, &xs_f16, uqs, usc, off_dev_ref.unwrap(), n_exp, mt, inter, hid).unwrap())
+                                    moe_q4_grouped_mma_dev(d, &xs_in, uqs, usc, off_dev_ref.unwrap(), n_exp, mt, inter, hid).unwrap())
                             } else {
                                 pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
-                                    moe_q4_grouped_mma(d, &xs_f16, uqs, usc, &g_starts, &expert_ids, inter, hid).unwrap())
+                                    moe_q4_grouped_mma(d, &xs_in, uqs, usc, &g_starts, &expert_ids, inter, hid).unwrap())
                             };
-                            let a2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                            let a2_raw = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                            let a2 = if fp4_sim { fp4rt(&a2_raw, mt, inter) } else { a2_raw };
                             // DOWN: [mt,hid] = a2[mt,inter] · Wdn_q4[eid; hid,inter]  (n=hid,k=inter)
                             let dn_out = if devdesc {
                                 pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
