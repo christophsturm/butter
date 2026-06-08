@@ -435,10 +435,11 @@ public final class Model: @unchecked Sendable {
                 )
                 // Nemotron-Labs-Diffusion ships an optional
                 // `linear_spec_lora` adapter that sharpens the
-                // self-speculation diffusion drafter — attach it if the
-                // checkpoint included the subfolder.
-                if let nd = loaded.engine as? NemotronDiffusionModel {
-                    nd.attachLoRA(from: dir, device: device)
+                // self-speculation diffusion drafter. Generalized: any
+                // LoRA-adaptable engine auto-attaches its bundled adapter here
+                // — `attachLoRA` no-ops when the checkpoint shipped none.
+                if let adaptable = loaded.engine as? any LoRAAdaptable {
+                    adaptable.attachLoRA(from: dir, device: device)
                 }
                 let tokenizer = try await TokenizerLoader().load(from: dir)
                 return Model(
@@ -569,23 +570,27 @@ public final class Model: @unchecked Sendable {
 // ─── Hot LoRA adapter management ─────────────────────────────────────
 
 extension Model {
-    /// Whether a LoRA adapter is currently attached. Always `false` for
-    /// families that don't support adapters (only Nemotron-Labs-
-    /// Diffusion does today).
-    public var hasLoRA: Bool { nemotronLabsDiffusion?.hasLoRA ?? false }
+    /// The loaded engine viewed as `LoRAAdaptable`, or `nil` when this model's
+    /// family doesn't support adapters. The single delegation point so the
+    /// `Model` wrapper never special-cases a concrete family.
+    private var loraAdaptable: (any LoRAAdaptable)? { engine as? any LoRAAdaptable }
+
+    /// Whether a LoRA adapter is currently attached. `false` for families that
+    /// don't conform to `LoRAAdaptable`.
+    public var hasLoRA: Bool { loraAdaptable?.hasLoRA ?? false }
 
     /// Hot-load a LoRA adapter at runtime. `directory` may be the model
-    /// directory (the adapter is resolved under `linear_spec_lora/`) or
-    /// a directory holding `adapter_model.safetensors` directly — so the
-    /// same call swaps in the bundled adapter or an external one. Any
-    /// currently-attached adapter is replaced. No-op on families that
-    /// don't support adapters. Do not call during an active generate.
+    /// directory (the adapter is resolved under the family's adapter
+    /// subfolder) or a directory holding the adapter outright — so the same
+    /// call swaps in the bundled adapter or an external one. Any
+    /// currently-attached adapter is replaced. No-op on families that don't
+    /// support adapters. Do not call during an active generate.
     public func loadLoRA(from directory: URL, device: Device = .shared) {
-        guard let nd = nemotronLabsDiffusion else { return }
-        nd.detachLoRA()
-        nd.attachLoRA(from: directory, device: device)
+        guard let adaptable = loraAdaptable else { return }
+        adaptable.detachLoRA()
+        adaptable.attachLoRA(from: directory, device: device)
     }
 
     /// Hot-unload the current LoRA adapter. No-op when none is attached.
-    public func unloadLoRA() { nemotronLabsDiffusion?.detachLoRA() }
+    public func unloadLoRA() { loraAdaptable?.detachLoRA() }
 }
