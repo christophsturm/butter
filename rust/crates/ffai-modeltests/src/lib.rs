@@ -2579,6 +2579,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             if let Some(seg_lo) = seg_lo_dev.as_ref() {
                                 // Packed: block-diagonal varlen flash-attn (each query stays in its segment).
                                 pf!(7, attn_flops, sdpa_multi_tc_varlen(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), seg_lo, pk_seg_len, hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
+                            } else if hd == 128 && std::env::var("NEMOTRON_FLASH_MMA_OFF").is_err()
+                                      && std::env::var("NEMOTRON_FLASH_WMMA").is_err()
+                                      && std::env::var("NEMOTRON_FLASH_FUSED").is_err() {
+                                // DEFAULT (CUDA, non-packed, hd=128): FlashAttention-2 with
+                                // register-resident O (mma.sync) — beats cuBLAS-TC attention
+                                // 1.5-3.3× (no HBM score materialization, causal-skipped, high
+                                // occupancy). Argmax-exact. NEMOTRON_FLASH_MMA_OFF=1 → cuBLAS-TC.
+                                pf!(7, attn_flops, ffai_ops::sdpa_flash_mma(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
                             } else if std::env::var("NEMOTRON_FLASH_WMMA").is_ok() {
                                 // Fused tensor-core (wmma) causal FlashAttention: scores
                                 // stay in shared (no HBM round-trip), causal skipped.
