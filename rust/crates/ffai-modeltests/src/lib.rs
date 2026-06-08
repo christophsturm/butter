@@ -2011,10 +2011,16 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // into one [mt,hid] f16 buffer. The fewer_syncs per-expert GEMM
                             // reads device slices of this (offset g0*hid*2) → no host xs,
                             // no dl(&xn), no host scatter, no per-expert re-upload.
-                            let tok_idx: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
-                            let tok_dev = Tensor::new(d.upload(&tbu(&tok_idx)).unwrap(), vec![mt], DType::U32);
+                            // sorted_tok (st_dev) IS the device token-index gather list (==
+                            // triples tokens) → use it DIRECTLY when devsort, skipping the host
+                            // tok_idx build + re-upload (one step toward a host-sync-free forward).
+                            let tok_owned: Option<Tensor> = if moe_dev.is_some() { None } else {
+                                let tok_idx: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
+                                Some(Tensor::new(d.upload(&tbu(&tok_idx)).unwrap(), vec![mt], DType::U32))
+                            };
+                            let tok_dev = match &moe_dev { Some((_,st,_)) => st, None => tok_owned.as_ref().unwrap() };
                             let xn2d = xn.clone().reshaped(vec![s, hid]);
-                            let xs_f32 = pf!(12, 0.0, gather(d, &xn2d, &tok_dev).unwrap()); // [mt, hid] f32
+                            let xs_f32 = pf!(12, 0.0, gather(d, &xn2d, tok_dev).unwrap()); // [mt, hid] f32
                             let xs_f16 = pf!(12, 0.0, cast_f32_f16(d, &xs_f32).unwrap());   // [mt, hid] f16
                             (Vec::new(), Some(xs_f16))
                         } else {
@@ -2207,11 +2213,20 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
                                     moe_q4_grouped_mma(d, &a2, dqs, dsc, &g_starts, &expert_ids, hid, inter).unwrap())
                             };
-                            let wts_h: Vec<f32> = triples.iter().map(|(_,_,w)| *w).collect();
-                            let tidx_h: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
-                            let wts_dev = upm(&wts_h, vec![mt]);
                             let acc_dev = upm(&acc_h, vec![s, hid]);
-                            moe_scatter_add_det(d, &dn_out, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                            if devdesc {
+                                // Fully on-device scatter: sorted_tok/sorted_wt (st/sw) ARE the
+                                // device token-idx + weight tensors → atomic scatter, NO host
+                                // tidx_h/wts_h (host-sync-free, toward graph capture).
+                                let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
+                                let dn_f32 = cast_f16_f32(d, &dn_out).unwrap(); // atomic scatter reads f32
+                                moe_scatter_add(d, &dn_f32, st_dev, sw_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                            } else {
+                                let wts_h: Vec<f32> = triples.iter().map(|(_,_,w)| *w).collect();
+                                let tidx_h: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
+                                let wts_dev = upm(&wts_h, vec![mt]);
+                                moe_scatter_add_det(d, &dn_out, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                            }
                             if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
                         } else if use_grouped_gemm {
                             // ── Grouped-GEMM path (NEMOTRON_GROUPED_GEMM=1) ───────────────
