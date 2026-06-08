@@ -1955,8 +1955,9 @@ __device__ __forceinline__ unsigned pk2(__half a, __half b){
     return (unsigned)__half_as_ushort(a) | ((unsigned)__half_as_ushort(b) << 16);
 }
 __device__ __forceinline__ __half dqn(unsigned w, int nib, __half sc){
-    int n = (int)((w>>(nib*4))&0xf); n = (n^0x8)-0x8;
-    return __float2half((float)n * __half2float(sc));
+    // magic-0x6400 all-f16: (nib^8)|0x6400 = f16(1024+signed+8), -1032 → signed, ×sc.
+    unsigned short t = (unsigned short)((((w>>(nib*4))&0xf) ^ 0x8) | 0x6400u);
+    return __hmul(__hsub(__ushort_as_half(t), __float2half(1032.f)), sc);
 }
 #define CPA(SD,SP) asm volatile("cp.async.cg.shared.global [%0],[%1],16,16;\n" :: "r"(SD), "l"(SP))
 extern "C" __global__ void moe_q4_grouped_mma(
