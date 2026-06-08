@@ -1932,6 +1932,147 @@ extern "C" __global__ void sdpa_tc_finalize(
 }
 "#;
 
+/// FUSED single-kernel causal FlashAttention (no HBM score/prob materialization,
+/// no qprep/kprep/vprep passes). One warp per (head, query row): the warp holds
+/// `Q[r]` in registers, streams K/V rows from HBM, and runs the online softmax +
+/// `O` accumulation entirely in registers — scores never touch global memory.
+/// Causal is exploited by looping `p` only to `base_kv + r` (the masked upper
+/// triangle is never computed, ~2× fewer FLOPs than the materialized path).
+/// hd must be a multiple of 32 (warp lanes own `hd/32` dims each). Q/K/V F32 or
+/// F16; output matches `q.dtype`. This is v1 (scalar FMA, no tensor cores) — it
+/// wins by removing the 6-dispatch HBM round-trip + the causal waste; the wmma
+/// upgrade is the follow-up. NEMOTRON_FLASH_FUSED=1 in the model.
+const SDPA_FLASH_FUSED_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void sdpa_flash_fused(
+    const void* __restrict__ q_in,   // [Sq, nq, hd]
+    const void* __restrict__ k_in,   // [nkv, kv_stride, hd]
+    const void* __restrict__ v_in,   // [nkv, kv_stride, hd]
+    void*       __restrict__ out,    // [Sq, nq, hd]
+    int sq, int nq, int nkv, int hd, int kv_stride,
+    int base_kv, float scale, int in_f32, int out_f32)
+{
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int rpb  = blockDim.x >> 5;            // query rows per block (= warps)
+    int r    = blockIdx.y * rpb + warp;    // query row
+    int h    = blockIdx.x;                 // q head
+    if (r >= sq) return;
+    int hpg  = nq / nkv;
+    int kh   = h / hpg;                    // kv head
+    int maxp = base_kv + r;                // inclusive causal bound
+    int dpl  = hd >> 5;                    // dims per lane (hd=128 -> 4)
+
+    const float* qf = (const float*)q_in; const __half* qhp = (const __half*)q_in;
+    const float* kf = (const float*)k_in; const __half* khp = (const __half*)k_in;
+    const float* vf = (const float*)v_in; const __half* vhp = (const __half*)v_in;
+
+    float qreg[8], oreg[8];
+    long qbase = ((long)r * nq + h) * (long)hd;
+    #pragma unroll
+    for (int t = 0; t < dpl; t++) {
+        int d = lane + (t << 5);
+        float qv = in_f32 ? qf[qbase + d] : __half2float(qhp[qbase + d]);
+        qreg[t] = qv * scale;
+        oreg[t] = 0.0f;
+    }
+    float m = -3.4e38f, l = 0.0f;
+
+    for (int p = 0; p <= maxp; p++) {
+        long kbase = ((long)kh * kv_stride + p) * (long)hd;
+        float part = 0.0f;
+        #pragma unroll
+        for (int t = 0; t < dpl; t++) {
+            int d = lane + (t << 5);
+            float kv = in_f32 ? kf[kbase + d] : __half2float(khp[kbase + d]);
+            part += qreg[t] * kv;
+        }
+        // full-warp reduce (sum) then broadcast the dot to every lane
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            part += __shfl_down_sync(0xffffffffu, part, off);
+        float s = __shfl_sync(0xffffffffu, part, 0);
+        // online softmax (identical math on every lane → consistent m/l)
+        float m_new = fmaxf(m, s);
+        float corr  = __expf(m - m_new);    // first iter: exp(-inf)=0
+        float pij   = __expf(s - m_new);
+        l = l * corr + pij;
+        #pragma unroll
+        for (int t = 0; t < dpl; t++) {
+            int d = lane + (t << 5);
+            float vv = in_f32 ? vf[kbase + d] : __half2float(vhp[kbase + d]);
+            oreg[t] = oreg[t] * corr + pij * vv;
+        }
+        m = m_new;
+    }
+
+    long obase = ((long)r * nq + h) * (long)hd;
+    float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    #pragma unroll
+    for (int t = 0; t < dpl; t++) {
+        int d = lane + (t << 5);
+        float ov = oreg[t] * inv;
+        if (out_f32) ((float*)out)[obase + d] = ov;
+        else         ((__half*)out)[obase + d] = __float2half(ov);
+    }
+}
+"#;
+
+/// Fused causal FlashAttention (see [`SDPA_FLASH_FUSED_SRC`]). Same signature +
+/// numerics as [`sdpa_multi_tc`] (its correctness oracle): Q pre-scaled by
+/// `scale`, GQA via `heads_per_group`, causal online softmax, output `[Sq,nq,hd]`
+/// in `q.dtype`. CUDA-only. `head_dim % 32 == 0` required.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_flash_fused(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    n_q_heads: u32,
+    base_kv: u32,
+    n_query: u32,
+    kv_stride: u32,
+    heads_per_group: u32,
+    causal: bool,
+    scale: f32,
+) -> Result<Tensor> {
+    let hd = head_dim;
+    let nq = n_q_heads as usize;
+    let sq = n_query as usize;
+    let hpg = heads_per_group as usize;
+    let nkv = nq / hpg;
+    let base = base_kv as usize;
+    if hd % 32 != 0 {
+        return Err(Error::Msg(format!("sdpa_flash_fused: head_dim {hd} not a multiple of 32")));
+    }
+    if !causal {
+        return Err(Error::Msg("sdpa_flash_fused: only causal wired".into()));
+    }
+    let n_kv = base + sq;
+    if n_kv > kv_stride as usize {
+        return Err(Error::Msg(format!("sdpa_flash_fused: n_kv {n_kv} exceeds kv_stride {kv_stride}")));
+    }
+    let in_f32 = match q.dtype { DType::F32 => 1i32, DType::F16 => 0,
+        other => return Err(Error::Msg(format!("sdpa_flash_fused: unsupported dtype {other:?}"))) };
+    let out_f32 = if q.dtype == DType::F32 { 1i32 } else { 0 };
+    let out = Tensor::empty(dev, vec![sq, nq, hd], q.dtype)?;
+
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    let rpb: u32 = 4;                      // 4 warps/block, one query row each
+    let block = [rpb * 32, 1, 1];
+    let grid = [nq as u32, (sq as u32).div_ceil(rpb), 1];
+    dev.dispatch_raw_cuda(
+        SDPA_FLASH_FUSED_SRC, "sdpa_flash_fused.cu", "sdpa_flash_fused",
+        &[(q.buffer.as_ref(), q.offset), (k.buffer.as_ref(), k.offset),
+          (v.buffer.as_ref(), v.offset), (out.buffer.as_ref(), 0)],
+        &[i(sq as i32), i(nq as i32), i(nkv as i32), i(hd as i32), i(kv_stride as i32),
+          i(base as i32), f(scale), i(in_f32), i(out_f32)],
+        grid, block, 0, false)?;
+    Ok(out)
+}
+
 /// Tensor-core prefill SDPA — drop-in faster replacement for [`sdpa_multi`].
 /// Same signature/semantics (causal/full, GQA, head_dim=128, Q pre-scaled by
 /// `scale`), but runs QKᵀ and P·V on the cuBLAS tensor cores with a

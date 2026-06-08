@@ -2579,6 +2579,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             if let Some(seg_lo) = seg_lo_dev.as_ref() {
                                 // Packed: block-diagonal varlen flash-attn (each query stays in its segment).
                                 pf!(7, attn_flops, sdpa_multi_tc_varlen(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), seg_lo, pk_seg_len, hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
+                            } else if std::env::var("NEMOTRON_FLASH_FUSED").is_ok() {
+                                // Fused single-kernel causal FlashAttention: no HBM
+                                // score/prep round-trip, causal triangle skipped.
+                                pf!(7, attn_flops, ffai_ops::sdpa_flash_fused(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
                             } else {
                             pf!(7, attn_flops, sdpa_multi_tc(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
                             }
