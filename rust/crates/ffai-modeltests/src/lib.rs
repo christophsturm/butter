@@ -1854,11 +1854,17 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // scatter) with NO host sync — the prerequisite for CUDA-graphing
                         // the forward (kill the host-launch GPU idle, the real 3-5× lever).
                         let mut moe_dev: Option<(Tensor, Tensor, Tensor)> = None; // (offsets, sorted_tok, sorted_wt)
-                        // NEMOTRON_Q4_DEVDESC: fully-on-device MoE (descriptors+gather+scatter
-                        // all device) → SKIP the host triples reconstruction entirely. mt =
-                        // s*top_k is deterministic (every token picks exactly top_k experts) so
-                        // NO dl is needed → the MoE region is host-sync-free (graph-capturable).
-                        let devdesc_skip = is_cuda && std::env::var("NEMOTRON_Q4_DEVDESC").is_ok();
+                        // Fully-on-device MoE (descriptors+gather+scatter all device) → SKIP
+                        // the host triples reconstruction entirely. mt = s*top_k is
+                        // deterministic (every token picks exactly top_k experts) so NO dl is
+                        // needed → the MoE region is host-sync-free. DEFAULT-ON for CUDA
+                        // batched prefill: it kills the per-expert host round-trips that left
+                        // the GPU 56% IDLE on the host-triples path (nsys: 43.6%→98% busy) →
+                        // ~2× prefill (S=2048 925→1820, S=1024 968→2009, S=3072 461→1865 tok/s;
+                        // argmax-matches the host path at S=1024/2048/3072, gold 1104@S2048).
+                        // NEMOTRON_Q4_DEVDESC_OFF=1 reverts to the host-triples path (A/B).
+                        // (Decode is unaffected — this is inside the batched-prefill closure.)
+                        let devdesc_skip = is_cuda && std::env::var("NEMOTRON_Q4_DEVDESC_OFF").is_err();
                         let (triples, mt): (Vec<(u32, usize, f32)>, usize) = if devsort {
                             let bias_dev = up(&bias[..]);
                             let rl_dev = pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64, matmul(d, gate_w, &xn).unwrap());
@@ -2210,7 +2216,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // NEMOTRON_Q4_DEVDESC=1: build tile descriptors ON DEVICE from the
                             // routing offsets (no host g_starts, FIXED launch) → the GEMM is
                             // graph-capturable. Validated to match the host-descriptor path.
-                            let devdesc = std::env::var("NEMOTRON_Q4_DEVDESC").is_ok() && moe_dev.is_some();
+                            let devdesc = devdesc_skip && moe_dev.is_some();
                             let off_dev_ref = moe_dev.as_ref().map(|(o,_,_)| o);
                             // UP: [mt,inter] = xs[mt,hid] · Wup_q4[eid; inter,hid]  (n=inter,k=hid)
                             let up_out = if devdesc {
@@ -2622,6 +2628,13 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // are small, sa²≪f16max so no /256 needed) + device merge below.
                         let mut sd_dev_opt: Option<Tensor> = None;
                         let sd_h: Vec<f32> = if devdesc_skip && is_cuda {
+                            // devdesc: fully ON-DEVICE shared expert (no dl) — device cuBLAS
+                            // (cublasLt, fast tensor-core) + device relu²(full scale — shared
+                            // activations small, sa²≪f16max) + device merge below. NOTE: this
+                            // is NOT CUDA-graph-capturable (the f16-out cublasLt wmma kernel
+                            // faults on replay), but graphs are a dead end here anyway — the
+                            // host-free forward alone pegs the GPU at ~98% busy, so the win is
+                            // killing the host round-trip idle, NOT graph replay.
                             let wsu = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
                             let xnh = pf!(15, 0.0, cast_f32_f16(d, &xn).unwrap());
                             let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
