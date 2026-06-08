@@ -2614,7 +2614,22 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let metal_mma_shared = !is_cuda
                             && shared_mma_flag.as_deref() != Some("0")
                             && !std::env::var("NEMOTRON_METAL_F32_SHARED").is_ok();
-                        let sd_h: Vec<f32> = if metal_mma_shared {
+                        // devdesc: fully ON-DEVICE shared expert (no dl) for graph capture.
+                        // device cuBLAS GEMMs + device relu²(full scale — shared activations
+                        // are small, sa²≪f16max so no /256 needed) + device merge below.
+                        let mut sd_dev_opt: Option<Tensor> = None;
+                        let sd_h: Vec<f32> = if devdesc_skip && is_cuda {
+                            let wsu = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
+                            let xnh = pf!(15, 0.0, cast_f32_f16(d, &xn).unwrap());
+                            let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
+                                gemm_cublas(d, &xnh, &wsu, s, *sm_up, *sk_up).unwrap());
+                            let sa2 = pf!(3, 0.0, relu2_scale_f16(d, &sa, 1.0f32).unwrap()); // full scale, device
+                            let wsd = deq16(&format!("{p}.shdn"), sdqs, sdsc, *sm_dn, *sk_dn, 0);
+                            let sd = pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
+                                gemm_cublas(d, &sa2, &wsd, s, *sm_dn, *sk_dn).unwrap()); // [s,hid] f16
+                            sd_dev_opt = Some(pf!(15, 0.0, cast_f16_f32(d, &sd).unwrap())); // device f32, full scale
+                            Vec::new()
+                        } else if metal_mma_shared {
                             // ── Portable Metal shared-expert MMA: gemm_q4_mpp up/down, host relu2 ──
                             // Cast xn → f16 once; up GEMM [s,hid]·Wupᵀ → [s,shared_inter] f16;
                             // relu2+(/256) in host f32 (overflow-safe); re-cast → f16; down GEMM
@@ -2680,9 +2695,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         };
                         if let Some(acc_dev) = acc_dev_keep.take() {
                             // ONDEVICE_MOE: routed acc is already on device. Merge the
-                            // shared-expert output (host f32, overflow-safe) + residual
-                            // on device — no dl(acc)+host-add+upm(acc) round-trip.
-                            let sd_dev = upm(&sd_h, vec![s, hid]);
+                            // shared-expert output + residual on device — no dl/upm. Under
+                            // devdesc sd is ALREADY device (sd_dev_opt, host-sync-free);
+                            // else upload the host f32 shared output.
+                            let sd_dev = sd_dev_opt.take().unwrap_or_else(|| upm(&sd_h, vec![s, hid]));
                             let merged = add(d, &acc_dev, &sd_dev).unwrap();
                             xt = add(d, &xt, &merged).unwrap();
                         } else {
