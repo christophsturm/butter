@@ -1857,10 +1857,8 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let swt = dl(&sw_dev, m);
                             let mut tr = Vec::with_capacity(m);
                             for e in 0..n_exp { for r in offs[e] as usize..offs[e+1] as usize { tr.push((e as u32, stok[r] as usize, swt[r])); } }
-                            // Match host stable order (by expert, then token) — the downstream
-                            // deterministic scatter is order-sensitive. (TODO: stable on-device
-                            // sort to drop this host sort for full graph-cleanliness.)
-                            tr.sort_by(|x,y| (x.0,x.1).cmp(&(y.0,y.1)));
+                            // route_sort is now STABLE (within-expert token order matches a host
+                            // stable_sort) → no host re-sort needed; tr already in canonical order.
                             (tr, m)
                         } else {
                             let rl_all = dl(&pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64, matmul(d, gate_w, &xn).unwrap()), s * n_exp);

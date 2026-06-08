@@ -1264,15 +1264,24 @@ extern "C" __global__ void moe_prefix(const unsigned* __restrict__ counts,
 }
 "#;
 const MOE_SCATTER_SORT_SRC: &str = r#"
-#include <cuda_fp16.h>
 extern "C" __global__ void moe_scatter_sort(
     const unsigned* __restrict__ idx, const float* __restrict__ wt,
-    unsigned* cursor, unsigned* __restrict__ sorted_tok, float* __restrict__ sorted_wt,
-    int mt, int top_k)
+    const unsigned* __restrict__ offsets, unsigned* __restrict__ sorted_tok, float* __restrict__ sorted_wt,
+    int mt, int top_k, int n_exp)
 {
-    int i = blockIdx.x*blockDim.x + threadIdx.x; if (i >= mt) return;
-    unsigned e = idx[i]; unsigned pos = atomicAdd(cursor + e, 1u);
-    sorted_tok[pos] = (unsigned)(i / top_k); sorted_wt[pos] = wt[i];
+    // STABLE counting-sort scatter: one thread per expert scans all pairs in
+    // index order, placing its tokens into [offsets[e], offsets[e+1]) ascending.
+    // No atomics → deterministic + within-expert token order matches a host
+    // stable_sort (so the model can drop its host re-sort). O(n_exp*mt).
+    int e = blockIdx.x*blockDim.x + threadIdx.x; if (e >= n_exp) return;
+    unsigned pos = offsets[e];
+    for (int i = 0; i < mt; i++) {
+        if (idx[i] == (unsigned)e) {
+            sorted_tok[pos] = (unsigned)(i / top_k);
+            sorted_wt[pos] = wt[i];
+            pos++;
+        }
+    }
 }
 "#;
 
@@ -1306,11 +1315,12 @@ pub fn moe_route_sort_device(
     dev.dispatch_raw_cuda(MOE_PREFIX_SRC, "moe_prefix.cu", "moe_prefix",
         &[(counts.buffer.as_ref(), 0), (offsets.buffer.as_ref(), 0), (cursor.buffer.as_ref(), 0)],
         &[i(n_exp as i32)], [1, 1, 1], [32, 1, 1], 0, false)?;
-    // 4. scatter into sorted order
+    // 4. STABLE scatter (one thread/expert, scans in index order) → sorted output
+    let _ = &cursor; // cursor no longer used (stable scatter reads offsets directly)
     dev.dispatch_raw_cuda(MOE_SCATTER_SORT_SRC, "moe_scatter_sort.cu", "moe_scatter_sort",
-        &[(idx.buffer.as_ref(), 0), (wt.buffer.as_ref(), 0), (cursor.buffer.as_ref(), 0),
+        &[(idx.buffer.as_ref(), 0), (wt.buffer.as_ref(), 0), (offsets.buffer.as_ref(), 0),
           (sorted_tok.buffer.as_ref(), 0), (sorted_wt.buffer.as_ref(), 0)],
-        &[i(mt as i32), i(top_k as i32)], [(mt as u32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+        &[i(mt as i32), i(top_k as i32), i(n_exp as i32)], [(n_exp as u32).div_ceil(128), 1, 1], [128, 1, 1], 0, false)?;
     Ok((sorted_tok, sorted_wt, offsets))
 }
 
