@@ -1838,23 +1838,46 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // ── Router over all S tokens (host top-k, matching decode) ──
                         // Batched gate gemv: [S, n_exp]. gate.weight is f32 dense.
                         let gate_w = &fwd[&format!("{p}.mixer.gate.weight")];
-                        let rl_all = dl(&pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64, matmul(d, gate_w, &xn).unwrap()), s * n_exp);
-                        // Per token: sigmoid+bias top-k → (expert, weight). Expand to
-                        // S*top_k triples, then SORT by expert for the bm64 BGEMM.
+                        // NEMOTRON_DEVSORT=1 (CUDA): on-device router + counting-sort
+                        // (moe_route_sort_device) — keeps the gate logits ON DEVICE (no
+                        // ~1MB rl_all dl), runs sigmoid+bias+topk + sort on the GPU, then
+                        // reconstructs the SAME `triples` via 3 small dls (offsets, sorted
+                        // tok, sorted wt). Removes the per-E-layer host sigmoid/topk/sort.
+                        // Step toward fully-on-device MoE + CUDA-graph prefill.
+                        let devsort = is_cuda && std::env::var("NEMOTRON_DEVSORT_OFF").is_err();
                         let _t_router = std::time::Instant::now();
-                        let mut triples: Vec<(u32, usize, f32)> = Vec::with_capacity(s * top_k); // (expert, token, weight)
-                        for ti in 0..s {
-                            let rl = &rl_all[ti*n_exp..(ti+1)*n_exp];
-                            let sig: Vec<f32> = rl.iter().map(|&z| 1.0/(1.0+(-z).exp())).collect();
-                            let choice: Vec<f32> = (0..n_exp).map(|i| sig[i]+bias[i]).collect();
-                            let eidx = ffai_runtime::topk(&choice, top_k);
-                            let mut w: Vec<f32> = eidx.iter().map(|&e| sig[e]).collect();
-                            let wsum: f32 = w.iter().sum::<f32>()+1e-20; for v in w.iter_mut() { *v = *v/wsum*scale_f; }
-                            for (j,&e) in eidx.iter().enumerate() { triples.push((e as u32, ti, w[j])); }
-                        }
-                        // Stable sort by expert id → contiguous same-expert groups.
-                        triples.sort_by_key(|t| t.0);
-                        let mt = triples.len();
+                        let (triples, mt): (Vec<(u32, usize, f32)>, usize) = if devsort {
+                            let bias_dev = up(&bias[..]);
+                            let rl_dev = pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64, matmul(d, gate_w, &xn).unwrap());
+                            let (st_dev, sw_dev, off_dev) = ffai_ops::moe_route_sort_device(d, &rl_dev, &bias_dev, n_exp, top_k, scale_f).unwrap();
+                            let rdu = |t: &Tensor, n: usize| -> Vec<u32> { let mut b = vec![0u8; n*4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); b.chunks(4).map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect() };
+                            let offs = rdu(&off_dev, n_exp + 1);
+                            let m = offs[n_exp] as usize;
+                            let stok = rdu(&st_dev, m);
+                            let swt = dl(&sw_dev, m);
+                            let mut tr = Vec::with_capacity(m);
+                            for e in 0..n_exp { for r in offs[e] as usize..offs[e+1] as usize { tr.push((e as u32, stok[r] as usize, swt[r])); } }
+                            // Match host stable order (by expert, then token) — the downstream
+                            // deterministic scatter is order-sensitive. (TODO: stable on-device
+                            // sort to drop this host sort for full graph-cleanliness.)
+                            tr.sort_by(|x,y| (x.0,x.1).cmp(&(y.0,y.1)));
+                            (tr, m)
+                        } else {
+                            let rl_all = dl(&pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64, matmul(d, gate_w, &xn).unwrap()), s * n_exp);
+                            let mut tr: Vec<(u32, usize, f32)> = Vec::with_capacity(s * top_k);
+                            for ti in 0..s {
+                                let rl = &rl_all[ti*n_exp..(ti+1)*n_exp];
+                                let sig: Vec<f32> = rl.iter().map(|&z| 1.0/(1.0+(-z).exp())).collect();
+                                let choice: Vec<f32> = (0..n_exp).map(|i| sig[i]+bias[i]).collect();
+                                let eidx = ffai_runtime::topk(&choice, top_k);
+                                let mut w: Vec<f32> = eidx.iter().map(|&e| sig[e]).collect();
+                                let wsum: f32 = w.iter().sum::<f32>()+1e-20; for v in w.iter_mut() { *v = *v/wsum*scale_f; }
+                                for (j,&e) in eidx.iter().enumerate() { tr.push((e as u32, ti, w[j])); }
+                            }
+                            tr.sort_by_key(|t| t.0);
+                            let m = tr.len();
+                            (tr, m)
+                        };
                         if std::env::var("NEMOTRON_ROUTER_TIME").is_ok() {
                             ROUTER_HOST_T.with(|c| c.set(c.get() + _t_router.elapsed().as_secs_f64()));
                         }

@@ -1227,7 +1227,7 @@ extern "C" __global__ void moe_batched_router(
     if (ti < s) {
         for (int j = e; j < n_exp; j += blockDim.x) {
             float z = logits[(long)ti*n_exp + j];
-            float sg = 1.f/(1.f+__expf(-z));
+            float sg = 1.f/(1.f+expf(-z));   // precise expf (not __expf) to match host topk exactly
             u[j] = sg; b[j] = sg + bias[j];
         }
     }
