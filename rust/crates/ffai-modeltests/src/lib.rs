@@ -1460,6 +1460,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     // (the same token the sequential path would produce). Token sequence is the
     // greedy chain seeded by `tok` (matching the sequential warm-up).
     thread_local! { static LAST_BATCHED_LOGITS: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    // Device logits tensor (no dl) + capture flag — for CUDA-graphing the forward.
+    thread_local! { static LAST_BATCHED_LOGITS_DEV: std::cell::RefCell<Option<Tensor>> = const { std::cell::RefCell::new(None) }; }
+    thread_local! { static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
     let prefill_batched = std::env::var("NEMOTRON_PREFILL_BATCHED").is_ok();
     if prefill_batched && prefill > 0 {
         let s = prefill; // number of prompt tokens
@@ -2796,13 +2799,21 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     BATCHED_LAYER_TRACE.with(|c| { let mut v = c.borrow_mut(); if v.len() <= l { v.resize(l+1, Vec::new()); } v[l] = h; });
                 }
             }
-            // final norm + lm_head on the LAST token only.
+            // final norm + lm_head on the LAST token only — DEVICE-CLEAN (no dl→up
+            // roundtrip): slice the last token on device, lm_head GEMM on device →
+            // device logits. Store the device logits for the graph path; dl for argmax
+            // ONLY when not capturing (a dl aborts cuda-graph stream capture).
             let xf = rms_norm(d, &xt, &fwd["norm_f"], eps).unwrap(); // [s, hid]
-            let last = dl(&slice(d, &xf, (s-1)*hid, hid).unwrap(), hid);
-            let logits = dl(&pf!(14, 2.0 * vocab as f64 * hid as f64, qmv(&up(&last), "language_model.lm_head.weight")), vocab);
-            let am = ffai_runtime::argmax(&logits);
-            LAST_BATCHED_LOGITS.with(|c| *c.borrow_mut() = logits);
-            am
+            let last_dev = slice(d, &xf, (s-1)*hid, hid).unwrap();   // [hid] device
+            let logits_dev = pf!(14, 2.0 * vocab as f64 * hid as f64, qmv(&last_dev, "language_model.lm_head.weight"));
+            LAST_BATCHED_LOGITS_DEV.with(|c| *c.borrow_mut() = Some(logits_dev.clone()));
+            if CAPTURING.with(|c| c.get()) { 0usize }
+            else {
+                let logits = dl(&logits_dev, vocab);
+                let am = ffai_runtime::argmax(&logits);
+                LAST_BATCHED_LOGITS.with(|c| *c.borrow_mut() = logits);
+                am
+            }
         };
 
         // Fixed prompt id list (deterministic ramp). The correctness gate runs BOTH
@@ -3009,10 +3020,44 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         for s2 in ssm_state.iter_mut() { *s2 = None; }
         for kv in kvcache.iter_mut() { *kv = None; }
         ROUTER_HOST_T.with(|c| c.set(0.0));
-        let t_pf = Instant::now();
-        let next = forward_batched(&ids, &conv_dev, &mut ssm_state, &mut kvcache, fakectx);
-        d.synchronize().ok();
-        let pf_s = t_pf.elapsed().as_secs_f64();
+        // NEMOTRON_GRAPH=1 (CUDA, needs NEMOTRON_Q4_DEVDESC for a dl-free forward):
+        // capture the whole forward into a CUDA graph, then time the REPLAY — kills
+        // the host-launch-serialized GPU idle (the ~2× prefill lever vs vLLM).
+        let graph_mode = std::env::var("NEMOTRON_GRAPH").is_ok() && d.backend() == Backend::Cuda;
+        let (next, pf_s) = if graph_mode {
+            // Pre-warm the caching pool to its high-water mark so NO cuMemAlloc fires
+            // during capture (alloc is illegal while the stream is capturing). Two extra
+            // forwards + resets fill the pool free-list with every scratch size the
+            // forward needs concurrently.
+            for _ in 0..2 {
+                let _ = forward_batched(&ids, &conv_dev, &mut ssm_state, &mut kvcache, fakectx);
+                d.synchronize().ok();
+                { let mut cd = conv_dev.borrow_mut(); for c in cd.iter_mut() { *c = None; } }
+                for s2 in ssm_state.iter_mut() { *s2 = None; }
+                for kv in kvcache.iter_mut() { *kv = None; }
+            }
+            CAPTURING.with(|c| c.set(true));
+            d.begin_capture().expect("begin_capture");
+            let _ = forward_batched(&ids, &conv_dev, &mut ssm_state, &mut kvcache, fakectx);
+            let exec = d.end_capture().expect("end_capture");
+            CAPTURING.with(|c| c.set(false));
+            d.synchronize().ok();
+            // timed replay (graph_launch re-runs the recorded ops on the captured buffers)
+            let t = Instant::now();
+            d.graph_launch(exec).expect("graph_launch");
+            d.synchronize().ok();
+            let rep = t.elapsed().as_secs_f64();
+            let logits = LAST_BATCHED_LOGITS_DEV.with(|c| c.borrow().clone()).map(|t| dl(&t, vocab)).unwrap_or_default();
+            let am = ffai_runtime::argmax(&logits);
+            LAST_BATCHED_LOGITS.with(|c| *c.borrow_mut() = logits);
+            eprintln!("  ── CUDA-GRAPH replay: {rep:.3}s = {:.2} tok/s (captured forward, argmax {am}) ──", ids.len() as f64 / rep);
+            (am, rep)
+        } else {
+            let t_pf = Instant::now();
+            let next = forward_batched(&ids, &conv_dev, &mut ssm_state, &mut kvcache, fakectx);
+            d.synchronize().ok();
+            (next, t_pf.elapsed().as_secs_f64())
+        };
         let n_tok = ids.len();
         let tps_batched = n_tok as f64 / pf_s;
         let conv_dev_on = std::env::var("NEMOTRON_CONV_DEVICE").is_ok()
