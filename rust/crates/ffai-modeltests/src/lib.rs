@@ -685,7 +685,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_router_device, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_grouped_gemm_cutlass, moe_router_device, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -1880,6 +1880,12 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         //   all DN GEMMs, then on-device scatter-add. Uses the device-gather
                         //   path for xs. Eliminates per-expert host syncs + cast overhead.
                         let use_grouped_gemm = std::env::var("NEMOTRON_GROUPED_GEMM").is_ok() && !use_bgemm && !use_w4a16;
+                        // NEMOTRON_CUTLASS_MOE=1 (CUDA + CUTLASS build): contiguous f16 expert
+                        //   slabs (dequant the full Q4 weight once, resident-cached) + ONE
+                        //   CUTLASS grouped GEMM per up/down over the sorted tokens. Beats
+                        //   cuBLAS per-expert on the skinny m≈96 shape (17.1 vs 15.7 TFLOP/s).
+                        let use_cutlass_moe = is_cuda && std::env::var("NEMOTRON_CUTLASS_MOE").is_ok()
+                            && !use_bgemm && !use_w4a16 && !use_grouped_gemm;
                         // NEMOTRON_MOE_GROUPED=1 (Metal only): replace the per-expert
                         //   dequant_q4_off+matmul loop with the token-sorted GROUPED Q4
                         //   GEMM (moe_bgemm_q4_bm64) — ONE MMA dispatch over all sorted
@@ -2077,6 +2083,38 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 moe_scatter_add_det(d, &dn_out, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32, false).unwrap();
                             }
                             // Download accumulated output for residual add.
+                            acc_h = dl(&acc_dev, s * hid);
+                        } else if use_cutlass_moe {
+                            // ── CUTLASS grouped MoE GEMM (NEMOTRON_CUTLASS_MOE=1) ─────────
+                            // Contiguous f16 expert slabs (dequant the FULL Q4 weight once,
+                            // resident-cached) + ONE CUTLASS grouped GEMM per up/down over
+                            // the sorted tokens; on-device relu²+scatter. Beats cuBLAS
+                            // per-expert on the skinny m≈96 shape (17.1 vs 15.7 TFLOP/s).
+                            let xs_f16 = xs_dev_f16_opt.as_ref().unwrap().clone();
+                            let mut g_starts: Vec<usize> = vec![0];
+                            let mut expert_ids: Vec<usize> = Vec::new();
+                            { let mut gi=0usize; while gi<mt { let eid=triples[gi].0 as usize; expert_ids.push(eid);
+                                let mut g2=gi+1; while g2<mt && triples[g2].0 as usize==eid {g2+=1;} g_starts.push(g2); gi=g2; } }
+                            // resident contiguous f16 slabs (build once per layer; cached in w16)
+                            let up_slab = { let key=format!("{p}.up_slab");
+                                if let Some(t)=w16.borrow().get(&key) { t.clone() }
+                                else { let t=pf!(3,(n_exp*inter*hid) as f64, dequant_q4(d, uqs, usc, n_exp*inter, hid, DType::F16).unwrap());
+                                       w16.borrow_mut().insert(key, t.clone()); t } };
+                            let dn_slab = { let key=format!("{p}.dn_slab");
+                                if let Some(t)=w16.borrow().get(&key) { t.clone() }
+                                else { let t=pf!(3,(n_exp*hid*inter) as f64, dequant_q4(d, dqs, dsc, n_exp*hid, inter, DType::F16).unwrap());
+                                       w16.borrow_mut().insert(key, t.clone()); t } };
+                            let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                moe_grouped_gemm_cutlass(d, &xs_f16, &up_slab, &g_starts, &expert_ids, inter, hid).unwrap());
+                            let a2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                            let dn_out_f16 = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                moe_grouped_gemm_cutlass(d, &a2, &dn_slab, &g_starts, &expert_ids, hid, inter).unwrap());
+                            let wts_h: Vec<f32> = triples.iter().map(|(_,_,w)| *w).collect();
+                            let tidx_h: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
+                            let wts_dev = upm(&wts_h, vec![mt]);
+                            let acc_dev = upm(&acc_h, vec![s, hid]);
+                            let dn_out = cast_f16_f32(d, &dn_out_f16).unwrap();
+                            moe_scatter_add_det(d, &dn_out, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32, false).unwrap();
                             acc_h = dl(&acc_dev, s * hid);
                         } else if use_grouped_gemm {
                             // ── Grouped-GEMM path (NEMOTRON_GROUPED_GEMM=1) ───────────────
