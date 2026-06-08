@@ -1944,6 +1944,128 @@ pub fn moe_grouped_gemm_mma(
     Ok(out)
 }
 
+// Q4-NATIVE grouped MoE GEMM (Marlin-style). Like moe_grouped_gemm_mma but reads
+// the model's SIGNED Q4 weights directly (NO f16 slab): cp.async packs int4 into
+// shared u32 staging + f16 scales, register-dequants per b-fragment in the mma
+// m16n8k16 loop. dqn = sign_extend((nib^8)-8) * f16scale (matches quantize_q4).
+// Qs [n_exp*N · K/32 · 4] u32, Sc [n_exp*N · K/32] f16 (= moe_up_all/down_all).
+const MOE_Q4_GROUPED_MMA_SRC: &str = r#"
+#include <cuda_fp16.h>
+__device__ __forceinline__ unsigned pk2(__half a, __half b){
+    return (unsigned)__half_as_ushort(a) | ((unsigned)__half_as_ushort(b) << 16);
+}
+__device__ __forceinline__ __half dqn(unsigned w, int nib, __half sc){
+    int n = (int)((w>>(nib*4))&0xf); n = (n^0x8)-0x8;
+    return __float2half((float)n * __half2float(sc));
+}
+#define CPA(SD,SP) asm volatile("cp.async.cg.shared.global [%0],[%1],16,16;\n" :: "r"(SD), "l"(SP))
+extern "C" __global__ void moe_q4_grouped_mma(
+    const __half* __restrict__ A,        // [mt,K] sorted activation f16
+    const unsigned* __restrict__ Qs,     // [n_exp*N, K/32*4] u32 signed-nibble Q4
+    const __half* __restrict__ Sc,       // [n_exp*N, K/32] f16 scales
+    const int* __restrict__ tok0_arr, const int* __restrict__ eid_arr, const int* __restrict__ gend_arr,
+    __half* __restrict__ Out,            // [mt, N] f16
+    int N, int K)
+{
+    const int BM=64,BN=64,BK=64,NS=8,NKS=4,GS=32,WPR=BK/8,GPR=BK/GS;
+    int bx=blockIdx.x, by=blockIdx.y;
+    int tok0=tok0_arr[bx], gend=gend_arr[bx], eid=eid_arr[bx], n0=by*BN;
+    int tid=threadIdx.x,warp=tid>>5,lane=tid&31,gid=lane>>2,tid4=lane&3,wrow=warp*16;
+    __shared__ __half   As[2][BM][BK];
+    __shared__ unsigned Wqs[2][BN][WPR];
+    __shared__ __half   Scs[2][BN][GPR];
+    float oc[NS][4]; for(int s=0;s<NS;s++){oc[s][0]=oc[s][1]=oc[s][2]=oc[s][3]=0.f;}
+    int nchunk=K/BK, WPB=K/32;
+    long grow0=(long)eid*N + n0;
+#define LOADC(C,BUF) do{ int kc=(C)*BK; \
+    for(int e=tid;e<BM*8;e+=128){ int r=e/8,k8=(e%8)*8; int t=tok0+r; int v=(t<gend); \
+        unsigned sd=(unsigned)__cvta_generic_to_shared(&As[BUF][r][k8]); \
+        const __half* sp=&A[(long)(v?t:tok0)*K + kc + k8]; CPA(sd,sp); } \
+    for(int e=tid;e<BN*WPR/4;e+=128){ int f=e*4,r=f/WPR,w0=f%WPR; \
+        unsigned sd=(unsigned)__cvta_generic_to_shared(&Wqs[BUF][r][w0]); \
+        const unsigned* sp=&Qs[(grow0+r)*WPB*4 + kc/8 + w0]; CPA(sd,sp); } \
+    for(int e=tid;e<BN*GPR;e+=128){ int r=e/GPR,g=e%GPR; \
+        Scs[BUF][r][g]=Sc[(grow0+r)*WPB + kc/32 + g]; } \
+    }while(0)
+    LOADC(0,0); asm volatile("cp.async.commit_group;\n"); __syncthreads();
+    for(int c=0;c<nchunk;c++){
+        if(c+1<nchunk){ LOADC(c+1,(c+1)&1); asm volatile("cp.async.commit_group;\n"); asm volatile("cp.async.wait_group 1;\n"); }
+        else { asm volatile("cp.async.wait_group 0;\n"); }
+        __syncthreads();
+        int buf=c&1;
+        for(int ks=0;ks<NKS;ks++){ int ko=ks*16; int c0=ko+2*tid4;
+            unsigned a0=pk2(As[buf][wrow+gid][c0],   As[buf][wrow+gid][c0+1]);
+            unsigned a1=pk2(As[buf][wrow+gid+8][c0], As[buf][wrow+gid+8][c0+1]);
+            unsigned a2=pk2(As[buf][wrow+gid][c0+8], As[buf][wrow+gid][c0+9]);
+            unsigned a3=pk2(As[buf][wrow+gid+8][c0+8],As[buf][wrow+gid+8][c0+9]);
+            for(int s=0;s<NS;s++){ int nrow=s*8+gid;
+                unsigned wA=Wqs[buf][nrow][c0/8], wB=Wqs[buf][nrow][(c0+8)/8];
+                __half sA=Scs[buf][nrow][c0/GS], sB=Scs[buf][nrow][(c0+8)/GS];
+                unsigned b0=pk2(dqn(wA,c0&7,sA),     dqn(wA,(c0+1)&7,sA));
+                unsigned b1=pk2(dqn(wB,(c0+8)&7,sB), dqn(wB,(c0+9)&7,sB));
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+                    :"+f"(oc[s][0]),"+f"(oc[s][1]),"+f"(oc[s][2]),"+f"(oc[s][3])
+                    :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+            }
+        }
+        __syncthreads();
+    }
+    int r0=tok0+wrow+gid, r8=tok0+wrow+gid+8;
+    for(int s=0;s<NS;s++){ int col=n0+s*8+2*tid4;
+        if(r0<gend&&col<N){ Out[(long)r0*N+col]=__float2half(oc[s][0]); Out[(long)r0*N+col+1]=__float2half(oc[s][1]); }
+        if(r8<gend&&col<N){ Out[(long)r8*N+col]=__float2half(oc[s][2]); Out[(long)r8*N+col+1]=__float2half(oc[s][3]); }
+    }
+}
+"#;
+
+/// Q4-native grouped MoE GEMM: `out[t,n] = Σ_k A[t,k]·dequant(Qs[eid,n,k])` over
+/// sorted token groups. `a` f16 `[mt,K]`; `qs` u32 + `sc` f16 = the model's
+/// contiguous `[n_exp*N, K]` Q4 pool (moe_up_all/down_all); `g_starts[g]..[g+1]`
+/// = group g's token range; `expert_ids[g]` selects the expert. Single launch,
+/// no dequant/slab. Returns `out[mt,N]` f16. `K%64==0`, `N%64==0`.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_q4_grouped_mma(
+    dev: &dyn Device,
+    a: &Tensor,
+    qs: &Tensor,
+    sc: &Tensor,
+    g_starts: &[usize],
+    expert_ids: &[usize],
+    n: usize,
+    k: usize,
+) -> Result<Tensor> {
+    let n_active = expert_ids.len();
+    let mt = g_starts.last().copied().unwrap_or(0);
+    if k % 64 != 0 { return Err(Error::Msg(format!("moe_q4_grouped_mma: K {k} %64!=0"))); }
+    if n % 64 != 0 { return Err(Error::Msg(format!("moe_q4_grouped_mma: N {n} %64!=0"))); }
+    let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
+    if n_active == 0 || mt == 0 { return Ok(out); }
+    // Per-m-tile descriptors (BM=64 token rows each, never crossing a group).
+    let (mut tok0, mut eid, mut gend) = (Vec::new(), Vec::new(), Vec::new());
+    for g in 0..n_active {
+        let (s, e) = (g_starts[g], g_starts[g + 1]);
+        let mut t = s;
+        while t < e { tok0.push(t as i32); eid.push(expert_ids[g] as i32); gend.push(e as i32); t += 64; }
+    }
+    let n_mtiles = tok0.len();
+    let up_i32 = |v: &[i32]| -> Result<Tensor> {
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        Ok(Tensor::new(dev.upload(&bytes).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![v.len()], DType::U32))
+    };
+    let (t0d, eidd, ged) = (up_i32(&tok0)?, up_i32(&eid)?, up_i32(&gend)?);
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let grid = [n_mtiles as u32, (n as u32).div_ceil(64), 1];
+    dev.dispatch_raw_cuda(
+        MOE_Q4_GROUPED_MMA_SRC, "moe_q4_grouped_mma.cu", "moe_q4_grouped_mma",
+        &[(a.buffer.as_ref(), a.offset), (qs.buffer.as_ref(), qs.offset), (sc.buffer.as_ref(), sc.offset),
+          (t0d.buffer.as_ref(), 0), (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
+          (out.buffer.as_ref(), 0)],
+        &[i(n as i32), i(k as i32)],
+        grid, [128, 1, 1], 0, false)?;
+    Ok(out)
+}
+
 /// Transpose+cast+scale Q `[n_query, n_q_heads, hd]` (caller dtype) into the
 /// head-major fp16 `[n_q_heads, n_query, hd]` layout the batched GEMM wants, with
 /// `scale` folded in. `IN_F32` selects f32 vs f16 input.
