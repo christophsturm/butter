@@ -2018,6 +2018,178 @@ extern "C" __global__ void sdpa_flash_fused(
 }
 "#;
 
+/// FUSED tensor-core (wmma) causal FlashAttention. v2 of [`SDPA_FLASH_FUSED_SRC`]:
+/// 1 warp / 16-query-row tile, hd=128. QKᵀ and P·V run on tensor cores (wmma
+/// 16×16×16 f16→f32); scores round-trip through SHARED (never HBM) so the online
+/// softmax + causal mask are plain per-row shared reductions (no fragment-layout
+/// reduction). K is transposed on load (`Kt[d][j]`) so QKᵀ = Q·Kt is a direct
+/// A·B. O accumulator stays in shared f32, rescaled per-row each KV tile. Causal
+/// tiles beyond the query block are skipped. f16 in/out; ~30KB static shared.
+const SDPA_FLASH_WMMA_SRC: &str = r#"
+#include <cuda_fp16.h>
+#include <mma.h>
+using namespace nvcuda;
+extern "C" __global__ void sdpa_flash_wmma(
+    const __half* __restrict__ q_in,   // [Sq, nq, 128] (already scaled? no — scaled here)
+    const __half* __restrict__ k_in,   // [nkv, kv_stride, 128]
+    const __half* __restrict__ v_in,   // [nkv, kv_stride, 128]
+    __half*       __restrict__ out,    // [Sq, nq, 128]
+    int sq, int nq, int nkv, int kv_stride, int base_kv, float scale)
+{
+    const int BR=16, BC=16, NC=8;          // 16 rows, 16 keys/tile, hd=128 -> 8 chunks
+    int h  = blockIdx.x;
+    int R0 = blockIdx.y * BR;
+    int hpg = nq / nkv, kh = h / hpg;
+    int lane = threadIdx.x;                 // 0..31 (one warp)
+
+    __shared__ __half Qs[BR][128];
+    __shared__ __half Kt[128][BC];          // transposed K: [d][j]
+    __shared__ __half Vs[BC][128];
+    __shared__ float  Os[BR][128];
+    __shared__ float  Ss[BR][BC];
+    __shared__ __half Ps[BR][BC];
+    __shared__ float  scratch[BR][128];
+    __shared__ float  m_sh[BR], l_sh[BR];
+
+    for (int e = lane; e < BR*128; e += 32) {
+        int i = e >> 7, d = e & 127, gr = R0 + i;
+        float qv = (gr < sq) ? __half2float(q_in[((long)gr*nq + h)*128 + d]) : 0.0f;
+        Qs[i][d] = __float2half(qv * scale);
+        Os[i][d] = 0.0f;
+    }
+    for (int i = lane; i < BR; i += 32) { m_sh[i] = -3.4e38f; l_sh[i] = 0.0f; }
+    __syncwarp();
+
+    int maxp_block = base_kv + R0 + BR - 1;
+    int last = base_kv + sq - 1;
+    if (maxp_block > last) maxp_block = last;
+
+    wmma::fragment<wmma::accumulator,16,16,16,float> s_acc;
+    for (int kj0 = 0; kj0 <= maxp_block; kj0 += BC) {
+        for (int e = lane; e < BC*128; e += 32) {
+            int j = e >> 7, d = e & 127, p = kj0 + j;
+            int ok = (p <= last);
+            Kt[d][j] = ok ? k_in[((long)kh*kv_stride + p)*128 + d] : __float2half(0.0f);
+            Vs[j][d] = ok ? v_in[((long)kh*kv_stride + p)*128 + d] : __float2half(0.0f);
+        }
+        __syncwarp();
+
+        wmma::fill_fragment(s_acc, 0.0f);
+        for (int c = 0; c < NC; c++) {
+            wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::row_major> b;
+            wmma::load_matrix_sync(a, &Qs[0][c*16], 128);
+            wmma::load_matrix_sync(b, &Kt[c*16][0], BC);
+            wmma::mma_sync(s_acc, a, b, s_acc);
+        }
+        wmma::store_matrix_sync(&Ss[0][0], s_acc, BC, wmma::mem_row_major);
+        __syncwarp();
+
+        if (lane < BR) {
+            int i = lane, gr = R0 + i;
+            if (gr < sq) {
+                int maxp = base_kv + R0 + i;
+                float rmax = -3.4e38f;
+                for (int j = 0; j < BC; j++) {
+                    float sv = (kj0 + j <= maxp) ? Ss[i][j] : -3.4e38f;
+                    rmax = fmaxf(rmax, sv);
+                }
+                float m_old = m_sh[i];
+                float m_new = fmaxf(m_old, rmax);
+                float corr  = (m_old > -3.0e38f) ? __expf(m_old - m_new) : 0.0f;
+                float rsum  = 0.0f;
+                for (int j = 0; j < BC; j++) {
+                    float w = (kj0 + j <= maxp && m_new > -3.0e38f) ? __expf(Ss[i][j] - m_new) : 0.0f;
+                    Ps[i][j] = __float2half(w);
+                    rsum += w;
+                }
+                for (int d = 0; d < 128; d++) Os[i][d] *= corr;
+                m_sh[i] = m_new;
+                l_sh[i] = l_sh[i]*corr + rsum;
+            } else {
+                for (int j = 0; j < BC; j++) Ps[i][j] = __float2half(0.0f);
+            }
+        }
+        __syncwarp();
+
+        for (int dc = 0; dc < NC; dc++) {
+            wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> pa;
+            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::row_major> vb;
+            wmma::fragment<wmma::accumulator,16,16,16,float> pv;
+            wmma::fill_fragment(pv, 0.0f);
+            wmma::load_matrix_sync(pa, &Ps[0][0], BC);
+            wmma::load_matrix_sync(vb, &Vs[0][dc*16], 128);
+            wmma::mma_sync(pv, pa, vb, pv);
+            wmma::store_matrix_sync(&scratch[0][dc*16], pv, 128, wmma::mem_row_major);
+        }
+        __syncwarp();
+        for (int e = lane; e < BR*128; e += 32) { int i = e >> 7, d = e & 127; Os[i][d] += scratch[i][d]; }
+        __syncwarp();
+    }
+
+    if (lane < BR) {
+        int i = lane, gr = R0 + i;
+        if (gr < sq) {
+            float l = l_sh[i], inv = (l > 0.0f) ? 1.0f/l : 0.0f;
+            for (int d = 0; d < 128; d++) out[((long)gr*nq + h)*128 + d] = __float2half(Os[i][d]*inv);
+        }
+    }
+}
+"#;
+
+/// Fused tensor-core causal FlashAttention (see [`SDPA_FLASH_WMMA_SRC`]). Same
+/// numerics/contract as [`sdpa_multi_tc`]; casts Q/K/V → f16, runs the single
+/// wmma kernel, returns `q.dtype`. head_dim must be 128. CUDA-only.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_flash_wmma(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    n_q_heads: u32,
+    base_kv: u32,
+    n_query: u32,
+    kv_stride: u32,
+    heads_per_group: u32,
+    causal: bool,
+    scale: f32,
+) -> Result<Tensor> {
+    let hd = head_dim;
+    let nq = n_q_heads as usize;
+    let sq = n_query as usize;
+    let hpg = heads_per_group as usize;
+    let nkv = nq / hpg;
+    let base = base_kv as usize;
+    if hd != 128 { return Err(Error::Msg(format!("sdpa_flash_wmma: head_dim {hd} != 128"))); }
+    if !causal { return Err(Error::Msg("sdpa_flash_wmma: only causal wired".into())); }
+    let n_kv = base + sq;
+    if n_kv > kv_stride as usize {
+        return Err(Error::Msg(format!("sdpa_flash_wmma: n_kv {n_kv} exceeds kv_stride {kv_stride}")));
+    }
+    // tensor cores need f16 inputs; cast if the caller passed f32 (the KV cache).
+    let to_f16 = |t: &Tensor| -> Result<Tensor> {
+        match t.dtype { DType::F16 => Ok(t.clone()), DType::F32 => cast_f32_f16(dev, t),
+            other => Err(Error::Msg(format!("sdpa_flash_wmma: unsupported dtype {other:?}"))) }
+    };
+    let qh = to_f16(q)?;
+    let kh = to_f16(k)?;
+    let vh = to_f16(v)?;
+    let out_h = Tensor::empty(dev, vec![sq, nq, hd], DType::F16)?;
+
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    let grid = [nq as u32, (sq as u32).div_ceil(16), 1];
+    dev.dispatch_raw_cuda(
+        SDPA_FLASH_WMMA_SRC, "sdpa_flash_wmma.cu", "sdpa_flash_wmma",
+        &[(qh.buffer.as_ref(), qh.offset), (kh.buffer.as_ref(), kh.offset),
+          (vh.buffer.as_ref(), vh.offset), (out_h.buffer.as_ref(), 0)],
+        &[i(sq as i32), i(nq as i32), i(nkv as i32), i(kv_stride as i32),
+          i(base as i32), f(scale)],
+        grid, [32, 1, 1], 0, false)?;
+    match q.dtype { DType::F16 => Ok(out_h), _ => cast_f16_f32(dev, &out_h) }
+}
+
 /// Fused causal FlashAttention (see [`SDPA_FLASH_FUSED_SRC`]). Same signature +
 /// numerics as [`sdpa_multi_tc`] (its correctness oracle): Q pre-scaled by
 /// `scale`, GQA via `heads_per_group`, causal online softmax, output `[Sq,nq,hd]`

@@ -6,7 +6,7 @@
 
 use ffai_cuda::CudaDevice;
 use ffai_core::{DType, Device, Tensor};
-use ffai_ops::{sdpa_multi, sdpa_flash_fused};
+use ffai_ops::{sdpa_multi, sdpa_flash_fused, sdpa_flash_wmma};
 
 fn rng(n: usize, seed: u64) -> Vec<f32> {
     let mut v = vec![0f32; n];
@@ -73,6 +73,58 @@ fn run(dev: &dyn Device, s: usize, in_f16: bool) {
     let tol = if in_f16 { 2e-2 } else { 1e-3 };
     assert!(max_rel < tol, "sdpa_flash_fused S={s} [{tag}]: max_rel={max_rel:.2e} > {tol:.0e}");
     eprintln!("sdpa_flash_fused S={s} [{tag}]: PASS ✓");
+}
+
+fn run_wmma(dev: &dyn Device, s: usize) {
+    let (nq, nkv, hd) = (32usize, 2usize, 128usize);
+    let hpg = nq / nkv;
+    let base_kv = 0usize;
+    let n_kv = base_kv + s;
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let q_vals = rng(s * nq * hd, 1234);
+    let k_vals = rng(nkv * n_kv * hd, 5678);
+    let v_vals = rng(nkv * n_kv * hd, 9012);
+    let up = |v: &[f32]| Tensor::new(dev.upload(&tb(v)).unwrap(), vec![v.len()], DType::F32);
+    let q = up(&q_vals).reshaped(vec![s, nq, hd]);
+    let k = up(&k_vals).reshaped(vec![nkv, n_kv, hd]);
+    let v = up(&v_vals).reshaped(vec![nkv, n_kv, hd]);
+    let ref_out = sdpa_multi(dev, &q, &k, &v, hd, nq as u32, base_kv as u32,
+                             s as u32, n_kv as u32, hpg as u32, true, scale).unwrap();
+    // f16 inputs (wmma needs tensor cores).
+    let qf = ffai_ops::cast_f32_f16(dev, &q).unwrap().reshaped(vec![s, nq, hd]);
+    let kf = ffai_ops::cast_f32_f16(dev, &k).unwrap().reshaped(vec![nkv, n_kv, hd]);
+    let vf = ffai_ops::cast_f32_f16(dev, &v).unwrap().reshaped(vec![nkv, n_kv, hd]);
+    let w = sdpa_flash_wmma(dev, &qf, &kf, &vf, hd, nq as u32, base_kv as u32,
+                            s as u32, n_kv as u32, hpg as u32, true, scale).unwrap();
+    let w = ffai_ops::cast_f16_f32(dev, &w).unwrap();
+    let a = dl_f32(dev, &ref_out);
+    let b = dl_f32(dev, &w);
+    let (mut max_abs, mut max_rel) = (0f32, 0f32);
+    for (r, t) in a.iter().zip(b.iter()) {
+        let abs = (r - t).abs();
+        let rel = abs / r.abs().max(1e-6);
+        if abs > max_abs { max_abs = abs; }
+        if rel > max_rel { max_rel = rel; }
+    }
+    eprintln!("sdpa_flash_wmma S={s}: max_abs={max_abs:.2e} max_rel={max_rel:.2e}");
+    assert!(max_rel < 3e-2, "sdpa_flash_wmma S={s}: max_rel={max_rel:.2e} > 3e-2");
+    eprintln!("sdpa_flash_wmma S={s}: PASS ✓");
+}
+
+#[test]
+fn sdpa_flash_wmma_s128() {
+    let Some(dev) = CudaDevice::create().expect("cuda init") else { eprintln!("no CUDA — skip"); return; };
+    run_wmma(dev.as_ref(), 128);
+}
+#[test]
+fn sdpa_flash_wmma_s512() {
+    let Some(dev) = CudaDevice::create().expect("cuda init") else { eprintln!("no CUDA — skip"); return; };
+    run_wmma(dev.as_ref(), 512);
+}
+#[test]
+fn sdpa_flash_wmma_s2048() {
+    let Some(dev) = CudaDevice::create().expect("cuda init") else { eprintln!("no CUDA — skip"); return; };
+    run_wmma(dev.as_ref(), 2048);
 }
 
 #[test]
