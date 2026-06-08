@@ -1204,6 +1204,116 @@ pub fn moe_router_device(dev: &dyn Device, gate_logits: &Tensor, bias: &Tensor, 
     Ok((idx, wts))
 }
 
+/// On-device MoE route + counting-sort. Replaces the per-E-layer HOST `triples`
+/// round-trip (router logits → host → sigmoid+topk+sort → upload) that stalls the
+/// GPU every MoE layer and blocks CUDA-graph capture of prefill. Given gate logits
+/// `[s, n_exp]` (f32) + bias `[n_exp]`, produces — ALL on device:
+///   sorted_tok `[mt]` u32 — token index per sorted slot (mt = s*top_k)
+///   sorted_wt  `[mt]` f32 — router weight per slot (sigmoid, normalized, ·scale)
+///   offsets    `[n_exp+1]` u32 — group boundaries (expert e's rows = [off[e],off[e+1]))
+/// Tokens grouped contiguously by expert. Order within an expert is atomic-cursor
+/// (not stable) — same near-tie nondeterminism as the existing GROUPED_GEMM path.
+const MOE_BATCHED_ROUTER_SRC: &str = r#"
+extern "C" __global__ void moe_batched_router(
+    const float* __restrict__ logits, const float* __restrict__ bias,
+    unsigned* __restrict__ idx_out, float* __restrict__ wt_out,
+    int s, int n_exp, int top_k, float scale)
+{
+    __shared__ float u[256];
+    __shared__ float b[256];
+    __shared__ int chosen[32];
+    int ti = blockIdx.x;
+    int e = threadIdx.x;
+    if (ti < s) {
+        for (int j = e; j < n_exp; j += blockDim.x) {
+            float z = logits[(long)ti*n_exp + j];
+            float sg = 1.f/(1.f+__expf(-z));
+            u[j] = sg; b[j] = sg + bias[j];
+        }
+    }
+    __syncthreads();
+    if (ti < s && e == 0) {
+        for (int r = 0; r < top_k; r++) {
+            int bi = 0; float bv = -1e30f;
+            for (int j = 0; j < n_exp; j++) { if (b[j] > bv) { bv = b[j]; bi = j; } }
+            chosen[r] = bi; b[bi] = -1e30f;
+        }
+        float ws = 1e-20f;
+        for (int r = 0; r < top_k; r++) ws += u[chosen[r]];
+        for (int r = 0; r < top_k; r++) {
+            idx_out[(long)ti*top_k + r] = (unsigned)chosen[r];
+            wt_out[(long)ti*top_k + r] = u[chosen[r]] / ws * scale;
+        }
+    }
+}
+"#;
+const MOE_HIST_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void moe_hist(const unsigned* __restrict__ idx, unsigned* counts, int mt) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if (i >= mt) return;
+    atomicAdd(counts + idx[i], 1u);
+}
+"#;
+const MOE_PREFIX_SRC: &str = r#"
+extern "C" __global__ void moe_prefix(const unsigned* __restrict__ counts,
+                                      unsigned* __restrict__ offsets, unsigned* __restrict__ cursor, int n_exp) {
+    if (threadIdx.x == 0) {
+        unsigned acc = 0; offsets[0] = 0;
+        for (int j = 0; j < n_exp; j++) { cursor[j] = acc; acc += counts[j]; offsets[j+1] = acc; }
+    }
+}
+"#;
+const MOE_SCATTER_SORT_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void moe_scatter_sort(
+    const unsigned* __restrict__ idx, const float* __restrict__ wt,
+    unsigned* cursor, unsigned* __restrict__ sorted_tok, float* __restrict__ sorted_wt,
+    int mt, int top_k)
+{
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if (i >= mt) return;
+    unsigned e = idx[i]; unsigned pos = atomicAdd(cursor + e, 1u);
+    sorted_tok[pos] = (unsigned)(i / top_k); sorted_wt[pos] = wt[i];
+}
+"#;
+
+#[allow(clippy::type_complexity)]
+pub fn moe_route_sort_device(
+    dev: &dyn Device, gate_logits: &Tensor, bias: &Tensor, n_exp: usize, top_k: usize, scale: f32,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let s = gate_logits.elem_count() / n_exp;
+    let mt = s * top_k;
+    let idx = Tensor::empty(dev, vec![mt], DType::U32)?;
+    let wt = Tensor::empty(dev, vec![mt], DType::F32)?;
+    let counts = Tensor::new(dev.upload(&vec![0u8; n_exp * 4]).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![n_exp], DType::U32);
+    let offsets = Tensor::empty(dev, vec![n_exp + 1], DType::U32)?;
+    let cursor = Tensor::empty(dev, vec![n_exp], DType::U32)?;
+    let sorted_tok = Tensor::empty(dev, vec![mt], DType::U32)?;
+    let sorted_wt = Tensor::empty(dev, vec![mt], DType::F32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    let blk = if n_exp >= 256 { 256 } else { n_exp.max(32) } as u32;
+    // 1. batched router → idx/wt
+    dev.dispatch_raw_cuda(MOE_BATCHED_ROUTER_SRC, "moe_route_sort.cu", "moe_batched_router",
+        &[(gate_logits.buffer.as_ref(), gate_logits.offset), (bias.buffer.as_ref(), bias.offset),
+          (idx.buffer.as_ref(), 0), (wt.buffer.as_ref(), 0)],
+        &[i(s as i32), i(n_exp as i32), i(top_k as i32), f(scale)],
+        [s as u32, 1, 1], [blk, 1, 1], 0, false)?;
+    // 2. histogram
+    dev.dispatch_raw_cuda(MOE_HIST_SRC, "moe_hist.cu", "moe_hist",
+        &[(idx.buffer.as_ref(), 0), (counts.buffer.as_ref(), 0)],
+        &[i(mt as i32)], [(mt as u32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+    // 3. exclusive prefix → offsets + cursor (cursor[e] = offsets[e])
+    dev.dispatch_raw_cuda(MOE_PREFIX_SRC, "moe_prefix.cu", "moe_prefix",
+        &[(counts.buffer.as_ref(), 0), (offsets.buffer.as_ref(), 0), (cursor.buffer.as_ref(), 0)],
+        &[i(n_exp as i32)], [1, 1, 1], [32, 1, 1], 0, false)?;
+    // 4. scatter into sorted order
+    dev.dispatch_raw_cuda(MOE_SCATTER_SORT_SRC, "moe_scatter_sort.cu", "moe_scatter_sort",
+        &[(idx.buffer.as_ref(), 0), (wt.buffer.as_ref(), 0), (cursor.buffer.as_ref(), 0),
+          (sorted_tok.buffer.as_ref(), 0), (sorted_wt.buffer.as_ref(), 0)],
+        &[i(mt as i32), i(top_k as i32)], [(mt as u32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+    Ok((sorted_tok, sorted_wt, offsets))
+}
+
 pub fn moe_weighted_sum(dev: &dyn Device, downs: &Tensor, wts: &Tensor, acc: &Tensor, hid: usize, top_k: usize) -> Result<()> {
     let k = cached_ir("ffai_moe_weighted_sum", acc.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_moe_weighted_sum::kernel_ir_for(acc.dtype); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
