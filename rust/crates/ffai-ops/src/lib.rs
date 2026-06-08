@@ -1690,51 +1690,54 @@ __device__ __forceinline__ unsigned pk2(__half a, __half b){
 extern "C" __global__ void moe_grouped_gemm_mma(
     const __half* __restrict__ A,                       // [mt, K]
     const __half* __restrict__ W_base,                  // [n_exp, N, K] contiguous
-    const int* __restrict__ tok0_arr,                   // [n_mtiles] abs token start
+    const int* __restrict__ tok0_arr,                   // [n_mtiles] abs token start (64-row tile)
     const int* __restrict__ eid_arr,                    // [n_mtiles] expert id (→ W slab)
     const int* __restrict__ gend_arr,                   // [n_mtiles] group end (excl)
     __half* __restrict__ out,                           // [mt, N]
     int N, int K)
 {
-    const int BM=16, BN=64, NS=8;   // 16 tokens, 64 out-cols (8 n8 subtiles)
+    // 4 warps/block: BM=64 rows (16/warp) × BN=64 cols, BK=64 K-staging (4
+    // mma-k-substeps per shared load → 4× fewer __syncthreads + ILP). ~16KB shared.
+    const int BM=64, BN=64, BK=64, NS=8, NKS=4;
     int bx = blockIdx.x, by = blockIdx.y;
-    int tok0 = tok0_arr[bx], gend = gend_arr[bx];
-    int n0 = by * BN;
-    int lane = threadIdx.x, gid = lane >> 2, tid4 = lane & 3;
-    const __half* W = W_base + (long)eid_arr[bx] * N * K;   // this expert's [N,K]
+    int tok0 = tok0_arr[bx], gend = gend_arr[bx], n0 = by * BN;
+    const __half* W = W_base + (long)eid_arr[bx] * N * K;
+    int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tid4 = lane & 3;
+    int wrow = warp * 16;
 
-    __shared__ __half As[BM][16];
-    __shared__ __half Ws[BN][16];
+    __shared__ __half As[BM][BK];
+    __shared__ __half Ws[BN][BK];
     float oc[NS][4];
     for (int s=0;s<NS;s++){ oc[s][0]=oc[s][1]=oc[s][2]=oc[s][3]=0.f; }
 
-    int nchunk = K >> 4;   // K/16
+    int nchunk = K / BK;
     for (int c=0;c<nchunk;c++){
-        int kc = c*16;
-        for (int e=lane; e<BM*16; e+=32){ int r=e>>4,k=e&15; int t=tok0+r;
+        int kc = c*BK;
+        for (int e=tid; e<BM*BK; e+=128){ int r=e>>6,k=e&63; int t=tok0+r;
             As[r][k] = (t<gend) ? A[(long)t*K + kc + k] : __float2half(0.f); }
-        for (int e=lane; e<BN*16; e+=32){ int r=e>>4,k=e&15; int nn=n0+r;
+        for (int e=tid; e<BN*BK; e+=128){ int r=e>>6,k=e&63; int nn=n0+r;
             Ws[r][k] = (nn<N) ? W[(long)nn*K + kc + k] : __float2half(0.f); }
-        __syncwarp();
-        unsigned a0=pk2(As[gid][2*tid4],   As[gid][2*tid4+1]);
-        unsigned a1=pk2(As[gid+8][2*tid4], As[gid+8][2*tid4+1]);
-        unsigned a2=pk2(As[gid][2*tid4+8], As[gid][2*tid4+9]);
-        unsigned a3=pk2(As[gid+8][2*tid4+8],As[gid+8][2*tid4+9]);
-        for (int s=0;s<NS;s++){ int nb=s*8;
-            unsigned b0=pk2(Ws[nb+gid][2*tid4],   Ws[nb+gid][2*tid4+1]);
-            unsigned b1=pk2(Ws[nb+gid][2*tid4+8], Ws[nb+gid][2*tid4+9]);
-            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
-                :"+f"(oc[s][0]),"+f"(oc[s][1]),"+f"(oc[s][2]),"+f"(oc[s][3])
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+        __syncthreads();
+        for (int ks=0; ks<NKS; ks++){ int ko=ks*16;
+            unsigned a0=pk2(As[wrow+gid][ko+2*tid4],   As[wrow+gid][ko+2*tid4+1]);
+            unsigned a1=pk2(As[wrow+gid+8][ko+2*tid4], As[wrow+gid+8][ko+2*tid4+1]);
+            unsigned a2=pk2(As[wrow+gid][ko+2*tid4+8], As[wrow+gid][ko+2*tid4+9]);
+            unsigned a3=pk2(As[wrow+gid+8][ko+2*tid4+8],As[wrow+gid+8][ko+2*tid4+9]);
+            for (int s=0;s<NS;s++){ int nb=s*8;
+                unsigned b0=pk2(Ws[nb+gid][ko+2*tid4],   Ws[nb+gid][ko+2*tid4+1]);
+                unsigned b1=pk2(Ws[nb+gid][ko+2*tid4+8], Ws[nb+gid][ko+2*tid4+9]);
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+                    :"+f"(oc[s][0]),"+f"(oc[s][1]),"+f"(oc[s][2]),"+f"(oc[s][3])
+                    :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+            }
         }
-        __syncwarp();
+        __syncthreads();
     }
-    // write: acc tile (16x8) → c0,c1 row gid; c2,c3 row gid+8; cols n0+s*8+2tid4{,+1}
-    int r0=tok0+gid, r8=tok0+gid+8;
+    int r0=tok0+wrow+gid, r8=tok0+wrow+gid+8;
     for (int s=0;s<NS;s++){ int col=n0+s*8+2*tid4;
-        if (r0<gend && col<N){   out[(long)r0*N+col]=__float2half(oc[s][0]); out[(long)r0*N+col+1]=__float2half(oc[s][1]); }
-        if (r8<gend && col<N){   out[(long)r8*N+col]=__float2half(oc[s][2]); out[(long)r8*N+col+1]=__float2half(oc[s][3]); }
+        if (r0<gend && col<N){ out[(long)r0*N+col]=__float2half(oc[s][0]); out[(long)r0*N+col+1]=__float2half(oc[s][1]); }
+        if (r8<gend && col<N){ out[(long)r8*N+col]=__float2half(oc[s][2]); out[(long)r8*N+col+1]=__float2half(oc[s][3]); }
     }
 }
 "#;
@@ -1757,7 +1760,7 @@ pub fn moe_grouped_gemm_mma(
 ) -> Result<Tensor> {
     let n_active = expert_ids.len();
     let mt = g_starts.last().copied().unwrap_or(0);
-    if k % 16 != 0 { return Err(Error::Msg(format!("moe_grouped_gemm_mma: K {k} %16!=0"))); }
+    if k % 64 != 0 { return Err(Error::Msg(format!("moe_grouped_gemm_mma: K {k} %64!=0"))); }
     let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
     if n_active == 0 || mt == 0 { return Ok(out); }
     // Build per-m-tile descriptors (BM=16 token rows each).
@@ -1765,7 +1768,7 @@ pub fn moe_grouped_gemm_mma(
     for g in 0..n_active {
         let (s, e) = (g_starts[g], g_starts[g + 1]);
         let mut t = s;
-        while t < e { tok0.push(t as i32); eid.push(expert_ids[g] as i32); gend.push(e as i32); t += 16; }
+        while t < e { tok0.push(t as i32); eid.push(expert_ids[g] as i32); gend.push(e as i32); t += 64; }
     }
     let n_mtiles = tok0.len();
     let up_i32 = |v: &[i32]| -> Result<Tensor> {
@@ -1781,7 +1784,7 @@ pub fn moe_grouped_gemm_mma(
           (t0d.buffer.as_ref(), 0), (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
           (out.buffer.as_ref(), 0)],
         &[i(n as i32), i(k as i32)],
-        grid, [32, 1, 1], 0, false)?;
+        grid, [128, 1, 1], 0, false)?;
     Ok(out)
 }
 
