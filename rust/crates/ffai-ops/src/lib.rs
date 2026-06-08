@@ -1674,6 +1674,117 @@ pub fn sdpa_multi(
 // Q is pre-scaled by `scale` in the transpose kernel, so the GEMM/softmax run on
 // already-scaled logits (matches `ffai_sdpa_multi`, which folds `scale` into Q).
 
+/// Grouped MoE GEMM via mma.sync (register-O), ONE launch for ALL experts.
+/// `out[t,n] = Σ_k A[t,k]·W[grp(t)][n,k]` over sorted tokens (each contiguous
+/// token range = one expert). Reads the RESIDENT f16 expert weights directly via
+/// a device pointer array — no f16 scratch (that's what sank cuBLAS-grouped) —
+/// and runs every expert's output tiles concurrently to FILL the GPU (the skinny
+/// m≈96 per-expert cuBLAS GEMMs hit only ~15 CTAs → 1.5% MFU). Same m16n8k16
+/// register-O technique + fragment packing as `sdpa_flash_mma`'s QKᵀ. 1 warp /
+/// (16-token × 64-col) tile; grid (n_mtiles, ceil(N/64)). f16 in/out.
+const MOE_GROUPED_GEMM_MMA_SRC: &str = r#"
+#include <cuda_fp16.h>
+__device__ __forceinline__ unsigned pk2(__half a, __half b){
+    return (unsigned)__half_as_ushort(a) | ((unsigned)__half_as_ushort(b) << 16);
+}
+extern "C" __global__ void moe_grouped_gemm_mma(
+    const __half* __restrict__ A,                       // [mt, K]
+    const __half* __restrict__ W_base,                  // [n_exp, N, K] contiguous
+    const int* __restrict__ tok0_arr,                   // [n_mtiles] abs token start
+    const int* __restrict__ eid_arr,                    // [n_mtiles] expert id (→ W slab)
+    const int* __restrict__ gend_arr,                   // [n_mtiles] group end (excl)
+    __half* __restrict__ out,                           // [mt, N]
+    int N, int K)
+{
+    const int BM=16, BN=64, NS=8;   // 16 tokens, 64 out-cols (8 n8 subtiles)
+    int bx = blockIdx.x, by = blockIdx.y;
+    int tok0 = tok0_arr[bx], gend = gend_arr[bx];
+    int n0 = by * BN;
+    int lane = threadIdx.x, gid = lane >> 2, tid4 = lane & 3;
+    const __half* W = W_base + (long)eid_arr[bx] * N * K;   // this expert's [N,K]
+
+    __shared__ __half As[BM][16];
+    __shared__ __half Ws[BN][16];
+    float oc[NS][4];
+    for (int s=0;s<NS;s++){ oc[s][0]=oc[s][1]=oc[s][2]=oc[s][3]=0.f; }
+
+    int nchunk = K >> 4;   // K/16
+    for (int c=0;c<nchunk;c++){
+        int kc = c*16;
+        for (int e=lane; e<BM*16; e+=32){ int r=e>>4,k=e&15; int t=tok0+r;
+            As[r][k] = (t<gend) ? A[(long)t*K + kc + k] : __float2half(0.f); }
+        for (int e=lane; e<BN*16; e+=32){ int r=e>>4,k=e&15; int nn=n0+r;
+            Ws[r][k] = (nn<N) ? W[(long)nn*K + kc + k] : __float2half(0.f); }
+        __syncwarp();
+        unsigned a0=pk2(As[gid][2*tid4],   As[gid][2*tid4+1]);
+        unsigned a1=pk2(As[gid+8][2*tid4], As[gid+8][2*tid4+1]);
+        unsigned a2=pk2(As[gid][2*tid4+8], As[gid][2*tid4+9]);
+        unsigned a3=pk2(As[gid+8][2*tid4+8],As[gid+8][2*tid4+9]);
+        for (int s=0;s<NS;s++){ int nb=s*8;
+            unsigned b0=pk2(Ws[nb+gid][2*tid4],   Ws[nb+gid][2*tid4+1]);
+            unsigned b1=pk2(Ws[nb+gid][2*tid4+8], Ws[nb+gid][2*tid4+9]);
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+                :"+f"(oc[s][0]),"+f"(oc[s][1]),"+f"(oc[s][2]),"+f"(oc[s][3])
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+        }
+        __syncwarp();
+    }
+    // write: acc tile (16x8) → c0,c1 row gid; c2,c3 row gid+8; cols n0+s*8+2tid4{,+1}
+    int r0=tok0+gid, r8=tok0+gid+8;
+    for (int s=0;s<NS;s++){ int col=n0+s*8+2*tid4;
+        if (r0<gend && col<N){   out[(long)r0*N+col]=__float2half(oc[s][0]); out[(long)r0*N+col+1]=__float2half(oc[s][1]); }
+        if (r8<gend && col<N){   out[(long)r8*N+col]=__float2half(oc[s][2]); out[(long)r8*N+col+1]=__float2half(oc[s][3]); }
+    }
+}
+"#;
+
+/// Grouped MoE GEMM (mma.sync register-O) — `out[t,n] = Σ_k A[t,k]·W[eid][n,k]`
+/// for sorted tokens. `a` is `[mt,K]` f16; `w_base` is the contiguous f16 expert
+/// weight slab `[n_exp,N,K]`; `g_starts[g]..g_starts[g+1]` is group g's token
+/// range; `expert_ids[g]` selects the weight slab. ONE launch, all experts'
+/// tiles concurrent (fills the GPU), reading resident f16 weights directly (no
+/// scratch). Returns `out[mt,N]` f16. K%16==0, N%8==0.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_gemm_mma(
+    dev: &dyn Device,
+    a: &Tensor,
+    w_base: &Tensor,
+    g_starts: &[usize],
+    expert_ids: &[usize],
+    n: usize,
+    k: usize,
+) -> Result<Tensor> {
+    let n_active = expert_ids.len();
+    let mt = g_starts.last().copied().unwrap_or(0);
+    if k % 16 != 0 { return Err(Error::Msg(format!("moe_grouped_gemm_mma: K {k} %16!=0"))); }
+    let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
+    if n_active == 0 || mt == 0 { return Ok(out); }
+    // Build per-m-tile descriptors (BM=16 token rows each).
+    let (mut tok0, mut eid, mut gend) = (Vec::new(), Vec::new(), Vec::new());
+    for g in 0..n_active {
+        let (s, e) = (g_starts[g], g_starts[g + 1]);
+        let mut t = s;
+        while t < e { tok0.push(t as i32); eid.push(expert_ids[g] as i32); gend.push(e as i32); t += 16; }
+    }
+    let n_mtiles = tok0.len();
+    let up_i32 = |v: &[i32]| -> Result<Tensor> {
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        Ok(Tensor::new(dev.upload(&bytes).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![v.len()], DType::U32))
+    };
+    let (t0d, eidd, ged) = (up_i32(&tok0)?, up_i32(&eid)?, up_i32(&gend)?);
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let grid = [n_mtiles as u32, (n as u32).div_ceil(64), 1];
+    dev.dispatch_raw_cuda(
+        MOE_GROUPED_GEMM_MMA_SRC, "moe_grouped_gemm_mma.cu", "moe_grouped_gemm_mma",
+        &[(a.buffer.as_ref(), a.offset), (w_base.buffer.as_ref(), w_base.offset),
+          (t0d.buffer.as_ref(), 0), (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
+          (out.buffer.as_ref(), 0)],
+        &[i(n as i32), i(k as i32)],
+        grid, [32, 1, 1], 0, false)?;
+    Ok(out)
+}
+
 /// Transpose+cast+scale Q `[n_query, n_q_heads, hd]` (caller dtype) into the
 /// head-major fp16 `[n_q_heads, n_query, hd]` layout the batched GEMM wants, with
 /// `scale` folded in. `IN_F32` selects f32 vs f16 input.
