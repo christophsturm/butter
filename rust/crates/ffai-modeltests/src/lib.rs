@@ -1913,7 +1913,31 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         //   tokens; on-device relu²+det-scatter. Collapses ~234 per-expert
                         //   cuBLAS launches → 2 AND reads 4.5-bit weights (vs 16-bit) → the
                         //   Marlin lever for the BW-bound MoE wall. Uses the device gather.
-                        let use_q4_grouped = is_cuda && std::env::var("NEMOTRON_Q4_GROUPED").is_ok()
+                        // NEMOTRON_Q4_GROUPED_LASTEXACT=K: run the EXACT cuBLAS per-expert
+                        // path for the LAST K MoE layers (output-proximal) and Q4-grouped for
+                        // the earlier ones — a precision/speed hybrid to test whether late-
+                        // layer exactness restores the argmax (1104) while keeping most of
+                        // the +35%. moe_idx = this E-layer's 0-based index among all E-layers.
+                        let q4_lastexact: usize = std::env::var("NEMOTRON_Q4_GROUPED_LASTEXACT")
+                            .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let n_moe_layers = PATTERN.chars().filter(|&c| c == 'E').count();
+                        let moe_idx = PATTERN.chars().take(l).filter(|&c| c == 'E').count();
+                        // NEMOTRON_Q4_GROUPED_FIRSTEXACT=K: exact cuBLAS for the FIRST K MoE
+                        // layers (the sensitive early ones), Q4 for the rest. (lastexact failed
+                        // at all K — early error propagates irreducibly; test exact-early.)
+                        // Default FIRSTEXACT=4: the first 4 MoE layers run EXACT cuBLAS, the
+                        // rest Q4. Validated argmax==1104@S2048 (exact-early restores the
+                        // razor 1104/1776 near-tie that pure-Q4 flips; gap 0.125, robust).
+                        // exact-LAST-K failed at all K (early error propagates irreducibly).
+                        let q4_firstexact: usize = std::env::var("NEMOTRON_Q4_GROUPED_FIRSTEXACT")
+                            .ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+                        let q4_layer_ok = moe_idx >= q4_firstexact
+                            && moe_idx < n_moe_layers.saturating_sub(q4_lastexact);
+                        // DEFAULT-ON for CUDA (escape: NEMOTRON_Q4_GROUPED_OFF=1): Q4-native
+                        // grouped MoE for all but the first FIRSTEXACT layers. +21% @S2048
+                        // (1009→1220 tok/s), argmax 1104 exact.
+                        let use_q4_grouped = is_cuda && std::env::var("NEMOTRON_Q4_GROUPED_OFF").is_err()
+                            && q4_layer_ok
                             && !use_bgemm && !use_w4a16 && !use_grouped_gemm && !use_cutlass_moe;
                         // NEMOTRON_MOE_GROUPED=1 (Metal only): replace the per-expert
                         //   dequant_q4_off+matmul loop with the token-sorted GROUPED Q4
