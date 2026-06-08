@@ -1451,6 +1451,91 @@ pub fn quantize_q8(w: &[f32], m: usize, k: usize) -> (Vec<u32>, Vec<f32>) {
     (qs, scales)
 }
 
+/// e2m1 (FP4) codebook magnitudes (index 0..7); sign bit is bit 3.
+const E2M1_LUT: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+/// Encode a value `x` (already divided by its block scale) to a 4-bit e2m1 code
+/// (sign<<3 | nearest-magnitude-index). Round-to-nearest over the 8-entry codebook.
+#[inline]
+fn enc_e2m1(v: f32) -> u8 {
+    let sign = if v < 0.0 { 8u8 } else { 0u8 };
+    let a = v.abs();
+    let mut best = 0usize;
+    let mut bd = f32::INFINITY;
+    for (i, &m) in E2M1_LUT.iter().enumerate() {
+        let d = (a - m).abs();
+        if d < bd { bd = d; best = i; }
+    }
+    sign | best as u8
+}
+
+/// Encode a non-negative scale `s` to a UE4M3 byte (4 exp bits bias-7, 3 mantissa,
+/// no sign — NVFP4's micro-scale type). Round-to-nearest over representable values.
+#[inline]
+fn enc_ue4m3(s: f32) -> u8 {
+    if s <= 0.0 { return 0; }
+    let (mut be, mut bm, mut bd) = (0i32, 0i32, f32::INFINITY);
+    for e in 0..16i32 {
+        for m in 0..8i32 {
+            let v = if e == 0 { (m as f32 / 8.0) * 0.007_812_5 }
+                    else { (1.0 + m as f32 / 8.0) * (e as f32 - 7.0).exp2() };
+            let d = (s - v).abs();
+            if d < bd { bd = d; be = e; bm = m; }
+        }
+    }
+    ((be << 3) | bm) as u8
+}
+
+/// Decode a UE4M3 byte back to f32 (for reconstruction / host reference).
+#[inline]
+pub fn dec_ue4m3(b: u8) -> f32 {
+    let e = ((b >> 3) & 0xF) as i32;
+    let m = (b & 7) as i32;
+    if e == 0 { (m as f32 / 8.0) * 0.007_812_5 } else { (1.0 + m as f32 / 8.0) * (e as f32 - 7.0).exp2() }
+}
+
+/// Quantize a row-major `[m, k]` F32 weight to **NVFP4** (NVIDIA FP4): E2M1 4-bit
+/// codes + per-**block-16** UE4M3 micro-scale + one per-tensor FP32 global. This is
+/// the format the native Blackwell `mma.sync.kind::mxf4nvf4` tensor-core path
+/// consumes (validated bit-exact on GB10/sm_121a). Single quantization from the
+/// original full-precision weights (no Q4→FP4 double-quant). `k % 16 == 0`.
+///
+/// Returns `(codes, scales, global)`:
+/// - `codes`: `[m · k/8]` u32, 8 e2m1 nibbles per u32 (nibble j of word w = element
+///   `w*8 + j` of the row), row-major — same packing convention as [`quantize_q4`].
+/// - `scales`: `[m · k/16]` UE4M3 bytes (one per 16-element K-block, row-major).
+/// - `global`: per-tensor f32; the true block scale is `dec_ue4m3(scale) * global`.
+///   Chosen so each block's `amax/6` lands in UE4M3's representable range.
+///
+/// Example: `let (codes, scales, g) = quantize_nvfp4(&w, n_rows, k_in);`
+pub fn quantize_nvfp4(w: &[f32], m: usize, k: usize) -> (Vec<u32>, Vec<u8>, f32) {
+    assert_eq!(k % 16, 0, "quantize_nvfp4: k must be a multiple of 16");
+    let nblk = k / 16;
+    // Per-tensor global: makes per-block (amax/6) fit UE4M3's ~448 max.
+    let gmax = w.iter().fold(0f32, |a, &x| a.max(x.abs()));
+    let global = if gmax > 0.0 { gmax / 6.0 / 448.0 } else { 1.0 };
+    let mut codes = vec![0u32; m * (k / 8)];
+    let mut scales = vec![0u8; m * nblk];
+    for r in 0..m {
+        for b in 0..nblk {
+            let base = r * k + b * 16;
+            let amax = (0..16).fold(0f32, |a, i| a.max(w[base + i].abs()));
+            let sb = enc_ue4m3((amax / 6.0) / global);
+            scales[r * nblk + b] = sb;
+            let bs = dec_ue4m3(sb) * global; // reconstructed block scale
+            let inv = if bs > 0.0 { 1.0 / bs } else { 0.0 };
+            for i in 0..16 {
+                let code = enc_e2m1(w[base + i] * inv) as u32;
+                let elem = b * 16 + i; // index within the row
+                let word = elem / 8;
+                let nib = elem % 8;
+                codes[r * (k / 8) + word] |= code << (nib * 4);
+            }
+        }
+    }
+    (codes, scales, global)
+}
+
 /// Prefill linear: `out[r, :] = weight · input[r, :]` for a block of rows in
 /// one dispatch — `weight` is `[out_dim, in_dim]`, `input` is `[n_rows, in_dim]`,
 /// result `[n_rows, out_dim]`. Dispatches the 32×32-tiled Reduction kernel
@@ -4408,7 +4493,64 @@ pub fn kv_append_many(
 
 #[cfg(test)]
 mod tests {
-    use super::{dsv4_mhc_sinkhorn_split, permute_q4_from_marlin, permute_q4_to_marlin, quantize_q4};
+    use super::{dsv4_mhc_sinkhorn_split, permute_q4_from_marlin, permute_q4_to_marlin, quantize_q4, quantize_nvfp4, dec_ue4m3, E2M1_LUT};
+
+    /// NVFP4 quantize → dequantize round-trip reconstruction error must be on par
+    /// with Q4 (the existing argmax-correct path). Validated standalone at ~9.5% on
+    /// GB10; here we just gate that the Rust quantizer reconstructs the same way and
+    /// stays comfortably under Q4's error ceiling for a representative weight.
+    #[test]
+    fn nvfp4_reconstruction_on_par_with_q4() {
+        let (m, k) = (64usize, 2688usize); // k % 16 == 0 and % 32 == 0
+        // deterministic pseudo-gaussian weights
+        let w: Vec<f32> = (0..m * k).map(|i| {
+            let x = ((i * 2654435761usize) & 0xffff) as f32 / 65535.0 - 0.5;
+            let y = (((i * 40503usize) >> 3) & 0xffff) as f32 / 65535.0 - 0.5;
+            (x + y) * 0.08 // roughly normal-ish, small magnitude
+        }).collect();
+
+        // NVFP4 reconstruct
+        let (codes, scales, global) = quantize_nvfp4(&w, m, k);
+        let nblk = k / 16;
+        let mut sse_nv = 0f64; let mut ss = 0f64;
+        for r in 0..m {
+            for b in 0..nblk {
+                let bs = dec_ue4m3(scales[r * nblk + b]) * global;
+                for i in 0..16 {
+                    let elem = b * 16 + i;
+                    let word = elem / 8; let nib = elem % 8;
+                    let code = (codes[r * (k / 8) + word] >> (nib * 4)) & 0xf;
+                    let sign = if code & 8 != 0 { -1.0 } else { 1.0 };
+                    let rec = sign * E2M1_LUT[(code & 7) as usize] * bs;
+                    let orig = w[r * k + elem];
+                    let d = (rec - orig) as f64; sse_nv += d * d; ss += (orig as f64) * (orig as f64);
+                }
+            }
+        }
+        // Q4 reconstruct (block-32 amax/7) for the same weight
+        let (qs, qsc) = quantize_q4(&w, m, k);
+        let bpr = k / 32; let mut sse_q4 = 0f64;
+        for r in 0..m {
+            for b in 0..bpr {
+                let d = qsc[r * bpr + b];
+                for word in 0..4 {
+                    for i in 0..8 {
+                        let packed = qs[r * bpr * 4 + b * 4 + word];
+                        let mut q = ((packed >> (i * 4)) & 0xf) as i32;
+                        if q >= 8 { q -= 16; } // sign-extend nibble
+                        let rec = q as f32 * d;
+                        let orig = w[r * k + b * 32 + word * 8 + i];
+                        let e = (rec - orig) as f64; sse_q4 += e * e;
+                    }
+                }
+            }
+        }
+        let rmse_nv = (sse_nv / ss).sqrt();
+        let rmse_q4 = (sse_q4 / ss).sqrt();
+        println!("nvfp4 rel_rmse={:.4}  q4 rel_rmse={:.4}", rmse_nv, rmse_q4);
+        // NVFP4 must be within 1.5× of Q4 (it was actually slightly better in C++).
+        assert!(rmse_nv < rmse_q4 * 1.5, "NVFP4 recon {rmse_nv:.4} >> Q4 {rmse_q4:.4}");
+    }
 
     /// Verify `permute_q4_to_marlin` + `permute_q4_from_marlin` is a lossless round-trip.
     #[test]
