@@ -685,7 +685,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_grouped_gemm_cutlass, moe_q4_grouped_mma, moe_router_device, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_grouped_gemm_cutlass, moe_q4_grouped_mma, moe_q4_grouped_mma_dev, moe_router_device, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -1846,6 +1846,11 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // Step toward fully-on-device MoE + CUDA-graph prefill.
                         let devsort = is_cuda && std::env::var("NEMOTRON_DEVSORT_OFF").is_err();
                         let _t_router = std::time::Instant::now();
+                        // off_dev/st_dev/sw_dev hoisted out (device routing tensors) so the
+                        // Q4 path can run fully on-device (device descriptors + gather +
+                        // scatter) with NO host sync — the prerequisite for CUDA-graphing
+                        // the forward (kill the host-launch GPU idle, the real 3-5× lever).
+                        let mut moe_dev: Option<(Tensor, Tensor, Tensor)> = None; // (offsets, sorted_tok, sorted_wt)
                         let (triples, mt): (Vec<(u32, usize, f32)>, usize) = if devsort {
                             let bias_dev = up(&bias[..]);
                             let rl_dev = pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64, matmul(d, gate_w, &xn).unwrap());
@@ -1859,6 +1864,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             for e in 0..n_exp { for r in offs[e] as usize..offs[e+1] as usize { tr.push((e as u32, stok[r] as usize, swt[r])); } }
                             // route_sort is now STABLE (within-expert token order matches a host
                             // stable_sort) → no host re-sort needed; tr already in canonical order.
+                            moe_dev = Some((off_dev, st_dev, sw_dev));
                             (tr, m)
                         } else {
                             let rl_all = dl(&pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64, matmul(d, gate_w, &xn).unwrap()), s * n_exp);
@@ -2179,13 +2185,28 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let mut expert_ids: Vec<usize> = Vec::new();
                             { let mut gi=0usize; while gi<mt { let eid=triples[gi].0 as usize; expert_ids.push(eid);
                                 let mut g2=gi+1; while g2<mt && triples[g2].0 as usize==eid {g2+=1;} g_starts.push(g2); gi=g2; } }
+                            // NEMOTRON_Q4_DEVDESC=1: build tile descriptors ON DEVICE from the
+                            // routing offsets (no host g_starts, FIXED launch) → the GEMM is
+                            // graph-capturable. Validated to match the host-descriptor path.
+                            let devdesc = std::env::var("NEMOTRON_Q4_DEVDESC").is_ok() && moe_dev.is_some();
+                            let off_dev_ref = moe_dev.as_ref().map(|(o,_,_)| o);
                             // UP: [mt,inter] = xs[mt,hid] · Wup_q4[eid; inter,hid]  (n=inter,k=hid)
-                            let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
-                                moe_q4_grouped_mma(d, &xs_f16, uqs, usc, &g_starts, &expert_ids, inter, hid).unwrap());
+                            let up_out = if devdesc {
+                                pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                    moe_q4_grouped_mma_dev(d, &xs_f16, uqs, usc, off_dev_ref.unwrap(), n_exp, mt, inter, hid).unwrap())
+                            } else {
+                                pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                    moe_q4_grouped_mma(d, &xs_f16, uqs, usc, &g_starts, &expert_ids, inter, hid).unwrap())
+                            };
                             let a2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
                             // DOWN: [mt,hid] = a2[mt,inter] · Wdn_q4[eid; hid,inter]  (n=hid,k=inter)
-                            let dn_out = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
-                                moe_q4_grouped_mma(d, &a2, dqs, dsc, &g_starts, &expert_ids, hid, inter).unwrap());
+                            let dn_out = if devdesc {
+                                pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                    moe_q4_grouped_mma_dev(d, &a2, dqs, dsc, off_dev_ref.unwrap(), n_exp, mt, hid, inter).unwrap())
+                            } else {
+                                pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                    moe_q4_grouped_mma(d, &a2, dqs, dsc, &g_starts, &expert_ids, hid, inter).unwrap())
+                            };
                             let wts_h: Vec<f32> = triples.iter().map(|(_,_,w)| *w).collect();
                             let tidx_h: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
                             let wts_dev = upm(&wts_h, vec![mt]);

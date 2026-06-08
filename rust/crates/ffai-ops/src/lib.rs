@@ -2067,6 +2067,68 @@ pub fn moe_q4_grouped_mma(
     Ok(out)
 }
 
+// Build fixed-size Q4 grouped-GEMM tile descriptors ON DEVICE from the routing
+// `offsets[n_exp+1]` (no host sync) → graph-safe. One thread walks the experts,
+// emitting one descriptor per BM=64-row tile; padding tiles get gend=0 (the GEMM
+// early-exits on them). maxt = mt/BM + n_exp is a per-S constant → fixed launch.
+const MOE_BUILD_TILES_SRC: &str = r#"
+extern "C" __global__ void moe_build_tiles(
+    const unsigned* __restrict__ offsets, int* __restrict__ tok0,
+    int* __restrict__ eid, int* __restrict__ gend, int n_exp, int BM, int maxt)
+{
+    if (blockIdx.x || threadIdx.x) return;
+    int t = 0;
+    for (int e = 0; e < n_exp; e++) {
+        unsigned s = offsets[e], en = offsets[e+1];
+        for (unsigned x = s; x < en; x += (unsigned)BM) {
+            if (t < maxt) { tok0[t]=(int)x; eid[t]=e; gend[t]=(int)en; t++; }
+        }
+    }
+    for (; t < maxt; t++) { tok0[t]=0; eid[t]=0; gend[t]=0; }
+}
+"#;
+
+/// Fully-on-device Q4 grouped MoE GEMM: builds tile descriptors on-device from
+/// `offsets` (device `[n_exp+1]` u32) with a FIXED launch (grid=[maxt,N/64],
+/// maxt = mt/64 + n_exp) → NO host sync, graph-capturable. Returns `out[mt,N]` f16.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_q4_grouped_mma_dev(
+    dev: &dyn Device,
+    a: &Tensor,
+    qs: &Tensor,
+    sc: &Tensor,
+    offsets: &Tensor,
+    n_exp: usize,
+    mt: usize,
+    n: usize,
+    k: usize,
+) -> Result<Tensor> {
+    if k % 64 != 0 { return Err(Error::Msg(format!("moe_q4_grouped_mma_dev: K {k} %64!=0"))); }
+    if n % 64 != 0 { return Err(Error::Msg(format!("moe_q4_grouped_mma_dev: N {n} %64!=0"))); }
+    let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
+    if mt == 0 { return Ok(out); }
+    let maxt = mt.div_ceil(64) + n_exp;
+    let t0d = Tensor::empty(dev, vec![maxt], DType::U32)?;
+    let eidd = Tensor::empty(dev, vec![maxt], DType::U32)?;
+    let ged = Tensor::empty(dev, vec![maxt], DType::U32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        MOE_BUILD_TILES_SRC, "moe_build_tiles.cu", "moe_build_tiles",
+        &[(offsets.buffer.as_ref(), offsets.offset), (t0d.buffer.as_ref(), 0),
+          (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0)],
+        &[i(n_exp as i32), i(64), i(maxt as i32)],
+        [1, 1, 1], [1, 1, 1], 0, false)?;
+    let grid = [maxt as u32, (n as u32).div_ceil(64), 1];
+    dev.dispatch_raw_cuda(
+        MOE_Q4_GROUPED_MMA_SRC, "moe_q4_grouped_mma.cu", "moe_q4_grouped_mma",
+        &[(a.buffer.as_ref(), a.offset), (qs.buffer.as_ref(), qs.offset), (sc.buffer.as_ref(), sc.offset),
+          (t0d.buffer.as_ref(), 0), (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
+          (out.buffer.as_ref(), 0)],
+        &[i(n as i32), i(k as i32)],
+        grid, [128, 1, 1], 0, false)?;
+    Ok(out)
+}
+
 /// Transpose+cast+scale Q `[n_query, n_q_heads, hd]` (caller dtype) into the
 /// head-major fp16 `[n_q_heads, n_query, hd]` layout the batched GEMM wants, with
 /// `scale` folded in. `IN_F32` selects f32 vs f16 input.
