@@ -337,6 +337,22 @@ impl Device for CudaDevice {
         self.dev.gemm_cublas_f32out(xb.ptr, wb.ptr, ob.ptr, m, n, k, ab_dtype).map_err(dispatch_err)
     }
 
+    fn moe_grouped_cutlass(
+        &self,
+        a: &dyn DeviceBuffer,
+        w: &dyn DeviceBuffer,
+        out: &dyn DeviceBuffer,
+        group_rows: &[i32],
+        expert_ids: &[i32],
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let ab = a.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("moe_grouped_cutlass: a not CudaBuffer".into()))?;
+        let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("moe_grouped_cutlass: w not CudaBuffer".into()))?;
+        let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("moe_grouped_cutlass: out not CudaBuffer".into()))?;
+        self.dev.moe_grouped_cutlass(ab.ptr, wb.ptr, ob.ptr, group_rows, expert_ids, n, k).map_err(dispatch_err)
+    }
+
     fn gemm_tc_off(
         &self,
         x: &dyn DeviceBuffer, x_off: usize,

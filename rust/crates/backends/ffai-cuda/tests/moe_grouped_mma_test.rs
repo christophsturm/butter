@@ -6,7 +6,7 @@
 
 use ffai_cuda::CudaDevice;
 use ffai_core::{DType, Device, Tensor};
-use ffai_ops::{moe_grouped_gemm_mma, cast_f32_f16, cast_f16_f32};
+use ffai_ops::{moe_grouped_gemm_mma, moe_grouped_gemm_cutlass, cast_f32_f16, cast_f16_f32};
 
 fn rng(n: usize, seed: u64) -> Vec<f32> {
     let mut v = vec![0f32; n];
@@ -62,6 +62,38 @@ fn run(d: &dyn Device, n_exp: usize, k: usize, n: usize, groups: &[(usize, usize
     eprintln!("moe_grouped_mma mt={mt} N={n} K={k}: max_abs={maxa:.2e} max_rel={maxr:.2e}");
     assert!(maxr < 3e-2, "moe_grouped_mma: max_rel {maxr:.2e} > 3e-2 (max_abs {maxa:.2e})");
     eprintln!("moe_grouped_mma mt={mt} N={n} K={k}: PASS ✓");
+}
+
+fn run_cutlass(d: &dyn Device, n_exp: usize, k: usize, n: usize, groups: &[(usize, usize)]) {
+    let mut g_starts = vec![0usize]; let mut expert_ids = vec![];
+    for &(e, r) in groups { expert_ids.push(e); g_starts.push(g_starts.last().unwrap() + r); }
+    let mt = *g_starts.last().unwrap();
+    let a_f = rng(mt*k, 11); let w_f = rng(n_exp*n*k, 22);
+    let (a16, w16) = (&a_f, &w_f);
+    let up = |v: &[f32], sh: Vec<usize>| -> Tensor {
+        Tensor::new(d.upload(&tb(v)).unwrap(), vec![v.len()], DType::F32).reshaped(sh) };
+    let a_dev = cast_f32_f16(d, &up(&a_f, vec![mt, k])).unwrap().reshaped(vec![mt, k]);
+    let w_dev = cast_f32_f16(d, &up(&w_f, vec![n_exp, n, k])).unwrap().reshaped(vec![n_exp, n, k]);
+    let out = match moe_grouped_gemm_cutlass(d, &a_dev, &w_dev, &g_starts, &expert_ids, n, k) {
+        Ok(o) => o,
+        Err(e) => { eprintln!("cutlass unavailable ({e:?}) — skip"); return; }
+    };
+    let got = dl(d, &cast_f16_f32(d, &out).unwrap());
+    let mut exp = vec![0f32; mt*n];
+    for g in 0..groups.len() { let (eid,_) = groups[g];
+        for t in g_starts[g]..g_starts[g+1] { for nn in 0..n {
+            let mut acc=0f32; for kk in 0..k { acc += a16[t*k+kk]*w16[(eid*n+nn)*k+kk]; }
+            exp[t*n+nn]=acc; } } }
+    let mut maxr=0f32; for (r,t) in exp.iter().zip(got.iter()) { let rel=(r-t).abs()/r.abs().max(1e-2); if rel>maxr {maxr=rel;} }
+    eprintln!("moe_grouped_CUTLASS mt={mt} N={n} K={k}: max_rel={maxr:.2e}");
+    assert!(maxr < 5e-2, "cutlass max_rel {maxr:.2e}");
+    eprintln!("moe_grouped_CUTLASS mt={mt} N={n} K={k}: PASS ✓");
+}
+
+#[test]
+fn moe_grouped_cutlass_nemotron() {
+    let Some(d) = CudaDevice::create().expect("cuda") else { eprintln!("no CUDA"); return; };
+    run_cutlass(d.as_ref(), 8, 2688, 1856, &[(0,96),(3,40),(5,128),(7,17)]);
 }
 
 #[test]

@@ -203,6 +203,25 @@ pub trait Device: Send + Sync {
         Err(Error::Msg("gemm_tc_out_f32 unsupported on this backend".into()))
     }
 
+    /// CUTLASS grouped MoE GEMM: `out[t,n] = Σ_k a[t,k]·w[eid(t)][n,k]` over
+    /// sorted-token groups. `a` f16 `[mt,K]`, `w` contiguous f16 expert slab
+    /// `[n_exp,N,K]`, `out` f16 `[mt,N]`; `group_rows`/`expert_ids` are host
+    /// slices. Default errors; CUDA implements it via the AOT CUTLASS lib (when
+    /// the runtime was built with CUTLASS_DIR).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_cutlass(
+        &self,
+        _a: &dyn DeviceBuffer,
+        _w: &dyn DeviceBuffer,
+        _out: &dyn DeviceBuffer,
+        _group_rows: &[i32],
+        _expert_ids: &[i32],
+        _n: usize,
+        _k: usize,
+    ) -> Result<()> {
+        Err(Error::Msg("moe_grouped_cutlass unsupported on this backend".into()))
+    }
+
     /// Byte-offset variant of []: same semantics but each buffer
     /// pointer is advanced by its byte offset before the GEMM call. Used to
     /// write expert GEMM outputs into pre-allocated slabs without extra copies.

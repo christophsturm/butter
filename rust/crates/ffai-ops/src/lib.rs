@@ -1754,6 +1754,30 @@ extern "C" __global__ void moe_grouped_gemm_mma(
 }
 "#;
 
+/// CUTLASS grouped MoE GEMM — `out[t,n] = Σ_k A[t,k]·W[eid][n,k]` over sorted
+/// token groups. `a` f16 `[mt,K]`; `w_base` contiguous f16 expert slab
+/// `[n_exp,N,K]`; `g_starts[g]..g_starts[g+1]` = group g's token range;
+/// `expert_ids[g]` selects the slab. Beats cuBLAS/the hand-rolled kernel on the
+/// skinny MoE shape. Returns `out[mt,N]` f16. CUDA + CUTLASS_DIR build only.
+pub fn moe_grouped_gemm_cutlass(
+    dev: &dyn Device,
+    a: &Tensor,
+    w_base: &Tensor,
+    g_starts: &[usize],
+    expert_ids: &[usize],
+    n: usize,
+    k: usize,
+) -> Result<Tensor> {
+    let n_active = expert_ids.len();
+    let mt = g_starts.last().copied().unwrap_or(0);
+    let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
+    if n_active == 0 || mt == 0 { return Ok(out); }
+    let group_rows: Vec<i32> = (0..n_active).map(|g| (g_starts[g + 1] - g_starts[g]) as i32).collect();
+    let eids: Vec<i32> = expert_ids.iter().map(|&e| e as i32).collect();
+    dev.moe_grouped_cutlass(a.buffer.as_ref(), w_base.buffer.as_ref(), out.buffer.as_ref(), &group_rows, &eids, n, k)?;
+    Ok(out)
+}
+
 /// Grouped MoE GEMM (mma.sync register-O) — `out[t,n] = Σ_k A[t,k]·W[eid][n,k]`
 /// for sorted tokens. `a` is `[mt,K]` f16; `w_base` is the contiguous f16 expert
 /// weight slab `[n_exp,N,K]`; `g_starts[g]..g_starts[g+1]` is group g's token
