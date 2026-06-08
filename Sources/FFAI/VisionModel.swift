@@ -862,3 +862,57 @@ public final class VisionModel: @unchecked Sendable {
         return block
     }
 }
+
+// MARK: - Seeing conformance
+
+// VisionModel is the composed-VLM handler behind `Model.vlm`. It OVERRIDES the
+// shared `Seeing` decode with its tuned batched-embedding prefill path — so it
+// never reaches `prefillVisual` (which keeps the trapping default). The unified
+// `Seeing.generate`/`generateStream` just route to the existing per-media
+// methods by which media is present.
+extension VisionModel: Seeing {
+    /// The composed text backbone runs the decode.
+    public var textEngine: any TextGenerating { engine }
+
+    public func makeLayerCaches(maxSeq: Int?, device: Device) -> [any LayerCacheProtocol] {
+        engine.makeLayerCaches(maxSeq: maxSeq, device: device)
+    }
+
+    public func generate(
+        promptTokens: [Int], image: RGBImage?, videoFrames: [RGBImage],
+        maxTokens: Int, parameters: GenerationParameters?,
+        eosTokenId: Int?, eosTokenIds: [Int], device: Device
+    ) throws -> [Int] {
+        if !videoFrames.isEmpty {
+            return try generate(
+                promptTokens: promptTokens, videoFrames: videoFrames,
+                maxTokens: maxTokens, parameters: parameters,
+                eosTokenId: eosTokenId, eosTokenIds: eosTokenIds, device: device)
+        }
+        return try generate(
+            promptTokens: promptTokens, image: image,
+            maxTokens: maxTokens, parameters: parameters,
+            eosTokenId: eosTokenId, eosTokenIds: eosTokenIds, device: device)
+    }
+
+    public func generateStream(
+        promptTokens: [Int], image: RGBImage?, videoFrames: [RGBImage],
+        maxTokens: Int, parameters: GenerationParameters?,
+        eosTokenId: Int?, eosTokenIds: [Int], device: Device
+    ) -> AsyncThrowingStream<GenerationChunk, Error> {
+        if !videoFrames.isEmpty {
+            do {
+                return try generateStream(
+                    promptTokens: promptTokens, videoFrames: videoFrames,
+                    maxTokens: maxTokens, parameters: parameters,
+                    eosTokenId: eosTokenId, eosTokenIds: eosTokenIds, device: device)
+            } catch {
+                return AsyncThrowingStream { $0.finish(throwing: error) }
+            }
+        }
+        return generateStream(
+            promptTokens: promptTokens, image: image,
+            maxTokens: maxTokens, parameters: parameters,
+            eosTokenId: eosTokenId, eosTokenIds: eosTokenIds, device: device)
+    }
+}
