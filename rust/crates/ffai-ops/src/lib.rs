@@ -6294,6 +6294,11 @@ extern "C" __global__ void moe_fp4_actq_pack(
 
 // VARIANT: each warp computes 4 consecutive n8-tiles — A frags loaded once,
 // reused 4x; W streams per-subtile. Cuts A traffic 4x, raises mma density.
+// 16-byte async global->shared copy (per-warp staging; no block syncs).
+__device__ __forceinline__ void mt_cp16(void* sm, const void* gm){
+  unsigned saddr=(unsigned)__cvta_generic_to_shared(sm);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"::"r"(saddr),"l"(gm));
+}
 extern "C" __global__ void moe_fp4_grouped_mma_x4(
     const unsigned* __restrict__ Ap, const unsigned* __restrict__ Asc,
     const unsigned* __restrict__ Wp, const unsigned* __restrict__ Wsc,
@@ -6303,9 +6308,18 @@ extern "C" __global__ void moe_fp4_grouped_mma_x4(
     unsigned* amax_out,
     int N, int K, int mt_total, int am_mode, float am_scale)
 {
+    // Per-warp cp.async 2-stage smem W pipeline + A register prefetch: the
+    // direct global->register W loads left the mma latency-bound (~42 TF);
+    // double-buffering the 4 W tiles per warp while the mma consumes the
+    // other stage measures 47.9 TF standalone on GB10 (+14%). Each warp owns
+    // its smem slot — per-warp wait_group + syncwarp only, NO __syncthreads
+    // (the cross-warp shared-W variant with block syncs measured SLOWER).
+    __shared__ unsigned smW[8][2][256]; // [warp][stage][4 tiles x 64 u32]
+    __shared__ unsigned smS[8][2][32];  // [warp][stage][4 tiles x 8 u32]
     int KT=K/64, NT=N/8, NG=(NT+3)>>2;
     int t=blockIdx.x;
-    int ng=blockIdx.y*(blockDim.x>>5)+(threadIdx.x>>5);
+    int w=threadIdx.x>>5;
+    int ng=blockIdx.y*(blockDim.x>>5)+w;
     if(ng>=NG) return;
     int base=tok0[t], end=gend[t];
     if(end<=base) return;
@@ -6315,22 +6329,47 @@ extern "C" __global__ void moe_fp4_grouped_mma_x4(
     const unsigned* As=Asc+ (long)t*KT*32+lane;
     float c[4][4]={};
     int nt0=ng*4;
+    #define X4_ISSUE(kt_,st_) do{                                            \
+        int c0=lane, c1=lane+32;                                              \
+        int j0=c0>>4, j1=c1>>4;                                               \
+        int nt_a=nt0+j0, nt_b=nt0+j1;                                         \
+        if(nt_a<NT) mt_cp16(&smW[w][st_][j0*64+(c0&15)*4],                    \
+            Wp+(((long)eid*NT+nt_a)*KT+(kt_))*64+(c0&15)*4);                  \
+        if(nt_b<NT) mt_cp16(&smW[w][st_][j1*64+(c1&15)*4],                    \
+            Wp+(((long)eid*NT+nt_b)*KT+(kt_))*64+(c1&15)*4);                  \
+        if(lane<8){ int js=lane>>1, hf=lane&1; int nt_s=nt0+js;               \
+            if(nt_s<NT) mt_cp16(&smS[w][st_][js*8+hf*4],                      \
+                Wsc+(((long)eid*NT+nt_s)*KT+(kt_))*8+hf*4); }                 \
+        asm volatile("cp.async.commit_group;");                               \
+    }while(0)
+    X4_ISSUE(0,0);
+    unsigned a0=A[0],a1=A[1],a2=A[2],a3=A[3],sA=As[0];
     for(int kt=0;kt<KT;kt++){
-        const unsigned* Ak=A+(long)kt*32*4;
-        unsigned a0=Ak[0],a1=Ak[1],a2=Ak[2],a3=Ak[3];
-        unsigned sA=As[(long)kt*32];
+        int st=kt&1;
+        unsigned na0=0,na1=0,na2=0,na3=0,nsA=0;
+        if(kt+1<KT){
+            X4_ISSUE(kt+1,st^1);
+            const unsigned* An=A+(long)(kt+1)*32*4;
+            na0=An[0];na1=An[1];na2=An[2];na3=An[3];nsA=As[(long)(kt+1)*32];
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            asm volatile("cp.async.wait_group 0;");
+        }
+        __syncwarp();
         #pragma unroll
         for(int j=0;j<4;j++){
             int nt=nt0+j; if(nt>=NT) break;
-            const unsigned* Wk=Wp+(((long)eid*NT+nt)*KT+kt)*32*2+lane*2;
-            unsigned b0=Wk[0],b1=Wk[1];
-            unsigned sB=Wsc[(((long)eid*NT+nt)*KT+kt)*8+gid];
+            unsigned b0=smW[w][st][j*64+lane*2], b1=smW[w][st][j*64+lane*2+1];
+            unsigned sB=smS[w][st][j*8+gid];
             asm volatile("mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
              "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3},{%10},{0,0},{%11},{0,0};"
              :"+f"(c[j][0]),"+f"(c[j][1]),"+f"(c[j][2]),"+f"(c[j][3])
              :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"r"(sA),"r"(sB));
         }
+        a0=na0;a1=na1;a2=na2;a3=na3;sA=nsA;
+        __syncwarp();
     }
+    #undef X4_ISSUE
     float g=gA[0]*gw[eid];
     int valid=end-base;
     float am=0.f;
