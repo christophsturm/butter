@@ -983,6 +983,22 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 // routed experts on DEVICE (upload f16 once, pack kernels do the rest).
                 if use_fp4_moe {
                     let mut build = |which: &str, n: usize, k: usize| {
+                        let key = format!("{p}.moe_{which}_fp4");
+                        let (kt2, nt2) = (k / 64, n / 8);
+                        let (wp_len, wsc_len) = (n_exp * nt2 * kt2 * 32 * 2, n_exp * nt2 * kt2 * 8);
+                        let cpath = cache_path(&format!("{key}.v1"));
+                        // disk-cache hit: upload the packed blobs directly (skips the
+                        // f32 collect + f16 convert + device pack — the slow part).
+                        if let Ok(b) = std::fs::read(&cpath) {
+                            let expect = (wp_len + wsc_len + n_exp) * 4;
+                            if b.len() == expect {
+                                let wp = Tensor::new(d.upload(&b[..wp_len * 4]).unwrap(), vec![wp_len], DType::U32);
+                                let wsc = Tensor::new(d.upload(&b[wp_len * 4..(wp_len + wsc_len) * 4]).unwrap(), vec![wsc_len], DType::U32);
+                                let gw = Tensor::new(d.upload(&b[(wp_len + wsc_len) * 4..]).unwrap(), vec![n_exp], DType::F32);
+                                fp4w.insert(key, (wp, wsc, gw));
+                                return;
+                            }
+                        }
                         let mut wh: Vec<f32> = Vec::with_capacity(n_exp * n * k);
                         for e in 0..n_exp {
                             wh.extend(g(&format!("{p}.mixer.experts.{e}.{which}.weight")));
@@ -992,10 +1008,30 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let wt = Tensor::new(d.upload(&bytes).unwrap(), vec![n_exp * n, k], DType::F16);
                         drop(bytes);
                         let (wp, wsc, gw) = ffai_ops::moe_fp4_pack_weights(d, &wt, n_exp, n, k).unwrap();
-                        fp4w.insert(format!("{p}.moe_{which}_fp4"), (wp, wsc, gw));
+                        // fill the cache (raw blob: wp ++ wsc ++ gw)
+                        let mut blob = vec![0u8; (wp_len + wsc_len + n_exp) * 4];
+                        d.download(wp.buffer.as_ref(), &mut blob[..wp_len * 4]).unwrap();
+                        d.download(wsc.buffer.as_ref(), &mut blob[wp_len * 4..(wp_len + wsc_len) * 4]).unwrap();
+                        d.download(gw.buffer.as_ref(), &mut blob[(wp_len + wsc_len) * 4..]).unwrap();
+                        let _ = std::fs::write(&cpath, &blob);
+                        fp4w.insert(key, (wp, wsc, gw));
                     };
                     build("up_proj", inter, hid);
                     build("down_proj", hid, inter);
+                    // shared expert (n_exp=1 grouped call), NEMOTRON_FP4_SHARED=1
+                    if std::env::var("NEMOTRON_FP4_SHARED").is_ok() {
+                        let mut build1 = |which: &str, n: usize, k: usize| {
+                            let wh: Vec<f32> = g(&format!("{p}.mixer.shared_experts.{which}.weight"));
+                            let bytes = tb_f16(&wh);
+                            drop(wh);
+                            let wt = Tensor::new(d.upload(&bytes).unwrap(), vec![n, k], DType::F16);
+                            drop(bytes);
+                            let (wp, wsc, gw) = ffai_ops::moe_fp4_pack_weights(d, &wt, 1, n, k).unwrap();
+                            fp4w.insert(format!("{p}.sh_{which}_fp4"), (wp, wsc, gw));
+                        };
+                        build1("up_proj", shared_inter, hid);
+                        build1("down_proj", hid, shared_inter);
+                    }
                 }
                 // NVFP4 recipe: shared-expert up/down → Q8.
                 if use_nvfp4_recipe {
@@ -2687,14 +2723,28 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // faults on replay), but graphs are a dead end here anyway — the
                             // host-free forward alone pegs the GPU at ~98% busy, so the win is
                             // killing the host round-trip idle, NOT graph replay.
-                            let wsu = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
                             let xnh = pf!(15, 0.0, cast_f32_f16(d, &xn).unwrap());
+                            let fp4_shared = fp4w.contains_key(&format!("{p}.sh_up_proj_fp4"));
+                            let sd = if fp4_shared {
+                                // NVFP4 W4A4 shared expert: same grouped kernel, n_exp=1
+                                // (offsets [0, s] — one run covering all rows).
+                                let off1 = Tensor::new(d.upload(&tbu(&[0u32, s as u32])).unwrap(), vec![2], DType::U32);
+                                let (uwp, uwsc, ugw) = &fp4w[&format!("{p}.sh_up_proj_fp4")];
+                                let (dwp, dwsc, dgw) = &fp4w[&format!("{p}.sh_down_proj_fp4")];
+                                let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xnh, uwp, uwsc, ugw, &off1, 1, s, shared_inter, hid).unwrap());
+                                let sa2 = pf!(3, 0.0, relu2_scale_f16(d, &sa, 1.0f32).unwrap());
+                                pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &sa2, dwp, dwsc, dgw, &off1, 1, s, hid, shared_inter).unwrap())
+                            } else {
+                            let wsu = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
                             let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
                                 gemm_cublas(d, &xnh, &wsu, s, *sm_up, *sk_up).unwrap());
                             let sa2 = pf!(3, 0.0, relu2_scale_f16(d, &sa, 1.0f32).unwrap()); // full scale, device
                             let wsd = deq16(&format!("{p}.shdn"), sdqs, sdsc, *sm_dn, *sk_dn, 0);
-                            let sd = pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
-                                gemm_cublas(d, &sa2, &wsd, s, *sm_dn, *sk_dn).unwrap()); // [s,hid] f16
+                            pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
+                                gemm_cublas(d, &sa2, &wsd, s, *sm_dn, *sk_dn).unwrap()) // [s,hid] f16
+                            };
                             sd_dev_opt = Some(pf!(15, 0.0, cast_f16_f32(d, &sd).unwrap())); // device f32, full scale
                             Vec::new()
                         } else if metal_mma_shared {
