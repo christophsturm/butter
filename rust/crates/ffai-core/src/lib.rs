@@ -103,6 +103,13 @@ pub trait Device: Send + Sync {
     /// Allocate + upload host bytes in one shot.
     fn upload(&self, bytes: &[u8]) -> Result<Arc<dyn DeviceBuffer>>;
 
+    /// Allocate `len` bytes of zero-initialized device memory. Backends
+    /// should override with a device-side fill — the default uploads a host
+    /// zero buffer, which for multi-MB accumulators is a pageable H2D copy.
+    fn alloc_zeroed(&self, len: usize) -> Result<Arc<dyn DeviceBuffer>> {
+        self.upload(&vec![0u8; len])
+    }
+
     /// Copy device memory back into a host slice.
     fn download(&self, buf: &dyn DeviceBuffer, out: &mut [u8]) -> Result<()>;
 

@@ -2352,14 +2352,16 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 // up-GEMM epilogue also computes the DOWN-GEMM's activation
                                 // amax (of relu²-transformed outputs) — kills the full 45MB
                                 // re-read the down amax pass used to do.
-                                let amax_dn = Tensor::new(d.upload(&[0u8; 4]).unwrap(), vec![1], DType::U32);
+                                let amax_dn = Tensor::new(d.alloc_zeroed(4).unwrap(), vec![1], DType::U32);
                                 let up_gidx = if fp4_direct { moe_dev.as_ref().map(|(_, st, _)| st) } else { None };
                                 let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
                                     ffai_ops::moe_fp4_grouped_mma_dev(d, &xs_in, uwp, uwsc, ugw, off_dev_ref.unwrap(), n_exp, mt, inter, hid, 0, 0.0, None, Some((&amax_dn, 1, inv)), up_gidx).unwrap());
                                 // relu²·(1/256) fused into the down act-quant (no standalone pass)
                                 let dn_out = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
                                     ffai_ops::moe_fp4_grouped_mma_dev(d, &up_out, dwp, dwsc, dgw, off_dev_ref.unwrap(), n_exp, mt, hid, inter, 1, inv, Some(&amax_dn), None, None).unwrap());
-                                let acc_dev = upm(&acc_h, vec![s, hid]);
+                                // acc_h is still all-zero on this path — seed the accumulator
+                                // with a device-side memset instead of uploading 22MB of zeros.
+                                let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
                                 let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
                                 moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
                                 if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
@@ -2382,7 +2384,8 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
                                     moe_q4_grouped_mma(d, &a2, dqs, dsc, &g_starts, &expert_ids, hid, inter).unwrap())
                             };
-                            let acc_dev = upm(&acc_h, vec![s, hid]);
+                            // acc_h is still all-zero here — device-side memset, no 22MB upload.
+                            let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
                             if devdesc {
                                 // Fully on-device scatter: sorted_tok/sorted_wt (st/sw) ARE the
                                 // device token-idx + weight tensors → atomic scatter, NO host
@@ -2795,7 +2798,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let off1 = Tensor::new(d.upload(&tbu(&[0u32, s as u32])).unwrap(), vec![2], DType::U32);
                                 let (uwp, uwsc, ugw) = &fp4w[&format!("{p}.sh_up_proj_fp4")];
                                 let (dwp, dwsc, dgw) = &fp4w[&format!("{p}.sh_down_proj_fp4")];
-                                let amax_sd = Tensor::new(d.upload(&[0u8; 4]).unwrap(), vec![1], DType::U32);
+                                let amax_sd = Tensor::new(d.alloc_zeroed(4).unwrap(), vec![1], DType::U32);
                                 let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
                                     ffai_ops::moe_fp4_grouped_mma_dev(d, &xnh, uwp, uwsc, ugw, &off1, 1, s, shared_inter, hid, 0, 0.0, None, Some((&amax_sd, 1, 1.0)), None).unwrap());
                                 pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,

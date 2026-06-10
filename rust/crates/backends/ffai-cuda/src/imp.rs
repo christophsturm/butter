@@ -161,6 +161,15 @@ impl Device for CudaDevice {
         Ok(Arc::new(CudaBuffer { ptr, len: bytes.len(), dev: self.dev.clone() }))
     }
 
+    fn alloc_zeroed(&self, len: usize) -> Result<Arc<dyn DeviceBuffer>> {
+        // Stream-ordered device memset — no host zero buffer, no pageable
+        // H2D copy. A [s,hid] f32 MoE accumulator is ~22 MB; uploading zeros
+        // for it cost ~4-6 ms of host-blocking copy per E-layer.
+        let ptr = self.dev.alloc_raw(len).map_err(dispatch_err)?;
+        self.dev.memset_zero_raw(ptr, len).map_err(dispatch_err)?;
+        Ok(Arc::new(CudaBuffer { ptr, len, dev: self.dev.clone() }))
+    }
+
     fn download(&self, buf: &dyn DeviceBuffer, out: &mut [u8]) -> Result<()> {
         let cb = buf
             .as_any()
