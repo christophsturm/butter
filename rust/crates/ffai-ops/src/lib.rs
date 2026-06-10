@@ -6521,9 +6521,13 @@ pub fn add_rms_norm(
     let residual = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
     let normed = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
     let eps_buf = dev.upload(&eps.to_le_bytes())?;
-    // native (reduction) mode: one threadgroup per row, `tid` = lane in row.
-    let k = cached_ir("mt_add_rms_norm", a.dtype,
-        || metaltile_std::mlx::unary::mt_add_rms_norm::kernel_ir_for(a.dtype));
+    // Reduction mode: one threadgroup per row, `tid` = lane within the row
+    // (the same TG=n/4 contract as mt_rms_norm).
+    let k = cached_ir("mt_add_rms_norm", a.dtype, || {
+        let mut k = metaltile_std::mlx::unary::mt_add_rms_norm::kernel_ir_for(a.dtype);
+        k.mode = metaltile_core::ir::KernelMode::Reduction;
+        k
+    });
     let grid = Grid { grid: [rows as u32, 1, 1], block: [(n / 4) as u32, 1, 1] };
     dev.dispatch(
         &k,
