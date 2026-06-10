@@ -1718,9 +1718,15 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             let grouped_dn_scratch: Option<Tensor> = if needs_grouped_scratch {
                 Some(Tensor::new(d.alloc(n_exp * hid * inter * 2).unwrap(), vec![n_exp * hid, inter], DType::F16))
             } else { None };
+            // xn carried from the previous layer's fused add+rms_norm (None on layer 0
+            // or after a non-fusable tail).
+            let mut xn_carry: Option<Tensor> = None;
             for (l, mix) in PATTERN.chars().enumerate() {
                 let p = format!("language_model.backbone.layers.{l}");
-                let xn = pf!(1, 0.0, rms_norm(d, &xt, &fwd[&format!("{p}.norm.weight")], eps).unwrap()); // [s, hid]
+                let xn = match xn_carry.take() {
+                    Some(t) => t,
+                    None => pf!(1, 0.0, rms_norm(d, &xt, &fwd[&format!("{p}.norm.weight")], eps).unwrap()), // [s, hid]
+                };
                 match mix {
                     'M' => {
                         // ── NEMOTRON_CONV_DEVICE=1: fully on-device conv (no host round-trip) ──
@@ -1788,7 +1794,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let ynt = pf!(6, 0.0, gated_group_rmsnorm_batched(d, &y_dev, &z_t,
                                 &up(&fw[&format!("{p}.mixer.norm.weight")]), eps, s, di, gs).unwrap());
                             let out = qmm(&ynt.reshaped(vec![s, di]), &format!("{p}.mixer.out_proj.weight"));
-                            xt = add(d, &xt, &out).unwrap();
+                            {
+                                // fused residual add + NEXT layer's rms_norm (one pass, llama.cpp-style)
+                                let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
+                                match nw {
+                                    Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &out, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
+                                    _ => { xt = add(d, &xt, &out).unwrap(); }
+                                }
+                            }
                         } else {
                         let proj = dl(&qmm(&xn, &format!("{p}.mixer.in_proj.weight")), s * in_proj_out); // [s, in_proj_out]
                         // Host-bridge the Mamba conv + SSD-scan input shuffle (correctness-first).
@@ -1893,7 +1906,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         }
                         let ynt = upm(&yn, vec![s, di]);
                         let out = qmm(&ynt, &format!("{p}.mixer.out_proj.weight")); // [s, hid]
-                        xt = add(d, &xt, &out).unwrap();
+                        {
+                            // fused residual add + NEXT layer's rms_norm (one pass, llama.cpp-style)
+                            let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
+                            match nw {
+                                Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &out, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
+                                _ => { xt = add(d, &xt, &out).unwrap(); }
+                            }
+                        }
                         } // end !use_conv_device
                     }
                     'E' => {
@@ -2862,10 +2882,25 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // else upload the host f32 shared output.
                             let sd_dev = sd_dev_opt.take().unwrap_or_else(|| upm(&sd_h, vec![s, hid]));
                             let merged = add(d, &acc_dev, &sd_dev).unwrap();
-                            xt = add(d, &xt, &merged).unwrap();
+                            {
+                                // fused residual add + NEXT layer's rms_norm (one pass, llama.cpp-style)
+                                let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
+                                match nw {
+                                    Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &merged, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
+                                    _ => { xt = add(d, &xt, &merged).unwrap(); }
+                                }
+                            }
                         } else {
                             for i in 0..s*hid { acc_h[i] += sd_h[i]; }
-                            xt = add(d, &xt, &upm(&acc_h, vec![s, hid])).unwrap();
+                            let acc_up = upm(&acc_h, vec![s, hid]);
+                            {
+                                // fused residual add + NEXT layer's rms_norm (one pass, llama.cpp-style)
+                                let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
+                                match nw {
+                                    Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &acc_up, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
+                                    _ => { xt = add(d, &xt, &acc_up).unwrap(); }
+                                }
+                            }
                         }
                     }
                     '*' => {
@@ -2945,7 +2980,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         };
                         // attn [s, nq, hd] = [s, qdim]; o_proj batched.
                         let o = qmm(&attn.reshaped(vec![s, qdim]), &format!("{p}.mixer.o_proj.weight"));
-                        xt = add(d, &xt, &o).unwrap();
+                        {
+                            // fused residual add + NEXT layer's rms_norm (one pass, llama.cpp-style)
+                            let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
+                            match nw {
+                                Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &o, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
+                                _ => { xt = add(d, &xt, &o).unwrap(); }
+                            }
+                        }
                     }
                     _ => unreachable!(),
                 }
@@ -2962,7 +3004,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             // roundtrip): slice the last token on device, lm_head GEMM on device →
             // device logits. Store the device logits for the graph path; dl for argmax
             // ONLY when not capturing (a dl aborts cuda-graph stream capture).
-            let xf = rms_norm(d, &xt, &fwd["norm_f"], eps).unwrap(); // [s, hid]
+            let xf = match xn_carry.take() {
+                Some(t) => t,
+                None => rms_norm(d, &xt, &fwd["norm_f"], eps).unwrap(), // [s, hid]
+            };
             let last_dev = slice(d, &xf, (s-1)*hid, hid).unwrap();   // [hid] device
             let logits_dev = pf!(14, 2.0 * vocab as f64 * hid as f64, qmv(&last_dev, "language_model.lm_head.weight"));
             LAST_BATCHED_LOGITS_DEV.with(|c| *c.borrow_mut() = Some(logits_dev.clone()));

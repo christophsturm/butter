@@ -6381,3 +6381,37 @@ pub fn moe_fp4_grouped_mma_dev(
         [warps_per_block * 32, 1, 1], 0, false)?;
     Ok(out)
 }
+
+/// Fused residual-add + RMS norm: `residual_out = a + b`, `normed_out =
+/// rms_norm(a + b, w)` — one pass instead of an `add` kernel plus a
+/// `rms_norm` kernel re-reading the sum (the per-layer residual hot path).
+pub fn add_rms_norm(
+    dev: &dyn Device, a: &Tensor, b: &Tensor, weight: &Tensor, eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    let n = *a.shape.last().ok_or_else(|| Error::Msg("add_rms_norm: scalar input".into()))?;
+    if n % 4 != 0 || n > 4096 * 4 {
+        return Err(Error::Msg(format!("add_rms_norm: n {n} unsupported (need %4, fits one block)")));
+    }
+    let rows = a.elem_count() / n;
+    let residual = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
+    let normed = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
+    let eps_buf = dev.upload(&eps.to_le_bytes())?;
+    // native (reduction) mode: one threadgroup per row, `tid` = lane in row.
+    let k = cached_ir("mt_add_rms_norm", a.dtype,
+        || metaltile_std::mlx::unary::mt_add_rms_norm::kernel_ir_for(a.dtype));
+    let grid = Grid { grid: [rows as u32, 1, 1], block: [(n / 4) as u32, 1, 1] };
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(a.buffer.clone()),
+            Binding::Buffer(b.buffer.clone()),
+            Binding::Buffer(weight.buffer.clone()),
+            Binding::Buffer(eps_buf),
+            Binding::Buffer(residual.buffer.clone()),
+            Binding::Buffer(normed.buffer.clone()),
+            Binding::Scalar((n as u32).to_le_bytes().to_vec()),
+        ],
+        grid,
+    )?;
+    Ok((residual, normed))
+}
