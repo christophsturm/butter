@@ -25,8 +25,12 @@
 // Each port should improve or hold the recorded `same_top_fraction`
 // and lower the `mean_kld` vs the baseline AURA scheme.
 //
-// Currently gated on the local Qwen3-0.6B-4bit checkpoint — the
-// smallest AURA-compatible model that runs end-to-end on a dev box.
+// Gated on a local AURA-compatible checkpoint supplied via the
+// `FFAI_AURA_KLD_MODEL_PATH` env var (Qwen3-0.6B-4bit is the smallest
+// model that runs the gate end-to-end on a dev box). No
+// machine-specific default — when the env var is unset or the path
+// doesn't exist, every test prints a skip line and returns 0, matching
+// `AuraDecodeBenchIntegrationTests`.
 
 import Foundation
 import TestHelpers
@@ -34,7 +38,9 @@ import Testing
 
 @testable import FFAI
 
-private let qwen3LocalPath = "/Users/tom/models/Qwen3-0.6B-4bit"
+private let qwen3LocalPath =
+    ProcessInfo.processInfo.environment["FFAI_AURA_KLD_MODEL_PATH"]
+    ?? "<FFAI_AURA_KLD_MODEL_PATH unset>"
 
 @Suite("AURA KL-divergence regression gate", .serialized)
 struct AuraKLDIntegrationTests {
