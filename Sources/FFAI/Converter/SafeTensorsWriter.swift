@@ -83,8 +83,21 @@ public final class SafeTensorsWriter {
     private var pending: [Pending] = []
     private var usedNames: Set<String> = []
 
-    public init(url: URL) {
+    /// Soft cap on a single output shard's tensor-data bytes. When the
+    /// accumulated tensors exceed this, `finalize` splits them across
+    /// `model-0000i-of-0000N.safetensors` shards + a `*.index.json` map
+    /// (the HF / mlx-community convention). A single tensor larger than the
+    /// cap still gets its own shard. Default 5 GB (matches `transformers`'
+    /// `max_shard_size="5GB"`). Set to `.max` to force a single file.
+    private let maxShardBytes: Int
+
+    /// Default per-shard cap — 5 GB, the HF/transformers/mlx-community
+    /// convention for sharded safetensors checkpoints.
+    public static let defaultMaxShardBytes = 5_000_000_000
+
+    public init(url: URL, maxShardBytes: Int = SafeTensorsWriter.defaultMaxShardBytes) {
         self.url = url
+        self.maxShardBytes = maxShardBytes
     }
 
     /// Accumulate one tensor. `bytes` must be raw little-endian tensor data
@@ -96,23 +109,77 @@ public final class SafeTensorsWriter {
         pending.append(Pending(name: name, dtype: dtype, shape: shape, bytes: bytes))
     }
 
-    /// Write the safetensors file. Clears the pending queue after writing.
-    /// Throws on JSON serialization failure or I/O error.
+    /// Write the safetensors output. If the accumulated tensor data fits in
+    /// one shard (≤ `maxShardBytes`) a single file is written at `url`
+    /// (original behavior). Otherwise the tensors are split across
+    /// `model-0000i-of-0000N.safetensors` shards plus a
+    /// `model.safetensors.index.json` weight-map, the HF/mlx-community
+    /// convention. Clears the pending queue after writing.
     public func finalize() throws {
-        // Build header JSON dict. Keys must be sorted alphabetically so
-        // the output is deterministic (mlx-lm also sorts alphabetically).
-        var headerDict: [String: Any] = [:]
+        let stem = url.deletingPathExtension().lastPathComponent  // "model"
+        let ext = url.pathExtension.isEmpty ? "safetensors" : url.pathExtension
+        let dir = url.deletingLastPathComponent()
 
-        // __metadata__ block — written first by convention, sorted to top
-        // in the final JSON because "_" sorts before letters in ASCII.
+        // Pick the fewest shards that keep every shard ≤ maxShardBytes, then
+        // split the tensors **evenly** across that many shards (by cumulative
+        // byte position) so they come out ~uniform — rather than several full
+        // shards plus a small tail. Each tensor is placed whole into the shard
+        // its cumulative-start falls in, so a shard's size is ≈ total/count
+        // plus at most one tensor's slack (well under maxShardBytes for any
+        // LLM checkpoint, whose largest tensor is far smaller than a shard).
+        let totalBytes = pending.reduce(0) { $0 + $1.bytes.count }
+        let shardCount = max(1, (totalBytes + maxShardBytes - 1) / maxShardBytes)
+
+        var shards: [[Pending]]
+        if shardCount <= 1 || totalBytes == 0 {
+            shards = [pending]
+        } else {
+            var buckets: [[Pending]] = Array(repeating: [], count: shardCount)
+            var cumulative = 0
+            for p in pending {
+                // floor(cumulative / (totalBytes / shardCount)), integer math.
+                var s = cumulative * shardCount / totalBytes
+                if s >= shardCount { s = shardCount - 1 }
+                buckets[s].append(p)
+                cumulative += p.bytes.count
+            }
+            shards = buckets.filter { !$0.isEmpty }
+        }
+
+        if shards.count <= 1 {
+            // Single file at `url` — no index needed (loaders treat a lone
+            // `model.safetensors` as the whole checkpoint).
+            try writeShardFile(url: url, tensors: pending)
+        } else {
+            let n = shards.count
+            var weightMap: [String: String] = [:]
+            for (i, shard) in shards.enumerated() {
+                let name = String(format: "%@-%05d-of-%05d.%@", stem, i + 1, n, ext)
+                try writeShardFile(url: dir.appendingPathComponent(name), tensors: shard)
+                for p in shard { weightMap[p.name] = name }
+            }
+            try writeIndex(
+                at: dir.appendingPathComponent("\(stem).\(ext).index.json"),
+                weightMap: weightMap, totalSize: totalBytes)
+        }
+
+        pending.removeAll()
+        usedNames.removeAll()
+    }
+
+    // ─── Helpers ────────────────────────────────────────────────────────
+
+    /// Serialize one safetensors file (`[u64 header len][JSON header][data]`)
+    /// for `tensors`, with data_offsets relative to this file. Atomic write.
+    private func writeShardFile(url: URL, tensors: [Pending]) throws {
+        var headerDict: [String: Any] = [:]
+        // __metadata__ sorts to the top ("_" precedes letters in ASCII).
         headerDict["__metadata__"] = [
             "format": "pt",
             "ffai_version": FFAI.version,
         ]
-
-        // Compute data_offsets as we walk the pending list in order.
         var offset = 0
-        for p in pending {
+        for p in tensors {
             let start = offset
             let end = offset + p.bytes.count
             headerDict[p.name] =
@@ -125,42 +192,48 @@ public final class SafeTensorsWriter {
             offset = end
         }
 
-        // Serialize JSON with sorted keys (NSJSONSerialization respects
-        // `.sortedKeys` on macOS 10.13+).
         let jsonData: Data
         do {
             jsonData = try JSONSerialization.data(
-                withJSONObject: headerDict,
-                options: [.sortedKeys]
-            )
+                withJSONObject: headerDict, options: [.sortedKeys])
         } catch {
             throw SafeTensorsWriterError.jsonSerializationFailed
         }
 
-        // Assemble the file in-memory:
-        //   [8 bytes u64-LE header length]
-        //   [N bytes UTF-8 JSON]
-        //   [tensor data, contiguous]
+        // [8 bytes u64-LE header length][JSON][tensor data, contiguous]
         var file = Data()
         var headerLen = UInt64(jsonData.count)
         withUnsafeBytes(of: &headerLen) { file.append(contentsOf: $0) }
         file.append(jsonData)
-        for p in pending {
-            file.append(p.bytes)
-        }
+        for p in tensors { file.append(p.bytes) }
 
-        // Write atomically so partial writes don't leave a corrupt file.
         do {
             try file.write(to: url, options: .atomic)
         } catch {
             throw SafeTensorsWriterError.writeFailed(url, error)
         }
-
-        pending.removeAll()
-        usedNames.removeAll()
     }
 
-    // ─── Helpers ────────────────────────────────────────────────────────
+    /// Write the `model.safetensors.index.json` shard map: `{ "metadata":
+    /// { "total_size": <data bytes> }, "weight_map": { tensor → shard } }`.
+    private func writeIndex(at url: URL, weightMap: [String: String], totalSize: Int) throws {
+        let index: [String: Any] = [
+            "metadata": ["total_size": totalSize],
+            "weight_map": weightMap,
+        ]
+        let data: Data
+        do {
+            data = try JSONSerialization.data(
+                withJSONObject: index, options: [.sortedKeys, .prettyPrinted])
+        } catch {
+            throw SafeTensorsWriterError.jsonSerializationFailed
+        }
+        do {
+            try data.write(to: url, options: .atomic)
+        } catch {
+            throw SafeTensorsWriterError.writeFailed(url, error)
+        }
+    }
 
     /// Map DType to the uppercase safetensors dtype tag that the loader
     /// (SafeTensors.swift → DType.fromSafeTensors) reads back correctly.

@@ -127,8 +127,8 @@ struct ConvertCommand: AsyncParsableCommand {
     @Option(
         name: .long,
         help: ArgumentHelp(
-            "Spec for MoE router gates (.gate / .router projections). Same accepted values as "
-                + "--bits. Omit (default) to keep routers full-precision — quantizing the router "
+            "Spec for MoE router gates (.gate / .router / router.proj projections). Same accepted "
+                + "values as --bits. Omit (default) to keep routers full-precision — quantizing the router "
                 + "risks flipping top-k expert selection for negligible memory saving. Set to "
                 + "mirror an upstream conversion that quantized the gate (e.g. 8)."))
     var routerBits: QuantSpec?
@@ -136,10 +136,12 @@ struct ConvertCommand: AsyncParsableCommand {
     @Option(
         name: .long,
         help: ArgumentHelp(
-            "MoE expert output layout: 'stacked' (default — gather per-expert weights into "
-                + "switch_mlp.<proj> [E,…] for fused expert-indexed dispatch) or 'per-expert' "
-                + "(keep the source experts.<e>.<proj> tensors)."))
-    var expertLayout: ExpertLayout = .stacked
+            "MoE expert output layout. 'fused' (default) preserves a fused 3D source "
+                + "(experts.gate_up_proj / down_proj) by quantizing it in place — the standard "
+                + "mlx layout, loadable alongside mlx-community uploads; per-expert sources fall "
+                + "back to stacked. 'stacked' gathers/splits everything into switch_mlp.<proj> "
+                + "[E,…] (FFAI QuantizedSwitchLinear). 'per-expert' keeps experts.<e>.<proj>."))
+    var expertLayout: ExpertLayout = .fused
 
     @Option(
         name: .long,

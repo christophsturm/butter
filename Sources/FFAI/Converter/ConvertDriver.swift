@@ -64,8 +64,18 @@ import Metal
 /// load correctly without per-tensor `config.json` entries.
 /// Output layout for MoE expert projections.
 public enum ExpertLayout: String, Sendable, CaseIterable {
+    /// Preserve a pre-stacked / fused source layout (`experts.gate_up_proj`
+    /// / `experts.down_proj`, 3-D `[E, out, in]`) by quantizing each tensor
+    /// **in place** under its original name — the standard mlx layout for
+    /// models that ship fused experts (diffusion-gemma), so FFAI can load
+    /// our output and existing mlx-community uploads through one path. The
+    /// fused `gate_up` is split after the expert-gather matmul, not on disk.
+    /// **Default.** Per-expert-indexed sources have nothing fused to
+    /// preserve, so under `.fused` they fall back to `.stacked`.
+    case fused
     /// Gather per-expert weights into one `switch_mlp.<proj>` tensor of
-    /// shape `[E, out, …]` (mlx-lm `QuantizedSwitchLinear` layout). Default.
+    /// shape `[E, out, …]` (mlx-lm `QuantizedSwitchLinear` layout); a fused
+    /// `gate_up` source is split into `switch_mlp.gate_proj` + `up_proj`.
     case stacked
     /// Keep the source per-expert `experts.<e>.<proj>` tensors as-is.
     case perExpert = "per-expert"
@@ -120,14 +130,16 @@ public struct ConvertOptions: Sendable {
     /// that quantized the gate (mlx-community ships some at 8-bit).
     public var routerSpec: QuantSpec? = nil
 
-    /// How MoE expert projections are written. `.stacked` (default)
-    /// gathers the per-expert `experts.<e>.{w1,w2,w3}` source tensors into
-    /// one stacked `switch_mlp.{gate,up,down}_proj` tensor of shape
-    /// `[E, out, …]` — mlx-lm's `QuantizedSwitchLinear` layout, which the
-    /// loader dispatches through a single fused expert-indexed kernel
-    /// (faster than 32 separate `Linear` calls). `.perExpert` preserves
-    /// the source per-expert tensors. Non-MoE checkpoints ignore this.
-    public var expertLayout: ExpertLayout = .stacked
+    /// How MoE expert projections are written. `.fused` (default) preserves
+    /// a fused 3-D source (`experts.gate_up_proj` / `experts.down_proj`) by
+    /// quantizing it in place under its original name (standard mlx layout
+    /// for fused-expert models); per-expert-indexed sources fall back to
+    /// `.stacked`. `.stacked` gathers/splits everything into
+    /// `switch_mlp.{gate,up,down}_proj` `[E, out, …]` (mlx-lm
+    /// `QuantizedSwitchLinear` layout — a single fused expert-indexed
+    /// kernel). `.perExpert` preserves the source per-expert tensors.
+    /// Non-MoE checkpoints ignore this.
+    public var expertLayout: ExpertLayout = .fused
 
     /// Spec for MoE expert projections (`switch_mlp.*` / `experts.<e>.*`).
     /// `nil` (default) inherits the main `bits`. Set to `.fp16` / `.bf16`
@@ -135,6 +147,13 @@ public struct ConvertOptions: Sendable {
     /// weight mass, so this is the big size/quality dial), or to a
     /// different width to quantize them apart from the dense path.
     public var expertSpec: QuantSpec? = nil
+
+    /// Soft cap (bytes) on a single output safetensors shard. When the
+    /// quantized output exceeds this, it's split across
+    /// `model-0000i-of-0000N.safetensors` + a `model.safetensors.index.json`
+    /// map (the HF/mlx-community convention — better upload/download
+    /// resumability and lower writer RAM). Default 5 GB.
+    public var maxShardBytes: Int = SafeTensorsWriter.defaultMaxShardBytes
 
     /// Original source identifier — HF repo id (`org/repo`) or local
     /// path — used to fill in the `base_model:` field of the emitted
@@ -161,6 +180,15 @@ public enum ConvertDriverError: Error, CustomStringConvertible {
     case noSafetensorsFound(URL)
     case unsupportedBits(Int)
     case mkdirFailed(URL, Error)
+    /// A tensor whose name matched the fused-MoE expert pattern
+    /// (`<prefix>.experts.<proj>`) did not have the expected 3D
+    /// `[experts, out, in]` shape (or a `gate_up` stack had an odd row
+    /// count that can't be split into equal gate/up halves).
+    case fusedExpertBadShape(key: String, shape: [Int], reason: String)
+    /// A stacked-expert projection's per-expert inner dim isn't aligned to
+    /// the group size / bit-stream stride, so it can't be affine-quantized.
+    /// Re-run with `--expert-bits bf16` to leave the experts full-precision.
+    case expertsNotQuantizable(base: String, perExpertShape: [Int], bits: Int, groupSize: Int)
 
     public var description: String {
         switch self {
@@ -176,6 +204,12 @@ public enum ConvertDriverError: Error, CustomStringConvertible {
             return "unsupported bits=\(b) — must be 2 / 3 / 4 / 5 / 6 / 8"
         case .mkdirFailed(let u, let e):
             return "failed to create output directory \(u.path): \(e)"
+        case .fusedExpertBadShape(let key, let shape, let reason):
+            return "fused MoE expert tensor \"\(key)\" has shape \(shape): \(reason)"
+        case .expertsNotQuantizable(let base, let shape, let bits, let gs):
+            return "stacked experts \"\(base)\" per-expert shape \(shape) can't be "
+                + "\(bits)-bit affine-quantized: inner dim must be a multiple of group_size "
+                + "\(gs) and (in * bits) a multiple of 32 — re-run with `--expert-bits bf16`"
         }
     }
 }
@@ -231,7 +265,7 @@ public enum ConvertDriver {
 
         // ─── Build output writer ─────────────────────────────────────
         let outputURL = destDir.appendingPathComponent("model.safetensors")
-        let writer = SafeTensorsWriter(url: outputURL)
+        let writer = SafeTensorsWriter(url: outputURL, maxShardBytes: options.maxShardBytes)
 
         // Build the conversion plan (sorted source keys → output steps),
         // then execute it. The plan is the extensibility seam for future
@@ -250,6 +284,16 @@ public enum ConvertDriver {
             case .stackExperts(let outBase, let expertKeys, let spec):
                 try executeStackExperts(
                     outBase: outBase, expertWeightKeys: expertKeys, spec: spec,
+                    bundle: bundle, writer: writer, options: options,
+                    device: device, progress: progress)
+            case .stackFused3DExperts(let sourceKey, let outBasePrefix, let kind, let spec):
+                try executeStackFused3DExperts(
+                    sourceKey: sourceKey, outBasePrefix: outBasePrefix, kind: kind, spec: spec,
+                    bundle: bundle, writer: writer, options: options,
+                    device: device, progress: progress)
+            case .quantizeFusedInPlace(let sourceKey, let spec):
+                try executeQuantizeFusedInPlace(
+                    sourceKey: sourceKey, spec: spec,
                     bundle: bundle, writer: writer, options: options,
                     device: device, progress: progress)
             }
@@ -304,12 +348,15 @@ public enum ConvertDriver {
     /// `[num_experts, hidden]` weight that scores experts for top-k
     /// routing. Matches the exact `.gate.weight` / `.router.weight`
     /// suffixes (`feed_forward.gate` in LFM2 / DeepSeek,
-    /// `block_sparse_moe.gate` in Mixtral, `mlp.gate` in Qwen MoE) and
-    /// deliberately does NOT match dense-MLP projections like
-    /// `.gate_proj.weight` / `.gate_up_proj.weight` (those end in
-    /// `proj.weight`, not `.gate.weight`).
+    /// `block_sparse_moe.gate` in Mixtral, `mlp.gate` in Qwen MoE) plus
+    /// `.router.proj.weight` (the `router.proj` scoring matrix in
+    /// diffusion-gemma's fused MoE) and deliberately does NOT match
+    /// dense-MLP projections like `.gate_proj.weight` /
+    /// `.gate_up_proj.weight` (those end in `proj.weight` without a
+    /// preceding `.router`).
     static func isMoERouterKey(_ key: String) -> Bool {
         key.hasSuffix(".gate.weight") || key.hasSuffix(".router.weight")
+            || key.hasSuffix(".router.proj.weight")
     }
 
     // ─── Conversion plan ─────────────────────────────────────────────
@@ -328,6 +375,35 @@ public enum ConvertDriver {
         /// `switch_mlp.<proj>` tensor under `outBase`. `spec` is the
         /// resolved expert spec (`expertSpec ?? bits`).
         case stackExperts(outBase: String, expertWeightKeys: [String], spec: QuantSpec)
+        /// Slice an already-fused 3D expert stack
+        /// (`<prefix>.experts.<proj>`, shape `[experts, out, in]`) into
+        /// per-expert 2D matrices and write them as stacked
+        /// `switch_mlp.<proj>` triplet(s) under `outBasePrefix`. For
+        /// `.gateUp` the source's `out` axis is split in half into
+        /// `gate_proj` (first half) + `up_proj` (second half); `.proj`
+        /// passes the stack through under a single projection name.
+        case stackFused3DExperts(
+            sourceKey: String, outBasePrefix: String, kind: FusedExpertKind, spec: QuantSpec)
+        /// Quantize a fused 3-D expert stack (`experts.<proj>`, shape
+        /// `[experts, out, in]`) **in place**, per expert, preserving the
+        /// original name → `<sourceKey>.{weight,scales,biases}` `[E, out, …]`.
+        /// No gate/up split (the loader splits `gate_up` after the matmul).
+        /// This is the standard mlx layout for fused-expert checkpoints.
+        case quantizeFusedInPlace(sourceKey: String, spec: QuantSpec)
+    }
+
+    /// Which `switch_mlp` projection(s) a fused 3D expert stack maps to.
+    enum FusedExpertKind: Equatable {
+        /// `gate_up_proj` — split the `out` axis in half → `gate_proj`
+        /// (rows `[0, out/2)`) + `up_proj` (rows `[out/2, out)`). The
+        /// `gate, up` row order is the universal HF fused-SwiGLU
+        /// convention (`gate, up = gate_up.chunk(2)`); the loader splits
+        /// the same way.
+        case gateUp
+        /// A single already-separate projection (`gate_proj` / `up_proj`
+        /// / `down_proj`, or the `w1` / `w3` / `w2` aliases) shipped as a
+        /// `[experts, out, in]` stack — no split, just a name.
+        case proj(String)
     }
 
     /// Parse a per-expert MoE weight key
@@ -354,30 +430,90 @@ public enum ConvertDriver {
         return ("\(prefix).switch_mlp.\(proj)", e)
     }
 
-    /// Build the output plan from sorted source keys. In `.stacked` layout,
-    /// per-expert weights are grouped by `(layer, projection)` into one
-    /// `stackExperts` step each and everything else is a `single`. In
-    /// `.perExpert` layout every tensor is a `single` (experts pick up
-    /// `expertSpec` through `effectiveSpec`).
-    static func buildPlan(keys: [String], options: ConvertOptions) -> [ConversionStep] {
-        guard options.expertLayout == .stacked else {
-            return keys.map { .single(key: $0) }
+    /// Parse a fused / pre-stacked MoE expert key
+    /// `<prefix>.experts.<projName>` (shape `[experts, out, in]`, no
+    /// per-expert index) → the `switch_mlp` output base prefix
+    /// `<prefix>.switch_mlp` + the projection kind. Tolerates an optional
+    /// trailing `.weight`. Returns nil for per-expert indexed keys (they
+    /// carry an integer index + a dotted remainder — handled by
+    /// `parseExpertWeightKey`) and for any non-expert key.
+    ///
+    /// `projName` ∈ {`gate_up_proj`, `gate_proj`/`w1`, `up_proj`/`w3`,
+    /// `down_proj`/`w2`}. This is the layout diffusion-gemma ships
+    /// (`experts.gate_up_proj` `[E, 2·moe, hidden]` + `experts.down_proj`
+    /// `[E, hidden, moe]`).
+    static func parseFusedExpertKey(_ key: String)
+        -> (outBasePrefix: String, kind: FusedExpertKind)?
+    {
+        guard let r = key.range(of: ".experts.") else { return nil }
+        let prefix = String(key[..<r.lowerBound])
+        var rest = String(key[r.upperBound...])
+        if rest.hasSuffix(".weight") { rest = String(rest.dropLast(".weight".count)) }
+        // A per-expert key (`0.w1`, `5.gate_proj`, …) still has a dot here
+        // — reject it so only the index-free fused form matches.
+        guard !rest.contains(".") else { return nil }
+        let outBasePrefix = "\(prefix).switch_mlp"
+        switch rest {
+        case "gate_up_proj": return (outBasePrefix, .gateUp)
+        case "gate_proj", "w1": return (outBasePrefix, .proj("gate_proj"))
+        case "up_proj", "w3": return (outBasePrefix, .proj("up_proj"))
+        case "down_proj", "w2": return (outBasePrefix, .proj("down_proj"))
+        default: return nil
         }
-        var groups: [String: [(Int, String)]] = [:]
+    }
+
+    /// Build the output plan from sorted source keys. Fused / pre-stacked
+    /// 3D expert stacks (`experts.<proj>`) become `stackFused3DExperts`
+    /// steps in either layout. In `.stacked` layout, per-expert indexed
+    /// weights are additionally grouped by `(layer, projection)` into one
+    /// `stackExperts` step each; everything else is a `single`. In
+    /// `.perExpert` layout the per-expert tensors fall through to `single`
+    /// (picking up `expertSpec` via `effectiveSpec`).
+    static func buildPlan(keys: [String], options: ConvertOptions) -> [ConversionStep] {
+        let spec = options.expertSpec ?? options.bits
         var consumed = Set<String>()
+        var steps: [ConversionStep] = []
+
+        // (1) Fused / pre-stacked 3D expert stacks (`experts.<proj>`, no
+        //     per-expert index). `.stacked` splits them into `switch_mlp`;
+        //     `.fused` (default) and `.perExpert` quantize them in place,
+        //     preserving the original `experts.<proj>` name (standard mlx
+        //     layout — the source is already expert-stacked).
         for key in keys {
-            if let (base, e) = parseExpertWeightKey(key) {
-                groups[base, default: []].append((e, key))
-                consumed.insert(key)
+            guard let (outBasePrefix, kind) = parseFusedExpertKey(key) else { continue }
+            if options.expertLayout == .stacked {
+                steps.append(
+                    .stackFused3DExperts(
+                        sourceKey: key, outBasePrefix: outBasePrefix, kind: kind, spec: spec))
+            } else {
+                steps.append(.quantizeFusedInPlace(sourceKey: key, spec: spec))
+            }
+            consumed.insert(key)
+        }
+
+        // (2) Per-expert indexed weights → stacked `switch_mlp.<proj>` for
+        //     every layout except `.perExpert` (which keeps them as singles
+        //     below). `.fused` has nothing fused to preserve for a
+        //     per-expert source, so it produces the same switch_mlp stack
+        //     as `.stacked`.
+        if options.expertLayout != .perExpert {
+            var groups: [String: [(Int, String)]] = [:]
+            for key in keys where !consumed.contains(key) {
+                if let (base, e) = parseExpertWeightKey(key) {
+                    groups[base, default: []].append((e, key))
+                    consumed.insert(key)
+                }
+            }
+            for base in groups.keys.sorted() {
+                let ordered = groups[base]!.sorted { $0.0 < $1.0 }.map { $0.1 }
+                steps.append(.stackExperts(outBase: base, expertWeightKeys: ordered, spec: spec))
             }
         }
-        var steps: [ConversionStep] =
-            keys.filter { !consumed.contains($0) }.map { .single(key: $0) }
-        let spec = options.expertSpec ?? options.bits
-        for base in groups.keys.sorted() {
-            let ordered = groups[base]!.sorted { $0.0 < $1.0 }.map { $0.1 }
-            steps.append(
-                .stackExperts(outBase: base, expertWeightKeys: ordered, spec: spec))
+
+        // (3) Everything else → single tensor (quantize / downcast / copy
+        //     decided per-tensor by `effectiveSpec`).
+        for key in keys where !consumed.contains(key) {
+            steps.append(.single(key: key))
         }
         return steps
     }
@@ -424,58 +560,170 @@ public enum ConvertDriver {
         }
     }
 
-    /// Gather per-expert weights and emit one stacked `switch_mlp.<proj>`
-    /// tensor. Each expert is quantized/downcast independently, then the
-    /// per-expert byte blobs are concatenated along a new leading expert
-    /// axis — the row-major `[E, …]` layout `sliceStackedExperts` slices.
-    /// Quantized (`spec == .bits`) → `[E, out, packed]` u32 + `[E, out,
-    /// groups]` scales/biases. Downcast/raw (`.fp16`/`.bf16`) → `[E, out,
-    /// in]` weight only.
+    /// Gather per-expert weights (one source `.weight` key per expert, in
+    /// expert order) and emit one stacked `switch_mlp.<proj>` triplet via
+    /// `writeStackedExperts`.
     private static func executeStackExperts(
         outBase: String, expertWeightKeys: [String], spec: QuantSpec,
         bundle: SafeTensorsBundle, writer: SafeTensorsWriter,
         options: ConvertOptions, device: Device,
         progress: (@Sendable (String) -> Void)?
     ) throws {
-        let numExperts = expertWeightKeys.count
         let first = try bundle.tensor(named: expertWeightKeys[0])
         precondition(first.shape.count == 2, "stackExperts: expert weight must be 2D")
-        let perExpertShape = first.shape  // [out, in]
+        try writeStackedExperts(
+            outBase: outBase, numExperts: expertWeightKeys.count,
+            perExpertShape: first.shape, srcDtype: first.dtype, spec: spec,
+            options: options, device: device, writer: writer, progress: progress,
+            expertSlice: { try bundle.tensor(named: expertWeightKeys[$0]) })
+    }
+
+    /// Slice an already-fused 3D expert stack (`[experts, out, in]`) into
+    /// per-expert 2D matrices and write the stacked `switch_mlp.<proj>`
+    /// triplet(s). For `.gateUp` the `out` axis is split in half (gate =
+    /// first half, up = second); `.proj` passes the stack through under
+    /// one name. Each per-expert (and per-half) slice is a zero-copy
+    /// contiguous view, so the existing `quantizeTensor` / `downcastBytes`
+    /// path is reused unchanged — no fused-specific GPU kernel.
+    private static func executeStackFused3DExperts(
+        sourceKey: String, outBasePrefix: String, kind: FusedExpertKind, spec: QuantSpec,
+        bundle: SafeTensorsBundle, writer: SafeTensorsWriter,
+        options: ConvertOptions, device: Device,
+        progress: (@Sendable (String) -> Void)?
+    ) throws {
+        let src = try bundle.tensor(named: sourceKey)
+        guard src.shape.count == 3 else {
+            throw ConvertDriverError.fusedExpertBadShape(
+                key: sourceKey, shape: src.shape,
+                reason: "expected a 3D [experts, out, in] stack")
+        }
+        let numExperts = src.shape[0]
+        let outRows = src.shape[1]
+        let inDim = src.shape[2]
+
+        // Build a contiguous `[rowCount, inDim]` view of expert `e`'s rows
+        // `[rowStart, rowStart + rowCount)`. The source is row-major
+        // `[E, out, in]`, so each expert — and each contiguous row band
+        // within it — is a contiguous block: `slicedRows` handles the byte
+        // offset, `reshaped` is a no-op metadata change.
+        func sliceProvider(rowStart: Int, rowCount: Int) -> (Int) -> Tensor {
+            { e in
+                src.slicedRows(start: e, count: 1)
+                    .reshaped(to: [outRows, inDim])
+                    .slicedRows(start: rowStart, count: rowCount)
+            }
+        }
+
+        switch kind {
+        case .gateUp:
+            guard outRows % 2 == 0 else {
+                throw ConvertDriverError.fusedExpertBadShape(
+                    key: sourceKey, shape: src.shape,
+                    reason: "gate_up_proj out dim \(outRows) is odd — cannot split into gate/up")
+            }
+            let half = outRows / 2
+            try writeStackedExperts(
+                outBase: "\(outBasePrefix).gate_proj", numExperts: numExperts,
+                perExpertShape: [half, inDim], srcDtype: src.dtype, spec: spec,
+                options: options, device: device, writer: writer, progress: progress,
+                expertSlice: sliceProvider(rowStart: 0, rowCount: half))
+            try writeStackedExperts(
+                outBase: "\(outBasePrefix).up_proj", numExperts: numExperts,
+                perExpertShape: [half, inDim], srcDtype: src.dtype, spec: spec,
+                options: options, device: device, writer: writer, progress: progress,
+                expertSlice: sliceProvider(rowStart: half, rowCount: half))
+
+        case .proj(let name):
+            try writeStackedExperts(
+                outBase: "\(outBasePrefix).\(name)", numExperts: numExperts,
+                perExpertShape: [outRows, inDim], srcDtype: src.dtype, spec: spec,
+                options: options, device: device, writer: writer, progress: progress,
+                expertSlice: sliceProvider(rowStart: 0, rowCount: outRows))
+        }
+    }
+
+    /// Quantize a fused 3-D expert stack (`[experts, out, in]`) **in place**,
+    /// per expert, preserving the source name (`experts.gate_up_proj` →
+    /// `experts.gate_up_proj.{weight,scales,biases}` `[E, out, packed]`). No
+    /// gate/up split — the runtime splits `gate_up` after the gather-matmul.
+    /// Reuses the same per-expert quantize path as the switch_mlp builders.
+    private static func executeQuantizeFusedInPlace(
+        sourceKey: String, spec: QuantSpec,
+        bundle: SafeTensorsBundle, writer: SafeTensorsWriter,
+        options: ConvertOptions, device: Device,
+        progress: (@Sendable (String) -> Void)?
+    ) throws {
+        let src = try bundle.tensor(named: sourceKey)
+        guard src.shape.count == 3 else {
+            throw ConvertDriverError.fusedExpertBadShape(
+                key: sourceKey, shape: src.shape,
+                reason: "expected a 3D [experts, out, in] stack")
+        }
+        let numExperts = src.shape[0]
+        let outRows = src.shape[1]
+        let inDim = src.shape[2]
+        try writeStackedExperts(
+            outBase: sourceKey, numExperts: numExperts,
+            perExpertShape: [outRows, inDim], srcDtype: src.dtype, spec: spec,
+            options: options, device: device, writer: writer, progress: progress,
+            expertSlice: { e in
+                src.slicedRows(start: e, count: 1).reshaped(to: [outRows, inDim])
+            })
+    }
+
+    /// Quantize / downcast a sequence of per-expert 2D `[out, in]` weights
+    /// (provided lazily by `expertSlice`, one per expert in expert order)
+    /// and write them as one stacked tensor under `outBase`. Quantized
+    /// (`.bits`) → `[E, out, packed]` u32 weight + `[E, out, groups]`
+    /// scales/biases — the row-major layout `sliceStackedExperts` reads.
+    /// Downcast (`.fp16`/`.bf16`) → `[E, out, in]` weight only. Shared by
+    /// both the per-expert (`executeStackExperts`) and fused-3D
+    /// (`executeStackFused3DExperts`) paths.
+    private static func writeStackedExperts(
+        outBase: String, numExperts: Int, perExpertShape: [Int], srcDtype: DType,
+        spec: QuantSpec, options: ConvertOptions, device: Device,
+        writer: SafeTensorsWriter, progress: (@Sendable (String) -> Void)?,
+        expertSlice: (Int) throws -> Tensor
+    ) throws {
+        precondition(perExpertShape.count == 2, "writeStackedExperts: perExpertShape must be 2D")
+        let outDim = perExpertShape[0], inDim = perExpertShape[1]
 
         switch spec {
         case .bits(let bits):
+            // Mirror the single-tensor eligibility guard (`effectiveSpec`):
+            // the inner dim must align to the group size and the packed
+            // bit-stream stride, else quantization would emit garbage.
+            guard inDim.isMultiple(of: options.groupSize), (inDim * bits) % 32 == 0 else {
+                throw ConvertDriverError.expertsNotQuantizable(
+                    base: outBase, perExpertShape: perExpertShape, bits: bits,
+                    groupSize: options.groupSize)
+            }
             progress?(
-                "stacking+quantizing \(outBase) "
-                    + "[\(numExperts), \(perExpertShape[0]), \(perExpertShape[1])] @ \(bits)bit")
+                "stacking+quantizing \(outBase) [\(numExperts), \(outDim), \(inDim)] @ \(bits)bit")
             var wData = Data(), sData = Data(), bData = Data()
-            for k in expertWeightKeys {
-                let t = try bundle.tensor(named: k)
+            for e in 0 ..< numExperts {
                 let (p, s, b) = try quantizeTensor(
-                    t, key: k, options: options, bits: bits, device: device)
+                    expertSlice(e), key: outBase, options: options, bits: bits, device: device)
                 wData.append(p)
                 sData.append(s)
                 bData.append(b)
             }
-            let pe = packedShape(
-                original: perExpertShape, numel: first.elementCount, bits: bits)  // [out, pCols]
-            let ge = scalesShape(original: perExpertShape, groupSize: options.groupSize)  // [out, gCols]
+            let pe = packedShape(original: perExpertShape, numel: outDim * inDim, bits: bits)
+            let ge = scalesShape(original: perExpertShape, groupSize: options.groupSize)
             try writer.append(
                 name: "\(outBase).weight", dtype: .u32, shape: [numExperts] + pe, bytes: wData)
             try writer.append(
-                name: "\(outBase).scales", dtype: first.dtype, shape: [numExperts] + ge,
-                bytes: sData)
+                name: "\(outBase).scales", dtype: srcDtype, shape: [numExperts] + ge, bytes: sData)
             try writer.append(
-                name: "\(outBase).biases", dtype: first.dtype, shape: [numExperts] + ge,
-                bytes: bData)
+                name: "\(outBase).biases", dtype: srcDtype, shape: [numExperts] + ge, bytes: bData)
 
         case .fp16, .bf16:
             let target = spec.downcastDtype!
             progress?(
-                "stacking \(outBase) "
-                    + "[\(numExperts), \(perExpertShape[0]), \(perExpertShape[1])] → \(target.rawValue)")
+                "stacking \(outBase) [\(numExperts), \(outDim), \(inDim)] → \(target.rawValue)")
             var wData = Data()
-            for k in expertWeightKeys {
-                wData.append(downcastBytes(from: try bundle.tensor(named: k), to: target))
+            for e in 0 ..< numExperts {
+                wData.append(downcastBytes(from: try expertSlice(e), to: target))
             }
             try writer.append(
                 name: "\(outBase).weight", dtype: target,

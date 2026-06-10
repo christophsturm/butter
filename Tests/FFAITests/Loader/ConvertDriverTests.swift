@@ -296,11 +296,13 @@ struct ConvertDriverTests {
 
     @Test("isMoERouterKey matches router gates but not dense gate_proj")
     func routerKeyMatcher() {
-        // Positive — exact `.gate.weight` / `.router.weight` suffixes.
+        // Positive — exact `.gate.weight` / `.router.weight` suffixes,
+        // plus diffusion-gemma's `.router.proj.weight` scoring matrix.
         #expect(ConvertDriver.isMoERouterKey("model.layers.0.feed_forward.gate.weight"))
         #expect(ConvertDriver.isMoERouterKey("model.layers.3.block_sparse_moe.gate.weight"))
         #expect(ConvertDriver.isMoERouterKey("model.layers.7.mlp.gate.weight"))
         #expect(ConvertDriver.isMoERouterKey("model.layers.0.mlp.router.weight"))
+        #expect(ConvertDriver.isMoERouterKey("model.decoder.layers.0.router.proj.weight"))
         // Negative — dense-MLP projections and attention weights.
         #expect(!ConvertDriver.isMoERouterKey("model.layers.0.mlp.gate_proj.weight"))
         #expect(!ConvertDriver.isMoERouterKey("model.layers.0.mlp.gate_up_proj.weight"))
@@ -326,7 +328,7 @@ struct ConvertDriverTests {
         #expect(ConvertDriver.parseExpertWeightKey("\(p).experts.0.w1.scales") == nil)
     }
 
-    @Test("stacked layout (default) gathers per-expert weights into switch_mlp.<proj>")
+    @Test("default layout gathers per-expert weights into switch_mlp.<proj>")
     func stackedExpertConversion() throws {
         let dir = tempDir()
         defer { cleanUp(dir) }
@@ -395,18 +397,239 @@ struct ConvertDriverTests {
         #expect(!out.has("\(p).switch_mlp.gate_proj.scales"))
     }
 
+    // ─── Fused 3D MoE experts (diffusion-gemma style) ───────────────
+
+    @Test("parseFusedExpertKey maps fused experts.<proj> → switch_mlp base; rejects per-expert keys")
+    func fusedExpertKeyParsing() {
+        let p = "model.decoder.layers.0"
+        // gate_up_proj → split kind under the switch_mlp base.
+        let gu = ConvertDriver.parseFusedExpertKey("\(p).experts.gate_up_proj")
+        #expect(gu?.outBasePrefix == "\(p).switch_mlp")
+        #expect(gu?.kind == .gateUp)
+        // Separate projections (+ w1/w3/w2 aliases) → single proj kind.
+        #expect(ConvertDriver.parseFusedExpertKey("\(p).experts.down_proj")?.kind == .proj("down_proj"))
+        #expect(ConvertDriver.parseFusedExpertKey("\(p).experts.gate_proj")?.kind == .proj("gate_proj"))
+        #expect(ConvertDriver.parseFusedExpertKey("\(p).experts.w3")?.kind == .proj("up_proj"))
+        // Tolerate an optional trailing `.weight`.
+        #expect(
+            ConvertDriver.parseFusedExpertKey("\(p).experts.down_proj.weight")?.kind
+                == .proj("down_proj"))
+        // Per-expert indexed keys are NOT fused (parseExpertWeightKey owns them).
+        #expect(ConvertDriver.parseFusedExpertKey("\(p).experts.0.w1.weight") == nil)
+        #expect(ConvertDriver.parseFusedExpertKey("\(p).experts.5.gate_proj.weight") == nil)
+        // Non-expert keys (incl. a dense gate_up_proj that isn't under .experts.).
+        #expect(ConvertDriver.parseFusedExpertKey("\(p).self_attn.q_proj.weight") == nil)
+        #expect(ConvertDriver.parseFusedExpertKey("\(p).mlp.gate_up_proj.weight") == nil)
+    }
+
+    @Test("default (.fused) quantizes experts.gate_up_proj/down_proj IN PLACE (matches mlx layout)")
+    func fusedExpertPreserveDefault() throws {
+        let dir = tempDir()
+        defer { cleanUp(dir) }
+        let E = 4
+        try writeSyntheticSource(at: dir, outDim: 4, inDim: 64, fusedMoEExperts: E)
+
+        let destDir = dir.appendingPathComponent("out")
+        var opts = ConvertOptions()
+        opts.bits = .bits(4)  // default expertLayout == .fused
+        try ConvertDriver.convert(sourceDir: dir, destDir: destDir, options: opts)
+
+        let out = try SafeTensorsBundle(directory: destDir, device: .shared)
+        let hidden = 64, moeOut = 128  // see writeSyntheticSource
+
+        // gate_up stays FUSED + in place under its original name:
+        // [E, 2*moeOut, hidden] → packed [E, 2*moeOut, hidden/8].
+        let gu = try out.tensor(named: "model.layers.3.experts.gate_up_proj.weight")
+        #expect(gu.dtype == .u32)
+        #expect(gu.shape == [E, 2 * moeOut, hidden / 8])  // [4, 256, 8]
+        #expect(
+            try out.tensor(named: "model.layers.3.experts.gate_up_proj.scales").shape
+                == [E, 2 * moeOut, hidden / 64])
+        #expect(out.has("model.layers.3.experts.gate_up_proj.biases"))
+
+        // down_proj in place: [E, hidden, moeOut] → packed [E, hidden, moeOut/8].
+        let dn = try out.tensor(named: "model.layers.3.experts.down_proj.weight")
+        #expect(dn.shape == [E, hidden, moeOut / 8])  // [4, 64, 16]
+        #expect(
+            try out.tensor(named: "model.layers.3.experts.down_proj.scales").shape
+                == [E, hidden, moeOut / 64])
+
+        // No split, no rename to switch_mlp under the default layout.
+        #expect(!out.has("model.layers.3.switch_mlp.gate_proj.weight"))
+        #expect(!out.has("model.layers.3.switch_mlp.up_proj.weight"))
+    }
+
+    @Test(".fused + --expert-bits bf16 keeps experts.gate_up_proj as a raw 3D stack")
+    func fusedExpertPreserveFullPrecision() throws {
+        let dir = tempDir()
+        defer { cleanUp(dir) }
+        let E = 3
+        try writeSyntheticSource(at: dir, outDim: 4, inDim: 64, fusedMoEExperts: E)
+
+        let destDir = dir.appendingPathComponent("out")
+        var opts = ConvertOptions()
+        opts.bits = .bits(4)
+        opts.expertSpec = .bf16  // experts stay full-precision
+        try ConvertDriver.convert(sourceDir: dir, destDir: destDir, options: opts)
+
+        let out = try SafeTensorsBundle(directory: destDir, device: .shared)
+        let gu = try out.tensor(named: "model.layers.3.experts.gate_up_proj.weight")
+        #expect(gu.dtype == .bf16)
+        #expect(gu.shape == [E, 256, 64])  // raw [E, 2*moeOut, hidden], unsplit
+        #expect(!out.has("model.layers.3.experts.gate_up_proj.scales"))
+        #expect(try out.tensor(named: "model.layers.3.experts.down_proj.weight").shape == [E, 64, 128])
+    }
+
+    @Test("--expert-layout stacked splits fused gate_up into switch_mlp.{gate,up,down}")
+    func fusedExpertStackedSplit() throws {
+        let dir = tempDir()
+        defer { cleanUp(dir) }
+        let E = 4
+        try writeSyntheticSource(at: dir, outDim: 4, inDim: 64, fusedMoEExperts: E)
+
+        let destDir = dir.appendingPathComponent("out")
+        var opts = ConvertOptions()
+        opts.bits = .bits(4)
+        opts.expertLayout = .stacked  // opt into the FFAI switch_mlp split
+        try ConvertDriver.convert(sourceDir: dir, destDir: destDir, options: opts)
+
+        let out = try SafeTensorsBundle(directory: destDir, device: .shared)
+        let p = "model.layers.3.switch_mlp"
+        let hidden = 64, moeOut = 128
+
+        let gate = try out.tensor(named: "\(p).gate_proj.weight")
+        #expect(gate.dtype == .u32)
+        #expect(gate.shape == [E, moeOut, hidden / 8])  // [4, 128, 8]
+        #expect(out.has("\(p).up_proj.weight"))
+        #expect(try out.tensor(named: "\(p).down_proj.weight").shape == [E, hidden, moeOut / 8])
+        // The fused tensor is gone in the split layout.
+        #expect(!out.has("model.layers.3.experts.gate_up_proj.weight"))
+    }
+
+    @Test("--expert-layout stacked gate_up split selects the right rows (bf16 round-trip is exact)")
+    func fusedGateUpSplitIsExact() throws {
+        let dir = tempDir()
+        defer { cleanUp(dir) }
+        let E = 2
+        try writeSyntheticSource(at: dir, outDim: 4, inDim: 64, fusedMoEExperts: E)
+
+        let destDir = dir.appendingPathComponent("out")
+        var opts = ConvertOptions()
+        opts.bits = .bits(4)
+        opts.expertLayout = .stacked  // the split path is what we're pinning
+        opts.expertSpec = .bf16  // raw copy → exact, isolates the slicing logic
+        try ConvertDriver.convert(sourceDir: dir, destDir: destDir, options: opts)
+
+        let srcB = try SafeTensorsBundle(directory: dir, device: .shared)
+        let outB = try SafeTensorsBundle(directory: destDir, device: .shared)
+
+        let hidden = 64, moeOut = 128
+        let perExpert = (2 * moeOut) * hidden
+        let half = moeOut * hidden
+        let gateUp = try srcB.tensor(named: "model.layers.3.experts.gate_up_proj").toFloatArray()
+        let gate = try outB.tensor(named: "model.layers.3.switch_mlp.gate_proj.weight").toFloatArray()
+        let up = try outB.tensor(named: "model.layers.3.switch_mlp.up_proj.weight").toFloatArray()
+
+        // Per expert: gate == first half of the gate_up rows, up == second.
+        for e in 0 ..< E {
+            let base = e * perExpert
+            let expGate = Array(gateUp[base ..< base + half])
+            let expUp = Array(gateUp[base + half ..< base + 2 * half])
+            #expect(
+                Array(gate[e * half ..< (e + 1) * half]) == expGate,
+                "expert \(e): gate_proj must be the FIRST half of gate_up rows")
+            #expect(
+                Array(up[e * half ..< (e + 1) * half]) == expUp,
+                "expert \(e): up_proj must be the SECOND half of gate_up rows")
+        }
+
+        // down_proj is a straight per-expert passthrough (no split).
+        let srcDown = try srcB.tensor(named: "model.layers.3.experts.down_proj").toFloatArray()
+        let outDown = try outB.tensor(named: "model.layers.3.switch_mlp.down_proj.weight").toFloatArray()
+        #expect(outDown == srcDown, "down_proj must be copied through expert-for-expert, unchanged")
+    }
+
+    // ─── Sharded output ─────────────────────────────────────────────
+
+    @Test("output above the shard cap splits into model-0000X + index.json (round-trips)")
+    func shardsLargeOutput() throws {
+        let dir = tempDir()
+        defer { cleanUp(dir) }
+        try writeSyntheticSource(
+            at: dir, outDim: 4, inDim: 64, includeEmbedding: true, moeExperts: 3)
+
+        let destDir = dir.appendingPathComponent("out")
+        var opts = ConvertOptions()
+        opts.bits = .bits(4)
+        opts.maxShardBytes = 256  // tiny cap → force several shards
+        try ConvertDriver.convert(sourceDir: dir, destDir: destDir, options: opts)
+
+        let fm = FileManager.default
+        let files = (try? fm.contentsOfDirectory(atPath: destDir.path)) ?? []
+        let shards = files.filter { $0.hasPrefix("model-") && $0.hasSuffix(".safetensors") }
+        #expect(shards.count >= 2, "tiny cap should produce multiple shards, got \(shards)")
+        #expect(files.contains("model.safetensors.index.json"))
+        #expect(
+            !files.contains("model.safetensors"),
+            "a sharded checkpoint must not also write a lone model.safetensors")
+
+        // index.json: weight_map covers tensors, points only at real shards,
+        // and metadata.total_size is positive.
+        let idx =
+            try JSONSerialization.jsonObject(
+                with: Data(
+                    contentsOf: destDir.appendingPathComponent("model.safetensors.index.json")))
+            as! [String: Any]
+        let weightMap = idx["weight_map"] as! [String: String]
+        let meta = idx["metadata"] as! [String: Any]
+        #expect((meta["total_size"] as! Int) > 0)
+        #expect(Set(weightMap.values).isSubset(of: Set(shards)))
+
+        // Round-trip: the loader reads the sharded checkpoint transparently.
+        let outB = try SafeTensorsBundle(directory: destDir, device: .shared)
+        #expect(try outB.tensor(named: "model.layers.0.q_proj.weight").dtype == .u32)
+        #expect(outB.has("model.embed_tokens.weight"))
+        // Per-expert source under the default .fused layout still stacks to switch_mlp.
+        #expect(outB.has("model.layers.2.feed_forward.switch_mlp.gate_proj.weight"))
+    }
+
+    @Test("output below the shard cap stays a single model.safetensors (no index)")
+    func singleFileBelowShardCap() throws {
+        let dir = tempDir()
+        defer { cleanUp(dir) }
+        try writeSyntheticSource(at: dir, outDim: 4, inDim: 64)
+
+        let destDir = dir.appendingPathComponent("out")
+        var opts = ConvertOptions()
+        opts.bits = .bits(4)  // default 5 GB cap; synthetic model is tiny
+        try ConvertDriver.convert(sourceDir: dir, destDir: destDir, options: opts)
+
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: destDir.path)) ?? []
+        #expect(files.contains("model.safetensors"))
+        #expect(!files.contains("model.safetensors.index.json"))
+        #expect(!files.contains { $0.hasPrefix("model-") && $0.hasSuffix(".safetensors") })
+    }
+
     // ─── Helpers ────────────────────────────────────────────────────
 
     /// Build a minimum-viable HuggingFace-style source directory with
     /// a single safetensors file + config.json. The synthetic model has
     /// just enough tensors to exercise role routing: one main linear,
     /// one norm, optionally an embedding and a vision-tower linear.
+    /// Per-expert `out` (= moe_intermediate) and `in` (= hidden) dims for
+    /// the fused-3D synthetic experts. Deliberately distinct + both
+    /// group_size(64)-aligned so the gate/up split (rows) and the down
+    /// in-dim are independently verifiable.
+    private static let fusedMoEHidden = 64
+    private static let fusedMoEIntermediate = 128
+
     private func writeSyntheticSource(
         at dir: URL, outDim: Int, inDim: Int,
         includeEmbedding: Bool = false,
         includeVisionTower: Bool = false,
         includeMoERouter: Bool = false,
-        moeExperts: Int = 0
+        moeExperts: Int = 0,
+        fusedMoEExperts: Int = 0
     ) throws {
         let safetensors = dir.appendingPathComponent("model.safetensors")
         let writer = SafeTensorsWriter(url: safetensors)
@@ -457,6 +680,26 @@ struct ConvertDriverTests {
                     name: "model.layers.2.feed_forward.experts.\(e).\(proj).weight",
                     dtype: .bf16, shape: [outDim, inDim], bytes: bytes)
             }
+        }
+
+        // Fused 3D MoE expert stacks at layer 3 (diffusion-gemma style):
+        //   experts.gate_up_proj [E, 2*moeOut, hidden]  (gate ‖ up on rows)
+        //   experts.down_proj    [E, hidden,   moeOut]
+        // No per-expert index, no `.weight` suffix — the fused layout.
+        if fusedMoEExperts > 0 {
+            let E = fusedMoEExperts
+            let hidden = Self.fusedMoEHidden
+            let moeOut = Self.fusedMoEIntermediate
+            let gateUp = bf16Bytes(
+                (0 ..< E * (2 * moeOut) * hidden).map { Float($0) * 0.0001 - 0.3 })
+            try writer.append(
+                name: "model.layers.3.experts.gate_up_proj",
+                dtype: .bf16, shape: [E, 2 * moeOut, hidden], bytes: gateUp)
+            let down = bf16Bytes(
+                (0 ..< E * hidden * moeOut).map { Float($0) * 0.0001 - 0.2 })
+            try writer.append(
+                name: "model.layers.3.experts.down_proj",
+                dtype: .bf16, shape: [E, hidden, moeOut], bytes: down)
         }
 
         try writer.finalize()
