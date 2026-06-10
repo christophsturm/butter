@@ -5900,3 +5900,361 @@ pub fn moe_grouped_gemm(
 
     Ok(dn_out)
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// NVFP4 (mxf4nvf4) grouped MoE GEMM — native Blackwell block-scaled FP4 mma.
+// Fragment-packed layout: weights repacked once at load (nvfp4_pack_w), acts
+// quantized+packed per layer (moe_fp4_actq_pack), one fixed-launch grouped mma
+// over BM=16 tile descriptors (graph-safe). Requires METALTILE_CUDA_ARCH=
+// compute_121a (or _120a) — base-arch PTX rejects the mma.
+// ════════════════════════════════════════════════════════════════════════════
+
+const MOE_FP4_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+// UE4M3 codebook (monotonic): e=0 subnormal m/8*2^-7? NO — matches quantize_nvfp4:
+// e==0 → (m/8)*0.0078125 (=2^-7), else (1+m/8)*2^(e-7).
+__device__ __forceinline__ float dec_ue4m3(unsigned b){
+    int e=(b>>3)&0xF, m=b&7;
+    return (e==0) ? (m/8.f)*0.0078125f : (1.f+m/8.f)*exp2f((float)(e-7));
+}
+__device__ __forceinline__ unsigned enc_ue4m3(float s){
+    if(!(s>0.f)) return 0u;
+    unsigned c;
+    if(s>=480.f) return 127u;
+    else {
+        int e; float fr=frexpf(s,&e);          // s = fr*2^e, fr in [0.5,1)
+        int E=e+6;                              // s = (2*fr)*2^(E-7)
+        if(E<1){                                // subnormal: v=(m/8)*2^-7
+            int m=(int)rintf(s*1024.f);
+            c = (m>7) ? 8u : (unsigned)m;
+        } else {
+            int m=(int)rintf((2.f*fr-1.f)*8.f);
+            if(m>7){m=0;E+=1;}
+            if(E>15){E=15;m=7;}
+            c=(unsigned)((E<<3)|m);
+        }
+    }
+    // neighbor refinement: closed-form rounding can land one code high at
+    // regime boundaries (subnormal->normal, exponent rollover); nearest of
+    // {c-1, c} matches the exhaustive-argmin reference exactly.
+    if(c>0){
+        float vc=dec_ue4m3(c), vp=dec_ue4m3(c-1);
+        if(fabsf(s-vp)<=fabsf(s-vc)) c=c-1;
+    }
+    return c;
+}
+__device__ __forceinline__ unsigned enc_e2m1(float x, float inv_bs){
+    float v=x*inv_bs; unsigned sg=(v<0.f)?8u:0u; v=fabsf(v);
+    // levels 0,.5,1,1.5,2,3,4,6 ; midpoints .25,.75,1.25,1.75,2.5,3.5,5
+    unsigned m = (v>=.25f)+(v>=.75f)+(v>=1.25f)+(v>=1.75f)+(v>=2.5f)+(v>=3.5f)+(v>=5.f);
+    return sg|m;
+}
+__device__ __forceinline__ int b4b_map(int blk){ const int t[4]={0,2,1,3}; return t[blk]; }
+
+// amax over slabs: x f16 [n_slabs * slab_len]; atomicMax on positive float bits.
+extern "C" __global__ void nvfp4_amax_slab(
+    const __half* __restrict__ x, unsigned* __restrict__ amax_bits,
+    long slab_len, int n_slabs)
+{
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x;
+    long total=slab_len*(long)n_slabs;
+    long stride=(long)gridDim.x*blockDim.x;
+    float m=0.f; int cur=-1;
+    for(long p=i;p<total;p+=stride){
+        int slab=(int)(p/slab_len);
+        float v=fabsf(__half2float(x[p]));
+        if(slab!=cur){
+            if(cur>=0&&m>0.f) atomicMax(&amax_bits[cur],__float_as_uint(m));
+            cur=slab; m=v;
+        } else m=fmaxf(m,v);
+    }
+    if(cur>=0&&m>0.f) atomicMax(&amax_bits[cur],__float_as_uint(m));
+}
+
+// finalize: g[i] = amax/6/448 (per-tensor NVFP4 global), floor tiny.
+extern "C" __global__ void nvfp4_globals(
+    const unsigned* __restrict__ amax_bits, float* __restrict__ g, int n)
+{
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
+    float a=__uint_as_float(amax_bits[i]);
+    float v=a/6.f/448.f; g[i]=(v>0.f)?v:1e-9f;
+}
+
+// Weight quant+pack: w f16 [n_exp*N, K] row-major → fragment layout
+// Wp [e][NT][KT][32][2] u32, Wsc [e][NT][KT][8] u32. One warp = (e,nt,kt).
+extern "C" __global__ void nvfp4_pack_w(
+    const __half* __restrict__ w, const float* __restrict__ gw,
+    unsigned* __restrict__ Wp, unsigned* __restrict__ Wsc,
+    int n_exp, int N, int K)
+{
+    int KT=K/64, NT=N/8;
+    long warp=((long)blockIdx.x*blockDim.x+threadIdx.x)>>5;
+    long total=(long)n_exp*NT*KT; if(warp>=total) return;
+    int lane=threadIdx.x&31, gid=lane>>2, tig=lane&3;
+    int kt=(int)(warp%KT); long t2=warp/KT; int nt=(int)(t2%NT); int e=(int)(t2/NT);
+    float g=gw[e]; float inv_g=1.f/g;
+    int row=nt*8+gid; const __half* wr=w+((long)e*N+row)*K;
+    unsigned b0=0,b1=0;
+    // lane covers (blk in {tig>=2?2,3:0,1}, w in {tig&1?8..15:0..7}) of the 64-K tile
+    int blk0=(tig>=2)?2:0, w0=(tig&1)?8:0;
+    for(int bb=0;bb<2;bb++){
+        int blk=blk0+bb; int bstart=kt*64+blk*16;
+        float amax=0.f;
+        #pragma unroll
+        for(int j=0;j<16;j++) amax=fmaxf(amax,fabsf(__half2float(wr[bstart+j])));
+        unsigned sb=enc_ue4m3((amax/6.f)*inv_g);
+        float bs=dec_ue4m3(sb)*g; float inv_bs=(bs>0.f)?1.f/bs:0.f;
+        unsigned reg=0;
+        #pragma unroll
+        for(int j=0;j<8;j++){
+            int kk=blk*16+w0+j; int gK=kt*64+kk; (void)kk;
+            unsigned code=enc_e2m1(__half2float(wr[gK]),inv_bs);
+            reg|=code<<(j*4);
+        }
+        if(blk&1) b1=reg; else b0=reg;
+    }
+    long fbase=((long)((long)e*NT+nt)*KT+kt);
+    Wp[(fbase*32+lane)*2+0]=b0; Wp[(fbase*32+lane)*2+1]=b1;
+    if(tig==0){
+        unsigned s=0;
+        #pragma unroll
+        for(int blk=0;blk<4;blk++){
+            int bstart=kt*64+blk*16; float amax=0.f;
+            for(int j=0;j<16;j++) amax=fmaxf(amax,fabsf(__half2float(wr[bstart+j])));
+            s|=enc_ue4m3((amax/6.f)*inv_g)<<(b4b_map(blk)*8);
+        }
+        Wsc[fbase*8+gid]=s;
+    }
+}
+
+// Activation quant+pack: a f16 [mt, K] (sorted rows) + tile descs → fragment
+// layout Ap [tile][KT][32][4] u32 + Asc [tile][KT][32] u32. Rows past gend → 0.
+// One warp = (tile, kt). gA read from device (dynamic per-call global).
+extern "C" __global__ void moe_fp4_actq_pack(
+    const __half* __restrict__ a, const int* __restrict__ tok0,
+    const int* __restrict__ gend, const float* __restrict__ gA,
+    unsigned* __restrict__ Ap, unsigned* __restrict__ Asc,
+    int maxt, int K, int mt_total)
+{
+    // Warp-per-(tile,kt): stage the 16x64 f16 tile to smem with coalesced
+    // half2 loads (each lane: 2 rows x 16B), compute the 64 block-16 amaxes
+    // cooperatively (one per (row,blk) pair on lanes 0..31 x2), then encode.
+    int KT=K/64;
+    int wid=threadIdx.x>>5;
+    long warp=((long)blockIdx.x*(blockDim.x>>5))+wid;
+    if(warp>=(long)maxt*KT) return;
+    int lane=threadIdx.x&31, gid=lane>>2, tig=lane&3;
+    int kt=(int)(warp%KT); int t=(int)(warp/KT);
+    int base=tok0[t], end=gend[t];
+    float g=gA[0]; float inv_g=1.f/g;
+    __shared__ __half smem_all[8][16*64];    // 8 warps/block x 2KB
+    __shared__ float bsmem_all[8][16*4];     // reconstructed block scales
+    __half* sm=smem_all[wid];
+    float* bsm=bsmem_all[wid];
+    // stage: lane loads rows (lane>>1) halves: 32 halves = 4x half4(8B). row-major.
+    {
+        int r0=lane>>1, c0=(lane&1)*32;      // each lane: row r0, cols c0..c0+31
+        int row=base+r0;
+        bool live=(r0 < end-base)&&(row<mt_total);
+        const __half* src=a+(long)row*K+kt*64+c0;
+        #pragma unroll
+        for(int j=0;j<32;j+=8){
+            if(live){
+                *(uint4*)&sm[r0*64+c0+j]=*(const uint4*)&src[j];
+            } else {
+                uint4 z={0,0,0,0}; *(uint4*)&sm[r0*64+c0+j]=z;
+            }
+        }
+    }
+    __syncwarp();
+    // block scales: 64 (row,blk) pairs; lanes do 2 each.
+    #pragma unroll
+    for(int pp=0;pp<2;pp++){
+        int pair=lane+pp*32;                 // 0..63
+        int r=pair>>2, blk=pair&3;
+        const __half* bp=&sm[r*64+blk*16];
+        float amax=0.f;
+        #pragma unroll
+        for(int j=0;j<16;j++) amax=fmaxf(amax,fabsf(__half2float(bp[j])));
+        unsigned sb=enc_ue4m3((amax/6.f)*inv_g);
+        bsm[r*4+blk]=dec_ue4m3(sb)*g;
+    }
+    __syncwarp();
+    unsigned regs[4]={0,0,0,0};
+    int blk0=(tig>=2)?2:0, w0=(tig&1)?8:0;
+    #pragma unroll
+    for(int half=0;half<2;half++){
+        int r=gid+half*8;
+        #pragma unroll
+        for(int bb=0;bb<2;bb++){
+            int blk=blk0+bb;
+            float bs=bsm[r*4+blk]; float inv_bs=(bs>0.f)?1.f/bs:0.f;
+            unsigned reg=0;
+            #pragma unroll
+            for(int j=0;j<8;j++)
+                reg|=enc_e2m1(__half2float(sm[r*64+blk*16+w0+j]),inv_bs)<<(j*4);
+            int ri=(blk&1)?(half?3:2):(half?1:0);
+            regs[ri]|=reg;
+        }
+    }
+    long fbase=(long)t*KT+kt;
+    #pragma unroll
+    for(int r=0;r<4;r++) Ap[(fbase*32+lane)*4+r]=regs[r];
+    // scale word (re-encode from reconstructed bs: enc(dec(x))==x for codebook values)
+    unsigned sw=0;
+    if(tig==0||tig==1){
+        int r=gid+(tig==1?8:0);
+        #pragma unroll
+        for(int blk=0;blk<4;blk++)
+            sw|=enc_ue4m3(bsm[r*4+blk]*inv_g)<<(b4b_map(blk)*8);
+    }
+    Asc[fbase*32+lane]=sw;
+}
+
+// Grouped mma: one warp = (tile, nt). FIXED launch grid — padding tiles
+// (gend==0) early-out → graph-safe. out f16 [mt, N] in sorted-row space.
+extern "C" __global__ void moe_fp4_grouped_mma(
+    const unsigned* __restrict__ Ap, const unsigned* __restrict__ Asc,
+    const unsigned* __restrict__ Wp, const unsigned* __restrict__ Wsc,
+    const int* __restrict__ tok0, const int* __restrict__ eidv,
+    const int* __restrict__ gend, const float* __restrict__ gA,
+    const float* __restrict__ gw, __half* __restrict__ out,
+    int N, int K, int mt_total)
+{
+    int KT=K/64, NT=N/8;
+    int t=blockIdx.x;                       // tile index
+    int nt=blockIdx.y*(blockDim.x>>5)+(threadIdx.x>>5); // n8-tile
+    if(nt>=NT) return;
+    int base=tok0[t], end=gend[t];
+    if(end<=base) return;                   // padding tile
+    int lane=threadIdx.x&31, gid=lane>>2, tig=lane&3;
+    unsigned eid=(unsigned)eidv[t];
+    const unsigned* A =Ap +((long)t*KT*32)*4+lane*4;
+    const unsigned* As=Asc+ (long)t*KT*32+lane;
+    const unsigned* W =Wp +(((long)eid*NT+nt)*KT*32)*2+lane*2;
+    const unsigned* Ws=Wsc+(((long)eid*NT+nt)*KT)*8+gid;
+    float c0=0,c1=0,c2=0,c3=0;
+    for(int kt=0;kt<KT;kt++){
+        const unsigned* Ak=A+(long)kt*32*4;
+        const unsigned* Wk=W+(long)kt*32*2;
+        unsigned a0=Ak[0],a1=Ak[1],a2=Ak[2],a3=Ak[3],b0=Wk[0],b1=Wk[1];
+        unsigned sA=As[(long)kt*32], sB=Ws[(long)kt*8];
+        asm volatile("mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
+         "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3},{%10},{0,0},{%11},{0,0};"
+         :"+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3)
+         :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"r"(sA),"r"(sB));
+    }
+    float g=gA[0]*gw[eid];
+    int valid=end-base; int col=nt*8+tig*2;
+    if(gid<valid){
+        long r=(long)(base+gid)*N+col;
+        out[r]=__float2half(c0*g); out[r+1]=__float2half(c1*g);
+    }
+    if(gid+8<valid){
+        long r=(long)(base+gid+8)*N+col;
+        out[r]=__float2half(c2*g); out[r+1]=__float2half(c3*g);
+    }
+}
+"#;
+
+/// Quantize+fragment-pack MoE expert weights to NVFP4 on device.
+/// `w_f16`: f16 `[n_exp*n, k]` row-major (concatenated experts). Returns
+/// `(wp, wsc, gw)` — fragment codes, scale words, per-expert globals (device).
+pub fn moe_fp4_pack_weights(
+    dev: &dyn Device, w_f16: &Tensor, n_exp: usize, n: usize, k: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    if k % 64 != 0 { return Err(Error::Msg(format!("moe_fp4_pack_weights: K {k} %64!=0"))); }
+    if n % 8 != 0 { return Err(Error::Msg(format!("moe_fp4_pack_weights: N {n} %8!=0"))); }
+    let (kt, ntl) = (k / 64, n / 8);
+    let amax = Tensor::new(dev.upload(&vec![0u8; n_exp * 4]).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![n_exp], DType::U32);
+    let gw = Tensor::empty(dev, vec![n_exp], DType::F32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let l = |x: i64| x.to_le_bytes().to_vec();
+    let slab = (n * k) as i64;
+    let total_elems = (n_exp * n * k) as u32;
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
+        &[(w_f16.buffer.as_ref(), w_f16.offset), (amax.buffer.as_ref(), 0)],
+        &[l(slab), i(n_exp as i32)],
+        [total_elems.div_ceil(256 * 8), 1, 1], [256, 1, 1], 0, false)?;
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_globals",
+        &[(amax.buffer.as_ref(), 0), (gw.buffer.as_ref(), 0)],
+        &[i(n_exp as i32)],
+        [(n_exp as u32).div_ceil(64), 1, 1], [64, 1, 1], 0, false)?;
+    let wp = Tensor::empty(dev, vec![n_exp * ntl * kt * 32 * 2], DType::U32)?;
+    let wsc = Tensor::empty(dev, vec![n_exp * ntl * kt * 8], DType::U32)?;
+    let warps = (n_exp * ntl * kt) as u32;
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_pack_w",
+        &[(w_f16.buffer.as_ref(), w_f16.offset), (gw.buffer.as_ref(), 0),
+          (wp.buffer.as_ref(), 0), (wsc.buffer.as_ref(), 0)],
+        &[i(n_exp as i32), i(n as i32), i(k as i32)],
+        [(warps * 32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+    Ok((wp, wsc, gw))
+}
+
+/// Fully-on-device NVFP4 grouped MoE GEMM (W4A4): quantizes the f16 sorted
+/// activations `a [mt,k]` to NVFP4 (dynamic per-call global), packs fragments,
+/// and runs the Blackwell block-scaled mma over BM=16 tile descriptors built
+/// from `offsets` (device `[n_exp+1]`). Fixed launch — graph-safe, no host
+/// syncs. Returns `out [mt, n]` f16.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_fp4_grouped_mma_dev(
+    dev: &dyn Device, a: &Tensor, wp: &Tensor, wsc: &Tensor, gw: &Tensor,
+    offsets: &Tensor, n_exp: usize, mt: usize, n: usize, k: usize,
+) -> Result<Tensor> {
+    if k % 64 != 0 { return Err(Error::Msg(format!("moe_fp4_grouped_mma_dev: K {k} %64!=0"))); }
+    let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
+    if mt == 0 { return Ok(out); }
+    let (kt, ntl) = (k / 64, n / 8);
+    let maxt = mt.div_ceil(16) + n_exp;
+    let t0d = Tensor::empty(dev, vec![maxt], DType::U32)?;
+    let eidd = Tensor::empty(dev, vec![maxt], DType::U32)?;
+    let ged = Tensor::empty(dev, vec![maxt], DType::U32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let l = |x: i64| x.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        MOE_BUILD_TILES_SRC, "moe_build_tiles.cu", "moe_build_tiles",
+        &[(offsets.buffer.as_ref(), offsets.offset), (t0d.buffer.as_ref(), 0),
+          (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0)],
+        &[i(n_exp as i32), i(16), i(maxt as i32)],
+        [1, 1, 1], [1, 1, 1], 0, false)?;
+    // dynamic activation global
+    let amax = Tensor::new(dev.upload(&vec![0u8; 4]).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![1], DType::U32);
+    let ga = Tensor::empty(dev, vec![1], DType::F32)?;
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
+        &[(a.buffer.as_ref(), a.offset), (amax.buffer.as_ref(), 0)],
+        &[l((mt * k) as i64), i(1)],
+        [((mt * k) as u32).div_ceil(256 * 8), 1, 1], [256, 1, 1], 0, false)?;
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_globals",
+        &[(amax.buffer.as_ref(), 0), (ga.buffer.as_ref(), 0)],
+        &[i(1)],
+        [1, 1, 1], [64, 1, 1], 0, false)?;
+    // act quant+pack
+    let ap = Tensor::empty(dev, vec![maxt * kt * 32 * 4], DType::U32)?;
+    let asc = Tensor::empty(dev, vec![maxt * kt * 32], DType::U32)?;
+    let warps = (maxt * kt) as u32;
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "moe_fp4_actq_pack",
+        &[(a.buffer.as_ref(), a.offset), (t0d.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
+          (ga.buffer.as_ref(), 0), (ap.buffer.as_ref(), 0), (asc.buffer.as_ref(), 0)],
+        &[i(maxt as i32), i(k as i32), i(mt as i32)],
+        [(warps * 32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+    // grouped mma: grid [maxt, NT/8] × 8 warps/block
+    let warps_per_block = 8u32;
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "moe_fp4_grouped_mma",
+        &[(ap.buffer.as_ref(), 0), (asc.buffer.as_ref(), 0),
+          (wp.buffer.as_ref(), wp.offset), (wsc.buffer.as_ref(), wsc.offset),
+          (t0d.buffer.as_ref(), 0), (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
+          (ga.buffer.as_ref(), 0), (gw.buffer.as_ref(), gw.offset),
+          (out.buffer.as_ref(), 0)],
+        &[i(n as i32), i(k as i32), i(mt as i32)],
+        [maxt as u32, (ntl as u32).div_ceil(warps_per_block), 1],
+        [warps_per_block * 32, 1, 1], 0, false)?;
+    Ok(out)
+}

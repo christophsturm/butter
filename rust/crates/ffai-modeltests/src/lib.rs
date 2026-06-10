@@ -788,6 +788,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     // Stored separately so the qmv/qacc/qrelu2 dispatch closures can key on which map to use
     // without touching the Q4 path at all.  Only populated when use_nvfp4_recipe=true.
     let mut qw8: HashMap<String, (Tensor, Tensor, usize, usize)> = HashMap::new();
+    // NVFP4 fragment-packed MoE weights (NEMOTRON_FP4_MOE): name → (wp, wsc, gw)
+    let mut fp4w: HashMap<String, (Tensor, Tensor, Tensor)> = HashMap::new();
+    let use_fp4_moe = std::env::var("NEMOTRON_FP4_MOE").is_ok();
     let mut fw: HashMap<String, Vec<f32>> = HashMap::new(); // f32 weights used HOST-side
     let mut fwd: HashMap<String, Tensor> = HashMap::new(); // f32 weights RESIDENT on device
     let fd = |fwd: &mut HashMap<String, Tensor>, name: &str, v: &[f32], shape: Vec<usize>| {
@@ -975,6 +978,24 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         qw.insert(format!("{moe_up_name}_marlin"), (Tensor::new(d.upload(&tbu(&uqs_mar)).unwrap(), vec![uqs_mar.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
                         qw.insert(format!("{moe_down_name}_marlin"), (Tensor::new(d.upload(&tbu(&dqs_mar)).unwrap(), vec![dqs_mar.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
                     }
+                }
+                // NVFP4 W4A4 path (NEMOTRON_FP4_MOE=1): quantize+fragment-pack the
+                // routed experts on DEVICE (upload f16 once, pack kernels do the rest).
+                if use_fp4_moe {
+                    let mut build = |which: &str, n: usize, k: usize| {
+                        let mut wh: Vec<f32> = Vec::with_capacity(n_exp * n * k);
+                        for e in 0..n_exp {
+                            wh.extend(g(&format!("{p}.mixer.experts.{e}.{which}.weight")));
+                        }
+                        let bytes = tb_f16(&wh);
+                        drop(wh);
+                        let wt = Tensor::new(d.upload(&bytes).unwrap(), vec![n_exp * n, k], DType::F16);
+                        drop(bytes);
+                        let (wp, wsc, gw) = ffai_ops::moe_fp4_pack_weights(d, &wt, n_exp, n, k).unwrap();
+                        fp4w.insert(format!("{p}.moe_{which}_fp4"), (wp, wsc, gw));
+                    };
+                    build("up_proj", inter, hid);
+                    build("down_proj", hid, inter);
                 }
                 // NVFP4 recipe: shared-expert up/down → Q8.
                 if use_nvfp4_recipe {
@@ -2230,6 +2251,23 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 cast_f32_f16(d, &upm(&rt, vec![rows, kk])).unwrap()
                             };
                             let xs_in = if fp4_sim { fp4rt(&xs_f16, mt, hid) } else { xs_f16.clone() };
+                            // Native NVFP4 W4A4 grouped mma (NEMOTRON_FP4_MOE=1, devdesc only):
+                            // dynamic act quant+pack + Blackwell block-scaled FP4 mma. Needs
+                            // METALTILE_CUDA_ARCH=compute_121a.
+                            let fp4_moe = devdesc && fp4w.contains_key(&format!("{p}.moe_up_proj_fp4"));
+                            if fp4_moe {
+                                let (uwp, uwsc, ugw) = &fp4w[&format!("{p}.moe_up_proj_fp4")];
+                                let (dwp, dwsc, dgw) = &fp4w[&format!("{p}.moe_down_proj_fp4")];
+                                let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xs_in, uwp, uwsc, ugw, off_dev_ref.unwrap(), n_exp, mt, inter, hid).unwrap());
+                                let a2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                                let dn_out = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &a2, dwp, dwsc, dgw, off_dev_ref.unwrap(), n_exp, mt, hid, inter).unwrap());
+                                let acc_dev = upm(&acc_h, vec![s, hid]);
+                                let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
+                                moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
+                            } else {
                             // UP: [mt,inter] = xs[mt,hid] · Wup_q4[eid; inter,hid]  (n=inter,k=hid)
                             let up_out = if devdesc {
                                 pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
@@ -2264,6 +2302,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 moe_scatter_add_det(d, &dn_out, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
                             }
                             if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
+                            } // end !fp4_moe (Q4 grouped path)
                         } else if use_grouped_gemm {
                             // ── Grouped-GEMM path (NEMOTRON_GROUPED_GEMM=1) ───────────────
                             // All UP dequants (async) → all UP GEMMs (async) → relu2_scale →
