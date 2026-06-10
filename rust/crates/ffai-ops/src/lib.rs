@@ -6130,6 +6130,61 @@ extern "C" __global__ void moe_fp4_actq_pack(
     Asc[fbase*32+lane]=sw;
 }
 
+// VARIANT: each warp computes 4 consecutive n8-tiles — A frags loaded once,
+// reused 4x; W streams per-subtile. Cuts A traffic 4x, raises mma density.
+extern "C" __global__ void moe_fp4_grouped_mma_x4(
+    const unsigned* __restrict__ Ap, const unsigned* __restrict__ Asc,
+    const unsigned* __restrict__ Wp, const unsigned* __restrict__ Wsc,
+    const int* __restrict__ tok0, const int* __restrict__ eidv,
+    const int* __restrict__ gend, const float* __restrict__ gA,
+    const float* __restrict__ gw, __half* __restrict__ out,
+    int N, int K, int mt_total)
+{
+    int KT=K/64, NT=N/8, NG=(NT+3)>>2;
+    int t=blockIdx.x;
+    int ng=blockIdx.y*(blockDim.x>>5)+(threadIdx.x>>5);
+    if(ng>=NG) return;
+    int base=tok0[t], end=gend[t];
+    if(end<=base) return;
+    int lane=threadIdx.x&31, gid=lane>>2, tig=lane&3;
+    unsigned eid=(unsigned)eidv[t];
+    const unsigned* A =Ap +((long)t*KT*32)*4+lane*4;
+    const unsigned* As=Asc+ (long)t*KT*32+lane;
+    float c[4][4]={};
+    int nt0=ng*4;
+    for(int kt=0;kt<KT;kt++){
+        const unsigned* Ak=A+(long)kt*32*4;
+        unsigned a0=Ak[0],a1=Ak[1],a2=Ak[2],a3=Ak[3];
+        unsigned sA=As[(long)kt*32];
+        #pragma unroll
+        for(int j=0;j<4;j++){
+            int nt=nt0+j; if(nt>=NT) break;
+            const unsigned* Wk=Wp+(((long)eid*NT+nt)*KT+kt)*32*2+lane*2;
+            unsigned b0=Wk[0],b1=Wk[1];
+            unsigned sB=Wsc[(((long)eid*NT+nt)*KT+kt)*8+gid];
+            asm volatile("mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
+             "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3},{%10},{0,0},{%11},{0,0};"
+             :"+f"(c[j][0]),"+f"(c[j][1]),"+f"(c[j][2]),"+f"(c[j][3])
+             :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"r"(sA),"r"(sB));
+        }
+    }
+    float g=gA[0]*gw[eid];
+    int valid=end-base;
+    #pragma unroll
+    for(int j=0;j<4;j++){
+        int nt=nt0+j; if(nt>=NT) break;
+        int col=nt*8+tig*2;
+        if(gid<valid){
+            long r=(long)(base+gid)*N+col;
+            out[r]=__float2half(c[j][0]*g); out[r+1]=__float2half(c[j][1]*g);
+        }
+        if(gid+8<valid){
+            long r=(long)(base+gid+8)*N+col;
+            out[r]=__float2half(c[j][2]*g); out[r+1]=__float2half(c[j][3]*g);
+        }
+    }
+}
+
 // Grouped mma: one warp = (tile, nt). FIXED launch grid — padding tiles
 // (gend==0) early-out → graph-safe. out f16 [mt, N] in sorted-row space.
 extern "C" __global__ void moe_fp4_grouped_mma(
@@ -6263,16 +6318,19 @@ pub fn moe_fp4_grouped_mma_dev(
         &[i(maxt as i32), i(k as i32), i(mt as i32)],
         [(warps * 32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
     // grouped mma: grid [maxt, NT/8] × 8 warps/block
+    // x4 variant: 4 n8-tiles per warp (A frags register-reused) — +49% on
+    // GB10 vs 1 nt/warp (L2-poorer than desktop Blackwell, where x1 wins).
     let warps_per_block = 8u32;
+    let ng = ntl.div_ceil(4) as u32;
     dev.dispatch_raw_cuda(
-        MOE_FP4_SRC, "moe_fp4.cu", "moe_fp4_grouped_mma",
+        MOE_FP4_SRC, "moe_fp4.cu", "moe_fp4_grouped_mma_x4",
         &[(ap.buffer.as_ref(), 0), (asc.buffer.as_ref(), 0),
           (wp.buffer.as_ref(), wp.offset), (wsc.buffer.as_ref(), wsc.offset),
           (t0d.buffer.as_ref(), 0), (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
           (ga.buffer.as_ref(), 0), (gw.buffer.as_ref(), gw.offset),
           (out.buffer.as_ref(), 0)],
         &[i(n as i32), i(k as i32), i(mt as i32)],
-        [maxt as u32, (ntl as u32).div_ceil(warps_per_block), 1],
+        [maxt as u32, ng.div_ceil(warps_per_block), 1],
         [warps_per_block * 32, 1, 1], 0, false)?;
     Ok(out)
 }
