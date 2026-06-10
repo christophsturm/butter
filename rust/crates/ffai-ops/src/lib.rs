@@ -6063,7 +6063,8 @@ extern "C" __global__ void moe_fp4_actq_pack(
     const __half* __restrict__ a, const int* __restrict__ tok0,
     const int* __restrict__ gend, const float* __restrict__ gA,
     unsigned* __restrict__ Ap, unsigned* __restrict__ Asc,
-    int maxt, int K, int mt_total, int act_mode, float act_scale)
+    const unsigned* __restrict__ st,
+    int maxt, int K, int mt_total, int act_mode, float act_scale, int use_st)
 {
     // Warp-per-(tile,kt): stage the 16x64 f16 tile to smem with coalesced
     // half2 loads (each lane: 2 rows x 16B), compute the 64 block-16 amaxes
@@ -6085,7 +6086,8 @@ extern "C" __global__ void moe_fp4_actq_pack(
         int r0=lane>>1, c0=(lane&1)*32;      // each lane: row r0, cols c0..c0+31
         int row=base+r0;
         bool live=(r0 < end-base)&&(row<mt_total);
-        const __half* src=a+(long)row*K+kt*64+c0;
+        long src_row=(use_st&&live)?(long)st[row]:(long)row;  // gather-on-read
+        const __half* src=a+src_row*K+kt*64+c0;
         #pragma unroll
         for(int j=0;j<32;j+=8){
             if(live){
@@ -6302,11 +6304,13 @@ pub fn moe_fp4_pack_weights(
 /// from `offsets` (device `[n_exp+1]`). Fixed launch — graph-safe, no host
 /// syncs. Returns `out [mt, n]` f16.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn moe_fp4_grouped_mma_dev(
     dev: &dyn Device, a: &Tensor, wp: &Tensor, wsc: &Tensor, gw: &Tensor,
     offsets: &Tensor, n_exp: usize, mt: usize, n: usize, k: usize,
     act_mode: i32, act_scale: f32,
     amax_in: Option<&Tensor>, amax_out: Option<(&Tensor, i32, f32)>,
+    gather_idx: Option<&Tensor>,
 ) -> Result<Tensor> {
     if k % 64 != 0 { return Err(Error::Msg(format!("moe_fp4_grouped_mma_dev: K {k} %64!=0"))); }
     let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
@@ -6334,8 +6338,8 @@ pub fn moe_fp4_grouped_mma_dev(
             dev.dispatch_raw_cuda(
                 MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
                 &[(a.buffer.as_ref(), a.offset), (amax_owned.buffer.as_ref(), 0)],
-                &[l((mt * k) as i64), i(1), i(act_mode), act_scale.to_le_bytes().to_vec()],
-                [((mt * k) as u32).div_ceil(256 * 64).max(1), 1, 1], [256, 1, 1], 0, false)?;
+                &[l(a.elem_count() as i64), i(1), i(act_mode), act_scale.to_le_bytes().to_vec()],
+                [(a.elem_count() as u32).div_ceil(256 * 64).max(1), 1, 1], [256, 1, 1], 0, false)?;
             &amax_owned
         }
     };
@@ -6352,8 +6356,10 @@ pub fn moe_fp4_grouped_mma_dev(
     dev.dispatch_raw_cuda(
         MOE_FP4_SRC, "moe_fp4.cu", "moe_fp4_actq_pack",
         &[(a.buffer.as_ref(), a.offset), (t0d.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
-          (ga.buffer.as_ref(), 0), (ap.buffer.as_ref(), 0), (asc.buffer.as_ref(), 0)],
-        &[i(maxt as i32), i(k as i32), i(mt as i32), i(act_mode), act_scale.to_le_bytes().to_vec()],
+          (ga.buffer.as_ref(), 0), (ap.buffer.as_ref(), 0), (asc.buffer.as_ref(), 0),
+          match gather_idx { Some(t) => (t.buffer.as_ref(), t.offset), None => (t0d.buffer.as_ref(), 0) }],
+        &[i(maxt as i32), i(k as i32), i(mt as i32), i(act_mode), act_scale.to_le_bytes().to_vec(),
+          i(if gather_idx.is_some() { 1 } else { 0 })],
         [(warps * 32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
     // grouped mma: grid [maxt, NT/8] × 8 warps/block
     // x4 variant: 4 n8-tiles per warp (A frags register-reused) — +49% on

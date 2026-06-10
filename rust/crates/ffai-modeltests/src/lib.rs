@@ -2085,7 +2085,15 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         } else {
                             None
                         };
-                        let (xs, xs_dev_f16_opt) = if use_bgemm || use_w4a16 || use_grouped_gemm || use_metal_grouped {
+                        // FP4-direct: actq_pack gathers on read from the ungathered
+                        // [s,hid] f16 — skip building the gathered xs entirely.
+                        let fp4_skip_gather = is_cuda && moe_dev.is_some() && xn_f16_router.is_some()
+                            && std::env::var("NEMOTRON_FP4_DIRECT_OFF").is_err()
+                            && std::env::var("NEMOTRON_FP4_SIM").is_err()
+                            && fp4w.contains_key(&format!("{p}.moe_up_proj_fp4"));
+                        let (xs, xs_dev_f16_opt) = if fp4_skip_gather {
+                            (Vec::new(), None)
+                        } else if use_bgemm || use_w4a16 || use_grouped_gemm || use_metal_grouped {
                             // BGEMM/W4A16: host gather → upload xs as one [mt, hid] f16 tensor.
                             let xn_h = xn_h_opt.as_ref().unwrap();
                             let mut xs_h = vec![0.0f32; mt * hid];
@@ -2280,7 +2288,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // moe_q4_grouped_mma reads the signed Q4 weights directly (no
                             // f16 slab, no dequant). ONE launch per up/down. Device gather
                             // gives xs_f16; on-device relu²(1/256)+det-scatter(×256).
-                            let xs_f16 = xs_dev_f16_opt.as_ref().unwrap().clone();
+                            // None in FP4-direct mode (gather skipped upstream) — dummy.
+                            let xs_f16 = xs_dev_f16_opt.clone().unwrap_or_else(|| {
+                                Tensor::new(d.upload(&[0u8; 2]).unwrap(), vec![1], DType::F16)
+                            });
                             // Host g_starts/expert_ids only for the host-descriptor path; the
                             // devdesc path builds them on-device (triples is empty there).
                             let mut g_starts: Vec<usize> = vec![0];
@@ -2303,7 +2314,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let rt = nvfp4_roundtrip(&hf, rows, kk);
                                 cast_f32_f16(d, &upm(&rt, vec![rows, kk])).unwrap()
                             };
-                            let xs_in = if fp4_sim { fp4rt(&xs_f16, mt, hid) } else { xs_f16.clone() };
+                            // FP4 direct mode: skip the gathered xs entirely — actq_pack
+                            // gathers on read via st_dev from the ungathered [s,hid] f16
+                            // (and the amax pass scans 6x fewer elements).
+                            let fp4_direct = !fp4_sim && moe_dev.is_some() && xn_f16_router.is_some()
+                                && std::env::var("NEMOTRON_FP4_DIRECT_OFF").is_err()
+                                && fp4w.contains_key(&format!("{p}.moe_up_proj_fp4"));
+                            let xs_in = if fp4_direct { xn_f16_router.as_ref().unwrap().clone() }
+                                else if fp4_sim { fp4rt(&xs_f16, mt, hid) } else { xs_f16.clone() };
                             // Native NVFP4 W4A4 grouped mma (NEMOTRON_FP4_MOE=1, devdesc only):
                             // dynamic act quant+pack + Blackwell block-scaled FP4 mma. Needs
                             // METALTILE_CUDA_ARCH=compute_121a.
@@ -2315,11 +2333,12 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 // amax (of relu²-transformed outputs) — kills the full 45MB
                                 // re-read the down amax pass used to do.
                                 let amax_dn = Tensor::new(d.upload(&[0u8; 4]).unwrap(), vec![1], DType::U32);
+                                let up_gidx = if fp4_direct { moe_dev.as_ref().map(|(_, st, _)| st) } else { None };
                                 let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xs_in, uwp, uwsc, ugw, off_dev_ref.unwrap(), n_exp, mt, inter, hid, 0, 0.0, None, Some((&amax_dn, 1, inv))).unwrap());
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xs_in, uwp, uwsc, ugw, off_dev_ref.unwrap(), n_exp, mt, inter, hid, 0, 0.0, None, Some((&amax_dn, 1, inv)), up_gidx).unwrap());
                                 // relu²·(1/256) fused into the down act-quant (no standalone pass)
                                 let dn_out = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &up_out, dwp, dwsc, dgw, off_dev_ref.unwrap(), n_exp, mt, hid, inter, 1, inv, Some(&amax_dn), None).unwrap());
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &up_out, dwp, dwsc, dgw, off_dev_ref.unwrap(), n_exp, mt, hid, inter, 1, inv, Some(&amax_dn), None, None).unwrap());
                                 let acc_dev = upm(&acc_h, vec![s, hid]);
                                 let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
                                 moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
@@ -2758,9 +2777,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let (dwp, dwsc, dgw) = &fp4w[&format!("{p}.sh_down_proj_fp4")];
                                 let amax_sd = Tensor::new(d.upload(&[0u8; 4]).unwrap(), vec![1], DType::U32);
                                 let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xnh, uwp, uwsc, ugw, &off1, 1, s, shared_inter, hid, 0, 0.0, None, Some((&amax_sd, 1, 1.0))).unwrap());
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xnh, uwp, uwsc, ugw, &off1, 1, s, shared_inter, hid, 0, 0.0, None, Some((&amax_sd, 1, 1.0)), None).unwrap());
                                 pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &sa, dwp, dwsc, dgw, &off1, 1, s, hid, shared_inter, 1, 1.0, Some(&amax_sd), None).unwrap())
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &sa, dwp, dwsc, dgw, &off1, 1, s, hid, shared_inter, 1, 1.0, Some(&amax_sd), None, None).unwrap())
                             } else {
                             let wsu = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
                             let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
