@@ -5957,9 +5957,27 @@ extern "C" __global__ void nvfp4_amax_slab(
     const __half* __restrict__ x, unsigned* __restrict__ amax_bits,
     long slab_len, int n_slabs)
 {
-    long i=(long)blockIdx.x*blockDim.x+threadIdx.x;
     long total=slab_len*(long)n_slabs;
     long stride=(long)gridDim.x*blockDim.x;
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(n_slabs==1){
+        // hot path (per-call activation global): block-reduce, 1 atomic/block.
+        float m=0.f;
+        for(long p=i;p<total;p+=stride) m=fmaxf(m,fabsf(__half2float(x[p])));
+        #pragma unroll
+        for(int o=16;o;o>>=1) m=fmaxf(m,__shfl_down_sync(0xffffffffu,m,o));
+        __shared__ float wm[32];
+        if((threadIdx.x&31)==0) wm[threadIdx.x>>5]=m;
+        __syncthreads();
+        if(threadIdx.x<32){
+            float v=(threadIdx.x<(blockDim.x>>5))?wm[threadIdx.x]:0.f;
+            #pragma unroll
+            for(int o=16;o;o>>=1) v=fmaxf(v,__shfl_down_sync(0xffffffffu,v,o));
+            if(threadIdx.x==0&&v>0.f) atomicMax(&amax_bits[0],__float_as_uint(v));
+        }
+        return;
+    }
+    // setup-only path (per-expert weight slabs): local-run accumulation.
     float m=0.f; int cur=-1;
     for(long p=i;p<total;p+=stride){
         int slab=(int)(p/slab_len);
@@ -6228,7 +6246,7 @@ pub fn moe_fp4_grouped_mma_dev(
         MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
         &[(a.buffer.as_ref(), a.offset), (amax.buffer.as_ref(), 0)],
         &[l((mt * k) as i64), i(1)],
-        [((mt * k) as u32).div_ceil(256 * 8), 1, 1], [256, 1, 1], 0, false)?;
+        [((mt * k) as u32).div_ceil(256 * 64).max(1), 1, 1], [256, 1, 1], 0, false)?;
     dev.dispatch_raw_cuda(
         MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_globals",
         &[(amax.buffer.as_ref(), 0), (ga.buffer.as_ref(), 0)],
