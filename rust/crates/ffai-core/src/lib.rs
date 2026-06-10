@@ -230,6 +230,26 @@ pub trait Device: Send + Sync {
         Err(Error::Msg("gemm_fp4 (block-scaled NVFP4 GEMM) unsupported on this backend".into()))
     }
 
+    /// FP8 (e4m3) GEMM with per-tensor f32 device scale pointers:
+    /// `out[m,n] = sx*sw * X·Wᵀ`. Default errors; CUDA implements it via
+    /// cublasLt (~2x the f16 tensor-core rate, far gentler quantization
+    /// than FP4).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_fp8(
+        &self,
+        _x: &dyn DeviceBuffer,
+        _x_scale: &dyn DeviceBuffer,
+        _w: &dyn DeviceBuffer,
+        _w_scale: &dyn DeviceBuffer,
+        _out: &dyn DeviceBuffer,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _out_f32: bool,
+    ) -> Result<()> {
+        Err(Error::Msg("gemm_fp8 unsupported on this backend".into()))
+    }
+
     /// CUTLASS grouped MoE GEMM: `out[t,n] = Σ_k a[t,k]·w[eid(t)][n,k]` over
     /// sorted-token groups. `a` f16 `[mt,K]`, `w` contiguous f16 expert slab
     /// `[n_exp,N,K]`, `out` f16 `[mt,N]`; `group_rows`/`expert_ids` are host

@@ -6471,6 +6471,45 @@ extern "C" __global__ void moe_fp4_grouped_mma(
     }
 }
 
+// FP8 e4m3 per-tensor quant. Pass 1 = nvfp4_amax_slab (reused, mode 0).
+// fp8_scale: amax bits -> scale = amax/448 and inv (one thread).
+extern "C" __global__ void fp8_scale(
+    const unsigned* __restrict__ amax_bits, float* __restrict__ sc)
+{
+    float am=__uint_as_float(*amax_bits);
+    float s=(am>0.f)?(am/448.f):1.f;
+    sc[0]=s;        // dequant scale (consumed by the GEMM)
+    sc[1]=1.f/s;    // quant scale (consumed by fp8_quant)
+}
+// fp8_quant: x f16 [n] -> e4m3 bytes, v*inv clamped to ±448, round-nearest.
+extern "C" __global__ void fp8_quant(
+    const __half* __restrict__ x, unsigned char* __restrict__ q,
+    const float* __restrict__ sc, long n)
+{
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x;
+    long stride=(long)gridDim.x*blockDim.x;
+    float inv=sc[1];
+    for(;i<n;i+=stride){
+        float v=__half2float(x[i])*inv;
+        v=fminf(fmaxf(v,-448.f),448.f);
+        // e4m3: sign + 4-bit exp (bias 7) + 3-bit mantissa, no inf, nan=0x7f
+        unsigned s=(v<0.f)?0x80u:0u; float a=fabsf(v);
+        unsigned c;
+        if(a<0.0009765625f){ // subnormal threshold 2^-10... min normal 2^-6
+            int m=(int)rintf(a*512.f); // subnormals: m/8 * 2^-6 -> a*2^9... (m = a/2^-9)
+            if(m>7)m=7; c=(unsigned)m;
+        } else {
+            int e; float fr=frexpf(a,&e); // a = fr*2^e, fr in [0.5,1)
+            int E=e+6;                    // a = (2fr)*2^(E-7)
+            int m=(int)rintf((2.f*fr-1.f)*8.f);
+            if(m>7){m=0;E+=1;}
+            if(E<1){ int ms=(int)rintf(a*512.f); if(ms>7)ms=7; c=(unsigned)ms; }
+            else { if(E>15)E=15; if(E==15&&m>6)m=6; c=(unsigned)((E<<3)|m); }
+        }
+        q[i]=(unsigned char)(s|c);
+    }
+}
+
 // Quantize f16 [R,K] row-major to the cuBLASLt block-scaled NVFP4 format:
 // packed e2m1 (2 elems/byte, linear row-major) + one ue4m3 scale per
 // 16-element K-block stored in the hardware's swizzled 512-byte-block layout.
@@ -6525,6 +6564,49 @@ pub fn lt_fp4_quant(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Result<
         &[i(r as i32), i(k as i32)],
         [nb.div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
     Ok((pack, sf))
+}
+
+/// Quantize an f16 tensor to e4m3 with a dynamic per-tensor scale.
+/// Returns `(q, sc)` — e4m3 bytes `[n]` + a 2-f32 scale buffer
+/// `[dequant_scale, quant_scale]` (the GEMM consumes word 0).
+pub fn fp8_quant(dev: &dyn Device, x: &Tensor, n: usize) -> Result<(Tensor, Tensor)> {
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let l = |v: i64| v.to_le_bytes().to_vec();
+    let amax = Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
+        &[(x.buffer.as_ref(), x.offset), (amax.buffer.as_ref(), 0)],
+        &[l(n as i64), i(1), i(0), 0f32.to_le_bytes().to_vec()],
+        [((n as u32).div_ceil(256 * 64)).max(1), 1, 1], [256, 1, 1], 0, false)?;
+    let sc = Tensor::new(dev.alloc(8)?, vec![2], DType::F32);
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "fp8_scale",
+        &[(amax.buffer.as_ref(), 0), (sc.buffer.as_ref(), 0)],
+        &[], [1, 1, 1], [1, 1, 1], 0, false)?;
+    let q = Tensor::new(dev.alloc(n)?, vec![n], DType::U32);
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "fp8_quant",
+        &[(x.buffer.as_ref(), x.offset), (q.buffer.as_ref(), 0), (sc.buffer.as_ref(), 0)],
+        &[l(n as i64)],
+        [(n as u32).div_ceil(256 * 4).max(1), 1, 1], [256, 1, 1], 0, false)?;
+    Ok((q, sc))
+}
+
+/// FP8 e4m3 dense GEMM with per-tensor scales (vendor-recipe precision for
+/// the Mamba in/out projections + shared expert on this model family).
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_fp8(
+    dev: &dyn Device,
+    x_q: &Tensor, x_sc: &Tensor,
+    w_q: &Tensor, w_sc: &Tensor,
+    m: usize, n: usize, k: usize, out_f32: bool,
+) -> Result<Tensor> {
+    let out = Tensor::empty(dev, vec![m, n], if out_f32 { DType::F32 } else { DType::F16 })?;
+    dev.gemm_fp8(
+        x_q.buffer.as_ref(), x_sc.buffer.as_ref(),
+        w_q.buffer.as_ref(), w_sc.buffer.as_ref(),
+        out.buffer.as_ref(), m, n, k, out_f32)?;
+    Ok(out)
 }
 
 /// Block-scaled NVFP4 dense GEMM: `out[m,n](f16) = X·Wᵀ` with both sides in

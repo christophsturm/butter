@@ -1736,10 +1736,42 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 }
                 o
             };
+            // FP8 dense (NEMOTRON_FP8_DENSE): the vendor recipe for this model
+            // family runs Mamba in/out_proj (+ o_proj, shared) at FP8 e4m3 with
+            // per-tensor scales — far gentler than FP4. Scopes: "mamba"
+            // (in/out_proj), "recipe" (+ o_proj), "all".
+            let fp8_dense_scope = if is_cuda { std::env::var("NEMOTRON_FP8_DENSE").ok() } else { None };
+            let fp8_dense = fp8_dense_scope.is_some();
+            let fp8_name_ok = move |name: &str| -> bool {
+                match fp8_dense_scope.as_deref() {
+                    Some("mamba") => name.contains("in_proj") || name.contains("out_proj"),
+                    Some("recipe") => name.contains("in_proj") || name.contains("out_proj") || name.contains("o_proj"),
+                    Some(_) => true,
+                    None => false,
+                }
+            };
+            let qmm_fp8d = |xh: &Tensor, name: &str, rows: usize, m: usize, k: usize,
+                            qs: &Tensor, sc: &Tensor| -> Tensor {
+                let (wq, wsc) = {
+                    if let Some(t) = w4lt.borrow().get(&format!("{name}.fp8")) { t.clone() } else {
+                        let wf = pf!(3, (m * k) as f64, dequant_q4_off(d, qs, sc, m, k, DType::F16, 0).unwrap());
+                        let t = ffai_ops::fp8_quant(d, &wf, m * k).unwrap();
+                        w4lt.borrow_mut().insert(format!("{name}.fp8"), t.clone());
+                        t
+                    }
+                };
+                let (xq, xsc) = pf!(15, 0.0, ffai_ops::fp8_quant(d, xh, rows * k).unwrap());
+                pf!(2, 2.0 * rows as f64 * m as f64 * k as f64,
+                    ffai_ops::gemm_fp8(d, &xq, &xsc, &wq, &wsc, rows, m, k, true).unwrap()) // [rows, m] f32
+            };
             let qmm = |x: &Tensor, name: &str| -> Tensor {
                 let (qs, sc, m, k) = &qw[name];
                 let rows = x.elem_count() / *k;
                 let flops = 2.0 * rows as f64 * *m as f64 * *k as f64;
+                if fp8_dense && rows > 1 && fp8_name_ok(name) {
+                    let xh = pf!(15, 0.0, cast_f32_f16(d, x).unwrap());
+                    return qmm_fp8d(&xh, name, rows, *m, *k, qs, sc);
+                }
                 if fp4_dense && rows > 1 && *k % 32 == 0 && fp4_name_ok(name) {
                     let xh = pf!(15, 0.0, cast_f32_f16(d, x).unwrap());
                     return qmm_fp4(&xh, name, rows, *m, *k, qs, sc);
@@ -1771,6 +1803,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 let (qs, sc, m, k) = &qw[name];
                 let rows = xh.elem_count() / *k;
                 let flops = 2.0 * rows as f64 * *m as f64 * *k as f64;
+                if fp8_dense && rows > 1 && fp8_name_ok(name) {
+                    return qmm_fp8d(xh, name, rows, *m, *k, qs, sc);
+                }
                 if fp4_dense && rows > 1 && *k % 32 == 0 && fp4_name_ok(name) {
                     return qmm_fp4(xh, name, rows, *m, *k, qs, sc);
                 }
