@@ -2311,11 +2311,15 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             if fp4_moe {
                                 let (uwp, uwsc, ugw) = &fp4w[&format!("{p}.moe_up_proj_fp4")];
                                 let (dwp, dwsc, dgw) = &fp4w[&format!("{p}.moe_down_proj_fp4")];
+                                // up-GEMM epilogue also computes the DOWN-GEMM's activation
+                                // amax (of relu²-transformed outputs) — kills the full 45MB
+                                // re-read the down amax pass used to do.
+                                let amax_dn = Tensor::new(d.upload(&[0u8; 4]).unwrap(), vec![1], DType::U32);
                                 let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xs_in, uwp, uwsc, ugw, off_dev_ref.unwrap(), n_exp, mt, inter, hid, 0, 0.0).unwrap());
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xs_in, uwp, uwsc, ugw, off_dev_ref.unwrap(), n_exp, mt, inter, hid, 0, 0.0, None, Some((&amax_dn, 1, inv))).unwrap());
                                 // relu²·(1/256) fused into the down act-quant (no standalone pass)
                                 let dn_out = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &up_out, dwp, dwsc, dgw, off_dev_ref.unwrap(), n_exp, mt, hid, inter, 1, inv).unwrap());
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &up_out, dwp, dwsc, dgw, off_dev_ref.unwrap(), n_exp, mt, hid, inter, 1, inv, Some(&amax_dn), None).unwrap());
                                 let acc_dev = upm(&acc_h, vec![s, hid]);
                                 let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
                                 moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
@@ -2752,10 +2756,11 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let off1 = Tensor::new(d.upload(&tbu(&[0u32, s as u32])).unwrap(), vec![2], DType::U32);
                                 let (uwp, uwsc, ugw) = &fp4w[&format!("{p}.sh_up_proj_fp4")];
                                 let (dwp, dwsc, dgw) = &fp4w[&format!("{p}.sh_down_proj_fp4")];
+                                let amax_sd = Tensor::new(d.upload(&[0u8; 4]).unwrap(), vec![1], DType::U32);
                                 let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xnh, uwp, uwsc, ugw, &off1, 1, s, shared_inter, hid, 0, 0.0).unwrap());
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xnh, uwp, uwsc, ugw, &off1, 1, s, shared_inter, hid, 0, 0.0, None, Some((&amax_sd, 1, 1.0))).unwrap());
                                 pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &sa, dwp, dwsc, dgw, &off1, 1, s, hid, shared_inter, 1, 1.0).unwrap())
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &sa, dwp, dwsc, dgw, &off1, 1, s, hid, shared_inter, 1, 1.0, Some(&amax_sd), None).unwrap())
                             } else {
                             let wsu = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
                             let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,

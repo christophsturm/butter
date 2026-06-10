@@ -6154,7 +6154,8 @@ extern "C" __global__ void moe_fp4_grouped_mma_x4(
     const int* __restrict__ tok0, const int* __restrict__ eidv,
     const int* __restrict__ gend, const float* __restrict__ gA,
     const float* __restrict__ gw, __half* __restrict__ out,
-    int N, int K, int mt_total)
+    unsigned* amax_out,
+    int N, int K, int mt_total, int am_mode, float am_scale)
 {
     int KT=K/64, NT=N/8, NG=(NT+3)>>2;
     int t=blockIdx.x;
@@ -6186,18 +6187,29 @@ extern "C" __global__ void moe_fp4_grouped_mma_x4(
     }
     float g=gA[0]*gw[eid];
     int valid=end-base;
+    float am=0.f;
     #pragma unroll
     for(int j=0;j<4;j++){
         int nt=nt0+j; if(nt>=NT) break;
         int col=nt*8+tig*2;
         if(gid<valid){
             long r=(long)(base+gid)*N+col;
-            out[r]=__float2half(c[j][0]*g); out[r+1]=__float2half(c[j][1]*g);
+            float v0=c[j][0]*g, v1=c[j][1]*g;
+            out[r]=__float2half(v0); out[r+1]=__float2half(v1);
+            if(am_mode>=0){am=fmaxf(am,fabsf(fp4_act(v0,am_mode,am_scale)));am=fmaxf(am,fabsf(fp4_act(v1,am_mode,am_scale)));}
         }
         if(gid+8<valid){
             long r=(long)(base+gid+8)*N+col;
-            out[r]=__float2half(c[j][2]*g); out[r+1]=__float2half(c[j][3]*g);
+            float v2=c[j][2]*g, v3=c[j][3]*g;
+            out[r]=__float2half(v2); out[r+1]=__float2half(v3);
+            if(am_mode>=0){am=fmaxf(am,fabsf(fp4_act(v2,am_mode,am_scale)));am=fmaxf(am,fabsf(fp4_act(v3,am_mode,am_scale)));}
         }
+    }
+    if(am_mode>=0){
+        // fused next-GEMM activation amax: warp-reduce then 1 atomic/warp.
+        #pragma unroll
+        for(int o=16;o;o>>=1) am=fmaxf(am,__shfl_down_sync(0xffffffffu,am,o));
+        if(lane==0&&am>0.f) atomicMax(amax_out,__float_as_uint(am));
     }
 }
 
@@ -6294,6 +6306,7 @@ pub fn moe_fp4_grouped_mma_dev(
     dev: &dyn Device, a: &Tensor, wp: &Tensor, wsc: &Tensor, gw: &Tensor,
     offsets: &Tensor, n_exp: usize, mt: usize, n: usize, k: usize,
     act_mode: i32, act_scale: f32,
+    amax_in: Option<&Tensor>, amax_out: Option<(&Tensor, i32, f32)>,
 ) -> Result<Tensor> {
     if k % 64 != 0 { return Err(Error::Msg(format!("moe_fp4_grouped_mma_dev: K {k} %64!=0"))); }
     let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
@@ -6311,14 +6324,22 @@ pub fn moe_fp4_grouped_mma_dev(
           (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0)],
         &[i(n_exp as i32), i(16), i(maxt as i32)],
         [1, 1, 1], [1, 1, 1], 0, false)?;
-    // dynamic activation global
-    let amax = Tensor::new(dev.upload(&vec![0u8; 4]).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![1], DType::U32);
+    // dynamic activation global: use the producer-GEMM's fused amax when
+    // provided (skips a full re-read of the activation tensor).
+    let amax_owned;
+    let amax: &Tensor = match amax_in {
+        Some(t) => t,
+        None => {
+            amax_owned = Tensor::new(dev.upload(&vec![0u8; 4]).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![1], DType::U32);
+            dev.dispatch_raw_cuda(
+                MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
+                &[(a.buffer.as_ref(), a.offset), (amax_owned.buffer.as_ref(), 0)],
+                &[l((mt * k) as i64), i(1), i(act_mode), act_scale.to_le_bytes().to_vec()],
+                [((mt * k) as u32).div_ceil(256 * 64).max(1), 1, 1], [256, 1, 1], 0, false)?;
+            &amax_owned
+        }
+    };
     let ga = Tensor::empty(dev, vec![1], DType::F32)?;
-    dev.dispatch_raw_cuda(
-        MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
-        &[(a.buffer.as_ref(), a.offset), (amax.buffer.as_ref(), 0)],
-        &[l((mt * k) as i64), i(1), i(act_mode), act_scale.to_le_bytes().to_vec()],
-        [((mt * k) as u32).div_ceil(256 * 64).max(1), 1, 1], [256, 1, 1], 0, false)?;
     dev.dispatch_raw_cuda(
         MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_globals",
         &[(amax.buffer.as_ref(), 0), (ga.buffer.as_ref(), 0)],
@@ -6345,8 +6366,11 @@ pub fn moe_fp4_grouped_mma_dev(
           (wp.buffer.as_ref(), wp.offset), (wsc.buffer.as_ref(), wsc.offset),
           (t0d.buffer.as_ref(), 0), (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
           (ga.buffer.as_ref(), 0), (gw.buffer.as_ref(), gw.offset),
-          (out.buffer.as_ref(), 0)],
-        &[i(n as i32), i(k as i32), i(mt as i32)],
+          (out.buffer.as_ref(), 0),
+          match &amax_out { Some((t, _, _)) => (t.buffer.as_ref(), t.offset), None => (ga.buffer.as_ref(), 0) }],
+        &[i(n as i32), i(k as i32), i(mt as i32),
+          i(amax_out.as_ref().map(|(_, m, _)| *m).unwrap_or(-1)),
+          amax_out.as_ref().map(|(_, _, sc)| *sc).unwrap_or(0.0).to_le_bytes().to_vec()],
         [maxt as u32, ng.div_ceil(warps_per_block), 1],
         [warps_per_block * 32, 1, 1], 0, false)?;
     Ok(out)
