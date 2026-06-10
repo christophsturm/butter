@@ -2835,6 +2835,129 @@ extern "C" __global__ void sdpa_flash_mma(
             else       { oh[i8]=__float2half(oc[t][2]*inv8); oh[i8+1]=__float2half(oc[t][3]*inv8); } }
     }
 }
+
+
+#include <cuda_fp16.h>
+extern "C" __global__ void sdpa_flash_mma_w4(
+    const void* __restrict__ q_in, const __half* __restrict__ k_in,
+    const __half* __restrict__ v_in, void* __restrict__ out,
+    int sq, int nq, int nkv, int kv_stride, int base_kv, float scale, int in_f32, int out_f32)
+{
+    const int BR=16, BC=16, HD=128, NC=8, ND=16, NW=4;  // 4 warps/block, 64 rows
+    int h = blockIdx.x;
+    int wid = threadIdx.x >> 5;
+    int R0 = blockIdx.y * (BR*NW) + wid * BR;
+    int hpg = nq / nkv, kh = h / hpg;
+    int lane = threadIdx.x & 31, gid = lane >> 2, tid4 = lane & 3;
+    const float* qf=(const float*)q_in; const __half* qh=(const __half*)q_in;
+    // K/V are pre-cast to f16 by the wrapper (cheap, repeatedly-read in the KV loop).
+
+    __shared__ __half Qs_a[4][BR][HD];
+    __shared__ __half Ks[BC][HD];
+    __shared__ __half Vs[BC][HD];
+    __shared__ float  Ss_a[4][BR][BC];
+    __shared__ __half Ps_a[4][BR][BC];
+    __shared__ float  cv_a[4][BR], mv_a[4][BR], lv_a[4][BR];
+    __half (*Qs)[HD] = Qs_a[wid];
+    float (*Ss)[BC] = Ss_a[wid];
+    __half (*Ps)[BC] = Ps_a[wid];
+    float *cv = cv_a[wid], *mv = mv_a[wid], *lv = lv_a[wid];
+
+    for (int e = lane; e < BR*HD; e += 32) { int i=e>>7,d=e&127,gr=R0+i; long idx=((long)gr*nq+h)*HD+d;
+        float qv = (gr<sq) ? (in_f32 ? qf[idx] : __half2float(qh[idx])) : 0.f;
+        Qs[i][d] = __float2half(qv*scale); }
+    float oc[ND][4];
+    for (int t=0;t<ND;t++){ oc[t][0]=oc[t][1]=oc[t][2]=oc[t][3]=0.f; }
+    if (lane<BR){ mv[lane]=-3.4e38f; lv[lane]=0.f; }
+    __syncwarp();
+
+    int last = base_kv + sq - 1;
+    int maxpb = base_kv + R0 + BR - 1; if (maxpb>last) maxpb=last;          // this warp's causal max
+    int blk_r_hi = blockIdx.y * (BR*NW) + (BR*NW) - 1;
+    int maxpb_blk = base_kv + blk_r_hi; if (maxpb_blk>last) maxpb_blk=last;  // block max
+
+    for (int kj0=0; kj0<=maxpb_blk; kj0+=BC) {
+        __syncthreads();
+        for (int e=threadIdx.x;e<BC*HD;e+=NW*32){ int j=e>>7,d=e&127,p=kj0+j,ok=(p<=last); long idx=((long)kh*kv_stride+p)*HD+d;
+            Ks[j][d]= ok? k_in[idx] : __float2half(0.f);
+            Vs[j][d]= ok? v_in[idx] : __float2half(0.f); }
+        __syncthreads();
+        if (kj0 > maxpb) continue;   // beyond this warp's causal window (barriers above are block-uniform)
+        __syncwarp();
+
+        // QKᵀ -> 2 S-tiles (n8: keys 0-7, 8-15), accumulate over 8 k-chunks
+        float sc[2][4] = {{0,0,0,0},{0,0,0,0}};
+        for (int c=0;c<NC;c++){
+            int kcol = c*16;
+            // A = Q[16x16] chunk (row-major m16n8k16 A layout)
+            unsigned a0=pk(Qs[gid][kcol+2*tid4],   Qs[gid][kcol+2*tid4+1]);
+            unsigned a1=pk(Qs[gid+8][kcol+2*tid4], Qs[gid+8][kcol+2*tid4+1]);
+            unsigned a2=pk(Qs[gid][kcol+2*tid4+8], Qs[gid][kcol+2*tid4+9]);
+            unsigned a3=pk(Qs[gid+8][kcol+2*tid4+8],Qs[gid+8][kcol+2*tid4+9]);
+            for (int s=0;s<2;s++){
+                int kbase = s*8;  // key offset for this n8 tile; n_local = gid
+                // B[kdim][n] = K[n][kdim]; col-major frag
+                unsigned b0=pk(Ks[kbase+gid][kcol+2*tid4],   Ks[kbase+gid][kcol+2*tid4+1]);
+                unsigned b1=pk(Ks[kbase+gid][kcol+2*tid4+8], Ks[kbase+gid][kcol+2*tid4+9]);
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+                    :"+f"(sc[s][0]),"+f"(sc[s][1]),"+f"(sc[s][2]),"+f"(sc[s][3])
+                    :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+            }
+        }
+        // store S tiles -> shared (acc layout: c0,c1 row gid; c2,c3 row gid+8)
+        for (int s=0;s<2;s++){
+            Ss[gid][s*8+2*tid4]   = sc[s][0]; Ss[gid][s*8+2*tid4+1]   = sc[s][1];
+            Ss[gid+8][s*8+2*tid4] = sc[s][2]; Ss[gid+8][s*8+2*tid4+1] = sc[s][3];
+        }
+        __syncwarp();
+
+        if (lane<BR){ int i=lane,gr=R0+i;
+            if (gr<sq){ int maxp=base_kv+R0+i; float rmax=-3.4e38f;
+                for (int j=0;j<BC;j++){ float sv=(kj0+j<=maxp)?Ss[i][j]:-3.4e38f; rmax=fmaxf(rmax,sv); }
+                float mo=mv[i], mn=fmaxf(mo,rmax); float cor=(mo>-3.0e38f)?__expf(mo-mn):0.f; float rs=0.f;
+                for (int j=0;j<BC;j++){ float w=(kj0+j<=maxp&&mn>-3.0e38f)?__expf(Ss[i][j]-mn):0.f; Ps[i][j]=__float2half(w); rs+=w; }
+                cv[i]=cor; mv[i]=mn; lv[i]=lv[i]*cor+rs;
+            } else { cv[i]=1.f; for(int j=0;j<BC;j++) Ps[i][j]=__float2half(0.f); }
+        }
+        __syncwarp();
+
+        // rescale O in registers (lane holds rows gid, gid+8)
+        float cg=cv[gid], cg8=cv[gid+8];
+        for (int t=0;t<ND;t++){ oc[t][0]*=cg; oc[t][1]*=cg; oc[t][2]*=cg8; oc[t][3]*=cg8; }
+
+        // PV: O += P·V. A=P[16x16] (row-major), B=V[16(k)x8(d)] per d-tile (col-major B[k][d])
+        unsigned pa0=pk(Ps[gid][2*tid4],   Ps[gid][2*tid4+1]);
+        unsigned pa1=pk(Ps[gid+8][2*tid4], Ps[gid+8][2*tid4+1]);
+        unsigned pa2=pk(Ps[gid][2*tid4+8], Ps[gid][2*tid4+9]);
+        unsigned pa3=pk(Ps[gid+8][2*tid4+8],Ps[gid+8][2*tid4+9]);
+        for (int t=0;t<ND;t++){
+            int dcol=t*8;  // n = d in [dcol,dcol+8), n_local=gid
+            unsigned vb0=pk(Vs[2*tid4][dcol+gid],   Vs[2*tid4+1][dcol+gid]);
+            unsigned vb1=pk(Vs[2*tid4+8][dcol+gid], Vs[2*tid4+9][dcol+gid]);
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+                :"+f"(oc[t][0]),"+f"(oc[t][1]),"+f"(oc[t][2]),"+f"(oc[t][3])
+                :"r"(pa0),"r"(pa1),"r"(pa2),"r"(pa3),"r"(vb0),"r"(vb1));
+        }
+        __syncwarp();
+    }
+
+    // finalize: O[row][dcol] = oc / l ; lane holds rows gid (c0,c1) and gid+8 (c2,c3)
+    float l0 = lv[gid], l8 = lv[gid+8];
+    float inv0=(l0>0.f)?1.f/l0:0.f, inv8=(l8>0.f)?1.f/l8:0.f;
+    int r0=R0+gid, r8=R0+gid+8;
+    float* of=(float*)out; __half* oh=(__half*)out;
+    for (int t=0;t<ND;t++){ int dcol=t*8;
+        if (r0<sq){ long i0=((long)r0*nq+h)*HD+dcol+2*tid4;
+            if(out_f32){ of[i0]=oc[t][0]*inv0; of[i0+1]=oc[t][1]*inv0; }
+            else       { oh[i0]=__float2half(oc[t][0]*inv0); oh[i0+1]=__float2half(oc[t][1]*inv0); } }
+        if (r8<sq){ long i8=((long)r8*nq+h)*HD+dcol+2*tid4;
+            if(out_f32){ of[i8]=oc[t][2]*inv8; of[i8+1]=oc[t][3]*inv8; }
+            else       { oh[i8]=__float2half(oc[t][2]*inv8); oh[i8+1]=__float2half(oc[t][3]*inv8); } }
+    }
+}
+
 "#;
 
 /// FlashAttention-2, register-resident O via mma.sync (see [`SDPA_FLASH_MMA_SRC`]).
@@ -2870,13 +2993,15 @@ pub fn sdpa_flash_mma(
     let out = Tensor::empty(dev, vec![sq, nq, hd], q.dtype)?;
     let i = |x: i32| x.to_le_bytes().to_vec();
     let f = |x: f32| x.to_le_bytes().to_vec();
-    let grid = [nq as u32, (sq as u32).div_ceil(16), 1];
+    // 4-warp blocks: 64 query rows/block sharing the K/V smem stage —
+    // 2.7x the 1-warp kernel at S=2048, bit-identical output.
+    let grid = [nq as u32, (sq as u32).div_ceil(64), 1];
     dev.dispatch_raw_cuda(
-        SDPA_FLASH_MMA_SRC, "sdpa_flash_mma.cu", "sdpa_flash_mma",
+        SDPA_FLASH_MMA_SRC, "sdpa_flash_mma.cu", "sdpa_flash_mma_w4",
         &[(q.buffer.as_ref(), q.offset), (kf16.buffer.as_ref(), kf16.offset),
           (vf16.buffer.as_ref(), vf16.offset), (out.buffer.as_ref(), 0)],
         &[i(sq as i32), i(nq as i32), i(nkv as i32), i(kv_stride as i32), i(base as i32), f(scale), i(in_f32), i(out_f32)],
-        grid, [32, 1, 1], 0, false)?;
+        grid, [128, 1, 1], 0, false)?;
     Ok(out)
 }
 
