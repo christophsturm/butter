@@ -36,13 +36,13 @@ ffai-metal = { path = "crates/backends/ffai-metal" }
 ffai-cuda = { path = "crates/backends/ffai-cuda" }
 ffai-vulkan = { path = "crates/backends/ffai-vulkan" }
 # ── shared kernel toolchain (external: the metaltile cuda/metal repo) ──
-# Canonical pointer is the git branch carrying both backends, so a fresh
-# clone (Eric included) is self-contained. Local co-development overrides
+# Canonical pointer is the upstream perf branch (split backend PRs #273/#274
+# + conv consolidation), so a fresh clone (Eric included) is self-contained. Local co-development overrides
 # these to the live checkout via the [patch] section below.
-metaltile-core = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-hip-vulkan" }
-metaltile-codegen = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-hip-vulkan" }
-metaltile-runtime = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-hip-vulkan" }
-metaltile-std = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-hip-vulkan" }
+metaltile-core = { git = "https://github.com/0xClandestine/metaltile", branch = "tom/perf/cuda-prefill-fp4-moe" }
+metaltile-codegen = { git = "https://github.com/0xClandestine/metaltile", branch = "tom/perf/cuda-prefill-fp4-moe" }
+metaltile-runtime = { git = "https://github.com/0xClandestine/metaltile", branch = "tom/perf/cuda-prefill-fp4-moe" }
+metaltile-std = { git = "https://github.com/0xClandestine/metaltile", branch = "tom/perf/cuda-prefill-fp4-moe" }
 # ── third-party ──────────────────────────────────────────────────────
 thiserror = "2"
 serde_json = "1"
@@ -54,7 +54,7 @@ rustc-hash = "2"       # FxHash for already-hashed / densely-numeric keys
 # (../metaltile-cuda), build against it directly — instant, no fetch, edits
 # to kernels/codegen pick up immediately. Eric / CI without that sibling
 # fall through to the git branch above. Comment out to force the git dep.
-[patch."https://github.com/TheTom/metaltile"]
+[patch."https://github.com/0xClandestine/metaltile"]
 metaltile-core = { path = "../../metaltile-cuda/crates/metaltile-core" }
 metaltile-codegen = { path = "../../metaltile-cuda/crates/metaltile-codegen" }
 metaltile-runtime = { path = "../../metaltile-cuda/crates/metaltile-runtime" }
