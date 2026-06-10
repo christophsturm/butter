@@ -189,6 +189,32 @@ pub fn mul(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
     elementwise(dev, a, b, BinOpKind::Mul, "ffai_mul")
 }
 
+const ADD3_SRC: &str = r#"
+extern "C" __global__ void ffai_add3(
+    const float* __restrict__ a, const float* __restrict__ b,
+    const float* __restrict__ c, float* __restrict__ out, long n)
+{
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x;
+    long stride=(long)gridDim.x*blockDim.x;
+    for(;i<n;i+=stride) out[i]=a[i]+b[i]+c[i];
+}
+"#;
+
+/// Fused three-way elementwise sum `a + b + c` (f32, CUDA raw path) — one
+/// launch + no intermediate tensor for the per-E-layer
+/// `residual + routed_acc + shared_out` merge (was two `ffai_add` launches).
+pub fn add3(dev: &dyn Device, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<Tensor> {
+    let out = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
+    let n = a.elem_count();
+    let l = |v: i64| v.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(ADD3_SRC, "add3.cu", "ffai_add3",
+        &[(a.buffer.as_ref(), a.offset), (b.buffer.as_ref(), b.offset),
+          (c.buffer.as_ref(), c.offset), (out.buffer.as_ref(), 0)],
+        &[l(n as i64)],
+        [(n as u32).div_ceil(256 * 4).max(1), 1, 1], [256, 1, 1], 0, false)?;
+    Ok(out)
+}
+
 // ── DeepSeek-V4 MoE ops ─────────────────────────────────────────────────
 
 /// DSv4 clamped SwiGLU: `out = silu(min(gate, limit)) * clip(up, ±limit)`.

@@ -1703,6 +1703,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     Some("mamba") => name.contains("in_proj") || name.contains("out_proj"),
                     Some("qkv") => name.contains("q_proj") || name.contains("k_proj")
                         || name.contains("v_proj") || name.contains("o_proj"),
+                    // audit: in_proj carries the worst FP4 quantization error
+                    // (normed-residual outliers) — exclude it, FP4 the rest.
+                    Some("noin") => !name.contains("in_proj"),
+                    Some("out") => name.contains("out_proj"),
                     Some(_) => true,
                     None => false,
                 }
@@ -2965,13 +2969,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // devdesc sd is ALREADY device (sd_dev_opt, host-sync-free);
                             // else upload the host f32 shared output.
                             let sd_dev = sd_dev_opt.take().unwrap_or_else(|| upm(&sd_h, vec![s, hid]));
-                            let merged = add(d, &acc_dev, &sd_dev).unwrap();
                             {
                                 // fused residual add + NEXT layer's rms_norm (one pass, llama.cpp-style)
                                 let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
                                 match nw {
-                                    Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &merged, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
-                                    _ => { xt = add(d, &xt, &merged).unwrap(); }
+                                    Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let merged = add(d, &acc_dev, &sd_dev).unwrap(); let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &merged, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
+                                    // one launch, no intermediate: residual + routed acc + shared out
+                                    _ if is_cuda => { xt = ffai_ops::add3(d, &xt, &acc_dev, &sd_dev).unwrap(); }
+                                    _ => { let merged = add(d, &acc_dev, &sd_dev).unwrap(); xt = add(d, &xt, &merged).unwrap(); }
                                 }
                             }
                         } else {
