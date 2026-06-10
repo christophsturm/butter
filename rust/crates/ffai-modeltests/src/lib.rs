@@ -902,6 +902,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             }
             'E' => {
                 fd(&mut fwd, &format!("{p}.mixer.gate.weight"), &g(&format!("{p}.mixer.gate.weight")), vec![n_exp, hid]);
+                // f16 copy for the batched-prefill cuBLAS router GEMM (688KB).
+                fwd.insert(format!("{p}.mixer.gate.weight.f16"),
+                    Tensor::new(d.upload(&tb_f16(&g(&format!("{p}.mixer.gate.weight")))).unwrap(), vec![n_exp, hid], DType::F16));
                 fw.insert(format!("{p}.mixer.gate.e_score_correction_bias"), g(&format!("{p}.mixer.gate.e_score_correction_bias")));
                 // Experts stored CONTIGUOUS ([n_exp*inter, hid] up, [n_exp*hid, inter] down)
                 // so the batched gather kernel runs them as one big efficient GEMV.
@@ -1911,6 +1914,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // scatter) with NO host sync — the prerequisite for CUDA-graphing
                         // the forward (kill the host-launch GPU idle, the real 3-5× lever).
                         let mut moe_dev: Option<(Tensor, Tensor, Tensor)> = None; // (offsets, sorted_tok, sorted_wt)
+                        let mut xn_f16_router: Option<Tensor> = None; // f16 xn from the router, reused by the gather
                         // Fully-on-device MoE (descriptors+gather+scatter all device) → SKIP
                         // the host triples reconstruction entirely. mt = s*top_k is
                         // deterministic (every token picks exactly top_k experts) so NO dl is
@@ -1924,7 +1928,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let devdesc_skip = is_cuda && std::env::var("NEMOTRON_Q4_DEVDESC_OFF").is_err();
                         let (triples, mt): (Vec<(u32, usize, f32)>, usize) = if devsort {
                             let bias_dev = up(&bias[..]);
-                            let rl_dev = pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64, matmul(d, gate_w, &xn).unwrap());
+                            // xn cast once to f16: feeds BOTH the cuBLAS router GEMM
+                            // (was software-MMA ffai_gemm, ~28x slower at this shape)
+                            // and the f16 token gather below.
+                            let xn_f16_e = pf!(15, 0.0, cast_f32_f16(d, &xn).unwrap());
+                            let gate_w16 = &fwd[&format!("{p}.mixer.gate.weight.f16")];
+                            let rl_dev = pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64,
+                                gemm_cublas_f32out(d, &xn_f16_e, gate_w16, s, n_exp, hid).unwrap());
+                            xn_f16_router = Some(xn_f16_e);
                             let (st_dev, sw_dev, off_dev) = ffai_ops::moe_route_sort_device(d, &rl_dev, &bias_dev, n_exp, top_k, scale_f).unwrap();
                             let m = s * top_k;
                             let tr: Vec<(u32, usize, f32)> = if devdesc_skip {
@@ -2096,9 +2107,15 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 Some(Tensor::new(d.upload(&tbu(&tok_idx)).unwrap(), vec![mt], DType::U32))
                             };
                             let tok_dev = match &moe_dev { Some((_,st,_)) => st, None => tok_owned.as_ref().unwrap() };
-                            let xn2d = xn.clone().reshaped(vec![s, hid]);
-                            let xs_f32 = pf!(12, 0.0, gather(d, &xn2d, tok_dev).unwrap()); // [mt, hid] f32
-                            let xs_f16 = pf!(12, 0.0, cast_f32_f16(d, &xs_f32).unwrap());   // [mt, hid] f16
+                            // f16-FIRST: cast [s,hid] once (or reuse the router's cast)
+                            // then gather in f16 — 3.2x less traffic than the old
+                            // gather-f32 [mt,hid] + cast-down chain (mt = 6s).
+                            let xn_f16g = match &xn_f16_router {
+                                Some(t) => t.clone(),
+                                None => pf!(15, 0.0, cast_f32_f16(d, &xn).unwrap()),
+                            };
+                            let xn2d = xn_f16g.reshaped(vec![s, hid]);
+                            let xs_f16 = pf!(12, 0.0, gather(d, &xn2d, tok_dev).unwrap()); // [mt, hid] f16
                             (Vec::new(), Some(xs_f16))
                         } else {
                             // Host gather: download xn, scatter rows.
