@@ -1254,7 +1254,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let zt      = pt!(2, in_proj_out * 4, slice(d, &proj, 0, di).unwrap());
                         let xbc_t   = pt!(2, in_proj_out * 4, slice(d, &proj, di, conv_dim).unwrap());
                         let dt_raw_t= pt!(2, in_proj_out * 4, slice(d, &proj, di + conv_dim, m_nh).unwrap());
-                        { let mut cd = conv_dev.borrow_mut(); if cd[l].is_none() { cd[l] = Some(up(&vec![0.0f32; (kc - 1) * conv_dim])); } }
+                        { let mut cd = conv_dev.borrow_mut(); if cd[l].is_none() { cd[l] = Some(Tensor::new(d.alloc_zeroed((kc - 1) * conv_dim * 4).unwrap(), vec![(kc - 1) * conv_dim], DType::F32)); } }
                         // conv1d: reads state ((kc-1)*conv_dim*4B) + xbc_t (conv_dim*4B) + weight (kc*conv_dim*4B) + bias (conv_dim*4B)
                         let yc = pt!(3, (kc - 1) * conv_dim * 4 + conv_dim * 4 + kc * conv_dim * 4 + conv_dim * 4, {
                             let cd = conv_dev.borrow();
@@ -1274,7 +1274,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let cmat   = pt!(2, (di + ng * ds * 2) * 4, slice(d, &xbc_act, di + ng * ds, ng * ds).unwrap());
                         // softplus_add: reads dt_raw_t (m_nh*4B) + bias (m_nh*4B)
                         let dt = pt!(6, m_nh * 8, softplus_add(d, &dt_raw_t, &up(&fw[&format!("{p}.mixer.dt_bias")])).unwrap());
-                        if ssm_state[l].is_none() { ssm_state[l] = Some(up(&vec![0.0f32; m_nh * m_dh * ds])); }
+                        if ssm_state[l].is_none() { ssm_state[l] = Some(Tensor::new(d.alloc_zeroed(m_nh * m_dh * ds * 4).unwrap(), vec![m_nh * m_dh * ds], DType::F32)); }
                         // ssm_step: reads state (m_nh*m_dh*ds*4B) + x (di*4B) + A,B,C,D,dt (small)
                         let (so, y_t) = pt!(7, m_nh * m_dh * ds * 4 + di * 4 + m_nh * 5 * 4 + ng * ds * 2 * 4, {
                             ssm_step(d, &x_ssm, &fwd[&format!("{p}.mixer.A_log")], &bmat, &cmat, &fwd[&format!("{p}.mixer.D")], &dt, ssm_state[l].as_ref().unwrap(), m_dh as u32, ds as u32, m_nh as u32, (m_nh / ng) as u32).unwrap()
@@ -1315,7 +1315,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     let cmat = &xbc_act[di + ng * ds..di + 2 * ng * ds];
                     let dt_bias = &fw[&format!("{p}.mixer.dt_bias")];
                     let dt: Vec<f32> = (0..m_nh).map(|i| softplus(dt_raw[i] + dt_bias[i])).collect();
-                    if ssm_state[l].is_none() { ssm_state[l] = Some(up(&vec![0.0f32; m_nh * m_dh * ds])); }
+                    if ssm_state[l].is_none() { ssm_state[l] = Some(Tensor::new(d.alloc_zeroed(m_nh * m_dh * ds * 4).unwrap(), vec![m_nh * m_dh * ds], DType::F32)); }
                     let (so, y_t) = pt!(7, m_nh * m_dh * ds * 4 + di * 4 + m_nh * 5 * 4 + ng * ds * 2 * 4, {
                         ssm_step(d, &up(x_ssm), &fwd[&format!("{p}.mixer.A_log")], &up(bmat), &up(cmat), &fwd[&format!("{p}.mixer.D")], &up(&dt), ssm_state[l].as_ref().unwrap(), m_dh as u32, ds as u32, m_nh as u32, (m_nh / ng) as u32).unwrap()
                     });
@@ -1414,10 +1414,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     } else { (q, k, v) };
                     if kvcache[l].is_none() {
                         kvcache[l] = if f16kv {
-                            let zf16 = || Tensor::new(d.upload(&vec![0u8; nkv * cap * hd * 2]).unwrap(), vec![nkv * cap * hd], DType::F16);
+                            let zf16 = || Tensor::new(d.alloc_zeroed(nkv * cap * hd * 2).unwrap(), vec![nkv * cap * hd], DType::F16);
                             Some((zf16(), zf16()))
                         } else {
-                            Some((up(&vec![0.0f32; nkv * cap * hd]), up(&vec![0.0f32; nkv * cap * hd])))
+                            Some((Tensor::new(d.alloc_zeroed(nkv * cap * hd * 4).unwrap(), vec![nkv * cap * hd], DType::F32), Tensor::new(d.alloc_zeroed(nkv * cap * hd * 4).unwrap(), vec![nkv * cap * hd], DType::F32)))
                         };
                     }
                     let (kcache, vcache) = kvcache[l].as_ref().unwrap();
@@ -1630,9 +1630,21 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 } else { $e }
             }}; }
             // Embed S tokens → [S, hid] f32 resident.
-            let mut xh = vec![0.0f32; s * hid];
-            for (i, &t) in ids.iter().enumerate() { xh[i*hid..(i+1)*hid].copy_from_slice(&embed[t*hid..(t+1)*hid]); }
-            let mut xt = upm(&xh, vec![s, hid]);
+            // Embed cached device-side keyed by the id list: the upload sourced a
+            // stack-local host Vec, so a CUDA-graph capture recorded a memcpy node
+            // from a pointer that's dangling by replay time. Cached, the pre-warm
+            // forwards fill it and the captured forward does NO embed H2D at all.
+            let mut xt = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                ids.hash(&mut h);
+                let key = format!("__embed.{:x}.{}", h.finish(), s);
+                cdev(key, &|| {
+                    let mut xh = vec![0.0f32; s * hid];
+                    for (i, &t) in ids.iter().enumerate() { xh[i*hid..(i+1)*hid].copy_from_slice(&embed[t*hid..(t+1)*hid]); }
+                    upm(&xh, vec![s, hid])
+                })
+            };
             // Tensor-core projection GEMM (Path A): dequant Q4 weight → f16 once,
             // cast x → f16, cuBLAS GemmEx (real tensor cores, f32 accumulate),
             // cast result → f32. Replaces the software-emulated coop_tile MMA
@@ -1779,7 +1791,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let dt_bias_dev = cdev(format!("{p}.mixer.dt_bias"), &|| up(&fw[&format!("{p}.mixer.dt_bias")]));
                             let dt_dev  = pf!(6, 0.0, softplus_add_rows(d, &dt_raw_t, &dt_bias_dev, s, m_nh).unwrap());
                             // SSD scan over S.
-                            if ssm_state[l].is_none() { ssm_state[l] = Some(up(&vec![0.0f32; m_nh * m_dh * ds])); }
+                            if ssm_state[l].is_none() { ssm_state[l] = Some(Tensor::new(d.alloc_zeroed(m_nh * m_dh * ds * 4).unwrap(), vec![m_nh * m_dh * ds], DType::F32)); }
                             let ssm_flops = s as f64 * m_nh as f64 * m_dh as f64 * ds as f64 * 4.0;
                             let use_chunked = std::env::var("NEMOTRON_CHUNKED_SCAN").is_ok();
                             // SSD chunked-matmul scan is DEFAULT-ON for CUDA (the Nemotron
@@ -1864,7 +1876,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // persist conv ring state for decode continuity.
                         { let mut cd = conv_dev.borrow_mut(); cd[l] = Some(up(&ring)); }
                         // SSD scan over S: x[s,H*Dh], b/c[s,G*Ds], dt[s,H], state[H*Dh*Ds].
-                        if ssm_state[l].is_none() { ssm_state[l] = Some(up(&vec![0.0f32; m_nh * m_dh * ds])); }
+                        if ssm_state[l].is_none() { ssm_state[l] = Some(Tensor::new(d.alloc_zeroed(m_nh * m_dh * ds * 4).unwrap(), vec![m_nh * m_dh * ds], DType::F32)); }
                         let x_dev = up(&xssm);
                         let b_dev = up(&bmat_all);
                         let c_dev = up(&cmat_all);
@@ -2937,7 +2949,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // PART C: eliminate dl(q)/dl(k)/dl(v) + per-token rope dispatches.
                         // Build positions [s] once, use batched rope_llama_many + kv_append_many.
                         if kvcache[l].is_none() {
-                            kvcache[l] = Some((up(&vec![0.0f32; nkv*cap*hd]), up(&vec![0.0f32; nkv*cap*hd])));
+                            kvcache[l] = Some((Tensor::new(d.alloc_zeroed(nkv*cap*hd*4).unwrap(), vec![nkv*cap*hd], DType::F32), Tensor::new(d.alloc_zeroed(nkv*cap*hd*4).unwrap(), vec![nkv*cap*hd], DType::F32)));
                         }
                         let positions_h: Vec<u32> = (0..s).map(|ti| (base + ti) as u32).collect();
                         let positions_dev = Tensor::new(
