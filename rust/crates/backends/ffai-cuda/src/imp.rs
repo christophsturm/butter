@@ -346,6 +346,26 @@ impl Device for CudaDevice {
         self.dev.gemm_cublas_f32out(xb.ptr, wb.ptr, ob.ptr, m, n, k, ab_dtype).map_err(dispatch_err)
     }
 
+    fn gemm_fp4(
+        &self,
+        x_pack: &dyn DeviceBuffer,
+        x_sf: &dyn DeviceBuffer,
+        w_pack: &dyn DeviceBuffer,
+        w_sf: &dyn DeviceBuffer,
+        out: &dyn DeviceBuffer,
+        m: usize,
+        n: usize,
+        k: usize,
+        out_f32: bool,
+    ) -> Result<()> {
+        let xb = x_pack.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_fp4: x_pack not CudaBuffer".into()))?;
+        let xs = x_sf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_fp4: x_sf not CudaBuffer".into()))?;
+        let wb = w_pack.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_fp4: w_pack not CudaBuffer".into()))?;
+        let ws = w_sf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_fp4: w_sf not CudaBuffer".into()))?;
+        let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_fp4: out not CudaBuffer".into()))?;
+        self.dev.gemm_cublaslt_fp4(xb.ptr, xs.ptr, wb.ptr, ws.ptr, ob.ptr, m, n, k, out_f32).map_err(dispatch_err)
+    }
+
     fn moe_grouped_cutlass(
         &self,
         a: &dyn DeviceBuffer,

@@ -6442,7 +6442,80 @@ extern "C" __global__ void moe_fp4_grouped_mma(
         out[r]=__float2half(c2*g); out[r+1]=__float2half(c3*g);
     }
 }
+
+// Quantize f16 [R,K] row-major to the cuBLASLt block-scaled NVFP4 format:
+// packed e2m1 (2 elems/byte, linear row-major) + one ue4m3 scale per
+// 16-element K-block stored in the hardware's swizzled 512-byte-block layout.
+// One thread per 16-element block; per-block self-scaling (amax/6 -> ue4m3),
+// no global amax pass.
+extern "C" __global__ void lt_fp4_quant(
+    const __half* __restrict__ x, unsigned char* __restrict__ xp,
+    unsigned char* __restrict__ sf, int R, int K)
+{
+    int KB=K/16;
+    long nb=(long)R*KB;
+    long b=(long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(b>=nb) return;
+    int r=(int)(b/KB), kb=(int)(b%KB);
+    const __half* xb=x+(long)r*K+kb*16;
+    float v[16]; float am=0.f;
+    #pragma unroll
+    for(int i=0;i<16;i++){ v[i]=__half2float(xb[i]); am=fmaxf(am,fabsf(v[i])); }
+    unsigned sc=enc_ue4m3(am/6.f);
+    if(sc==0u&&am>0.f) sc=1u;
+    float sd=dec_ue4m3(sc);
+    float inv=(sd>0.f)?(1.f/sd):0.f;
+    int KB4=(KB+3)>>2;
+    long soff=(long)(r>>7)*(512L*KB4)+(long)(kb>>2)*512+(r&31)*16+((r>>5)&3)*4+(kb&3);
+    sf[soff]=(unsigned char)sc;
+    unsigned char* o=xp+((long)r*K+kb*16)/2;
+    #pragma unroll
+    for(int i=0;i<8;i++){
+        unsigned lo=enc_e2m1(v[2*i],inv), hi=enc_e2m1(v[2*i+1],inv);
+        o[i]=(unsigned char)(lo|(hi<<4));
+    }
+}
 "#;
+
+/// Quantize an f16 `[r, k]` row-major tensor to cuBLASLt block-scaled NVFP4:
+/// returns `(pack, sf)` — packed e2m1 `[r*k/2]` bytes + the swizzled ue4m3
+/// scale tensor sized `ceil(r/128)*512*ceil((k/16)/4)` bytes (zero-seeded so
+/// padding rows decode to 0). Used for both weights (once, at setup) and
+/// activations (per call). `k % 32 == 0` required.
+pub fn lt_fp4_quant(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Result<(Tensor, Tensor)> {
+    if k % 32 != 0 { return Err(Error::Msg(format!("lt_fp4_quant: k {k} %32!=0"))); }
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let kb = k / 16;
+    let kb4 = kb.div_ceil(4);
+    let sf_bytes = r.div_ceil(128) * 512 * kb4;
+    let pack = Tensor::new(dev.alloc((r * k) / 2)?, vec![(r * k) / 2], DType::U32);
+    let sf = Tensor::new(dev.alloc_zeroed(sf_bytes)?, vec![sf_bytes], DType::U32);
+    let nb = (r * kb) as u32;
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "lt_fp4_quant",
+        &[(x.buffer.as_ref(), x.offset), (pack.buffer.as_ref(), 0), (sf.buffer.as_ref(), 0)],
+        &[i(r as i32), i(k as i32)],
+        [nb.div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+    Ok((pack, sf))
+}
+
+/// Block-scaled NVFP4 dense GEMM: `out[m,n](f16) = X·Wᵀ` with both sides in
+/// the `lt_fp4_quant` format. Routes through the backend's cublasLt FP4 path
+/// (~4x the f16 tensor-core GEMM on GB10).
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_fp4(
+    dev: &dyn Device,
+    x_pack: &Tensor, x_sf: &Tensor,
+    w_pack: &Tensor, w_sf: &Tensor,
+    m: usize, n: usize, k: usize, out_f32: bool,
+) -> Result<Tensor> {
+    let out = Tensor::empty(dev, vec![m, n], if out_f32 { DType::F32 } else { DType::F16 })?;
+    dev.gemm_fp4(
+        x_pack.buffer.as_ref(), x_sf.buffer.as_ref(),
+        w_pack.buffer.as_ref(), w_sf.buffer.as_ref(),
+        out.buffer.as_ref(), m, n, k, out_f32)?;
+    Ok(out)
+}
 
 /// Quantize+fragment-pack MoE expert weights to NVFP4 on device.
 /// `w_f16`: f16 `[n_exp*n, k]` row-major (concatenated experts). Returns

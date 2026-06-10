@@ -1565,6 +1565,12 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         // of driver API time on GB10.
         let const_dev: std::cell::RefCell<HashMap<String, Tensor>> =
             std::cell::RefCell::new(HashMap::new());
+        // NEMOTRON_FP4_DENSE=1: dense projections (qkv/o, mamba in/out_proj)
+        // through the cublasLt block-scaled NVFP4 GEMM (~4x the f16 tensor-core
+        // path on GB10). Weight pack cached here across forwards (quantized
+        // once from the dequanted f16 weight); activations quantized per call.
+        let w4lt: std::cell::RefCell<HashMap<String, (Tensor, Tensor)>> =
+            std::cell::RefCell::new(HashMap::new());
         // Batched forward over an explicit token-id slice; writes states; returns
         // the argmax logits for the LAST token.
         let forward_batched = |ids: &[usize],
@@ -1685,10 +1691,55 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             let deq16 = |key: &str, qs: &Tensor, sc: &Tensor, m: usize, k: usize, blk_off: usize| -> Tensor {
                 deq16c(key, qs, sc, m, k, blk_off, true)
             };
+            // FP4 dense projections (NEMOTRON_FP4_DENSE=1): quantize the f16
+            // activation per call, weight pack cached cross-forward; cublasLt
+            // block-scaled NVFP4 GEMM with f32 output (fused output cast).
+            // Value selects scope: "1"/"all" = every dense projection;
+            // "mamba" = in/out_proj only; "qkv" = attention q/k/v/o only.
+            let fp4_dense_scope = if is_cuda { std::env::var("NEMOTRON_FP4_DENSE").ok() } else { None };
+            let fp4_dense = fp4_dense_scope.is_some();
+            let fp4_name_ok = move |name: &str| -> bool {
+                match fp4_dense_scope.as_deref() {
+                    Some("mamba") => name.contains("in_proj") || name.contains("out_proj"),
+                    Some("qkv") => name.contains("q_proj") || name.contains("k_proj")
+                        || name.contains("v_proj") || name.contains("o_proj"),
+                    Some(_) => true,
+                    None => false,
+                }
+            };
+            let qmm_fp4 = |xh: &Tensor, name: &str, rows: usize, m: usize, k: usize,
+                           qs: &Tensor, sc: &Tensor| -> Tensor {
+                let (wp, wsf) = {
+                    if let Some(t) = w4lt.borrow().get(name) { t.clone() } else {
+                        let wf = pf!(3, (m * k) as f64, dequant_q4_off(d, qs, sc, m, k, DType::F16, 0).unwrap());
+                        let t = ffai_ops::lt_fp4_quant(d, &wf, m, k).unwrap();
+                        w4lt.borrow_mut().insert(name.to_string(), t.clone());
+                        t
+                    }
+                };
+                let (xp, xsf) = pf!(15, 0.0, ffai_ops::lt_fp4_quant(d, xh, rows, k).unwrap());
+                let o = pf!(2, 2.0 * rows as f64 * m as f64 * k as f64,
+                    ffai_ops::gemm_fp4(d, &xp, &xsf, &wp, &wsf, rows, m, k, true).unwrap()); // [rows, m] f32
+                if std::env::var("NEMOTRON_FP4_DENSE_DEBUG").is_ok() {
+                    // numeric audit vs the f16 path (bench-only; huge max|d| = layout bug,
+                    // few-percent rel = expected FP4 quantization noise)
+                    let wf = deq16(name, qs, sc, m, k, 0);
+                    let r16 = gemm_cublas_f32out(d, xh, &wf, rows, m, k).unwrap();
+                    let a = dl(&o, rows * m); let b = dl(&r16, rows * m);
+                    let (mut mab, mut mrel, mut den) = (0f32, 0f32, 0f32);
+                    for i in 0..a.len() { let d0 = (a[i] - b[i]).abs(); mab = mab.max(d0); den = den.max(b[i].abs()); if b[i].abs() > 1.0 { mrel = mrel.max(d0 / b[i].abs()); } }
+                    eprintln!("FP4_DENSE_DEBUG {name}: rows={rows} m={m} k={k} max|d|={mab:.4} max_rel(>1)={mrel:.4} max|ref|={den:.2}");
+                }
+                o
+            };
             let qmm = |x: &Tensor, name: &str| -> Tensor {
                 let (qs, sc, m, k) = &qw[name];
                 let rows = x.elem_count() / *k;
                 let flops = 2.0 * rows as f64 * *m as f64 * *k as f64;
+                if fp4_dense && rows > 1 && *k % 32 == 0 && fp4_name_ok(name) {
+                    let xh = pf!(15, 0.0, cast_f32_f16(d, x).unwrap());
+                    return qmm_fp4(&xh, name, rows, *m, *k, qs, sc);
+                }
                 if use_f32_gemm {
                     let wf = pf!(3, (m * k) as f64, dequant_q4(d, qs, sc, *m, *k, DType::F32).unwrap());
                     pf!(2, flops, matmul(d, &wf, x).unwrap()) // [rows, m]
@@ -1716,6 +1767,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 let (qs, sc, m, k) = &qw[name];
                 let rows = xh.elem_count() / *k;
                 let flops = 2.0 * rows as f64 * *m as f64 * *k as f64;
+                if fp4_dense && rows > 1 && *k % 32 == 0 && fp4_name_ok(name) {
+                    return qmm_fp4(xh, name, rows, *m, *k, qs, sc);
+                }
                 if !is_cuda {
                     // Portable Q4-native Metal MMA (xh already f16).
                     let oh = pf!(2, flops, gemm_q4_mpp(d, xh, qs, sc, rows, *m, *k).unwrap());

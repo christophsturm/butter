@@ -210,6 +210,26 @@ pub trait Device: Send + Sync {
         Err(Error::Msg("gemm_tc_out_f32 unsupported on this backend".into()))
     }
 
+    /// Block-scaled NVFP4 GEMM (Blackwell): `out[m,n](f16) = X·Wᵀ` with both
+    /// operands packed e2m1 (2/byte) + per-16-element ue4m3 scale tensors in
+    /// the hardware's swizzled block layout. Default errors; CUDA implements
+    /// it via cublasLt (measured ~4x the f16 tensor-core path on GB10).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_fp4(
+        &self,
+        _x_pack: &dyn DeviceBuffer,
+        _x_sf: &dyn DeviceBuffer,
+        _w_pack: &dyn DeviceBuffer,
+        _w_sf: &dyn DeviceBuffer,
+        _out: &dyn DeviceBuffer,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _out_f32: bool,
+    ) -> Result<()> {
+        Err(Error::Msg("gemm_fp4 (block-scaled NVFP4 GEMM) unsupported on this backend".into()))
+    }
+
     /// CUTLASS grouped MoE GEMM: `out[t,n] = Σ_k a[t,k]·w[eid(t)][n,k]` over
     /// sorted-token groups. `a` f16 `[mt,K]`, `w` contiguous f16 expert slab
     /// `[n_exp,N,K]`, `out` f16 `[mt,N]`; `group_rows`/`expert_ids` are host
