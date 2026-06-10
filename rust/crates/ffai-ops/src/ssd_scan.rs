@@ -98,12 +98,13 @@ extern "C" __global__ void ssd_gather_bc(
 const SSD_GATHER_BC_G_SRC: &str = r#"
 #include <cuda_fp16.h>
 extern "C" __global__ void ssd_gather_bc_g(
-    const float* __restrict__ b_mat,  // [T, G, ds]
-    const float* __restrict__ c_mat,  // [T, G, ds]
+    const float* __restrict__ b_mat,  // B base (row-strided; see rs/b_off)
+    const float* __restrict__ c_mat,  // C base
     __half*      __restrict__ b_out,  // [nc*G, L, ds] f16  (per group)
     __half*      __restrict__ c_out,  // [nc*G, L, ds] f16  (per group)
     unsigned int T, unsigned int G,
-    unsigned int L, unsigned int ds, unsigned int nc)
+    unsigned int L, unsigned int ds, unsigned int nc,
+    unsigned int rs, unsigned int b_off, unsigned int c_off) // row stride + col offsets
 {
     unsigned long long n = (unsigned long long)nc * G * L * ds;
     unsigned long long e = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -116,8 +117,8 @@ extern "C" __global__ void ssd_gather_bc_g(
     unsigned int t   = c * L + i;
     float bv = 0.f, cv = 0.f;
     if (t < T) {
-        bv = b_mat[(t * G + g) * ds + s];
-        cv = c_mat[(t * G + g) * ds + s];
+        bv = b_mat[(unsigned long long)t * rs + b_off + g * ds + s];
+        cv = c_mat[(unsigned long long)t * rs + c_off + g * ds + s];
     }
     b_out[e] = __float2half(bv);
     c_out[e] = __float2half(cv);
@@ -128,9 +129,10 @@ extern "C" __global__ void ssd_gather_bc_g(
 const SSD_XT_SRC: &str = r#"
 #include <cuda_fp16.h>
 extern "C" __global__ void ssd_xt(
-    const float* __restrict__ x,     // [T, H, dh]
+    const float* __restrict__ x,     // x base (row-strided)
     __half*      __restrict__ xt,    // [nc*H, dh, L]
-    unsigned int T, unsigned int H, unsigned int dh, unsigned int L, unsigned int nc)
+    unsigned int T, unsigned int H, unsigned int dh, unsigned int L, unsigned int nc,
+    unsigned int rs, unsigned int x_off)
 {
     unsigned long long n = (unsigned long long)nc * H * dh * L;
     unsigned long long e = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -141,7 +143,7 @@ extern "C" __global__ void ssd_xt(
     unsigned int c  = bh / H;
     unsigned int h  = bh % H;
     unsigned int t  = c * L + i;
-    float v = (t < T) ? x[(t * H + h) * dh + p] : 0.f;
+    float v = (t < T) ? x[(unsigned long long)t * rs + x_off + h * dh + p] : 0.f;
     xt[e] = __float2half(v);
 }
 "#;
@@ -179,12 +181,13 @@ extern "C" __global__ void ssd_mmask(
 const SSD_BDT_SRC: &str = r#"
 #include <cuda_fp16.h>
 extern "C" __global__ void ssd_bdt(
-    const float* __restrict__ b_mat, // [T, G, ds]
+    const float* __restrict__ b_mat, // B base (row-strided)
     const float* __restrict__ lcs,   // [nc*H, L]
     const float* __restrict__ dt,    // [T, H]
     __half*      __restrict__ bdt,   // [nc*H, ds, L]
     unsigned int T, unsigned int H, unsigned int G, unsigned int hpg,
-    unsigned int L, unsigned int ds, unsigned int nc)
+    unsigned int L, unsigned int ds, unsigned int nc,
+    unsigned int rs, unsigned int b_off)
 {
     unsigned long long n = (unsigned long long)nc * H * ds * L;
     unsigned long long e = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -197,7 +200,7 @@ extern "C" __global__ void ssd_bdt(
     unsigned int g  = h / hpg;
     unsigned int tj = c * L + j;
     float bv = 0.f, dtj = 0.f;
-    if (tj < T) { bv = b_mat[(tj * G + g) * ds + s]; dtj = dt[tj * H + h]; }
+    if (tj < T) { bv = b_mat[(unsigned long long)tj * rs + b_off + g * ds + s]; dtj = dt[tj * H + h]; }
     float decay = expf(lcs[bh * L + (L - 1)] - lcs[bh * L + j]);
     bdt[e] = __float2half(decay * dtj * bv);
 }
@@ -282,10 +285,11 @@ extern "C" __global__ void ssd_combine(
     const __half* __restrict__ y_intra, // [nc*H, L, dh]
     const __half* __restrict__ cs,      // [nc*H, L, dh]
     const float*  __restrict__ lcs,     // [nc*H, L]
-    const float*  __restrict__ x,       // [T, H, dh]
+    const float*  __restrict__ x,       // x base (row-strided)
     const float*  __restrict__ d_skip,  // [H]
     float*        __restrict__ y,       // [T, H, dh]
-    unsigned int T, unsigned int H, unsigned int dh, unsigned int L, unsigned int nc)
+    unsigned int T, unsigned int H, unsigned int dh, unsigned int L, unsigned int nc,
+    unsigned int rs, unsigned int x_off)
 {
     unsigned long long e = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long n = (unsigned long long)nc * H * L * dh;
@@ -300,7 +304,7 @@ extern "C" __global__ void ssd_combine(
     float yi = __half2float(y_intra[e]);
     float decay = expf(lcs[bh * L + i]);
     float ci = __half2float(cs[e]) * decay;
-    float xv = x[(t * H + h) * dh + p];
+    float xv = x[(unsigned long long)t * rs + x_off + h * dh + p];
     y[(t * H + h) * dh + p] = yi + ci + xv * d_skip[h];
 }
 "#;
@@ -313,12 +317,19 @@ extern "C" __global__ void ssd_combine(
 /// multiple of L — the tail chunk is zero-padded. `chunk_len` is typically 128
 /// or 256. Gated by `NEMOTRON_SSD_MATMUL` at the call site.
 #[allow(clippy::too_many_arguments)]
-pub fn ssm_prefill_scan_ssd(
+#[allow(clippy::too_many_arguments)]
+pub fn ssm_prefill_scan_ssd_strided(
     dev: &dyn Device,
+    // ONE row-strided base holding [x | B | C] per token row (e.g. the conv
+    // output read in place — no mamba_split_conv materialization). For the
+    // compact 3-tensor form pass the same tensors with rs = their natural
+    // widths via `ssm_prefill_scan_ssd`.
     x: &Tensor,
-    a_log: &Tensor,
+    x_rs: u32, x_off: u32,
     b_mat: &Tensor,
     c_mat: &Tensor,
+    bc_rs: u32, b_off: u32, c_off: u32,
+    a_log: &Tensor,
     d_skip: &Tensor,
     dt: &Tensor,
     state_in: &Tensor,
@@ -399,8 +410,11 @@ pub fn ssm_prefill_scan_ssd(
     if fused {
         raw(SSD_GATHER_BC_G_SRC, "ssd_gather_bc_g.cu", "ssd_gather_bc_g",
             &[(bb(b_mat), 0), (bb(c_mat), 0), (bb(&b_f16), 0), (bb(&c_f16), 0)],
-            &[tt, gg, ll, dsd, ncn], bgc * l * dsu)?;
+            &[tt, gg, ll, dsd, ncn, bc_rs, b_off, c_off], bgc * l * dsu)?;
     } else {
+        if (bc_rs, b_off, c_off) != ((g * dsu) as u32, 0, 0) {
+            return Err(Error::Msg("ssm_prefill_scan_ssd: strided B/C requires the fused gather (unset NEMOTRON_SSD_FUSED_OFF)".into()));
+        }
         raw(SSD_GATHER_BC_SRC, "ssd_gather_bc.cu", "ssd_gather_bc",
             &[(bb(b_mat), 0), (bb(c_mat), 0), (bb(&b_f16), 0), (bb(&c_f16), 0)],
             &[tt, hh, gg, hpgn, ll, dsd, ncn], bhc * l * dsu)?;
@@ -408,7 +422,7 @@ pub fn ssm_prefill_scan_ssd(
     // 3. Transpose x → xT [nc*H, dh, L] f16.
     raw(SSD_XT_SRC, "ssd_xt.cu", "ssd_xt",
         &[(bb(x), 0), (bb(&xt), 0)],
-        &[tt, hh, dhd, ll, ncn], bhc * dhu * l)?;
+        &[tt, hh, dhd, ll, ncn, x_rs, x_off], bhc * dhu * l)?;
 
     // Byte size of one [L,ds] f16 group slice — the broadcast stride for the
     // device-pointer arrays (head h → group h/hpg slice c*G + h/hpg).
@@ -457,7 +471,7 @@ pub fn ssm_prefill_scan_ssd(
     // 5. BdT[s,j] = decay·dt·B  [ds,L] f16.
     raw(SSD_BDT_SRC, "ssd_bdt.cu", "ssd_bdt",
         &[(bb(b_mat), 0), (bb(&lcs), 0), (bb(dt), 0), (bb(&bdt), 0)],
-        &[tt, hh, gg, hpgn, ll, dsd, ncn], bhc * dsu * l)?;
+        &[tt, hh, gg, hpgn, ll, dsd, ncn, bc_rs, b_off], bhc * dsu * l)?;
 
     // ── G3: S_chunk = BdT · xᵀ-form  [ds,dh]. m=ds, n=dh, k=L,
     //        X=bdt[ds,L], W=xt[dh,L]. ─────────────────────────────────────
@@ -501,7 +515,36 @@ pub fn ssm_prefill_scan_ssd(
     // 7. Combine → y [T,H,dh] f32.
     raw(SSD_COMBINE_SRC, "ssd_combine.cu", "ssd_combine",
         &[(bb(&y_intra), 0), (bb(&cs), 0), (bb(&lcs), 0), (bb(x), 0), (bb(d_skip), 0), (bb(&y), 0)],
-        &[tt, hh, dhd, ll, ncn], bhc * l * dhu)?;
+        &[tt, hh, dhd, ll, ncn, x_rs, x_off], bhc * l * dhu)?;
 
     Ok((state_out, y))
+}
+
+/// Compact 3-tensor form of [`ssm_prefill_scan_ssd_strided`] — original
+/// signature preserved for existing callers (x [T,H·dh], B/C [T,G·ds]).
+#[allow(clippy::too_many_arguments)]
+pub fn ssm_prefill_scan_ssd(
+    dev: &dyn Device,
+    x: &Tensor,
+    a_log: &Tensor,
+    b_mat: &Tensor,
+    c_mat: &Tensor,
+    d_skip: &Tensor,
+    dt: &Tensor,
+    state_in: &Tensor,
+    t_total: u32,
+    dh: u32,
+    ds: u32,
+    n_heads: u32,
+    n_groups: u32,
+    chunk_len: u32,
+    seg_reset: Option<&Tensor>,
+) -> Result<(Tensor, Tensor)> {
+    ssm_prefill_scan_ssd_strided(
+        dev,
+        x, n_heads * dh, 0,
+        b_mat, c_mat, n_groups * ds, 0, 0,
+        a_log, d_skip, dt, state_in,
+        t_total, dh, ds, n_heads, n_groups, chunk_len, seg_reset,
+    )
 }

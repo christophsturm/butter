@@ -44,7 +44,7 @@ fn scalar_buf(dev: &dyn Device, bits: u32) -> Result<std::sync::Arc<dyn ffai_cor
 }
 
 mod ssd_scan;
-pub use ssd_scan::ssm_prefill_scan_ssd;
+pub use ssd_scan::{ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_strided};
 
 mod ssd_scan_portable;
 pub use ssd_scan_portable::ssm_prefill_scan_ssd_portable;

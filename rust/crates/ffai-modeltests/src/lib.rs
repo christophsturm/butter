@@ -1877,9 +1877,6 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let ring_off = (s.saturating_sub(kc - 1)) * conv_dim;
                             { let mut cd = conv_dev.borrow_mut();
                               cd[l] = Some(slice(d, &xbc_t, ring_off, ring_len).unwrap()); }
-                            // PART B: fused split — 1 dispatch replaces 3 strided_col_copy calls.
-                            let (x_dev, b_dev, c_dev) = pf!(15, 0.0,
-                                mamba_split_conv(d, &yc_silu, s, conv_dim, di, ng * ds).unwrap());
                             // Softplus + dt_bias on device: [s, m_nh] → dt_all [s*m_nh].
                             let dt_bias_dev = cdev(format!("{p}.mixer.dt_bias"), &|| up(&fw[&format!("{p}.mixer.dt_bias")]));
                             let dt_dev  = pf!(6, 0.0, softplus_add_rows(d, &dt_raw_t, &dt_bias_dev, s, m_nh).unwrap());
@@ -1899,15 +1896,27 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // CUDA default chunk len 128 (validated win); 256 elsewhere.
                             let ssd_l: u32 = std::env::var("NEMOTRON_SSD_L").ok().and_then(|v| v.parse().ok())
                                 .unwrap_or(if is_cuda { 128 } else { 256 });
-                            let (so, y_dev) = if use_ssd_port {
-                                pf!(5, ssm_flops, ssm_prefill_scan_ssd_portable(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l).unwrap())
-                            } else if use_ssd {
-                                pf!(5, ssm_flops, ssm_prefill_scan_ssd(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l, seg_reset_dev.as_ref()).unwrap())
-                            } else if use_chunked {
-                                pf!(5, ssm_flops, ssm_prefill_scan_chunked(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
-                            } else {
-                                pf!(5, ssm_flops, ssm_prefill_scan(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
+                            let mut ssd_split_out: Option<(Tensor, Tensor)> = None;
+                            // NOTE: a strided-input SSD path (reading x/B/C in place from the
+                            // conv output, no mamba_split_conv) was measured SLOWER (-6-8% e2e,
+                            // argmax exact): scattered column reads from the 6K-wide conv rows
+                            // cost more than the split's streaming write+read. Machinery kept in
+                            // ssm_prefill_scan_ssd_strided; compact split path stays.
+                            {
+                                // PART B: fused split — 1 dispatch replaces 3 strided_col_copy calls.
+                                let (x_dev, b_dev, c_dev) = pf!(15, 0.0,
+                                    mamba_split_conv(d, &yc_silu, s, conv_dim, di, ng * ds).unwrap());
+                                if use_ssd {
+                                    ssd_split_out = Some(pf!(5, ssm_flops, ssm_prefill_scan_ssd(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l, seg_reset_dev.as_ref()).unwrap()));
+                                } else if use_ssd_port {
+                                    ssd_split_out = Some(pf!(5, ssm_flops, ssm_prefill_scan_ssd_portable(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l).unwrap()));
+                                } else if use_chunked {
+                                    ssd_split_out = Some(pf!(5, ssm_flops, ssm_prefill_scan_chunked(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap()));
+                                } else {
+                                    ssd_split_out = Some(pf!(5, ssm_flops, ssm_prefill_scan(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap()));
+                                }
                             };
+                            let (so, y_dev) = ssd_split_out.take().unwrap();
                             ssm_state[l] = Some(so);
                             // PART B: on-device batched gated group RMSNorm — eliminates the
                             // dl(y)+dl(z)+host loop+up(yn) round-trip (2 × s×di = ~42MB per layer).
