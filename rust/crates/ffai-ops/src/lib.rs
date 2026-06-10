@@ -1269,18 +1269,24 @@ extern "C" __global__ void moe_scatter_sort(
     const unsigned* __restrict__ offsets, unsigned* __restrict__ sorted_tok, float* __restrict__ sorted_wt,
     int mt, int top_k, int n_exp)
 {
-    // STABLE counting-sort scatter: one thread per expert scans all pairs in
-    // index order, placing its tokens into [offsets[e], offsets[e+1]) ascending.
-    // No atomics → deterministic + within-expert token order matches a host
-    // stable_sort (so the model can drop its host re-sort). O(n_exp*mt).
-    int e = blockIdx.x*blockDim.x + threadIdx.x; if (e >= n_exp) return;
-    unsigned pos = offsets[e];
-    for (int i = 0; i < mt; i++) {
-        if (idx[i] == (unsigned)e) {
-            sorted_tok[pos] = (unsigned)(i / top_k);
-            sorted_wt[pos] = wt[i];
-            pos++;
+    // STABLE counting-sort scatter, warp-per-expert: lanes sweep 32 consecutive
+    // pairs per step (coalesced); __ballot gives each match its stable rank
+    // (popc of lower lanes) on top of a running per-warp base. Deterministic,
+    // no atomics, same output order as the old 1-thread-per-expert scan but
+    // 32-way parallel per expert. O(n_exp*mt/32) per warp.
+    int e = (blockIdx.x*blockDim.x + threadIdx.x) >> 5; if (e >= n_exp) return;
+    int lane = threadIdx.x & 31;
+    unsigned base = offsets[e];
+    for (int w = 0; w < mt; w += 32) {
+        int i = w + lane;
+        bool match = (i < mt) && (idx[i] == (unsigned)e);
+        unsigned mask = __ballot_sync(0xffffffffu, match);
+        if (match) {
+            unsigned rank = __popc(mask & ((1u << lane) - 1u));
+            sorted_tok[base + rank] = (unsigned)(i / top_k);
+            sorted_wt[base + rank] = wt[i];
         }
+        base += __popc(mask);
     }
 }
 "#;
@@ -1320,7 +1326,7 @@ pub fn moe_route_sort_device(
     dev.dispatch_raw_cuda(MOE_SCATTER_SORT_SRC, "moe_scatter_sort.cu", "moe_scatter_sort",
         &[(idx.buffer.as_ref(), 0), (wt.buffer.as_ref(), 0), (offsets.buffer.as_ref(), 0),
           (sorted_tok.buffer.as_ref(), 0), (sorted_wt.buffer.as_ref(), 0)],
-        &[i(mt as i32), i(top_k as i32), i(n_exp as i32)], [(n_exp as u32).div_ceil(128), 1, 1], [128, 1, 1], 0, false)?;
+        &[i(mt as i32), i(top_k as i32), i(n_exp as i32)], [((n_exp * 32) as u32).div_ceil(128), 1, 1], [128, 1, 1], 0, false)?;
     Ok((sorted_tok, sorted_wt, offsets))
 }
 
