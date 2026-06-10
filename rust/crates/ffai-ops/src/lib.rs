@@ -24,6 +24,25 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
 
+/// Device-resident scalar-constant cache: tiny buffers (norm `eps` values)
+/// uploaded once per (device, bit-pattern) instead of per call. The norms run
+/// hundreds of times per prefill forward, and each 4-byte upload pays a full
+/// pageable H2D + driver round-trip.
+fn scalar_buf(dev: &dyn Device, bits: u32) -> Result<std::sync::Arc<dyn ffai_core::DeviceBuffer>> {
+    use std::cell::RefCell;
+    thread_local! {
+        static CACHE: RefCell<FxHashMap<(usize, u32), std::sync::Arc<dyn ffai_core::DeviceBuffer>>> =
+            RefCell::new(FxHashMap::default());
+    }
+    let key = (dev as *const dyn Device as *const () as usize, bits);
+    if let Some(b) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return Ok(b);
+    }
+    let b = dev.upload(&bits.to_le_bytes())?;
+    CACHE.with(|c| c.borrow_mut().insert(key, b.clone()));
+    Ok(b)
+}
+
 mod ssd_scan;
 pub use ssd_scan::ssm_prefill_scan_ssd;
 
@@ -430,7 +449,7 @@ pub fn rms_norm(dev: &dyn Device, x: &Tensor, weight: &Tensor, eps: f32) -> Resu
     let n = *x.shape.last().ok_or_else(|| Error::Msg("rms_norm: scalar input".into()))?;
     let rows = x.elem_count() / n;
     let out = Tensor::empty(dev, x.shape.clone(), x.dtype)?;
-    let eps_buf = dev.upload(&eps.to_le_bytes())?;
+    let eps_buf = scalar_buf(dev, eps.to_bits())?;
 
     // Fast path: 4 elems/thread, needs n a multiple of 128 and ≤ 4096.
     // Otherwise the strided wide variant handles any row width.
@@ -822,7 +841,7 @@ pub fn softplus_add(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> 
 pub fn gated_group_rmsnorm(dev: &dyn Device, y: &Tensor, z: &Tensor, w: &Tensor, eps: f32, di: usize, gs: usize) -> Result<Tensor> {
     let k = cached_ir("ffai_gated_group_rmsnorm", z.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_gated_group_rmsnorm::kernel_ir_for(z.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
     let out = Tensor::empty(dev, vec![di], z.dtype)?;
-    let eps_buf = Tensor::new(dev.upload(&eps.to_le_bytes()).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![1], DType::F32);
+    let eps_buf = Tensor::new(scalar_buf(dev, eps.to_bits())?, vec![1], DType::F32);
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     let ng = (di / gs) as u32;
     dev.dispatch(&k, &[Binding::Buffer(y.buffer.clone()), Binding::Buffer(z.buffer.clone()), Binding::Buffer(w.buffer.clone()), Binding::Buffer(out.buffer.clone()), Binding::Buffer(eps_buf.buffer.clone()), u(gs as u32)], Grid { grid: [ng, 1, 1], block: [(gs / 4) as u32, 1, 1] })?;
@@ -1299,7 +1318,7 @@ pub fn moe_route_sort_device(
     let mt = s * top_k;
     let idx = Tensor::empty(dev, vec![mt], DType::U32)?;
     let wt = Tensor::empty(dev, vec![mt], DType::F32)?;
-    let counts = Tensor::new(dev.upload(&vec![0u8; n_exp * 4]).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![n_exp], DType::U32);
+    let counts = Tensor::new(dev.alloc_zeroed(n_exp * 4).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![n_exp], DType::U32);
     let offsets = Tensor::empty(dev, vec![n_exp + 1], DType::U32)?;
     let cursor = Tensor::empty(dev, vec![n_exp], DType::U32)?;
     let sorted_tok = Tensor::empty(dev, vec![mt], DType::U32)?;
@@ -3166,8 +3185,8 @@ pub fn sdpa_multi_tc(
         blk256(nkv*n_kv*hd), [256,1,1], 0, false)?;
 
     // ── running FlashAttention state (init via upload: o=0, l=0, m=-inf) ─────
-    let o_run = Tensor::new(dev.upload(&vec![0u8; nq*sq*hd*4])?, vec![nq, sq, hd], DType::F32);
-    let l_run = Tensor::new(dev.upload(&vec![0u8; nq*sq*4])?, vec![nq, sq], DType::F32);
+    let o_run = Tensor::new(dev.alloc_zeroed(nq*sq*hd*4)?, vec![nq, sq, hd], DType::F32);
+    let l_run = Tensor::new(dev.alloc_zeroed(nq*sq*4)?, vec![nq, sq], DType::F32);
     let neg: Vec<u8> = (0..nq*sq).flat_map(|_| (-3.4e38f32).to_le_bytes()).collect();
     let m_run = Tensor::new(dev.upload(&neg)?, vec![nq, sq], DType::F32);
 
@@ -3310,8 +3329,8 @@ pub fn sdpa_multi_tc_varlen(
         &[i(nkv as i32), i(kv_stride as i32), i(n_kv as i32), i(hd as i32), i(in_f32)],
         blk256(nkv*n_kv*hd), [256,1,1], 0, false)?;
 
-    let o_run = Tensor::new(dev.upload(&vec![0u8; nq*sq*hd*4])?, vec![nq, sq, hd], DType::F32);
-    let l_run = Tensor::new(dev.upload(&vec![0u8; nq*sq*4])?, vec![nq, sq], DType::F32);
+    let o_run = Tensor::new(dev.alloc_zeroed(nq*sq*hd*4)?, vec![nq, sq, hd], DType::F32);
+    let l_run = Tensor::new(dev.alloc_zeroed(nq*sq*4)?, vec![nq, sq], DType::F32);
     let neg: Vec<u8> = (0..nq*sq).flat_map(|_| (-3.4e38f32).to_le_bytes()).collect();
     let m_run = Tensor::new(dev.upload(&neg)?, vec![nq, sq], DType::F32);
 
@@ -3677,7 +3696,7 @@ pub fn ssm_prefill_scan(
     let da_log = Tensor::empty(dev, vec![t * nh * dsu], x.dtype)?;
     let dbx_log = Tensor::empty(dev, vec![t * nh * dhu * dsu], x.dtype)?;
     // mask buffer: has_mask=0 → kernel ignores contents, but the binding must exist.
-    let mask = Tensor::new(dev.upload(&vec![0u8; t * 4]).unwrap(), vec![t], DType::U32);
+    let mask = Tensor::new(dev.alloc_zeroed(t * 4).unwrap(), vec![t], DType::U32);
     let kern = cached_ir("ssm_step_record_d64_128_64_8", x.dtype, || {
         let mut kk = metaltile_std::ffai::ssm_replay::ssm_step_record_d64_128_64_8::kernel_ir_for(x.dtype);
         kk.mode = KernelMode::Grid3D;
@@ -4236,7 +4255,7 @@ pub fn moe_scatter_add_det_dev(
     in_f16: bool,
 ) -> Result<()> {
     let i = |x: i32| x.to_le_bytes().to_vec();
-    let counts = Tensor::new(dev.upload(&vec![0u8; s * 4]).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![s], DType::U32);
+    let counts = Tensor::new(dev.alloc_zeroed(s * 4).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![s], DType::U32);
     dev.dispatch_raw_cuda(MOE_HIST_SRC, "moe_hist.cu", "moe_hist",
         &[(sorted_tok.buffer.as_ref(), sorted_tok.offset), (counts.buffer.as_ref(), 0)],
         &[i(mt as i32)], [(mt as u32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
@@ -4388,7 +4407,7 @@ pub fn layer_norm(dev: &dyn Device, x: &Tensor, weight: &Tensor, bias: &Tensor, 
     let n = *x.shape.last().ok_or_else(|| Error::Msg("layer_norm: scalar input".into()))?;
     let rows = x.elem_count() / n;
     let out = Tensor::empty(dev, x.shape.clone(), x.dtype)?;
-    let eps_buf = dev.upload(&eps.to_le_bytes())?;
+    let eps_buf = scalar_buf(dev, eps.to_bits())?;
     let k = lookup("mt_layer_norm", x.dtype)?;
     let grid = Grid { grid: [rows as u32, 1, 1], block: [(n / 4) as u32, 1, 1] };
     dev.dispatch(
@@ -4886,7 +4905,7 @@ pub fn gated_group_rmsnorm_batched(
         k
     });
     let out = Tensor::empty(dev, vec![s * di], DType::F32)?;
-    let eps_buf = Tensor::new(dev.upload(&eps.to_le_bytes()).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![1], DType::F32);
+    let eps_buf = Tensor::new(scalar_buf(dev, eps.to_bits())?, vec![1], DType::F32);
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     dev.dispatch(
         &kernel,
@@ -6395,7 +6414,7 @@ pub fn moe_fp4_pack_weights(
     if k % 64 != 0 { return Err(Error::Msg(format!("moe_fp4_pack_weights: K {k} %64!=0"))); }
     if n % 8 != 0 { return Err(Error::Msg(format!("moe_fp4_pack_weights: N {n} %8!=0"))); }
     let (kt, ntl) = (k / 64, n / 8);
-    let amax = Tensor::new(dev.upload(&vec![0u8; n_exp * 4]).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![n_exp], DType::U32);
+    let amax = Tensor::new(dev.alloc_zeroed(n_exp * 4).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![n_exp], DType::U32);
     let gw = Tensor::empty(dev, vec![n_exp], DType::F32)?;
     let i = |x: i32| x.to_le_bytes().to_vec();
     let l = |x: i64| x.to_le_bytes().to_vec();
@@ -6459,7 +6478,7 @@ pub fn moe_fp4_grouped_mma_dev(
     let amax: &Tensor = match amax_in {
         Some(t) => t,
         None => {
-            amax_owned = Tensor::new(dev.upload(&vec![0u8; 4]).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![1], DType::U32);
+            amax_owned = Tensor::new(dev.alloc_zeroed(4).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![1], DType::U32);
             dev.dispatch_raw_cuda(
                 MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
                 &[(a.buffer.as_ref(), a.offset), (amax_owned.buffer.as_ref(), 0)],
@@ -6520,7 +6539,7 @@ pub fn add_rms_norm(
     let rows = a.elem_count() / n;
     let residual = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
     let normed = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
-    let eps_buf = dev.upload(&eps.to_le_bytes())?;
+    let eps_buf = scalar_buf(dev, eps.to_bits())?;
     // Reduction mode: one threadgroup per row, `tid` = lane within the row
     // (the same TG=n/4 contract as mt_rms_norm).
     let k = cached_ir("mt_add_rms_norm", a.dtype, || {

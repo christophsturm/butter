@@ -1558,6 +1558,13 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         let pf_n: Vec<std::cell::Cell<u64>> = (0..NPF).map(|_| std::cell::Cell::new(0)).collect();
         let pf_flop: Vec<std::cell::Cell<f64>> = (0..NPF).map(|_| std::cell::Cell::new(0.0)).collect();
         let pf_on = std::env::var("NEMOTRON_PROFILE").is_ok();
+        // Device-resident constants cache: per-layer constant vectors (dt_bias,
+        // router correction bias) + tiny index tensors, uploaded ONCE and reused
+        // across layers AND forwards. These were re-uploaded per layer per
+        // forward — ~140 small pageable H2D copies/forward, each paying ~0.3ms
+        // of driver API time on GB10.
+        let const_dev: std::cell::RefCell<HashMap<String, Tensor>> =
+            std::cell::RefCell::new(HashMap::new());
         // Batched forward over an explicit token-id slice; writes states; returns
         // the argmax logits for the LAST token.
         let forward_batched = |ids: &[usize],
@@ -1577,6 +1584,13 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             // (host top-k) defaults are already portable at d0/S≤4096. CUDA path is
             // left byte-for-byte unchanged — gated purely on `is_cuda`.
             let is_cuda = d.backend() == Backend::Cuda;
+            // Fetch-or-upload a device-resident constant (cached across forwards).
+            let cdev = |key: String, make: &dyn Fn() -> Tensor| -> Tensor {
+                if let Some(t) = const_dev.borrow().get(&key) { return t.clone(); }
+                let t = make();
+                const_dev.borrow_mut().insert(key, t.clone());
+                t
+            };
             // ── Packed multi-sequence prefill (NEMOTRON_PACKED=N) ──────────────
             // N equal-length sequences (seg_len = s/N, a multiple of the SSD chunk
             // len) packed into one token stream. Attention goes block-diagonal via
@@ -1762,7 +1776,8 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let (x_dev, b_dev, c_dev) = pf!(15, 0.0,
                                 mamba_split_conv(d, &yc_silu, s, conv_dim, di, ng * ds).unwrap());
                             // Softplus + dt_bias on device: [s, m_nh] → dt_all [s*m_nh].
-                            let dt_dev  = pf!(6, 0.0, softplus_add_rows(d, &dt_raw_t, &up(&fw[&format!("{p}.mixer.dt_bias")]), s, m_nh).unwrap());
+                            let dt_bias_dev = cdev(format!("{p}.mixer.dt_bias"), &|| up(&fw[&format!("{p}.mixer.dt_bias")]));
+                            let dt_dev  = pf!(6, 0.0, softplus_add_rows(d, &dt_raw_t, &dt_bias_dev, s, m_nh).unwrap());
                             // SSD scan over S.
                             if ssm_state[l].is_none() { ssm_state[l] = Some(up(&vec![0.0f32; m_nh * m_dh * ds])); }
                             let ssm_flops = s as f64 * m_nh as f64 * m_dh as f64 * ds as f64 * 4.0;
@@ -1947,7 +1962,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // (Decode is unaffected — this is inside the batched-prefill closure.)
                         let devdesc_skip = is_cuda && std::env::var("NEMOTRON_Q4_DEVDESC_OFF").is_err();
                         let (triples, mt): (Vec<(u32, usize, f32)>, usize) = if devsort {
-                            let bias_dev = up(&bias[..]);
+                            let bias_dev = cdev(format!("{p}.mixer.gate.e_score_correction_bias"), &|| up(&bias[..]));
                             // xn cast once to f16: feeds BOTH the cuBLAS router GEMM
                             // (was software-MMA ffai_gemm, ~28x slower at this shape)
                             // and the f16 token gather below.
@@ -2795,7 +2810,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let sd = if fp4_shared {
                                 // NVFP4 W4A4 shared expert: same grouped kernel, n_exp=1
                                 // (offsets [0, s] — one run covering all rows).
-                                let off1 = Tensor::new(d.upload(&tbu(&[0u32, s as u32])).unwrap(), vec![2], DType::U32);
+                                let off1 = cdev(format!("__off1.{s}"), &|| Tensor::new(d.upload(&tbu(&[0u32, s as u32])).unwrap(), vec![2], DType::U32));
                                 let (uwp, uwsc, ugw) = &fp4w[&format!("{p}.sh_up_proj_fp4")];
                                 let (dwp, dwsc, dgw) = &fp4w[&format!("{p}.sh_down_proj_fp4")];
                                 let amax_sd = Tensor::new(d.alloc_zeroed(4).unwrap(), vec![1], DType::U32);
