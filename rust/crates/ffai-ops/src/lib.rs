@@ -196,7 +196,9 @@ extern "C" __global__ void ffai_add3(
 {
     long i=(long)blockIdx.x*blockDim.x+threadIdx.x;
     long stride=(long)gridDim.x*blockDim.x;
-    for(;i<n;i+=stride) out[i]=a[i]+b[i]+c[i];
+    // association matches the unfused path exactly: xt + (acc + sd) — a
+    // left-assoc a+b+c flipped the d32768 argmax via last-ulp drift.
+    for(;i<n;i+=stride) out[i]=a[i]+(b[i]+c[i]);
 }
 "#;
 
