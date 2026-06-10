@@ -5953,9 +5953,13 @@ __device__ __forceinline__ unsigned enc_e2m1(float x, float inv_bs){
 __device__ __forceinline__ int b4b_map(int blk){ const int t[4]={0,2,1,3}; return t[blk]; }
 
 // amax over slabs: x f16 [n_slabs * slab_len]; atomicMax on positive float bits.
+__device__ __forceinline__ float fp4_act(float v, int mode, float fs){
+    if(mode==1){ float r=v>0.f?v:0.f; return r*r*fs; }
+    return v;
+}
 extern "C" __global__ void nvfp4_amax_slab(
     const __half* __restrict__ x, unsigned* __restrict__ amax_bits,
-    long slab_len, int n_slabs)
+    long slab_len, int n_slabs, int act_mode, float act_scale)
 {
     long total=slab_len*(long)n_slabs;
     long stride=(long)gridDim.x*blockDim.x;
@@ -5963,7 +5967,7 @@ extern "C" __global__ void nvfp4_amax_slab(
     if(n_slabs==1){
         // hot path (per-call activation global): block-reduce, 1 atomic/block.
         float m=0.f;
-        for(long p=i;p<total;p+=stride) m=fmaxf(m,fabsf(__half2float(x[p])));
+        for(long p=i;p<total;p+=stride) m=fmaxf(m,fabsf(fp4_act(__half2float(x[p]),act_mode,act_scale)));
         #pragma unroll
         for(int o=16;o;o>>=1) m=fmaxf(m,__shfl_down_sync(0xffffffffu,m,o));
         __shared__ float wm[32];
@@ -6053,7 +6057,7 @@ extern "C" __global__ void moe_fp4_actq_pack(
     const __half* __restrict__ a, const int* __restrict__ tok0,
     const int* __restrict__ gend, const float* __restrict__ gA,
     unsigned* __restrict__ Ap, unsigned* __restrict__ Asc,
-    int maxt, int K, int mt_total)
+    int maxt, int K, int mt_total, int act_mode, float act_scale)
 {
     // Warp-per-(tile,kt): stage the 16x64 f16 tile to smem with coalesced
     // half2 loads (each lane: 2 rows x 16B), compute the 64 block-16 amaxes
@@ -6079,7 +6083,13 @@ extern "C" __global__ void moe_fp4_actq_pack(
         #pragma unroll
         for(int j=0;j<32;j+=8){
             if(live){
-                *(uint4*)&sm[r0*64+c0+j]=*(const uint4*)&src[j];
+                uint4 v=*(const uint4*)&src[j];
+                if(act_mode){
+                    const __half* hv=(const __half*)&v;
+                    #pragma unroll
+                    for(int q=0;q<8;q++)
+                        sm[r0*64+c0+j+q]=__float2half(fp4_act(__half2float(hv[q]),act_mode,act_scale));
+                } else *(uint4*)&sm[r0*64+c0+j]=v;
             } else {
                 uint4 z={0,0,0,0}; *(uint4*)&sm[r0*64+c0+j]=z;
             }
@@ -6249,7 +6259,7 @@ pub fn moe_fp4_pack_weights(
     dev.dispatch_raw_cuda(
         MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
         &[(w_f16.buffer.as_ref(), w_f16.offset), (amax.buffer.as_ref(), 0)],
-        &[l(slab), i(n_exp as i32)],
+        &[l(slab), i(n_exp as i32), i(0), 0f32.to_le_bytes().to_vec()],
         [total_elems.div_ceil(256 * 8), 1, 1], [256, 1, 1], 0, false)?;
     dev.dispatch_raw_cuda(
         MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_globals",
@@ -6277,6 +6287,7 @@ pub fn moe_fp4_pack_weights(
 pub fn moe_fp4_grouped_mma_dev(
     dev: &dyn Device, a: &Tensor, wp: &Tensor, wsc: &Tensor, gw: &Tensor,
     offsets: &Tensor, n_exp: usize, mt: usize, n: usize, k: usize,
+    act_mode: i32, act_scale: f32,
 ) -> Result<Tensor> {
     if k % 64 != 0 { return Err(Error::Msg(format!("moe_fp4_grouped_mma_dev: K {k} %64!=0"))); }
     let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
@@ -6300,7 +6311,7 @@ pub fn moe_fp4_grouped_mma_dev(
     dev.dispatch_raw_cuda(
         MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
         &[(a.buffer.as_ref(), a.offset), (amax.buffer.as_ref(), 0)],
-        &[l((mt * k) as i64), i(1)],
+        &[l((mt * k) as i64), i(1), i(act_mode), act_scale.to_le_bytes().to_vec()],
         [((mt * k) as u32).div_ceil(256 * 64).max(1), 1, 1], [256, 1, 1], 0, false)?;
     dev.dispatch_raw_cuda(
         MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_globals",
@@ -6315,7 +6326,7 @@ pub fn moe_fp4_grouped_mma_dev(
         MOE_FP4_SRC, "moe_fp4.cu", "moe_fp4_actq_pack",
         &[(a.buffer.as_ref(), a.offset), (t0d.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
           (ga.buffer.as_ref(), 0), (ap.buffer.as_ref(), 0), (asc.buffer.as_ref(), 0)],
-        &[i(maxt as i32), i(k as i32), i(mt as i32)],
+        &[i(maxt as i32), i(k as i32), i(mt as i32), i(act_mode), act_scale.to_le_bytes().to_vec()],
         [(warps * 32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
     // grouped mma: grid [maxt, NT/8] × 8 warps/block
     // x4 variant: 4 n8-tiles per warp (A frags register-reused) — +49% on
