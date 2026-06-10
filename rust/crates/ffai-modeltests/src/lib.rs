@@ -2740,7 +2740,11 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // faults on replay), but graphs are a dead end here anyway — the
                             // host-free forward alone pegs the GPU at ~98% busy, so the win is
                             // killing the host round-trip idle, NOT graph replay.
-                            let xnh = pf!(15, 0.0, cast_f32_f16(d, &xn).unwrap());
+                            // reuse the router's f16 cast of xn (same tensor) when present
+                            let xnh = match &xn_f16_router {
+                                Some(t) => t.clone(),
+                                None => pf!(15, 0.0, cast_f32_f16(d, &xn).unwrap()),
+                            };
                             let fp4_shared = fp4w.contains_key(&format!("{p}.sh_up_proj_fp4"));
                             let sd = if fp4_shared {
                                 // NVFP4 W4A4 shared expert: same grouped kernel, n_exp=1
