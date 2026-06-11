@@ -1676,6 +1676,12 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         // once from the dequanted f16 weight); activations quantized per call.
         let w4lt: std::cell::RefCell<HashMap<String, (Tensor, Tensor)>> =
             std::cell::RefCell::new(HashMap::new());
+        // Single-slot act-quant dedup: q/k/v (and any same-input projections)
+        // quantize the SAME activation tensor — cache the last (input, dims) ->
+        // (pack, sf). Holding the input Tensor keeps its buffer alive, so the
+        // pointer-identity check can't alias a pool-recycled buffer.
+        let actq_slot: std::cell::RefCell<Option<(Tensor, usize, usize, Tensor, Tensor)>> =
+            std::cell::RefCell::new(None);
         // Batched forward over an explicit token-id slice; writes states; returns
         // the argmax logits for the LAST token.
         let forward_batched = |ids: &[usize],
@@ -1826,7 +1832,19 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         t
                     }
                 };
-                let (xp, xsf) = pf!(15, 0.0, ffai_ops::lt_fp4_quant(d, xh, rows, k).unwrap());
+                let (xp, xsf) = {
+                    let hit = actq_slot.borrow().as_ref().map_or(false, |(cx, cr, ck, _, _)|
+                        *cr == rows && *ck == k && std::sync::Arc::ptr_eq(&cx.buffer, &xh.buffer));
+                    if hit {
+                        let s0 = actq_slot.borrow();
+                        let (_, _, _, p, f) = s0.as_ref().unwrap();
+                        (p.clone(), f.clone())
+                    } else {
+                        let t = pf!(15, 0.0, ffai_ops::lt_fp4_quant(d, xh, rows, k).unwrap());
+                        *actq_slot.borrow_mut() = Some((xh.clone(), rows, k, t.0.clone(), t.1.clone()));
+                        t
+                    }
+                };
                 let o = pf!(2, 2.0 * rows as f64 * m as f64 * k as f64,
                     ffai_ops::gemm_fp4(d, &xp, &xsf, &wp, &wsf, rows, m, k, true).unwrap()); // [rows, m] f32
                 if std::env::var("NEMOTRON_FP4_DENSE_DEBUG").is_ok() {
