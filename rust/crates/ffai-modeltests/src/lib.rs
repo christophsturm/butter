@@ -3150,6 +3150,33 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     ffai_ops::moe_fp4_grouped_mma_dev(d, &xnh, uwp, uwsc, ugw, &off1, 1, s, shared_inter, hid, 0, 0.0, None, Some((&amax_sd, 1, 1.0)), None).unwrap());
                                 pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
                                     ffai_ops::moe_fp4_grouped_mma_dev(d, &sa, dwp, dwsc, dgw, &off1, 1, s, hid, shared_inter, 1, 1.0, Some(&amax_sd), None, None).unwrap())
+                            } else if std::env::var("NEMOTRON_FP4_SHARED_LT").is_ok() {
+                                // Lt block-scaled FP4 shared expert (~4x the f16 GEMM rate):
+                                // weights packed once (cross-forward cache), activations
+                                // quantized per call. Quant-regime lever (changes numerics).
+                                let (uwq, uwsf) = {
+                                    let key = format!("{p}.shup.lt4");
+                                    if let Some(t) = w4lt.borrow().get(&key) { t.clone() } else {
+                                        let wf = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
+                                        let t = ffai_ops::lt_fp4_quant(d, &wf, *sm_up, *sk_up).unwrap();
+                                        w4lt.borrow_mut().insert(key, t.clone()); t
+                                    }
+                                };
+                                let (dwq, dwsf) = {
+                                    let key = format!("{p}.shdn.lt4");
+                                    if let Some(t) = w4lt.borrow().get(&key) { t.clone() } else {
+                                        let wf = deq16(&format!("{p}.shdn"), sdqs, sdsc, *sm_dn, *sk_dn, 0);
+                                        let t = ffai_ops::lt_fp4_quant(d, &wf, *sm_dn, *sk_dn).unwrap();
+                                        w4lt.borrow_mut().insert(key, t.clone()); t
+                                    }
+                                };
+                                let (xq, xsf) = pf!(15, 0.0, ffai_ops::lt_fp4_quant(d, &xnh, s, hid).unwrap());
+                                let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
+                                    ffai_ops::gemm_fp4(d, &xq, &xsf, &uwq, &uwsf, s, *sm_up, *sk_up, false).unwrap());
+                                let sa2 = pf!(3, 0.0, relu2_scale_f16(d, &sa, 1.0f32).unwrap());
+                                let (aq, asf) = pf!(15, 0.0, ffai_ops::lt_fp4_quant(d, &sa2, s, shared_inter).unwrap());
+                                pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
+                                    ffai_ops::gemm_fp4(d, &aq, &asf, &dwq, &dwsf, s, *sm_dn, *sk_dn, false).unwrap())
                             } else {
                             let wsu = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
                             let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
