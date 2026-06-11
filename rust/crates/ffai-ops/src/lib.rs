@@ -3028,8 +3028,8 @@ extern "C" __global__ void sdpa_flash_mma_w4s(
     const float* qf=(const float*)q_in; const __half* qh=(const __half*)q_in;
 
     __shared__ __half Qs_a[4][BR][HD];
-    __shared__ __half Ks[BC][HD];
-    __shared__ __half Vs[BC][HD];
+    __shared__ __half Ks2[2][BC][HD];   // cp.async double-buffered KV stages
+    __shared__ __half Vs2[2][BC][HD];
     __shared__ float  Ss_a[4][BR][BC];
     __shared__ __half Ps_a[4][BR][BC];
     __shared__ float  cv_a[4][BR], mv_a[4][BR], lv_a[4][BR];
@@ -3052,12 +3052,28 @@ extern "C" __global__ void sdpa_flash_mma_w4s(
     int maxpb_blk = base_kv + blk_r_hi; if (maxpb_blk>last) maxpb_blk=last;
     int kv_hi = kv0 + kv_chunk - 1; if (kv_hi > maxpb_blk) kv_hi = maxpb_blk;
 
+    // cp.async 16B chunk staging: BC*HD f16 = 4KB per matrix = 256 chunks;
+    // 128 threads x 2 chunks each. Tail tiles (p > last) fall back to a tiny
+    // zero-fill after the wait (rare: only the last tile of the sequence).
+    #define KV_ISSUE(kj_,st_) do{                                                     for (int c2=threadIdx.x; c2<2*BC*HD/8; c2+=NW*32){                                 int which=c2>=(BC*HD/8);                                                       int e8=(c2%(BC*HD/8))*8;                                                       int j=e8>>7, d=e8&127, p=(kj_)+j;                                              const __half* src = which? &v_in[((long)kh*kv_stride+p)*HD+d]                                           : &k_in[((long)kh*kv_stride+p)*HD+d];                 __half* dst = which? &Vs2[st_][j][d] : &Ks2[st_][j][d];                        if (p<=last) {                                                                     unsigned sa=(unsigned)__cvta_generic_to_shared(dst);                           asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"::"r"(sa),"l"(src));             }                                                                          }                                                                              asm volatile("cp.async.commit_group;");                                    }while(0)
+    KV_ISSUE(kv0,0);
     for (int kj0=kv0; kj0<=kv_hi; kj0+=BC) {
+        int st=((kj0-kv0)/BC)&1;
+        if (kj0+BC<=kv_hi) {
+            KV_ISSUE(kj0+BC,st^1);
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            asm volatile("cp.async.wait_group 0;");
+        }
         __syncthreads();
-        for (int e=threadIdx.x;e<BC*HD;e+=NW*32){ int j=e>>7,d=e&127,p=kj0+j,ok=(p<=last); long idx=((long)kh*kv_stride+p)*HD+d;
-            Ks[j][d]= ok? k_in[idx] : __float2half(0.f);
-            Vs[j][d]= ok? v_in[idx] : __float2half(0.f); }
-        __syncthreads();
+        // zero-fill the (rare) beyond-last lanes of this stage
+        if (kj0+BC-1 > last) {
+            for (int e=threadIdx.x;e<BC*HD;e+=NW*32){ int j=e>>7,d=e&127;
+                if (kj0+j>last){ Ks2[st][j][d]=__float2half(0.f); Vs2[st][j][d]=__float2half(0.f); } }
+            __syncthreads();
+        }
+        __half (*Ks)[HD] = Ks2[st];
+        __half (*Vs)[HD] = Vs2[st];
         if (kj0 > maxpb) continue;
         __syncwarp();
 
@@ -3113,6 +3129,7 @@ extern "C" __global__ void sdpa_flash_mma_w4s(
         __syncwarp();
     }
 
+    #undef KV_ISSUE
     // emit UNNORMALIZED partial + (m,l); rows beyond sq skipped
     int r0=R0+gid, r8=R0+gid+8;
     long pbase = (long)part * sq;
