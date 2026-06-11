@@ -1881,17 +1881,20 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             };
             let qmm_fp8d = |xh: &Tensor, name: &str, rows: usize, m: usize, k: usize,
                             qs: &Tensor, sc: &Tensor| -> Tensor {
+                // PER-CHANNEL weight (rows=m) + PER-TOKEN act (rows) FP8, scales
+                // folded post-GEMM (D[r,c]*=xsc[r]·wsc[c]) — the quality-
+                // preserving granularity (per-tensor was cosine ~0.94).
                 let (wq, wsc) = {
-                    if let Some(t) = w4lt.borrow().get(&format!("{name}.fp8")) { t.clone() } else {
+                    if let Some(t) = w4lt.borrow().get(&format!("{name}.fp8c")) { t.clone() } else {
                         let wf = pf!(3, (m * k) as f64, dequant_q4_off(d, qs, sc, m, k, DType::F16, 0).unwrap());
-                        let t = ffai_ops::fp8_quant(d, &wf, m * k).unwrap();
-                        w4lt.borrow_mut().insert(format!("{name}.fp8"), t.clone());
+                        let t = ffai_ops::fp8_quant_perrow(d, &wf, m, k).unwrap();
+                        w4lt.borrow_mut().insert(format!("{name}.fp8c"), t.clone());
                         t
                     }
                 };
-                let (xq, xsc) = pf!(15, 0.0, ffai_ops::fp8_quant(d, xh, rows * k).unwrap());
+                let (xq, xsc) = pf!(15, 0.0, ffai_ops::fp8_quant_perrow(d, xh, rows, k).unwrap());
                 pf!(2, 2.0 * rows as f64 * m as f64 * k as f64,
-                    ffai_ops::gemm_fp8(d, &xq, &xsc, &wq, &wsc, rows, m, k, true).unwrap()) // [rows, m] f32
+                    ffai_ops::gemm_fp8_perchan(d, &xq, &xsc, &wq, &wsc, rows, m, k).unwrap()) // [rows, m] f32
             };
             let qmm = |x: &Tensor, name: &str| -> Tensor {
                 let (qs, sc, m, k) = &qw[name];

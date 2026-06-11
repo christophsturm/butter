@@ -6891,6 +6891,65 @@ extern "C" __global__ void fp8_scale(
     sc[1]=1.f/s;    // quant scale (consumed by fp8_quant)
 }
 // fp8_quant: x f16 [n] -> e4m3 bytes, v*inv clamped to ±448, round-nearest.
+// Per-row e4m3 quant: each of R rows -> e4m3 + per-row dequant scale[R]
+// (amax/448). Per-channel (weight rows=N) or per-token (act rows=M).
+extern "C" __global__ void fp8_quant_perrow(
+    const __half* __restrict__ x, unsigned char* __restrict__ q,
+    float* __restrict__ scale, int R, int K)
+{
+    int r=blockIdx.x; if(r>=R) return;
+    const __half* xr=x+(long)r*K;
+    __shared__ float sm[256];
+    float am=0.f;
+    for(int i=threadIdx.x;i<K;i+=blockDim.x) am=fmaxf(am,fabsf(__half2float(xr[i])));
+    sm[threadIdx.x]=am; __syncthreads();
+    for(int o=blockDim.x>>1;o>0;o>>=1){ if(threadIdx.x<o) sm[threadIdx.x]=fmaxf(sm[threadIdx.x],sm[threadIdx.x+o]); __syncthreads(); }
+    float sc=(sm[0]>0.f)?sm[0]/448.f:1.f; float inv=1.f/sc;
+    if(threadIdx.x==0) scale[r]=sc;
+    unsigned char* qr=q+(long)r*K;
+    for(int i=threadIdx.x;i<K;i+=blockDim.x){
+        float v=__half2float(xr[i])*inv; v=fminf(fmaxf(v,-448.f),448.f);
+        unsigned s2=(v<0.f)?0x80u:0u; float a=fabsf(v); unsigned c;
+        if(!(a>0.f)) c=0u; else if(a>=448.f) c=0x7Eu;
+        else { int e; float fr=frexpf(a,&e); int E=e+6;
+            if(E<1){ int m=(int)rintf(a*512.f); if(m>7)m=7; c=(unsigned)m; }
+            else { int m=(int)rintf((2.f*fr-1.f)*8.f); if(m>7){m=0;E+=1;} if(E>15){E=15;m=6;} c=(unsigned)((E<<3)|m); } }
+        qr[i]=(unsigned char)(s2|c);
+    }
+}
+extern "C" __global__ void fp8_quant_perrow_f32(
+    const float* __restrict__ x, unsigned char* __restrict__ q,
+    float* __restrict__ scale, int R, int K)
+{
+    int r=blockIdx.x; if(r>=R) return;
+    const float* xr=x+(long)r*K;
+    __shared__ float sm[256];
+    float am=0.f;
+    for(int i=threadIdx.x;i<K;i+=blockDim.x) am=fmaxf(am,fabsf(xr[i]));
+    sm[threadIdx.x]=am; __syncthreads();
+    for(int o=blockDim.x>>1;o>0;o>>=1){ if(threadIdx.x<o) sm[threadIdx.x]=fmaxf(sm[threadIdx.x],sm[threadIdx.x+o]); __syncthreads(); }
+    float sc=(sm[0]>0.f)?sm[0]/448.f:1.f; float inv=1.f/sc;
+    if(threadIdx.x==0) scale[r]=sc;
+    unsigned char* qr=q+(long)r*K;
+    for(int i=threadIdx.x;i<K;i+=blockDim.x){
+        float v=xr[i]*inv; v=fminf(fmaxf(v,-448.f),448.f);
+        unsigned s2=(v<0.f)?0x80u:0u; float a=fabsf(v); unsigned c;
+        if(!(a>0.f)) c=0u; else if(a>=448.f) c=0x7Eu;
+        else { int e; float fr=frexpf(a,&e); int E=e+6;
+            if(E<1){ int m=(int)rintf(a*512.f); if(m>7)m=7; c=(unsigned)m; }
+            else { int m=(int)rintf((2.f*fr-1.f)*8.f); if(m>7){m=0;E+=1;} if(E>15){E=15;m=6;} c=(unsigned)((E<<3)|m); } }
+        qr[i]=(unsigned char)(s2|c);
+    }
+}
+// post-GEMM rowcol dequant: D[r,c] *= xsc[r] * wsc[c]  (D [M,N] row-major).
+extern "C" __global__ void fp8_rowcol_scale_f32(
+    float* __restrict__ o, const float* __restrict__ xsc, const float* __restrict__ wsc, int M, int N)
+{
+    long e=(long)blockIdx.x*blockDim.x+threadIdx.x; long n=(long)M*N;
+    long st=(long)gridDim.x*blockDim.x;
+    for(;e<n;e+=st){ int r=(int)(e/N), c=(int)(e%N); o[e]*=xsc[r]*wsc[c]; }
+}
+
 extern "C" __global__ void fp8_quant(
     const __half* __restrict__ x, unsigned char* __restrict__ q,
     const float* __restrict__ sc, long n)
@@ -7447,6 +7506,47 @@ pub fn gemm_fp8(
         x_q.buffer.as_ref(), x_sc.buffer.as_ref(),
         w_q.buffer.as_ref(), w_sc.buffer.as_ref(),
         out.buffer.as_ref(), m, n, k, out_f32)?;
+    Ok(out)
+}
+
+/// Per-row e4m3 quant of an f16/f32 `[r,k]` tensor → `(q [r*k] bytes, scale [r] f32)`.
+/// Per-channel (weights, rows=n) / per-token (acts, rows=m) — the quality-
+/// preserving FP8 granularity (per-tensor crushed cosine to ~0.94).
+pub fn fp8_quant_perrow(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Result<(Tensor, Tensor)> {
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let q = Tensor::new(dev.alloc(r * k)?, vec![r * k], DType::U32);
+    let sc = Tensor::new(dev.alloc(r * 4)?, vec![r], DType::F32);
+    let kn = if x.dtype == DType::F32 { "fp8_quant_perrow_f32" } else { "fp8_quant_perrow" };
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", kn,
+        &[(x.buffer.as_ref(), x.offset), (q.buffer.as_ref(), 0), (sc.buffer.as_ref(), 0)],
+        &[i(r as i32), i(k as i32)], [r as u32, 1, 1], [256, 1, 1], 0, false)?;
+    Ok((q, sc))
+}
+
+/// FP8 e4m3 GEMM with PER-CHANNEL weight + PER-TOKEN act scales, folded as a
+/// post-pass (`D[r,c] *= xsc[r]·wsc[c]`) — sidesteps cuBLASLt's unsupported
+/// OUTER_VEC FP8 path. `x_q`/`x_sc` per-token (rows=m), `w_q`/`w_sc`
+/// per-channel (rows=n). Quality-preserving (cosine >0.98 typical). out[m,n] f32.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_fp8_perchan(
+    dev: &dyn Device,
+    x_q: &Tensor, x_sc: &Tensor,
+    w_q: &Tensor, w_sc: &Tensor,
+    m: usize, n: usize, k: usize,
+) -> Result<Tensor> {
+    let out = Tensor::empty(dev, vec![m, n], DType::F32)?;
+    // identity per-tensor scale (1.0) — the real per-channel/per-token scales
+    // are folded in the post-pass below. D_raw = Wq·Xq in f32.
+    let one = scalar_buf(dev, (1.0f32).to_bits())?;
+    dev.gemm_fp8(
+        x_q.buffer.as_ref(), one.as_ref(),
+        w_q.buffer.as_ref(), one.as_ref(),
+        out.buffer.as_ref(), m, n, k, true)?;
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fp8_rowcol_scale_f32",
+        &[(out.buffer.as_ref(), 0), (x_sc.buffer.as_ref(), x_sc.offset), (w_sc.buffer.as_ref(), w_sc.offset)],
+        &[i(m as i32), i(n as i32)],
+        [((m*n) as u32).div_ceil(256*4).max(1), 1, 1], [256, 1, 1], 0, false)?;
     Ok(out)
 }
 
