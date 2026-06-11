@@ -357,13 +357,18 @@ impl Device for CudaDevice {
         n: usize,
         k: usize,
         out_f32: bool,
+        d_scale: Option<&dyn DeviceBuffer>,
     ) -> Result<()> {
         let xb = x_pack.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_fp4: x_pack not CudaBuffer".into()))?;
         let xs = x_sf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_fp4: x_sf not CudaBuffer".into()))?;
         let wb = w_pack.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_fp4: w_pack not CudaBuffer".into()))?;
         let ws = w_sf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_fp4: w_sf not CudaBuffer".into()))?;
         let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_fp4: out not CudaBuffer".into()))?;
-        self.dev.gemm_cublaslt_fp4(xb.ptr, xs.ptr, wb.ptr, ws.ptr, ob.ptr, m, n, k, out_f32).map_err(dispatch_err)
+        let ds = match d_scale {
+            Some(t) => t.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_fp4: d_scale not CudaBuffer".into()))?.ptr,
+            None => 0u64,
+        };
+        self.dev.gemm_cublaslt_fp4(xb.ptr, xs.ptr, wb.ptr, ws.ptr, ob.ptr, m, n, k, out_f32, ds).map_err(dispatch_err)
     }
 
     fn gemm_fp8(

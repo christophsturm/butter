@@ -7068,6 +7068,47 @@ extern "C" __global__ void lt_fp4_quant_gs(
     }
 }
 
+// f32-input global-aware variant of lt_fp4_quant_gs (dense activations read
+// straight from the f32 residual stream; block scales relative to gs[0]).
+extern "C" __global__ void lt_fp4_quant_gs_f32(
+    const float* __restrict__ x, unsigned char* __restrict__ xp,
+    unsigned char* __restrict__ sf, const float* __restrict__ gs,
+    int R, int K)
+{
+    int KB=K/16;
+    long nb=(long)R*KB;
+    long b=(long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(b>=nb) return;
+    int r=(int)(b/KB), kb=(int)(b%KB);
+    const float* xb=x+(long)r*K+kb*16;
+    float v[16]; float am=0.f;
+    #pragma unroll
+    for(int i=0;i<16;i++){ v[i]=xb[i]; am=fmaxf(am,fabsf(v[i])); }
+    float ig=1.f/gs[0];
+    unsigned sc=enc_ue4m3((am/6.f)*ig);
+    if(sc==0u&&am>0.f) sc=1u;
+    float sd=dec_ue4m3(sc);
+    float inv=(sd>0.f)?(ig/sd):0.f;
+    int KB4=(KB+3)>>2;
+    long soff=(long)(r>>7)*(512L*KB4)+(long)(kb>>2)*512+(r&31)*16+((r>>5)&3)*4+(kb&3);
+    sf[soff]=(unsigned char)sc;
+    unsigned char* o=xp+((long)r*K+kb*16)/2;
+    #pragma unroll
+    for(int i=0;i<8;i++){
+        unsigned lo=enc_e2m1(v[2*i],inv), hi=enc_e2m1(v[2*i+1],inv);
+        o[i]=(unsigned char)(lo|(hi<<4));
+    }
+}
+// D-scale fold: dscale[0] = act_global * weight_global (both gs[0]).
+extern "C" __global__ void fp4_dscale(
+    const float* __restrict__ ga, const float* __restrict__ gw, float* __restrict__ d)
+{ if(threadIdx.x==0&&blockIdx.x==0) d[0]=ga[0]*gw[0]; }
+// post-GEMM per-tensor output scale by a device scalar (f32 or f16 out).
+extern "C" __global__ void fp4_apply_dscale_f32(float* __restrict__ o, const float* __restrict__ d, long n)
+{ long i=(long)blockIdx.x*blockDim.x+threadIdx.x; long st=(long)gridDim.x*blockDim.x; float s=d[0]; for(;i<n;i+=st) o[i]*=s; }
+extern "C" __global__ void fp4_apply_dscale_f16(__half* __restrict__ o, const float* __restrict__ d, long n)
+{ long i=(long)blockIdx.x*blockDim.x+threadIdx.x; long st=(long)gridDim.x*blockDim.x; float s=d[0]; for(;i<n;i+=st) o[i]=__float2half(__half2float(o[i])*s); }
+
 // Grouped variant of lt_fp4_quant_gs for the grouped block-scaled GEMM: the
 // packed e2m1 stays GLOBAL row-major (per-group A ptr = base + start*K/2),
 // but the ue4m3 scales land in a PER-GROUP swizzled blob addressed by the
@@ -7413,18 +7454,68 @@ pub fn gemm_fp8(
 /// the `lt_fp4_quant` format. Routes through the backend's cublasLt FP4 path
 /// (~4x the f16 tensor-core GEMM on GB10).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn gemm_fp4(
     dev: &dyn Device,
     x_pack: &Tensor, x_sf: &Tensor,
     w_pack: &Tensor, w_sf: &Tensor,
     m: usize, n: usize, k: usize, out_f32: bool,
+    d_scale: Option<&Tensor>,
 ) -> Result<Tensor> {
     let out = Tensor::empty(dev, vec![m, n], if out_f32 { DType::F32 } else { DType::F16 })?;
     dev.gemm_fp4(
         x_pack.buffer.as_ref(), x_sf.buffer.as_ref(),
         w_pack.buffer.as_ref(), w_sf.buffer.as_ref(),
-        out.buffer.as_ref(), m, n, k, out_f32)?;
+        out.buffer.as_ref(), m, n, k, out_f32, None)?;
+    if let Some(ds) = d_scale {
+        let l = |v: i64| v.to_le_bytes().to_vec();
+        let ne = (m * n) as i64;
+        let kn = if out_f32 { "fp4_apply_dscale_f32" } else { "fp4_apply_dscale_f16" };
+        dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", kn,
+            &[(out.buffer.as_ref(), 0), (ds.buffer.as_ref(), ds.offset)],
+            &[l(ne)], [((ne as u32).div_ceil(256*4)).max(1),1,1],[256,1,1],0,false)?;
+    }
     Ok(out)
+}
+
+/// Global-aware dense FP4 quant: per-TENSOR global keeps the ue4m3 block
+/// scales in normal range (block-amax/6 relative to the global) instead of
+/// the subnormal floor that wrecks small-magnitude dense weights (cosine
+/// 0.44 -> ~0.97). Returns (pack, sf, gs[2]=[global,unused]); the GEMM folds
+/// the act·weight globals back via its D-scale. f16 or f32 input.
+pub fn lt_fp4_quant_g(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Result<(Tensor, Tensor, Tensor)> {
+    if k % 32 != 0 { return Err(Error::Msg(format!("lt_fp4_quant_g: k {k} %32!=0"))); }
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let l = |v: i64| v.to_le_bytes().to_vec();
+    let kb = k / 16; let kb4 = kb.div_ceil(4);
+    let sf_bytes = r.div_ceil(128) * 512 * kb4;
+    // per-tensor global = amax over [r,k] -> nvfp4_gscale (gs[0]=amax/(6*448)).
+    let amax = Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
+        &[(x.buffer.as_ref(), x.offset), (amax.buffer.as_ref(), 0)],
+        &[l((r*k) as i64), i(1), i(0), 0f32.to_le_bytes().to_vec()],
+        [((r*k) as u32).div_ceil(256*64).max(1),1,1],[256,1,1],0,false)?;
+    let gs = Tensor::new(dev.alloc(8)?, vec![2], DType::F32);
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_gscale",
+        &[(amax.buffer.as_ref(),0),(gs.buffer.as_ref(),0)], &[], [1,1,1],[1,1,1],0,false)?;
+    let pack = Tensor::new(dev.alloc((r*k)/2)?, vec![(r*k)/2], DType::U32);
+    let sf = Tensor::new(dev.alloc_zeroed(sf_bytes)?, vec![sf_bytes], DType::U32);
+    let nb = (r*kb) as u32;
+    let kname = if x.dtype == DType::F32 { "lt_fp4_quant_gs_f32" } else { "lt_fp4_quant_gs" };
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", kname,
+        &[(x.buffer.as_ref(), x.offset), (pack.buffer.as_ref(),0), (sf.buffer.as_ref(),0), (gs.buffer.as_ref(),0)],
+        &[i(r as i32), i(k as i32)],
+        [nb.div_ceil(256),1,1],[256,1,1],0,false)?;
+    Ok((pack, sf, gs))
+}
+
+/// dscale[0] = act_global * weight_global (device, one f32) for the FP4 D-scale fold.
+pub fn fp4_dscale(dev: &dyn Device, ga: &Tensor, gw: &Tensor) -> Result<Tensor> {
+    let d = Tensor::new(dev.alloc(4)?, vec![1], DType::F32);
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fp4_dscale",
+        &[(ga.buffer.as_ref(), ga.offset), (gw.buffer.as_ref(), gw.offset), (d.buffer.as_ref(),0)],
+        &[], [1,1,1],[1,1,1],0,false)?;
+    Ok(d)
 }
 
 /// Quantize+fragment-pack MoE expert weights to NVFP4 on device.

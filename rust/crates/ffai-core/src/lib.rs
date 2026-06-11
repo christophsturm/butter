@@ -226,6 +226,7 @@ pub trait Device: Send + Sync {
         _n: usize,
         _k: usize,
         _out_f32: bool,
+        _d_scale: Option<&dyn DeviceBuffer>,
     ) -> Result<()> {
         Err(Error::Msg("gemm_fp4 (block-scaled NVFP4 GEMM) unsupported on this backend".into()))
     }

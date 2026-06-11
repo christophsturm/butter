@@ -1680,7 +1680,8 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         // quantize the SAME activation tensor — cache the last (input, dims) ->
         // (pack, sf). Holding the input Tensor keeps its buffer alive, so the
         // pointer-identity check can't alias a pool-recycled buffer.
-        let actq_slot: std::cell::RefCell<Option<(Tensor, usize, usize, Tensor, Tensor)>> =
+        let w4g: std::cell::RefCell<HashMap<String, Tensor>> = std::cell::RefCell::new(HashMap::new());
+        let actq_slot: std::cell::RefCell<Option<(Tensor, usize, usize, Tensor, Tensor, Tensor)>> =
             std::cell::RefCell::new(None);
         // Batched forward over an explicit token-id slice; writes states; returns
         // the argmax logits for the LAST token.
@@ -1824,29 +1825,34 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             };
             let qmm_fp4 = |xh: &Tensor, name: &str, rows: usize, m: usize, k: usize,
                            qs: &Tensor, sc: &Tensor| -> Tensor {
-                let (wp, wsf) = {
-                    if let Some(t) = w4lt.borrow().get(name) { t.clone() } else {
+                // GLOBAL-AWARE: per-tensor global keeps ue4m3 block scales in
+                // normal range (was the subnormal-floor bug = cosine 0.44);
+                // the act·weight globals fold back via the GEMM D-scale.
+                let (wp, wsf, wg) = {
+                    if let (Some(t), Some(g)) = (w4lt.borrow().get(name).cloned(), w4g.borrow().get(name).cloned()) { (t.0, t.1, g) } else {
                         let wf = pf!(3, (m * k) as f64, dequant_q4_off(d, qs, sc, m, k, DType::F16, 0).unwrap());
-                        let t = ffai_ops::lt_fp4_quant(d, &wf, m, k).unwrap();
-                        w4lt.borrow_mut().insert(name.to_string(), t.clone());
-                        t
+                        let (wp, wsf, wg) = ffai_ops::lt_fp4_quant_g(d, &wf, m, k).unwrap();
+                        w4lt.borrow_mut().insert(name.to_string(), (wp.clone(), wsf.clone()));
+                        w4g.borrow_mut().insert(name.to_string(), wg.clone());
+                        (wp, wsf, wg)
                     }
                 };
-                let (xp, xsf) = {
-                    let hit = actq_slot.borrow().as_ref().map_or(false, |(cx, cr, ck, _, _)|
+                let (xp, xsf, xg) = {
+                    let hit = actq_slot.borrow().as_ref().map_or(false, |(cx, cr, ck, _, _, _)|
                         *cr == rows && *ck == k && std::sync::Arc::ptr_eq(&cx.buffer, &xh.buffer));
                     if hit {
                         let s0 = actq_slot.borrow();
-                        let (_, _, _, p, f) = s0.as_ref().unwrap();
-                        (p.clone(), f.clone())
+                        let (_, _, _, p, f, g) = s0.as_ref().unwrap();
+                        (p.clone(), f.clone(), g.clone())
                     } else {
-                        let t = pf!(15, 0.0, ffai_ops::lt_fp4_quant(d, xh, rows, k).unwrap());
-                        *actq_slot.borrow_mut() = Some((xh.clone(), rows, k, t.0.clone(), t.1.clone()));
+                        let t = pf!(15, 0.0, ffai_ops::lt_fp4_quant_g(d, xh, rows, k).unwrap());
+                        *actq_slot.borrow_mut() = Some((xh.clone(), rows, k, t.0.clone(), t.1.clone(), t.2.clone()));
                         t
                     }
                 };
+                let dscale = ffai_ops::fp4_dscale(d, &xg, &wg).unwrap();
                 let o = pf!(2, 2.0 * rows as f64 * m as f64 * k as f64,
-                    ffai_ops::gemm_fp4(d, &xp, &xsf, &wp, &wsf, rows, m, k, true).unwrap()); // [rows, m] f32
+                    ffai_ops::gemm_fp4(d, &xp, &xsf, &wp, &wsf, rows, m, k, true, Some(&dscale)).unwrap()); // [rows, m] f32
                 if std::env::var("NEMOTRON_FP4_DENSE_DEBUG").is_ok() {
                     // numeric audit vs the f16 path (bench-only; huge max|d| = layout bug,
                     // few-percent rel = expected FP4 quantization noise)
@@ -3172,29 +3178,31 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 // Lt block-scaled FP4 shared expert (~4x the f16 GEMM rate):
                                 // weights packed once (cross-forward cache), activations
                                 // quantized per call. Quant-regime lever (changes numerics).
-                                let (uwq, uwsf) = {
+                                let (uwq, uwsf, uwg) = {
                                     let key = format!("{p}.shup.lt4");
-                                    if let Some(t) = w4lt.borrow().get(&key) { t.clone() } else {
+                                    if let (Some(t), Some(g)) = (w4lt.borrow().get(&key).cloned(), w4g.borrow().get(&key).cloned()) { (t.0, t.1, g) } else {
                                         let wf = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
-                                        let t = ffai_ops::lt_fp4_quant(d, &wf, *sm_up, *sk_up).unwrap();
-                                        w4lt.borrow_mut().insert(key, t.clone()); t
+                                        let (wp, wsf, wg) = ffai_ops::lt_fp4_quant_g(d, &wf, *sm_up, *sk_up).unwrap();
+                                        w4lt.borrow_mut().insert(key.clone(), (wp.clone(), wsf.clone())); w4g.borrow_mut().insert(key, wg.clone()); (wp, wsf, wg)
                                     }
                                 };
-                                let (dwq, dwsf) = {
+                                let (dwq, dwsf, dwg) = {
                                     let key = format!("{p}.shdn.lt4");
-                                    if let Some(t) = w4lt.borrow().get(&key) { t.clone() } else {
+                                    if let (Some(t), Some(g)) = (w4lt.borrow().get(&key).cloned(), w4g.borrow().get(&key).cloned()) { (t.0, t.1, g) } else {
                                         let wf = deq16(&format!("{p}.shdn"), sdqs, sdsc, *sm_dn, *sk_dn, 0);
-                                        let t = ffai_ops::lt_fp4_quant(d, &wf, *sm_dn, *sk_dn).unwrap();
-                                        w4lt.borrow_mut().insert(key, t.clone()); t
+                                        let (wp, wsf, wg) = ffai_ops::lt_fp4_quant_g(d, &wf, *sm_dn, *sk_dn).unwrap();
+                                        w4lt.borrow_mut().insert(key.clone(), (wp.clone(), wsf.clone())); w4g.borrow_mut().insert(key, wg.clone()); (wp, wsf, wg)
                                     }
                                 };
-                                let (xq, xsf) = pf!(15, 0.0, ffai_ops::lt_fp4_quant(d, &xnh, s, hid).unwrap());
+                                let (xq, xsf, xg) = pf!(15, 0.0, ffai_ops::lt_fp4_quant_g(d, &xnh, s, hid).unwrap());
+                                let ds_u = ffai_ops::fp4_dscale(d, &xg, &uwg).unwrap();
                                 let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
-                                    ffai_ops::gemm_fp4(d, &xq, &xsf, &uwq, &uwsf, s, *sm_up, *sk_up, false).unwrap());
+                                    ffai_ops::gemm_fp4(d, &xq, &xsf, &uwq, &uwsf, s, *sm_up, *sk_up, false, Some(&ds_u)).unwrap());
                                 let sa2 = pf!(3, 0.0, relu2_scale_f16(d, &sa, 1.0f32).unwrap());
-                                let (aq, asf) = pf!(15, 0.0, ffai_ops::lt_fp4_quant(d, &sa2, s, shared_inter).unwrap());
+                                let (aq, asf, ag) = pf!(15, 0.0, ffai_ops::lt_fp4_quant_g(d, &sa2, s, shared_inter).unwrap());
+                                let ds_d = ffai_ops::fp4_dscale(d, &ag, &dwg).unwrap();
                                 pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
-                                    ffai_ops::gemm_fp4(d, &aq, &asf, &dwq, &dwsf, s, *sm_dn, *sk_dn, false).unwrap())
+                                    ffai_ops::gemm_fp4(d, &aq, &asf, &dwq, &dwsf, s, *sm_dn, *sk_dn, false, Some(&ds_d)).unwrap())
                             } else {
                             let wsu = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
                             let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
