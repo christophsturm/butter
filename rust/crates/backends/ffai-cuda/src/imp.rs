@@ -402,6 +402,68 @@ impl Device for CudaDevice {
         self.dev.moe_grouped_cutlass(ab.ptr, wb.ptr, ob.ptr, group_rows, expert_ids, n, k).map_err(dispatch_err)
     }
 
+    fn moe_grouped_cutlass_fp4(
+        &self,
+        a: &dyn DeviceBuffer,
+        sfa: &dyn DeviceBuffer,
+        w: &dyn DeviceBuffer,
+        sfw: &dyn DeviceBuffer,
+        out: &dyn DeviceBuffer,
+        group_rows: &[i32],
+        expert_ids: &[i32],
+        sfa_off: &[i64],
+        alpha_vec: Option<&dyn DeviceBuffer>,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let dc = |b: &dyn DeviceBuffer, what: &str| -> Result<u64> {
+            Ok(b.as_any()
+                .downcast_ref::<CudaBuffer>()
+                .ok_or_else(|| Error::Msg(format!("moe_grouped_cutlass_fp4: {what} not CudaBuffer")))?
+                .ptr)
+        };
+        let (ap, sfap, wp, sfwp, op) =
+            (dc(a, "a")?, dc(sfa, "sfa")?, dc(w, "w")?, dc(sfw, "sfw")?, dc(out, "out")?);
+        let alp = match alpha_vec {
+            Some(b) => dc(b, "alpha_vec")?,
+            None => 0,
+        };
+        self.dev
+            .moe_grouped_cutlass_fp4(ap, sfap, wp, sfwp, op, group_rows, expert_ids, sfa_off, alp, n, k)
+            .map_err(dispatch_err)
+    }
+
+    fn moe_grouped_cutlass_fp4_prepare(
+        &self,
+        w: &dyn DeviceBuffer,
+        sfw: &dyn DeviceBuffer,
+        alpha: &dyn DeviceBuffer,
+        n_groups: usize,
+        n: usize,
+        k: usize,
+        max_m_total: usize,
+    ) -> Result<u64> {
+        let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fp4_prepare: w not CudaBuffer".into()))?;
+        let sb = sfw.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fp4_prepare: sfw not CudaBuffer".into()))?;
+        let al = alpha.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fp4_prepare: alpha not CudaBuffer".into()))?;
+        self.dev.moe_grouped_cutlass_fp4_prepare(wb.ptr, sb.ptr, al.ptr, n_groups, n, k, max_m_total).map_err(dispatch_err)
+    }
+
+    fn moe_grouped_cutlass_fp4_run(
+        &self,
+        handle: u64,
+        a: &dyn DeviceBuffer,
+        sfa: &dyn DeviceBuffer,
+        out: &dyn DeviceBuffer,
+        off_dev: &dyn DeviceBuffer,
+    ) -> Result<()> {
+        let ab = a.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fp4_run: a not CudaBuffer".into()))?;
+        let sb = sfa.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fp4_run: sfa not CudaBuffer".into()))?;
+        let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fp4_run: out not CudaBuffer".into()))?;
+        let fb = off_dev.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fp4_run: off not CudaBuffer".into()))?;
+        self.dev.moe_grouped_cutlass_fp4_run(handle, ab.ptr, sb.ptr, ob.ptr, fb.ptr).map_err(dispatch_err)
+    }
+
     fn gemm_tc_off(
         &self,
         x: &dyn DeviceBuffer, x_off: usize,

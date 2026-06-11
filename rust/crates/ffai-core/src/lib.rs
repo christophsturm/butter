@@ -269,6 +269,61 @@ pub trait Device: Send + Sync {
         Err(Error::Msg("moe_grouped_cutlass unsupported on this backend".into()))
     }
 
+    /// CUTLASS grouped block-scaled NVFP4 MoE GEMM: `out[t,n] = Σ_k a[t,k]·
+    /// w[eid(t)][n,k]` over sorted-token groups, both operands packed e2m1 +
+    /// ue4m3 block-16 scales in the canonical 512B-block swizzle. `a` packed
+    /// `[mt,K/2]` bytes, `sfa` per-group scale pool (group g's blob at byte
+    /// `sfa_off[g]`, group-LOCAL rows), `w`/`sfw` per-expert packed/scale
+    /// slabs, `out` f16 `[mt,N]`. `group_rows`/`expert_ids`/`sfa_off` are host
+    /// slices. Default errors; CUDA implements it via the AOT CUTLASS lib
+    /// (sm_120a/121a builds with CUTLASS_DIR).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_cutlass_fp4(
+        &self,
+        _a: &dyn DeviceBuffer,
+        _sfa: &dyn DeviceBuffer,
+        _w: &dyn DeviceBuffer,
+        _sfw: &dyn DeviceBuffer,
+        _out: &dyn DeviceBuffer,
+        _group_rows: &[i32],
+        _expert_ids: &[i32],
+        _sfa_off: &[i64],
+        _alpha_vec: Option<&dyn DeviceBuffer>, // device f32[n_groups] per-group scales
+        _n: usize,
+        _k: usize,
+    ) -> Result<()> {
+        Err(Error::Msg("moe_grouped_cutlass_fp4 unsupported on this backend".into()))
+    }
+
+    /// Prepare a persistent CUTLASS grouped-FP4 handle (device blob +
+    /// workspace + initialized GEMM; descriptors filled per call ON DEVICE).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_cutlass_fp4_prepare(
+        &self,
+        _w: &dyn DeviceBuffer,
+        _sfw: &dyn DeviceBuffer,
+        _alpha: &dyn DeviceBuffer,
+        _n_groups: usize,
+        _n: usize,
+        _k: usize,
+        _max_m_total: usize,
+    ) -> Result<u64> {
+        Err(Error::Msg("moe_grouped_cutlass_fp4_prepare unsupported on this backend".into()))
+    }
+
+    /// Run a prepared CUTLASS grouped-FP4 handle: one device fill kernel from
+    /// the router offsets + gemm.run. No host work, no per-call allocs.
+    fn moe_grouped_cutlass_fp4_run(
+        &self,
+        _handle: u64,
+        _a: &dyn DeviceBuffer,
+        _sfa: &dyn DeviceBuffer,
+        _out: &dyn DeviceBuffer,
+        _off_dev: &dyn DeviceBuffer,
+    ) -> Result<()> {
+        Err(Error::Msg("moe_grouped_cutlass_fp4_run unsupported on this backend".into()))
+    }
+
     /// Byte-offset variant of []: same semantics but each buffer
     /// pointer is advanced by its byte offset before the GEMM call. Used to
     /// write expert GEMM outputs into pre-allocated slabs without extra copies.

@@ -791,6 +791,17 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     // NVFP4 fragment-packed MoE weights (NEMOTRON_FP4_MOE): name → (wp, wsc, gw)
     let mut fp4w: HashMap<String, (Tensor, Tensor, Tensor)> = HashMap::new();
     let use_fp4_moe = std::env::var("NEMOTRON_FP4_MOE").is_ok();
+    // CUTLASS-layout NVFP4 MoE weights (NEMOTRON_CUTLASS_MOE=1 on top of
+    // FP4_MOE): name → (packed e2m1 slab, swizzled ue4m3 SF slab, per-expert
+    // globals). Feeds the grouped block-scaled CUTLASS GEMM instead of the
+    // hand-rolled mma.
+    let mut fp4w_cutlass: HashMap<String, (Tensor, Tensor, Tensor)> = HashMap::new();
+    // Persistent CUTLASS grouped-FP4 handles per layer: (up_handle, dn_handle,
+    // alpha_up, alpha_dn). Prepared lazily on first use; alpha buffers are
+    // fixed addresses the prepared blob points at (values rewritten per call).
+    let cutlass_handles: std::cell::RefCell<HashMap<String, (u64, u64, Tensor, Tensor)>> =
+        std::cell::RefCell::new(HashMap::new());
+    let use_fp4_cutlass_env = use_fp4_moe && std::env::var("NEMOTRON_CUTLASS_MOE").is_ok();
     let mut fw: HashMap<String, Vec<f32>> = HashMap::new(); // f32 weights used HOST-side
     let mut fwd: HashMap<String, Tensor> = HashMap::new(); // f32 weights RESIDENT on device
     let fd = |fwd: &mut HashMap<String, Tensor>, name: &str, v: &[f32], shape: Vec<usize>| {
@@ -1021,6 +1032,47 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     };
                     build("up_proj", inter, hid);
                     build("down_proj", hid, inter);
+                    // CUTLASS-layout NVFP4 weights (NEMOTRON_CUTLASS_MOE=1 on top
+                    // of FP4_MOE): linear packed e2m1 + per-expert canonical-
+                    // swizzle ue4m3 SF, quantized ONCE at setup from the
+                    // dequanted f16 (parallel to the fragment pack above).
+                    if use_fp4_cutlass_env {
+                        let mut buildc = |which: &str, n: usize, k: usize| {
+                            let key = format!("{p}.moe_{which}_fp4_cutlass");
+                            let kb4 = (k / 16).div_ceil(4);
+                            let sf_exp = n.div_ceil(128) * 512 * kb4;
+                            let (pack_len, sf_len, gw_len) = (n_exp * n * k / 2, n_exp * sf_exp, n_exp * 4); // bytes
+                            let cpath = cache_path(&format!("{key}.v2"));
+                            // disk-cache hit: upload the packed blobs directly.
+                            if let Ok(b) = std::fs::read(&cpath) {
+                                if b.len() == pack_len + sf_len + gw_len {
+                                    let wp = Tensor::new(d.upload(&b[..pack_len]).unwrap(), vec![pack_len], DType::U32);
+                                    let wsf = Tensor::new(d.upload(&b[pack_len..pack_len + sf_len]).unwrap(), vec![sf_len], DType::U32);
+                                    let gw = Tensor::new(d.upload(&b[pack_len + sf_len..]).unwrap(), vec![n_exp], DType::F32);
+                                    fp4w_cutlass.insert(key, (wp, wsf, gw));
+                                    return;
+                                }
+                            }
+                            let mut wh: Vec<f32> = Vec::with_capacity(n_exp * n * k);
+                            for e in 0..n_exp {
+                                wh.extend(g(&format!("{p}.mixer.experts.{e}.{which}.weight")));
+                            }
+                            let bytes = tb_f16(&wh);
+                            drop(wh);
+                            let wt = Tensor::new(d.upload(&bytes).unwrap(), vec![n_exp * n, k], DType::F16);
+                            drop(bytes);
+                            let (wp, wsf, gw) = ffai_ops::lt_fp4_quant_slab(d, &wt, n_exp, n, k).unwrap();
+                            // fill the cache (raw blob: pack ++ sf ++ gw)
+                            let mut blob = vec![0u8; pack_len + sf_len + gw_len];
+                            d.download(wp.buffer.as_ref(), &mut blob[..pack_len]).unwrap();
+                            d.download(wsf.buffer.as_ref(), &mut blob[pack_len..pack_len + sf_len]).unwrap();
+                            d.download(gw.buffer.as_ref(), &mut blob[pack_len + sf_len..]).unwrap();
+                            let _ = std::fs::write(&cpath, &blob);
+                            fp4w_cutlass.insert(key, (wp, wsf, gw));
+                        };
+                        buildc("up_proj", inter, hid);
+                        buildc("down_proj", hid, inter);
+                    }
                     // NEMOTRON_FP4_SHARED_FOLD=1: shared expert folded into the routed
                     // grouped GEMM as 2 extra always-selected groups. Up: shared up
                     // [2*inter, hid] appended as two [inter, hid] expert slabs. Down:
@@ -2199,6 +2251,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         //   CUTLASS grouped GEMM per up/down over the sorted tokens. Beats
                         //   cuBLAS per-expert on the skinny m≈96 shape (17.1 vs 15.7 TFLOP/s).
                         let use_cutlass_moe = is_cuda && std::env::var("NEMOTRON_CUTLASS_MOE").is_ok()
+                            && !use_fp4_moe
                             && !use_bgemm && !use_w4a16 && !use_grouped_gemm;
                         // NEMOTRON_Q4_GROUPED=1 (CUDA): Q4-NATIVE single-launch grouped MoE
                         //   GEMM (moe_q4_grouped_mma) — reads the model's signed Q4 weights
@@ -2524,6 +2577,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // (and the amax pass scans 6x fewer elements).
                             let fp4_direct = !fp4_sim && moe_dev.is_some() && xn_f16_router.is_some()
                                 && std::env::var("NEMOTRON_FP4_DIRECT_OFF").is_err()
+                                && !use_fp4_cutlass_env // CUTLASS path gathers in its own quant
                                 && fp4w.contains_key(&format!("{p}.moe_up_proj_fp4"));
                             let xs_in = if fp4_direct { xn_f16_router.as_ref().unwrap().clone() }
                                 else if fp4_sim { fp4rt(&xs_f16, mt, hid) } else { xs_f16.clone() };
@@ -2538,7 +2592,91 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // kills the separate shared up/down f16 GEMMs + relu2 + merge.
                             let fold_keys = fp4_moe && fp4_direct
                                 && fp4w.contains_key(&format!("{p}.moe_up_proj_fp4_fold"));
-                            if fold_keys {
+                            let fp4_cutlass = fp4_moe && use_fp4_cutlass_env
+                                && fp4w_cutlass.contains_key(&format!("{p}.moe_up_proj_fp4_cutlass"));
+                            let cutlass_dev = fp4_cutlass && std::env::var("NEMOTRON_CUTLASS_DEV").is_ok();
+                            if cutlass_dev {
+                                // ── device-descriptor CUTLASS grouped NVFP4 (zero host
+                                // work per call): persistent prepared handles per layer;
+                                // per call = grouped act quant (device sfa offsets) +
+                                // alpha refresh + ONE fill kernel + gemm.run, per
+                                // up/down. Groups = ALL n_exp experts (M=0 groups run
+                                // zero tiles). ────────────────────────────────────────
+                                let off_dev = off_dev_ref.unwrap();
+                                let (uwp, uwsf, ugw) = &fp4w_cutlass[&format!("{p}.moe_up_proj_fp4_cutlass")];
+                                let (dwp, dwsf, dgw) = &fp4w_cutlass[&format!("{p}.moe_down_proj_fp4_cutlass")];
+                                if !cutlass_handles.borrow().contains_key(p.as_str()) {
+                                    let alpha_u = Tensor::new(d.alloc_zeroed(n_exp * 4).unwrap(), vec![n_exp], DType::F32);
+                                    let alpha_d = Tensor::new(d.alloc_zeroed(n_exp * 4).unwrap(), vec![n_exp], DType::F32);
+                                    let hu = d.moe_grouped_cutlass_fp4_prepare(
+                                        uwp.buffer.as_ref(), uwsf.buffer.as_ref(), alpha_u.buffer.as_ref(),
+                                        n_exp, inter, hid, mt).unwrap();
+                                    let hd = d.moe_grouped_cutlass_fp4_prepare(
+                                        dwp.buffer.as_ref(), dwsf.buffer.as_ref(), alpha_d.buffer.as_ref(),
+                                        n_exp, hid, inter, mt).unwrap();
+                                    cutlass_handles.borrow_mut().insert(p.clone(), (hu, hd, alpha_u, alpha_d));
+                                }
+                                let hb = cutlass_handles.borrow();
+                                let (hu, hd, alpha_u, alpha_d) = hb.get(p.as_str()).unwrap();
+                                // gather-on-read up-quant from the UNGATHERED xn — kills the
+                                // explicit xs gather pass; amax scans s rows instead of mt.
+                                let (_, st_dev0, _) = moe_dev.as_ref().unwrap();
+                                let (ap, asf, ags) = if let Some(xnr) = xn_f16_router.as_ref() {
+                                    pf!(15, 0.0, ffai_ops::lt_fp4_quant_grouped_dev(d, xnr, mt, hid, off_dev, n_exp, 0, 0.0, Some((st_dev0, s))).unwrap())
+                                } else {
+                                    pf!(15, 0.0, ffai_ops::lt_fp4_quant_grouped_dev(d, &xs_in, mt, hid, off_dev, n_exp, 0, 0.0, None).unwrap())
+                                };
+                                ffai_ops::fp4_group_alpha_id(d, &ags, ugw, alpha_u, n_exp).unwrap();
+                                let up_out = Tensor::empty(d, vec![mt, inter], DType::F16).unwrap();
+                                pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                    d.moe_grouped_cutlass_fp4_run(*hu, ap.buffer.as_ref(), asf.buffer.as_ref(), up_out.buffer.as_ref(), off_dev.buffer.as_ref()).unwrap());
+                                // relu²·(1/256) fused into the down-quant (no standalone pass)
+                                let (bp, bsf, bgs) = pf!(15, 0.0,
+                                    ffai_ops::lt_fp4_quant_grouped_dev(d, &up_out, mt, inter, off_dev, n_exp, 1, inv, None).unwrap());
+                                ffai_ops::fp4_group_alpha_id(d, &bgs, dgw, alpha_d, n_exp).unwrap();
+                                let dn_out = Tensor::empty(d, vec![mt, hid], DType::F16).unwrap();
+                                pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                    d.moe_grouped_cutlass_fp4_run(*hd, bp.buffer.as_ref(), bsf.buffer.as_ref(), dn_out.buffer.as_ref(), off_dev.buffer.as_ref()).unwrap());
+                                drop(hb);
+                                let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
+                                let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
+                                moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
+                            } else if fp4_cutlass {
+                                // ── CUTLASS grouped NVFP4 GEMM (NEMOTRON_CUTLASS_MOE=1
+                                // on top of FP4_MOE) ──────────────────────────────────
+                                // Host group descriptors from the device routing offsets
+                                // (one small [n_exp+1] dl per E-layer; device-side build
+                                // is a graph-safety follow-up), CUTLASS-layout act quant
+                                // (linear e2m1 + per-group swizzled SF), ONE grouped
+                                // block-scaled GEMM per up/down, relu²·(1/256) between,
+                                // then the same det-scatter as the mma path.
+                                let off_dev = off_dev_ref.unwrap();
+                                let mut ob = vec![0u8; (n_exp + 1) * 4];
+                                d.download(off_dev.buffer.as_ref(), &mut ob).unwrap();
+                                let offs: Vec<usize> = ob.chunks(4)
+                                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect();
+                                let mut g_starts_c: Vec<usize> = vec![0];
+                                let mut eids_c: Vec<usize> = Vec::new();
+                                for e in 0..n_exp {
+                                    if offs[e + 1] > offs[e] { eids_c.push(e); g_starts_c.push(offs[e + 1]); }
+                                }
+                                let (uwp, uwsf, ugw) = &fp4w_cutlass[&format!("{p}.moe_up_proj_fp4_cutlass")];
+                                let (dwp, dwsf, dgw) = &fp4w_cutlass[&format!("{p}.moe_down_proj_fp4_cutlass")];
+                                let (ap, asf, aoff, ags) = pf!(15, 0.0,
+                                    ffai_ops::lt_fp4_quant_grouped(d, &xs_in, mt, hid, &g_starts_c).unwrap());
+                                let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                    ffai_ops::moe_grouped_gemm_cutlass_fp4(d, &ap, &asf, &aoff, &ags, uwp, uwsf, ugw, &g_starts_c, &eids_c, inter, hid).unwrap());
+                                let a2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                                let (bp, bsf, boff, bgs) = pf!(15, 0.0,
+                                    ffai_ops::lt_fp4_quant_grouped(d, &a2, mt, inter, &g_starts_c).unwrap());
+                                let dn_out = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                    ffai_ops::moe_grouped_gemm_cutlass_fp4(d, &bp, &bsf, &boff, &bgs, dwp, dwsf, dgw, &g_starts_c, &eids_c, hid, inter).unwrap());
+                                let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
+                                let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
+                                moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
+                            } else if fold_keys {
                                 let (uwp, uwsc, ugw) = &fp4w[&format!("{p}.moe_up_proj_fp4_fold")];
                                 let (dwp, dwsc, dgw) = &fp4w[&format!("{p}.moe_down_proj_fp4_fold")];
                                 let amax_dn = Tensor::new(d.alloc_zeroed(4).unwrap(), vec![1], DType::U32);

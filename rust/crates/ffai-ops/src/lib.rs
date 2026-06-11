@@ -44,7 +44,7 @@ fn scalar_buf(dev: &dyn Device, bits: u32) -> Result<std::sync::Arc<dyn ffai_cor
 }
 
 mod ssd_scan;
-pub use ssd_scan::{ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_strided};
+pub use ssd_scan::ssm_prefill_scan_ssd;
 
 mod ssd_scan_portable;
 pub use ssd_scan_portable::ssm_prefill_scan_ssd_portable;
@@ -6565,6 +6565,135 @@ extern "C" __global__ void lt_fp4_quant(
         o[i]=(unsigned char)(lo|(hi<<4));
     }
 }
+
+// nvfp4_gscale: amax bits -> [global, inv_global] (one thread). global =
+// amax/(6*448) (same convention as nvfp4_globals); 1.0 when amax == 0.
+// Word 0 feeds the GEMM's per-group alpha; word 1 feeds the quant kernels.
+extern "C" __global__ void nvfp4_gscale(
+    const unsigned* __restrict__ amax_bits, float* __restrict__ g)
+{
+    float a=__uint_as_float(*amax_bits);
+    float v=a/6.f/448.f;
+    v=(v>0.f)?v:1.f;
+    g[0]=v; g[1]=1.f/v;
+}
+
+// fp4_sfa_offsets: device build of the per-group SFA byte offsets from the
+// router offsets — sfa_off[g] = (sum_{j<g} ceil(M_j/128)) * 512 * ceil(K/64).
+// Single block, serial prefix (n_groups <= a few hundred).
+extern "C" __global__ void fp4_sfa_offsets(
+    const unsigned* __restrict__ off, long long* __restrict__ sfa_off,
+    int n_groups, int kb4)
+{
+    if(threadIdx.x!=0||blockIdx.x!=0) return;
+    long long acc=0;
+    for(int g=0; g<n_groups; ++g){
+        sfa_off[g]=acc*512LL*kb4;
+        unsigned m=off[g+1]-off[g];
+        acc+=(long long)((m+127)/128);
+    }
+}
+
+// fp4_group_alpha_id: identity-expert variant — alpha[g] = gA[0] * gw[g].
+extern "C" __global__ void fp4_group_alpha_id(
+    const float* __restrict__ gA, const float* __restrict__ gw,
+    float* __restrict__ alpha, int n)
+{
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n) alpha[i]=gA[0]*gw[i];
+}
+
+// fp4_group_alpha: per-group GEMM output scale alpha[g] = gA[0] * gw[eid[g]]
+// (activation per-call global x expert weight global) — folds both per-tensor
+// globals back into the grouped GEMM epilogue, all device-side.
+extern "C" __global__ void fp4_group_alpha(
+    const float* __restrict__ gA, const float* __restrict__ gw,
+    const int* __restrict__ eids, float* __restrict__ alpha, int n)
+{
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n) alpha[i]=gA[0]*gw[eids[i]];
+}
+
+// lt_fp4_quant + per-tensor global: identical layout to lt_fp4_quant but the
+// block scale is encoded RELATIVE to gs[0] (sc = enc_ue4m3((amax/6)/global)),
+// keeping the ue4m3 codes centered in the normal range instead of the
+// subnormal floor (the no-global recipe loses scale precision when block
+// amaxes are small, e.g. Q4-dequanted weights). Effective block scale =
+// dec_ue4m3(sc) * global — the GEMM multiplies global back in via alpha.
+extern "C" __global__ void lt_fp4_quant_gs(
+    const __half* __restrict__ x, unsigned char* __restrict__ xp,
+    unsigned char* __restrict__ sf, const float* __restrict__ gs,
+    int R, int K)
+{
+    int KB=K/16;
+    long nb=(long)R*KB;
+    long b=(long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(b>=nb) return;
+    int r=(int)(b/KB), kb=(int)(b%KB);
+    const __half* xb=x+(long)r*K+kb*16;
+    float v[16]; float am=0.f;
+    #pragma unroll
+    for(int i=0;i<16;i++){ v[i]=__half2float(xb[i]); am=fmaxf(am,fabsf(v[i])); }
+    float ig=1.f/gs[0];
+    unsigned sc=enc_ue4m3((am/6.f)*ig);
+    if(sc==0u&&am>0.f) sc=1u;
+    float sd=dec_ue4m3(sc);
+    float inv=(sd>0.f)?(ig/sd):0.f;
+    int KB4=(KB+3)>>2;
+    long soff=(long)(r>>7)*(512L*KB4)+(long)(kb>>2)*512+(r&31)*16+((r>>5)&3)*4+(kb&3);
+    sf[soff]=(unsigned char)sc;
+    unsigned char* o=xp+((long)r*K+kb*16)/2;
+    #pragma unroll
+    for(int i=0;i<8;i++){
+        unsigned lo=enc_e2m1(v[2*i],inv), hi=enc_e2m1(v[2*i+1],inv);
+        o[i]=(unsigned char)(lo|(hi<<4));
+    }
+}
+
+// Grouped variant of lt_fp4_quant_gs for the grouped block-scaled GEMM: the
+// packed e2m1 stays GLOBAL row-major (per-group A ptr = base + start*K/2),
+// but the ue4m3 scales land in a PER-GROUP swizzled blob addressed by the
+// group-LOCAL row (each group's SF tensor must start at row 0 of its own
+// 128-row-stripe layout). g_starts = device [n_groups] start rows
+// (contiguous coverage of 0..R, sorted ascending); sfa_off = device
+// [n_groups] BYTE offsets of each group's blob inside sf. gs = [global,
+// inv_global] from nvfp4_gscale (per-call activation global).
+extern "C" __global__ void lt_fp4_quant_grouped(
+    const __half* __restrict__ x, unsigned char* __restrict__ xp,
+    unsigned char* __restrict__ sf, const int* __restrict__ g_starts,
+    const long long* __restrict__ sfa_off, const float* __restrict__ gs,
+    const unsigned* __restrict__ st,
+    int n_groups, int R, int K, int act_mode, float act_scale, int use_st)
+{
+    int KB=K/16;
+    long nb=(long)R*KB;
+    long b=(long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(b>=nb) return;
+    int r=(int)(b/KB), kb=(int)(b%KB);
+    // largest g with g_starts[g] <= r (binary search; groups contiguous)
+    int gl=0, gh=n_groups-1;
+    while(gl<gh){ int gm=(gl+gh+1)>>1; if(g_starts[gm]<=r) gl=gm; else gh=gm-1; }
+    int lr=r-g_starts[gl];
+    int sr = use_st ? (int)st[r] : r;   // gather-on-read from the ungathered source
+    const __half* xb=x+(long)sr*K+kb*16;
+    float v[16]; float am=0.f;
+    #pragma unroll
+    for(int i=0;i<16;i++){ v[i]=fp4_act(__half2float(xb[i]),act_mode,act_scale); am=fmaxf(am,fabsf(v[i])); }
+    float ig=gs[1];
+    unsigned sc=enc_ue4m3((am/6.f)*ig);
+    if(sc==0u&&am>0.f) sc=1u;
+    float sd=dec_ue4m3(sc);
+    float inv=(sd>0.f)?(ig/sd):0.f;
+    int KB4=(KB+3)>>2;
+    long soff=(long long)sfa_off[gl]+(long)(lr>>7)*(512L*KB4)+(long)(kb>>2)*512+(lr&31)*16+((lr>>5)&3)*4+(kb&3);
+    sf[soff]=(unsigned char)sc;
+    unsigned char* o=xp+((long)r*K+kb*16)/2;
+    #pragma unroll
+    for(int i=0;i<8;i++){
+        unsigned lo=enc_e2m1(v[2*i],inv), hi=enc_e2m1(v[2*i+1],inv);
+        o[i]=(unsigned char)(lo|(hi<<4));
+    }
+}
 "#;
 
 /// Extend routed MoE descriptors (st/sw/offsets) with two identity groups
@@ -6608,6 +6737,213 @@ pub fn lt_fp4_quant(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Result<
         &[i(r as i32), i(k as i32)],
         [nb.div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
     Ok((pack, sf))
+}
+
+/// Grouped-activation variant of [`lt_fp4_quant`] feeding the CUTLASS grouped
+/// block-scaled GEMM: quantizes the sorted-token f16 `x [mt, k]` to packed
+/// e2m1 `[mt*k/2]` bytes (global row-major) + a per-group swizzled ue4m3
+/// scale pool where group g's blob (group-LOCAL rows, padded to 128-row
+/// stripes, zero-seeded) starts at byte `sfa_off[g]`. A per-call activation
+/// GLOBAL (amax/(6·448), dynamic, device-computed — no host sync) centers the
+/// block scales in the ue4m3 normal range; the GEMM folds it back in via the
+/// per-group alpha (see [`moe_grouped_gemm_cutlass_fp4`]). `g_starts` has
+/// `n_groups+1` entries (`g_starts[n_groups] == mt`). Returns
+/// `(pack, sf, sfa_off, gs)` — `gs` = device `[global, inv_global]` f32 pair.
+pub fn lt_fp4_quant_grouped(
+    dev: &dyn Device, x: &Tensor, mt: usize, k: usize, g_starts: &[usize],
+) -> Result<(Tensor, Tensor, Vec<i64>, Tensor)> {
+    if k % 32 != 0 { return Err(Error::Msg(format!("lt_fp4_quant_grouped: k {k} %32!=0"))); }
+    let n_groups = g_starts.len() - 1;
+    let kb = k / 16;
+    let kb4 = kb.div_ceil(4);
+    let mut sfa_off: Vec<i64> = Vec::with_capacity(n_groups);
+    let mut sf_bytes: i64 = 0;
+    for g in 0..n_groups {
+        sfa_off.push(sf_bytes);
+        let m = g_starts[g + 1] - g_starts[g];
+        sf_bytes += (m.div_ceil(128) * 512 * kb4) as i64;
+    }
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let l = |v: i64| v.to_le_bytes().to_vec();
+    // per-call activation global: amax over the whole [mt,k] then amax→scale.
+    let amax = Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
+        &[(x.buffer.as_ref(), x.offset), (amax.buffer.as_ref(), 0)],
+        &[l((mt * k) as i64), i(1), i(0), 0f32.to_le_bytes().to_vec()],
+        [((mt * k) as u32).div_ceil(256 * 64).max(1), 1, 1], [256, 1, 1], 0, false)?;
+    let gs = Tensor::new(dev.alloc(8)?, vec![2], DType::F32);
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_gscale",
+        &[(amax.buffer.as_ref(), 0), (gs.buffer.as_ref(), 0)],
+        &[], [1, 1, 1], [1, 1, 1], 0, false)?;
+    let pack = Tensor::new(dev.alloc((mt * k) / 2)?, vec![(mt * k) / 2], DType::U32);
+    let sf = Tensor::new(dev.alloc_zeroed(sf_bytes as usize)?, vec![sf_bytes as usize], DType::U32);
+    let starts_b: Vec<u8> = g_starts[..n_groups].iter().flat_map(|&s| (s as i32).to_le_bytes()).collect();
+    let offs_b: Vec<u8> = sfa_off.iter().flat_map(|&o| o.to_le_bytes()).collect();
+    let starts_d = Tensor::new(dev.upload(&starts_b)?, vec![n_groups], DType::U32);
+    let offs_d = Tensor::new(dev.upload(&offs_b)?, vec![n_groups * 2], DType::U32);
+    let nb = (mt * kb) as u32;
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "lt_fp4_quant_grouped",
+        &[(x.buffer.as_ref(), x.offset), (pack.buffer.as_ref(), 0), (sf.buffer.as_ref(), 0),
+          (starts_d.buffer.as_ref(), 0), (offs_d.buffer.as_ref(), 0), (gs.buffer.as_ref(), 0),
+          (gs.buffer.as_ref(), 0)],
+        &[i(n_groups as i32), i(mt as i32), i(k as i32), i(0), 0f32.to_le_bytes().to_vec(), i(0)],
+        [nb.div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+    Ok((pack, sf, sfa_off, gs))
+}
+
+/// Quantize a contiguous f16 expert slab `[n_exp*n, k]` to per-expert
+/// block-scaled NVFP4 in the CUTLASS/cuBLASLt canonical layout: per-expert
+/// packed e2m1 (`n*k/2` bytes each, contiguous) + per-expert swizzled ue4m3
+/// scales (`ceil(n/128)*512*ceil(k/64)` bytes each, contiguous, zero-seeded)
+/// + per-expert GLOBALS `gw [n_exp]` f32 (amax/(6·448) — keeps the block
+/// scales in the ue4m3 normal range; the GEMM folds `gw` back in via the
+/// per-group alpha). One quant dispatch per expert so every expert's SF blob
+/// is laid out from local row 0 (an `[n_exp*n, k]` whole-slab quant would
+/// misalign stripes whenever `n % 128 != 0`). Setup-time only.
+pub fn lt_fp4_quant_slab(
+    dev: &dyn Device, w: &Tensor, n_exp: usize, n: usize, k: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    if k % 32 != 0 { return Err(Error::Msg(format!("lt_fp4_quant_slab: k {k} %32!=0"))); }
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let l = |v: i64| v.to_le_bytes().to_vec();
+    let kb = k / 16;
+    let kb4 = kb.div_ceil(4);
+    let sf_exp = n.div_ceil(128) * 512 * kb4;
+    let pack_exp = n * k / 2;
+    // per-expert globals (same two passes as the fragment-pack setup)
+    let amax = Tensor::new(dev.alloc_zeroed(n_exp * 4)?, vec![n_exp], DType::U32);
+    let gw = Tensor::empty(dev, vec![n_exp], DType::F32)?;
+    let slab = (n * k) as i64;
+    let total_elems = (n_exp * n * k) as u32;
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
+        &[(w.buffer.as_ref(), w.offset), (amax.buffer.as_ref(), 0)],
+        &[l(slab), i(n_exp as i32), i(0), 0f32.to_le_bytes().to_vec()],
+        [total_elems.div_ceil(256 * 8), 1, 1], [256, 1, 1], 0, false)?;
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_globals",
+        &[(amax.buffer.as_ref(), 0), (gw.buffer.as_ref(), 0)],
+        &[i(n_exp as i32)],
+        [(n_exp as u32).div_ceil(64), 1, 1], [64, 1, 1], 0, false)?;
+    let pack = Tensor::new(dev.alloc(n_exp * pack_exp)?, vec![n_exp * pack_exp], DType::U32);
+    let sf = Tensor::new(dev.alloc_zeroed(n_exp * sf_exp)?, vec![n_exp * sf_exp], DType::U32);
+    let nb = (n * kb) as u32;
+    for e in 0..n_exp {
+        dev.dispatch_raw_cuda(
+            MOE_FP4_SRC, "moe_fp4.cu", "lt_fp4_quant_gs",
+            &[(w.buffer.as_ref(), w.offset + e * n * k * 2),
+              (pack.buffer.as_ref(), e * pack_exp), (sf.buffer.as_ref(), e * sf_exp),
+              (gw.buffer.as_ref(), e * 4)],
+            &[i(n as i32), i(k as i32)],
+            [nb.div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+    }
+    Ok((pack, sf, gw))
+}
+
+/// Device-descriptor variant of [`lt_fp4_quant_grouped`]: per-group SFA
+/// offsets are computed ON DEVICE from the router offsets (`off_dev`, u32
+/// `[n_groups+1]`) — no host offsets, no uploads, graph-safe. The SFA pool is
+/// sized worst-case (`mt/128 + n_groups` stripes). Returns `(pack, sf, gs)`;
+/// the GEMM run derives the same per-group offsets from `off_dev`.
+pub fn lt_fp4_quant_grouped_dev(
+    dev: &dyn Device, x: &Tensor, mt: usize, k: usize, off_dev: &Tensor, n_groups: usize,
+    act_mode: i32, act_scale: f32,
+    gather_st: Option<(&Tensor, usize)>,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    if k % 32 != 0 { return Err(Error::Msg(format!("lt_fp4_quant_grouped_dev: k {k} %32!=0"))); }
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let l = |v: i64| v.to_le_bytes().to_vec();
+    let kb = k / 16;
+    let kb4 = kb.div_ceil(4);
+    let sf_bytes = (mt.div_ceil(128) + n_groups) * 512 * kb4; // worst-case stripes
+    let amax_rows = gather_st.map(|(_, s_rows)| s_rows).unwrap_or(mt);
+    let amax = Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
+        &[(x.buffer.as_ref(), x.offset), (amax.buffer.as_ref(), 0)],
+        &[l((amax_rows * k) as i64), i(1), i(act_mode), act_scale.to_le_bytes().to_vec()],
+        [((amax_rows * k) as u32).div_ceil(256 * 64).max(1), 1, 1], [256, 1, 1], 0, false)?;
+    let gs = Tensor::new(dev.alloc(8)?, vec![2], DType::F32);
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_gscale",
+        &[(amax.buffer.as_ref(), 0), (gs.buffer.as_ref(), 0)],
+        &[], [1, 1, 1], [1, 1, 1], 0, false)?;
+    let sfa_off = Tensor::new(dev.alloc(n_groups * 8)?, vec![n_groups * 2], DType::U32);
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "fp4_sfa_offsets",
+        &[(off_dev.buffer.as_ref(), off_dev.offset), (sfa_off.buffer.as_ref(), 0)],
+        &[i(n_groups as i32), i(kb4 as i32)],
+        [1, 1, 1], [1, 1, 1], 0, false)?;
+    let pack = Tensor::new(dev.alloc((mt * k) / 2)?, vec![(mt * k) / 2], DType::U32);
+    let sf = Tensor::new(dev.alloc_zeroed(sf_bytes)?, vec![sf_bytes], DType::U32);
+    let nb = (mt * kb) as u32;
+    // off_dev doubles as g_starts (u32 values, n_groups+1 entries; the kernel
+    // binary-searches the first n_groups).
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "lt_fp4_quant_grouped",
+        &[(x.buffer.as_ref(), x.offset), (pack.buffer.as_ref(), 0), (sf.buffer.as_ref(), 0),
+          (off_dev.buffer.as_ref(), off_dev.offset), (sfa_off.buffer.as_ref(), 0), (gs.buffer.as_ref(), 0),
+          match gather_st { Some((t, _)) => (t.buffer.as_ref(), t.offset), None => (gs.buffer.as_ref(), 0) }],
+        &[i(n_groups as i32), i(mt as i32), i(k as i32), i(act_mode), act_scale.to_le_bytes().to_vec(),
+          i(if gather_st.is_some() { 1 } else { 0 })],
+        [nb.div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+    Ok((pack, sf, gs))
+}
+
+/// Per-group alpha for the identity-expert device path: alpha[g] = gs[0]*gw[g],
+/// written into the PERSISTENT `alpha` buffer the prepared handle points at.
+pub fn fp4_group_alpha_id(dev: &dyn Device, gs: &Tensor, gw: &Tensor, alpha: &Tensor, n: usize) -> Result<()> {
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "fp4_group_alpha_id",
+        &[(gs.buffer.as_ref(), gs.offset), (gw.buffer.as_ref(), gw.offset), (alpha.buffer.as_ref(), 0)],
+        &[i(n as i32)],
+        [(n as u32).div_ceil(64), 1, 1], [64, 1, 1], 0, false)
+}
+
+/// CUTLASS grouped block-scaled NVFP4 MoE GEMM — `out[t,n](f16) = Σ_k
+/// A[t,k]·W[eid][n,k]` over sorted-token groups with BOTH operands in packed
+/// e2m1 + swizzled ue4m3 block-16 scales. `a_pack`/`a_sf`/`sfa_off`/`a_gs`
+/// from [`lt_fp4_quant_grouped`]; `w_pack`/`w_sf`/`w_gw` from
+/// [`lt_fp4_quant_slab`]. The per-tensor globals are folded back in through
+/// the GEMM's per-group alpha (`gA·gw[eid]`, built device-side — no host
+/// sync). `g_starts[g]..g_starts[g+1]` = group g's token rows;
+/// `expert_ids[g]` selects the weight slab. ONE GEMM launch for all groups.
+/// Returns `out [mt, n]` f16. CUDA + CUTLASS_DIR sm_120a/121a build only.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_gemm_cutlass_fp4(
+    dev: &dyn Device,
+    a_pack: &Tensor, a_sf: &Tensor, sfa_off: &[i64], a_gs: &Tensor,
+    w_pack: &Tensor, w_sf: &Tensor, w_gw: &Tensor,
+    g_starts: &[usize], expert_ids: &[usize],
+    n: usize, k: usize,
+) -> Result<Tensor> {
+    let n_active = expert_ids.len();
+    let mt = g_starts.last().copied().unwrap_or(0);
+    let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
+    if n_active == 0 || mt == 0 { return Ok(out); }
+    let group_rows: Vec<i32> = (0..n_active).map(|g| (g_starts[g + 1] - g_starts[g]) as i32).collect();
+    let eids: Vec<i32> = expert_ids.iter().map(|&e| e as i32).collect();
+    // device per-group alpha = gA[0] * gw[eid[g]]
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let eids_b: Vec<u8> = eids.iter().flat_map(|&e| e.to_le_bytes()).collect();
+    let eids_d = Tensor::new(dev.upload(&eids_b)?, vec![n_active], DType::U32);
+    let alpha = Tensor::empty(dev, vec![n_active], DType::F32)?;
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "fp4_group_alpha",
+        &[(a_gs.buffer.as_ref(), a_gs.offset), (w_gw.buffer.as_ref(), w_gw.offset),
+          (eids_d.buffer.as_ref(), 0), (alpha.buffer.as_ref(), 0)],
+        &[i(n_active as i32)],
+        [(n_active as u32).div_ceil(64), 1, 1], [64, 1, 1], 0, false)?;
+    dev.moe_grouped_cutlass_fp4(
+        a_pack.buffer.as_ref(), a_sf.buffer.as_ref(),
+        w_pack.buffer.as_ref(), w_sf.buffer.as_ref(),
+        out.buffer.as_ref(), &group_rows, &eids, sfa_off,
+        Some(alpha.buffer.as_ref()), n, k)?;
+    Ok(out)
 }
 
 /// Quantize an f16 tensor to e4m3 with a dynamic per-tensor scale.
