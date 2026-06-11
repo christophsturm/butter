@@ -1021,6 +1021,59 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     };
                     build("up_proj", inter, hid);
                     build("down_proj", hid, inter);
+                    // NEMOTRON_FP4_SHARED_FOLD=1: shared expert folded into the routed
+                    // grouped GEMM as 2 extra always-selected groups. Up: shared up
+                    // [2*inter, hid] appended as two [inter, hid] expert slabs. Down:
+                    // shared down [hid, 2*inter] K-SPLIT into two [hid, inter] slabs
+                    // (their scatter-adds sum to the full K=2*inter GEMM).
+                    if std::env::var("NEMOTRON_FP4_SHARED_FOLD").is_ok() {
+                        let mut buildf = |which: &str, n: usize, k: usize, split_k: bool| {
+                            let key = format!("{p}.moe_{which}_fp4_fold");
+                            let ne = n_exp + 2;
+                            let (kt2, nt2) = (k / 64, n / 8);
+                            let (wp_len, wsc_len) = (ne * nt2 * kt2 * 32 * 2, ne * nt2 * kt2 * 8);
+                            let cpath = cache_path(&format!("{key}.v1"));
+                            if let Ok(b) = std::fs::read(&cpath) {
+                                let expect = (wp_len + wsc_len + ne) * 4;
+                                if b.len() == expect {
+                                    let wp = Tensor::new(d.upload(&b[..wp_len * 4]).unwrap(), vec![wp_len], DType::U32);
+                                    let wsc = Tensor::new(d.upload(&b[wp_len * 4..(wp_len + wsc_len) * 4]).unwrap(), vec![wsc_len], DType::U32);
+                                    let gw = Tensor::new(d.upload(&b[(wp_len + wsc_len) * 4..]).unwrap(), vec![ne], DType::F32);
+                                    fp4w.insert(key, (wp, wsc, gw));
+                                    return;
+                                }
+                            }
+                            let mut wh: Vec<f32> = Vec::with_capacity(ne * n * k);
+                            for e in 0..n_exp {
+                                wh.extend(g(&format!("{p}.mixer.experts.{e}.{which}.weight")));
+                            }
+                            let shw: Vec<f32> = g(&format!("{p}.mixer.shared_experts.{which}.weight"));
+                            if !split_k {
+                                // up: [2n, k] row-major → slab order is already two [n,k] stacks
+                                wh.extend(&shw);
+                            } else {
+                                // down: [n, 2k] row-major → two [n, k] column halves
+                                for half in 0..2 {
+                                    for r in 0..n {
+                                        wh.extend(&shw[r * 2 * k + half * k..r * 2 * k + half * k + k]);
+                                    }
+                                }
+                            }
+                            let bytes = tb_f16(&wh);
+                            drop(wh);
+                            let wt = Tensor::new(d.upload(&bytes).unwrap(), vec![ne * n, k], DType::F16);
+                            drop(bytes);
+                            let (wp, wsc, gw) = ffai_ops::moe_fp4_pack_weights(d, &wt, ne, n, k).unwrap();
+                            let mut blob = vec![0u8; (wp_len + wsc_len + ne) * 4];
+                            d.download(wp.buffer.as_ref(), &mut blob[..wp_len * 4]).unwrap();
+                            d.download(wsc.buffer.as_ref(), &mut blob[wp_len * 4..(wp_len + wsc_len) * 4]).unwrap();
+                            d.download(gw.buffer.as_ref(), &mut blob[(wp_len + wsc_len) * 4..]).unwrap();
+                            let _ = std::fs::write(&cpath, &blob);
+                            fp4w.insert(key, (wp, wsc, gw));
+                        };
+                        buildf("up_proj", inter, hid, false);
+                        buildf("down_proj", hid, inter, true);
+                    }
                     // shared expert (n_exp=1 grouped call), NEMOTRON_FP4_SHARED=1
                     if std::env::var("NEMOTRON_FP4_SHARED").is_ok() {
                         let mut build1 = |which: &str, n: usize, k: usize| {
@@ -2301,6 +2354,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // accumulator on device, keep it here so the shared expert +
                         // residual add stay on-device (no dl(acc)+upm(acc) round-trip).
                         let mut acc_dev_keep: Option<Tensor> = None;
+                        // set when the shared expert was folded into the routed grouped
+                        // GEMM (acc already holds routed + shared) — skip the sd block.
+                        let mut shared_folded = false;
                         if use_w4a16 {
                             // ── W4A16 WMMA path (NEMOTRON_W4A16=1 or NEMOTRON_W4A16_MARLIN=1) ──
                             // Small S (mt ≤ W4A16_THRESH, standard path only): inline Q4 dequant
@@ -2475,7 +2531,29 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // dynamic act quant+pack + Blackwell block-scaled FP4 mma. Needs
                             // METALTILE_CUDA_ARCH=compute_121a.
                             let fp4_moe = devdesc && fp4w.contains_key(&format!("{p}.moe_up_proj_fp4"));
-                            if fp4_moe {
+                            // Shared expert FOLDED into the grouped GEMM as two always-
+                            // selected groups (up: two N=inter slabs; down: K-split halves
+                            // whose scatter-adds sum to the full down GEMM). Same act quant
+                            // (identity gather rows of xn), same deterministic scatter —
+                            // kills the separate shared up/down f16 GEMMs + relu2 + merge.
+                            let fold_keys = fp4_moe && fp4_direct
+                                && fp4w.contains_key(&format!("{p}.moe_up_proj_fp4_fold"));
+                            if fold_keys {
+                                let (uwp, uwsc, ugw) = &fp4w[&format!("{p}.moe_up_proj_fp4_fold")];
+                                let (dwp, dwsc, dgw) = &fp4w[&format!("{p}.moe_down_proj_fp4_fold")];
+                                let amax_dn = Tensor::new(d.alloc_zeroed(4).unwrap(), vec![1], DType::U32);
+                                let (off0, st0, sw0) = moe_dev.as_ref().unwrap();
+                                let (st_e, sw_e, off_e) = ffai_ops::moe_extend_groups(d, st0, sw0, off0, mt, s, n_exp).unwrap();
+                                let mt_e = mt + 2 * s;
+                                let up_out = pf!(11, 2.0*mt_e as f64*inter as f64*hid as f64,
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xs_in, uwp, uwsc, ugw, &off_e, n_exp + 2, mt_e, inter, hid, 0, 0.0, None, Some((&amax_dn, 1, inv)), Some(&st_e)).unwrap());
+                                let dn_out = pf!(11, 2.0*mt_e as f64*hid as f64*inter as f64,
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &up_out, dwp, dwsc, dgw, &off_e, n_exp + 2, mt_e, hid, inter, 1, inv, Some(&amax_dn), None, None).unwrap());
+                                let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
+                                moe_scatter_add_det_dev(d, &dn_out, &st_e, &sw_e, &acc_dev, s, mt_e, hid, 256.0f32, true).unwrap();
+                                shared_folded = true;
+                                if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
+                            } else if fp4_moe {
                                 let (uwp, uwsc, ugw) = &fp4w[&format!("{p}.moe_up_proj_fp4")];
                                 let (dwp, dwsc, dgw) = &fp4w[&format!("{p}.moe_down_proj_fp4")];
                                 // up-GEMM epilogue also computes the DOWN-GEMM's activation
@@ -2907,7 +2985,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // device cuBLAS GEMMs + device relu²(full scale — shared activations
                         // are small, sa²≪f16max so no /256 needed) + device merge below.
                         let mut sd_dev_opt: Option<Tensor> = None;
-                        let sd_h: Vec<f32> = if devdesc_skip && is_cuda {
+                        let sd_h: Vec<f32> = if shared_folded {
+                            Vec::new() // shared already accumulated in the grouped scatter
+                        } else if devdesc_skip && is_cuda {
                             // devdesc: fully ON-DEVICE shared expert (no dl) — device cuBLAS
                             // (cublasLt, fast tensor-core) + device relu²(full scale — shared
                             // activations small, sa²≪f16max) + device merge below. NOTE: this
@@ -3012,15 +3092,20 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // shared-expert output + residual on device — no dl/upm. Under
                             // devdesc sd is ALREADY device (sd_dev_opt, host-sync-free);
                             // else upload the host f32 shared output.
-                            let sd_dev = sd_dev_opt.take().unwrap_or_else(|| upm(&sd_h, vec![s, hid]));
                             {
                                 // fused residual add + NEXT layer's rms_norm (one pass, llama.cpp-style)
                                 let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
-                                match nw {
-                                    Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let merged = add(d, &acc_dev, &sd_dev).unwrap(); let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &merged, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
-                                    // one launch, no intermediate: residual + routed acc + shared out
-                                    _ if is_cuda => { xt = ffai_ops::add3(d, &xt, &acc_dev, &sd_dev).unwrap(); }
-                                    _ => { let merged = add(d, &acc_dev, &sd_dev).unwrap(); xt = add(d, &xt, &merged).unwrap(); }
+                                if shared_folded {
+                                    // shared already accumulated into acc by the grouped scatter
+                                    xt = add(d, &xt, &acc_dev).unwrap();
+                                } else {
+                                    let sd_dev = sd_dev_opt.take().unwrap_or_else(|| upm(&sd_h, vec![s, hid]));
+                                    match nw {
+                                        Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let merged = add(d, &acc_dev, &sd_dev).unwrap(); let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &merged, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
+                                        // one launch, no intermediate: residual + routed acc + shared out
+                                        _ if is_cuda => { xt = ffai_ops::add3(d, &xt, &acc_dev, &sd_dev).unwrap(); }
+                                        _ => { let merged = add(d, &acc_dev, &sd_dev).unwrap(); xt = add(d, &xt, &merged).unwrap(); }
+                                    }
                                 }
                             }
                         } else {

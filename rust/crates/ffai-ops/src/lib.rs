@@ -6471,6 +6471,29 @@ extern "C" __global__ void moe_fp4_grouped_mma(
     }
 }
 
+// Extend the routed MoE group descriptors with TWO identity groups covering
+// all s tokens (the shared expert folded into the grouped GEMM as two
+// stacked always-selected experts: up [2*inter,hid] slabs / down K-split).
+// out st/sw get [mt..mt+2s) = identity tokens with weight 1.0; offsets gain
+// off[n_exp+1] = mt+s, off[n_exp+2] = mt+2s. One launch, graph-safe.
+extern "C" __global__ void moe_extend_groups(
+    const unsigned* __restrict__ st_in, const float* __restrict__ sw_in,
+    const unsigned* __restrict__ off_in,
+    unsigned* __restrict__ st_out, float* __restrict__ sw_out,
+    unsigned* __restrict__ off_out,
+    int mt, int s, int n_exp)
+{
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    int total=mt+2*s;
+    if(i<total){
+        if(i<mt){ st_out[i]=st_in[i]; sw_out[i]=sw_in[i]; }
+        else { st_out[i]=(unsigned)((i-mt)%s); sw_out[i]=1.0f; }
+    }
+    if(i<=n_exp){ off_out[i]=off_in[i]; }
+    else if(i==n_exp+1){ off_out[i]=(unsigned)(mt+s); }
+    else if(i==n_exp+2){ off_out[i]=(unsigned)(mt+2*s); }
+}
+
 // FP8 e4m3 per-tensor quant. Pass 1 = nvfp4_amax_slab (reused, mode 0).
 // fp8_scale: amax bits -> scale = amax/448 and inv (one thread).
 extern "C" __global__ void fp8_scale(
@@ -6543,6 +6566,27 @@ extern "C" __global__ void lt_fp4_quant(
     }
 }
 "#;
+
+/// Extend routed MoE descriptors (st/sw/offsets) with two identity groups
+/// covering all `s` tokens — the shared expert folded into the grouped GEMM.
+/// Returns (st_ext [mt+2s], sw_ext [mt+2s], off_ext [n_exp+3]).
+pub fn moe_extend_groups(
+    dev: &dyn Device, st: &Tensor, sw: &Tensor, off: &Tensor,
+    mt: usize, s: usize, n_exp: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let total = mt + 2 * s;
+    let st_e = Tensor::new(dev.alloc(total * 4)?, vec![total], DType::U32);
+    let sw_e = Tensor::new(dev.alloc(total * 4)?, vec![total], DType::F32);
+    let off_e = Tensor::new(dev.alloc((n_exp + 3) * 4)?, vec![n_exp + 3], DType::U32);
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC, "moe_fp4.cu", "moe_extend_groups",
+        &[(st.buffer.as_ref(), st.offset), (sw.buffer.as_ref(), sw.offset), (off.buffer.as_ref(), off.offset),
+          (st_e.buffer.as_ref(), 0), (sw_e.buffer.as_ref(), 0), (off_e.buffer.as_ref(), 0)],
+        &[i(mt as i32), i(s as i32), i(n_exp as i32)],
+        [(total as u32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+    Ok((st_e, sw_e, off_e))
+}
 
 /// Quantize an f16 `[r, k]` row-major tensor to cuBLASLt block-scaled NVFP4:
 /// returns `(pack, sf)` — packed e2m1 `[r*k/2]` bytes + the swizzled ue4m3
