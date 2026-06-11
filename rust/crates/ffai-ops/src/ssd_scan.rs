@@ -242,6 +242,39 @@ extern "C" __global__ void ssd_recur(
 }
 "#;
 
+/// Transposed-coalesced inter-chunk recurrence: consumes S_chunkᵀ
+/// `[nc*H, dh, ds]` (G3 emitted with swapped operands) with an s-fastest
+/// thread map, so BOTH the chunk-state reads and the SinT/state writes are
+/// fully coalesced — the original layout scattered one side 32-way across
+/// the serial nc loop. Same math, same per-thread accumulation order.
+const SSD_RECUR_T_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void ssd_recur_t(
+    const __half* __restrict__ s_chunk_t, // [nc*H, dh, ds]
+    const float*  __restrict__ lcs,       // [nc*H, L]
+    const float*  __restrict__ state_in,  // [H, dh, ds] f32
+    __half*       __restrict__ sin_t,     // [nc*H, dh, ds] f16
+    float*        __restrict__ state_out, // [H, dh, ds] f32
+    unsigned int H, unsigned int dh, unsigned int ds, unsigned int L, unsigned int nc)
+{
+    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long tot = (unsigned long long)H * ds * dh;
+    if (idx >= tot) return;
+    unsigned int sct = (unsigned int)(idx % ds);          // state (fastest)
+    unsigned int p   = (unsigned int)((idx / ds) % dh);   // head_dim
+    unsigned int h   = (unsigned int)(idx / ((unsigned long long)ds * dh));
+    float st = state_in[(h * dh + p) * ds + sct];
+    for (unsigned int c = 0; c < nc; ++c) {
+        unsigned int bh = c * H + h;
+        sin_t[(bh * dh + p) * ds + sct] = __float2half(st);
+        float alpha = expf(lcs[bh * L + (L - 1)]);
+        float sc = __half2float(s_chunk_t[((unsigned long long)bh * dh + p) * ds + sct]);
+        st = alpha * st + sc;
+    }
+    state_out[(h * dh + p) * ds + sct] = st;
+}
+"#;
+
 /// Varlen inter-chunk recurrence. Identical to `ssd_recur` but resets the
 /// carried state to zero at every chunk flagged in `seg_reset[c]` — i.e. the
 /// first chunk of each packed sequence starts fresh. Requires each packed
@@ -475,15 +508,32 @@ pub fn ssm_prefill_scan_ssd_strided(
 
     // ── G3: S_chunk = BdT · xᵀ-form  [ds,dh]. m=ds, n=dh, k=L,
     //        X=bdt[ds,L], W=xt[dh,L]. ─────────────────────────────────────
+    // NEMOTRON_SSD_RECUR_T=1: emit S_chunkᵀ [dh,ds] instead (operands
+    // swapped — same products, GEMM-internal accumulation order may differ)
+    // and run the fully-coalesced transposed recurrence. Quant-regime lever;
+    // default off to preserve the exact path's bit pattern.
+    let recur_t = seg_reset.is_none() && std::env::var("NEMOTRON_SSD_RECUR_T").is_ok();
     let st_dsl = (dsu * l) as i64 * el;
     let st_dsdh = (dsu * dhu) as i64 * el;
-    dev.gemm_strided_batched(
-        bb(&bdt), st_dsl, bb(&xt), st_dhl, bb(&s_chunk), st_dsdh,
-        dsu, dhu, l, bhc, DType::F16,
-    )?;
+    if recur_t {
+        dev.gemm_strided_batched(
+            bb(&xt), st_dhl, bb(&bdt), st_dsl, bb(&s_chunk), st_dsdh,
+            dhu, dsu, l, bhc, DType::F16,
+        )?;
+    } else {
+        dev.gemm_strided_batched(
+            bb(&bdt), st_dsl, bb(&xt), st_dhl, bb(&s_chunk), st_dsdh,
+            dsu, dhu, l, bhc, DType::F16,
+        )?;
+    }
 
     // 6. Serial inter-chunk recurrence → SinT [nc*H, dh, ds] + state_out.
     //    Varlen: reset state at packed-sequence boundaries (seg_reset[c]).
+    if recur_t {
+        raw(SSD_RECUR_T_SRC, "ssd_recur_t.cu", "ssd_recur_t",
+            &[(bb(&s_chunk), 0), (bb(&lcs), 0), (bb(state_in), 0), (bb(&sin_t), 0), (bb(&state_out), 0)],
+            &[hh, dhd, dsd, ll, ncn], h * dsu * dhu)?;
+    } else {
     match seg_reset {
         Some(sr) => raw(SSD_RECUR_VARLEN_SRC, "ssd_recur_varlen.cu", "ssd_recur_varlen",
             &[(bb(&s_chunk), 0), (bb(&lcs), 0), (bb(state_in), 0), (bb(sr), 0), (bb(&sin_t), 0), (bb(&state_out), 0)],
@@ -492,6 +542,7 @@ pub fn ssm_prefill_scan_ssd_strided(
             &[(bb(&s_chunk), 0), (bb(&lcs), 0), (bb(state_in), 0), (bb(&sin_t), 0), (bb(&state_out), 0)],
             &[hh, dhd, dsd, ll, ncn], h * dsu * dhu)?,
     };
+    }
 
     // ── G4: CS = C · S_in  [L,dh]. m=L, n=dh, k=ds, X=c_f16, W=sinT[dh,ds]. ─
     let st_dhds = (dhu * dsu) as i64 * el;
