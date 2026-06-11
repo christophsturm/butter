@@ -3127,6 +3127,153 @@ extern "C" __global__ void sdpa_flash_mma_w4s(
             ml_part[mi]=mv[lane]; ml_part[mi+1]=lv[lane]; } }
 }
 
+// FP8 (e4m3) attention variant: QK and PV run m16n8k32 e4m3 mma (2x the
+// f16 rate — attention at depth is mma-compute-bound). Q is scaled+quantized
+// per call (per-tensor), K/V staged to e4m3 in smem from the f16 cache; the
+// QK product is descaled by qs*ks before the softmax max-subtraction, PV by
+// vs at the end — the standard exact-fold points. Split-KV partials variant
+// (always emits partials; P=1 degenerates to one partition + merge).
+__device__ __forceinline__ unsigned char enc_e4m3a(float v){
+    // round-to-nearest e4m3 (saturate 448) — sign + 4-bit exp(bias 7) + 3-bit man
+    unsigned s=(v<0.f)?0x80u:0u; float a=fabsf(v);
+    if(!(a>0.f)) return (unsigned char)s;
+    if(a>=448.f) return (unsigned char)(s|0x7Eu);
+    int e; float fr=frexpf(a,&e); int E=e+6;
+    unsigned c;
+    if(E<1){ int m=(int)rintf(a*512.f); if(m>7)m=7; c=(unsigned)m; }
+    else { int m=(int)rintf((2.f*fr-1.f)*8.f); if(m>7){m=0;E+=1;} if(E>15){E=15;m=6;} c=(unsigned)((E<<3)|m); }
+    return (unsigned char)(s|c);
+}
+extern "C" __global__ void sdpa_flash_mma_w4s_fp8(
+    const void* __restrict__ q_in, const __half* __restrict__ k_in,
+    const __half* __restrict__ v_in,
+    float* __restrict__ o_part, float* __restrict__ ml_part,
+    const float* __restrict__ scales, // [3] = qs_inv, ks pair... [0]=q_inv,[1]=k_inv,[2]=v_inv; dequant = product
+    int sq, int nq, int nkv, int kv_stride, int base_kv, float scale, int in_f32,
+    int kv_chunk)
+{
+    const int BR=16, BC=16, HD=128, NC=4, ND=16, NW=4;  // NC=4 chunks of k32
+    int h = blockIdx.x;
+    int wid = threadIdx.x >> 5;
+    int R0 = blockIdx.y * (BR*NW) + wid * BR;
+    int part = blockIdx.z;
+    int kv0 = part * kv_chunk;
+    int hpg = nq / nkv, kh = h / hpg;
+    int lane = threadIdx.x & 31, gid = lane >> 2, tid4 = lane & 3;
+    const float* qf=(const float*)q_in; const __half* qh=(const __half*)q_in;
+    float qi=scales[0], ki=scales[1], vi=scales[2];
+    float qk_de = 1.f/(qi*ki);     // S_real = S_acc * (1/qi)*(1/ki) where quant mult by inv
+    float v_de  = 1.f/vi;
+
+    __shared__ unsigned char Qs_a[4][BR][HD];
+    __shared__ unsigned char Ks[BC][HD];
+    __shared__ unsigned char Vs[HD][BC];   // transposed for PV B-frag (k=BC fastest? store [d][j])
+    __shared__ float  Ss_a[4][BR][BC];
+    __shared__ unsigned char Ps_a[4][BR][BC];
+    __shared__ float  cv_a[4][BR], mv_a[4][BR], lv_a[4][BR];
+    unsigned char (*Qs)[HD] = Qs_a[wid];
+    float (*Ss)[BC] = Ss_a[wid];
+    unsigned char (*Ps)[BC] = Ps_a[wid];
+    float *cv = cv_a[wid], *mv = mv_a[wid], *lv = lv_a[wid];
+
+    for (int e = lane; e < BR*HD; e += 32) { int i=e>>7,d=e&127,gr=R0+i; long idx=((long)gr*nq+h)*HD+d;
+        float qv = (gr<sq) ? (in_f32 ? qf[idx] : __half2float(qh[idx])) : 0.f;
+        Qs[i][d] = enc_e4m3a(qv*scale*qi); }
+    float oc[ND][4];
+    for (int t=0;t<ND;t++){ oc[t][0]=oc[t][1]=oc[t][2]=oc[t][3]=0.f; }
+    if (lane<BR){ mv[lane]=-3.4e38f; lv[lane]=0.f; }
+    __syncwarp();
+
+    int last = base_kv + sq - 1;
+    int maxpb = base_kv + R0 + BR - 1; if (maxpb>last) maxpb=last;
+    int blk_r_hi = blockIdx.y * (BR*NW) + (BR*NW) - 1;
+    int maxpb_blk = base_kv + blk_r_hi; if (maxpb_blk>last) maxpb_blk=last;
+    int kv_hi = kv0 + kv_chunk - 1; if (kv_hi > maxpb_blk) kv_hi = maxpb_blk;
+
+    #define PK4(p0,p1,p2,p3) ((unsigned)(p0)|((unsigned)(p1)<<8)|((unsigned)(p2)<<16)|((unsigned)(p3)<<24))
+    for (int kj0=kv0; kj0<=kv_hi; kj0+=BC) {
+        __syncthreads();
+        for (int e=threadIdx.x;e<BC*HD;e+=NW*32){ int j=e>>7,d=e&127,p=kj0+j,ok=(p<=last); long idx=((long)kh*kv_stride+p)*HD+d;
+            float kvv = ok? __half2float(k_in[idx]) : 0.f;
+            float vvv = ok? __half2float(v_in[idx]) : 0.f;
+            Ks[j][d]= enc_e4m3a(kvv*ki);
+            Vs[d][j]= enc_e4m3a(vvv*vi); }
+        __syncthreads();
+        if (kj0 > maxpb) continue;
+        __syncwarp();
+
+        // QK: m16n8k32 e4m3, 4 chunks over HD=128
+        float sc[2][4] = {{0,0,0,0},{0,0,0,0}};
+        for (int c=0;c<NC;c++){
+            int kcol = c*32;
+            unsigned a0=PK4(Qs[gid][kcol+4*tid4],Qs[gid][kcol+4*tid4+1],Qs[gid][kcol+4*tid4+2],Qs[gid][kcol+4*tid4+3]);
+            unsigned a1=PK4(Qs[gid+8][kcol+4*tid4],Qs[gid+8][kcol+4*tid4+1],Qs[gid+8][kcol+4*tid4+2],Qs[gid+8][kcol+4*tid4+3]);
+            unsigned a2=PK4(Qs[gid][kcol+4*tid4+16],Qs[gid][kcol+4*tid4+17],Qs[gid][kcol+4*tid4+18],Qs[gid][kcol+4*tid4+19]);
+            unsigned a3=PK4(Qs[gid+8][kcol+4*tid4+16],Qs[gid+8][kcol+4*tid4+17],Qs[gid+8][kcol+4*tid4+18],Qs[gid+8][kcol+4*tid4+19]);
+            for (int s2=0;s2<2;s2++){
+                int kbase = s2*8;
+                unsigned b0=PK4(Ks[kbase+gid][kcol+4*tid4],Ks[kbase+gid][kcol+4*tid4+1],Ks[kbase+gid][kcol+4*tid4+2],Ks[kbase+gid][kcol+4*tid4+3]);
+                unsigned b1=PK4(Ks[kbase+gid][kcol+4*tid4+16],Ks[kbase+gid][kcol+4*tid4+17],Ks[kbase+gid][kcol+4*tid4+18],Ks[kbase+gid][kcol+4*tid4+19]);
+                asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+                    :"+f"(sc[s2][0]),"+f"(sc[s2][1]),"+f"(sc[s2][2]),"+f"(sc[s2][3])
+                    :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+            }
+        }
+        for (int s2=0;s2<2;s2++){
+            Ss[gid][s2*8+2*tid4]   = sc[s2][0]*qk_de; Ss[gid][s2*8+2*tid4+1]   = sc[s2][1]*qk_de;
+            Ss[gid+8][s2*8+2*tid4] = sc[s2][2]*qk_de; Ss[gid+8][s2*8+2*tid4+1] = sc[s2][3]*qk_de;
+        }
+        __syncwarp();
+
+        if (lane<BR){ int i=lane,gr=R0+i;
+            if (gr<sq){ int maxp=base_kv+R0+i; float rmax=-3.4e38f;
+                for (int j=0;j<BC;j++){ float sv=(kj0+j<=maxp)?Ss[i][j]:-3.4e38f; rmax=fmaxf(rmax,sv); }
+                float mo=mv[i], mn=fmaxf(mo,rmax); float cor=(mo>-3.0e38f)?__expf(mo-mn):0.f; float rs=0.f;
+                for (int j=0;j<BC;j++){ float w=(kj0+j<=maxp&&mn>-3.0e38f)?__expf(Ss[i][j]-mn):0.f;
+                    Ps[i][j]=enc_e4m3a(w); rs+=w; }
+                cv[i]=cor; mv[i]=mn; lv[i]=lv[i]*cor+rs;
+            } else { cv[i]=1.f; for(int j=0;j<BC;j++) Ps[i][j]=0; }
+        }
+        __syncwarp();
+
+        float cg=cv[gid], cg8=cv[gid+8];
+        for (int t=0;t<ND;t++){ oc[t][0]*=cg; oc[t][1]*=cg; oc[t][2]*=cg8; oc[t][3]*=cg8; }
+
+        // PV: m16n8k32 e4m3 — but k dim here is BC=16, pad to 32 with zeros:
+        // single k32 chunk covering BC=16 (upper 16 zero).
+        unsigned pa0=PK4(Ps[gid][4*tid4>=BC?0:4*tid4], (4*tid4+1<BC)?Ps[gid][4*tid4+1]:0, (4*tid4+2<BC)?Ps[gid][4*tid4+2]:0, (4*tid4+3<BC)?Ps[gid][4*tid4+3]:0);
+        unsigned pa1=PK4(Ps[gid+8][4*tid4>=BC?0:4*tid4], (4*tid4+1<BC)?Ps[gid+8][4*tid4+1]:0, (4*tid4+2<BC)?Ps[gid+8][4*tid4+2]:0, (4*tid4+3<BC)?Ps[gid+8][4*tid4+3]:0);
+        // k+16 portion = zeros (BC=16)
+        unsigned pa2=0u, pa3=0u;
+        if (4*tid4 >= BC) { pa0=0u; pa1=0u; }
+        for (int t=0;t<ND;t++){
+            int dcol=t*8;
+            unsigned vb0=PK4(Vs[dcol+gid][4*tid4>=BC?0:4*tid4], (4*tid4+1<BC)?Vs[dcol+gid][4*tid4+1]:0, (4*tid4+2<BC)?Vs[dcol+gid][4*tid4+2]:0, (4*tid4+3<BC)?Vs[dcol+gid][4*tid4+3]:0);
+            unsigned vb1=0u;
+            if (4*tid4 >= BC) vb0=0u;
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+                :"+f"(oc[t][0]),"+f"(oc[t][1]),"+f"(oc[t][2]),"+f"(oc[t][3])
+                :"r"(pa0),"r"(pa1),"r"(pa2),"r"(pa3),"r"(vb0),"r"(vb1));
+        }
+        __syncwarp();
+    }
+    #undef PK4
+
+    int r0=R0+gid, r8=R0+gid+8;
+    long pbase = (long)part * sq;
+    for (int t=0;t<ND;t++){ int dcol=t*8;
+        if (r0<sq){ long i0=((pbase+r0)*nq+h)*(long)HD+dcol+2*tid4;
+            o_part[i0]=oc[t][0]*v_de; o_part[i0+1]=oc[t][1]*v_de; }
+        if (r8<sq){ long i8=((pbase+r8)*nq+h)*(long)HD+dcol+2*tid4;
+            o_part[i8]=oc[t][2]*v_de; o_part[i8+1]=oc[t][3]*v_de; }
+    }
+    if (lane<BR){ int gr=R0+lane;
+        if (gr<sq){ long mi=((pbase+gr)*nq+h)*2;
+            ml_part[mi]=mv[lane]; ml_part[mi+1]=lv[lane]; } }
+}
+
 // Merge split-KV partials: out[r,h,d] = sum_p o_p e^{m_p-m*} / sum_p l_p e^{m_p-m*}.
 extern "C" __global__ void sdpa_flash_merge(
     const float* __restrict__ o_part, const float* __restrict__ ml_part,
@@ -3191,6 +3338,35 @@ pub fn sdpa_flash_mma(
     // partial-softmax merge is the standard exact decomposition.
     let kv_chunk_target = 8192usize;
     let n_part = n_kv.div_ceil(kv_chunk_target).min(8);
+    // FP8 attention (NEMOTRON_FLASH_FP8=1): e4m3 QK and PV mma at 2x the f16
+    // tensor-core rate — attention at depth is mma-compute-bound. Static
+    // conservative scales (16x: |x|<28 covers the post-softmax-scale Q and the
+    // K/V ranges with e4m3's 448 ceiling). Quant-regime lever.
+    if std::env::var("NEMOTRON_FLASH_FP8").is_ok() {
+        let np = n_part.max(1);
+        let kv_chunk = n_kv.div_ceil(np).div_ceil(16) * 16;
+        let scl: [f32; 3] = [16.0, 16.0, 16.0];
+        let mut sb = Vec::with_capacity(12);
+        for v in scl { sb.extend_from_slice(&v.to_le_bytes()); }
+        let scales = Tensor::new(dev.upload(&sb)?, vec![3], DType::F32);
+        let o_part = Tensor::new(dev.alloc(np * sq * nq * hd * 4)?, vec![np * sq * nq * hd], DType::F32);
+        let ml_part = Tensor::new(dev.alloc(np * sq * nq * 2 * 4)?, vec![np * sq * nq * 2], DType::F32);
+        let grid = [nq as u32, (sq as u32).div_ceil(64), np as u32];
+        dev.dispatch_raw_cuda(
+            SDPA_FLASH_MMA_SRC, "sdpa_flash_mma.cu", "sdpa_flash_mma_w4s_fp8",
+            &[(q.buffer.as_ref(), q.offset), (kf16.buffer.as_ref(), kf16.offset),
+              (vf16.buffer.as_ref(), vf16.offset), (o_part.buffer.as_ref(), 0), (ml_part.buffer.as_ref(), 0),
+              (scales.buffer.as_ref(), 0)],
+            &[i(sq as i32), i(nq as i32), i(nkv as i32), i(kv_stride as i32), i(base as i32), f(scale), i(in_f32), i(kv_chunk as i32)],
+            grid, [128, 1, 1], 0, false)?;
+        let n_el = (sq * nq * hd) as u32;
+        dev.dispatch_raw_cuda(
+            SDPA_FLASH_MMA_SRC, "sdpa_flash_mma.cu", "sdpa_flash_merge",
+            &[(o_part.buffer.as_ref(), 0), (ml_part.buffer.as_ref(), 0), (out.buffer.as_ref(), 0)],
+            &[i(sq as i32), i(nq as i32), i(np as i32), i(out_f32)],
+            [n_el.div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+        return Ok(out);
+    }
     if n_part > 1 && std::env::var("NEMOTRON_FLASH_SPLITKV_OFF").is_err() {
         let kv_chunk = n_kv.div_ceil(n_part).div_ceil(16) * 16; // BC-aligned
         let o_part = Tensor::new(dev.alloc(n_part * sq * nq * hd * 4)?, vec![n_part * sq * nq * hd], DType::F32);
