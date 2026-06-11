@@ -6533,6 +6533,38 @@ extern "C" __global__ void fp8_quant(
     }
 }
 
+// f32-input variant of lt_fp4_quant — reads the residual-stream f32 tensor
+// directly, killing the cast_f32_f16 + f16 intermediate round-trip that
+// preceded every dense-projection quant (f32 -> f16 -> e2m1 became
+// f32 -> e2m1; the e2m1 grid subsumes the f16 rounding).
+extern "C" __global__ void lt_fp4_quant_f32(
+    const float* __restrict__ x, unsigned char* __restrict__ xp,
+    unsigned char* __restrict__ sf, int R, int K)
+{
+    int KB=K/16;
+    long nb=(long)R*KB;
+    long b=(long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(b>=nb) return;
+    int r=(int)(b/KB), kb=(int)(b%KB);
+    const float* xb=x+(long)r*K+kb*16;
+    float v[16]; float am=0.f;
+    #pragma unroll
+    for(int i=0;i<16;i++){ v[i]=xb[i]; am=fmaxf(am,fabsf(v[i])); }
+    unsigned sc=enc_ue4m3(am/6.f);
+    if(sc==0u&&am>0.f) sc=1u;
+    float sd=dec_ue4m3(sc);
+    float inv=(sd>0.f)?(1.f/sd):0.f;
+    int KB4=(KB+3)>>2;
+    long soff=(long)(r>>7)*(512L*KB4)+(long)(kb>>2)*512+(r&31)*16+((r>>5)&3)*4+(kb&3);
+    sf[soff]=(unsigned char)sc;
+    unsigned char* o=xp+((long)r*K+kb*16)/2;
+    #pragma unroll
+    for(int i=0;i<8;i++){
+        unsigned lo=enc_e2m1(v[2*i],inv), hi=enc_e2m1(v[2*i+1],inv);
+        o[i]=(unsigned char)(lo|(hi<<4));
+    }
+}
+
 // Quantize f16 [R,K] row-major to the cuBLASLt block-scaled NVFP4 format:
 // packed e2m1 (2 elems/byte, linear row-major) + one ue4m3 scale per
 // 16-element K-block stored in the hardware's swizzled 512-byte-block layout.
@@ -6731,8 +6763,10 @@ pub fn lt_fp4_quant(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Result<
     let pack = Tensor::new(dev.alloc((r * k) / 2)?, vec![(r * k) / 2], DType::U32);
     let sf = Tensor::new(dev.alloc_zeroed(sf_bytes)?, vec![sf_bytes], DType::U32);
     let nb = (r * kb) as u32;
+    // f32 input quantizes directly (no f16 staging round-trip).
+    let kname = if x.dtype == DType::F32 { "lt_fp4_quant_f32" } else { "lt_fp4_quant" };
     dev.dispatch_raw_cuda(
-        MOE_FP4_SRC, "moe_fp4.cu", "lt_fp4_quant",
+        MOE_FP4_SRC, "moe_fp4.cu", kname,
         &[(x.buffer.as_ref(), x.offset), (pack.buffer.as_ref(), 0), (sf.buffer.as_ref(), 0)],
         &[i(r as i32), i(k as i32)],
         [nb.div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;

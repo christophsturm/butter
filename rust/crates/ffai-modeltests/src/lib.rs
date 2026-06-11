@@ -1878,8 +1878,8 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     return qmm_fp8d(&xh, name, rows, *m, *k, qs, sc);
                 }
                 if fp4_dense && rows > 1 && *k % 32 == 0 && fp4_name_ok(name) {
-                    let xh = pf!(15, 0.0, cast_f32_f16(d, x).unwrap());
-                    return qmm_fp4(&xh, name, rows, *m, *k, qs, sc);
+                    // f32 input quantizes directly inside qmm_fp4 (no cast staging)
+                    return qmm_fp4(x, name, rows, *m, *k, qs, sc);
                 }
                 if use_f32_gemm {
                     let wf = pf!(3, (m * k) as f64, dequant_q4(d, qs, sc, *m, *k, DType::F32).unwrap());
