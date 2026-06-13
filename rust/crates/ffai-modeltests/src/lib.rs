@@ -2361,8 +2361,11 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // For BGEMM: host gather → single device upload (avoids per-expert uploads).
                         // For DEVICE_GATHER: on-device gather (EXPERIMENTAL, may produce wrong output).
                         // Default: host gather (validated path).
-                        let xn_h_opt: Option<Vec<f32>> = if use_bgemm || use_w4a16 || dev_gather || use_grouped_gemm || use_metal_grouped {
+                        let xn_h_opt: Option<Vec<f32>> = if (use_bgemm || use_w4a16 || dev_gather || use_grouped_gemm || use_metal_grouped)
+                            && !(use_w4a16_marlin && moe_dev.is_some()) {
                             // Need xn on host for BGEMM/W4A16/METAL_GROUPED (host gather) or DEV_GATHER (gather source).
+                            // The on-device Marlin path (PATH B) gathers via st_dev and never reads xn_h, so skip the
+                            // host download -- a dl here aborts CUDA-graph stream capture (keeps the forward capturable).
                             Some(dl(&xn, s * hid))
                         } else {
                             None
