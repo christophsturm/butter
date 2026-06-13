@@ -4695,6 +4695,36 @@ pub fn moe_scatter_add_det_dev(
     Ok(())
 }
 
+/// Expand per-expert CSR offsets `[n_exp+1]` into a per-row expert-id vector
+/// `[mt]` on device: `idx[r] = e` for every `r` in `[off[e], off[e+1])`.
+/// Graph-safe replacement for the host `triples.map(|(e,_,_)| e)` build -- lets
+/// the on-device Marlin W4A16 MoE path get per-row expert ids without a host dl.
+const MOE_EXPERT_IDS_SRC: &str = r#"
+extern "C" __global__ void moe_expert_ids_from_offsets(
+    const unsigned int* __restrict__ off,  // [n_exp+1]
+    unsigned int*       __restrict__ idx,  // [mt]
+    int n_exp)
+{
+    int e = blockIdx.x;
+    if (e >= n_exp) return;
+    unsigned int lo = off[e];
+    unsigned int hi = off[e + 1];
+    for (unsigned int r = lo + threadIdx.x; r < hi; r += blockDim.x)
+        idx[r] = (unsigned int)e;
+}
+"#;
+
+/// Build a per-row expert-id tensor `[mt]` (u32) from CSR offsets `[n_exp+1]`.
+/// One block per expert fills its contiguous row range. Fully device-side.
+pub fn moe_expert_ids_from_offsets(dev: &dyn Device, off: &Tensor, n_exp: usize, mt: usize) -> Result<Tensor> {
+    let idx = Tensor::empty(dev, vec![mt], DType::U32)?;
+    dev.dispatch_raw_cuda(MOE_EXPERT_IDS_SRC, "moe_expert_ids.cu", "moe_expert_ids_from_offsets",
+        &[(off.buffer.as_ref(), off.offset), (idx.buffer.as_ref(), 0)],
+        &[(n_exp as i32).to_le_bytes().to_vec()],
+        [n_exp as u32, 1, 1], [256, 1, 1], 0, false)?;
+    Ok(idx)
+}
+
 /// Raw CUDA source for `relu2_scale_f16`: `out[i] = max(0, (float)in[i])^2 * scale`
 /// where `in` and `out` are __half (f16). Fuses the cast-to-f32, relu, square,
 /// scale, and cast-back-to-f16 that the MoE prefill loop previously did by
@@ -4711,6 +4741,8 @@ extern "C" __global__ void relu2_scale_f16(
     if (i < n) {
         float v = __half2float(inp[i]);
         if (v < 0.f) v = 0.f;
+        float lim = sqrtf(65504.0f / scale);
+        v = fminf(v, lim);   // clamp to f16-square-safe range (Inf/NaN -> lim, no overflow)
         out[i] = __float2half(v * v * scale);
     }
 }
@@ -6171,9 +6203,10 @@ pub fn moe_w4a16_marlin(
     let n_out_i   = n_out   as i32;
     let k_in_i    = k_in    as i32;
 
-    // Use the 128×128 tile when n_out is a multiple of 128 (higher compute
-    // density: 4× accumulator, double-buffered loads, scale preload).
-    if n_out % 128 == 0 {
+    // Use the 128×128 tile only when BOTH n_out and k_in are multiples of 128
+    // (the 128-tile strides K by 128; a non-128 k_in -- e.g. inter=1856 on the
+    // down-GEMM -- would read past the weight buffer). Else fall to the 64-tile.
+    if n_out % 128 == 0 && k_in % 128 == 0 {
         dev.dispatch_raw_cuda(
             MOE_W4A16_MARLIN128_SRC,
             "moe_w4a16_marlin128.cu",

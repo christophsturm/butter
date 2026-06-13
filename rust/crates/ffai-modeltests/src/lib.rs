@@ -685,7 +685,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_grouped_gemm_cutlass, moe_q4_grouped_mma, moe_q4_grouped_mma_dev, moe_router_device, moe_scatter_add_det_dev, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, nvfp4_roundtrip, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_expert_ids_from_offsets, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_grouped_gemm_cutlass, moe_q4_grouped_mma, moe_q4_grouped_mma_dev, moe_router_device, moe_scatter_add_det_dev, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, nvfp4_roundtrip, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -719,7 +719,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     let g = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0 };
     let up = |v: &[f32]| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), vec![v.len()], DType::F32) };
     let upm = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
-    let dl = |t: &Tensor, n: usize| -> Vec<f32> { let mut b = vec![0u8; n * 4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
+    let dl = |t: &Tensor, n: usize| -> Vec<f32> { let owned; let src = if t.dtype == DType::F16 { owned = cast_f16_f32(d, t).unwrap(); &owned } else { t }; let mut b = vec![0u8; n * 4]; d.download(src.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
     let softplus = |x: f32| if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
 
     // ── Q4 weight cache ─────────────────────────────────────────────────────────
@@ -2372,9 +2372,17 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let fp4_skip_gather = is_cuda && moe_dev.is_some() && xn_f16_router.is_some()
                             && std::env::var("NEMOTRON_FP4_DIRECT_OFF").is_err()
                             && std::env::var("NEMOTRON_FP4_SIM").is_err()
-                            && fp4w.contains_key(&format!("{p}.moe_up_proj_fp4"));
+                            && fp4w.contains_key(&format!("{p}.moe_up_proj_fp4")) && !use_w4a16;
                         let (xs, xs_dev_f16_opt) = if fp4_skip_gather {
                             (Vec::new(), None)
+                        } else if use_w4a16_marlin && moe_dev.is_some() {
+                            // PATH B (graph-safe): Marlin gathers tokens ON-DEVICE via the sorted_tok
+                            // list (st_dev) -- no host xs copy, no host triples. [mt,hid] f16, sorted by expert.
+                            let (_, st_dev, _) = moe_dev.as_ref().unwrap();
+                            let xn_f16g = match &xn_f16_router { Some(t) => t.clone(), None => pf!(15, 0.0, cast_f32_f16(d, &xn).unwrap()) };
+                            let xn2d = xn_f16g.reshaped(vec![s, hid]);
+                            let xs_f16 = pf!(12, 0.0, gather(d, &xn2d, st_dev).unwrap());
+                            (Vec::new(), Some(xs_f16))
                         } else if use_bgemm || use_w4a16 || use_grouped_gemm || use_metal_grouped {
                             // BGEMM/W4A16: host gather → upload xs as one [mt, hid] f16 tensor.
                             let xn_h = xn_h_opt.as_ref().unwrap();
@@ -2449,60 +2457,81 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let w4a16_thresh: usize = std::env::var("NEMOTRON_W4A16_THRESH")
                                 .ok().and_then(|v| v.parse().ok()).unwrap_or(12288);
                             let xs_f16 = xs_dev_f16_opt.as_ref().unwrap().clone();
-                            let wts_h: Vec<f32> = triples.iter().map(|(_,_,w)| *w).collect();
-                            let tidx_h: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
-                            let wts_dev = upm(&wts_h, vec![mt]);
-                            let tidx_dev2 = Tensor::new(d.upload(&tbu(&tidx_h)).unwrap(), vec![mt], DType::U32);
-                            let acc_dev = upm(&acc_h, vec![s, hid]);
-                            if use_w4a16_marlin || mt <= w4a16_thresh {
-                                // Marlin path: always inline WMMA (handles all mt, Marlin layout).
-                                // Standard W4A16 path: inline WMMA for small mt ≤ threshold.
-                                let idx_u32: Vec<u32> = triples.iter().map(|(e,_,_)| *e).collect();
-                                let idx_dev = Tensor::new(d.upload(&tbu(&idx_u32)).unwrap(), vec![mt], DType::U32);
-                                let dn_out_f16 = if use_w4a16_marlin {
-                                    // Marlin coalesced path (NEMOTRON_W4A16_MARLIN=1):
-                                    // read the MARLIN-layout copies under the `_marlin`
-                                    // keys, NOT the base standard-layout weights that the
-                                    // sequential step path (moe_fused_ffn) consumes.
-                                    let (muqs, musc, _, _) = &qw[&format!("{p}.moe_up_all_marlin")];
-                                    let (mdqs, mdsc, _, _) = &qw[&format!("{p}.moe_down_all_marlin")];
-                                    let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
-                                        moe_w4a16_marlin(d, &xs_f16, muqs, musc, &idx_dev, mt, inter, hid).unwrap());
-                                    let up_relu2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
-                                    pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
-                                        moe_w4a16_marlin(d, &up_relu2, mdqs, mdsc, &idx_dev, mt, hid, inter).unwrap())
-                                } else {
-                                    // Standard scattered-nibble W4A16 path (NEMOTRON_W4A16=1)
-                                    let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
-                                        moe_w4a16(d, &xs_f16, uqs, usc, &idx_dev, mt, inter, hid).unwrap());
-                                    let up_relu2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
-                                    pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
-                                        moe_w4a16(d, &up_relu2, dqs, dsc, &idx_dev, mt, hid, inter).unwrap())
-                                };
-                                let dn_out = cast_f16_f32(d, &dn_out_f16).unwrap();
-                                moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                            let marlin_dev = use_w4a16_marlin && moe_dev.is_some();
+                            if marlin_dev {
+                                // PATH B (graph-safe): fully on-device Marlin W4A16 MoE. Per-row expert
+                                // ids from CSR offsets-expand, scatter via det_dev (st_dev/sw_dev), acc on
+                                // device (kept unconditionally: ondevice_moe is hardwired off for use_w4a16,
+                                // but PATH B is fully device + the shared expert emits sd_dev_opt, so the
+                                // downstream device merge is the correct graph-safe consumer). No host dl.
+                                let (off_dev, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
+                                let idx_dev = moe_expert_ids_from_offsets(d, off_dev, n_exp, mt).unwrap();
+                                let (muqs, musc, _, _) = &qw[&format!("{p}.moe_up_all_marlin")];
+                                let (mdqs, mdsc, _, _) = &qw[&format!("{p}.moe_down_all_marlin")];
+                                let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                    moe_w4a16_marlin(d, &xs_f16, muqs, musc, &idx_dev, mt, inter, hid).unwrap());
+                                let up_relu2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                                let dn_out_f16 = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                    moe_w4a16_marlin(d, &up_relu2, mdqs, mdsc, &idx_dev, mt, hid, inter).unwrap());
+                                let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
+                                moe_scatter_add_det_dev(d, &dn_out_f16, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                acc_dev_keep = Some(acc_dev);
                             } else {
-                                // Large S (standard W4A16 only): grouped_gemm (dequant-once + cuBLAS).
-                                // NOTE: never reached when use_w4a16_marlin=true (weights in Marlin layout).
-                                let mut g_starts_l: Vec<usize> = vec![0];
-                                let mut expert_ids_l: Vec<usize> = Vec::new();
-                                let mut gi = 0usize;
-                                while gi < mt {
-                                    let eid = triples[gi].0 as usize;
-                                    expert_ids_l.push(eid);
-                                    let mut gi2 = gi + 1;
-                                    while gi2 < mt && triples[gi2].0 as usize == eid { gi2 += 1; }
-                                    g_starts_l.push(gi2);
-                                    gi = gi2;
+                                let wts_h: Vec<f32> = triples.iter().map(|(_,_,w)| *w).collect();
+                                let tidx_h: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
+                                let wts_dev = upm(&wts_h, vec![mt]);
+                                let tidx_dev2 = Tensor::new(d.upload(&tbu(&tidx_h)).unwrap(), vec![mt], DType::U32);
+                                let acc_dev = upm(&acc_h, vec![s, hid]);
+                                if use_w4a16_marlin || mt <= w4a16_thresh {
+                                    // Marlin path: always inline WMMA (handles all mt, Marlin layout).
+                                    // Standard W4A16 path: inline WMMA for small mt ≤ threshold.
+                                    let idx_u32: Vec<u32> = triples.iter().map(|(e,_,_)| *e).collect();
+                                    let idx_dev = Tensor::new(d.upload(&tbu(&idx_u32)).unwrap(), vec![mt], DType::U32);
+                                    let dn_out_f16 = if use_w4a16_marlin {
+                                        // Marlin coalesced path (NEMOTRON_W4A16_MARLIN=1):
+                                        // read the MARLIN-layout copies under the `_marlin`
+                                        // keys, NOT the base standard-layout weights that the
+                                        // sequential step path (moe_fused_ffn) consumes.
+                                        let (muqs, musc, _, _) = &qw[&format!("{p}.moe_up_all_marlin")];
+                                        let (mdqs, mdsc, _, _) = &qw[&format!("{p}.moe_down_all_marlin")];
+                                        let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                            moe_w4a16_marlin(d, &xs_f16, muqs, musc, &idx_dev, mt, inter, hid).unwrap());
+                                        let up_relu2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                                        pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                            moe_w4a16_marlin(d, &up_relu2, mdqs, mdsc, &idx_dev, mt, hid, inter).unwrap())
+                                    } else {
+                                        // Standard scattered-nibble W4A16 path (NEMOTRON_W4A16=1)
+                                        let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                            moe_w4a16(d, &xs_f16, uqs, usc, &idx_dev, mt, inter, hid).unwrap());
+                                        let up_relu2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                                        pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                            moe_w4a16(d, &up_relu2, dqs, dsc, &idx_dev, mt, hid, inter).unwrap())
+                                    };
+                                    let dn_out = cast_f16_f32(d, &dn_out_f16).unwrap();
+                                    moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                                } else {
+                                    // Large S (standard W4A16 only): grouped_gemm (dequant-once + cuBLAS).
+                                    // NOTE: never reached when use_w4a16_marlin=true (weights in Marlin layout).
+                                    let mut g_starts_l: Vec<usize> = vec![0];
+                                    let mut expert_ids_l: Vec<usize> = Vec::new();
+                                    let mut gi = 0usize;
+                                    while gi < mt {
+                                        let eid = triples[gi].0 as usize;
+                                        expert_ids_l.push(eid);
+                                        let mut gi2 = gi + 1;
+                                        while gi2 < mt && triples[gi2].0 as usize == eid { gi2 += 1; }
+                                        g_starts_l.push(gi2);
+                                        gi = gi2;
+                                    }
+                                    let dn_out_f16 = pf!(11, 2.0*mt as f64*(inter+hid) as f64*hid as f64,
+                                        moe_grouped_gemm(d, uqs, usc, dqs, dsc, &xs_f16,
+                                            &g_starts_l, &expert_ids_l, hid, inter, up_bpr, down_bpr,
+                                            grouped_up_scratch.as_ref(), grouped_dn_scratch.as_ref()).unwrap());
+                                    let dn_out = cast_f16_f32(d, &dn_out_f16).unwrap();
+                                    moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
                                 }
-                                let dn_out_f16 = pf!(11, 2.0*mt as f64*(inter+hid) as f64*hid as f64,
-                                    moe_grouped_gemm(d, uqs, usc, dqs, dsc, &xs_f16,
-                                        &g_starts_l, &expert_ids_l, hid, inter, up_bpr, down_bpr,
-                                        grouped_up_scratch.as_ref(), grouped_dn_scratch.as_ref()).unwrap());
-                                let dn_out = cast_f16_f32(d, &dn_out_f16).unwrap();
-                                moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                                acc_h = dl(&acc_dev, s * hid);
                             }
-                            acc_h = dl(&acc_dev, s * hid);
                         } else if use_bgemm {
                             // ── Batched bm64 BGEMM path ───────────────────────────────────
                             // xs_dev_f16 from device gather (set above when use_bgemm=true).
