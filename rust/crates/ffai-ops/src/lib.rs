@@ -1976,21 +1976,21 @@ const MOE_GROUPED_GEMM_MMA_SRC: &str = r#"
 __device__ __forceinline__ unsigned pk2(__half a, __half b){
     return (unsigned)__half_as_ushort(a) | ((unsigned)__half_as_ushort(b) << 16);
 }
-// cp.async one 16B (8-half) chunk shared<-global; src-size 0 → zero-fill (OOB mask)
 #define CPA(SD, SP, V) asm volatile("cp.async.cg.shared.global [%0],[%1],16,%2;\n" \
     :: "r"(SD), "l"(SP), "r"((V)?16:0))
+// BM=64, BN=128: each block computes 128 N-cols so the loaded A tile is reused
+// across 2x the weights → halves redundant A reads (the real bottleneck: A was
+// re-read once per 64-wide N-tile, N/64=29 times/expert > weight traffic).
 extern "C" __global__ void moe_grouped_gemm_mma(
-    const __half* __restrict__ A,                       // [mt, K]
-    const __half* __restrict__ W_base,                  // [n_exp, N, K] contiguous
-    const int* __restrict__ tok0_arr,                   // [n_mtiles] abs token start (64-row tile)
-    const int* __restrict__ eid_arr,                    // [n_mtiles] expert id (→ W slab)
-    const int* __restrict__ gend_arr,                   // [n_mtiles] group end (excl)
-    __half* __restrict__ out,                           // [mt, N]
+    const __half* __restrict__ A,
+    const __half* __restrict__ W_base,
+    const int* __restrict__ tok0_arr,
+    const int* __restrict__ eid_arr,
+    const int* __restrict__ gend_arr,
+    __half* __restrict__ out,
     int N, int K)
 {
-    // 4 warps/block, BM=64×BN=64, BK=64. cp.async DOUBLE-BUFFERED: load K-tile
-    // c+1 while the mma consumes tile c (hides HBM latency — the real GEMM lever).
-    const int BM=64, BN=64, BK=64, NS=8, NKS=4, U=BK/8;  // U=8 uint4/row
+    const int BM=64, BN=128, BK=64, NS=16, NKS=4, U=BK/8;
     int bx = blockIdx.x, by = blockIdx.y;
     int tok0 = tok0_arr[bx], gend = gend_arr[bx], n0 = by * BN;
     const __half* W = W_base + (long)eid_arr[bx] * N * K;
@@ -2024,6 +2024,7 @@ extern "C" __global__ void moe_grouped_gemm_mma(
             unsigned a1=pk2(As[buf][wrow+gid+8][ko+2*tid4], As[buf][wrow+gid+8][ko+2*tid4+1]);
             unsigned a2=pk2(As[buf][wrow+gid][ko+2*tid4+8], As[buf][wrow+gid][ko+2*tid4+9]);
             unsigned a3=pk2(As[buf][wrow+gid+8][ko+2*tid4+8],As[buf][wrow+gid+8][ko+2*tid4+9]);
+            #pragma unroll
             for (int s=0;s<NS;s++){ int nb=s*8;
                 unsigned b0=pk2(Ws[buf][nb+gid][ko+2*tid4],   Ws[buf][nb+gid][ko+2*tid4+1]);
                 unsigned b1=pk2(Ws[buf][nb+gid][ko+2*tid4+8], Ws[buf][nb+gid][ko+2*tid4+9]);
@@ -2102,7 +2103,7 @@ pub fn moe_grouped_gemm_mma(
     };
     let (t0d, eidd, ged) = (up_i32(&tok0)?, up_i32(&eid)?, up_i32(&gend)?);
     let i = |x: i32| x.to_le_bytes().to_vec();
-    let grid = [n_mtiles as u32, (n as u32).div_ceil(64), 1];
+    let grid = [n_mtiles as u32, (n as u32).div_ceil(128), 1];
     dev.dispatch_raw_cuda(
         MOE_GROUPED_GEMM_MMA_SRC, "moe_grouped_gemm_mma.cu", "moe_grouped_gemm_mma",
         &[(a.buffer.as_ref(), a.offset), (w_base.buffer.as_ref(), w_base.offset),
@@ -2124,20 +2125,22 @@ __device__ __forceinline__ unsigned pk2(__half a, __half b){
     return (unsigned)__half_as_ushort(a) | ((unsigned)__half_as_ushort(b) << 16);
 }
 __device__ __forceinline__ __half dqn(unsigned w, int nib, __half sc){
-    // magic-0x6400 all-f16: (nib^8)|0x6400 = f16(1024+signed+8), -1032 → signed, ×sc.
     unsigned short t = (unsigned short)((((w>>(nib*4))&0xf) ^ 0x8) | 0x6400u);
     return __hmul(__hsub(__ushort_as_half(t), __float2half(1032.f)), sc);
 }
 #define CPA(SD,SP) asm volatile("cp.async.cg.shared.global [%0],[%1],16,16;\n" :: "r"(SD), "l"(SP))
+// BN=128 (NS=16): each block does 128 N-cols → the loaded A tile is reused over
+// 2x the weights, halving redundant A reads (the bottleneck). Weight/scale loads
+// CLAMP rows at n0+r>=N to the expert's row 0 (no OOB; garbage masked on store).
 extern "C" __global__ void moe_q4_grouped_mma(
-    const __half* __restrict__ A,        // [mt,K] sorted activation f16
-    const unsigned* __restrict__ Qs,     // [n_exp*N, K/32*4] u32 signed-nibble Q4
-    const __half* __restrict__ Sc,       // [n_exp*N, K/32] f16 scales
+    const __half* __restrict__ A,
+    const unsigned* __restrict__ Qs,
+    const __half* __restrict__ Sc,
     const int* __restrict__ tok0_arr, const int* __restrict__ eid_arr, const int* __restrict__ gend_arr,
-    __half* __restrict__ Out,            // [mt, N] f16
+    __half* __restrict__ Out,
     int N, int K)
 {
-    const int BM=64,BN=64,BK=64,NS=8,NKS=4,GS=32,WPR=BK/8,GPR=BK/GS;
+    const int BM=64,BN=128,BK=64,NS=16,NKS=4,GS=32,WPR=BK/8,GPR=BK/GS;
     int bx=blockIdx.x, by=blockIdx.y;
     int tok0=tok0_arr[bx], gend=gend_arr[bx], eid=eid_arr[bx], n0=by*BN;
     int tid=threadIdx.x,warp=tid>>5,lane=tid&31,gid=lane>>2,tid4=lane&3,wrow=warp*16;
@@ -2146,16 +2149,16 @@ extern "C" __global__ void moe_q4_grouped_mma(
     __shared__ __half   Scs[2][BN][GPR];
     float oc[NS][4]; for(int s=0;s<NS;s++){oc[s][0]=oc[s][1]=oc[s][2]=oc[s][3]=0.f;}
     int nchunk=K/BK, WPB=K/32;
-    long grow0=(long)eid*N + n0;
+    long ebase=(long)eid*N;
 #define LOADC(C,BUF) do{ int kc=(C)*BK; \
     for(int e=tid;e<BM*8;e+=128){ int r=e/8,k8=(e%8)*8; int t=tok0+r; int v=(t<gend); \
         unsigned sd=(unsigned)__cvta_generic_to_shared(&As[BUF][r][k8]); \
         const __half* sp=&A[(long)(v?t:tok0)*K + kc + k8]; CPA(sd,sp); } \
-    for(int e=tid;e<BN*WPR/4;e+=128){ int f=e*4,r=f/WPR,w0=f%WPR; \
+    for(int e=tid;e<BN*WPR/4;e+=128){ int f=e*4,r=f/WPR,w0=f%WPR; long wr=ebase+((n0+r<N)?(n0+r):0); \
         unsigned sd=(unsigned)__cvta_generic_to_shared(&Wqs[BUF][r][w0]); \
-        const unsigned* sp=&Qs[(grow0+r)*WPB*4 + kc/8 + w0]; CPA(sd,sp); } \
-    for(int e=tid;e<BN*GPR;e+=128){ int r=e/GPR,g=e%GPR; \
-        Scs[BUF][r][g]=Sc[(grow0+r)*WPB + kc/32 + g]; } \
+        const unsigned* sp=&Qs[wr*WPB*4 + kc/8 + w0]; CPA(sd,sp); } \
+    for(int e=tid;e<BN*GPR;e+=128){ int r=e/GPR,g=e%GPR; long sr=ebase+((n0+r<N)?(n0+r):0); \
+        Scs[BUF][r][g]=Sc[sr*WPB + kc/32 + g]; } \
     }while(0)
     LOADC(0,0); asm volatile("cp.async.commit_group;\n"); __syncthreads();
     for(int c=0;c<nchunk;c++){
@@ -2164,10 +2167,13 @@ extern "C" __global__ void moe_q4_grouped_mma(
         __syncthreads();
         int buf=c&1;
         for(int ks=0;ks<NKS;ks++){ int ko=ks*16; int c0=ko+2*tid4;
-            unsigned a0=pk2(As[buf][wrow+gid][c0],   As[buf][wrow+gid][c0+1]);
-            unsigned a1=pk2(As[buf][wrow+gid+8][c0], As[buf][wrow+gid+8][c0+1]);
-            unsigned a2=pk2(As[buf][wrow+gid][c0+8], As[buf][wrow+gid][c0+9]);
-            unsigned a3=pk2(As[buf][wrow+gid+8][c0+8],As[buf][wrow+gid+8][c0+9]);
+            int arow = (lane & 7) + ((lane >> 3) & 1) * 8;
+            int acol = (lane >> 4) * 8;
+            unsigned aaddr = (unsigned)__cvta_generic_to_shared(&As[buf][wrow+arow][ko+acol]);
+            unsigned a0,a1,a2,a3;
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3) : "r"(aaddr));
+            #pragma unroll
             for(int s=0;s<NS;s++){ int nrow=s*8+gid;
                 unsigned wA=Wqs[buf][nrow][c0/8], wB=Wqs[buf][nrow][(c0+8)/8];
                 __half sA=Scs[buf][nrow][c0/GS], sB=Scs[buf][nrow][(c0+8)/GS];
@@ -2225,7 +2231,7 @@ pub fn moe_q4_grouped_mma(
     };
     let (t0d, eidd, ged) = (up_i32(&tok0)?, up_i32(&eid)?, up_i32(&gend)?);
     let i = |x: i32| x.to_le_bytes().to_vec();
-    let grid = [n_mtiles as u32, (n as u32).div_ceil(64), 1];
+    let grid = [n_mtiles as u32, (n as u32).div_ceil(128), 1];
     dev.dispatch_raw_cuda(
         MOE_Q4_GROUPED_MMA_SRC, "moe_q4_grouped_mma.cu", "moe_q4_grouped_mma",
         &[(a.buffer.as_ref(), a.offset), (qs.buffer.as_ref(), qs.offset), (sc.buffer.as_ref(), sc.offset),
@@ -2287,7 +2293,7 @@ pub fn moe_q4_grouped_mma_dev(
           (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0)],
         &[i(n_exp as i32), i(64), i(maxt as i32)],
         [1, 1, 1], [1, 1, 1], 0, false)?;
-    let grid = [maxt as u32, (n as u32).div_ceil(64), 1];
+    let grid = [maxt as u32, (n as u32).div_ceil(128), 1];
     dev.dispatch_raw_cuda(
         MOE_Q4_GROUPED_MMA_SRC, "moe_q4_grouped_mma.cu", "moe_q4_grouped_mma",
         &[(a.buffer.as_ref(), a.offset), (qs.buffer.as_ref(), qs.offset), (sc.buffer.as_ref(), sc.offset),
@@ -6547,6 +6553,10 @@ __device__ __forceinline__ unsigned enc_e2m1(float x, float inv_bs){
     unsigned m = (v>=.25f)+(v>=.75f)+(v>=1.25f)+(v>=1.75f)+(v>=2.5f)+(v>=3.5f)+(v>=5.f);
     return sg|m;
 }
+__device__ __forceinline__ float dec_e2m1(unsigned code){
+    const float L[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f};
+    float mag=L[code&7u]; return (code&8u)?-mag:mag;
+}
 __device__ __forceinline__ int b4b_map(int blk){ const int t[4]={0,2,1,3}; return t[blk]; }
 
 // amax over slabs: x f16 [n_slabs * slab_len]; atomicMax on positive float bits.
@@ -7160,6 +7170,43 @@ extern "C" __global__ void lt_fp4_quant_gs(
     }
 }
 
+extern "C" __global__ void lt_fp4_quant_gs_46(
+    const __half* __restrict__ x, unsigned char* __restrict__ xp,
+    unsigned char* __restrict__ sf, const float* __restrict__ gs, int R, int K)
+{
+    int KB=K/16; long nb=(long)R*KB;
+    long b=(long)blockIdx.x*blockDim.x+threadIdx.x; if(b>=nb) return;
+    int r=(int)(b/KB), kb=(int)(b%KB);
+    const __half* xb=x+(long)r*K+kb*16;
+    float v[16]; float am=0.f;
+    #pragma unroll
+    for(int i=0;i<16;i++){ v[i]=__half2float(xb[i]); am=fmaxf(am,fabsf(v[i])); }
+    float ig=1.f/gs[0];
+    // Four-Over-Six: scale-to-4 (denser, no 4-6 hole) vs scale-to-6 (full range), pick min-MSE per block.
+    unsigned sc6=enc_ue4m3((am/6.f)*ig); if(sc6==0u&&am>0.f) sc6=1u; float sd6=dec_ue4m3(sc6); float inv6=(sd6>0.f)?(ig/sd6):0.f;
+    unsigned sc4=enc_ue4m3((am/4.f)*ig); if(sc4==0u&&am>0.f) sc4=1u; float sd4=dec_ue4m3(sc4); float inv4=(sd4>0.f)?(ig/sd4):0.f;
+    float e6=0.f,e4=0.f;
+    #pragma unroll
+    for(int i=0;i<16;i++){
+        float r6=(inv6>0.f)?dec_e2m1(enc_e2m1(v[i],inv6))/inv6:0.f; float d6=r6-v[i]; e6+=d6*d6;
+        float r4=(inv4>0.f)?dec_e2m1(enc_e2m1(v[i],inv4))/inv4:0.f; float d4=r4-v[i]; e4+=d4*d4;
+    }
+    // ue4m3 code 127 (e=15,m=7) is NaN in hardware e4m3 (max normal=448=code126).
+    // scale-to-4 can push the block scale >480 → enc_ue4m3 returns 127 → cuBLASLt
+    // reads a NaN block scale → garbage. scale-to-6 maxes at 448 (code126, safe).
+    // So only pick scale-to-4 when it stays a valid (non-NaN) ue4m3 code.
+    unsigned sc; float inv;
+    if(e4<e6 && sc4<127u){ sc=sc4; inv=inv4; } else { sc=sc6; inv=inv6; }
+    int KB4=(KB+3)>>2;
+    long soff=(long)(r>>7)*(512L*KB4)+(long)(kb>>2)*512+(r&31)*16+((r>>5)&3)*4+(kb&3);
+    sf[soff]=(unsigned char)sc;
+    unsigned char* o=xp+((long)r*K+kb*16)/2;
+    #pragma unroll
+    for(int i=0;i<8;i++){
+        unsigned lo=enc_e2m1(v[2*i],inv), hi=enc_e2m1(v[2*i+1],inv);
+        o[i]=(unsigned char)(lo|(hi<<4));
+    }
+}
 // f32-input global-aware variant of lt_fp4_quant_gs (dense activations read
 // straight from the f32 residual stream; block scales relative to gs[0]).
 extern "C" __global__ void lt_fp4_quant_gs_f32(
@@ -7244,6 +7291,55 @@ extern "C" __global__ void lt_fp4_quant_grouped(
         unsigned lo=enc_e2m1(v[2*i],inv), hi=enc_e2m1(v[2*i+1],inv);
         o[i]=(unsigned char)(lo|(hi<<4));
     }
+}
+
+// Routed-act Four-Over-Six: same as lt_fp4_quant_grouped but adaptive 4/6 block
+// scale (NVFP4 quality). code-127 guard: scale-to-4 can hit ue4m3 NaN code.
+extern "C" __global__ void lt_fp4_quant_grouped_46(
+    const __half* __restrict__ x, unsigned char* __restrict__ xp,
+    unsigned char* __restrict__ sf, const int* __restrict__ g_starts,
+    const long long* __restrict__ sfa_off, const float* __restrict__ gs,
+    const unsigned* __restrict__ st,
+    int n_groups, int R, int K, int act_mode, float act_scale, int use_st)
+{
+    int KB=K/16; long nb=(long)R*KB;
+    long b=(long)blockIdx.x*blockDim.x+threadIdx.x; if(b>=nb) return;
+    int r=(int)(b/KB), kb=(int)(b%KB);
+    int gl=0, gh=n_groups-1;
+    while(gl<gh){ int gm=(gl+gh+1)>>1; if(g_starts[gm]<=r) gl=gm; else gh=gm-1; }
+    int lr=r-g_starts[gl];
+    int sr = use_st ? (int)st[r] : r;
+    const __half* xb=x+(long)sr*K+kb*16;
+    float v[16]; float am=0.f;
+    #pragma unroll
+    for(int i=0;i<16;i++){ v[i]=fp4_act(__half2float(xb[i]),act_mode,act_scale); am=fmaxf(am,fabsf(v[i])); }
+    float ig=gs[1];
+    unsigned sc6=enc_ue4m3((am/6.f)*ig); if(sc6==0u&&am>0.f) sc6=1u; float sd6=dec_ue4m3(sc6); float inv6=(sd6>0.f)?(ig/sd6):0.f;
+    unsigned sc4=enc_ue4m3((am/4.f)*ig); if(sc4==0u&&am>0.f) sc4=1u; float sd4=dec_ue4m3(sc4); float inv4=(sd4>0.f)?(ig/sd4):0.f;
+    float e6=0.f,e4=0.f;
+    #pragma unroll
+    for(int i=0;i<16;i++){
+        float r6=(inv6>0.f)?dec_e2m1(enc_e2m1(v[i],inv6))/inv6:0.f; float d6=r6-v[i]; e6+=d6*d6;
+        float r4=(inv4>0.f)?dec_e2m1(enc_e2m1(v[i],inv4))/inv4:0.f; float d4=r4-v[i]; e4+=d4*d4;
+    }
+    unsigned sc; float inv;
+    if(e4<e6 && sc4<127u){ sc=sc4; inv=inv4; } else { sc=sc6; inv=inv6; }
+    int KB4=(KB+3)>>2;
+    long soff=(long long)sfa_off[gl]+(long)(lr>>7)*(512L*KB4)+(long)(kb>>2)*512+(lr&31)*16+((lr>>5)&3)*4+(kb&3);
+    sf[soff]=(unsigned char)sc;
+    unsigned char* o=xp+((long)r*K+kb*16)/2;
+    #pragma unroll
+    for(int i=0;i<8;i++){
+        unsigned lo=enc_e2m1(v[2*i],inv), hi=enc_e2m1(v[2*i+1],inv);
+        o[i]=(unsigned char)(lo|(hi<<4));
+    }
+}
+extern "C" __global__ void pad_rows_f16(const __half* src, __half* dst, int k, int kpad, int rows){
+    long i = (long)blockIdx.x*blockDim.x + threadIdx.x;
+    long total = (long)rows*(long)kpad;
+    if(i>=total) return;
+    int c = (int)(i % (long)kpad); long r = i / (long)kpad;
+    dst[i] = (c<k) ? src[r*(long)k + c] : __float2half(0.f);
 }
 "#;
 
@@ -7384,9 +7480,12 @@ pub fn lt_fp4_quant_slab(
     let pack = Tensor::new(dev.alloc(n_exp * pack_exp)?, vec![n_exp * pack_exp], DType::U32);
     let sf = Tensor::new(dev.alloc_zeroed(n_exp * sf_exp)?, vec![n_exp * sf_exp], DType::U32);
     let nb = (n * kb) as u32;
+    // B8a: routed-expert WEIGHT 4/6 (Four-Over-Six) under NEMOTRON_FP4_46 — free
+    // (setup-time, covers ~90% of params). Same per-expert global gw[e] (gs[0]).
+    let kname = if std::env::var("NEMOTRON_FP4_46").is_ok() { "lt_fp4_quant_gs_46" } else { "lt_fp4_quant_gs" };
     for e in 0..n_exp {
         dev.dispatch_raw_cuda(
-            MOE_FP4_SRC, "moe_fp4.cu", "lt_fp4_quant_gs",
+            MOE_FP4_SRC, "moe_fp4.cu", kname,
             &[(w.buffer.as_ref(), w.offset + e * n * k * 2),
               (pack.buffer.as_ref(), e * pack_exp), (sf.buffer.as_ref(), e * sf_exp),
               (gw.buffer.as_ref(), e * 4)],
@@ -7434,9 +7533,10 @@ pub fn lt_fp4_quant_grouped_dev(
     let sf = Tensor::new(dev.alloc_zeroed(sf_bytes)?, vec![sf_bytes], DType::U32);
     let nb = (mt * kb) as u32;
     // off_dev doubles as g_starts (u32 values, n_groups+1 entries; the kernel
-    // binary-searches the first n_groups).
+    // binary-searches the first n_groups). B8a: routed-ACT 4/6 under NEMOTRON_FP4_46.
+    let gkname = if std::env::var("NEMOTRON_FP4_46_ACT").is_ok() { "lt_fp4_quant_grouped_46" } else { "lt_fp4_quant_grouped" };
     dev.dispatch_raw_cuda(
-        MOE_FP4_SRC, "moe_fp4.cu", "lt_fp4_quant_grouped",
+        MOE_FP4_SRC, "moe_fp4.cu", gkname,
         &[(x.buffer.as_ref(), x.offset), (pack.buffer.as_ref(), 0), (sf.buffer.as_ref(), 0),
           (off_dev.buffer.as_ref(), off_dev.offset), (sfa_off.buffer.as_ref(), 0), (gs.buffer.as_ref(), 0),
           match gather_st { Some((t, _)) => (t.buffer.as_ref(), t.offset), None => (gs.buffer.as_ref(), 0) }],
@@ -7498,6 +7598,151 @@ pub fn moe_grouped_gemm_cutlass_fp4(
         Some(alpha.buffer.as_ref()), n, k)?;
     Ok(out)
 }
+
+/// Zero-pad the K (column) dim of an f16 `[rows,k]` tensor to `[rows,kpad]`.
+/// No-op clone when `kpad==k`. Used to satisfy the mxf8f6f4 SF atom-K=128
+/// constraint (e.g. down-proj K=1856 -> 1920); padded cols add 0 to the dot.
+pub fn pad_rows_f16(dev: &dyn Device, x: &Tensor, rows: usize, k: usize, kpad: usize) -> Result<Tensor> {
+    if kpad == k { return Ok(x.clone()); }
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let dst = Tensor::new(dev.alloc(rows * kpad * 2)?, vec![rows * kpad], DType::F16);
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "pad_rows_f16",
+        &[(x.buffer.as_ref(), x.offset), (dst.buffer.as_ref(), 0)],
+        &[i(k as i32), i(kpad as i32), i(rows as i32)],
+        [((rows * kpad) as u32).div_ceil(256).max(1), 1, 1], [256, 1, 1], 0, false)?;
+    Ok(dst)
+}
+
+/// W4A8 per-group SFA byte offsets (atom-padded, ue8m0 = 1 byte/elem) for the
+/// grouped act-quant + GEMM. MX per-32 blocks: kb = k/32. Per group the SFA
+/// section is `ceil(m/128)*512*ceil(kb/4)` bytes (same swizzle atom as NVFP4,
+/// only the block size differs). Returns `(offsets[n_groups], total_bytes)`.
+pub fn w4a8_sfa_offsets(g_starts: &[usize], k: usize) -> (Vec<i64>, usize) {
+    let n_groups = g_starts.len() - 1;
+    let kb4 = (k / 32).div_ceil(4);
+    let mut offs = Vec::with_capacity(n_groups);
+    let mut acc: i64 = 0;
+    for g in 0..n_groups {
+        offs.push(acc);
+        let m = g_starts[g + 1] - g_starts[g];
+        acc += (m.div_ceil(128) * 512 * kb4) as i64;
+    }
+    (offs, acc as usize)
+}
+
+/// W4A8 grouped MoE GEMM: fp8 e4m3 acts x mxfp4 weights (cutlass mxf8f6f4).
+/// Both SF are per-32 ue8m0 (full-range), so NO per-tensor global scale / alpha
+/// (alpha=1.0). `sfa_off` = host per-group SFA byte offsets (atom-padded);
+/// `sfb_exp_bytes` = per-expert SFB stride in bytes (from `w4a8_packw`).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_gemm_w4a8(
+    dev: &dyn Device,
+    a_pack: &Tensor, a_sf: &Tensor, sfa_off: &[i64],
+    w_pack: &Tensor, w_sf: &Tensor, sfb_exp_bytes: i64,
+    g_starts: &[usize], expert_ids: &[usize],
+    n: usize, k: usize,
+) -> Result<Tensor> {
+    let n_active = expert_ids.len();
+    let mt = g_starts.last().copied().unwrap_or(0);
+    let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
+    if n_active == 0 || mt == 0 { return Ok(out); }
+    let group_rows: Vec<i32> = (0..n_active).map(|g| (g_starts[g + 1] - g_starts[g]) as i32).collect();
+    let eids: Vec<i32> = expert_ids.iter().map(|&e| e as i32).collect();
+    dev.moe_grouped_cutlass_w4a8(
+        a_pack.buffer.as_ref(), a_sf.buffer.as_ref(),
+        w_pack.buffer.as_ref(), w_sf.buffer.as_ref(),
+        out.buffer.as_ref(), &group_rows, &eids, sfa_off,
+        sfb_exp_bytes, None, n, k)?;
+    Ok(out)
+}
+
+/// W4A8 fp8 act-quant: f16 `x[mt,k]` -> e4m3 bytes `[mt*k]` + ue8m0 SF (per-32,
+/// group-aware SFA). `sfa_off` = host per-group SFA byte offsets (atom-padded).
+/// Returns `(q, sf)`. `sf_total_bytes` = caller-sized SFA buffer length.
+pub fn w4a8_actquant_grouped(
+    dev: &dyn Device,
+    x: &Tensor, group_rows: &[i32], sfa_off: &[i64], sf_total_bytes: usize,
+    mt: usize, k: usize,
+) -> Result<(Tensor, Tensor)> {
+    let q = Tensor::new(dev.alloc(mt * k)?, vec![mt * k], DType::U32);
+    let sf = Tensor::new(dev.alloc_zeroed(sf_total_bytes.max(1))?, vec![sf_total_bytes.max(1)], DType::U32);
+    dev.w4a8_actquant(x.buffer.as_ref(), q.buffer.as_ref(), sf.buffer.as_ref(),
+        group_rows, sfa_off, mt, k)?;
+    Ok((q, sf))
+}
+
+/// W4A8 mxfp4 weight pack: f16 `w[n_exp,n,k]` -> e2m1 bytes + ue8m0 SF (per-32).
+/// Returns `(packed, sf, sfb_exp_elems)`; the GEMM's `sfb_exp_bytes` = sfb_exp_elems.
+pub fn w4a8_packw(
+    dev: &dyn Device,
+    w: &Tensor, n_exp: usize, n: usize, k: usize,
+) -> Result<(Tensor, Tensor, i64)> {
+    let packed = Tensor::new(dev.alloc(n_exp * n * k / 2)?, vec![n_exp * n * k / 2], DType::U32);
+    // SFB size: per-expert atom-padded element count, queried from the first pack.
+    // Over-allocate generously (per-32 -> n*k/32 + atom padding) then trust the
+    // returned per-expert element count for the GEMM stride.
+    let sf_cap = n_exp * ((n * k / 32) + 4 * 128 * 4);
+    let sf = Tensor::new(dev.alloc_zeroed(sf_cap.max(1))?, vec![sf_cap.max(1)], DType::U32);
+    let sfb_exp_elems = dev.w4a8_packw(w.buffer.as_ref(), packed.buffer.as_ref(), sf.buffer.as_ref(),
+        n_exp, n, k)?;
+    Ok((packed, sf, sfb_exp_elems))
+}
+
+/// `sfb_exp_bytes` = per-expert SFB stride in bytes (from `w8a8_packw`).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_gemm_w8a8(
+    dev: &dyn Device,
+    a_pack: &Tensor, a_sf: &Tensor, sfa_off: &[i64],
+    w_pack: &Tensor, w_sf: &Tensor, sfb_exp_bytes: i64,
+    g_starts: &[usize], expert_ids: &[usize],
+    n: usize, k: usize,
+) -> Result<Tensor> {
+    let n_active = expert_ids.len();
+    let mt = g_starts.last().copied().unwrap_or(0);
+    let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
+    if n_active == 0 || mt == 0 { return Ok(out); }
+    let group_rows: Vec<i32> = (0..n_active).map(|g| (g_starts[g + 1] - g_starts[g]) as i32).collect();
+    let eids: Vec<i32> = expert_ids.iter().map(|&e| e as i32).collect();
+    dev.moe_grouped_cutlass_w8a8(
+        a_pack.buffer.as_ref(), a_sf.buffer.as_ref(),
+        w_pack.buffer.as_ref(), w_sf.buffer.as_ref(),
+        out.buffer.as_ref(), &group_rows, &eids, sfa_off,
+        sfb_exp_bytes, None, n, k)?;
+    Ok(out)
+}
+
+/// W4A8 fp8 act-quant: f16 `x[mt,k]` -> e4m3 bytes `[mt*k]` + ue8m0 SF (per-32,
+/// group-aware SFA). `sfa_off` = host per-group SFA byte offsets (atom-padded).
+/// Returns `(q, sf)`. `sf_total_bytes` = caller-sized SFA buffer length.
+pub fn w8a8_actquant_grouped(
+    dev: &dyn Device,
+    x: &Tensor, group_rows: &[i32], sfa_off: &[i64], sf_total_bytes: usize,
+    mt: usize, k: usize,
+) -> Result<(Tensor, Tensor)> {
+    let q = Tensor::new(dev.alloc(mt * k)?, vec![mt * k], DType::U32);
+    let sf = Tensor::new(dev.alloc_zeroed(sf_total_bytes.max(1))?, vec![sf_total_bytes.max(1)], DType::U32);
+    dev.w8a8_actquant(x.buffer.as_ref(), q.buffer.as_ref(), sf.buffer.as_ref(),
+        group_rows, sfa_off, mt, k)?;
+    Ok((q, sf))
+}
+
+/// W4A8 mxfp4 weight pack: f16 `w[n_exp,n,k]` -> e2m1 bytes + ue8m0 SF (per-32).
+/// Returns `(packed, sf, sfb_exp_elems)`; the GEMM's `sfb_exp_bytes` = sfb_exp_elems.
+pub fn w8a8_packw(
+    dev: &dyn Device,
+    w: &Tensor, n_exp: usize, n: usize, k: usize,
+) -> Result<(Tensor, Tensor, i64)> {
+    let packed = Tensor::new(dev.alloc(n_exp * n * k)?, vec![n_exp * n * k], DType::U32);
+    // SFB size: per-expert atom-padded element count, queried from the first pack.
+    // Over-allocate generously (per-32 -> n*k/32 + atom padding) then trust the
+    // returned per-expert element count for the GEMM stride.
+    let sf_cap = n_exp * ((n * k / 32) + 4 * 128 * 4);
+    let sf = Tensor::new(dev.alloc_zeroed(sf_cap.max(1))?, vec![sf_cap.max(1)], DType::U32);
+    let sfb_exp_elems = dev.w8a8_packw(w.buffer.as_ref(), packed.buffer.as_ref(), sf.buffer.as_ref(),
+        n_exp, n, k)?;
+    Ok((packed, sf, sfb_exp_elems))
+}
+
 
 /// Quantize an f16 tensor to e4m3 with a dynamic per-tensor scale.
 /// Returns `(q, sc)` — e4m3 bytes `[n]` + a 2-f32 scale buffer
@@ -7616,6 +7861,32 @@ pub fn gemm_fp4(
 /// the subnormal floor that wrecks small-magnitude dense weights (cosine
 /// 0.44 -> ~0.97). Returns (pack, sf, gs[2]=[global,unused]); the GEMM folds
 /// the act·weight globals back via its D-scale. f16 or f32 input.
+/// Four-Over-Six variant (adaptive 4/6 block scale; NVFP4 quality, GEMM-identical = free). f16 in.
+pub fn lt_fp4_quant_g_46(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Result<(Tensor, Tensor, Tensor)> {
+    if k % 32 != 0 { return Err(Error::Msg(format!("lt_fp4_quant_g_46: k {k} %32!=0"))); }
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let l = |v: i64| v.to_le_bytes().to_vec();
+    let kb = k / 16; let kb4 = kb.div_ceil(4);
+    let sf_bytes = r.div_ceil(128) * 512 * kb4;
+    let amax = Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_amax_slab",
+        &[(x.buffer.as_ref(), x.offset), (amax.buffer.as_ref(), 0)],
+        &[l((r*k) as i64), i(1), i(0), 0f32.to_le_bytes().to_vec()],
+        [((r*k) as u32).div_ceil(256*64).max(1),1,1],[256,1,1],0,false)?;
+    let gs = Tensor::new(dev.alloc(8)?, vec![2], DType::F32);
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_gscale",
+        &[(amax.buffer.as_ref(),0),(gs.buffer.as_ref(),0)], &[], [1,1,1],[1,1,1],0,false)?;
+    let pack = Tensor::new(dev.alloc((r*k)/2)?, vec![(r*k)/2], DType::U32);
+    let sf = Tensor::new(dev.alloc_zeroed(sf_bytes)?, vec![sf_bytes], DType::U32);
+    let nb = (r*kb) as u32;
+    let kname = if x.dtype == DType::F32 { "lt_fp4_quant_gs_f32" } else { "lt_fp4_quant_gs_46" };
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", kname,
+        &[(x.buffer.as_ref(), x.offset), (pack.buffer.as_ref(),0), (sf.buffer.as_ref(),0), (gs.buffer.as_ref(),0)],
+        &[i(r as i32), i(k as i32)],
+        [nb.div_ceil(256),1,1],[256,1,1],0,false)?;
+    Ok((pack, sf, gs))
+}
+
 pub fn lt_fp4_quant_g(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Result<(Tensor, Tensor, Tensor)> {
     if k % 32 != 0 { return Err(Error::Msg(format!("lt_fp4_quant_g: k {k} %32!=0"))); }
     let i = |v: i32| v.to_le_bytes().to_vec();
@@ -7631,6 +7902,28 @@ pub fn lt_fp4_quant_g(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Resul
     let gs = Tensor::new(dev.alloc(8)?, vec![2], DType::F32);
     dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "nvfp4_gscale",
         &[(amax.buffer.as_ref(),0),(gs.buffer.as_ref(),0)], &[], [1,1,1],[1,1,1],0,false)?;
+    let pack = Tensor::new(dev.alloc((r*k)/2)?, vec![(r*k)/2], DType::U32);
+    let sf = Tensor::new(dev.alloc_zeroed(sf_bytes)?, vec![sf_bytes], DType::U32);
+    let nb = (r*kb) as u32;
+    let kname = if x.dtype == DType::F32 { "lt_fp4_quant_gs_f32" } else { "lt_fp4_quant_gs" };
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", kname,
+        &[(x.buffer.as_ref(), x.offset), (pack.buffer.as_ref(),0), (sf.buffer.as_ref(),0), (gs.buffer.as_ref(),0)],
+        &[i(r as i32), i(k as i32)],
+        [nb.div_ceil(256),1,1],[256,1,1],0,false)?;
+    Ok((pack, sf, gs))
+}
+
+/// No-global FP4 quant: per-16 ue4m3 block scales absorb the FULL magnitude
+/// (global gs=[1,1]), so the dequant stays ~true-scale and the f16-output GEMM
+/// (out_f32=false) does NOT overflow — fast f16 path AND correct (vs the
+/// two-level global variant whose globally-normalized raw blows past f16 max).
+pub fn lt_fp4_quant_g_ng(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Result<(Tensor, Tensor, Tensor)> {
+    if k % 32 != 0 { return Err(Error::Msg(format!("lt_fp4_quant_g_ng: k {k} %32!=0"))); }
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let kb = k / 16; let kb4 = kb.div_ceil(4);
+    let sf_bytes = r.div_ceil(128) * 512 * kb4;
+    let one_bytes: Vec<u8> = [1f32, 1f32].iter().flat_map(|f| f.to_le_bytes()).collect();
+    let gs = Tensor::new(dev.upload(&one_bytes)?, vec![2], DType::F32); // gs=[1, 1]: no global
     let pack = Tensor::new(dev.alloc((r*k)/2)?, vec![(r*k)/2], DType::U32);
     let sf = Tensor::new(dev.alloc_zeroed(sf_bytes)?, vec![sf_bytes], DType::U32);
     let nb = (r*kb) as u32;

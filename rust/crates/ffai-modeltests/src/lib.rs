@@ -796,6 +796,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     // globals). Feeds the grouped block-scaled CUTLASS GEMM instead of the
     // hand-rolled mma.
     let mut fp4w_cutlass: HashMap<String, (Tensor, Tensor, Tensor)> = HashMap::new();
+    // W4A8 MoE weights (NEMOTRON_W4A8_MOE): mxfp4 weights (per-32 ue8m0) packed
+    // ONCE at load → name → (packed e2m1, sf ue8m0, sfb_exp_elems). Fed to the
+    // mxf8f6f4 grouped GEMM with fp8 e4m3 acts — the quality-holding fast path
+    // (256 act levels vs W4A4's 16; weights stay 4-bit so HBM/speed ~= W4A4).
+    let mut w4a8w: HashMap<String, (Tensor, Tensor, i64)> = HashMap::new();
+    let use_w4a8_env = std::env::var("NEMOTRON_W4A8_MOE").is_ok();
+    let mut w8a8w: HashMap<String, (Tensor, Tensor, i64)> = HashMap::new();
+    let use_w8a8_env = std::env::var("NEMOTRON_W8A8_MOE").is_ok();
     // Persistent CUTLASS grouped-FP4 handles per layer: (up_handle, dn_handle,
     // alpha_up, alpha_dn). Prepared lazily on first use; alpha buffers are
     // fixed addresses the prepared blob points at (values rewritten per call).
@@ -1072,6 +1080,45 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         };
                         buildc("up_proj", inter, hid);
                         buildc("down_proj", hid, inter);
+                    }
+                    // W4A8: pack the SAME dequanted f16 experts as mxfp4 (per-32
+                    // ue8m0) once at load. sfb_exp_elems returned by w4a8_packw
+                    // is the per-expert SF stride the GEMM consumes (no disk cache
+                    // — packing is fast and the stride must come from the packer).
+                    if use_w4a8_env {
+                        let mut buildw = |which: &str, n: usize, k: usize| {
+                            let key = format!("{p}.moe_{which}_w4a8");
+                            let mut wh: Vec<f32> = Vec::with_capacity(n_exp * n * k);
+                            for e in 0..n_exp {
+                                wh.extend(g(&format!("{p}.mixer.experts.{e}.{which}.weight")));
+                            }
+                            let bytes = tb_f16(&wh); drop(wh);
+                            let wt = Tensor::new(d.upload(&bytes).unwrap(), vec![n_exp * n, k], DType::F16);
+                            drop(bytes);
+                            // mxf8f6f4 SF atom-K = 128 → pad K (down-proj K=1856 -> 1920).
+                            let kpad = k.div_ceil(128) * 128;
+                            let wt = ffai_ops::pad_rows_f16(d, &wt, n_exp * n, k, kpad).unwrap();
+                            let (wp, wsf, eb) = ffai_ops::w4a8_packw(d, &wt, n_exp, n, kpad).unwrap();
+                            w4a8w.insert(key, (wp, wsf, eb));
+                        };
+                        buildw("up_proj", inter, hid);
+                        buildw("down_proj", hid, inter);
+                    }
+                    // W8A8: pack experts as fp8 e4m3 (per-32 ue8m0) once at load.
+                    // No K-pad (mxf8 atom = per-32; validated K=1856 unpadded).
+                    if use_w8a8_env {
+                        let mut buildw8 = |which: &str, n: usize, k: usize| {
+                            let key = format!("{p}.moe_{which}_w8a8");
+                            let mut wh: Vec<f32> = Vec::with_capacity(n_exp * n * k);
+                            for e in 0..n_exp { wh.extend(g(&format!("{p}.mixer.experts.{e}.{which}.weight"))); }
+                            let bytes = tb_f16(&wh); drop(wh);
+                            let wt = Tensor::new(d.upload(&bytes).unwrap(), vec![n_exp * n, k], DType::F16);
+                            drop(bytes);
+                            let (wp, wsf, eb) = ffai_ops::w8a8_packw(d, &wt, n_exp, n, k).unwrap();
+                            w8a8w.insert(key, (wp, wsf, eb));
+                        };
+                        buildw8("up_proj", inter, hid);
+                        buildw8("down_proj", hid, inter);
                     }
                     // NEMOTRON_FP4_SHARED_FOLD=1: shared expert folded into the routed
                     // grouped GEMM as 2 extra always-selected groups. Up: shared up
@@ -2654,7 +2701,87 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let fp4_cutlass = fp4_moe && use_fp4_cutlass_env
                                 && fp4w_cutlass.contains_key(&format!("{p}.moe_up_proj_fp4_cutlass"));
                             let cutlass_dev = fp4_cutlass && std::env::var("NEMOTRON_CUTLASS_DEV").is_ok();
-                            if cutlass_dev {
+                            // ── W4A8: fp8 e4m3 acts x mxfp4 weights (mxf8f6f4). Self-
+                            // contained host-desc path (gathers sorted rows itself);
+                            // group-aware per-32 act-quant; relu²·(1/256) between;
+                            // same det-scatter. Quality-holding (256 act levels). ──
+                            let w8a8_moe = use_w8a8_env && w8a8w.contains_key(&format!("{p}.moe_up_proj_w8a8"));
+                            let w4a8_moe = use_w4a8_env && w4a8w.contains_key(&format!("{p}.moe_up_proj_w4a8"));
+                            if w8a8_moe {
+                                let off_dev = off_dev_ref.unwrap();
+                                let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
+                                let xn2d = xn_f16_router.as_ref().unwrap().reshaped(vec![s, hid]);
+                                let xs_g = pf!(12, 0.0, gather(d, &xn2d, st_dev).unwrap());
+                                let mut ob = vec![0u8; (n_exp + 1) * 4];
+                                d.download(off_dev.buffer.as_ref(), &mut ob).unwrap();
+                                let offs: Vec<usize> = ob.chunks(4).map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]]) as usize).collect();
+                                let mut g_starts_c: Vec<usize> = vec![0];
+                                let mut eids_c: Vec<usize> = Vec::new();
+                                for e in 0..n_exp { if offs[e+1] > offs[e] { eids_c.push(e); g_starts_c.push(offs[e+1]); } }
+                                let grows: Vec<i32> = g_starts_c.windows(2).map(|w| (w[1]-w[0]) as i32).collect();
+                                let (uwp, uwsf, ueb) = &w8a8w[&format!("{p}.moe_up_proj_w8a8")];
+                                let (dwp, dwsf, deb) = &w8a8w[&format!("{p}.moe_down_proj_w8a8")];
+                                let (uoff, ubytes) = ffai_ops::w4a8_sfa_offsets(&g_starts_c, hid);
+                                let (ap, asf) = pf!(15, 0.0,
+                                    ffai_ops::w8a8_actquant_grouped(d, &xs_g, &grows, &uoff, ubytes, mt, hid).unwrap());
+                                let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                    ffai_ops::moe_grouped_gemm_w8a8(d, &ap, &asf, &uoff, uwp, uwsf, *ueb, &g_starts_c, &eids_c, inter, hid).unwrap());
+                                let a2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                                let (boff, bbytes) = ffai_ops::w4a8_sfa_offsets(&g_starts_c, inter);
+                                let (bp, bsf) = pf!(15, 0.0,
+                                    ffai_ops::w8a8_actquant_grouped(d, &a2, &grows, &boff, bbytes, mt, inter).unwrap());
+                                let dn_out = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                    ffai_ops::moe_grouped_gemm_w8a8(d, &bp, &bsf, &boff, dwp, dwsf, *deb, &g_starts_c, &eids_c, hid, inter).unwrap());
+                                let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
+                                moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
+                            } else if w4a8_moe {
+                                let off_dev = off_dev_ref.unwrap();
+                                let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
+                                let xn2d = xn_f16_router.as_ref().unwrap().reshaped(vec![s, hid]);
+                                let xs_g = pf!(12, 0.0, gather(d, &xn2d, st_dev).unwrap());
+                                let mut ob = vec![0u8; (n_exp + 1) * 4];
+                                d.download(off_dev.buffer.as_ref(), &mut ob).unwrap();
+                                let offs: Vec<usize> = ob.chunks(4)
+                                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect();
+                                let mut g_starts_c: Vec<usize> = vec![0];
+                                let mut eids_c: Vec<usize> = Vec::new();
+                                for e in 0..n_exp { if offs[e + 1] > offs[e] { eids_c.push(e); g_starts_c.push(offs[e + 1]); } }
+                                let grows: Vec<i32> = g_starts_c.windows(2).map(|w| (w[1] - w[0]) as i32).collect();
+                                let (uwp, uwsf, ueb) = &w4a8w[&format!("{p}.moe_up_proj_w4a8")];
+                                let (dwp, dwsf, deb) = &w4a8w[&format!("{p}.moe_down_proj_w4a8")];
+                                let hid_pad = hid.div_ceil(128) * 128;
+                                let inter_pad = inter.div_ceil(128) * 128;
+                                let xs_p = ffai_ops::pad_rows_f16(d, &xs_g, mt, hid, hid_pad).unwrap();
+                                let (uoff, ubytes) = ffai_ops::w4a8_sfa_offsets(&g_starts_c, hid_pad);
+                                let (ap, asf) = pf!(15, 0.0,
+                                    ffai_ops::w4a8_actquant_grouped(d, &xs_p, &grows, &uoff, ubytes, mt, hid_pad).unwrap());
+                                let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                    ffai_ops::moe_grouped_gemm_w4a8(d, &ap, &asf, &uoff, uwp, uwsf, *ueb, &g_starts_c, &eids_c, inter, hid_pad).unwrap());
+                                let a2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                                let a2p = ffai_ops::pad_rows_f16(d, &a2, mt, inter, inter_pad).unwrap();
+                                let (boff, bbytes) = ffai_ops::w4a8_sfa_offsets(&g_starts_c, inter_pad);
+                                let (bp, bsf) = pf!(15, 0.0,
+                                    ffai_ops::w4a8_actquant_grouped(d, &a2p, &grows, &boff, bbytes, mt, inter_pad).unwrap());
+                                let dn_out = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                    ffai_ops::moe_grouped_gemm_w4a8(d, &bp, &bsf, &boff, dwp, dwsf, *deb, &g_starts_c, &eids_c, hid, inter_pad).unwrap());
+                                {
+                                    use std::sync::atomic::{AtomicUsize, Ordering};
+                                    static DBG: AtomicUsize = AtomicUsize::new(0);
+                                    if std::env::var("NEMOTRON_W4A8_DBG").is_ok() && DBG.fetch_add(1, Ordering::Relaxed) < 1 {
+                                        let nrm = |t: &Tensor, n: usize| -> f64 {
+                                            let v = dl(&cast_f16_f32(d, t).unwrap(), n);
+                                            (v.iter().map(|x| (*x as f64)*(*x as f64)).sum::<f64>() / n as f64).sqrt()
+                                        };
+                                        eprintln!("  [W4A8-DBG {p}] n_active={} mt={mt} g_starts_c.last={:?} | rms: xs_g={:.4} up_out={:.4} a2={:.4} dn_out={:.4}",
+                                            eids_c.len(), g_starts_c.last(),
+                                            nrm(&xs_g, mt*hid), nrm(&up_out, mt*inter), nrm(&a2, mt*inter), nrm(&dn_out, mt*hid));
+                                    }
+                                }
+                                let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
+                                moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
+                            } else if cutlass_dev {
                                 // ── device-descriptor CUTLASS grouped NVFP4 (zero host
                                 // work per call): persistent prepared handles per layer;
                                 // per call = grouped act quant (device sfa offsets) +
@@ -3210,6 +3337,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
                                     ffai_ops::moe_fp4_grouped_mma_dev(d, &sa, dwp, dwsc, dgw, &off1, 1, s, hid, shared_inter, 1, 1.0, Some(&amax_sd), None, None).unwrap())
                             } else if std::env::var("NEMOTRON_FP4_SHARED_LT").is_ok() {
+                                let q46 = std::env::var("NEMOTRON_FP4_46").is_ok();
+                                let q46w = q46 || std::env::var("NEMOTRON_FP4_46W").is_ok();
+                                let q46a = q46 || std::env::var("NEMOTRON_FP4_46A").is_ok();
                                 // Lt block-scaled FP4 shared expert (~4x the f16 GEMM rate):
                                 // weights packed once (cross-forward cache), activations
                                 // quantized per call. Quant-regime lever (changes numerics).
@@ -3217,7 +3347,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     let key = format!("{p}.shup.lt4");
                                     if let (Some(t), Some(g)) = (w4lt.borrow().get(&key).cloned(), w4g.borrow().get(&key).cloned()) { (t.0, t.1, g) } else {
                                         let wf = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
-                                        let (wp, wsf, wg) = ffai_ops::lt_fp4_quant_g(d, &wf, *sm_up, *sk_up).unwrap();
+                                        let (wp, wsf, wg) = if q46w { ffai_ops::lt_fp4_quant_g_46(d, &wf, *sm_up, *sk_up).unwrap() } else { ffai_ops::lt_fp4_quant_g(d, &wf, *sm_up, *sk_up).unwrap() };
                                         w4lt.borrow_mut().insert(key.clone(), (wp.clone(), wsf.clone())); w4g.borrow_mut().insert(key, wg.clone()); (wp, wsf, wg)
                                     }
                                 };
@@ -3225,19 +3355,20 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     let key = format!("{p}.shdn.lt4");
                                     if let (Some(t), Some(g)) = (w4lt.borrow().get(&key).cloned(), w4g.borrow().get(&key).cloned()) { (t.0, t.1, g) } else {
                                         let wf = deq16(&format!("{p}.shdn"), sdqs, sdsc, *sm_dn, *sk_dn, 0);
-                                        let (wp, wsf, wg) = ffai_ops::lt_fp4_quant_g(d, &wf, *sm_dn, *sk_dn).unwrap();
+                                        let (wp, wsf, wg) = if q46w { ffai_ops::lt_fp4_quant_g_46(d, &wf, *sm_dn, *sk_dn).unwrap() } else { ffai_ops::lt_fp4_quant_g(d, &wf, *sm_dn, *sk_dn).unwrap() };
                                         w4lt.borrow_mut().insert(key.clone(), (wp.clone(), wsf.clone())); w4g.borrow_mut().insert(key, wg.clone()); (wp, wsf, wg)
                                     }
                                 };
-                                let (xq, xsf, xg) = pf!(15, 0.0, ffai_ops::lt_fp4_quant_g(d, &xnh, s, hid).unwrap());
+                                let (xq, xsf, xg) = pf!(15, 0.0, if q46a { ffai_ops::lt_fp4_quant_g_46(d, &xnh, s, hid).unwrap() } else { ffai_ops::lt_fp4_quant_g(d, &xnh, s, hid).unwrap() });
                                 let ds_u = ffai_ops::fp4_dscale(d, &xg, &uwg).unwrap();
                                 let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
-                                    ffai_ops::gemm_fp4(d, &xq, &xsf, &uwq, &uwsf, s, *sm_up, *sk_up, false, Some(&ds_u)).unwrap());
-                                let sa2 = pf!(3, 0.0, relu2_scale_f16(d, &sa, 1.0f32).unwrap());
-                                let (aq, asf, ag) = pf!(15, 0.0, ffai_ops::lt_fp4_quant_g(d, &sa2, s, shared_inter).unwrap());
+                                    ffai_ops::gemm_fp4(d, &xq, &xsf, &uwq, &uwsf, s, *sm_up, *sk_up, true, Some(&ds_u)).unwrap());
+                                let sa2 = pf!(3, 0.0, relu2_scale_f16(d, &cast_f32_f16(d,&sa).unwrap(), 1.0f32).unwrap());
+                                let (aq, asf, ag) = pf!(15, 0.0, if q46a { ffai_ops::lt_fp4_quant_g_46(d, &sa2, s, shared_inter).unwrap() } else { ffai_ops::lt_fp4_quant_g(d, &sa2, s, shared_inter).unwrap() });
                                 let ds_d = ffai_ops::fp4_dscale(d, &ag, &dwg).unwrap();
-                                pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
-                                    ffai_ops::gemm_fp4(d, &aq, &asf, &dwq, &dwsf, s, *sm_dn, *sk_dn, false, Some(&ds_d)).unwrap())
+                                let sd_lt = pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
+                                    ffai_ops::gemm_fp4(d, &aq, &asf, &dwq, &dwsf, s, *sm_dn, *sk_dn, true, Some(&ds_d)).unwrap());
+                                cast_f32_f16(d, &sd_lt).unwrap()
                             } else {
                             let wsu = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
                             let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
@@ -3398,8 +3529,18 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         };
                         let attn = if use_tc_attn {
                             if let Some(seg_lo) = seg_lo_dev.as_ref() {
+                                // A4: A/B scores-in-shared flash kernels vs the HBM-materializing
+                                // varlen path. Single-segment prefill = plain causal [base,base+s).
+                                match std::env::var("NEMOTRON_PACKED_ATTN").ok().as_deref() {
+                                    Some("fused") if hd==128 => { let _=(seg_lo,pk_seg_len);
+                                        pf!(7, attn_flops, ffai_ops::sdpa_flash_fused(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap()) }
+                                    Some("wmma") if hd==128 => { let _=(seg_lo,pk_seg_len);
+                                        pf!(7, attn_flops, ffai_ops::sdpa_flash_wmma(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap()) }
+                                    _ => {
                                 // Packed: block-diagonal varlen flash-attn (each query stays in its segment).
                                 pf!(7, attn_flops, sdpa_multi_tc_varlen(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), seg_lo, pk_seg_len, hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
+                                    }
+                                }
                             } else if hd == 128 && std::env::var("NEMOTRON_FLASH_MMA_OFF").is_err()
                                       && std::env::var("NEMOTRON_FLASH_WMMA").is_err()
                                       && std::env::var("NEMOTRON_FLASH_FUSED").is_err() {
@@ -3699,6 +3840,33 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             let am = ffai_runtime::argmax(&logits);
             LAST_BATCHED_LOGITS.with(|c| *c.borrow_mut() = logits);
             eprintln!("  ── CUDA-GRAPH replay: {rep:.3}s = {:.2} tok/s (captured forward, argmax {am}) ──", ids.len() as f64 / rep);
+            // I1: BF16/W4A16-oracle metric. NEMOTRON_DUMP_LOGITS=<f> writes last-token
+            // logits (run a high-precision/no-fp4-act config to make the oracle).
+            // NEMOTRON_BF16_REF=<f> loads it and reports cosine/argmax/top5 vs current.
+            {
+                let bl = LAST_BATCHED_LOGITS.with(|c| c.borrow().clone());
+                if let Ok(p) = std::env::var("NEMOTRON_DUMP_LOGITS") {
+                    let by: Vec<u8> = bl.iter().flat_map(|f| f.to_le_bytes()).collect();
+                    std::fs::write(&p, &by).ok();
+                    eprintln!("  [ORACLE] dumped {} logits -> {p}", bl.len());
+                }
+                if let Ok(p) = std::env::var("NEMOTRON_BF16_REF") {
+                    let nf = bl.iter().filter(|x| !x.is_finite()).count();
+                    if nf > 0 { eprintln!("  [BF16-REF] {nf} non-finite logits — skip"); }
+                    else if let Ok(rb) = std::fs::read(&p) {
+                        let rl: Vec<f32> = rb.chunks(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+                        if rl.len()==bl.len() && !bl.is_empty() {
+                            let (mut dot,mut na,mut nb)=(0f64,0f64,0f64);
+                            for (a,b) in bl.iter().zip(rl.iter()){ dot+=(*a as f64)*(*b as f64); na+=(*a as f64).powi(2); nb+=(*b as f64).powi(2); }
+                            let cos=dot/(na.sqrt()*nb.sqrt()+1e-30);
+                            let amb=ffai_runtime::argmax(&bl); let amr=ffai_runtime::argmax(&rl);
+                            let t5=|v:&[f32]|{let mut ix:Vec<usize>=(0..v.len()).collect(); ix.sort_by(|&a,&b| v[b].partial_cmp(&v[a]).unwrap()); ix.truncate(5); ix};
+                            let (tb,tr)=(t5(&bl),t5(&rl)); let ov=tr.iter().filter(|x| tb.contains(x)).count();
+                            eprintln!("  [BF16-REF vs {p}] cosine={cos:.6}  argmax={amb} (oracle {amr}){}  top5-overlap={ov}/5", if amb==amr {" EXACT*"} else {" MISMATCH"});
+                        } else { eprintln!("  [BF16-REF] len mismatch {} vs {}", bl.len(), rl.len()); }
+                    }
+                }
+            }
             (am, rep)
         } else {
             let t_pf = Instant::now();

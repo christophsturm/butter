@@ -297,6 +297,12 @@ impl Device for CudaDevice {
             slots.push(Slot::Scalar(scalar_store.len()));
             scalar_store.push(s.clone());
         }
+        if fn_name.contains("marlin") && std::env::var("NEMOTRON_MARLIN_DBG").is_ok() {
+            eprintln!("[MARLINPTR] fn={} grid={:?} block={:?} smem={} ptrs={:?} scalars_lens={:?}",
+                fn_name, grid, block, shared_bytes,
+                ptr_store.iter().map(|p| format!("0x{:x}", p)).collect::<Vec<_>>(),
+                scalars.iter().map(|s| s.len()).collect::<Vec<_>>());
+        }
 
         let mut args: Vec<*mut c_void> = slots.iter().map(|s| match s {
             Slot::Ptr(i)    => &ptr_store[*i]    as *const u64 as *mut c_void,
@@ -438,6 +444,157 @@ impl Device for CudaDevice {
             .map_err(dispatch_err)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_cutlass_w4a8(
+        &self,
+        a: &dyn DeviceBuffer,
+        sfa: &dyn DeviceBuffer,
+        w: &dyn DeviceBuffer,
+        sfw: &dyn DeviceBuffer,
+        out: &dyn DeviceBuffer,
+        group_rows: &[i32],
+        expert_ids: &[i32],
+        sfa_off: &[i64],
+        sfb_exp_bytes: i64,
+        alpha_vec: Option<&dyn DeviceBuffer>,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let dc = |b: &dyn DeviceBuffer, what: &str| -> Result<u64> {
+            Ok(b.as_any()
+                .downcast_ref::<CudaBuffer>()
+                .ok_or_else(|| Error::Msg(format!("moe_grouped_cutlass_w4a8: {what} not CudaBuffer")))?
+                .ptr)
+        };
+        let (ap, sfap, wp, sfwp, op) =
+            (dc(a, "a")?, dc(sfa, "sfa")?, dc(w, "w")?, dc(sfw, "sfw")?, dc(out, "out")?);
+        let alp = match alpha_vec {
+            Some(b) => dc(b, "alpha_vec")?,
+            None => 0,
+        };
+        self.dev
+            .moe_grouped_cutlass_w4a8(ap, sfap, wp, sfwp, op, group_rows, expert_ids, sfa_off, sfb_exp_bytes, alp, n, k)
+            .map_err(dispatch_err)
+    }
+
+    fn w4a8_actquant(
+        &self,
+        x: &dyn DeviceBuffer,
+        out: &dyn DeviceBuffer,
+        sf: &dyn DeviceBuffer,
+        group_rows: &[i32],
+        sfa_off: &[i64],
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let dc = |b: &dyn DeviceBuffer, what: &str| -> Result<u64> {
+            Ok(b.as_any()
+                .downcast_ref::<CudaBuffer>()
+                .ok_or_else(|| Error::Msg(format!("w4a8_actquant: {what} not CudaBuffer")))?
+                .ptr)
+        };
+        let (xp, op, sfp) = (dc(x, "x")?, dc(out, "out")?, dc(sf, "sf")?);
+        self.dev
+            .w4a8_actquant_run(xp, op, sfp, group_rows, sfa_off, n, k)
+            .map_err(dispatch_err)
+    }
+
+    fn w4a8_packw(
+        &self,
+        w: &dyn DeviceBuffer,
+        outp: &dyn DeviceBuffer,
+        sf: &dyn DeviceBuffer,
+        n_exp: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<i64> {
+        let dc = |b: &dyn DeviceBuffer, what: &str| -> Result<u64> {
+            Ok(b.as_any()
+                .downcast_ref::<CudaBuffer>()
+                .ok_or_else(|| Error::Msg(format!("w4a8_packw: {what} not CudaBuffer")))?
+                .ptr)
+        };
+        let (wp, op, sfp) = (dc(w, "w")?, dc(outp, "outp")?, dc(sf, "sf")?);
+        self.dev
+            .w4a8_packw_run(wp, op, sfp, n_exp, n, k)
+            .map_err(dispatch_err)
+    }
+
+    fn moe_grouped_cutlass_w8a8(
+        &self,
+        a: &dyn DeviceBuffer,
+        sfa: &dyn DeviceBuffer,
+        w: &dyn DeviceBuffer,
+        sfw: &dyn DeviceBuffer,
+        out: &dyn DeviceBuffer,
+        group_rows: &[i32],
+        expert_ids: &[i32],
+        sfa_off: &[i64],
+        sfb_exp_bytes: i64,
+        alpha_vec: Option<&dyn DeviceBuffer>,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let dc = |b: &dyn DeviceBuffer, what: &str| -> Result<u64> {
+            Ok(b.as_any()
+                .downcast_ref::<CudaBuffer>()
+                .ok_or_else(|| Error::Msg(format!("moe_grouped_cutlass_w8a8: {what} not CudaBuffer")))?
+                .ptr)
+        };
+        let (ap, sfap, wp, sfwp, op) =
+            (dc(a, "a")?, dc(sfa, "sfa")?, dc(w, "w")?, dc(sfw, "sfw")?, dc(out, "out")?);
+        let alp = match alpha_vec {
+            Some(b) => dc(b, "alpha_vec")?,
+            None => 0,
+        };
+        self.dev
+            .moe_grouped_cutlass_w8a8(ap, sfap, wp, sfwp, op, group_rows, expert_ids, sfa_off, sfb_exp_bytes, alp, n, k)
+            .map_err(dispatch_err)
+    }
+
+    fn w8a8_actquant(
+        &self,
+        x: &dyn DeviceBuffer,
+        out: &dyn DeviceBuffer,
+        sf: &dyn DeviceBuffer,
+        group_rows: &[i32],
+        sfa_off: &[i64],
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let dc = |b: &dyn DeviceBuffer, what: &str| -> Result<u64> {
+            Ok(b.as_any()
+                .downcast_ref::<CudaBuffer>()
+                .ok_or_else(|| Error::Msg(format!("w8a8_actquant: {what} not CudaBuffer")))?
+                .ptr)
+        };
+        let (xp, op, sfp) = (dc(x, "x")?, dc(out, "out")?, dc(sf, "sf")?);
+        self.dev
+            .w8a8_actquant_run(xp, op, sfp, group_rows, sfa_off, n, k)
+            .map_err(dispatch_err)
+    }
+
+    fn w8a8_packw(
+        &self,
+        w: &dyn DeviceBuffer,
+        outp: &dyn DeviceBuffer,
+        sf: &dyn DeviceBuffer,
+        n_exp: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<i64> {
+        let dc = |b: &dyn DeviceBuffer, what: &str| -> Result<u64> {
+            Ok(b.as_any()
+                .downcast_ref::<CudaBuffer>()
+                .ok_or_else(|| Error::Msg(format!("w8a8_packw: {what} not CudaBuffer")))?
+                .ptr)
+        };
+        let (wp, op, sfp) = (dc(w, "w")?, dc(outp, "outp")?, dc(sf, "sf")?);
+        self.dev
+            .w8a8_packw_run(wp, op, sfp, n_exp, n, k)
+            .map_err(dispatch_err)
+    }
+
     fn moe_grouped_cutlass_fp4_prepare(
         &self,
         w: &dyn DeviceBuffer,
@@ -467,6 +624,72 @@ impl Device for CudaDevice {
         let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fp4_run: out not CudaBuffer".into()))?;
         let fb = off_dev.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fp4_run: off not CudaBuffer".into()))?;
         self.dev.moe_grouped_cutlass_fp4_run(handle, ab.ptr, sb.ptr, ob.ptr, fb.ptr).map_err(dispatch_err)
+    }
+
+    fn moe_grouped_cutlass_fp4_FUSEDACT_prepare(
+        &self,
+        w: &dyn DeviceBuffer,
+        sfw: &dyn DeviceBuffer,
+        alpha: &dyn DeviceBuffer,
+        norm_constant: &dyn DeviceBuffer,
+        n_groups: usize,
+        n: usize,
+        k: usize,
+        max_m_total: usize,
+    ) -> Result<u64> {
+        let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fused_prepare: w not CudaBuffer".into()))?;
+        let sb = sfw.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fused_prepare: sfw not CudaBuffer".into()))?;
+        let al = alpha.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fused_prepare: alpha not CudaBuffer".into()))?;
+        let nc = norm_constant.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fused_prepare: norm_constant not CudaBuffer".into()))?;
+        self.dev.moe_grouped_cutlass_fp4_FUSEDACT_prepare(wb.ptr, sb.ptr, al.ptr, nc.ptr, n_groups, n, k, max_m_total).map_err(dispatch_err)
+    }
+
+    fn moe_grouped_cutlass_fp4_FUSEDACT_run(
+        &self,
+        handle: u64,
+        a: &dyn DeviceBuffer,
+        sfa: &dyn DeviceBuffer,
+        out: &dyn DeviceBuffer,
+        sfd: &dyn DeviceBuffer,
+        off_dev: &dyn DeviceBuffer,
+    ) -> Result<()> {
+        let ab = a.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fused_run: a not CudaBuffer".into()))?;
+        let sb = sfa.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fused_run: sfa not CudaBuffer".into()))?;
+        let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fused_run: out not CudaBuffer".into()))?;
+        let db = sfd.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fused_run: sfd not CudaBuffer".into()))?;
+        let fb = off_dev.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("fused_run: off not CudaBuffer".into()))?;
+        self.dev.moe_grouped_cutlass_fp4_FUSEDACT_run(handle, ab.ptr, sb.ptr, ob.ptr, db.ptr, fb.ptr).map_err(dispatch_err)
+    }
+
+    fn moe_grouped_cutlass_fp4_AMAX_prepare(
+        &self,
+        w: &dyn DeviceBuffer,
+        sfw: &dyn DeviceBuffer,
+        d_amax: &dyn DeviceBuffer,
+        n_groups: usize,
+        n: usize,
+        k: usize,
+        max_m_total: usize,
+    ) -> Result<u64> {
+        let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("amax_prepare: w not CudaBuffer".into()))?;
+        let sb = sfw.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("amax_prepare: sfw not CudaBuffer".into()))?;
+        let am = d_amax.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("amax_prepare: d_amax not CudaBuffer".into()))?;
+        self.dev.moe_grouped_cutlass_fp4_AMAX_prepare(wb.ptr, sb.ptr, am.ptr, n_groups, n, k, max_m_total).map_err(dispatch_err)
+    }
+
+    fn moe_grouped_cutlass_fp4_AMAX_run(
+        &self,
+        handle: u64,
+        a: &dyn DeviceBuffer,
+        sfa: &dyn DeviceBuffer,
+        out: &dyn DeviceBuffer,
+        off_dev: &dyn DeviceBuffer,
+    ) -> Result<()> {
+        let ab = a.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("amax_run: a not CudaBuffer".into()))?;
+        let sb = sfa.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("amax_run: sfa not CudaBuffer".into()))?;
+        let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("amax_run: out not CudaBuffer".into()))?;
+        let fb = off_dev.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("amax_run: off not CudaBuffer".into()))?;
+        self.dev.moe_grouped_cutlass_fp4_AMAX_run(handle, ab.ptr, sb.ptr, ob.ptr, fb.ptr).map_err(dispatch_err)
     }
 
     fn gemm_tc_off(

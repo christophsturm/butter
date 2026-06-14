@@ -296,6 +296,105 @@ pub trait Device: Send + Sync {
         Err(Error::Msg("moe_grouped_cutlass_fp4 unsupported on this backend".into()))
     }
 
+    /// W4A8 grouped MoE GEMM: fp8 e4m3 acts (a + ue8m0 sfa) x mxfp4 weights
+    /// (w + ue8m0 sfw), cutlass mxf8f6f4 mixed block-scaled MMA. Mirrors
+    /// `moe_grouped_cutlass_fp4` but holds near-bf16 quality (256 act levels).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_cutlass_w4a8(
+        &self,
+        _a: &dyn DeviceBuffer,
+        _sfa: &dyn DeviceBuffer,
+        _w: &dyn DeviceBuffer,
+        _sfw: &dyn DeviceBuffer,
+        _out: &dyn DeviceBuffer,
+        _group_rows: &[i32],
+        _expert_ids: &[i32],
+        _sfa_off: &[i64],
+        _sfb_exp_bytes: i64,
+        _alpha_vec: Option<&dyn DeviceBuffer>,
+        _n: usize,
+        _k: usize,
+    ) -> Result<()> {
+        Err(Error::Msg("moe_grouped_cutlass_w4a8 unsupported on this backend".into()))
+    }
+
+    /// W4A8 fp8 act-quant: x[mt,K] half -> out e4m3 + sf ue8m0 (per-32,
+    /// group-aware SFA; group_rows/sfa_off are HOST arrays).
+    fn w4a8_actquant(
+        &self,
+        _x: &dyn DeviceBuffer,
+        _out: &dyn DeviceBuffer,
+        _sf: &dyn DeviceBuffer,
+        _group_rows: &[i32],
+        _sfa_off: &[i64],
+        _n: usize,
+        _k: usize,
+    ) -> Result<()> {
+        Err(Error::Msg("w4a8_actquant unsupported on this backend".into()))
+    }
+
+    /// W4A8 mxfp4 weight pack: w[n_exp,N,K] half -> outp e2m1 + sf ue8m0
+    /// (per-32, SFB). Returns per-expert SFB element count.
+    fn w4a8_packw(
+        &self,
+        _w: &dyn DeviceBuffer,
+        _outp: &dyn DeviceBuffer,
+        _sf: &dyn DeviceBuffer,
+        _n_exp: usize,
+        _n: usize,
+        _k: usize,
+    ) -> Result<i64> {
+        Err(Error::Msg("w4a8_packw unsupported on this backend".into()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_cutlass_w8a8(
+        &self,
+        _a: &dyn DeviceBuffer,
+        _sfa: &dyn DeviceBuffer,
+        _w: &dyn DeviceBuffer,
+        _sfw: &dyn DeviceBuffer,
+        _out: &dyn DeviceBuffer,
+        _group_rows: &[i32],
+        _expert_ids: &[i32],
+        _sfa_off: &[i64],
+        _sfb_exp_bytes: i64,
+        _alpha_vec: Option<&dyn DeviceBuffer>,
+        _n: usize,
+        _k: usize,
+    ) -> Result<()> {
+        Err(Error::Msg("moe_grouped_cutlass_w8a8 unsupported on this backend".into()))
+    }
+
+    /// W4A8 fp8 act-quant: x[mt,K] half -> out e4m3 + sf ue8m0 (per-32,
+    /// group-aware SFA; group_rows/sfa_off are HOST arrays).
+    fn w8a8_actquant(
+        &self,
+        _x: &dyn DeviceBuffer,
+        _out: &dyn DeviceBuffer,
+        _sf: &dyn DeviceBuffer,
+        _group_rows: &[i32],
+        _sfa_off: &[i64],
+        _n: usize,
+        _k: usize,
+    ) -> Result<()> {
+        Err(Error::Msg("w8a8_actquant unsupported on this backend".into()))
+    }
+
+    /// W4A8 mxfp4 weight pack: w[n_exp,N,K] half -> outp e2m1 + sf ue8m0
+    /// (per-32, SFB). Returns per-expert SFB element count.
+    fn w8a8_packw(
+        &self,
+        _w: &dyn DeviceBuffer,
+        _outp: &dyn DeviceBuffer,
+        _sf: &dyn DeviceBuffer,
+        _n_exp: usize,
+        _n: usize,
+        _k: usize,
+    ) -> Result<i64> {
+        Err(Error::Msg("w8a8_packw unsupported on this backend".into()))
+    }
+
     /// Prepare a persistent CUTLASS grouped-FP4 handle (device blob +
     /// workspace + initialized GEMM; descriptors filled per call ON DEVICE).
     #[allow(clippy::too_many_arguments)]
@@ -323,6 +422,71 @@ pub trait Device: Send + Sync {
         _off_dev: &dyn DeviceBuffer,
     ) -> Result<()> {
         Err(Error::Msg("moe_grouped_cutlass_fp4_run unsupported on this backend".into()))
+    }
+
+    /// Fused-activation prepare: GEMM1 folds relu²·(1/256) + NVFP4 block-quant
+    /// into its epilogue, emitting e2m1 D + ue4m3 SFD. `norm_constant` = device
+    /// f32 ptr to the static gs (1/256). Gated behind NEMOTRON_FUSE_UPACT.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_cutlass_fp4_FUSEDACT_prepare(
+        &self,
+        _w: &dyn DeviceBuffer,
+        _sfw: &dyn DeviceBuffer,
+        _alpha: &dyn DeviceBuffer,
+        _norm_constant: &dyn DeviceBuffer,
+        _n_groups: usize,
+        _n: usize,
+        _k: usize,
+        _max_m_total: usize,
+    ) -> Result<u64> {
+        Err(Error::Msg("moe_grouped_cutlass_fp4_FUSEDACT_prepare unsupported on this backend".into()))
+    }
+
+    /// Run a fused-activation handle: device fill kernel + gemm.run, emitting
+    /// `out` (e2m1) + `sfd` (ue4m3) for the down-GEMM input. No host work.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_cutlass_fp4_FUSEDACT_run(
+        &self,
+        _handle: u64,
+        _a: &dyn DeviceBuffer,
+        _sfa: &dyn DeviceBuffer,
+        _out: &dyn DeviceBuffer,
+        _sfd: &dyn DeviceBuffer,
+        _off_dev: &dyn DeviceBuffer,
+    ) -> Result<()> {
+        Err(Error::Msg("moe_grouped_cutlass_fp4_FUSEDACT_run unsupported on this backend".into()))
+    }
+
+    /// Amax-in-epilogue prepare: GEMM1 emits f16 D = relu²·(1/256) AND a
+    /// per-group amax (`d_amax`, device f32[n_groups], persistent) of those
+    /// activated values. The down-quant reads the epilogue amax instead of
+    /// re-scanning. Gated behind NEMOTRON_AMAX_EPI.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_cutlass_fp4_AMAX_prepare(
+        &self,
+        _w: &dyn DeviceBuffer,
+        _sfw: &dyn DeviceBuffer,
+        _d_amax: &dyn DeviceBuffer,
+        _n_groups: usize,
+        _n: usize,
+        _k: usize,
+        _max_m_total: usize,
+    ) -> Result<u64> {
+        Err(Error::Msg("moe_grouped_cutlass_fp4_AMAX_prepare unsupported on this backend".into()))
+    }
+
+    /// Run an amax-in-epilogue handle: device fill kernel + gemm.run, emitting
+    /// `out` (f16 a2) and writing the per-group amax into the handle's d_amax
+    /// (zeroed on-stream inside the run). No host work.
+    fn moe_grouped_cutlass_fp4_AMAX_run(
+        &self,
+        _handle: u64,
+        _a: &dyn DeviceBuffer,
+        _sfa: &dyn DeviceBuffer,
+        _out: &dyn DeviceBuffer,
+        _off_dev: &dyn DeviceBuffer,
+    ) -> Result<()> {
+        Err(Error::Msg("moe_grouped_cutlass_fp4_AMAX_run unsupported on this backend".into()))
     }
 
     /// Byte-offset variant of []: same semantics but each buffer
