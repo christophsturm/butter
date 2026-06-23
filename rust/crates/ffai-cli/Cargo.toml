@@ -1,0 +1,20 @@
+[package]
+name = "ffai-cli"
+description = "FFAI command-line front end."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ffai"
+path = "src/main.rs"
+
+[dependencies]
+ffai.workspace = true
+
+[features]
+default = ["metal"]
+metal = ["ffai/metal"]
+cuda = ["ffai/cuda"]
+vulkan = ["ffai/vulkan"]
