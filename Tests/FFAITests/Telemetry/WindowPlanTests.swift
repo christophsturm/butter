@@ -83,13 +83,13 @@ struct WindowPlanTests {
     @Test("KLD distribution percentiles + top-1 agreement")
     func distributionSummary() {
         // samples 0..9; nearest-rank over 10 elements:
-        //   median q=.5 → rank round(.5*9)=round(4.5)=4 → 4
+        //   median q=.5 → rank round(.5*9)=round(4.5)=5 (half-away) → 5
         //   p90    q=.9 → rank round(.9*9)=round(8.1)=8 → 8
         //   p99    q=.99→ rank round(.99*9)=round(8.91)=9 → 9
         let samples = (0 ..< 10).map { Double($0) }
         let d = Perplexity.KLDistribution.from(klSamples: samples, agreements: 7, scored: 10)
         #expect(d.mean == 4.5)
-        #expect(d.median == 4)
+        #expect(d.median == 5)
         #expect(d.p90 == 8)
         #expect(d.p99 == 9)
         #expect(d.max == 9)
