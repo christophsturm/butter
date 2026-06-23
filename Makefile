@@ -76,6 +76,18 @@ regenerate-kernels: ## run `tile build --emit` to regenerate metallib + Swift wr
 	    { printf '// swift-format-ignore-file\n//\n'; cat "$$gen"; } > "$$tmp" && mv "$$tmp" "$$gen"; \
 	  fi
 
+# ─── Bench ────────────────────────────────────────────────────────────
+# Quality benches (wikitext2 perplexity / KLD, NIAH retrieval) forced-decode
+# an entire corpus. In debug that's far too slow for the numbers to mean
+# anything (design §7), and the CLI hard-refuses a debug quality bench. Always
+# go through release. Pass-through args via ARGS=:
+#
+#   make bench ARGS="--method wikitext2 --model <repo> --wikitext2-corpus wiki.test.raw"
+#   make bench ARGS="--method niah --model <long-ctx-repo>"
+.PHONY: bench
+bench: regenerate-kernels ## run `ffai bench` in release (quality benches require it)
+	swift run -c release ffai bench $(ARGS)
+
 # ─── Test ─────────────────────────────────────────────────────────────
 #
 # Production-parity defaults. The 2026-05-19 GPU-pin root cause —

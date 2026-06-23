@@ -46,7 +46,7 @@ struct BenchTests {
         #expect(BenchMethod.simple.isImplemented)
         #expect(BenchMethod.summarization.isImplemented)
         #expect(BenchMethod.wikitext2.isImplemented)
-        #expect(BenchMethod.niah.isImplemented == false)
+        #expect(BenchMethod.niah.isImplemented)
         #expect(BenchMethod.multiTurn.isImplemented == false)
         #expect(BenchMethod.toolCalling.isImplemented == false)
         #expect(BenchMethod.ngramSpot.isImplemented == false)
