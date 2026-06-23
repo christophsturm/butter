@@ -50,21 +50,21 @@ extension Ops {
         let n = UInt32(nValues)
         switch outDtype {
         case .f32:
-            MetalTileKernels.ffai_gguf_dequant_q8_0_f32(
+            MetalTileKernels.mt_gguf_dequant_q8_0_f32(
                 qs_signed: qsSigned.buffer, qs_signedOffset: qsSigned.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 out: result.buffer, outOffset: result.offset,
                 n_values: n,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_gguf_dequant_q8_0_f16(
+            MetalTileKernels.mt_gguf_dequant_q8_0_f16(
                 qs_signed: qsSigned.buffer, qs_signedOffset: qsSigned.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 out: result.buffer, outOffset: result.offset,
                 n_values: n,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_gguf_dequant_q8_0_bf16(
+            MetalTileKernels.mt_gguf_dequant_q8_0_bf16(
                 qs_signed: qsSigned.buffer, qs_signedOffset: qsSigned.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -93,7 +93,7 @@ extension Ops {
         let n = UInt32(nValues)
         switch outDtype {
         case .f32:
-            MetalTileKernels.ffai_gguf_dequant_q2_k_f32(
+            MetalTileKernels.mt_gguf_dequant_q2_k_f32(
                 qs_packed: qsPacked.buffer, qs_packedOffset: qsPacked.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset,
@@ -102,7 +102,7 @@ extension Ops {
                 n_values: n,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_gguf_dequant_q2_k_f16(
+            MetalTileKernels.mt_gguf_dequant_q2_k_f16(
                 qs_packed: qsPacked.buffer, qs_packedOffset: qsPacked.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset,
@@ -111,7 +111,7 @@ extension Ops {
                 n_values: n,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_gguf_dequant_q2_k_bf16(
+            MetalTileKernels.mt_gguf_dequant_q2_k_bf16(
                 qs_packed: qsPacked.buffer, qs_packedOffset: qsPacked.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset,
@@ -147,7 +147,7 @@ extension Ops {
         let mOutU = UInt32(mOut)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.ffai_moe_gather_gemv_iq2xxs_f16(
+            MetalTileKernels.mt_moe_gather_gemv_iq2xxs_f16(
                 x: x.buffer, xOffset: x.offset,
                 qs_all: qsAll.buffer, qs_allOffset: qsAll.offset,
                 d_all: dAll.buffer, d_allOffset: dAll.offset,
@@ -158,7 +158,7 @@ extension Ops {
                 k_in: kInU, m_out: mOutU,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.ffai_moe_gather_gemv_iq2xxs_f32(
+            MetalTileKernels.mt_moe_gather_gemv_iq2xxs_f32(
                 x: x.buffer, xOffset: x.offset,
                 qs_all: qsAll.buffer, qs_allOffset: qsAll.offset,
                 d_all: dAll.buffer, d_allOffset: dAll.offset,
@@ -169,7 +169,7 @@ extension Ops {
                 k_in: kInU, m_out: mOutU,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_moe_gather_gemv_iq2xxs_bf16(
+            MetalTileKernels.mt_moe_gather_gemv_iq2xxs_bf16(
                 x: x.buffer, xOffset: x.offset,
                 qs_all: qsAll.buffer, qs_allOffset: qsAll.offset,
                 d_all: dAll.buffer, d_allOffset: dAll.offset,
@@ -195,17 +195,17 @@ extension Ops {
         let kInU = UInt32(q8.kIn); let mOutU = UInt32(q8.mOut)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.ffai_gemv_q8_f16(
+            MetalTileKernels.mt_gemv_q8_f16(
                 qs: qsT, d_f32: dT, x: x.buffer, xOffset: x.offset,
                 out: out.buffer, outOffset: out.offset,
                 k_in: kInU, m_out: mOutU, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.ffai_gemv_q8_f32(
+            MetalTileKernels.mt_gemv_q8_f32(
                 qs: qsT, d_f32: dT, x: x.buffer, xOffset: x.offset,
                 out: out.buffer, outOffset: out.offset,
                 k_in: kInU, m_out: mOutU, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_gemv_q8_bf16(
+            MetalTileKernels.mt_gemv_q8_bf16(
                 qs: qsT, d_f32: dT, x: x.buffer, xOffset: x.offset,
                 out: out.buffer, outOffset: out.offset,
                 k_in: kInU, m_out: mOutU, gridSize: grd, threadgroupSize: tg, on: cmd)
@@ -226,19 +226,19 @@ extension Ops {
         let kInU = UInt32(q8.kIn); let mOutU = UInt32(q8.mOut); let rpg = UInt32(rowsPerGroup)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.ffai_grouped_gemv_q8_f16(
+            MetalTileKernels.mt_grouped_gemv_q8_f16(
                 qs: q8.qs, d_f32: q8.d, x: x.buffer, xOffset: x.offset,
                 out: out.buffer, outOffset: out.offset,
                 k_in: kInU, m_out: mOutU, rows_per_group: rpg,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.ffai_grouped_gemv_q8_f32(
+            MetalTileKernels.mt_grouped_gemv_q8_f32(
                 qs: q8.qs, d_f32: q8.d, x: x.buffer, xOffset: x.offset,
                 out: out.buffer, outOffset: out.offset,
                 k_in: kInU, m_out: mOutU, rows_per_group: rpg,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_grouped_gemv_q8_bf16(
+            MetalTileKernels.mt_grouped_gemv_q8_bf16(
                 qs: q8.qs, d_f32: q8.d, x: x.buffer, xOffset: x.offset,
                 out: out.buffer, outOffset: out.offset,
                 k_in: kInU, m_out: mOutU, rows_per_group: rpg,
@@ -260,19 +260,19 @@ extension Ops {
         let kInU = UInt32(q8.kIn); let mOutU = UInt32(q8.mOut); let rpg = UInt32(rowsPerGroup)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.ffai_grouped_gemv_q8_rows_f16(
+            MetalTileKernels.mt_grouped_gemv_q8_rows_f16(
                 qs: q8.qs, d_f32: q8.d, x: x.buffer, xOffset: x.offset,
                 out: out.buffer, outOffset: out.offset,
                 k_in: kInU, m_out: mOutU, rows_per_group: rpg,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.ffai_grouped_gemv_q8_rows_f32(
+            MetalTileKernels.mt_grouped_gemv_q8_rows_f32(
                 qs: q8.qs, d_f32: q8.d, x: x.buffer, xOffset: x.offset,
                 out: out.buffer, outOffset: out.offset,
                 k_in: kInU, m_out: mOutU, rows_per_group: rpg,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_grouped_gemv_q8_rows_bf16(
+            MetalTileKernels.mt_grouped_gemv_q8_rows_bf16(
                 qs: q8.qs, d_f32: q8.d, x: x.buffer, xOffset: x.offset,
                 out: out.buffer, outOffset: out.offset,
                 k_in: kInU, m_out: mOutU, rows_per_group: rpg,
@@ -298,17 +298,17 @@ extension Ops {
         let kInU = UInt32(q8.kIn); let mOutU = UInt32(nRows)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.ffai_gemv_q8_f16(
+            MetalTileKernels.mt_gemv_q8_f16(
                 qs: q8.qs, qsOffset: qsOff, d_f32: q8.d, d_f32Offset: dOff,
                 x: x.buffer, xOffset: x.offset, out: out.buffer, outOffset: out.offset,
                 k_in: kInU, m_out: mOutU, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.ffai_gemv_q8_f32(
+            MetalTileKernels.mt_gemv_q8_f32(
                 qs: q8.qs, qsOffset: qsOff, d_f32: q8.d, d_f32Offset: dOff,
                 x: x.buffer, xOffset: x.offset, out: out.buffer, outOffset: out.offset,
                 k_in: kInU, m_out: mOutU, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_gemv_q8_bf16(
+            MetalTileKernels.mt_gemv_q8_bf16(
                 qs: q8.qs, qsOffset: qsOff, d_f32: q8.d, d_f32Offset: dOff,
                 x: x.buffer, xOffset: x.offset, out: out.buffer, outOffset: out.offset,
                 k_in: kInU, m_out: mOutU, gridSize: grd, threadgroupSize: tg, on: cmd)
@@ -328,7 +328,7 @@ extension Ops {
     ) {
         let grd = MTLSize(width: 32, height: 1, depth: 1)
         let tg = MTLSize(width: 32, height: 1, depth: 1)
-        MetalTileKernels.mt_dsv4_router_topk_f32(
+        MetalTileKernels.mt_moe_router_topk_biased_f32(
             score_biased: scoreBiased.buffer, score_biasedOffset: scoreBiased.offset,
             score_unbiased: scoreUnbiased.buffer, score_unbiasedOffset: scoreUnbiased.offset,
             indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
@@ -372,7 +372,7 @@ extension Ops {
         let kInU = UInt32(kIn); let mOutU = UInt32(mOut); let nSlotsU = UInt32(nSlots)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.ffai_moe_gather_down_q2k_f16(
+            MetalTileKernels.mt_moe_gather_down_q2k_f16(
                 inners_all: innersAll.buffer, inners_allOffset: innersAll.offset,
                 qs_all: qsAll.buffer, qs_allOffset: qsAll.offset,
                 scales_all: scalesAll.buffer, scales_allOffset: scalesAll.offset,
@@ -384,7 +384,7 @@ extension Ops {
                 k_in: kInU, m_out: mOutU, n_slots: nSlotsU,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.ffai_moe_gather_down_q2k_f32(
+            MetalTileKernels.mt_moe_gather_down_q2k_f32(
                 inners_all: innersAll.buffer, inners_allOffset: innersAll.offset,
                 qs_all: qsAll.buffer, qs_allOffset: qsAll.offset,
                 scales_all: scalesAll.buffer, scales_allOffset: scalesAll.offset,
@@ -396,7 +396,7 @@ extension Ops {
                 k_in: kInU, m_out: mOutU, n_slots: nSlotsU,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_moe_gather_down_q2k_bf16(
+            MetalTileKernels.mt_moe_gather_down_q2k_bf16(
                 inners_all: innersAll.buffer, inners_allOffset: innersAll.offset,
                 qs_all: qsAll.buffer, qs_allOffset: qsAll.offset,
                 scales_all: scalesAll.buffer, scales_allOffset: scalesAll.offset,
@@ -432,7 +432,7 @@ extension Ops {
         let n = UInt32(nValues)
         switch outDtype {
         case .f32:
-            MetalTileKernels.ffai_gguf_dequant_iq2_xxs_f32(
+            MetalTileKernels.mt_gguf_dequant_iq2_xxs_f32(
                 qs_u32: qsU32.buffer, qs_u32Offset: qsU32.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset,
                 grid: grid.buffer, gridOffset: grid.offset,
@@ -441,7 +441,7 @@ extension Ops {
                 n_values: n,
                 gridSize: gridDim, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_gguf_dequant_iq2_xxs_f16(
+            MetalTileKernels.mt_gguf_dequant_iq2_xxs_f16(
                 qs_u32: qsU32.buffer, qs_u32Offset: qsU32.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset,
                 grid: grid.buffer, gridOffset: grid.offset,
@@ -450,7 +450,7 @@ extension Ops {
                 n_values: n,
                 gridSize: gridDim, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_gguf_dequant_iq2_xxs_bf16(
+            MetalTileKernels.mt_gguf_dequant_iq2_xxs_bf16(
                 qs_u32: qsU32.buffer, qs_u32Offset: qsU32.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset,
                 grid: grid.buffer, gridOffset: grid.offset,
@@ -474,7 +474,7 @@ extension Ops {
         precondition(rawBytes.dtype == .u8)
         precondition(qsU32.dtype == .u32)
         let (gridDim, tg) = elementwiseGrid(nBlocks * 16)
-        MetalTileKernels.ffai_gguf_iq2_xxs_extract_qs_u32(
+        MetalTileKernels.mt_gguf_iq2_xxs_extract_qs_u32(
             raw_bytes: rawBytes.buffer, raw_bytesOffset: rawBytes.offset,
             qs_u32: qsU32.buffer, qs_u32Offset: qsU32.offset,
             n_blocks: UInt32(nBlocks),
@@ -502,7 +502,7 @@ extension Ops {
         let n = UInt32(nValues)
         switch outDtype {
         case .f32:
-            MetalTileKernels.ffai_gguf_dequant_iq2_xxs_raw_f32(
+            MetalTileKernels.mt_gguf_dequant_iq2_xxs_raw_f32(
                 raw_bytes: rawBytes.buffer, raw_bytesOffset: rawBytes.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset,
                 grid: grid.buffer, gridOffset: grid.offset,
@@ -511,7 +511,7 @@ extension Ops {
                 n_values: n,
                 gridSize: gridDim, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_gguf_dequant_iq2_xxs_raw_f16(
+            MetalTileKernels.mt_gguf_dequant_iq2_xxs_raw_f16(
                 raw_bytes: rawBytes.buffer, raw_bytesOffset: rawBytes.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset,
                 grid: grid.buffer, gridOffset: grid.offset,
@@ -520,7 +520,7 @@ extension Ops {
                 n_values: n,
                 gridSize: gridDim, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_gguf_dequant_iq2_xxs_raw_bf16(
+            MetalTileKernels.mt_gguf_dequant_iq2_xxs_raw_bf16(
                 raw_bytes: rawBytes.buffer, raw_bytesOffset: rawBytes.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset,
                 grid: grid.buffer, gridOffset: grid.offset,
