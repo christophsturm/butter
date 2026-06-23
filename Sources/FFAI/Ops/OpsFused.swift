@@ -188,7 +188,7 @@ extension Ops {
         let tg = MTLSize(width: tgSize, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            MetalTileKernels.ffai_rms_norm_residual_f32(
+            MetalTileKernels.mt_rms_norm_residual_f32(
                 x: x.buffer, xOffset: x.offset,
                 residual: residual.buffer, residualOffset: residual.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -196,7 +196,7 @@ extension Ops {
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_rms_norm_residual_f16(
+            MetalTileKernels.mt_rms_norm_residual_f16(
                 x: x.buffer, xOffset: x.offset,
                 residual: residual.buffer, residualOffset: residual.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -204,7 +204,7 @@ extension Ops {
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_rms_norm_residual_bf16(
+            MetalTileKernels.mt_rms_norm_residual_bf16(
                 x: x.buffer, xOffset: x.offset,
                 residual: residual.buffer, residualOffset: residual.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -250,7 +250,7 @@ extension Ops {
         let tg = MTLSize(width: tgSize, height: 1, depth: 1)
         switch z.dtype {
         case .f32:
-            MetalTileKernels.ffai_gated_rmsnorm_f32(
+            MetalTileKernels.mt_gated_rmsnorm_f32(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -258,7 +258,7 @@ extension Ops {
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_gated_rmsnorm_f16(
+            MetalTileKernels.mt_gated_rmsnorm_f16(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -266,7 +266,7 @@ extension Ops {
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_gated_rmsnorm_bf16(
+            MetalTileKernels.mt_gated_rmsnorm_bf16(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -611,7 +611,7 @@ extension Ops {
         let tg = MTLSize(width: tpg, height: 1, depth: 1)
         switch output.dtype {
         case .f32:
-            MetalTileKernels.ffai_moe_down_swiglu_accum_int4_chain8_f32(
+            MetalTileKernels.mt_moe_down_swiglu_accum_int4_chain8_f32(
                 gate_0: gates[0].buffer, gate_0Offset: gates[0].offset,
                 up_0: ups[0].buffer, up_0Offset: ups[0].offset,
                 gate_1: gates[1].buffer, gate_1Offset: gates[1].offset,
@@ -638,7 +638,7 @@ extension Ops {
                 group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_moe_down_swiglu_accum_int4_chain8_f16(
+            MetalTileKernels.mt_moe_down_swiglu_accum_int4_chain8_f16(
                 gate_0: gates[0].buffer, gate_0Offset: gates[0].offset,
                 up_0: ups[0].buffer, up_0Offset: ups[0].offset,
                 gate_1: gates[1].buffer, gate_1Offset: gates[1].offset,
@@ -665,7 +665,7 @@ extension Ops {
                 group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_moe_down_swiglu_accum_int4_chain8_bf16(
+            MetalTileKernels.mt_moe_down_swiglu_accum_int4_chain8_bf16(
                 gate_0: gates[0].buffer, gate_0Offset: gates[0].offset,
                 up_0: ups[0].buffer, up_0Offset: ups[0].offset,
                 gate_1: gates[1].buffer, gate_1Offset: gates[1].offset,

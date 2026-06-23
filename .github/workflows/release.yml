@@ -128,8 +128,12 @@ jobs:
 
       - name: Generate kernel artifacts (tile build --emit all)
         working-directory: metaltile
+        # Build `__tile_runner` (metaltile-std bin) alongside `tile` and put it
+        # on PATH — `tile build` spawns it by bare name and `cargo run --bin
+        # tile` never builds the sibling runner.
         run: |
-          cargo run --release --bin tile -- build --emit all \
+          cargo build --release --bin tile --bin __tile_runner
+          PATH="$PWD/target/release:$PATH" tile build --emit all \
             --out ${{ github.workspace }}/FFAI/Sources/MetalTileSwift
 
       - name: Build (release, with tests + testability)

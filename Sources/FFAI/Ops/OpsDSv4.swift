@@ -43,7 +43,7 @@ extension Ops {
         let unbiased = scoreUnbiased ?? Tensor.empty(shape: [n], dtype: .f32)
         let biased = scoreBiased ?? Tensor.empty(shape: [n], dtype: .f32)
         let (grid, tg) = elementwiseGrid(n)
-        MetalTileKernels.ffai_moe_router_sqrtsoftplus_f32(
+        MetalTileKernels.mt_moe_router_sqrtsoftplus_f32(
             logits: logits.buffer, logitsOffset: logits.offset,
             bias: bias.buffer, biasOffset: bias.offset,
             score_unbiased: unbiased.buffer, score_unbiasedOffset: unbiased.offset,
@@ -72,7 +72,7 @@ extension Ops {
         let n = UInt32(nValues)
         switch outDtype {
         case .f32:
-            MetalTileKernels.ffai_dsv4_mxfp4_dequant_f32(
+            MetalTileKernels.mt_mxfp4_dequant_f32(
                 qs_packed: qsPacked.buffer, qs_packedOffset: qsPacked.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 lut: lut.buffer, lutOffset: lut.offset,
@@ -80,7 +80,7 @@ extension Ops {
                 n_values: n,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_dsv4_mxfp4_dequant_f16(
+            MetalTileKernels.mt_mxfp4_dequant_f16(
                 qs_packed: qsPacked.buffer, qs_packedOffset: qsPacked.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 lut: lut.buffer, lutOffset: lut.offset,
@@ -88,7 +88,7 @@ extension Ops {
                 n_values: n,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_dsv4_mxfp4_dequant_bf16(
+            MetalTileKernels.mt_mxfp4_dequant_bf16(
                 qs_packed: qsPacked.buffer, qs_packedOffset: qsPacked.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 lut: lut.buffer, lutOffset: lut.offset,
@@ -123,7 +123,7 @@ extension Ops {
         let n = UInt32(nDim)
         switch outDtype {
         case .f32:
-            MetalTileKernels.ffai_dsv4_fp8_block_dequant_f32(
+            MetalTileKernels.mt_fp8_block_dequant_f32(
                 weight_bytes: weightBytes.buffer, weight_bytesOffset: weightBytes.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 fp8_lut: lut.buffer, fp8_lutOffset: lut.offset,
@@ -131,7 +131,7 @@ extension Ops {
                 m_dim: m, n_dim: n,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_dsv4_fp8_block_dequant_f16(
+            MetalTileKernels.mt_fp8_block_dequant_f16(
                 weight_bytes: weightBytes.buffer, weight_bytesOffset: weightBytes.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 fp8_lut: lut.buffer, fp8_lutOffset: lut.offset,
@@ -139,7 +139,7 @@ extension Ops {
                 m_dim: m, n_dim: n,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_dsv4_fp8_block_dequant_bf16(
+            MetalTileKernels.mt_fp8_block_dequant_bf16(
                 weight_bytes: weightBytes.buffer, weight_bytesOffset: weightBytes.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 fp8_lut: lut.buffer, fp8_lutOffset: lut.offset,
@@ -171,7 +171,7 @@ extension Ops {
         let pl = UInt32(poolLen)
         switch outDtype {
         case .f32:
-            MetalTileKernels.ffai_dsv4_compressor_pool_f32(
+            MetalTileKernels.mt_compressor_pool_f32(
                 raw_kv: rawKv.buffer, raw_kvOffset: rawKv.offset,
                 gate: gate.buffer, gateOffset: gate.offset,
                 ape: ape.buffer, apeOffset: ape.offset,
@@ -179,7 +179,7 @@ extension Ops {
                 head_dim: hd, pool_len: pl,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_dsv4_compressor_pool_f16(
+            MetalTileKernels.mt_compressor_pool_f16(
                 raw_kv: rawKv.buffer, raw_kvOffset: rawKv.offset,
                 gate: gate.buffer, gateOffset: gate.offset,
                 ape: ape.buffer, apeOffset: ape.offset,
@@ -187,7 +187,7 @@ extension Ops {
                 head_dim: hd, pool_len: pl,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_dsv4_compressor_pool_bf16(
+            MetalTileKernels.mt_compressor_pool_bf16(
                 raw_kv: rawKv.buffer, raw_kvOffset: rawKv.offset,
                 gate: gate.buffer, gateOffset: gate.offset,
                 ape: ape.buffer, apeOffset: ape.offset,
@@ -224,7 +224,7 @@ extension Ops {
         let iters = UInt32(sinkhornIters)
         switch mixes.dtype {
         case .f32:
-            MetalTileKernels.ffai_dsv4_mhc_sinkhorn_split_f32(
+            MetalTileKernels.mt_mhc_sinkhorn_split_f32(
                 mixes: mixes.buffer, mixesOffset: mixes.offset,
                 scale: scale.buffer, scaleOffset: scale.offset,
                 base: base.buffer, baseOffset: base.offset,
@@ -234,7 +234,7 @@ extension Ops {
                 n_tokens: nt, eps: eps, sinkhorn_iters: iters,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_dsv4_mhc_sinkhorn_split_f16(
+            MetalTileKernels.mt_mhc_sinkhorn_split_f16(
                 mixes: mixes.buffer, mixesOffset: mixes.offset,
                 scale: scale.buffer, scaleOffset: scale.offset,
                 base: base.buffer, baseOffset: base.offset,
@@ -244,7 +244,7 @@ extension Ops {
                 n_tokens: nt, eps: eps, sinkhorn_iters: iters,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_dsv4_mhc_sinkhorn_split_bf16(
+            MetalTileKernels.mt_mhc_sinkhorn_split_bf16(
                 mixes: mixes.buffer, mixesOffset: mixes.offset,
                 scale: scale.buffer, scaleOffset: scale.offset,
                 base: base.buffer, baseOffset: base.offset,
@@ -274,21 +274,21 @@ extension Ops {
         let nt = UInt32(nTokens)
         switch outDtype {
         case .f32:
-            MetalTileKernels.ffai_dsv4_mhc_collapse_f32(
+            MetalTileKernels.mt_mhc_collapse_f32(
                 state: state.buffer, stateOffset: state.offset,
                 pre: pre.buffer, preOffset: pre.offset,
                 out: result.buffer, outOffset: result.offset,
                 hidden_dim: hd, n_hc: nc, n_tokens: nt,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_dsv4_mhc_collapse_f16(
+            MetalTileKernels.mt_mhc_collapse_f16(
                 state: state.buffer, stateOffset: state.offset,
                 pre: pre.buffer, preOffset: pre.offset,
                 out: result.buffer, outOffset: result.offset,
                 hidden_dim: hd, n_hc: nc, n_tokens: nt,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_dsv4_mhc_collapse_bf16(
+            MetalTileKernels.mt_mhc_collapse_bf16(
                 state: state.buffer, stateOffset: state.offset,
                 pre: pre.buffer, preOffset: pre.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -320,7 +320,7 @@ extension Ops {
         let nt = UInt32(nTokens)
         switch blockOut.dtype {
         case .f32:
-            MetalTileKernels.ffai_dsv4_mhc_expand_f32(
+            MetalTileKernels.mt_mhc_expand_f32(
                 block_out: blockOut.buffer, block_outOffset: blockOut.offset,
                 post: post.buffer, postOffset: post.offset,
                 comb: comb.buffer, combOffset: comb.offset,
@@ -329,7 +329,7 @@ extension Ops {
                 hidden_dim: hd, n_hc: nc, n_tokens: nt,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_dsv4_mhc_expand_f16(
+            MetalTileKernels.mt_mhc_expand_f16(
                 block_out: blockOut.buffer, block_outOffset: blockOut.offset,
                 post: post.buffer, postOffset: post.offset,
                 comb: comb.buffer, combOffset: comb.offset,
@@ -338,7 +338,7 @@ extension Ops {
                 hidden_dim: hd, n_hc: nc, n_tokens: nt,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_dsv4_mhc_expand_bf16(
+            MetalTileKernels.mt_mhc_expand_bf16(
                 block_out: blockOut.buffer, block_outOffset: blockOut.offset,
                 post: post.buffer, postOffset: post.offset,
                 comb: comb.buffer, combOffset: comb.offset,
@@ -370,7 +370,7 @@ extension Ops {
         let nk = UInt32(nKv)
         switch qIdx.dtype {
         case .f32:
-            MetalTileKernels.ffai_dsv4_indexer_score_f32(
+            MetalTileKernels.mt_indexer_score_f32(
                 q_idx: qIdx.buffer, q_idxOffset: qIdx.offset,
                 k_idx: kIdx.buffer, k_idxOffset: kIdx.offset,
                 w: w.buffer, wOffset: w.offset,
@@ -378,7 +378,7 @@ extension Ops {
                 n_heads: nh, d_idx: di, n_kv: nk,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_dsv4_indexer_score_f16(
+            MetalTileKernels.mt_indexer_score_f16(
                 q_idx: qIdx.buffer, q_idxOffset: qIdx.offset,
                 k_idx: kIdx.buffer, k_idxOffset: kIdx.offset,
                 w: w.buffer, wOffset: w.offset,
@@ -386,7 +386,7 @@ extension Ops {
                 n_heads: nh, d_idx: di, n_kv: nk,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_dsv4_indexer_score_bf16(
+            MetalTileKernels.mt_indexer_score_bf16(
                 q_idx: qIdx.buffer, q_idxOffset: qIdx.offset,
                 k_idx: kIdx.buffer, k_idxOffset: kIdx.offset,
                 w: w.buffer, wOffset: w.offset,
@@ -410,7 +410,7 @@ extension Ops {
         precondition(nKv <= 1024, "dsv4IndexerTopkBlock: nKv > 1024 needs the multi-block variant")
         precondition(k <= nKv, "dsv4IndexerTopkBlock: k must be <= nKv")
         let result = outIndices ?? Tensor.empty(shape: [k], dtype: .u32)
-        MetalTileKernels.ffai_dsv4_indexer_topk_block_f32(
+        MetalTileKernels.mt_indexer_topk_block_f32(
             score: score.buffer, scoreOffset: score.offset,
             out_indices: result.buffer, out_indicesOffset: result.offset,
             n_kv: UInt32(nKv), k: UInt32(k),
@@ -447,7 +447,7 @@ extension Ops {
         let hpg = UInt32(nQHeads / nKvHeads)
         switch outDtype {
         case .f32:
-            MetalTileKernels.ffai_sdpa_decode_d512_sink_f32(
+            MetalTileKernels.mt_sdpa_decode_d512_sink_f32(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -456,7 +456,7 @@ extension Ops {
                 head_dim: hd, n_kv: nk, kv_stride: ks, heads_per_group: hpg, scale: scale,
                 gridSize: gridSize, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_sdpa_decode_d512_sink_f16(
+            MetalTileKernels.mt_sdpa_decode_d512_sink_f16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -465,7 +465,7 @@ extension Ops {
                 head_dim: hd, n_kv: nk, kv_stride: ks, heads_per_group: hpg, scale: scale,
                 gridSize: gridSize, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_sdpa_decode_d512_sink_bf16(
+            MetalTileKernels.mt_sdpa_decode_d512_sink_bf16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -503,27 +503,30 @@ extension Ops {
         let invFlag: UInt32 = inverse ? 1 : 0
         switch qk.dtype {
         case .f32:
-            MetalTileKernels.ffai_dsv4_partial_rope_f32(
+            MetalTileKernels.mt_partial_rope_f32(
                 qk: qk.buffer, qkOffset: qk.offset,
                 out: out.buffer, outOffset: out.offset,
                 head_dim: hd, n_nope: nNopeU, half_rot: halfRotU,
-                position: posU, theta_base: thetaBase, inverse_flag: invFlag,
+                n_heads: UInt32(nHeads), base_position: posU,
+                theta_base: thetaBase, inverse_flag: invFlag,
                 freq_scale: freqScale, ext_factor: extFactor, corr_low: corrLow, corr_high: corrHigh,
                 gridSize: gridSize, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_dsv4_partial_rope_f16(
+            MetalTileKernels.mt_partial_rope_f16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 out: out.buffer, outOffset: out.offset,
                 head_dim: hd, n_nope: nNopeU, half_rot: halfRotU,
-                position: posU, theta_base: thetaBase, inverse_flag: invFlag,
+                n_heads: UInt32(nHeads), base_position: posU,
+                theta_base: thetaBase, inverse_flag: invFlag,
                 freq_scale: freqScale, ext_factor: extFactor, corr_low: corrLow, corr_high: corrHigh,
                 gridSize: gridSize, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_dsv4_partial_rope_bf16(
+            MetalTileKernels.mt_partial_rope_bf16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 out: out.buffer, outOffset: out.offset,
                 head_dim: hd, n_nope: nNopeU, half_rot: halfRotU,
-                position: posU, theta_base: thetaBase, inverse_flag: invFlag,
+                n_heads: UInt32(nHeads), base_position: posU,
+                theta_base: thetaBase, inverse_flag: invFlag,
                 freq_scale: freqScale, ext_factor: extFactor, corr_low: corrLow, corr_high: corrHigh,
                 gridSize: gridSize, threadgroupSize: tg, on: cmd)
         default:
@@ -550,21 +553,21 @@ extension Ops {
         let invFlag: UInt32 = inverse ? 1 : 0
         switch qk.dtype {
         case .f32:
-            MetalTileKernels.ffai_dsv4_partial_rope_rows_f32(
+            MetalTileKernels.mt_partial_rope_f32(
                 qk: qk.buffer, qkOffset: qk.offset, out: out.buffer, outOffset: out.offset,
                 head_dim: hd, n_nope: nNopeU, half_rot: halfRotU, n_heads: nHeadsU,
                 base_position: baseU, theta_base: thetaBase, inverse_flag: invFlag,
                 freq_scale: freqScale, ext_factor: extFactor, corr_low: corrLow, corr_high: corrHigh,
                 gridSize: gridSize, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_dsv4_partial_rope_rows_f16(
+            MetalTileKernels.mt_partial_rope_f16(
                 qk: qk.buffer, qkOffset: qk.offset, out: out.buffer, outOffset: out.offset,
                 head_dim: hd, n_nope: nNopeU, half_rot: halfRotU, n_heads: nHeadsU,
                 base_position: baseU, theta_base: thetaBase, inverse_flag: invFlag,
                 freq_scale: freqScale, ext_factor: extFactor, corr_low: corrLow, corr_high: corrHigh,
                 gridSize: gridSize, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_dsv4_partial_rope_rows_bf16(
+            MetalTileKernels.mt_partial_rope_bf16(
                 qk: qk.buffer, qkOffset: qk.offset, out: out.buffer, outOffset: out.offset,
                 head_dim: hd, n_nope: nNopeU, half_rot: halfRotU, n_heads: nHeadsU,
                 base_position: baseU, theta_base: thetaBase, inverse_flag: invFlag,
@@ -601,7 +604,7 @@ extension Ops {
         let hpg = UInt32(nQHeads / nKvHeads)
         switch outDtype {
         case .f32:
-            MetalTileKernels.ffai_dsv4_csa_sdpa_decode_f32(
+            MetalTileKernels.mt_csa_sdpa_decode_f32(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -610,7 +613,7 @@ extension Ops {
                 head_dim: hd, n_selected: ns, kv_stride: ks, heads_per_group: hpg, scale: scale,
                 gridSize: gridSize, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_dsv4_csa_sdpa_decode_f16(
+            MetalTileKernels.mt_csa_sdpa_decode_f16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -619,7 +622,7 @@ extension Ops {
                 head_dim: hd, n_selected: ns, kv_stride: ks, heads_per_group: hpg, scale: scale,
                 gridSize: gridSize, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_dsv4_csa_sdpa_decode_bf16(
+            MetalTileKernels.mt_csa_sdpa_decode_bf16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,

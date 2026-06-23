@@ -1493,33 +1493,44 @@ enum Gemma4Ops {
         let nHeads = qk.elementCount / headDim
         let halfDim = headDim / 2  // pairing offset + freq denominator
         let rotatedPairs = rotatedDim / 2  // grid height — only these rotate
-        let grid = MTLSize(width: nHeads, height: rotatedPairs, depth: 1)
+        let grid = MTLSize(width: 1, height: nHeads, depth: rotatedPairs)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
+        // mt_rope_banded reads position from a per-row `positions: [T]` u32
+        // buffer (decode = the T=1 case: a 1-element buffer); `row_stride` is
+        // the per-token stride in qk (`n_heads * head_dim`). Single-token decode
+        // here so a 1-element positions buffer + grid depth 1.
+        let posBuf = Device.shared.makeBuffer(length: 4)
+        var posVal = UInt32(position)
+        memcpy(posBuf.contents(), &posVal, 4)
+        let rowStride = UInt32(nHeads * headDim)
         switch qk.dtype {
         case .f32:
-            MetalTileKernels.ffai_rope_llama_f32(
+            MetalTileKernels.mt_rope_banded_f32(
                 qk: qk.buffer, qkOffset: qk.offset,
+                positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
                 head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
-                position: UInt32(position), theta_base: thetaBase,
+                row_stride: rowStride, theta_base: thetaBase,
                 scale_factor: 1.0, low_freq_factor: 1.0,
                 high_freq_factor: 1.0, original_max_position: 1.0,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_rope_llama_f16(
+            MetalTileKernels.mt_rope_banded_f16(
                 qk: qk.buffer, qkOffset: qk.offset,
+                positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
                 head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
-                position: UInt32(position), theta_base: thetaBase,
+                row_stride: rowStride, theta_base: thetaBase,
                 scale_factor: 1.0, low_freq_factor: 1.0,
                 high_freq_factor: 1.0, original_max_position: 1.0,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_rope_llama_bf16(
+            MetalTileKernels.mt_rope_banded_bf16(
                 qk: qk.buffer, qkOffset: qk.offset,
+                positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
                 head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
-                position: UInt32(position), theta_base: thetaBase,
+                row_stride: rowStride, theta_base: thetaBase,
                 scale_factor: 1.0, low_freq_factor: 1.0,
                 high_freq_factor: 1.0, original_max_position: 1.0,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
