@@ -1,0 +1,11 @@
+[package]
+name = "ffai-core"
+description = "FFAI backend-neutral core: the Device trait, Tensor, and dtype/buffer/binding types every backend shares."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+metaltile-core.workspace = true
+thiserror.workspace = true
