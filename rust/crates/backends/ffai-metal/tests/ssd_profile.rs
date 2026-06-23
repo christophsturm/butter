@@ -24,6 +24,13 @@ fn cos_sim(a: &[f32], b: &[f32]) -> f64 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
+// Profiling sweep: times the sequential scan against chunked-scan chunk
+// lengths over a range of sequence lengths. Run manually with
+// `cargo test -p ffai-metal --test ssd_profile -- --ignored`. Ignored in
+// CI because the long-running sweep dispatches trip the GPU watchdog on
+// hosted runners (the chunked-scan correctness it checks is covered by the
+// ssd unit tests).
+#[ignore = "profiling sweep; run manually, trips the GPU watchdog on CI runners"]
 #[test]
 fn ssd_lsweep_profile_metal() {
     let Some(dev) = MetalDevice::create().expect("metal") else { eprintln!("no Metal — skip"); return; };
