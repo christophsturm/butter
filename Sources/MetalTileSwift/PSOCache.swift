@@ -123,11 +123,28 @@ public final class PSOCache: @unchecked Sendable {
             }
             function = fn
         }
-        let pso: MTLComputePipelineState
+        var pso: MTLComputePipelineState
         do {
             pso = try library.device.makeComputePipelineState(function: function)
         } catch {
-            throw PSOCacheError.psoCompileFailed(name, error)
+            // Some Metal toolchains reject certain MPP cooperative-tensor
+            // bodies at PSO creation (e.g. "unsupported deferred-static-alloca-
+            // size" on the bm8 matmul2d on macOS 26). Fall back to the AOT
+            // metallib function for MPP kernels: the offline `tile build`
+            // already compiled it, and this path is only taken when the live
+            // compile FAILS — so the skew the live-compile guards against does
+            // not apply (and on CI the metallib is built by the same toolchain
+            // that runs the tests, so there is no header skew to begin with).
+            guard Self.isMppKernel(name),
+                let aot = library.library.makeFunction(name: name)
+            else {
+                throw PSOCacheError.psoCompileFailed(name, error)
+            }
+            do {
+                pso = try library.device.makeComputePipelineState(function: aot)
+            } catch let aotError {
+                throw PSOCacheError.psoCompileFailed(name, aotError)
+            }
         }
 
         lock.lock()
