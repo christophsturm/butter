@@ -4849,7 +4849,7 @@ public enum Ops {
 
         switch (keyBits, valueBits, headDim, out.dtype) {
         case (4, 2, 128, .f32):
-            MetalTileKernels.aura_flash_sdpa_kb4_vb2_d128_f32(
+            MetalTileKernels.mt_aura_flash_sdpa_kb4_vb2_d128_f32(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -4865,7 +4865,7 @@ public enum Ops {
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 2, 128, .f16):
-            MetalTileKernels.aura_flash_sdpa_kb4_vb2_d128_f16(
+            MetalTileKernels.mt_aura_flash_sdpa_kb4_vb2_d128_f16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -4881,7 +4881,7 @@ public enum Ops {
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 2, 128, .bf16):
-            MetalTileKernels.aura_flash_sdpa_kb4_vb2_d128_bf16(
+            MetalTileKernels.mt_aura_flash_sdpa_kb4_vb2_d128_bf16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -4897,7 +4897,7 @@ public enum Ops {
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 4, 128, .f32):
-            MetalTileKernels.aura_flash_sdpa_kb4_vb4_d128_f32(
+            MetalTileKernels.mt_aura_flash_sdpa_kb4_vb4_d128_f32(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -4913,7 +4913,7 @@ public enum Ops {
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 4, 128, .f16):
-            MetalTileKernels.aura_flash_sdpa_kb4_vb4_d128_f16(
+            MetalTileKernels.mt_aura_flash_sdpa_kb4_vb4_d128_f16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -4929,7 +4929,7 @@ public enum Ops {
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 4, 128, .bf16):
-            MetalTileKernels.aura_flash_sdpa_kb4_vb4_d128_bf16(
+            MetalTileKernels.mt_aura_flash_sdpa_kb4_vb4_d128_bf16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -5068,7 +5068,7 @@ public enum Ops {
 
         switch (keyBits, valueBits, headDim, out.dtype) {
         case (4, 2, 128, .f32):
-            MetalTileKernels.aura_flash_p1_kb4_vb2_d128_f32(
+            MetalTileKernels.mt_aura_flash_p1_kb4_vb2_d128_f32(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -5085,7 +5085,7 @@ public enum Ops {
                 num_blocks: numBlocksU, block_size: blockSizeU,
                 q_position: qPosition,
                 gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
-            MetalTileKernels.aura_flash_pass2_d128_f32(
+            MetalTileKernels.mt_aura_flash_pass2_d128_f32(
                 o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
                 m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
                 l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
@@ -5093,7 +5093,7 @@ public enum Ops {
                 dim: dim, num_blocks: numBlocksU,
                 gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
         case (4, 2, 128, .f16):
-            MetalTileKernels.aura_flash_p1_kb4_vb2_d128_f16(
+            MetalTileKernels.mt_aura_flash_p1_kb4_vb2_d128_f16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -5110,7 +5110,7 @@ public enum Ops {
                 num_blocks: numBlocksU, block_size: blockSizeU,
                 q_position: qPosition,
                 gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
-            MetalTileKernels.aura_flash_pass2_d128_f16(
+            MetalTileKernels.mt_aura_flash_pass2_d128_f16(
                 o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
                 m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
                 l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
@@ -5118,7 +5118,7 @@ public enum Ops {
                 dim: dim, num_blocks: numBlocksU,
                 gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
         case (4, 2, 128, .bf16):
-            MetalTileKernels.aura_flash_p1_kb4_vb2_d128_bf16(
+            MetalTileKernels.mt_aura_flash_p1_kb4_vb2_d128_bf16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -5135,7 +5135,7 @@ public enum Ops {
                 num_blocks: numBlocksU, block_size: blockSizeU,
                 q_position: qPosition,
                 gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
-            MetalTileKernels.aura_flash_pass2_d128_bf16(
+            MetalTileKernels.mt_aura_flash_pass2_d128_bf16(
                 o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
                 m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
                 l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
@@ -5143,7 +5143,7 @@ public enum Ops {
                 dim: dim, num_blocks: numBlocksU,
                 gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
         case (4, 4, 128, .f32):
-            MetalTileKernels.aura_flash_p1_kb4_vb4_d128_f32(
+            MetalTileKernels.mt_aura_flash_p1_kb4_vb4_d128_f32(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -5160,7 +5160,7 @@ public enum Ops {
                 num_blocks: numBlocksU, block_size: blockSizeU,
                 q_position: qPosition,
                 gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
-            MetalTileKernels.aura_flash_pass2_d128_f32(
+            MetalTileKernels.mt_aura_flash_pass2_d128_f32(
                 o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
                 m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
                 l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
@@ -5168,7 +5168,7 @@ public enum Ops {
                 dim: dim, num_blocks: numBlocksU,
                 gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
         case (4, 4, 128, .f16):
-            MetalTileKernels.aura_flash_p1_kb4_vb4_d128_f16(
+            MetalTileKernels.mt_aura_flash_p1_kb4_vb4_d128_f16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -5185,7 +5185,7 @@ public enum Ops {
                 num_blocks: numBlocksU, block_size: blockSizeU,
                 q_position: qPosition,
                 gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
-            MetalTileKernels.aura_flash_pass2_d128_f16(
+            MetalTileKernels.mt_aura_flash_pass2_d128_f16(
                 o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
                 m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
                 l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
@@ -5193,7 +5193,7 @@ public enum Ops {
                 dim: dim, num_blocks: numBlocksU,
                 gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
         case (4, 4, 128, .bf16):
-            MetalTileKernels.aura_flash_p1_kb4_vb4_d128_bf16(
+            MetalTileKernels.mt_aura_flash_p1_kb4_vb4_d128_bf16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -5210,7 +5210,7 @@ public enum Ops {
                 num_blocks: numBlocksU, block_size: blockSizeU,
                 q_position: qPosition,
                 gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
-            MetalTileKernels.aura_flash_pass2_d128_bf16(
+            MetalTileKernels.mt_aura_flash_pass2_d128_bf16(
                 o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
                 m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
                 l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
