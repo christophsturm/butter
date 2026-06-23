@@ -486,10 +486,8 @@ extension Ops {
         let dev = Device.shared
         switch out.dtype {
         case .f32:
-            let startBuf = dev.makeBuffer(length: 4)
-            let stepBuf = dev.makeBuffer(length: 4)
-            startBuf.contents().bindMemory(to: Float.self, capacity: 1).pointee = start
-            stepBuf.contents().bindMemory(to: Float.self, capacity: 1).pointee = step
+            let startBuf = dev.scalarBuffer(start)
+            let stepBuf = dev.scalarBuffer(step)
             let (grid, tg) = elementwiseGrid(n)
             MetalTileKernels.mt_arange_f32(
                 out: out.buffer, outOffset: out.offset,

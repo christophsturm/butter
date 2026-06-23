@@ -76,6 +76,207 @@ public enum Ops {
 
     // ─── Element-wise binary: add ────────────────────────────────────
 
+    /// In-place scaled add: `accum[i] += scalar * src[i]`.
+    public static func axpyScalarInplace(
+        _ accum: Tensor, _ src: Tensor, scalar: Float, on cmd: MTLCommandBuffer
+    ) {
+        precondition(accum.shape == src.shape, "axpyScalarInplace: shape mismatch")
+        precondition(accum.dtype == src.dtype, "axpyScalarInplace: dtype mismatch")
+        let n = accum.elementCount
+        let (grid, tg) = elementwiseGrid(n)
+        switch accum.dtype {
+        case .f32:
+            MetalTileKernels.ffai_axpy_scalar_inplace_f32(
+                src: src.buffer, srcOffset: src.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                scalar: scalar,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_axpy_scalar_inplace_f16(
+                src: src.buffer, srcOffset: src.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                scalar: scalar,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_axpy_scalar_inplace_bf16(
+                src: src.buffer, srcOffset: src.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                scalar: scalar,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("axpyScalarInplace: unsupported dtype \(accum.dtype)")
+        }
+    }
+
+    /// Fused multi-expert (top-K=6) down gemv + weighted accumulate.
+    /// `accum[r] += Σ_k w[k] * (downs[k][r] · inners[k])`.
+    /// 1 dispatch replaces 18 (6 gemv + 6 mul + 6 add).
+    public static func moeDownWeightedSum6(
+        downs: [Tensor], inners: [Tensor], weights: Tensor, accum: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(downs.count == 6 && inners.count == 6,
+                     "moeDownWeightedSum6: expects exactly 6 of each")
+        precondition(weights.dtype == .f32 && weights.elementCount >= 6,
+                     "moeDownWeightedSum6: weights must be f32 of len 6")
+        let m = downs[0].shape[0]
+        let k = downs[0].shape[1]
+        precondition(k <= 2048, "moeDownWeightedSum6: k \(k) exceeds kernel TG staging cap 2048")
+        let dt = downs[0].dtype
+        let tgWidth = 256
+        let grid = MTLSize(width: m * tgWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch dt {
+        case .f16:
+            MetalTileKernels.ffai_moe_down_weighted_sum_6_f16(
+                down_0: downs[0].buffer, down_0Offset: downs[0].offset,
+                inner_0: inners[0].buffer, inner_0Offset: inners[0].offset,
+                down_1: downs[1].buffer, down_1Offset: downs[1].offset,
+                inner_1: inners[1].buffer, inner_1Offset: inners[1].offset,
+                down_2: downs[2].buffer, down_2Offset: downs[2].offset,
+                inner_2: inners[2].buffer, inner_2Offset: inners[2].offset,
+                down_3: downs[3].buffer, down_3Offset: downs[3].offset,
+                inner_3: inners[3].buffer, inner_3Offset: inners[3].offset,
+                down_4: downs[4].buffer, down_4Offset: downs[4].offset,
+                inner_4: inners[4].buffer, inner_4Offset: inners[4].offset,
+                down_5: downs[5].buffer, down_5Offset: downs[5].offset,
+                inner_5: inners[5].buffer, inner_5Offset: inners[5].offset,
+                weights: weights.buffer, weightsOffset: weights.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                k: UInt32(k),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f32:
+            MetalTileKernels.ffai_moe_down_weighted_sum_6_f32(
+                down_0: downs[0].buffer, down_0Offset: downs[0].offset,
+                inner_0: inners[0].buffer, inner_0Offset: inners[0].offset,
+                down_1: downs[1].buffer, down_1Offset: downs[1].offset,
+                inner_1: inners[1].buffer, inner_1Offset: inners[1].offset,
+                down_2: downs[2].buffer, down_2Offset: downs[2].offset,
+                inner_2: inners[2].buffer, inner_2Offset: inners[2].offset,
+                down_3: downs[3].buffer, down_3Offset: downs[3].offset,
+                inner_3: inners[3].buffer, inner_3Offset: inners[3].offset,
+                down_4: downs[4].buffer, down_4Offset: downs[4].offset,
+                inner_4: inners[4].buffer, inner_4Offset: inners[4].offset,
+                down_5: downs[5].buffer, down_5Offset: downs[5].offset,
+                inner_5: inners[5].buffer, inner_5Offset: inners[5].offset,
+                weights: weights.buffer, weightsOffset: weights.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                k: UInt32(k),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_moe_down_weighted_sum_6_bf16(
+                down_0: downs[0].buffer, down_0Offset: downs[0].offset,
+                inner_0: inners[0].buffer, inner_0Offset: inners[0].offset,
+                down_1: downs[1].buffer, down_1Offset: downs[1].offset,
+                inner_1: inners[1].buffer, inner_1Offset: inners[1].offset,
+                down_2: downs[2].buffer, down_2Offset: downs[2].offset,
+                inner_2: inners[2].buffer, inner_2Offset: inners[2].offset,
+                down_3: downs[3].buffer, down_3Offset: downs[3].offset,
+                inner_3: inners[3].buffer, inner_3Offset: inners[3].offset,
+                down_4: downs[4].buffer, down_4Offset: downs[4].offset,
+                inner_4: inners[4].buffer, inner_4Offset: inners[4].offset,
+                down_5: downs[5].buffer, down_5Offset: downs[5].offset,
+                inner_5: inners[5].buffer, inner_5Offset: inners[5].offset,
+                weights: weights.buffer, weightsOffset: weights.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                k: UInt32(k),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("moeDownWeightedSum6: unsupported dtype \(dt)")
+        }
+    }
+
+    /// Fused gate gemv + up gemv + SwiGLU. 1 dispatch replaces 3.
+    /// `inner[r] = silu(gate_w[r] · x) * (up_w[r] · x)`.
+    public static func gateUpSwigluFused(
+        gateW: Tensor, upW: Tensor, x: Tensor, inner: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(gateW.shape.count == 2 && upW.shape.count == 2, "gateUpSwigluFused: weights 2D")
+        precondition(x.shape.count == 1 && inner.shape.count == 1, "gateUpSwigluFused: vec/inner 1D")
+        precondition(gateW.shape == upW.shape, "gateUpSwigluFused: gate/up shape mismatch")
+        precondition(gateW.shape[0] == inner.shape[0], "gateUpSwigluFused: m mismatch")
+        precondition(gateW.shape[1] == x.shape[0], "gateUpSwigluFused: k mismatch")
+        let m = gateW.shape[0]
+        let k = gateW.shape[1]
+        let tgWidth = 256
+        let grid = MTLSize(width: m * tgWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch gateW.dtype {
+        case .f32:
+            MetalTileKernels.ffai_gate_up_swiglu_fused_f32(
+                gate_w: gateW.buffer, gate_wOffset: gateW.offset,
+                up_w: upW.buffer, up_wOffset: upW.offset,
+                x: x.buffer, xOffset: x.offset,
+                inner: inner.buffer, innerOffset: inner.offset,
+                k: UInt32(k),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_gate_up_swiglu_fused_f16(
+                gate_w: gateW.buffer, gate_wOffset: gateW.offset,
+                up_w: upW.buffer, up_wOffset: upW.offset,
+                x: x.buffer, xOffset: x.offset,
+                inner: inner.buffer, innerOffset: inner.offset,
+                k: UInt32(k),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_gate_up_swiglu_fused_bf16(
+                gate_w: gateW.buffer, gate_wOffset: gateW.offset,
+                up_w: upW.buffer, up_wOffset: upW.offset,
+                x: x.buffer, xOffset: x.offset,
+                inner: inner.buffer, innerOffset: inner.offset,
+                k: UInt32(k),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("gateUpSwigluFused: unsupported dtype \(gateW.dtype)")
+        }
+    }
+
+    /// Fused gemv + weighted in-place accumulate:
+    /// `accum[r] += weight * (Σ_j mat[r, j] * vec[j])`.
+    /// Saves 2 dispatches per call (vs gemv → Tensor.filled(w) → mul → add).
+    public static func gemvAxpyInplace(
+        mat: Tensor, vec: Tensor, accum: Tensor, weight: Float,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(mat.shape.count == 2, "gemvAxpyInplace: mat must be 2D")
+        precondition(vec.shape.count == 1, "gemvAxpyInplace: vec must be 1D")
+        precondition(accum.shape.count == 1, "gemvAxpyInplace: accum must be 1D")
+        precondition(mat.shape[1] == vec.shape[0], "gemvAxpyInplace: k mismatch")
+        precondition(mat.shape[0] == accum.shape[0], "gemvAxpyInplace: m mismatch")
+        precondition(mat.dtype == vec.dtype && mat.dtype == accum.dtype, "gemvAxpyInplace: dtype mismatch")
+        let m = mat.shape[0]
+        let k = mat.shape[1]
+        let tgWidth = 256
+        let grid = MTLSize(width: m * tgWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch mat.dtype {
+        case .f32:
+            MetalTileKernels.ffai_gemv_axpy_inplace_f32(
+                mat: mat.buffer, matOffset: mat.offset,
+                vec: vec.buffer, vecOffset: vec.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                k: UInt32(k), weight: weight,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_gemv_axpy_inplace_f16(
+                mat: mat.buffer, matOffset: mat.offset,
+                vec: vec.buffer, vecOffset: vec.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                k: UInt32(k), weight: weight,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_gemv_axpy_inplace_bf16(
+                mat: mat.buffer, matOffset: mat.offset,
+                vec: vec.buffer, vecOffset: vec.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                k: UInt32(k), weight: weight,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("gemvAxpyInplace: unsupported dtype \(mat.dtype)")
+        }
+    }
+
     public static func add(
         _ a: Tensor, _ b: Tensor, on cmd: MTLCommandBuffer,
         into out: Tensor? = nil
@@ -621,18 +822,10 @@ public enum Ops {
         // Allocate one or two eps buffers depending on whether the two
         // eps values match — RMSNorm pairs typically come from the
         // same checkpoint config and so share a single eps in practice.
-        let epsBuf1: MTLBuffer = {
-            let b = device.makeBuffer(length: 4)
-            var v = eps1
-            memcpy(b.contents(), &v, 4)
-            return b
-        }()
+        let epsBuf1: MTLBuffer = device.scalarBuffer(eps1)
         let epsBuf2: MTLBuffer = {
             if eps1 == eps2 { return epsBuf1 }
-            let b = device.makeBuffer(length: 4)
-            var v = eps2
-            memcpy(b.contents(), &v, 4)
-            return b
+            return device.scalarBuffer(eps2)
         }()
         @inline(__always)
         func dispatch(
@@ -700,9 +893,7 @@ public enum Ops {
         let normed = normedOut ?? Tensor.empty(shape: a.shape, dtype: a.dtype)
 
         // eps as a 1-element f32 buffer.
-        var epsValue = eps
-        let epsBuf = device.makeBuffer(length: 4)
-        memcpy(epsBuf.contents(), &epsValue, 4)
+        let epsBuf = device.scalarBuffer(eps)
 
         // TPG = n / 4 (kernel vectorises in 4-elem chunks). One
         // threadgroup per row → grid = nRows * (n/4) threads × 1 × 1.
@@ -757,9 +948,7 @@ public enum Ops {
         eps: Float, n: Int, nRows: Int, on cmd: MTLCommandBuffer
     ) {
         // eps as a 1-element f32 buffer.
-        var epsValue = eps
-        let epsBuf = device.makeBuffer(length: 4)
-        memcpy(epsBuf.contents(), &epsValue, 4)
+        let epsBuf = device.scalarBuffer(eps)
 
         // Fast kernel needs TPG = n/4 with TPG a multiple of 32 and
         // ≤ 1024. Anything outside that — too wide, too narrow, or not
@@ -3589,6 +3778,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .f16):
@@ -3600,6 +3790,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .bf16):
@@ -3611,6 +3802,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .f32):
@@ -3622,6 +3814,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .f16):
@@ -3633,6 +3826,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .bf16):
@@ -3644,6 +3838,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         // d512 routes to the dedicated `ffai_sdpa_decode_d512_*` kernel.
@@ -6101,9 +6296,7 @@ public enum Ops {
             inDim % groupSize == 0,
             "Ops.rmsNormQgemvInt4Fast: in_dim must divide group_size=64")
         // eps as a 1-element f32 buffer.
-        var epsValue = eps
-        let epsBuf = device.makeBuffer(length: 4)
-        memcpy(epsBuf.contents(), &epsValue, 4)
+        let epsBuf = device.scalarBuffer(eps)
         let tg = MTLSize(width: 64, height: 1, depth: 1)
         let nTiles = outDim / 8
         let grid = MTLSize(width: nTiles * 64, height: 1, depth: 1)
@@ -6205,9 +6398,7 @@ public enum Ops {
         let grid = MTLSize(width: nTiles * tpg, height: 1, depth: 1)
         let tg = MTLSize(width: tpg, height: 1, depth: 1)
         // eps as a 1-element f32 buffer.
-        var epsValue = eps
-        let epsBuf = device.makeBuffer(length: 4)
-        memcpy(epsBuf.contents(), &epsValue, 4)
+        let epsBuf = device.scalarBuffer(eps)
         switch out.dtype {
         case .f32:
             MetalTileKernels.ffai_gated_rms_norm_qgemv_int4_fast_f32(
@@ -6496,6 +6687,59 @@ public enum Ops {
         enc.endEncoding()
     }
 
+    /// DSv4 SwiGLU-with-limit (single): `silu(min(gate,limit)) * clip(up,±limit)`.
+    public static func swigluLimit(
+        gate: Tensor, up: Tensor, limit: Float, on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(gate.dtype == up.dtype && gate.elementCount == up.elementCount,
+            "Ops.swigluLimit: gate/up mismatch")
+        let result = out ?? Tensor.empty(shape: gate.shape, dtype: gate.dtype)
+        swigluLimitMany(gates: [gate], ups: [up], outs: [result], limit: limit, on: cmd)
+        return result
+    }
+
+    /// DSv4 SwiGLU-with-limit, N dispatches sharing one encoder:
+    /// `out = silu(min(gate, limit)) * clip(up, -limit, +limit)`. DSv4
+    /// trains with swiglu_limit=10; the clamp is essential — unclamped
+    /// silu(gate)*up overflows fp16 in the deep high-magnitude layers.
+    public static func swigluLimitMany(
+        gates: [Tensor], ups: [Tensor], outs: [Tensor], limit: Float,
+        on cmd: MTLCommandBuffer
+    ) {
+        let n = gates.count
+        precondition(ups.count == n && outs.count == n, "Ops.swigluLimitMany: count mismatch")
+        guard n > 0 else { return }
+        let dtype = gates[0].dtype
+        let psoName: String
+        switch dtype {
+        case .f32: psoName = "ffai_dsv4_swiglu_limit_f32"
+        case .f16: psoName = "ffai_dsv4_swiglu_limit_f16"
+        case .bf16: psoName = "ffai_dsv4_swiglu_limit_bf16"
+        default: fatalError("Ops.swigluLimitMany: unsupported dtype \(dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        var lim = limit
+        for i in 0 ..< n {
+            let count = gates[i].elementCount
+            precondition(ups[i].elementCount == count && outs[i].elementCount == count,
+                "Ops.swigluLimitMany: shape mismatch at index \(i)")
+            precondition(ups[i].dtype == dtype && outs[i].dtype == dtype,
+                "Ops.swigluLimitMany: dtype mismatch at index \(i)")
+            let tgWidth = min(count, 256)
+            enc.setBuffer(gates[i].buffer, offset: gates[i].offset, index: 0)
+            enc.setBuffer(ups[i].buffer, offset: ups[i].offset, index: 1)
+            enc.setBuffer(outs[i].buffer, offset: outs[i].offset, index: 2)
+            enc.setBytes(&lim, length: 4, index: 3)
+            enc.dispatchThreads(
+                MTLSize(width: count, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1))
+        }
+        enc.endEncoding()
+    }
+
     // ─── MoE gather quantised matmul, scalar m1 ────────────────────────
     //
     // Wraps `mt_moe_gather_qmm_int4_{f32,f16,bf16}`. One TG per
@@ -6608,9 +6852,7 @@ public enum Ops {
             x.dtype == weight.dtype && weight.dtype == bias.dtype,
             "Ops.layerNorm: x/weight/bias dtype mismatch")
         let result = out ?? Tensor.empty(shape: x.shape, dtype: x.dtype)
-        var epsValue = eps
-        let epsBuf = device.makeBuffer(length: 4)
-        memcpy(epsBuf.contents(), &epsValue, 4)
+        let epsBuf = device.scalarBuffer(eps)
         // TPG=1024 per the kernel's reduce-tree contract. One TG per row.
         let tgWidth = 1024
         let grid = MTLSize(width: nRows * tgWidth, height: 1, depth: 1)

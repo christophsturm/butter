@@ -37,12 +37,30 @@ public struct Tensor: @unchecked Sendable {
     public var elementCount: Int { shape.reduce(1, *) }
     public var byteCount: Int { elementCount * dtype.byteSize }
 
-    /// Allocate a new contiguous tensor. Caller-owned buffer.
+    /// Allocate a new contiguous tensor. When `device.scratchModeActive`
+    /// is true, routes through the scratch slab so transients within
+    /// a `withScratch { ... }` scope don't hammer Metal's internal
+    /// driver pool (per-token forward path).
     public static func empty(shape: [Int], dtype: DType, device: Device = .shared) -> Tensor {
+        if device.scratchModeActive {
+            return Tensor.scratch(shape: shape, dtype: dtype, device: device)
+        }
         let count = shape.reduce(1, *)
         let bytes = count * dtype.byteSize
         return Tensor(
             buffer: device.makeBuffer(length: bytes), offset: 0, shape: shape, dtype: dtype)
+    }
+
+    /// Allocate a sub-block-local tensor into the device's scratch
+    /// slab. Slice becomes invalid after `device.resetScratch()` —
+    /// use only for transients whose lifetime is bounded by the
+    /// caller's `device.withScratch { ... }` scope. Carry-over state
+    /// must use `Tensor.empty(...)` instead.
+    public static func scratch(shape: [Int], dtype: DType, device: Device = .shared) -> Tensor {
+        let count = shape.reduce(1, *)
+        let bytes = count * dtype.byteSize
+        let (buf, offset) = device.allocScratch(bytes: bytes)
+        return Tensor(buffer: buf, offset: offset, shape: shape, dtype: dtype)
     }
 
     /// Reshape (no copy). Element count must match.

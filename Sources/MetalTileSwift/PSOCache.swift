@@ -112,8 +112,8 @@ public final class PSOCache: @unchecked Sendable {
         // baked-in MPP types disagree with the device runtime's, producing
         // bit-deterministic wrong output (e.g. cos 0.816 vs 0.999 oracle).
         // Live-compile via `makeLibrary(source:)` resolves MPP against the
-        // running OS's header, dodging the skew. See ollama #15594, #14432,
-        // llama.cpp PR #16634 for the same class of bug.
+        // running OS's header, dodging the skew. This is a known class of
+        // MPP header-skew bug.
         let function: MTLFunction
         if Self.isMppKernel(name) {
             function = try liveCompileMppFunction(name)
@@ -136,21 +136,30 @@ public final class PSOCache: @unchecked Sendable {
         return pso
     }
 
-    /// Returns true for kernels that use `mpp::tensor_ops::matmul2d` and
-    /// must be live-compiled from .metal source on the running OS. Detected
-    /// purely by name — every metaltile MPP kernel name contains `_mpp_`
-    /// (e.g. `mt_qmm_mma_mpp_*`, `mt_moe_gather_qmm_mma_int4_bm{8,16,64}_mpp_*`).
-    /// Non-MPP kernels (the bulk of the metallib) still load from
-    /// kernels.metallib — much faster PSO build.
+    /// Returns true for kernels that use cooperative-tensor MMA
+    /// (`mpp::tensor_ops::matmul2d` or the Metal-4 `metal::tensor` coop_tile)
+    /// and must be live-compiled from .metal source on the running OS.
+    /// Detected purely by name:
+    ///   • `_mpp_`  — the MPP `matmul2d` kernels (qmm_mma, moe_mpp_*).
+    ///   • `bgemm`  — the coop_tile MMA bgemms (moe_bgemm_*_bm64 / _view).
+    /// Both lower cooperative-tensor ops whose type IDs / tile layouts are
+    /// resolved against the SDK header at compile time; an offline `xcrun
+    /// metal`→metallib bakes in types that disagree with the running OS's
+    /// runtime, producing BIT-DETERMINISTIC WRONG output (verified: the
+    /// metallib bm64 gives sumAbs 20718 vs the runtime-compiled 24583 on
+    /// identical inputs — see metaltile moe_bm64_ragged_correctness +
+    /// /tmp/bmtest.swift). Live-compile via `makeLibrary(source:)` resolves
+    /// against the running OS's header. The bulk (gemv, elementwise, etc.)
+    /// have no MMA → still load fast from kernels.metallib.
     private static func isMppKernel(_ name: String) -> Bool {
-        // Opt-out via env var, just in case a future kernel name accidentally
-        // matches `_mpp_` (e.g. an `_mppow_` variant). Default on.
+        // Opt-out via env var, in case a future kernel name accidentally
+        // matches (e.g. an `_mppow_` variant). Default on.
         if let raw = ProcessInfo.processInfo.environment["FFAI_PSO_LIVE_COMPILE_MPP"],
             raw == "0" || raw.lowercased() == "false"
         {
             return false
         }
-        return name.contains("_mpp_")
+        return name.contains("_mpp_") || name.contains("bgemm")
     }
 
     private func liveCompileMppFunction(_ name: String) throws -> MTLFunction {
