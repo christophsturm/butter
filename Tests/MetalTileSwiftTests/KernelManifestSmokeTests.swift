@@ -106,8 +106,7 @@ struct KernelManifestSmokeTests {
 
         var failures: [String] = []
         for entry in manifest.kernels {
-            // MPP cooperative-tensor kernels can't compile on Family < 9
-            // runners; their correctness is verified upstream on M3+.
+            // Fast-skip the obviously-MPP kernels by name on Family < 9.
             if !Self.mppCooperativeTensorAvailable, Self.isMppKernel(entry.name) {
                 continue
             }
@@ -118,6 +117,18 @@ struct KernelManifestSmokeTests {
                     "kernel \(entry.name) reports zero maxTotalThreadsPerThreadgroup — Metal refused to instantiate"
                 )
             } catch {
+                // Cooperative-tensor (MMA) kernels are not all named `_mpp_` /
+                // `bgemm` (e.g. the `_nax_` steel-GEMM cells). On a Family < 9
+                // runner the Metal compiler rejects every cooperative-tensor
+                // body with "unsupported deferred-static-alloca-size"; treat
+                // that specific compile error as a skip on inadequate hardware
+                // (these are verified upstream on M3+) rather than a failure.
+                // Any other compile error is still a real failure.
+                if !Self.mppCooperativeTensorAvailable,
+                    "\(error)".contains("deferred-static-alloca-size")
+                {
+                    continue
+                }
                 failures.append("\(entry.name): \(error)")
             }
         }
