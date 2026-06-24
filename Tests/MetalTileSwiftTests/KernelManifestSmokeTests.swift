@@ -45,6 +45,21 @@ import Testing
 @Suite("Kernel manifest PSO smoke")
 struct KernelManifestSmokeTests {
 
+    /// MPP cooperative-tensor kernels (`_mpp_` / `bgemm`) lower simdgroup
+    /// matmul that needs Apple GPU Family 9+ (M3+). The macos-latest runner
+    /// pool is mixed M1/M3 hardware; on a Family < 9 host the Metal compiler
+    /// rejects the cooperative-tensor body, so the manifest sweep skips those
+    /// kernels there. They are covered by ffai-kernels' own GPU correctness
+    /// suite on adequate hardware. Detection mirrors `PSOCache.isMppKernel`.
+    static let mppCooperativeTensorAvailable: Bool = {
+        guard let device = MTLCreateSystemDefaultDevice() else { return false }
+        return device.supportsFamily(.apple9)
+    }()
+
+    static func isMppKernel(_ name: String) -> Bool {
+        name.contains("_mpp_") || name.contains("bgemm")
+    }
+
     /// JSON shape mirrored from `metaltile-codegen::emit::write_manifest`.
     /// Only `name` is parsed — the rest is left flexible so manifest
     /// schema bumps don't fail the test.
@@ -91,6 +106,10 @@ struct KernelManifestSmokeTests {
 
         var failures: [String] = []
         for entry in manifest.kernels {
+            // Fast-skip the obviously-MPP kernels by name on Family < 9.
+            if !Self.mppCooperativeTensorAvailable, Self.isMppKernel(entry.name) {
+                continue
+            }
             do {
                 let pso = try cache.pipelineStateThrowing(for: entry.name)
                 #expect(
@@ -98,6 +117,18 @@ struct KernelManifestSmokeTests {
                     "kernel \(entry.name) reports zero maxTotalThreadsPerThreadgroup — Metal refused to instantiate"
                 )
             } catch {
+                // Cooperative-tensor (MMA) kernels are not all named `_mpp_` /
+                // `bgemm` (e.g. the `_nax_` steel-GEMM cells). On a Family < 9
+                // runner the Metal compiler rejects every cooperative-tensor
+                // body with "unsupported deferred-static-alloca-size"; treat
+                // that specific compile error as a skip on inadequate hardware
+                // (these are verified upstream on M3+) rather than a failure.
+                // Any other compile error is still a real failure.
+                if !Self.mppCooperativeTensorAvailable,
+                    "\(error)".contains("deferred-static-alloca-size")
+                {
+                    continue
+                }
                 failures.append("\(entry.name): \(error)")
             }
         }
