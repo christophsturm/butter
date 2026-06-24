@@ -45,6 +45,21 @@ import Testing
 @Suite("Kernel manifest PSO smoke")
 struct KernelManifestSmokeTests {
 
+    /// MPP cooperative-tensor kernels (`_mpp_` / `bgemm`) lower simdgroup
+    /// matmul that needs Apple GPU Family 9+ (M3+). The macos-latest runner
+    /// pool is mixed M1/M3 hardware; on a Family < 9 host the Metal compiler
+    /// rejects the cooperative-tensor body, so the manifest sweep skips those
+    /// kernels there. They are covered by ffai-kernels' own GPU correctness
+    /// suite on adequate hardware. Detection mirrors `PSOCache.isMppKernel`.
+    static let mppCooperativeTensorAvailable: Bool = {
+        guard let device = MTLCreateSystemDefaultDevice() else { return false }
+        return device.supportsFamily(.apple9)
+    }()
+
+    static func isMppKernel(_ name: String) -> Bool {
+        name.contains("_mpp_") || name.contains("bgemm")
+    }
+
     /// JSON shape mirrored from `metaltile-codegen::emit::write_manifest`.
     /// Only `name` is parsed — the rest is left flexible so manifest
     /// schema bumps don't fail the test.
@@ -91,6 +106,11 @@ struct KernelManifestSmokeTests {
 
         var failures: [String] = []
         for entry in manifest.kernels {
+            // MPP cooperative-tensor kernels can't compile on Family < 9
+            // runners; their correctness is verified upstream on M3+.
+            if !Self.mppCooperativeTensorAvailable, Self.isMppKernel(entry.name) {
+                continue
+            }
             do {
                 let pso = try cache.pipelineStateThrowing(for: entry.name)
                 #expect(
