@@ -1142,7 +1142,16 @@ struct OpsSpecialPathTests {
 
     // MARK: - MoE batched-prefill variants
 
-    @Test("moeGatherDequantGemmInt4Bm8 f32 — dispatch on BM=8 tile shape")
+    // Gated on Apple GPU Family 9+ (M3+) like the bm64 MPP cells: the bm8
+    // path lowers MPP cooperative-tensor matmul, and on a Family < 9 runner
+    // (the macos-latest pool is mixed M1/M3 hardware) the PSO either zeroes
+    // output or fails to compile outright on newer toolchains, fatal-erroring
+    // PSOCache. Reuses the single availability gate so this stays in sync.
+    @Test(
+        "moeGatherDequantGemmInt4Bm8 f32 — dispatch on BM=8 tile shape",
+        .enabled(
+            if: MoEBgemmBm64MppTests.mppCooperativeTensorAvailable,
+            "MPP cooperative tensor — Apple GPU Family 9+"))
     func moeBm8Smoke() {
         // TODO: needs production-shape correctness reference — the
         // kernel's BM=8 tile is exercised at decode top-K; the BM=16
