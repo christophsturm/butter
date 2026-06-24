@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Real CUDA backend (compiled under `--features cuda`). Wraps
-//! `metaltile_runtime::CudaDevice` — the NVRTC → PTX → driver path that
+//! `ffai_kernels_runtime::CudaDevice` — the NVRTC → PTX → driver path that
 //! runs the kernel corpus bit-accurately on GB10 — behind the shared
 //! [`ffai_core::Device`] trait, so the engine layer above is identical to
 //! the Metal/Vulkan paths.
@@ -13,9 +13,9 @@ use std::os::raw::c_void;
 use std::sync::{Arc, RwLock};
 
 use ffai_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
-use metaltile_codegen::{CodegenBackend, CudaGenerator};
-use metaltile_core::ir::KernelMode;
-use metaltile_runtime::{CudaDevice as MtCudaDevice, CudaModule, MetalTileError};
+use ffai_kernels_codegen::{CodegenBackend, CudaGenerator};
+use ffai_kernels_core::ir::KernelMode;
+use ffai_kernels_runtime::{CudaDevice as MtCudaDevice, CudaModule, MetalTileError};
 
 fn dispatch_err(e: MetalTileError) -> Error {
     Error::Dispatch(e.to_string())

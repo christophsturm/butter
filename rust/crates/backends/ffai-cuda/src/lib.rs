@@ -4,7 +4,7 @@
 //! # ffai-cuda
 //!
 //! CUDA backend for the FFAI engine. Under `--features cuda` it wraps
-//! `metaltile_runtime::CudaDevice` (NVRTC → PTX → driver) behind the shared
+//! `ffai_kernels_runtime::CudaDevice` (NVRTC → PTX → driver) behind the shared
 //! [`ffai_core::Device`] trait — the same seam the Metal/Vulkan backends
 //! implement, so everything above it is backend-agnostic. Without the
 //! feature it is a stub so non-CUDA hosts still build the workspace.

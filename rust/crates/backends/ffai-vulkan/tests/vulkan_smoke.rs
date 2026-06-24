@@ -9,7 +9,7 @@
 
 use ffai_core::{Binding, Grid};
 use ffai_vulkan::VulkanDevice;
-use metaltile_core::{
+use ffai_kernels_core::{
     dtype::DType,
     ir::{BinOpKind, IndexExpr, Kernel, Op, Param, ParamKind, ValueId},
     shape::Shape,

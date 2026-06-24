@@ -8,7 +8,7 @@
 
 #![cfg(feature = "cuda")]
 
-use metaltile_runtime::CudaDevice;
+use ffai_kernels_runtime::CudaDevice;
 use std::os::raw::c_void;
 use std::time::Instant;
 

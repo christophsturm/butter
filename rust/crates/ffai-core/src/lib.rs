@@ -28,8 +28,8 @@ pub use error::{Error, Result};
 
 // Re-export the shared kernel IR + dtype so the whole engine speaks one
 // vocabulary and nothing downstream depends on metaltile-core directly.
-pub use metaltile_core::dtype::DType;
-pub use metaltile_core::ir::Kernel;
+pub use ffai_kernels_core::dtype::DType;
+pub use ffai_kernels_core::ir::Kernel;
 
 /// Which accelerator family a [`Device`] targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

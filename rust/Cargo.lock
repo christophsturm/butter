@@ -110,7 +110,7 @@ dependencies = [
 name = "ffai-core"
 version = "0.1.0"
 dependencies = [
- "metaltile-core",
+ "ffai-kernels-core",
  "thiserror",
 ]
 
@@ -119,13 +119,13 @@ name = "ffai-cuda"
 version = "0.1.0"
 dependencies = [
  "ffai-core",
+ "ffai-kernels-codegen",
+ "ffai-kernels-core",
+ "ffai-kernels-runtime",
  "ffai-loader",
  "ffai-models",
  "ffai-modeltests",
  "ffai-ops",
- "metaltile-codegen",
- "metaltile-core",
- "metaltile-runtime",
 ]
 
 [[package]]
@@ -133,6 +133,91 @@ name = "ffai-ffi"
 version = "0.1.0"
 dependencies = [
  "ffai",
+]
+
+[[package]]
+name = "ffai-kernels"
+version = "0.1.0"
+source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#d4cafc60ea4a43b411fdec98ede42cfeec3cd49d"
+dependencies = [
+ "bytemuck",
+ "ffai-kernels-codegen",
+ "ffai-kernels-core",
+ "ffai-kernels-macros",
+ "ffai-kernels-runtime",
+ "inventory",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "rayon",
+ "regex",
+ "serde",
+]
+
+[[package]]
+name = "ffai-kernels-codegen"
+version = "0.1.0"
+source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#d4cafc60ea4a43b411fdec98ede42cfeec3cd49d"
+dependencies = [
+ "ffai-kernels-core",
+ "inventory",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "ffai-kernels-core"
+version = "0.1.0"
+source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#d4cafc60ea4a43b411fdec98ede42cfeec3cd49d"
+dependencies = [
+ "ffai-kernels-macros",
+ "inventory",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "thiserror",
+]
+
+[[package]]
+name = "ffai-kernels-macros"
+version = "0.1.0"
+source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#d4cafc60ea4a43b411fdec98ede42cfeec3cd49d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "ffai-kernels-runtime"
+version = "0.1.0"
+source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#d4cafc60ea4a43b411fdec98ede42cfeec3cd49d"
+dependencies = [
+ "ffai-kernels-codegen",
+ "ffai-kernels-core",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "parking_lot",
+ "rustc-hash",
+ "smallvec",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "ffai-kernels-std"
+version = "0.1.0"
+source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#d4cafc60ea4a43b411fdec98ede42cfeec3cd49d"
+dependencies = [
+ "ffai-kernels",
+ "half",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -149,13 +234,13 @@ name = "ffai-metal"
 version = "0.1.0"
 dependencies = [
  "ffai-core",
+ "ffai-kernels-core",
+ "ffai-kernels-runtime",
  "ffai-loader",
  "ffai-models",
  "ffai-modeltests",
  "ffai-ops",
  "ffai-runtime",
- "metaltile-core",
- "metaltile-runtime",
  "parking_lot",
 ]
 
@@ -185,9 +270,9 @@ name = "ffai-ops"
 version = "0.1.0"
 dependencies = [
  "ffai-core",
- "metaltile-codegen",
- "metaltile-core",
- "metaltile-std",
+ "ffai-kernels-codegen",
+ "ffai-kernels-core",
+ "ffai-kernels-std",
  "parking_lot",
  "rustc-hash",
 ]
@@ -201,11 +286,11 @@ name = "ffai-vulkan"
 version = "0.1.0"
 dependencies = [
  "ffai-core",
+ "ffai-kernels-core",
+ "ffai-kernels-runtime",
  "ffai-loader",
  "ffai-models",
  "ffai-runtime",
- "metaltile-core",
- "metaltile-runtime",
 ]
 
 [[package]]
@@ -262,91 +347,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "metaltile"
-version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/metaltile?branch=dev#5b36752e71306267d3955a310ef5df94f6183bd9"
-dependencies = [
- "bytemuck",
- "inventory",
- "metaltile-codegen",
- "metaltile-core",
- "metaltile-macros",
- "metaltile-runtime",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "rayon",
- "regex",
- "serde",
-]
-
-[[package]]
-name = "metaltile-codegen"
-version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/metaltile?branch=dev#5b36752e71306267d3955a310ef5df94f6183bd9"
-dependencies = [
- "inventory",
- "metaltile-core",
- "rustc-hash",
- "serde",
- "serde_json",
- "smallvec",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "metaltile-core"
-version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/metaltile?branch=dev#5b36752e71306267d3955a310ef5df94f6183bd9"
-dependencies = [
- "inventory",
- "metaltile-macros",
- "rustc-hash",
- "serde",
- "serde_json",
- "smallvec",
- "thiserror",
-]
-
-[[package]]
-name = "metaltile-macros"
-version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/metaltile?branch=dev#5b36752e71306267d3955a310ef5df94f6183bd9"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "metaltile-runtime"
-version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/metaltile?branch=dev#5b36752e71306267d3955a310ef5df94f6183bd9"
-dependencies = [
- "metaltile-codegen",
- "metaltile-core",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "parking_lot",
- "rustc-hash",
- "smallvec",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "metaltile-std"
-version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/metaltile?branch=dev#5b36752e71306267d3955a310ef5df94f6183bd9"
-dependencies = [
- "half",
- "metaltile",
- "rustc-hash",
 ]
 
 [[package]]

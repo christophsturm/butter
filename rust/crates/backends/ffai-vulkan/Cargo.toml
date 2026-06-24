@@ -1,6 +1,6 @@
 [package]
 name = "ffai-vulkan"
-description = "FFAI Vulkan backend — wraps metaltile-runtime's VulkanDevice (GlslGenerator -> shaderc -> SPIR-V -> VkPipeline) behind the ffai-core Device trait. The portable GPU path for non-CUDA / non-Apple hardware."
+description = "FFAI Vulkan backend — wraps ffai-kernels-runtime's VulkanDevice (GlslGenerator -> shaderc -> SPIR-V -> VkPipeline) behind the ffai-core Device trait. The portable GPU path for non-CUDA / non-Apple hardware."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,20 +8,20 @@ repository.workspace = true
 
 [dependencies]
 ffai-core.workspace = true
-metaltile-core = { workspace = true, optional = true }
-metaltile-runtime = { workspace = true, optional = true }
+ffai-kernels-core = { workspace = true, optional = true }
+ffai-kernels-runtime = { workspace = true, optional = true }
 
 [dev-dependencies]
 ffai-core.workspace = true
-metaltile-core.workspace = true
+ffai-kernels-core.workspace = true
 ffai-models.workspace = true
 ffai-loader.workspace = true
 ffai-runtime.workspace = true
 
 [features]
 # Off by default so macOS / non-Vulkan hosts build the crate as a stub.
-# `--features vulkan` pulls metaltile-runtime's real Vulkan device.
-vulkan = ["dep:metaltile-core", "dep:metaltile-runtime", "metaltile-runtime/vulkan"]
+# `--features vulkan` pulls ffai-kernels-runtime's real Vulkan device.
+vulkan = ["dep:ffai-kernels-core", "dep:ffai-kernels-runtime", "ffai-kernels-runtime/vulkan"]
 
 [[test]]
 name = "vulkan_smoke"

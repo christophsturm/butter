@@ -25,7 +25,7 @@
 //! Fixed for NemotronH: dh=64, ds=128, H=64, G=8 (hpg=8). L ∈ {128,256}.
 
 use ffai_core::{Binding, DType, Device, Error, Grid, Result, Tensor};
-use metaltile_core::ir::KernelMode;
+use ffai_kernels_core::ir::KernelMode;
 
 use crate::cached_ir;
 
@@ -138,7 +138,7 @@ pub fn ssm_prefill_scan_ssd_portable(
                   o_stride: usize|
      -> Result<()> {
         let kern = cached_ir("ffai_gemm_batched", DType::F32, || {
-            let mut k = metaltile_std::kernels::gemm::dense::mt_gemm_batched::kernel_ir_for(DType::F32);
+            let mut k = ffai_kernels_std::kernels::gemm::dense::mt_gemm_batched::kernel_ir_for(DType::F32);
             k.mode = KernelMode::Reduction;
             k
         });
@@ -315,7 +315,7 @@ pub fn ssm_prefill_scan_ssd_portable(
 /// Resolve one of the `ssd_*` portable elementwise kernels by name. They are
 /// f32-fixed (`kernel_ir_for()` with no dtype arg), Grid3D-dispatched.
 fn build_ssd_ir(name: &str) -> ffai_core::Kernel {
-    use metaltile_std::kernels::ssm;
+    use ffai_kernels_std::kernels::ssm;
     match name {
         "ssd_lcs" => ssm::scan::mt_ssd_lcs::kernel_ir_for(),
         "ssd_gather_bc" => ssm::scan::mt_ssd_gather_bc::kernel_ir_for(),
