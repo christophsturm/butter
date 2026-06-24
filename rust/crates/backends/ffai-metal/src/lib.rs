@@ -3,7 +3,7 @@
 
 //! # ffai-metal
 //!
-//! Metal backend for the FFAI engine. Wraps `metaltile_runtime::Context`
+//! Metal backend for the FFAI engine. Wraps `ffai_kernels_runtime::Context`
 //! (the public Metal face — MSL JIT, PSO cache, dispatch) behind the shared
 //! [`ffai_core::Device`] trait, so the **same Rust models run on Apple GPUs
 //! (and iOS)** as on CUDA. This is the half that makes "models shared across
@@ -16,7 +16,7 @@
 //! (preserves in-place reads + readback) and invalidate the stale resident copy.
 
 use ffai_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
-use metaltile_runtime::{Context, DispatchSpec, MetalTileError, ResidentBuffer};
+use ffai_kernels_runtime::{Context, DispatchSpec, MetalTileError, ResidentBuffer};
 use parking_lot::{Mutex, RwLock};
 use std::any::Any;
 use std::collections::BTreeMap;

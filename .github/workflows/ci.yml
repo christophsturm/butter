@@ -45,19 +45,19 @@ jobs:
         with:
           path: FFAI
 
-      - name: Checkout sibling metaltile
+      - name: Checkout sibling ffai-kernels
         # Pinned to `dev` for now because:
-        #   - thewafflehaus/metaltile main is behind upstream's CLI rework.
-        #   - upstream/metaltile main is a `gm` placeholder commit.
+        #   - thewafflehaus/ffai-kernels main is behind upstream's CLI rework.
+        #   - upstream/ffai-kernels main is a `gm` placeholder commit.
         #   - All the kernels FFAI's Ops.swift expects live on
-        #     thewafflehaus/metaltile dev (post the ek/std-kernels merge).
+        #     thewafflehaus/ffai-kernels dev (post the ek/std-kernels merge).
         # Move back to `main` once we sync our org's main from upstream's
-        # post-CLI-rework main, or cut a metaltile release tag and pin to it.
+        # post-CLI-rework main, or cut a ffai-kernels release tag and pin to it.
         uses: actions/checkout@v6
         with:
-          repository: thewafflehaus/metaltile
+          repository: thewafflehaus/ffai-kernels
           ref: dev
-          path: metaltile
+          path: ffai-kernels
 
       - name: Show toolchain
         run: |
@@ -70,14 +70,14 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo registry + metaltile build
+      - name: Cache cargo registry + ffai-kernels build
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ${{ github.workspace }}/metaltile/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('metaltile/Cargo.lock', 'metaltile/Cargo.toml') }}
+            ${{ github.workspace }}/ffai-kernels/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('ffai-kernels/Cargo.lock', 'ffai-kernels/Cargo.toml') }}
           restore-keys: |
             cargo-${{ runner.os }}-
 
@@ -95,13 +95,13 @@ jobs:
         run: swift package resolve
 
       - name: Generate kernel artifacts (tile build --emit all)
-        # Compiles metaltile and produces kernels.metallib + manifest.json
+        # Compiles ffai-kernels and produces kernels.metallib + manifest.json
         # + Generated/MetalTileKernels.swift into FFAI/Sources/MetalTileSwift/.
         # Once the `tile` binary ships via Homebrew this no longer needs
-        # the sibling metaltile checkout. Run from metaltile/ so its
+        # the sibling ffai-kernels checkout. Run from ffai-kernels/ so its
         # rust-toolchain.toml (nightly, 2024 edition) is picked up.
-        working-directory: metaltile
-        # `tile build` spawns the `__tile_runner` subprocess (a metaltile-std
+        working-directory: ffai-kernels
+        # `tile build` spawns the `__tile_runner` subprocess (a ffai-kernels-std
         # bin) for kernel discovery, resolved by bare name via PATH. Build both
         # binaries and put target/release on PATH so the spawn resolves —
         # `cargo run --bin tile` alone never builds the sibling runner.

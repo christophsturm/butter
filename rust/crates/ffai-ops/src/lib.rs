@@ -18,8 +18,8 @@
 //! the correct dispatch mode.
 
 use ffai_core::{Binding, DType, Device, Error, Grid, Kernel, Result, Tensor};
-use metaltile_core::ir::{ActKind, BinOpKind, IndexExpr, Op, Param, ParamKind, ValueId};
-use metaltile_core::shape::Shape;
+use ffai_kernels_core::ir::{ActKind, BinOpKind, IndexExpr, Op, Param, ParamKind, ValueId};
+use ffai_kernels_core::shape::Shape;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
@@ -73,7 +73,7 @@ fn cached_ir(name: &str, dtype: DType, build: impl FnOnce() -> Kernel) -> Kernel
 
 /// Look up a registered metaltile kernel by name and instantiate its IR for
 /// `dtype`, **with the correct dispatch mode already set**. We pull it from
-/// the test registry (`metaltile_std::all_tests`) rather than the raw kernel
+/// the test registry (`ffai_kernels_std::all_tests`) rather than the raw kernel
 /// registry: the test/bench setup is where each kernel's `KernelMode`
 /// (Elementwise / Reduction / Grid3D …) is configured, and that mode drives
 /// codegen (e.g. whether `tid` vs `gid` is defined, the `_n_elems` arg). This
@@ -83,7 +83,7 @@ fn lookup(name: &str, dtype: DType) -> Result<Kernel> {
     if let Some(k) = kernel_cache().lock().get(&key) {
         return Ok(k.clone());
     }
-    for entry in metaltile_std::all_tests() {
+    for entry in ffai_kernels_std::all_tests() {
         let t = entry.test();
         if !t.dtypes().contains(&dtype) {
             continue;
@@ -557,7 +557,7 @@ pub fn gemv_q8(
     // are JIT-specialized by the runtime from the scalar bindings below).
     // Coalesced variant: consecutive lanes read consecutive qs words (~2× the
     // strided original's DRAM bandwidth on GB10).
-    let k = cached_ir("ffai_gemv_q8_coalesced", x.dtype, || { let mut k = metaltile_std::kernels::gemm::gemv_quantized::mt_gemv_q8_coalesced::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("ffai_gemv_q8_coalesced", x.dtype, || { let mut k = ffai_kernels_std::kernels::gemm::gemv_quantized::mt_gemv_q8_coalesced::kernel_ir_for(x.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
     let out = Tensor::empty(dev, vec![m_out], x.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     let grid = Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] };
@@ -608,8 +608,8 @@ pub fn gemm_q8_mpp(
     // `ffai_gemm_q8_mpp` in Reduction mode (matches the metaltile coopmat test
     // + bench). Buffer order: x, qs, d_f32, out; constexpr n_rows, out_dim, k_in.
     let k = cached_ir("ffai_gemm_q8_mpp", DType::F16, || {
-        let mut k = metaltile_std::kernels::gemm::gemm_q8_mpp::mt_gemm_q8_mpp::kernel_ir_for(DType::F16);
-        k.mode = metaltile_core::ir::KernelMode::Reduction;
+        let mut k = ffai_kernels_std::kernels::gemm::gemm_q8_mpp::mt_gemm_q8_mpp::kernel_ir_for(DType::F16);
+        k.mode = ffai_kernels_core::ir::KernelMode::Reduction;
         k
     });
     let out = Tensor::empty(dev, vec![n_rows * m_out], DType::F16)?;
@@ -653,8 +653,8 @@ pub fn add_bias_rows(dev: &dyn Device, x: &Tensor, bias: &Tensor, n_rows: usize,
     // `BinOpKind::Mod` → GLSL `uint(i) % uint(n)` (integer modulo), validated
     // bit-exact on Vulkan by `metaltile-std/tests/vulkan_add_bias_rows.rs`.
     // No host round-trip — runs straight on the device-local weight buffer.
-    use metaltile_core::ir::ConstExprDecl;
-    use metaltile_core::ConstExpr;
+    use ffai_kernels_core::ir::ConstExprDecl;
+    use ffai_kernels_core::ConstExpr;
     let total = n_rows * n;
     let out = Tensor::empty(dev, vec![total], DType::F32)?;
     let mut k = Kernel::new("ffai_add_bias_rows");
@@ -727,7 +727,7 @@ pub fn add_bias_rows(dev: &dyn Device, x: &Tensor, bias: &Tensor, n_rows: usize,
 /// Q8 gemv with fused ReLU²: `out[r] = max(0, (Wq·x)[r])²` — a MoE expert's
 /// `up` projection + activation in one dispatch. Dispatches `ffai_gemv_q8_coalesced_relu2`.
 pub fn gemv_q8_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rows_per_group: usize) -> Result<Tensor> {
-    let k = cached_ir("ffai_gemv_q8_coalesced_relu2", x.dtype, || { let mut k = metaltile_std::kernels::gemm::gemv_quantized::mt_gemv_q8_coalesced_relu2::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("ffai_gemv_q8_coalesced_relu2", x.dtype, || { let mut k = ffai_kernels_std::kernels::gemm::gemv_quantized::mt_gemv_q8_coalesced_relu2::kernel_ir_for(x.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
     let out = Tensor::empty(dev, vec![m_out], x.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     let grid = Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] };
@@ -754,7 +754,7 @@ pub fn gemv_q8_accum(
     if k_in % 32 != 0 {
         return Err(Error::Msg(format!("gemv_q8_accum: k_in {k_in} must be a multiple of 32")));
     }
-    let k = cached_ir("ffai_gemv_q8_coalesced_accum", acc.dtype, || { let mut k = metaltile_std::kernels::gemm::gemv_quantized::mt_gemv_q8_coalesced_accum::kernel_ir_for(acc.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("ffai_gemv_q8_coalesced_accum", acc.dtype, || { let mut k = ffai_kernels_std::kernels::gemm::gemv_quantized::mt_gemv_q8_coalesced_accum::kernel_ir_for(acc.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     let grid = Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] };
     dev.dispatch(
@@ -780,7 +780,7 @@ pub fn gemv_q8_accum(
 /// context entirely on-device — no host reorg/reupload per step (the 32K-context
 /// fix). Dispatches `ffai_kv_append` (runtime `pos` ⇒ compiled once, not per step).
 pub fn kv_append(dev: &dyn Device, src: &Tensor, dst: &Tensor, posbuf: &Tensor, hd: usize, cap: usize, n: usize) -> Result<()> {
-    let k = cached_ir("ffai_kv_append", src.dtype, || { let mut k = metaltile_std::kernels::kv_cache::cache::mt_kv_append::kernel_ir_for(src.dtype); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("ffai_kv_append", src.dtype, || { let mut k = ffai_kernels_std::kernels::kv_cache::cache::mt_kv_append::kernel_ir_for(src.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     let grid = Grid { grid: [(n as u32).div_ceil(64), 1, 1], block: [64, 1, 1] };
     dev.dispatch(&k, &[Binding::Buffer(src.buffer.clone()), Binding::Buffer(dst.buffer.clone()), Binding::Buffer(posbuf.buffer.clone()), u(hd as u32), u(cap as u32)], grid)?;
@@ -789,7 +789,7 @@ pub fn kv_append(dev: &dyn Device, src: &Tensor, dst: &Tensor, posbuf: &Tensor, 
 
 /// Device slice `out[i] = src[off + i]` for `len` elements (no host round-trip).
 pub fn slice(dev: &dyn Device, src: &Tensor, off: usize, len: usize) -> Result<Tensor> {
-    let k = cached_ir("ffai_slice", src.dtype, || { let mut k = metaltile_std::kernels::ops::copy::mt_slice::kernel_ir_for(src.dtype); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("ffai_slice", src.dtype, || { let mut k = ffai_kernels_std::kernels::ops::copy::mt_slice::kernel_ir_for(src.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
     // Defensive bounds check. The kernel reads `src[off + i]` for i in [0, len),
     // addressing a sub-slab purely via `off` against the RAW bound buffer (the
     // tensor.offset is ignored by design). A caller binding a buffer that does
@@ -813,7 +813,7 @@ pub fn slice(dev: &dyn Device, src: &Tensor, off: usize, len: usize) -> Result<T
 /// Cast f32 → f16 (KV-cache compaction: store attention K/V at half precision
 /// to halve the 32K-context sdpa read). Returns a fresh F16 tensor.
 pub fn cast_f32_f16(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
-    let k = cached_ir("ffai_cast_f32_f16", DType::F16, || { let mut k = metaltile_std::kernels::ops::unary::mt_cast_f32_f16::kernel_ir(); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("ffai_cast_f32_f16", DType::F16, || { let mut k = ffai_kernels_std::kernels::ops::unary::mt_cast_f32_f16::kernel_ir(); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
     let n = src.elem_count();
     let out = Tensor::empty(dev, src.shape.clone(), DType::F16)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -824,7 +824,7 @@ pub fn cast_f32_f16(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
 /// Cast f16 → f32 (reverse: widen the sdpa f16 output back to f32 for the
 /// downstream o_proj Q4 GEMV, which consumes f32 activations). Fresh F32 tensor.
 pub fn cast_f16_f32(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
-    let k = cached_ir("ffai_cast_f16_f32", DType::F32, || { let mut k = metaltile_std::kernels::ops::unary::mt_cast_f16_f32::kernel_ir(); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("ffai_cast_f16_f32", DType::F32, || { let mut k = ffai_kernels_std::kernels::ops::unary::mt_cast_f16_f32::kernel_ir(); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
     let n = src.elem_count();
     let out = Tensor::empty(dev, src.shape.clone(), DType::F32)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -836,7 +836,7 @@ pub fn cast_f16_f32(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
 /// (NEMOTRON_BF16_STREAM) doesn't overflow on NemotronH massive-activation
 /// channels the way f16 (max 65504) does.
 pub fn cast_f32_bf16(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
-    let k = cached_ir("ffai_cast_f32_bf16", DType::BF16, || { let mut k = metaltile_std::kernels::ops::unary::mt_cast_f32_bf16::kernel_ir(); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("ffai_cast_f32_bf16", DType::BF16, || { let mut k = ffai_kernels_std::kernels::ops::unary::mt_cast_f32_bf16::kernel_ir(); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
     let n = src.elem_count();
     let out = Tensor::empty(dev, src.shape.clone(), DType::BF16)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -846,7 +846,7 @@ pub fn cast_f32_bf16(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
 
 /// Cast bf16 → f32 (widen the residual back for ops that need f32 input).
 pub fn cast_bf16_f32(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
-    let k = cached_ir("ffai_cast_bf16_f32", DType::F32, || { let mut k = metaltile_std::kernels::ops::unary::mt_cast_to_f32::kernel_ir_for(DType::BF16); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("ffai_cast_bf16_f32", DType::F32, || { let mut k = ffai_kernels_std::kernels::ops::unary::mt_cast_to_f32::kernel_ir_for(DType::BF16); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
     let n = src.elem_count();
     let out = Tensor::empty(dev, src.shape.clone(), DType::F32)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -856,7 +856,7 @@ pub fn cast_bf16_f32(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
 
 /// Device Mamba dt: `softplus(dt_raw + dt_bias)` — no host round-trip.
 pub fn softplus_add(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let k = cached_ir("ffai_softplus_add", DType::F32, || { let mut k = metaltile_std::kernels::ssm::scan::mt_softplus_add::kernel_ir(); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("ffai_softplus_add", DType::F32, || { let mut k = ffai_kernels_std::kernels::ssm::scan::mt_softplus_add::kernel_ir(); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
     let n = a.elem_count();
     let out = Tensor::empty(dev, a.shape.clone(), DType::F32)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -867,7 +867,7 @@ pub fn softplus_add(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> 
 /// NemotronH/Zamba2 gated grouped RMSNorm ON-DEVICE: out = (y·silu(z)) normalized
 /// per `gs`-group, ×w. Removes the per-Mamba-layer dl→host-norm→up sync. `y` is f32.
 pub fn gated_group_rmsnorm(dev: &dyn Device, y: &Tensor, z: &Tensor, w: &Tensor, eps: f32, di: usize, gs: usize) -> Result<Tensor> {
-    let k = cached_ir("ffai_gated_group_rmsnorm", z.dtype, || { let mut k = metaltile_std::kernels::ssm::scan::mt_gated_group_rmsnorm::kernel_ir_for(z.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("ffai_gated_group_rmsnorm", z.dtype, || { let mut k = ffai_kernels_std::kernels::ssm::scan::mt_gated_group_rmsnorm::kernel_ir_for(z.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
     let out = Tensor::empty(dev, vec![di], z.dtype)?;
     let eps_buf = Tensor::new(scalar_buf(dev, eps.to_bits())?, vec![1], DType::F32);
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -880,7 +880,7 @@ pub fn gated_group_rmsnorm(dev: &dyn Device, y: &Tensor, z: &Tensor, w: &Tensor,
 pub fn conv_roll(dev: &dyn Device, old: &Tensor, xbc: &Tensor, conv_dim: usize, kc: usize) -> Result<Tensor> {
     let n = (kc - 1) * conv_dim;
     let keep = (kc - 2) * conv_dim;
-    let k = cached_ir("ffai_conv_roll", old.dtype, || { let mut k = metaltile_std::kernels::convolution::conv1d_causal::mt_conv_roll::kernel_ir_for(old.dtype); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("ffai_conv_roll", old.dtype, || { let mut k = ffai_kernels_std::kernels::convolution::conv1d_causal::mt_conv_roll::kernel_ir_for(old.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
     let out = Tensor::empty(dev, vec![n], old.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     dev.dispatch(&k, &[Binding::Buffer(old.buffer.clone()), Binding::Buffer(xbc.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(conv_dim as u32), u(keep as u32), u(n as u32)], Grid { grid: [(n as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
@@ -1012,7 +1012,7 @@ pub fn softplus_add_rows(
 /// Batched MoE up+ReLU²: gather `top_k` experts (indices `idx`) from the
 /// contiguous `[n_exp*inter, hid]` Q4 weight into one `[top_k*inter]` GEMV.
 pub fn moe_gather_up_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, idx: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<Tensor> {
-    let k = cached_ir("ffai_moe_gather_q4_relu2", x.dtype, || { let mut k = metaltile_std::kernels::moe::moe_gather_q4::mt_moe_gather_q4_relu2::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("ffai_moe_gather_q4_relu2", x.dtype, || { let mut k = ffai_kernels_std::kernels::moe::moe_gather_q4::mt_moe_gather_q4_relu2::kernel_ir_for(x.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
     let out = Tensor::empty(dev, vec![top_k * inter], x.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     // Default rpt=2: MoE-gather kernels are big + latency-bound; 2 warps/row hides
@@ -1025,7 +1025,7 @@ pub fn moe_gather_up_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &T
 /// contiguous `[n_exp*hid, inter]` Q4 weight; `x` is the `[top_k*inter]` up output.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gather_down_accum(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, idx: &Tensor, wts: &Tensor, acc: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<()> {
-    let k = cached_ir("ffai_moe_gather_q4_down_accum", x.dtype, || { let mut k = metaltile_std::kernels::moe::moe_gather_q4::mt_moe_gather_q4_down_accum::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("ffai_moe_gather_q4_down_accum", x.dtype, || { let mut k = ffai_kernels_std::kernels::moe::moe_gather_q4::mt_moe_gather_q4_down_accum::kernel_ir_for(x.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(wts.buffer.clone()), Binding::Buffer(acc.buffer.clone()), u(inter as u32), u(hid as u32), u(top_k as u32)], Grid { grid: [hid as u32, 1, 1], block: [32, 1, 1] })?;
     Ok(())
@@ -1033,7 +1033,7 @@ pub fn moe_gather_down_accum(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: 
 
 /// Batched MoE down gather → `[top_k*hid]` (one big GEMV, no accumulate).
 pub fn moe_gather_down(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, idx: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<Tensor> {
-    let k = cached_ir("ffai_moe_gather_q4_down", x.dtype, || { let mut k = metaltile_std::kernels::moe::moe_gather_q4::mt_moe_gather_q4_down::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("ffai_moe_gather_q4_down", x.dtype, || { let mut k = ffai_kernels_std::kernels::moe::moe_gather_q4::mt_moe_gather_q4_down::kernel_ir_for(x.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
     let out = Tensor::empty(dev, vec![top_k * hid], x.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     // Default rpt=2: MoE-gather kernels are big + latency-bound; 2 warps/row hides
@@ -1235,18 +1235,18 @@ pub fn moe_fused_ffn(
 /// Returns (idx[top_k] U32, wts[top_k] F32) WITHOUT a host round-trip — replaces the
 /// per-layer dl(gate)+host-topk+up(idx) sync that drains the async pipeline 23×/token.
 pub fn moe_router_device(dev: &dyn Device, gate_logits: &Tensor, bias: &Tensor, n_exp: usize, top_k: usize, scale: f32) -> Result<(Tensor, Tensor)> {
-    use metaltile_core::ir::KernelMode;
+    use ffai_kernels_core::ir::KernelMode;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     let f = |v: f32| Binding::Scalar(v.to_le_bytes().to_vec());
     let unbiased = Tensor::empty(dev, vec![n_exp], DType::F32)?;
     let biased = Tensor::empty(dev, vec![n_exp], DType::F32)?;
-    let ks = cached_ir("ffai_moe_sigmoid_bias", DType::F32, || { let mut k = metaltile_std::kernels::moe::moe_sigmoid_bias::mt_moe_sigmoid_bias::kernel_ir(); k.mode = KernelMode::Grid3D; k });
+    let ks = cached_ir("ffai_moe_sigmoid_bias", DType::F32, || { let mut k = ffai_kernels_std::kernels::moe::moe_sigmoid_bias::mt_moe_sigmoid_bias::kernel_ir(); k.mode = KernelMode::Grid3D; k });
     dev.dispatch(&ks, &[Binding::Buffer(gate_logits.buffer.clone()), Binding::Buffer(bias.buffer.clone()), Binding::Buffer(unbiased.buffer.clone()), Binding::Buffer(biased.buffer.clone()), u(n_exp as u32)], Grid { grid: [(n_exp as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
     let idx = Tensor::empty(dev, vec![top_k], DType::U32)?;
     let wts = Tensor::empty(dev, vec![top_k], DType::F32)?;
-    let kr = cached_ir("mt_dsv4_router_topk", DType::F32, || { let mut k = metaltile_std::kernels::moe::moe_router_topk_biased::mt_moe_router_topk_biased::kernel_ir_for(DType::F32); k.mode = KernelMode::Reduction; k });
+    let kr = cached_ir("mt_dsv4_router_topk", DType::F32, || { let mut k = ffai_kernels_std::kernels::moe::moe_router_topk_biased::mt_moe_router_topk_biased::kernel_ir_for(DType::F32); k.mode = KernelMode::Reduction; k });
     dev.dispatch(&kr, &[Binding::Buffer(biased.buffer.clone()), Binding::Buffer(unbiased.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(wts.buffer.clone()), u(n_exp as u32), u(top_k as u32)], Grid { grid: [1, 1, 1], block: [32, 1, 1] })?;
-    let kv = cached_ir("ffai_vscale", DType::F32, || { let mut k = metaltile_std::kernels::ops::unary::mt_vscale::kernel_ir(); k.mode = KernelMode::Grid3D; k });
+    let kv = cached_ir("ffai_vscale", DType::F32, || { let mut k = ffai_kernels_std::kernels::ops::unary::mt_vscale::kernel_ir(); k.mode = KernelMode::Grid3D; k });
     dev.dispatch(&kv, &[Binding::Buffer(wts.buffer.clone()), f(scale), u(top_k as u32)], Grid { grid: [(top_k as u32).div_ceil(64), 1, 1], block: [64, 1, 1] })?;
     Ok((idx, wts))
 }
@@ -1378,7 +1378,7 @@ pub fn moe_route_sort_device(
 }
 
 pub fn moe_weighted_sum(dev: &dyn Device, downs: &Tensor, wts: &Tensor, acc: &Tensor, hid: usize, top_k: usize) -> Result<()> {
-    let k = cached_ir("ffai_moe_weighted_sum", acc.dtype, || { let mut k = metaltile_std::kernels::moe::moe_gather_q4::mt_moe_weighted_sum::kernel_ir_for(acc.dtype); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("ffai_moe_weighted_sum", acc.dtype, || { let mut k = ffai_kernels_std::kernels::moe::moe_gather_q4::mt_moe_weighted_sum::kernel_ir_for(acc.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     dev.dispatch(&k, &[Binding::Buffer(downs.buffer.clone()), Binding::Buffer(wts.buffer.clone()), Binding::Buffer(acc.buffer.clone()), u(hid as u32), u(top_k as u32)], Grid { grid: [(hid as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
     Ok(())
@@ -1393,15 +1393,15 @@ fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor
     let name = if vec { "ffai_gemv_q4_vec" } else if two_row { "ffai_gemv_q4_coalesced_2row" } else { match kernel { "plain" => "ffai_gemv_q4_coalesced", "relu2" => "ffai_gemv_q4_coalesced_relu2", _ => "ffai_gemv_q4_coalesced_accum" } };
     let k = cached_ir(name, x.dtype, || {
         let mut k = if vec {
-            metaltile_std::kernels::gemm::gemv_quantized::mt_gemv_q4_vec::kernel_ir_for(x.dtype)
+            ffai_kernels_std::kernels::gemm::gemv_quantized::mt_gemv_q4_vec::kernel_ir_for(x.dtype)
         } else if two_row {
-            metaltile_std::kernels::gemm::gemv_quantized::mt_gemv_q4_coalesced_2row::kernel_ir_for(x.dtype)
+            ffai_kernels_std::kernels::gemm::gemv_quantized::mt_gemv_q4_coalesced_2row::kernel_ir_for(x.dtype)
         } else { match kernel {
-            "plain" => metaltile_std::kernels::gemm::gemv_quantized::mt_gemv_q4_coalesced::kernel_ir_for(x.dtype),
-            "relu2" => metaltile_std::kernels::gemm::gemv_quantized::mt_gemv_q4_coalesced_relu2::kernel_ir_for(x.dtype),
-            _ => metaltile_std::kernels::gemm::gemv_quantized::mt_gemv_q4_coalesced_accum::kernel_ir_for(x.dtype),
+            "plain" => ffai_kernels_std::kernels::gemm::gemv_quantized::mt_gemv_q4_coalesced::kernel_ir_for(x.dtype),
+            "relu2" => ffai_kernels_std::kernels::gemm::gemv_quantized::mt_gemv_q4_coalesced_relu2::kernel_ir_for(x.dtype),
+            _ => ffai_kernels_std::kernels::gemm::gemv_quantized::mt_gemv_q4_coalesced_accum::kernel_ir_for(x.dtype),
         }};
-        k.mode = metaltile_core::ir::KernelMode::Reduction;
+        k.mode = ffai_kernels_core::ir::KernelMode::Reduction;
         k
     });
     let out = acc.cloned().unwrap_or(Tensor::empty(dev, vec![m_out], x.dtype)?);
@@ -1728,13 +1728,13 @@ pub fn gemm_q4_mpp(
     out_dim: usize,
     k_in: usize,
 ) -> Result<Tensor> {
-    use metaltile_core::ir::KernelMode;
+    use ffai_kernels_core::ir::KernelMode;
     if k_in % 32 != 0 {
         return Err(Error::Msg(format!("gemm_q4_mpp: k_in {k_in} must be a multiple of 32")));
     }
     let out = Tensor::empty(dev, vec![n_rows, out_dim], x.dtype)?;
     let kern = cached_ir("ffai_gemm_q4_mpp", x.dtype, || {
-        let mut kk = metaltile_std::kernels::gemm::gemm_q4_mpp::mt_gemm_q4_mpp::kernel_ir_for(x.dtype);
+        let mut kk = ffai_kernels_std::kernels::gemm::gemm_q4_mpp::mt_gemm_q4_mpp::kernel_ir_for(x.dtype);
         kk.mode = KernelMode::Reduction;
         kk
     });
@@ -1777,13 +1777,13 @@ pub fn moe_bgemm_q4_bm64(
     n_out: usize,
     k_in: usize,
 ) -> Result<Tensor> {
-    use metaltile_core::ir::KernelMode;
+    use ffai_kernels_core::ir::KernelMode;
     if n_out % 64 != 0 {
         return Err(Error::Msg(format!("moe_bgemm_q4_bm64: n_out {n_out} must be a multiple of 64")));
     }
     let out = Tensor::empty(dev, vec![m_total, n_out], x.dtype)?;
     let kern = cached_ir("ffai_moe_bgemm_q4_bm64", x.dtype, || {
-        let mut kk = metaltile_std::kernels::moe::moe_bgemm_q4_bm64::mt_moe_bgemm_q4_bm64::kernel_ir_for(x.dtype);
+        let mut kk = ffai_kernels_std::kernels::moe::moe_bgemm_q4_bm64::mt_moe_bgemm_q4_bm64::kernel_ir_for(x.dtype);
         kk.mode = KernelMode::Reduction;
         kk
     });
@@ -1839,7 +1839,7 @@ pub fn dequant_q4_off(
     out_dtype: DType,
     blk_off: usize,
 ) -> Result<Tensor> {
-    use metaltile_core::ir::KernelMode;
+    use ffai_kernels_core::ir::KernelMode;
     let n = m * k;
     // Defensive bounds check. The kernel addresses sub-slabs purely via blk_off
     // against the RAW bound buffers, reading up to qs[(blk_off + m*bpr - 1)*4 + 3]
@@ -1860,7 +1860,7 @@ pub fn dequant_q4_off(
     }
     let out = Tensor::empty(dev, vec![m, k], out_dtype)?;
     let kern = cached_ir("ffai_dequant_q4", out_dtype, || {
-        let mut kk = metaltile_std::kernels::quant::dequant_q4::mt_dequant_q4::kernel_ir_for(out_dtype);
+        let mut kk = ffai_kernels_std::kernels::quant::dequant_q4::mt_dequant_q4::kernel_ir_for(out_dtype);
         kk.mode = KernelMode::Grid3D;
         kk
     });
@@ -1907,13 +1907,13 @@ pub fn sdpa_multi(
     causal: bool,
     scale: f32,
 ) -> Result<Tensor> {
-    use metaltile_core::ir::KernelMode;
+    use ffai_kernels_core::ir::KernelMode;
     if head_dim != 128 {
         return Err(Error::Msg(format!("sdpa_multi: head_dim must be 128, got {head_dim}")));
     }
     let out = Tensor::empty(dev, vec![n_query as usize, n_q_heads as usize, head_dim], q.dtype)?;
     let kern = cached_ir("ffai_sdpa_multi", q.dtype, || {
-        let mut kk = metaltile_std::kernels::sdpa::sdpa_multi::mt_sdpa_multi::kernel_ir_for(q.dtype);
+        let mut kk = ffai_kernels_std::kernels::sdpa::sdpa_multi::mt_sdpa_multi::kernel_ir_for(q.dtype);
         kk.mode = KernelMode::Reduction;
         kk
     });
@@ -4102,7 +4102,7 @@ pub fn ssm_prefill_scan(
     n_heads: u32,
     n_groups: u32,
 ) -> Result<(Tensor, Tensor)> {
-    use metaltile_core::ir::KernelMode;
+    use ffai_kernels_core::ir::KernelMode;
     if (dh, ds, n_heads, n_groups) != (64, 128, 64, 8) {
         return Err(Error::Msg(format!(
             "ssm_prefill_scan: only Nemotron cell (64,128,64,8) wired, got ({dh},{ds},{n_heads},{n_groups})"
@@ -4118,7 +4118,7 @@ pub fn ssm_prefill_scan(
     // mask buffer: has_mask=0 → kernel ignores contents, but the binding must exist.
     let mask = Tensor::new(dev.alloc_zeroed(t * 4).unwrap(), vec![t], DType::U32);
     let kern = cached_ir("ssm_step_record_d64_128_64_8", x.dtype, || {
-        let mut kk = metaltile_std::kernels::ssm::ssm_replay::mt_ssm_step_record_d64_128_64_8::kernel_ir_for(x.dtype);
+        let mut kk = ffai_kernels_std::kernels::ssm::ssm_replay::mt_ssm_step_record_d64_128_64_8::kernel_ir_for(x.dtype);
         kk.mode = KernelMode::Grid3D;
         kk
     });
@@ -4261,7 +4261,7 @@ pub fn sdpa_decode_2pass(
     scale: f32,
     blocks: u32,
 ) -> Result<Tensor> {
-    use metaltile_core::ir::KernelMode;
+    use ffai_kernels_core::ir::KernelMode;
     let n_q_heads = q.elem_count() / head_dim;
     let n_kv_heads = n_q_heads / gqa_factor as usize;
     let nb = blocks as usize;
@@ -4272,7 +4272,7 @@ pub fn sdpa_decode_2pass(
     let f = |x: f32| Binding::Scalar(x.to_le_bytes().to_vec());
 
     let k1 = cached_ir("sdpa_decode_2pass_pass1", q.dtype, || {
-        let mut k = metaltile_std::kernels::sdpa::sdpa_decode_2pass::mt_sdpa_decode_2pass_pass1::kernel_ir_for(q.dtype);
+        let mut k = ffai_kernels_std::kernels::sdpa::sdpa_decode_2pass::mt_sdpa_decode_2pass_pass1::kernel_ir_for(q.dtype);
         k.mode = KernelMode::Reduction;
         k
     });
@@ -4284,7 +4284,7 @@ pub fn sdpa_decode_2pass(
 
     let out = Tensor::empty(dev, vec![n_q_heads, head_dim], q.dtype)?;
     let k2 = cached_ir("sdpa_decode_2pass_pass2", q.dtype, || {
-        let mut k = metaltile_std::kernels::sdpa::sdpa_decode_2pass::mt_sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
+        let mut k = ffai_kernels_std::kernels::sdpa::sdpa_decode_2pass::mt_sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
         k.mode = KernelMode::Reduction;
         k
     });
@@ -4311,7 +4311,7 @@ pub fn sdpa_decode_2pass_tiled(
     scale: f32,
     blocks: u32,
 ) -> Result<Tensor> {
-    use metaltile_core::ir::KernelMode;
+    use ffai_kernels_core::ir::KernelMode;
     let n_q_heads = q.elem_count() / head_dim;
     let n_kv_heads = n_q_heads / gqa_factor as usize;
     let nb = blocks as usize;
@@ -4322,7 +4322,7 @@ pub fn sdpa_decode_2pass_tiled(
     let f = |x: f32| Binding::Scalar(x.to_le_bytes().to_vec());
 
     let k1 = cached_ir("sdpa_decode_2pass_pass1_tiled", q.dtype, || {
-        let mut k = metaltile_std::kernels::sdpa::sdpa_decode_2pass::mt_sdpa_decode_2pass_pass1_tiled::kernel_ir_for(q.dtype);
+        let mut k = ffai_kernels_std::kernels::sdpa::sdpa_decode_2pass::mt_sdpa_decode_2pass_pass1_tiled::kernel_ir_for(q.dtype);
         k.mode = KernelMode::Reduction;
         k
     });
@@ -4334,7 +4334,7 @@ pub fn sdpa_decode_2pass_tiled(
 
     let out = Tensor::empty(dev, vec![n_q_heads, head_dim], q.dtype)?;
     let k2 = cached_ir("sdpa_decode_2pass_pass2", q.dtype, || {
-        let mut k = metaltile_std::kernels::sdpa::sdpa_decode_2pass::mt_sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
+        let mut k = ffai_kernels_std::kernels::sdpa::sdpa_decode_2pass::mt_sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
         k.mode = KernelMode::Reduction;
         k
     });
@@ -4362,7 +4362,7 @@ pub fn sdpa_decode_2pass_bc4(
     scale: f32,
     blocks: u32,
 ) -> Result<Tensor> {
-    use metaltile_core::ir::KernelMode;
+    use ffai_kernels_core::ir::KernelMode;
     let n_q_heads = q.elem_count() / head_dim;
     let n_kv_heads = n_q_heads / gqa_factor as usize;
     let nb = blocks as usize;
@@ -4374,7 +4374,7 @@ pub fn sdpa_decode_2pass_bc4(
 
     // BC=4 pass 1: 4 positions per loop iter for MLP / load-latency hiding.
     let k1 = cached_ir("sdpa_decode_2pass_pass1_bc4", q.dtype, || {
-        let mut k = metaltile_std::kernels::sdpa::sdpa_decode_2pass::mt_sdpa_decode_2pass_pass1_bc4::kernel_ir_for(q.dtype);
+        let mut k = ffai_kernels_std::kernels::sdpa::sdpa_decode_2pass::mt_sdpa_decode_2pass_pass1_bc4::kernel_ir_for(q.dtype);
         k.mode = KernelMode::Reduction;
         k
     });
@@ -4387,7 +4387,7 @@ pub fn sdpa_decode_2pass_bc4(
     // Pass 2 unchanged: same partial buffer layout, same reduction.
     let out = Tensor::empty(dev, vec![n_q_heads, head_dim], q.dtype)?;
     let k2 = cached_ir("sdpa_decode_2pass_pass2", q.dtype, || {
-        let mut k = metaltile_std::kernels::sdpa::sdpa_decode_2pass::mt_sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
+        let mut k = ffai_kernels_std::kernels::sdpa::sdpa_decode_2pass::mt_sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
         k.mode = KernelMode::Reduction;
         k
     });
@@ -4436,7 +4436,7 @@ pub fn relu2(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
     k.body.push_op(Op::Activation { kind: ActKind::Relu, value: ValueId::new(1) }, ValueId::new(2));
     k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: ValueId::new(2), rhs: ValueId::new(2) }, ValueId::new(3));
     k.body.push_op_no_result(Op::Store { dst: "c".into(), indices: vec![IndexExpr::Value(ValueId::new(0))], value: ValueId::new(3), mask: None });
-    k.mode = metaltile_core::ir::KernelMode::Elementwise;
+    k.mode = ffai_kernels_core::ir::KernelMode::Elementwise;
     let out = Tensor::empty(dev, x.shape.clone(), x.dtype)?;
     let n = out.elem_count() as u32;
     let grid = Grid::d1(n.div_ceil(256), 256);
@@ -4827,7 +4827,7 @@ pub fn fma_inplace(dev: &dyn Device, acc: &Tensor, x: &Tensor, s: &Tensor) -> Re
     k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: ValueId::new(2), rhs: ValueId::new(3) }, ValueId::new(4));
     k.body.push_op(Op::BinOp { op: BinOpKind::Add, lhs: ValueId::new(1), rhs: ValueId::new(4) }, ValueId::new(5));
     k.body.push_op_no_result(Op::Store { dst: "acc".into(), indices: idx(), value: ValueId::new(5), mask: None });
-    k.mode = metaltile_core::ir::KernelMode::Elementwise;
+    k.mode = ffai_kernels_core::ir::KernelMode::Elementwise;
     let n = acc.elem_count() as u32;
     let grid = Grid::d1(n.div_ceil(256), 256);
     dev.dispatch(&k, &[Binding::Buffer(acc.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(s.buffer.clone())], grid)?;
@@ -5054,11 +5054,11 @@ pub fn rope_llama_many(
     high_freq_factor: f32,
     original_max_position: f32,
 ) -> Result<Tensor> {
-    use metaltile_core::ir::KernelMode;
+    use ffai_kernels_core::ir::KernelMode;
     let t = qk.elem_count() / (n_heads * head_dim);
     let half = head_dim / 2;
     let k = cached_ir("ffai_rope_llama_many", qk.dtype, || {
-        let mut kk = metaltile_std::kernels::rope::rope_banded::mt_rope_banded::kernel_ir_for(qk.dtype);
+        let mut kk = ffai_kernels_std::kernels::rope::rope_banded::mt_rope_banded::kernel_ir_for(qk.dtype);
         kk.mode = KernelMode::Grid3D;
         kk
     });
@@ -5104,10 +5104,10 @@ pub fn kv_append_many(
     head_dim: usize,
     max_seq: usize,
 ) -> Result<()> {
-    use metaltile_core::ir::KernelMode;
+    use ffai_kernels_core::ir::KernelMode;
     let t = src.elem_count() / (n_kv_heads * head_dim);
     let k = cached_ir("kv_cache_update_many", src.dtype, || {
-        let mut kk = metaltile_std::kernels::kv_cache::update_many::mt_kv_cache_update_many::kernel_ir_for(src.dtype);
+        let mut kk = ffai_kernels_std::kernels::kv_cache::update_many::mt_kv_cache_update_many::kernel_ir_for(src.dtype);
         kk.mode = KernelMode::Grid3D;
         kk
     });
@@ -5268,8 +5268,8 @@ pub fn mamba_split_proj(
     m_nh: usize,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let kernel = cached_ir("mamba_split_proj", DType::F32, || {
-        use metaltile_core::ir::KernelMode;
-        let mut k = metaltile_std::kernels::ssm::scan::mt_mamba_split_proj::kernel_ir_for();
+        use ffai_kernels_core::ir::KernelMode;
+        let mut k = ffai_kernels_std::kernels::ssm::scan::mt_mamba_split_proj::kernel_ir_for();
         k.mode = KernelMode::Grid3D;
         k
     });
@@ -5316,8 +5316,8 @@ pub fn mamba_split_conv(
     ng_ds: usize,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let kernel = cached_ir("mamba_split_conv", DType::F32, || {
-        use metaltile_core::ir::KernelMode;
-        let mut k = metaltile_std::kernels::ssm::scan::mt_mamba_split_conv::kernel_ir_for();
+        use ffai_kernels_core::ir::KernelMode;
+        let mut k = ffai_kernels_std::kernels::ssm::scan::mt_mamba_split_conv::kernel_ir_for();
         k.mode = KernelMode::Grid3D;
         k
     });
@@ -5360,8 +5360,8 @@ pub fn gated_group_rmsnorm_batched(
 ) -> Result<Tensor> {
     let ng = di / gs;
     let kernel = cached_ir("gated_group_rmsnorm_batched", DType::F32, || {
-        use metaltile_core::ir::KernelMode;
-        let mut k = metaltile_std::kernels::ssm::scan::mt_gated_group_rmsnorm_batched::kernel_ir_for();
+        use ffai_kernels_core::ir::KernelMode;
+        let mut k = ffai_kernels_std::kernels::ssm::scan::mt_gated_group_rmsnorm_batched::kernel_ir_for();
         k.mode = KernelMode::Reduction;
         k
     });
@@ -8091,8 +8091,8 @@ pub fn add_rms_norm(
     // Reduction mode: one threadgroup per row, `tid` = lane within the row
     // (the same TG=n/4 contract as mt_rms_norm).
     let k = cached_ir("mt_add_rms_norm", a.dtype, || {
-        let mut k = metaltile_std::kernels::ops::unary::mt_add_rms_norm::kernel_ir_for(a.dtype);
-        k.mode = metaltile_core::ir::KernelMode::Reduction;
+        let mut k = ffai_kernels_std::kernels::ops::unary::mt_add_rms_norm::kernel_ir_for(a.dtype);
+        k.mode = ffai_kernels_core::ir::KernelMode::Reduction;
         k
     });
     let grid = Grid { grid: [rows as u32, 1, 1], block: [(n / 4) as u32, 1, 1] };

@@ -8,7 +8,7 @@ Package.resolved
 
 # Generated kernel artifacts (regenerated on every build by SPM plugin).
 # Ignore everything in Generated/ except .gitkeep so the directory
-# survives a fresh clone before metaltile-emit runs.
+# survives a fresh clone before ffai-kernels-emit runs.
 Sources/MetalTileSwift/Resources/kernels.metallib
 Sources/MetalTileSwift/Resources/manifest.json
 Sources/MetalTileSwift/Resources/kernels/

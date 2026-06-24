@@ -35,14 +35,14 @@ ffai-modeltests = { path = "crates/ffai-modeltests" }
 ffai-metal = { path = "crates/backends/ffai-metal" }
 ffai-cuda = { path = "crates/backends/ffai-cuda" }
 ffai-vulkan = { path = "crates/backends/ffai-vulkan" }
-# ── shared kernel toolchain (external: the metaltile cuda/metal repo) ──
+# ── shared kernel toolchain (external: the ffai-kernels cuda/metal repo) ──
 # Canonical pointer is the org `dev` branch, so a fresh clone is
-# self-contained. For local co-development against a sibling metaltile
+# self-contained. For local co-development against a sibling ffai-kernels
 # checkout, add a `[patch]` override in your own (uncommitted) config.
-metaltile-core = { git = "https://github.com/thewafflehaus/metaltile", branch = "dev" }
-metaltile-codegen = { git = "https://github.com/thewafflehaus/metaltile", branch = "dev" }
-metaltile-runtime = { git = "https://github.com/thewafflehaus/metaltile", branch = "dev" }
-metaltile-std = { git = "https://github.com/thewafflehaus/metaltile", branch = "dev" }
+ffai-kernels-core = { git = "https://github.com/thewafflehaus/ffai-kernels", branch = "dev" }
+ffai-kernels-codegen = { git = "https://github.com/thewafflehaus/ffai-kernels", branch = "dev" }
+ffai-kernels-runtime = { git = "https://github.com/thewafflehaus/ffai-kernels", branch = "dev" }
+ffai-kernels-std = { git = "https://github.com/thewafflehaus/ffai-kernels", branch = "dev" }
 # ── third-party ──────────────────────────────────────────────────────
 thiserror = "2"
 serde_json = "1"
@@ -53,7 +53,7 @@ rustc-hash = "2"       # FxHash for already-hashed / densely-numeric keys
 
 # Perf build for benchmarks (fat-LTO inlines parking_lot locks, Arc/Rc clones,
 # FNV/Fx hash closures into the hot path). Kept OUT of [profile.release] on
-# purpose: fat-LTO + codegen-units=1 balloons build time with the metaltile
+# purpose: fat-LTO + codegen-units=1 balloons build time with the ffai-kernels
 # patch, and `panic="abort"` would break `cargo test`. (Rust-playbook split.)
 [profile.bench]
 inherits = "release"

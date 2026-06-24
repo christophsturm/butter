@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Real Vulkan backend (compiled under `--features vulkan`). Wraps
-//! `metaltile_runtime::VulkanDevice` — the GlslGenerator → shaderc → SPIR-V →
+//! `ffai_kernels_runtime::VulkanDevice` — the GlslGenerator → shaderc → SPIR-V →
 //! VkPipeline path that runs the kernel corpus bit-accurately on any Vulkan
 //! 1.2+ device (validated on AMD RX 9070 XT / RDNA4) — behind the shared
 //! [`ffai_core::Device`] trait.
@@ -50,8 +50,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use ffai_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
-use metaltile_core::ir::ParamKind;
-use metaltile_runtime::{
+use ffai_kernels_core::ir::ParamKind;
+use ffai_kernels_runtime::{
     BatchDispatch, MetalTileError, VulkanDevice as MtVulkanDevice, VulkanPipeline, VulkanRawBuffer,
 };
 
@@ -105,8 +105,8 @@ fn host_shadow_enabled() -> bool {
 /// Synthesize a Strided param's `_shape` / `_strides` companion buffer
 /// (row-major) from the param's static shape — mirrors metaltile's own
 /// `synth_strided_meta` so the resident binding layout matches the emitter.
-fn synth_strided_meta(shape: &metaltile_core::shape::Shape, strides: bool) -> Vec<u8> {
-    use metaltile_core::shape::Dim;
+fn synth_strided_meta(shape: &ffai_kernels_core::shape::Shape, strides: bool) -> Vec<u8> {
+    use ffai_kernels_core::shape::Dim;
     let dims: Vec<u32> = (0..shape.rank())
         .map(|i| match shape.dim(i) {
             Some(Dim::Known(n)) => *n as u32,

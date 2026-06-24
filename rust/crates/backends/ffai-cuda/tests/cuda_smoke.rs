@@ -12,7 +12,7 @@
 
 use ffai_core::{Binding, DType, Grid, Tensor};
 use ffai_cuda::CudaDevice;
-use metaltile_core::{
+use ffai_kernels_core::{
     ir::{BinOpKind, IndexExpr, Kernel, Op, Param, ParamKind, ValueId},
     shape::Shape,
 };

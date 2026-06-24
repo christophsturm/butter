@@ -53,12 +53,12 @@ jobs:
           key: rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
           restore-keys: rust-${{ runner.os }}-
 
-      - name: Sync metaltile to dev tip
-        # The metaltile crates are a `branch = "dev"` git dependency, which
+      - name: Sync ffai-kernels to dev tip
+        # The ffai-kernels crates are a `branch = "dev"` git dependency, which
         # Cargo.lock pins to a specific rev. Re-resolve just those crates so
         # CI tracks the live dev branch (the rest of the lock stays put), and
-        # picks up kernel fixes the moment they land on metaltile dev.
-        run: cargo update -p metaltile-core -p metaltile-codegen -p metaltile-runtime -p metaltile-std
+        # picks up kernel fixes the moment they land on ffai-kernels dev.
+        run: cargo update -p ffai-kernels-core -p ffai-kernels-codegen -p ffai-kernels-runtime -p ffai-kernels-std
 
       - name: Build workspace (default = metal backend)
         run: cargo build --workspace
