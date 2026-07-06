@@ -7032,6 +7032,60 @@ public enum Ops {
         }
     }
 
+    /// Row-broadcast sigmoid FMA over a `[T, hidden]` layout:
+    /// `out[r, h] = base[r, h] + sigmoid(gate[r]) * value[r, h]`.
+    /// The T-batched form of `sigmoidScalarFMA` — one dispatch replaces
+    /// the per-row command-buffer fan-out at batched prefill.
+    public static func sigmoidRowFMA(
+        gate: Tensor, value: Tensor, base: Tensor,
+        into out: Tensor, t: Int, hidden: Int, on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            gate.dtype == value.dtype && value.dtype == base.dtype && base.dtype == out.dtype,
+            "Ops.sigmoidRowFMA: all tensors must share dtype")
+        precondition(
+            gate.elementCount == t,
+            "Ops.sigmoidRowFMA: gate must be [T] (got \(gate.elementCount), T=\(t))")
+        precondition(
+            value.elementCount == t * hidden && base.elementCount == t * hidden
+                && out.elementCount == t * hidden,
+            "Ops.sigmoidRowFMA: value / base / out must be T*hidden")
+
+        let n = t * hidden
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let hiddenU = UInt32(hidden)
+        switch out.dtype {
+        case .f32:
+            MetalTileKernels.mt_sigmoid_row_fma_f32(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_sigmoid_row_fma_f16(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_sigmoid_row_fma_bf16(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.sigmoidRowFMA: unsupported dtype \(out.dtype)")
+        }
+    }
+
     // ─── Fused SwiGLU ─────────────────────────────────────────────────
     //
     // Wraps `mt_swiglu_{f32,f16,bf16}`. Computes `out[i] = silu(gate[i]) * up[i]`

@@ -1069,36 +1069,20 @@ public final class Qwen35MoEFFN: Module {
         let gateLogitsAll = sharedExpertGate.callMany(
             xRows, t: t,
             on: work, device: device)
-        work.commit()
-
-        // ── Per-row sigmoidScalarFMA fan-out ─────────────────────────────
-        // `Ops.sigmoidScalarFMA` requires a `[1]` scalar gate; row-slice
-        // each token's gate logit + run the FMA. T fmaCmd commits but
-        // each is one small kernel that pipelines on the queue.
+        // ── Batched sigmoid-gated fan-in (single dispatch) ───────────────
         let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
-        for r in 0 ..< t {
-            let gateRow = Tensor(
-                buffer: gateLogitsAll.buffer,
-                offset: gateLogitsAll.offset + r * dtBytes,
-                shape: [1], dtype: dt)
-            let sharedRow = Tensor(
-                buffer: sharedOutAll.buffer,
-                offset: sharedOutAll.offset + r * hidden * dtBytes,
-                shape: [hidden], dtype: dt)
-            let routedRow = Tensor(
-                buffer: routed.buffer,
-                offset: routed.offset + r * hidden * dtBytes,
-                shape: [hidden], dtype: dt)
-            let outRow = Tensor(
-                buffer: outFlat.buffer,
-                offset: outFlat.offset + r * hidden * dtBytes,
-                shape: [hidden], dtype: dt)
-            let fmaCmd = device.makeCommandBuffer()
-            Ops.sigmoidScalarFMA(
-                gate: gateRow, value: sharedRow, base: routedRow,
-                into: outRow, on: fmaCmd)
-            fmaCmd.commit()
-        }
+        let _ = dtBytes
+        // One row-broadcast FMA over all T rows on the SAME `work` cmd
+        // (before its commit). The previous shape was T separate command
+        // buffers each carrying one sigmoidScalarFMA dispatch — ~82k
+        // command buffers per 2k-token prefill across 40 MoE layers,
+        // which dominated prefill wall clock. `routed` lives on the
+        // moe-internal committed cmd; Metal hazard tracking orders the
+        // cross-command read exactly as it did for the per-row loop.
+        Ops.sigmoidRowFMA(
+            gate: gateLogitsAll, value: sharedOutAll, base: routed,
+            into: outFlat, t: t, hidden: hidden, on: work)
+        work.commit()
         return outFlat
     }
 }
