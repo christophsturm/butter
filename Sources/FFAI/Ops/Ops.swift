@@ -597,6 +597,25 @@ public enum Ops {
     /// Cooperative-thread matrix-vector multiply. weight: [out_dim, in_dim],
     /// input: [in_dim], output: [out_dim]. One threadgroup per output row;
     /// threads cooperate on the dot-product reduction.
+    /// Device-side MoE dispatch plan (mt_moe_sort_plan). From the router's
+    /// top-k expert ids [mTotal] produces sortedExperts/sourceTokens/invPerm
+    /// in one dispatch — no readback / wait / host sort.
+    public static func moeSortPlan(
+        topkIds: Tensor, sortedExperts: Tensor, sourceTokens: Tensor, invPerm: Tensor,
+        mTotal: Int, k: Int, on cmd: MTLCommandBuffer
+    ) {
+        let tgWidth = min(mTotal, 256)
+        let grid = MTLSize(width: mTotal, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        MetalTileKernels.mt_moe_sort_plan_f32(
+            topk_ids: topkIds.buffer, topk_idsOffset: topkIds.offset,
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            source_tokens: sourceTokens.buffer, source_tokensOffset: sourceTokens.offset,
+            inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+            m_total: UInt32(mTotal), k: UInt32(k),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
     /// Dequantize an mlx int4 affine-quantized `[outDim, inDim]` weight to a
     /// dense `[outDim, inDim]` tensor in one dispatch (one thread per packed
     /// u32 = 8 nibbles). Used to batch narrow-outDim projections (e.g. a

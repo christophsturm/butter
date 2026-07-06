@@ -704,6 +704,22 @@ public final class MoELayer: Module, DecoderLayer {
         // weights for the host-side sort plan.
         let nExperts = router.nExperts
         let topK = router.topK
+        // Token-order device plan (DEVPLAN2, default on): the GPU router
+        // writes indices+weights; we run the expert GEMMs in token order
+        // (no expert sort), so no readback / waitUntilCompleted / host sort.
+        // source_tokens = i/topK (iota), inv_perm = identity, both constant.
+        let useDevPlan2 =
+            ProcessInfo.processInfo.environment["DEVPLAN2"] != "0"
+            && self.gpuRouterEnabled
+            && router.gatingMode == .softmaxThenTopK
+            && router.normTopKProb
+            && router.expertBias == nil
+            && router.topK == 8
+            && stackedInt4Experts != nil
+        var d2Indices: Tensor? = nil
+        var d2Source: Tensor? = nil
+        var d2InvPerm: Tensor? = nil
+        var d2Weights: Tensor? = nil
         var routings = [MoERouter.Routing](
             repeating: MoERouter.Routing(indices: [], weights: []),
             count: t)
@@ -713,7 +729,25 @@ public final class MoELayer: Module, DecoderLayer {
             && router.normTopKProb
             && router.expertBias == nil
             && router.topK == 8
-        if useGPURouter {
+        if useDevPlan2 {
+            let mTot = t * topK
+            let indicesBuf = Tensor.empty(shape: [t, topK], dtype: .u32, device: device)
+            let weightsBuf = Tensor.empty(shape: [t, topK], dtype: gateLogitsAll.dtype, device: device)
+            Ops.moeRouterTopKMany(
+                logits: gateLogitsAll, indicesOut: indicesBuf, weightsOut: weightsBuf,
+                t: t, nExperts: nExperts, k: topK, normTopkProb: router.normTopKProb, on: cmd)
+            // Device sort: expert-grouped plan on GPU (no readback/wait/host sort).
+            let idsFlat = Tensor(buffer: indicesBuf.buffer, offset: indicesBuf.offset, shape: [mTot], dtype: .u32)
+            let se = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
+            let st = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
+            let ip = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
+            Ops.moeSortPlan(topkIds: idsFlat, sortedExperts: se, sourceTokens: st, invPerm: ip, mTotal: mTot, k: topK, on: cmd)
+            cmd.commit()  // no wait: downstream `work` hazard-tracks these buffers
+            d2Source = st
+            d2InvPerm = ip
+            d2Indices = se
+            d2Weights = Tensor(buffer: weightsBuf.buffer, offset: weightsBuf.offset, shape: [mTot], dtype: gateLogitsAll.dtype)
+        } else if useGPURouter {
             let indicesBuf = Tensor.empty(
                 shape: [t, topK], dtype: .u32, device: device)
             let weightsBuf = Tensor.empty(
@@ -753,8 +787,14 @@ public final class MoELayer: Module, DecoderLayer {
             }
         }
 
-        // ── 4. Build sorted plan over T·topK rows ────────────────────────
+        // ── 4. Build sorted plan over T·topK rows (host) — skipped when
+        //      the token-order device plan is active. ────────────────────
         let mTotal = t * topK
+        var sortedExpertsHost = [UInt32]()
+        var sourceTokensHost = [UInt32]()
+        var invPermHost = [UInt32]()
+        var weightsTokenOrderHost = [Float]()
+        if d2Indices == nil {
         // Tuple: (sortKey expertId, sourceToken, originalSlot, weight)
         var planTuples: [(Int, Int, Int, Float)] = []
         planTuples.reserveCapacity(mTotal)
@@ -765,9 +805,7 @@ public final class MoELayer: Module, DecoderLayer {
             }
         }
         planTuples.sort { $0.0 < $1.0 }
-        var sortedExpertsHost = [UInt32]()
         sortedExpertsHost.reserveCapacity(mTotal)
-        var sourceTokensHost = [UInt32]()
         sourceTokensHost.reserveCapacity(mTotal)
         var sortedWeightsHost = [Float]()
         sortedWeightsHost.reserveCapacity(mTotal)
@@ -781,19 +819,19 @@ public final class MoELayer: Module, DecoderLayer {
         // = sortedIdx where (token r, slot s) landed in `downOut`.
         // `weightsTokenOrderHost[r·k+s]` = routings[r].weights[s]
         // (unsorted, matches the kernel's per-token lookup).
-        var invPermHost = [UInt32](repeating: 0, count: mTotal)
+        invPermHost = [UInt32](repeating: 0, count: mTotal)
         for (sortedIdx, tuple) in planTuples.enumerated() {
             let r = tuple.1
             let slot = tuple.2
             invPermHost[r * topK + slot] = UInt32(sortedIdx)
         }
-        var weightsTokenOrderHost = [Float]()
         weightsTokenOrderHost.reserveCapacity(mTotal)
         for r in 0 ..< t {
             for slot in 0 ..< topK {
                 weightsTokenOrderHost.append(routings[r].weights[slot])
             }
         }
+        }  // end if d2Indices == nil (host sort)
 
         // ── 5. Fall back to per-token decode if no stacked-int4 weights ──
         guard let stacked = stackedInt4Experts, stacked.dtype == dt else {
@@ -826,21 +864,24 @@ public final class MoELayer: Module, DecoderLayer {
         let moeIntermediate = stacked.moeIntermediate
         let groupSize = stacked.groupSize
 
-        // ── 7. Build gather index + expert ids on GPU ────────────────────
-        let gatherIdxBuf = device.makeBuffer(length: mTotal * 4)
-        sourceTokensHost.withUnsafeBytes {
-            _ = memcpy(gatherIdxBuf.contents(), $0.baseAddress!, mTotal * 4)
+        // ── 7. Gather index + expert ids ─────────────────────────────────
+        let gatherIdxTensor: Tensor
+        let indices: Tensor
+        if let di = d2Indices, let ds = d2Source {
+            gatherIdxTensor = ds
+            indices = di
+        } else {
+            let gatherIdxBuf = device.makeBuffer(length: mTotal * 4)
+            sourceTokensHost.withUnsafeBytes {
+                _ = memcpy(gatherIdxBuf.contents(), $0.baseAddress!, mTotal * 4)
+            }
+            gatherIdxTensor = Tensor(buffer: gatherIdxBuf, offset: 0, shape: [mTotal], dtype: .u32)
+            let expertIdsBuf = device.makeBuffer(length: mTotal * 4)
+            sortedExpertsHost.withUnsafeBytes {
+                _ = memcpy(expertIdsBuf.contents(), $0.baseAddress!, mTotal * 4)
+            }
+            indices = Tensor(buffer: expertIdsBuf, offset: 0, shape: [mTotal], dtype: .u32)
         }
-        let gatherIdxTensor = Tensor(
-            buffer: gatherIdxBuf, offset: 0,
-            shape: [mTotal], dtype: .u32)
-        let expertIdsBuf = device.makeBuffer(length: mTotal * 4)
-        sortedExpertsHost.withUnsafeBytes {
-            _ = memcpy(expertIdsBuf.contents(), $0.baseAddress!, mTotal * 4)
-        }
-        let indices = Tensor(
-            buffer: expertIdsBuf, offset: 0,
-            shape: [mTotal], dtype: .u32)
 
         // ── 8. Gather activations: [mTotal, hidden] ──────────────────────
         // Source rows are picked from h[sourceToken] — one dispatch.
@@ -916,30 +957,34 @@ public final class MoELayer: Module, DecoderLayer {
         // that's 512 dispatches → 1 per gate/up/down stage.
         let dtBytes = dt.byteSize
         let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
-        // invPerm + weights buffers (built on host in the plan loop).
-        let invPermBuf = device.makeBuffer(length: mTotal * 4)
-        invPermHost.withUnsafeBytes {
-            _ = memcpy(invPermBuf.contents(), $0.baseAddress!, mTotal * 4)
-        }
-        let invPermTensor = Tensor(
-            buffer: invPermBuf, offset: 0,
-            shape: [mTotal], dtype: .u32)
-        let weightsTensor = Tensor.empty(shape: [mTotal], dtype: dt, device: device)
-        // Host → GPU weights in dtype.
-        switch dt {
-        case .f32:
-            weightsTensor.copyIn(from: weightsTokenOrderHost)
-        case .bf16:
-            weightsTensor.copyIn(
-                from: weightsTokenOrderHost.map { v -> UInt16 in
-                    let bits = v.bitPattern
-                    let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
-                    return UInt16(rounded >> 16)
-                })
-        case .f16:
-            weightsTensor.copyIn(from: weightsTokenOrderHost.map { Float16($0) })
-        default:
-            fatalError("MoELayer.decodeMany: unsupported dtype \(dt) for unpermute weights")
+        let invPermTensor: Tensor
+        let weightsTensor: Tensor
+        if let dip = d2InvPerm, let dw = d2Weights, dw.dtype == dt {
+            invPermTensor = dip
+            weightsTensor = dw
+        } else {
+            let invPermBuf = device.makeBuffer(length: mTotal * 4)
+            invPermHost.withUnsafeBytes {
+                _ = memcpy(invPermBuf.contents(), $0.baseAddress!, mTotal * 4)
+            }
+            invPermTensor = Tensor(buffer: invPermBuf, offset: 0, shape: [mTotal], dtype: .u32)
+            let wt = Tensor.empty(shape: [mTotal], dtype: dt, device: device)
+            switch dt {
+            case .f32:
+                wt.copyIn(from: weightsTokenOrderHost)
+            case .bf16:
+                wt.copyIn(
+                    from: weightsTokenOrderHost.map { v -> UInt16 in
+                        let bits = v.bitPattern
+                        let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
+                        return UInt16(rounded >> 16)
+                    })
+            case .f16:
+                wt.copyIn(from: weightsTokenOrderHost.map { Float16($0) })
+            default:
+                fatalError("MoELayer.decodeMany: unsupported dtype \(dt) for unpermute weights")
+            }
+            weightsTensor = wt
         }
         Ops.moeUnpermute(
             expertOutputs: downOut, invPerm: invPermTensor,
