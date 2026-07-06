@@ -237,6 +237,19 @@ public final class QuantizedLinear: Module {
                 input: x, weight: weight, scales: scales, biases: biases,
                 t: t, nOut: outDim, kIn: inDim, groupSize: groupSize,
                 on: cmd, device: device, into: out, bits: bits)
+        } else if bits == 4 || bits == 8 {
+            // Narrow outDim (e.g. 8-bit shared_expert_gate hidden->1) that
+            // misses the outDim%32 fast tile: dequantize the weight to dense
+            // once + a single batched `gemm`, instead of T per-row
+            // `dequantGemv` dispatches. At prefill T=2048 x 40 layers the
+            // per-row loop on the hidden->1 gate was ~1.9s; this is 2
+            // dispatches per call.
+            let wDense = Tensor.empty(shape: [outDim, inDim], dtype: x.dtype, device: device)
+            Ops.affineDequantize(
+                weight: weight, scales: scales, biases: biases,
+                outDim: outDim, inDim: inDim, groupSize: groupSize, bits: bits,
+                on: cmd, into: wDense)
+            out = Ops.gemm(weight: wDense, input: x, nRows: t, on: cmd)
         } else {
             let dtBytes = x.dtype.byteSize
             out = Tensor.empty(shape: [t, outDim], dtype: x.dtype, device: device)

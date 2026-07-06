@@ -597,6 +597,37 @@ public enum Ops {
     /// Cooperative-thread matrix-vector multiply. weight: [out_dim, in_dim],
     /// input: [in_dim], output: [out_dim]. One threadgroup per output row;
     /// threads cooperate on the dot-product reduction.
+    /// Dequantize an mlx int4 affine-quantized `[outDim, inDim]` weight to a
+    /// dense `[outDim, inDim]` tensor in one dispatch (one thread per packed
+    /// u32 = 8 nibbles). Used to batch narrow-outDim projections (e.g. a
+    /// `hidden -> 1` gate) through a single dense `gemm` instead of a
+    /// per-row `dequantGemv` T-loop.
+    public static func affineDequantize(
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        outDim: Int, inDim: Int, groupSize: Int, bits: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor
+    ) {
+        precondition(weight.dtype == .u32, "affineDequantize: weight must be u32 packed")
+        precondition(bits == 4 || bits == 8, "affineDequantize: only bits 4/8 supported")
+        precondition(out.elementCount == outDim * inDim,
+            "affineDequantize: out must be outDim*inDim (\(outDim*inDim)), got \(out.elementCount)")
+        let packFactor = 32 / bits           // int4 -> 8, int8 -> 4 elems / u32
+        let packs = (outDim * inDim) / packFactor
+        let tgWidth = min(packs, 256)
+        let grid = MTLSize(width: packs, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let gs = UInt32(groupSize)
+        switch (bits, out.dtype) {
+        case (4, .f32): MetalTileKernels.mt_affine_dequantize_int4_f32(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, .f16): MetalTileKernels.mt_affine_dequantize_int4_f16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, .bf16): MetalTileKernels.mt_affine_dequantize_int4_bf16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (8, .f32): MetalTileKernels.mt_affine_dequantize_int8_f32(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (8, .f16): MetalTileKernels.mt_affine_dequantize_int8_f16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (8, .bf16): MetalTileKernels.mt_affine_dequantize_int8_bf16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        default: fatalError("affineDequantize: unsupported bits/dtype \(bits)/\(out.dtype)")
+        }
+    }
+
     public static func gemv(
         weight: Tensor, input: Tensor,
         on cmd: MTLCommandBuffer,
