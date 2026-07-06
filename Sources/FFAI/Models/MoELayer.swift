@@ -404,6 +404,7 @@ public final class MoELayer: Module, DecoderLayer {
     let gpuRouterEnabled: Bool
     let forceBGEMMAtT1: Bool
     let noBGEMMBm64: Bool
+    let bm64Env: Bool
 
     /// Lazy dequant of the gate weight + cached output. Skipped when
     /// `gate.inner` is not a 8-bit QuantizedLinear or env
@@ -495,6 +496,7 @@ public final class MoELayer: Module, DecoderLayer {
         self.gpuRouterEnabled = env["FFAI_MOE_GPU_ROUTER"] != "0"
         self.forceBGEMMAtT1 = env["FFAI_MOE_BGEMM_FORCE_T1"] != nil
         self.noBGEMMBm64 = env["FFAI_MOE_BGEMM_NO_BM64"] != nil
+        self.bm64Env = env["FFAI_MOE_BGEMM_BM64"] != nil
     }
 
     public func parameters() -> [(String, Tensor)] {
@@ -867,10 +869,14 @@ public final class MoELayer: Module, DecoderLayer {
         //     2.69× T=32 win.
         //   - mTotal ≤ 8 + `FFAI_MOE_BGEMM_BM8=1` → bm8 (decode T=1
         //     fallback).
-        // bm64_mpp default-on for mTotal ≥ 1024. Crossover sits between
-        // mTotal=512 (bm16 +19%) and mTotal=1024 (bm64 +18%). Opt out
-        // via FFAI_MOE_BGEMM_NO_BM64=1.
-        let useBm64 = mTotal >= 1024 && !self.noBGEMMBm64
+        // bm16 (simdgroup-MMA `moeGatherDequantGemmInt4`) is the default:
+        // it is fastest across every measured prefill mTotal for this
+        // model's narrow experts (moeIntermediate 512), +3-5% end-to-end
+        // over bm64_mpp at mTotal 1024..16384 on an M5 Max, wikitext-2
+        // perplexity unchanged. bm64_mpp (NAX cooperative-tensor) is
+        // retained as opt-in via FFAI_MOE_BGEMM_BM64=1 for wider-expert
+        // models / other hardware where its larger tile may win.
+        let useBm64 = self.bm64Env && !self.noBGEMMBm64 && mTotal >= 1024
         let useBm8 = !useBm64 && topK <= 8 && useBm8Env && mTotal <= 8
         let bgemm:
             (Tensor, Tensor, Tensor, Tensor, Tensor, Int, Int, Int, Int, MTLCommandBuffer, Tensor)
