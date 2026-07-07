@@ -26,14 +26,24 @@ import Metal
 
 /// SDK-portable replacement for `await cmd.completed()` (Xcode 26+
 /// only) and `cmd.waitUntilCompleted()` (now flagged unavailable from
-/// async contexts in Xcode 26.5). Uses the long-standing
-/// `addCompletedHandler` callback bridged through
-/// `withCheckedContinuation`, which works on every Metal SDK from
-/// macOS 10.11 onward.
+/// async contexts in Xcode 26.5).
+///
+/// Every call site in this repo does `cmd.commit(); await
+/// cmd.awaitCompletion()` — i.e. the buffer is already committed (often
+/// already complete) by the time this runs. `addCompletedHandler` is
+/// only legal to call *before* `commit()` (Metal asserts otherwise:
+/// "Completed handler provided after commit call"); it tolerated the
+/// post-commit call historically, but current Metal enforces it, so
+/// that bridge would abort here. Instead, hop to a background queue and
+/// call the always-legal, any-time-after-commit `waitUntilCompleted()`
+/// — the queue hop keeps it out of the `async` context Xcode 26.5 flags.
 extension MTLCommandBuffer {
     public func awaitCompletion() async {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            self.addCompletedHandler { _ in cont.resume() }
+            DispatchQueue.global().async {
+                self.waitUntilCompleted()
+                cont.resume()
+            }
         }
     }
 }
