@@ -1874,11 +1874,27 @@ public final class Qwen35GDNMixer: Module {
             shape: [t * numValueHeads * valueHeadDim],
             dtype: .f32, device: device)
 
+        // Per-head RMSNorm of q/k, computed once per (b, t, hk_idx) —
+        // gatedDeltaPrepChunk's own grid would otherwise redundantly
+        // recompute it `valueHeadDim · (numValueHeads/numKeyHeads)` times.
+        let qNormedAll = Tensor.empty(
+            shape: [t * numKeyHeads * keyHeadDim], dtype: .f32, device: device)
+        let kNormedAll = Tensor.empty(
+            shape: [t * numKeyHeads * keyHeadDim], dtype: .f32, device: device)
+        Ops.gatedDeltaQKNormPrepass(
+            convOut: convOutAllF32,
+            qNormWeight: qNormWeightF32, kNormWeight: kNormWeightF32,
+            qNormed: qNormedAll, kNormed: kNormedAll,
+            tLen: tLenScalar, tCount: t,
+            batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
+            hv: numValueHeads, hk: numKeyHeads,
+            on: cmd)
+
         Ops.gatedDeltaPrepChunk(
             convOut: convOutAllF32,
             aLog: aLogTF32, dtBias: dtBiasTF32,
             aRaw: aRawF32All, bRaw: bRawF32All,
-            qNormWeight: qNormWeightF32, kNormWeight: kNormWeightF32,
+            qNormed: qNormedAll, kNormed: kNormedAll,
             stateIn: cache.gdn.current, stateOut: cache.gdn.next,
             y: yF32All,
             tLen: tLenScalar,

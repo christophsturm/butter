@@ -6071,6 +6071,88 @@ public enum Ops {
         }
     }
 
+    /// q/k RMSNorm pre-pass for `gatedDeltaPrepChunk`. `gatedDeltaPrepChunk`'s
+    /// dispatch grid is `[Dv, batchSize·hv, 1]` — every one of the `Dv`
+    /// threadgroups sharing a given `(b, hv_idx)` would otherwise
+    /// redundantly recompute the identical q/k RMSNorm (q/k don't depend
+    /// on `dv_idx`), and GQA groups recompute it again across their
+    /// shared `hk_idx`. This kernel computes it once per `(b, t, hk_idx)`
+    /// — grid `[tLen, batchSize·hk, 1]`, fully parallel across tokens —
+    /// and writes dense `qNormed`/`kNormed` that `gatedDeltaPrepChunk`
+    /// loads directly instead of recomputing.
+    ///
+    /// Shape contract (all share dtype except `tLen`):
+    ///   - `convOut`     : `[batchSize, tLen, 2·hk·dk + hv·dv]`
+    ///   - `qNormWeight` / `kNormWeight` : `[hk·dk]`
+    ///   - `qNormed` / `kNormed` : `[batchSize, tLen, hk, dk]` (output)
+    public static func gatedDeltaQKNormPrepass(
+        convOut: Tensor,
+        qNormWeight: Tensor, kNormWeight: Tensor,
+        qNormed: Tensor, kNormed: Tensor,
+        tLen: Tensor, tCount: Int,
+        batchSize: Int, dk: Int, dv: Int, hv: Int, hk: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            convOut.dtype == qNormWeight.dtype && qNormWeight.dtype == kNormWeight.dtype
+                && kNormWeight.dtype == qNormed.dtype && qNormed.dtype == kNormed.dtype,
+            "Ops.gatedDeltaQKNormPrepass: every tensor must share dtype")
+        precondition(
+            dk % 32 == 0,
+            "Ops.gatedDeltaQKNormPrepass: dk (\(dk)) must be a multiple of 32")
+        precondition(
+            hv % hk == 0,
+            "Ops.gatedDeltaQKNormPrepass: hv (\(hv)) must be a multiple of hk (\(hk)) (GQA)")
+        precondition(
+            tLen.dtype == .u32 && tLen.elementCount == 1,
+            "Ops.gatedDeltaQKNormPrepass: tLen must be a [1] u32 scalar buffer")
+        // `tCount` (host Int) drives dispatch grid width; `tLen` (GPU
+        // scalar) drives the kernel body's `bt = b·t_total + t` — same
+        // split as `gatedDeltaPrepChunk`'s runtime-`tLen` convention, just
+        // that here T is also a grid dimension so the host needs it too.
+        let tgWidth = 32
+        let grid = MTLSize(width: tCount * tgWidth, height: batchSize * hk, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let dkU = UInt32(dk)
+        let dvU = UInt32(dv)
+        let hvU = UInt32(hv)
+        let hkU = UInt32(hk)
+        switch convOut.dtype {
+        case .f32:
+            MetalTileKernels.mt_gated_delta_qknorm_prepass_f32(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_gated_delta_qknorm_prepass_f16(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_gated_delta_qknorm_prepass_bf16(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.gatedDeltaQKNormPrepass: unsupported dtype \(convOut.dtype)")
+        }
+    }
+
     /// Chunked-prefill counterpart to `gatedDeltaPrepStep`. Runs the
     /// fused GDN prep + recurrence over a contiguous range of tokens
     /// in one dispatch instead of looping the single-token kernel,
@@ -6084,8 +6166,9 @@ public enum Ops {
     ///   - `aLog`      : `[hv]` per-head log-decay
     ///   - `dtBias`    : `[hv]` per-head delta-t bias
     ///   - `aRaw`/`bRaw` : `[batchSize, tLen, hv]` chunk gates
-    ///   - `qNormWeight` / `kNormWeight` : `[dk]` Q-norm / K-norm
-    ///     applied before the recurrence
+    ///   - `qNormed` / `kNormed` : `[batchSize, tLen, hk, dk]`, from
+    ///     `gatedDeltaQKNormPrepass` — must be dispatched on the same
+    ///     `convOut`/`tLen` chunk beforehand.
     ///   - `stateIn` / `stateOut` : `[batchSize, hv, dv, dk]` fp32
     ///     recurrent state (read-once / write-once across the chunk)
     ///   - `y`         : `[batchSize, tLen, hv·dv]` output activations
@@ -6093,7 +6176,7 @@ public enum Ops {
         convOut: Tensor,
         aLog: Tensor, dtBias: Tensor,
         aRaw: Tensor, bRaw: Tensor,
-        qNormWeight: Tensor, kNormWeight: Tensor,
+        qNormed: Tensor, kNormed: Tensor,
         stateIn: Tensor, stateOut: Tensor, y: Tensor,
         tLen: Tensor,
         batchSize: Int, dk: Int, dv: Int, hv: Int, hk: Int,
@@ -6102,8 +6185,8 @@ public enum Ops {
         precondition(
             convOut.dtype == aLog.dtype && aLog.dtype == dtBias.dtype
                 && dtBias.dtype == aRaw.dtype && aRaw.dtype == bRaw.dtype
-                && bRaw.dtype == qNormWeight.dtype && qNormWeight.dtype == kNormWeight.dtype
-                && kNormWeight.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
+                && bRaw.dtype == qNormed.dtype && qNormed.dtype == kNormed.dtype
+                && kNormed.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
                 && stateOut.dtype == y.dtype,
             "Ops.gatedDeltaPrepChunk: every tensor must share dtype")
         precondition(
@@ -6138,8 +6221,8 @@ public enum Ops {
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
                 a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
                 b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
-                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
-                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
                 state_in: stateIn.buffer, state_inOffset: stateIn.offset,
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
@@ -6153,8 +6236,8 @@ public enum Ops {
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
                 a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
                 b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
-                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
-                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
                 state_in: stateIn.buffer, state_inOffset: stateIn.offset,
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
@@ -6168,8 +6251,8 @@ public enum Ops {
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
                 a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
                 b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
-                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
-                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
                 state_in: stateIn.buffer, state_inOffset: stateIn.offset,
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
