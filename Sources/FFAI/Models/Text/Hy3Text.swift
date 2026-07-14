@@ -493,13 +493,59 @@ final class Hy3MoELayer: Hy3LayerProtocol {
         let routing = router.route(logits: logits)
 
         let workCmd = device.makeCommandBuffer()
+        let nSlots = routing.indices.count
+        let moeInter = switchGate.weight.shape[1]
+
+        // Slice all expert rows once (host views into stacked slabs).
+        var gW = [Tensor](); gW.reserveCapacity(nSlots)
+        var gS = [Tensor](); gS.reserveCapacity(nSlots)
+        var gB = [Tensor](); gB.reserveCapacity(nSlots)
+        var uW = [Tensor](); uW.reserveCapacity(nSlots)
+        var uS = [Tensor](); uS.reserveCapacity(nSlots)
+        var uB = [Tensor](); uB.reserveCapacity(nSlots)
+        var dW = [Tensor](); dW.reserveCapacity(nSlots)
+        var dS = [Tensor](); dS.reserveCapacity(nSlots)
+        var dB = [Tensor](); dB.reserveCapacity(nSlots)
+        var gateOut = [Tensor](); gateOut.reserveCapacity(nSlots)
+        var upOut = [Tensor](); upOut.reserveCapacity(nSlots)
+        var downOut = [Tensor](); downOut.reserveCapacity(nSlots)
+        var xs = [Tensor](); xs.reserveCapacity(nSlots)
+        for ei in routing.indices {
+            gW.append(sliceExpert(switchGate.weight, ei))
+            gS.append(sliceExpert(switchGate.scales, ei))
+            gB.append(sliceExpert(switchGate.biases, ei))
+            uW.append(sliceExpert(switchUp.weight, ei))
+            uS.append(sliceExpert(switchUp.scales, ei))
+            uB.append(sliceExpert(switchUp.biases, ei))
+            dW.append(sliceExpert(switchDown.weight, ei))
+            dS.append(sliceExpert(switchDown.scales, ei))
+            dB.append(sliceExpert(switchDown.biases, ei))
+            gateOut.append(Tensor.empty(shape: [moeInter], dtype: dtype, device: device))
+            upOut.append(Tensor.empty(shape: [moeInter], dtype: dtype, device: device))
+            downOut.append(Tensor.empty(shape: [hidden], dtype: dtype, device: device))
+            xs.append(ffnIn)
+        }
+
+        // One encoder for all gate+up gemvs (2·nSlots dispatches), one for downs.
+        Ops.dequantGemvMany(
+            bits: gateBits, weights: gW + uW, scales: gS + uS, biases: gB + uB,
+            inputs: xs + xs, outputs: gateOut + upOut,
+            groupSize: groupSize, on: workCmd)
+        var inners = [Tensor](); inners.reserveCapacity(nSlots)
+        for i in 0 ..< nSlots {
+            inners.append(Ops.swiglu(gate: gateOut[i], up: upOut[i], on: workCmd))
+        }
+        Ops.dequantGemvMany(
+            bits: downBits, weights: dW, scales: dS, biases: dB,
+            inputs: inners, outputs: downOut,
+            groupSize: groupSize, on: workCmd)
+
         var accumulator: Tensor?
-        for (slot, ei) in routing.indices.enumerated() {
-            let expertOut = expertSwiGLU(ffnIn, expert: ei, on: workCmd, device: device)
+        for slot in 0 ..< nSlots {
             let w = Tensor.filled(
                 routing.weights[slot], shape: [hidden],
                 dtype: dtype, device: device)
-            let scaled = Ops.mul(expertOut, w, on: workCmd)
+            let scaled = Ops.mul(downOut[slot], w, on: workCmd)
             accumulator =
                 accumulator.map { Ops.add($0, scaled, on: workCmd) } ?? scaled
         }
@@ -521,39 +567,10 @@ final class Hy3MoELayer: Hy3LayerProtocol {
         return result
     }
 
-    /// One expert SwiGLU via sliced stacked mlx-affine weights + dequantGemv.
-    private func expertSwiGLU(
-        _ x: Tensor, expert ei: Int, on cmd: MTLCommandBuffer, device: Device
-    ) -> Tensor {
-        let gW = switchGate.weight.slicedRows(start: ei, count: 1)
-            .reshaped(to: [switchGate.weight.shape[1], switchGate.weight.shape[2]])
-        let gS = switchGate.scales.slicedRows(start: ei, count: 1)
-            .reshaped(to: [switchGate.scales.shape[1], switchGate.scales.shape[2]])
-        let gB = switchGate.biases.slicedRows(start: ei, count: 1)
-            .reshaped(to: [switchGate.biases.shape[1], switchGate.biases.shape[2]])
-        let uW = switchUp.weight.slicedRows(start: ei, count: 1)
-            .reshaped(to: [switchUp.weight.shape[1], switchUp.weight.shape[2]])
-        let uS = switchUp.scales.slicedRows(start: ei, count: 1)
-            .reshaped(to: [switchUp.scales.shape[1], switchUp.scales.shape[2]])
-        let uB = switchUp.biases.slicedRows(start: ei, count: 1)
-            .reshaped(to: [switchUp.biases.shape[1], switchUp.biases.shape[2]])
-        let dW = switchDown.weight.slicedRows(start: ei, count: 1)
-            .reshaped(to: [switchDown.weight.shape[1], switchDown.weight.shape[2]])
-        let dS = switchDown.scales.slicedRows(start: ei, count: 1)
-            .reshaped(to: [switchDown.scales.shape[1], switchDown.scales.shape[2]])
-        let dB = switchDown.biases.slicedRows(start: ei, count: 1)
-            .reshaped(to: [switchDown.biases.shape[1], switchDown.biases.shape[2]])
-
-        let g = Ops.dequantGemv(
-            weight: gW, scales: gS, biases: gB,
-            input: x, bits: gateBits, groupSize: groupSize, on: cmd)
-        let u = Ops.dequantGemv(
-            weight: uW, scales: uS, biases: uB,
-            input: x, bits: upBits, groupSize: groupSize, on: cmd)
-        let inner = Ops.swiglu(gate: g, up: u, on: cmd)
-        return Ops.dequantGemv(
-            weight: dW, scales: dS, biases: dB,
-            input: inner, bits: downBits, groupSize: groupSize, on: cmd)
+    /// 2D view of expert row `ei` in a stacked [E, M, packed] slab.
+    private func sliceExpert(_ t: Tensor, _ ei: Int) -> Tensor {
+        t.slicedRows(start: ei, count: 1)
+            .reshaped(to: [t.shape[1], t.shape[2]])
     }
 }
 

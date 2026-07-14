@@ -2140,24 +2140,56 @@ public enum Ops {
         groupSize: Int = 64,
         on cmd: MTLCommandBuffer
     ) {
+        dequantGemvMany(
+            bits: 4, weights: weights, scales: scales, biases: biases,
+            inputs: inputs, outputs: outputs, groupSize: groupSize, on: cmd)
+    }
+
+    /// Encoder-batched `dequantGemv` for bits ∈ {2, 3, 4, 5, 6, 8}.
+    /// One PSO + one compute encoder; N dispatches rotate the five
+    /// buffers. Used by Hy3 MoE (topK=8 × gate/up/down = up to 24
+    /// gemvs per layer) to drop N-1 encoder begin/end pairs.
+    public static func dequantGemvMany(
+        bits: Int,
+        weights: [Tensor], scales: [Tensor], biases: [Tensor],
+        inputs: [Tensor], outputs: [Tensor],
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer
+    ) {
         let n = weights.count
         precondition(
             scales.count == n && biases.count == n && inputs.count == n && outputs.count == n,
-            "Ops.dequantGemvInt4Many: count mismatch")
+            "Ops.dequantGemvMany: count mismatch")
         guard n > 0 else { return }
         let dtype = inputs[0].dtype
         let psoName: String
-        switch dtype {
-        case .f32: psoName = "mt_dequant_gemv_int4_f32"
-        case .f16: psoName = "mt_dequant_gemv_int4_f16"
-        case .bf16: psoName = "mt_dequant_gemv_int4_bf16"
-        default: fatalError("Ops.dequantGemvInt4Many: unsupported dtype \(dtype)")
+        switch (bits, dtype) {
+        case (2, .f32): psoName = "mt_dequant_gemv_int2_f32"
+        case (2, .f16): psoName = "mt_dequant_gemv_int2_f16"
+        case (2, .bf16): psoName = "mt_dequant_gemv_int2_bf16"
+        case (3, .f32): psoName = "mt_dequant_gemv_int3_f32"
+        case (3, .f16): psoName = "mt_dequant_gemv_int3_f16"
+        case (3, .bf16): psoName = "mt_dequant_gemv_int3_bf16"
+        case (4, .f32): psoName = "mt_dequant_gemv_int4_f32"
+        case (4, .f16): psoName = "mt_dequant_gemv_int4_f16"
+        case (4, .bf16): psoName = "mt_dequant_gemv_int4_bf16"
+        case (5, .f32): psoName = "mt_dequant_gemv_int5_f32"
+        case (5, .f16): psoName = "mt_dequant_gemv_int5_f16"
+        case (5, .bf16): psoName = "mt_dequant_gemv_int5_bf16"
+        case (6, .f32): psoName = "mt_dequant_gemv_int6_f32"
+        case (6, .f16): psoName = "mt_dequant_gemv_int6_f16"
+        case (6, .bf16): psoName = "mt_dequant_gemv_int6_bf16"
+        case (8, .f32): psoName = "mt_dequant_gemv_int8_f32"
+        case (8, .f16): psoName = "mt_dequant_gemv_int8_f16"
+        case (8, .bf16): psoName = "mt_dequant_gemv_int8_bf16"
+        default:
+            fatalError("Ops.dequantGemvMany: unsupported (bits=\(bits), dtype=\(dtype))")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
         let packedPerRow = weights[0].shape[1]
-        let inDim = packedPerRow * 32 / 4  // bits = 4 → 8 weights / u32
+        let inDim = packedPerRow * 32 / bits
         var inDimV = UInt32(inDim)
         var groupSizeV = UInt32(groupSize)
         enc.setBytes(&inDimV, length: 4, index: 5)
@@ -2167,10 +2199,10 @@ public enum Ops {
         for i in 0 ..< n {
             precondition(
                 weights[i].shape[1] == packedPerRow,
-                "Ops.dequantGemvInt4Many: inDim varies at index \(i)")
+                "Ops.dequantGemvMany: inDim varies at index \(i)")
             precondition(
                 inputs[i].dtype == dtype && outputs[i].dtype == dtype,
-                "Ops.dequantGemvInt4Many: dtype varies at index \(i)")
+                "Ops.dequantGemvMany: dtype varies at index \(i)")
             enc.setBuffer(weights[i].buffer, offset: weights[i].offset, index: 0)
             enc.setBuffer(scales[i].buffer, offset: scales[i].offset, index: 1)
             enc.setBuffer(biases[i].buffer, offset: biases[i].offset, index: 2)
