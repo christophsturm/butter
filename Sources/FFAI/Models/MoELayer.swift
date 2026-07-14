@@ -75,6 +75,15 @@ public enum MoEGatingMode: Sendable {
     /// top-K of the raw logits, then softmax over just those K
     /// (Granite4). Always normalised.
     case topKThenSoftmax
+    /// DeepSeek-V3 / NemotronH / **Hy3** (`hy_v3`) style:
+    ///   unbiased = sigmoid(logits)
+    ///   biased   = unbiased + expert_bias          (selection only)
+    ///   top-K by biased; weights = renorm(unbiased[chosen]) if
+    ///   `normTopKProb`, then × `routedScalingFactor`.
+    /// Requires non-nil `expertBias`. Confirmed against vLLM
+    /// `FusedMoE(scoring_func="sigmoid", e_score_correction_bias=…)`
+    /// and llama.cpp `hy-v3.cpp` (`LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID`).
+    case sigmoidBiasedTopK
 }
 
 // ─── MoERouter — pure-CPU top-K + combine-weight computation ─────────
@@ -94,17 +103,24 @@ public struct MoERouter: Sendable {
     /// construction).
     public let normTopKProb: Bool
 
-    /// Optional per-expert additive bias, applied to the post-softmax
-    /// gate values *before* top-K selection. This is LFM2-MoE's
-    /// load-balancing `expert_bias`: the biased value steers selection
-    /// AND becomes the combine weight. `nil` (the default) leaves every
-    /// other MoE family's routing byte-for-byte unchanged. Honoured only
-    /// for `.softmaxThenTopK`.
+    /// Optional per-expert additive bias.
+    /// - `.softmaxThenTopK` (LFM2-MoE): applied to post-softmax probs
+    ///   *before* top-K; biased values also become combine weights.
+    /// - `.sigmoidBiasedTopK` (Hy3 / DSv3 / NemotronH): applied to
+    ///   sigmoid scores for **selection only**; combine weights stay
+    ///   the raw sigmoid values. Required non-nil for that mode.
     public let expertBias: [Float]?
+
+    /// Multiplier applied to final combine weights after renorm.
+    /// Hy3 `router_scaling_factor` (2.826), NemotronH
+    /// `routed_scaling_factor`, DSv3/v4 equivalents. Default 1.0 leaves
+    /// other families unchanged.
+    public let routedScalingFactor: Float
 
     public init(
         nExperts: Int, topK: Int, gatingMode: MoEGatingMode,
-        normTopKProb: Bool = true, expertBias: [Float]? = nil
+        normTopKProb: Bool = true, expertBias: [Float]? = nil,
+        routedScalingFactor: Float = 1.0
     ) {
         precondition(nExperts > 0, "MoERouter: nExperts must be positive")
         precondition(
@@ -116,11 +132,18 @@ public struct MoERouter: Sendable {
                 "MoERouter: expertBias has \(bias.count) entries, "
                     + "nExperts is \(nExperts)")
         }
+        if gatingMode == .sigmoidBiasedTopK {
+            precondition(
+                expertBias != nil,
+                "MoERouter: .sigmoidBiasedTopK requires expertBias "
+                    + "(Hy3 / DSv3 e_score_correction_bias)")
+        }
         self.nExperts = nExperts
         self.topK = topK
         self.gatingMode = gatingMode
         self.normTopKProb = normTopKProb
         self.expertBias = expertBias
+        self.routedScalingFactor = routedScalingFactor
     }
 
     /// Routing result: `indices[i]` is the i-th selected expert,
@@ -169,7 +192,9 @@ public struct MoERouter: Sendable {
             // `softmax(logits) + bias`.
             let idx = Self.topKIndices(logits, k: topK)
             let weights = Self.softmax(idx.map { logits[$0] })
-            return Routing(indices: idx, weights: weights)
+            return Routing(
+                indices: idx,
+                weights: Self.applyScale(weights, scale: routedScalingFactor))
 
         case .softmaxThenTopK:
             // `normTopKProb=false` case — semantically distinct
@@ -192,7 +217,9 @@ public struct MoERouter: Sendable {
                 let sum = weights.reduce(0, +)
                 if sum > 0 { weights = weights.map { $0 / sum } }
             }
-            return Routing(indices: idx, weights: weights)
+            return Routing(
+                indices: idx,
+                weights: Self.applyScale(weights, scale: routedScalingFactor))
 
         case .topKThenSoftmax:
             // Top-K of raw logits, softmax over just the K picked —
@@ -200,8 +227,37 @@ public struct MoERouter: Sendable {
             // doesn't apply.
             let idx = Self.topKIndices(logits, k: topK)
             let weights = Self.softmax(idx.map { logits[$0] })
-            return Routing(indices: idx, weights: weights)
+            return Routing(
+                indices: idx,
+                weights: Self.applyScale(weights, scale: routedScalingFactor))
+
+        case .sigmoidBiasedTopK:
+            // Path B — Hy3 / NemotronH / DeepSeek-V3 noaux.
+            // Selection on (sigmoid + bias); weights from raw sigmoid.
+            let bias = expertBias!  // preconditioned non-nil at init
+            var unbiased = [Float](repeating: 0, count: nExperts)
+            var biased = [Float](repeating: 0, count: nExperts)
+            for i in 0 ..< nExperts {
+                let s = 1.0 / (1.0 + Foundation.exp(-logits[i]))
+                unbiased[i] = s
+                biased[i] = s + bias[i]
+            }
+            let idx = Self.topKIndices(biased, k: topK)
+            var weights = idx.map { unbiased[$0] }
+            if normTopKProb {
+                let sum = weights.reduce(0, +) + 1e-20
+                weights = weights.map { $0 / sum }
+            }
+            return Routing(
+                indices: idx,
+                weights: Self.applyScale(weights, scale: routedScalingFactor))
         }
+    }
+
+    @inline(__always)
+    private static func applyScale(_ w: [Float], scale: Float) -> [Float] {
+        if scale == 1.0 { return w }
+        return w.map { $0 * scale }
     }
 
     // ─── CPU helpers ─────────────────────────────────────────────────

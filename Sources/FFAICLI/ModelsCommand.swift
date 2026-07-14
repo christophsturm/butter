@@ -483,6 +483,15 @@ private let modelCatalog: [CatalogGroup] = [
                     "nvidia/Nemotron-Cascade-14B-Thinking",
                     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
                 ]),
+            // Hy3 — Tencent Hunyuan hy_v3 MoE (sigmoid+bias Path B router).
+            CatalogEntry(
+                family: "Hy3", modelType: "hy_v3",
+                summary: "Tencent Hy3 295B-A21B MoE: sigmoid+bias router, shared expert, QK-norm→RoPE. Prefer mlx 2-bit oQ2 on Apple Silicon.",
+                repos: [
+                    "tencent/Hy3",
+                    "tencent/Hy3-FP8",
+                    "mlx-community/Hy3-oQ2",
+                ]),
             // Qwen 3.5 / 3.6 hybrid (Gated Delta Net ↔ attention, dense / MoE).
             CatalogEntry(
                 family: "Qwen 3.5 / 3.6", modelType: "qwen3_5 / qwen3_5_moe",

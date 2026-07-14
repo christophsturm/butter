@@ -108,6 +108,32 @@ struct MoERouterTests {
         #expect(Set(r.indices) == [0, 1, 2])
         #expect(abs(r.weights.reduce(0, +) - 1) < 1e-5)
     }
+
+    /// Hy3 / DSv3 / NemotronH Path B: select on sigmoid+bias, weight on
+    /// raw sigmoid, renorm, then × routedScalingFactor.
+    @Test("sigmoidBiasedTopK (Hy3 Path B) selects on bias, weights on sigmoid")
+    func sigmoidBiasedTopKHy3() {
+        // logits → sigmoid ≈ [0.119, 0.269, 0.500, 0.731]
+        let logits: [Float] = [-2, -1, 0, 1]
+        // Bias steers selection toward expert 0 despite low sigmoid.
+        let bias: [Float] = [10, 0, 0, 0]
+        let router = MoERouter(
+            nExperts: 4, topK: 2,
+            gatingMode: .sigmoidBiasedTopK,
+            normTopKProb: true,
+            expertBias: bias,
+            routedScalingFactor: 2.826)
+        let r = router.route(logits: logits)
+        // Selection by biased: expert 0 (0.119+10) then expert 3 (0.731).
+        #expect(r.indices == [0, 3])
+        // Weights from unbiased, renormed, then scaled.
+        let s0: Float = 1 / (1 + Foundation.exp(2))
+        let s3: Float = 1 / (1 + Foundation.exp(-1))
+        let renorm0 = s0 / (s0 + s3)
+        let renorm3 = s3 / (s0 + s3)
+        #expect(abs(r.weights[0] - renorm0 * 2.826) < 1e-4)
+        #expect(abs(r.weights[1] - renorm3 * 2.826) < 1e-4)
+    }
 }
 
 // ─── MoELayer ────────────────────────────────────────────────────────
