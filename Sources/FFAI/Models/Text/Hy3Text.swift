@@ -60,7 +60,14 @@ public enum Hy3Dense: Hy3Variant {
         let topK = tc.int("num_experts_per_tok") ?? 8
         let nShared = tc.int("num_shared_experts") ?? 1
         let firstKDense = tc.int("first_k_dense_replace") ?? 1
-        let maxSeq = tc.int("max_position_embeddings") ?? 262_144
+        // Checkpoint advertises a 262144 window. Full KV at that depth is
+        // ~86 GB for Hy3 (80 layers, 8 KV heads, d=128, f16 K+V) — unusable
+        // next to the 92 GB oQ2 weights on a 128 GB Mac. Default to 8192
+        // (~1.3 GB); override with LoadOptions.maxContextLength for longer.
+        let defaultMaxSeq = 8192
+        let maxSeq =
+            options.maxContextLength
+            ?? min(tc.int("max_position_embeddings") ?? defaultMaxSeq, defaultMaxSeq)
         let eps = Float(tc.float("rms_norm_eps") ?? 1e-5)
         let routeNorm = tc.bool("route_norm") ?? true
         let routerScale = Float(tc.float("router_scaling_factor") ?? 1.0)
@@ -612,13 +619,16 @@ public final class Hy3Model: LanguageModel {
         caches: [any LayerCacheProtocol],
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
-        let tap = InspectTap.fromEnvironment
-        var workCmd = tap.makeWorkCmd(from: cmd, device: device)
-
         let tokenBuf = device.makeBuffer(length: 4)
         var tid = UInt32(tokenId)
         memcpy(tokenBuf.contents(), &tid, 4)
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
+
+        // Private work buffer — Hy3MoELayer commits for router CPU
+        // readback. Never touch the caller's `cmd` until final norm +
+        // lm_head (LanguageModel.forward commits that once).
+        // Mirrors NemotronH / Qwen3x MoE-bearing decode.
+        var workCmd = device.makeCommandBuffer()
         var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
 
         for (i, layer) in layers.enumerated() {
@@ -626,24 +636,20 @@ public final class Hy3Model: LanguageModel {
                 h, position: position,
                 cache: caches[i] as! any KVCacheProtocol,
                 cmd: workCmd, device: device)
-            // MoE layers commit `workCmd` for the router readback —
-            // open a fresh buffer for everything that follows.
+            // MoE commits `workCmd` for the router readback — refresh so
+            // the next layer does not encode onto a committed buffer.
             if layer is Hy3MoELayer {
                 workCmd = device.makeCommandBuffer()
             }
         }
 
-        let normed = finalNorm(h, on: workCmd)
-        let logits = lmHead(normed, on: workCmd)
-        // LanguageModel contract: do not commit the caller's buffer.
-        // If MoE forced a replacement buffer, we own it — commit so
-        // logits become valid before return.
-        if workCmd !== cmd {
-            workCmd.commit()
-            workCmd.waitUntilCompleted()
-        }
-        _ = tap
-        return logits
+        // Flush any trailing non-MoE work so `h` is GPU-resident before
+        // we queue final ops on the caller's pristine `cmd`.
+        workCmd.commit()
+        workCmd.waitUntilCompleted()
+
+        let normed = finalNorm(h, on: cmd)
+        return lmHead(normed, on: cmd)
     }
 }
 
