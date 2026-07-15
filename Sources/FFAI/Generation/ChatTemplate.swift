@@ -28,31 +28,88 @@
 import Foundation
 import Tokenizers
 
+/// One piece of a chat message's content. A text-only turn is a single
+/// `.text`; a multimodal turn interleaves `.text` with media slots
+/// (`.image` / `.video` / `.audio`) that bind positionally, in order, to
+/// the `media` array carried alongside the messages on a vision request.
+/// The slot itself carries no pixels — it marks WHERE the media's
+/// placeholder run belongs in the rendered prompt.
+public enum ContentPart: Sendable, Equatable {
+    case text(String)
+    case image
+    case video
+    case audio
+}
+
 public struct ChatMessage: Sendable, Equatable {
     public enum Role: String, Sendable, Codable, Equatable {
         case system, user, assistant, tool
     }
 
     public var role: Role
-    public var content: String
+    public var content: [ContentPart]
     /// Reasoning trace for an assistant message. Only relevant in
     /// multi-turn conversations where the prior assistant turn included
     /// a thinking segment that the template wants to re-emit.
     public var thinking: String?
 
+    /// Text-only message (the common case). Content becomes a single
+    /// `.text` part, so every text chat template is unaffected.
     public init(role: Role, content: String, thinking: String? = nil) {
+        self.role = role
+        self.content = [.text(content)]
+        self.thinking = thinking
+    }
+
+    /// Multimodal message: interleave `.text` with media slots.
+    public init(role: Role, content: [ContentPart], thinking: String? = nil) {
         self.role = role
         self.content = content
         self.thinking = thinking
     }
 
+    /// Concatenated text of all `.text` parts (media slots omitted).
+    public var textContent: String {
+        content.compactMap {
+            if case .text(let s) = $0 { return s } else { return nil }
+        }.joined()
+    }
+
+    /// True if any part is a media slot.
+    public var hasMedia: Bool {
+        content.contains {
+            if case .text = $0 { return false } else { return true }
+        }
+    }
+
+    /// The media slots in order — binds positionally to the request's
+    /// `media` array.
+    public var mediaSlots: [ContentPart] {
+        content.filter {
+            if case .text = $0 { return false } else { return true }
+        }
+    }
+
     /// Convert to the `[String: any Sendable]` shape swift-transformers
-    /// passes into the Jinja template.
+    /// passes into the Jinja template. Text-only turns emit a plain
+    /// `String` content (byte-identical to prior behavior — text
+    /// templates unaffected); multimodal turns emit an HF-style content
+    /// list (`[{"type":"text","text":…}, {"type":"image"}, …]`) that VL
+    /// chat templates iterate.
     public var asTemplateMessage: [String: any Sendable] {
-        var dict: [String: any Sendable] = [
-            "role": role.rawValue,
-            "content": content,
-        ]
+        var dict: [String: any Sendable] = ["role": role.rawValue]
+        if hasMedia {
+            dict["content"] = content.map { part -> [String: any Sendable] in
+                switch part {
+                case .text(let s): return ["type": "text", "text": s]
+                case .image: return ["type": "image"]
+                case .video: return ["type": "video"]
+                case .audio: return ["type": "audio"]
+                }
+            }
+        } else {
+            dict["content"] = textContent
+        }
         if let t = thinking { dict["thinking"] = t }
         return dict
     }
