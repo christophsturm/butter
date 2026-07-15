@@ -79,6 +79,9 @@ regenerate-kernels: ## run `ffaik build --emit` to regenerate metallib + Swift w
 	    tmp="$$gen.tmp"; \
 	    { printf '// swift-format-ignore-file\n//\n'; cat "$$gen"; } > "$$tmp" && mv "$$tmp" "$$gen"; \
 	  fi
+	@# Compat shim: FFAI still calls MetalTileKernels.* (pre-rebrand name).
+	@printf '// swift-format-ignore-file\n//\npublic typealias MetalTileKernels = FFAIKernels\n' \
+	  > $(KERNEL_OUT)/Generated/MetalTileKernels.swift
 
 # ─── Bench ────────────────────────────────────────────────────────────
 # Quality benches (wikitext2 perplexity / KLD, NIAH retrieval) forced-decode

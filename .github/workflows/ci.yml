@@ -107,6 +107,15 @@ jobs:
           cargo build --release --bin ffaik --bin __ffai_runner
           PATH="$PWD/target/release:$PATH" ffaik build --emit all \
             --out ${{ github.workspace }}/FFAI/Sources/MetalTileSwift
+          # Compat shim: FFAI still dispatches via MetalTileKernels.*
+          OUT="${{ github.workspace }}/FFAI/Sources/MetalTileSwift/Generated"
+          printf '// swift-format-ignore-file\n//\npublic typealias MetalTileKernels = FFAIKernels\n' \
+            > "$OUT/MetalTileKernels.swift"
+          if [ -f "$OUT/FFAIKernels.swift" ] && ! head -1 "$OUT/FFAIKernels.swift" | grep -q swift-format-ignore-file; then
+            tmp="$OUT/FFAIKernels.swift.tmp"
+            { printf '// swift-format-ignore-file\n//\n'; cat "$OUT/FFAIKernels.swift"; } > "$tmp"
+            mv "$tmp" "$OUT/FFAIKernels.swift"
+          fi
 
       - name: Run unit tests (with coverage)
         # FFAITests + MetalTileSwiftTests (kernel round-trip).
