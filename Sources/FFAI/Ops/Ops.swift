@@ -8822,9 +8822,9 @@ public enum Ops {
     /// `outLen = (inLen + 2*pad - k) / stride + 1`.
     ///
     /// Grid3D one-thread-per-output kernel (`KernelMode::Grid3D` in
-    /// `audio_conv1d.rs`); `elementwiseGrid` is the correct dispatch.
+    /// `convolution/consolidated/conv1d.rs`); `elementwiseGrid` is the correct dispatch.
     ///
-    /// ## DISPATCH INVARIANTS (from `ffai/audio_conv1d.rs`)
+    /// ## DISPATCH INVARIANTS (from `convolution/consolidated/conv1d.rs`)
     ///   * `outLen == (inLen + 2*pad - k) / stride + 1`.
     ///   * `stride >= 1`, `k >= 1`.
     public static func audioConv1d(
@@ -8839,7 +8839,7 @@ public enum Ops {
         precondition(
             stride >= 1 && k >= 1,
             "Ops.audioConv1d: stride and k must be >= 1 "
-                + "(ffai/audio_conv1d.rs)")
+                + "(convolution/consolidated/conv1d.rs)")
         precondition(
             input.elementCount == batch * inCh * inLen,
             "Ops.audioConv1d: input must be [batch, inCh, inLen]")
@@ -8853,7 +8853,7 @@ public enum Ops {
         precondition(
             outLen >= 1,
             "Ops.audioConv1d: degenerate outLen=\(outLen) "
-                + "(ffai/audio_conv1d.rs)")
+                + "(convolution/consolidated/conv1d.rs)")
         let result =
             out
             ?? Tensor.empty(

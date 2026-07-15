@@ -1484,7 +1484,7 @@ public final class Gemma4Layer: Module {
 // MARK: - Gemma4Ops — ProportionalRoPE wrapper
 
 /// Gemma 4-specific Ops extensions. `ropeProportional` drives the
-/// shared `ffai_rope_llama` RoPE kernel for Gemma 4's ProportionalRoPE.
+/// shared `ffai_rope_banded` RoPE kernel for Gemma 4's ProportionalRoPE.
 enum Gemma4Ops {
     /// ProportionalRoPE: rotate the first `rotatedDim` dims of each
     /// `headDim`-strided head, pairing `(i, i + headDim/2)` for
@@ -1493,7 +1493,7 @@ enum Gemma4Ops {
     /// untouched, so this MUST run in-place — the buffer already holds
     /// the correct identity values for the unrotated dims.
     ///
-    /// The shared `ffai_rope_llama` kernel computes
+    /// The shared `ffai_rope_banded` kernel computes
     /// `inv_freq = theta^(-i/half_dim)` and rotates `(base+i, base+i+half_dim)`.
     /// Driving it with `head_dim = headDim`, `half_dim = headDim/2`
     /// (true rotate-half offset + freq denominator) and a grid height of

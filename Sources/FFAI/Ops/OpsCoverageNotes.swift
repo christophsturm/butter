@@ -136,11 +136,6 @@ public enum OpsCoverageNotes {
                 "SSM replay specializations for the Mamba2 prefill chain. Composed inside Mamba2LayerCache replay."
         ),
 
-        // ── Probe / bench / test kernels ───────────────────────────
-        UncoveredKernel(
-            familyName: "ffai_sgload_smoke",
-            rationale: "Subgroup-load smoke test kernel — used only by ffai-kernels' own GPU probe."),
-
         // ── Bit-stream affine quant variants (bits 3 / 5 / 6) ───────
         UncoveredKernel(
             familyName: "ffai_affine_{quantize,dequantize}_int{3,5,6}",
@@ -236,9 +231,6 @@ public enum OpsCoverageNotes {
             rationale:
                 "Per-row sum/max/min/prod. Sampling pipeline uses argmax / argmin / softmax instead; raw row-reductions have no production caller yet."
         ),
-        UncoveredKernel(
-            familyName: "ffai_rms_inv_scalar",
-            rationale: "Bench-only helper used by RMSNorm correctness tests on the ffai-kernels side."),
 
         // ── Logits processors (the chain-replay variants) ──────────
         // The non-record logits_* are wrapped in Ops.swift via OpsLogits.swift.
