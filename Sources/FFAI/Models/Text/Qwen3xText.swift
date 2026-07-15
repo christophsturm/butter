@@ -632,7 +632,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
         // Batched gather BGEMM fast path: when the experts are mlx
         // int4-quantized AND the shapes satisfy the bm16 tile contract
         // (N%32 == 0, K%32 == 0), capture the stacked weight tensors so
-        // `MoELayer.decode` can dispatch `mt_moe_gather_qmm_mma_int4_bm16_*`
+        // `MoELayer.decode` can dispatch `ffai_moe_gather_qmm_mma_int4_bm16_*`
         // — one launch per projection instead of `topK` sequential
         // SwiGLU triplets (24 → 3 dispatches at `topK=8`).
         let stackedInt4 = tryLoadStackedInt4(
@@ -670,7 +670,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
     /// Try to load the stacked-int4-experts triplet for the batched
     /// gather BGEMM fast path in `MoELayer.decode`. Returns nil unless
     /// the checkpoint is mlx affine 4-bit AND the gate/up/down shapes
-    /// satisfy the `mt_moe_gather_qmm_mma_int4_bm16_*` tile contract
+    /// satisfy the `ffai_moe_gather_qmm_mma_int4_bm16_*` tile contract
     /// (`hidden % 32 == 0`, `moeIntermediate % 32 == 0`, derived bits
     /// per-tensor == 4). The returned tensors are direct handles into
     /// the safetensors mmap, so no extra allocations.
@@ -1187,7 +1187,7 @@ public final class Qwen35GDNMixer: Module {
     let eps, invKeyScale: Float
     let dtype: DType
 
-    // ─── Fused `mt_gated_delta_prep_step` path constants (fp32) ───────
+    // ─── Fused `ffai_gated_delta_prep_step` path constants (fp32) ───────
     //
     // The fused kernel takes its tensors all in a single dtype. The GDN
     // recurrence state stays fp32 (see `GDNStateCache` header — bf16
@@ -1214,8 +1214,8 @@ public final class Qwen35GDNMixer: Module {
     /// allocation per token.
     let epsBufFused: Tensor
 
-    /// `FFAI_GDN_FUSED_PREP=1` route through `mt_gated_delta_prep_step`
-    /// + `mt_gated_mixer_norm`. Cached at init so per-token env lookups
+    /// `FFAI_GDN_FUSED_PREP=1` route through `ffai_gated_delta_prep_step`
+    /// + `ffai_gated_mixer_norm`. Cached at init so per-token env lookups
     /// disappear and the GDN *layer* (not just the mixer) can branch on
     /// it — when fused, the mixer keeps `cmd` in-flight so the residual
     /// add + FFN chain onto the same command buffer.
@@ -1467,7 +1467,7 @@ public final class Qwen35GDNMixer: Module {
 
         // ── Fused GDN prep + recurrence path (opt-in) ─────────────────
         //
-        // `FFAI_GDN_FUSED_PREP=1` routes through `mt_gated_delta_prep_step`,
+        // `FFAI_GDN_FUSED_PREP=1` routes through `ffai_gated_delta_prep_step`,
         // which absorbs the per-head q/k RMSNorm + scale + g / beta math
         // + the recurrence kernel into ONE dispatch. Eliminates the
         // phase-1 host commit+wait (the host no longer needs convAct /
@@ -2647,7 +2647,7 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
             xNorm, position: position, cache: kv,
             cmd: cmd, device: device)
 
-        // Fused residual add + post-mix RMSNorm via mt_add_rms_norm
+        // Fused residual add + post-mix RMSNorm via ffai_add_rms_norm
         // (hidden ≤ 4096). Validator gate falls through for wider
         // hybrids that may exceed the kernel's row-width cap.
         let postMix: Tensor
@@ -2725,7 +2725,7 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
             cache: kv, cmd: cmd, device: device
         ).reshaped(to: [t * hidden])
 
-        // ── Residual add — fused with post-norm via mt_add_rms_norm
+        // ── Residual add — fused with post-norm via ffai_add_rms_norm
         // (hidden ≤ 4096). Falls back to separate Ops.add + rmsNormRows
         // for wider hidden sizes via the validator gate.
         let postMix: Tensor
@@ -2814,7 +2814,7 @@ private func qwen35ApplyFFNMany(
 ) -> Tensor {
     // Post-norm over T rows of [hidden]. One rmsNormRows kernel —
     // unless the caller already produced the normed tensor via the
-    // fused `mt_add_rms_norm` kernel.
+    // fused `ffai_add_rms_norm` kernel.
     let ffnNorm =
         preNormed
         ?? Ops.rmsNormRows(
@@ -2853,7 +2853,7 @@ private func qwen35ApplyFFN(
     preNormed: Tensor? = nil
 ) -> Tensor {
     // `preNormed` lets the attention-layer caller supply the
-    // fused-kernel output of `mt_add_rms_norm` (postMix already +
+    // fused-kernel output of `ffai_add_rms_norm` (postMix already +
     // post-norm in one dispatch). When nil, we run the separate norm.
     let ffnNorm = preNormed ?? postNorm(postMix, on: cmd)
     switch ffn {
@@ -3096,11 +3096,11 @@ public final class Qwen35Model: LanguageModel {
     ///
     ///   1. A batched-T variant of every projection (`dequantGemv` /
     ///      `gemv` → batched `dequantGemm` / `gemm`). The existing
-    ///      `mt_qmm_mma_m16` is BM=16 fixed; a dynamic-M qmm + chunking
+    ///      `ffai_qmm_mma_m16` is BM=16 fixed; a dynamic-M qmm + chunking
     ///      dispatcher is needed.
     ///   2. A batched-T conv1d_causal (the GDN input projection's conv1d
     ///      is rolling over `convKernel`; chunked form exists in
-    ///      metaltile-ffai's `mt_gated_delta_chunk` for the *recurrence*
+    ///      metaltile-ffai's `ffai_gated_delta_chunk` for the *recurrence*
     ///      but conv1d still has to step T times).
     ///   3. Per-layer `decodeMany(_ inputs: [T, hidden], ...)` on
     ///      `Qwen35GDNLayer` / `Qwen35AttentionLayer` that uses

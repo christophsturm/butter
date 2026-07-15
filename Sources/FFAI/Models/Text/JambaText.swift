@@ -834,7 +834,7 @@ public final class JambaAttentionLayer: Module, DecoderLayer {
         let xNorm = inputNorm(h, on: cmd)
         let mixerOut = mixer.forward(xNorm, cache: kv, cmd: cmd, device: device)
 
-        // Fused residual add + pre-FF RMSNorm via mt_add_rms_norm
+        // Fused residual add + pre-FF RMSNorm via ffai_add_rms_norm
         // (hidden ≤ 4096). Jamba 1.5 Mini is hidden=4096 (fits);
         // wider variants fall through the validator gate.
         let postMix: Tensor
@@ -899,7 +899,7 @@ private func jambaApplyFFN(
     preNormed: Tensor? = nil
 ) -> Tensor {
     // `preNormed` lets the attention-layer caller supply the
-    // fused-kernel output of `mt_add_rms_norm` (postMix already +
+    // fused-kernel output of `ffai_add_rms_norm` (postMix already +
     // pre-FF norm in one dispatch). When nil, we run the separate norm.
     let ffnNorm = preNormed ?? preFFNorm(postMix, on: cmd)
     switch ffn {

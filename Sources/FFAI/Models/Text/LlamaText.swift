@@ -306,7 +306,7 @@ public final class LlamaLayer: Module {
         }
         let oOut = oProj(attnReadyForOProj, on: cmd)
 
-        // Fused residual add + post-attn RMSNorm via mt_add_rms_norm
+        // Fused residual add + post-attn RMSNorm via ffai_add_rms_norm
         // (hidden ≤ 4096). Validator gate handles Llama 3 70B (8192).
         // Returns (postAttn residual stream, normed input for MLP).
         let postAttn: Tensor
@@ -419,7 +419,7 @@ public final class LlamaLayer: Module {
         let attnFlat = attnOut.reshaped(to: [nRows, nHeads * headDim])
         let oOut = oProj.callMany(attnFlat, t: nRows, on: cmd, device: device)
 
-        // Fused residual add + post-attn RMSNorm via mt_add_rms_norm
+        // Fused residual add + post-attn RMSNorm via ffai_add_rms_norm
         // (hidden ≤ 4096). Validator gate handles Llama 3 70B (8192).
         let postAttn: Tensor
         let mlpNorm: Tensor

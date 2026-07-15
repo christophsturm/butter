@@ -209,7 +209,7 @@ struct OpsMathTests {
 
     // ─── copy kernel (vs blit) ─────────────────────────────────────
 
-    @Test("copyKernel f32 — duplicates src into dst via mt_copy")
+    @Test("copyKernel f32 — duplicates src into dst via ffai_copy")
     func copyKernelF32() {
         autoreleasepool {
             let src = Tensor.empty(shape: [4], dtype: .f32)

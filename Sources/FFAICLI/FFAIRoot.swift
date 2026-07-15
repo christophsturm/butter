@@ -36,7 +36,7 @@ struct FFAIRoot: AsyncParsableCommand {
         subcommands: [
             GenerateCommand.self, BenchCommand.self,
             InspectCommand.self, ModelsCommand.self,
-            ConvertCommand.self, Hy3ProbeCommand.self,
+            ConvertCommand.self,
         ],
         defaultSubcommand: GenerateCommand.self
     )

@@ -15,7 +15,7 @@
 // FFAI wrapper correctness tests for `Ops.moeGatherDequantGemmInt4Bm64Mpp`.
 //
 // Background: the upstream metaltile kernel
-// `mt_moe_gather_qmm_mma_int4_bm64_mpp_bf16` passes its own GPU correctness
+// `ffai_moe_gather_qmm_mma_int4_bm64_mpp_bf16` passes its own GPU correctness
 // tests (incl. multi-n-tile / multi-K-block / group_size=64 cells we added
 // upstream), but FFAI's `forwardManyEquivalence` Qwen3.6-A3B canary trips
 // when the wrapper is engaged via `FFAI_MOE_BGEMM_BM64=1` (argmax 279 vs
@@ -34,7 +34,7 @@ import Testing
 
 @Suite("MoE bm64_mpp wrapper correctness")
 struct MoEBgemmBm64MppTests {
-    /// The `mt_moe_gather_qmm_mma_int4_bm64_mpp_bf16` kernel uses MPP
+    /// The `ffai_moe_gather_qmm_mma_int4_bm64_mpp_bf16` kernel uses MPP
     /// cooperative-tensor (simdgroup_matrix) intrinsics that require
     /// Apple GPU Family 9+ (M3 and later). On Family 7 (M1, CI runner)
     /// the kernel compiles but produces zeroed output (cos=0.0). Gate
@@ -396,12 +396,12 @@ struct MoEBgemmBm64MppTests {
             .deletingLastPathComponent()  // Tests/
             .deletingLastPathComponent()  // <repo>/
         let metalURL = repoRoot.appendingPathComponent(
-            "Sources/MetalTileSwift/Resources/kernels/mt_moe_gather_qmm_mma_int4_bm64_mpp_bf16.metal"
+            "Sources/MetalTileSwift/Resources/kernels/ffai_moe_gather_qmm_mma_int4_bm64_mpp_bf16.metal"
         )
         let source = try String(contentsOf: metalURL, encoding: .utf8)
         let opts = MTLCompileOptions()
         let lib = try mtlDevice.makeLibrary(source: source, options: opts)
-        let fn = lib.makeFunction(name: "mt_moe_gather_qmm_mma_int4_bm64_mpp_bf16")!
+        let fn = lib.makeFunction(name: "ffai_moe_gather_qmm_mma_int4_bm64_mpp_bf16")!
         let pso = try mtlDevice.makeComputePipelineState(function: fn)
 
         let queue = mtlDevice.makeCommandQueue()!
@@ -508,7 +508,7 @@ struct MoEBgemmBm64MppTests {
         memset(outBuf.contents(), 0, tRows * nOut * 2)
 
         // Use the FFAI MetalTileLibrary's PSO (same metallib, same kernel).
-        let pso = PSOCache.shared.pipelineState(for: "mt_moe_gather_qmm_mma_int4_bm64_mpp_bf16")
+        let pso = PSOCache.shared.pipelineState(for: "ffai_moe_gather_qmm_mma_int4_bm64_mpp_bf16")
         let queue = mtlDevice.makeCommandQueue()!
         let cb = queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!

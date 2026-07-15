@@ -1647,8 +1647,8 @@ final class Hy3MoELayer: Hy3LayerProtocol {
     }
 
     /// Batched Path B + expert-sorted int2 MMA gather for `t` tokens.
-    /// Router stays on-device; plan is `mt_moe_sort_plan` then
-    /// `mt_moe_gather_qmm_mma_int2_bm16_*` (affine BM16). No host
+    /// Router stays on-device; plan is `ffai_moe_sort_plan` then
+    /// `ffai_moe_gather_qmm_mma_int2_bm16_*` (affine BM16). No host
     /// index readback. Returns routed sum `[t, hidden]`.
     /// Multi-token Path B MoE. When `fuseShared`, also runs shared gate‖up
     /// on the same concurrent encoder as MoE gate‖up (and shared down

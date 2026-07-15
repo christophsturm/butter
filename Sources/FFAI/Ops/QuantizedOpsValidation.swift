@@ -129,7 +129,7 @@ public enum QuantizedOpsValidation {
         if groupSize <= 0 {
             return "groupSize must be positive (got \(groupSize))"
         }
-        // The metaltile quantize kernels (`mt_affine_quantize_int{2,3,4,5,6,8}`
+        // The metaltile quantize kernels (`ffai_affine_quantize_int{2,3,4,5,6,8}`
         // in `crates/metaltile-std/src/mlx/quantized.rs`) all hardcode
         // the min/max reduction shape at one simdgroup × 2 elements/lane
         // = 64 elements/group. Each lane reads `w[in_base + lane * 2]`
@@ -142,7 +142,7 @@ public enum QuantizedOpsValidation {
         // every bit-width.
         if groupSize != 64 {
             return
-                "groupSize=\(groupSize) unsupported for affine quantize — only group_size=64 is emitted (kernel reduces over one simdgroup × 2 elements/lane = 64 elements; see metaltile mt_affine_quantize_int\(bits))"
+                "groupSize=\(groupSize) unsupported for affine quantize — only group_size=64 is emitted (kernel reduces over one simdgroup × 2 elements/lane = 64 elements; see metaltile ffai_affine_quantize_int\(bits))"
         }
         if !numel.isMultiple(of: groupSize) {
             return

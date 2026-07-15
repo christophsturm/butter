@@ -96,7 +96,7 @@ public final class Linear: Module {
     /// (Rebase 2026-05-23: keep Tom's `callMany` API, drop my parallel
     /// `batched(_:nRows:)` from `3a87b78`. Both did the same job;
     /// Tom's QuantizedLinear.callMany variant actually wraps the
-    /// `mt_qmm_mma`-backed `Ops.dequantGemmDynamicM` kernel — what my
+    /// `ffai_qmm_mma`-backed `Ops.dequantGemmDynamicM` kernel — what my
     /// doc comment had flagged as a TODO.)
     public func callMany(_ x: Tensor, t: Int, on cmd: MTLCommandBuffer) -> Tensor {
         let y = Ops.gemm(weight: weight, input: x, nRows: t, on: cmd)
@@ -234,7 +234,7 @@ public final class QuantizedLinear: Module {
 
     /// T-batched. `x` is `[T, inDim]` flat row-major, returns
     /// `[T, outDim]` flat. Dispatches `Ops.dequantGemmDynamicM` — one
-    /// `mt_qmm_mma` kernel for T multiple of 32, or one padded
+    /// `ffai_qmm_mma` kernel for T multiple of 32, or one padded
     /// dispatch + host slice for ragged T. Matches the batched-prefill
     /// path (BP2).
     public func callMany(
@@ -244,7 +244,7 @@ public final class QuantizedLinear: Module {
     ) -> Tensor {
         let outDim = weight.shape[0]
         let inDim = scales.shape[scales.shape.count - 1] * groupSize
-        // 2/4/8-bit affine go through `mt_qmm_mma{,_int2,_int8}` when
+        // 2/4/8-bit affine go through `ffai_qmm_mma{,_int2,_int8}` when
         // outDim is a multiple of 32 (BN tile). Hy3 oQ2 stores attention
         // + shared MLP as int8 — the old bits==8 path full-dequantized
         // every callMany (~7 densify+gemm per layer × 80), which

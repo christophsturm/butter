@@ -677,7 +677,7 @@ public final class GPTOSSLayer: Module {
     /// on the CPU is negligible next to the per-layer GPU gemms, and
     /// the layer already has CPU sync points (sinks + router) so the
     /// readback is free. The post-attention norm runs on the GPU
-    /// because it is now fused into `mt_add_rms_norm`, whose row-
+    /// because it is now fused into `ffai_add_rms_norm`, whose row-
     /// width invariants (multiple of 4, ≤ 4096) GPT-OSS satisfies.
     func decode(
         _ h: Tensor, position: Int, cache: KVCache,
@@ -696,16 +696,16 @@ public final class GPTOSSLayer: Module {
             cache: cache, cmd: cmd, device: device)
 
         // The residual add + post-attention RMSNorm run as ONE fused
-        // GPU dispatch via mt_add_rms_norm — replaces the previous
+        // GPU dispatch via ffai_add_rms_norm — replaces the previous
         // (Ops.add on GPU + gptOSSHostRMSNorm on CPU) pair. GPT-OSS's
         // hidden=2880 is a multiple of 4 and ≤ 4096, so it fits the
         // fused kernel's row-width invariants even though it does NOT
-        // satisfy the legacy `mt_rms_norm`'s 128-element invariant
+        // satisfy the legacy `ffai_rms_norm`'s 128-element invariant
         // (which is why the standalone norm was on the host).
         precondition(
             OpsValidation.validateAddRmsNorm(n: hidden) == nil,
             "GPTOSSLayer.decode: hidden=\(hidden) violates "
-                + "mt_add_rms_norm invariants")
+                + "ffai_add_rms_norm invariants")
         let addCmd = device.makeCommandBuffer()
         let fused = Ops.addAndRmsNorm(
             h, attnOut, weight: postAttnNorm.weight, eps: postAttnNorm.eps,

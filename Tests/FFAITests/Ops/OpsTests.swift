@@ -528,12 +528,12 @@ struct OpsTests {
         }
     }
 
-    @Test("rmsNorm f32 — wide row (n=5376) routes to mt_rms_norm_wide")
+    @Test("rmsNorm f32 — wide row (n=5376) routes to ffai_rms_norm_wide")
     func rmsNormWideF32() {
         autoreleasepool {
             // n = 5376 (Gemma 4 31B hidden) is past the 4096 cap of the
             // 4-elements-per-thread kernel, so Ops.rmsNorm routes to the
-            // strided mt_rms_norm_wide kernel. eps eps=1e-6 like Gemma 4.
+            // strided ffai_rms_norm_wide kernel. eps eps=1e-6 like Gemma 4.
             let n = 5376
             let eps: Float = 1e-6
             let xs: [Float] = (0 ..< n).map { Float(($0 % 37) - 18) * 0.21 }

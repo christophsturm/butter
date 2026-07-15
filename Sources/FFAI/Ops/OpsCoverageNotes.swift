@@ -22,7 +22,7 @@
 //      higher-level wrapper (e.g. `aura_flash_p1_*` is used inside
 //      `Ops.auraFlashAttention`-style composites, not directly).
 //   2. Some are bit-width / tile-shape variants that the existing
-//      wrapper switches over by parameter (e.g. `mt_qmv_b3` … `mt_qmv_b8`
+//      wrapper switches over by parameter (e.g. `ffai_qmv_b3` … `ffai_qmv_b8`
 //      are auto-routed inside `Ops.dequantGemv(bits:)`).
 //   3. Some are `_record` / `state_replay_*` infrastructure for the
 //      `dispatch_chain` indirect-command-buffer mode — those aren't
@@ -82,29 +82,29 @@ public enum OpsCoverageNotes {
 
         // ── Bit-width / tile-shape variants of an already-wrapped op ─
         UncoveredKernel(
-            familyName: "mt_qmm_b{3,4,5,6,8} / mt_qmv_b{3,4,5,6,8} / mt_qvm_b{3,4,5,6,8}",
+            familyName: "ffai_qmm_b{3,4,5,6,8} / ffai_qmv_b{3,4,5,6,8} / ffai_qvm_b{3,4,5,6,8}",
             rationale:
                 "MLX-style quantized matmul variants. FFAI's production path uses ffai_* / dequant_gemv_* kernels (different geometry); these MLX-style siblings are kept for `tile bench` side-by-side comparisons only."
         ),
         UncoveredKernel(
             familyName:
-                "mt_qmm_bm2_int8_fast / mt_qmm_bm4_int8_fast / mt_qmm_int8_fast / mt_qmv_int8_fast / mt_qvm_int4_fast / mt_qmm_mma_int8 / mt_qmm_mma_m16_int8 / mt_qmm_mma_mpp_int8 / mt_qmm_nax_int8 / mt_qmm_nax",
+                "ffai_qmm_bm2_int8_fast / ffai_qmm_bm4_int8_fast / ffai_qmm_int8_fast / ffai_qmv_int8_fast / ffai_qvm_int4_fast / ffai_qmm_mma_int8 / ffai_qmm_mma_m16_int8 / ffai_qmm_mma_mpp_int8 / ffai_qmm_nax_int8 / ffai_qmm_nax",
             rationale:
                 "MLX-style int8/int4 GEMM variants. Not on the FFAI hot path (which uses ffai_gemm + dequant_gemv_int*)."
         ),
         UncoveredKernel(
             familyName:
-                "mt_moe_gather_qmm_b{3,5,6,8} / *_mma_b{3,5,6,8} / *_int8 / *_int8_bm{8,16,64}_mpp / *_int4_m{8,16,32}",
+                "ffai_moe_gather_qmm_b{3,5,6,8} / *_mma_b{3,5,6,8} / *_int8 / *_int8_bm{8,16,64}_mpp / *_int4_m{8,16,32}",
             rationale:
                 "MoE gather quantized matmul bit-width / tile-shape variants. Routed inside Ops.moeGatherDequantGemm* by bits + BM."
         ),
         UncoveredKernel(
-            familyName: "mt_steel_gemm_{32x32,64x64,…}_{1x2,2x2,4x2,…}",
+            familyName: "ffai_steel_gemm_{32x32,64x64,…}_{1x2,2x2,4x2,…}",
             rationale:
                 "Tile-shape variants of the base steel GEMM. Internal to Ops.gemm dispatch; user-facing wrapper picks the right tile."
         ),
         UncoveredKernel(
-            familyName: "mt_steel_gemm_{gather,masked,segmented,splitk,splitk_accum,fused,nax}*",
+            familyName: "ffai_steel_gemm_{gather,masked,segmented,splitk,splitk_accum,fused,nax}*",
             rationale:
                 "Specialized steel GEMM variants (gather / masked / split-K / NAX). Not yet on the production hot path; reserved for future Ops.gemm specializations."
         ),
@@ -138,12 +138,12 @@ public enum OpsCoverageNotes {
 
         // ── Probe / bench / test kernels ───────────────────────────
         UncoveredKernel(
-            familyName: "mt_sgload_smoke",
+            familyName: "ffai_sgload_smoke",
             rationale: "Subgroup-load smoke test kernel — used only by metaltile's own GPU probe."),
 
         // ── Bit-stream affine quant variants (bits 3 / 5 / 6) ───────
         UncoveredKernel(
-            familyName: "mt_affine_{quantize,dequantize}_int{3,5,6}",
+            familyName: "ffai_affine_{quantize,dequantize}_int{3,5,6}",
             rationale:
                 "Bit-stream packed affine quant for odd bit-widths. Not yet exposed at the QuantizedOps layer — caller-side production callers either use Ops.dequantGemv (which has int{3,5,6} arms via the dequant_gemv_int* kernels) or QuantizedOps.{quantize,dequantize}Affine for bits ∈ {2,4,8}. Promotion path: add the bit-stream packing arm to QuantizedOps if a per-buffer int{3,5,6} need arises."
         ),
@@ -174,7 +174,7 @@ public enum OpsCoverageNotes {
         // ── FP4 / FP8 / MXFP ───────────────────────────────────────
         UncoveredKernel(
             familyName:
-                "mt_fp4_{quant_dequant,qmm_mma} / mt_fp8_{e4m3,e5m2}_{quant_dequant,qmm_mma} / mt_fp_qmm_nax",
+                "ffai_fp4_{quant_dequant,qmm_mma} / mt_fp8_{e4m3,e5m2}_{quant_dequant,qmm_mma} / mt_fp_qmm_nax",
             rationale:
                 "FP4 / FP8 / MXFP quantization. FFAI's DType enum does not yet expose fp4/fp8 cases — wrapping these would require a DType expansion first. Tracked as a follow-up; the existing GPT-OSS MXFP4 transcode goes through a model-specific Loader path."
         ),
@@ -186,58 +186,58 @@ public enum OpsCoverageNotes {
 
         // ── FFT / Hadamard / scan / sort / strided ─────────────────
         UncoveredKernel(
-            familyName: "mt_fft_n{32,64,…,1024} / mt_fft_bluestein_*",
+            familyName: "ffai_fft_n{32,64,…,1024} / mt_fft_bluestein_*",
             rationale:
                 "FFT building blocks composed inside mel_spectrogram / vocoder_istft. Not exposed standalone — the audio pipeline is the only caller."
         ),
         UncoveredKernel(
-            familyName: "mt_hadamard_n{64,128,…,1024}",
+            familyName: "ffai_hadamard_n{64,128,…,1024}",
             rationale:
                 "Walsh-Hadamard transform — composed inside AURA encode (the SRHT rotation step). Direct standalone use is uncommon enough we route through auraEncode."
         ),
         UncoveredKernel(
-            familyName: "mt_scan / mt_scan_exclusive / mt_scan_{max,min,prod}*",
+            familyName: "ffai_scan / ffai_scan_exclusive / ffai_scan_{max,min,prod}*",
             rationale:
                 "Inclusive / exclusive prefix-scan family. No production caller at the Ops layer yet."
         ),
         UncoveredKernel(
-            familyName: "mt_sort / mt_sort_segmented",
+            familyName: "ffai_sort / mt_sort_segmented",
             rationale:
                 "Sort kernels. No on-GPU sort production caller; logits sampling uses GPU mask + CPU-side argmax."
         ),
         UncoveredKernel(
-            familyName: "mt_strided_copy / mt_strided_copy_nd",
+            familyName: "ffai_strided_copy / mt_strided_copy_nd",
             rationale:
-                "Strided / N-D copy. Production data movement uses MTLBlit (Ops.copy) or contiguous mt_copy (Ops.copyKernel). Strided variant is reserved for the future when slicing semantics land."
+                "Strided / N-D copy. Production data movement uses MTLBlit (Ops.copy) or contiguous ffai_copy (Ops.copyKernel). Strided variant is reserved for the future when slicing semantics land."
         ),
         UncoveredKernel(
-            familyName: "mt_masked_scatter / mt_scatter / mt_scatter_axis",
+            familyName: "ffai_masked_scatter / mt_scatter / mt_scatter_axis",
             rationale:
                 "Scatter / masked-scatter primitives. No production caller; the embedding write path uses kv_cache_update for KV and direct buffer-row writes for embeddings."
         ),
         UncoveredKernel(
-            familyName: "mt_gather_axis / mt_gather_front",
+            familyName: "ffai_gather_axis / ffai_gather_front",
             rationale:
                 "Gather primitives. Embedding gather uses Ops.gather / Ops.dequantGather; axis-gather has no production caller."
         ),
         UncoveredKernel(
-            familyName: "mt_merge / mt_select / mt_binary_two",
+            familyName: "ffai_merge / mt_select / mt_binary_two",
             rationale:
                 "Element-wise primitives — merge (two-input ternary), select, binary_two. No production caller at the Ops layer."
         ),
         UncoveredKernel(
             familyName:
-                "mt_seg_reduce / mt_seg_reduce_{max,min,prod} / mt_col_reduce* / mt_all_reduce*",
+                "ffai_seg_reduce / ffai_seg_reduce_{max,min,prod} / mt_col_reduce* / mt_all_reduce*",
             rationale:
                 "Segmented + column + cross-row reduction primitives. mt_row_reduce variants are also unwrapped — Ops exposes the higher-level argmax / softmax / logsumexp instead, which cover the production decoder needs."
         ),
         UncoveredKernel(
-            familyName: "mt_row_reduce / mt_row_reduce_{max,min,prod}",
+            familyName: "ffai_row_reduce / mt_row_reduce_{max,min,prod}",
             rationale:
                 "Per-row sum/max/min/prod. Sampling pipeline uses argmax / argmin / softmax instead; raw row-reductions have no production caller yet."
         ),
         UncoveredKernel(
-            familyName: "mt_rms_inv_scalar",
+            familyName: "ffai_rms_inv_scalar",
             rationale: "Bench-only helper used by RMSNorm correctness tests on the metaltile side."),
 
         // ── Logits processors (the chain-replay variants) ──────────
@@ -246,23 +246,23 @@ public enum OpsCoverageNotes {
         // ── Scalar math primitives ─────────────────────────────────
         UncoveredKernel(
             familyName:
-                "mt_acos / mt_acosh / mt_asin / mt_asinh / mt_atan / mt_atan2 / mt_atanh / mt_cos / mt_cosh / mt_sin / mt_sinh / mt_tan / mt_tanh_op / mt_erf / mt_erfinv / mt_exp2 / mt_expm1 / mt_log10 / mt_log1p / mt_log2 / mt_logaddexp / mt_remainder / mt_sign / mt_trunc / mt_random_hash",
+                "ffai_acos / mt_acosh / mt_asin / mt_asinh / mt_atan / mt_atan2 / mt_atanh / mt_cos / mt_cosh / mt_sin / mt_sinh / mt_tan / mt_tanh_op / mt_erf / mt_erfinv / mt_exp2 / mt_expm1 / mt_log10 / mt_log1p / mt_log2 / mt_logaddexp / mt_remainder / mt_sign / mt_trunc / mt_random_hash",
             rationale:
                 "Trig / hyperbolic / specialised log / random scalar primitives. No production caller; covered by torch's CPU-side preprocessing for the rare callers that need them. Wrappers can be added incrementally if a model family adopts one."
         ),
         UncoveredKernel(
-            familyName: "mt_fft_bluestein_chirp_filter",
+            familyName: "ffai_fft_bluestein_chirp_filter",
             rationale:
                 "Bluestein-FFT chirp-filter helper. Composed inside mel_spectrogram; not a standalone caller."
         ),
         UncoveredKernel(
-            familyName: "mt_scalar_fma_chain8",
+            familyName: "ffai_scalar_fma_chain8",
             rationale:
                 "Chain-of-8 scalar FMA used by AURA encode rotation. Internal building block."),
 
         // ── Other ──────────────────────────────────────────────────
         UncoveredKernel(
-            familyName: "mt_gemv_masked",
+            familyName: "ffai_gemv_masked",
             rationale:
                 "Masked GEMV for sparse attention. No production caller yet — sparse attention variants use sdpa_multi/decode instead."
         ),
@@ -280,7 +280,7 @@ public enum OpsCoverageNotes {
 
         // ── Future per-headDim sdpa specializations ────────────────
         UncoveredKernel(
-            familyName: "mt_sdpa / mt_sdpa_prefill / mt_sdpa_vector / mt_sdpa_prefill_mma_bf16",
+            familyName: "ffai_sdpa / ffai_sdpa_prefill / ffai_sdpa_vector / ffai_sdpa_prefill_mma_bf16",
             rationale:
                 "MLX-side base SDPA kernels — FFAI routes through ffai_sdpa_decode / ffai_sdpa_multi / ffai_sdpa_bidirectional which carry the dispatch-shape contracts and DISPATCH-INVARIANTS docs that prevent the 2026-05-19 GPU-pin class of bug. The MLX siblings are kept for bench comparisons."
         ),

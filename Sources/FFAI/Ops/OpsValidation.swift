@@ -44,10 +44,10 @@ public enum OpsValidation {
     //
     // `Ops.dispatchRmsNorm` routes by row width across two metaltile
     // kernels (`crates/metaltile-std/src/mlx/rms_norm.rs`):
-    //   • `mt_rms_norm` (fast path). `N = TPG * 4` (4 elements per
+    //   • `ffai_rms_norm` (fast path). `N = TPG * 4` (4 elements per
     //     thread), `TPG = n / 4`, `TPG` a multiple of 32 ⇒ `n` a
     //     multiple of 128, `TPG ≤ 1024` ⇒ `n ≤ 4096`.
-    //   • `mt_rms_norm_wide` (any width). Each thread strides over the
+    //   • `ffai_rms_norm_wide` (any width). Each thread strides over the
     //     row with `TPG = 1024`; no 128-alignment or upper bound. Used
     //     when `n > 4096` (Gemma 4 27B+ hidden 5376) AND when `n` is
     //     not a multiple of 128 (SmolVLM2 vision tower d=960 etc).
@@ -201,15 +201,15 @@ public enum OpsValidation {
 
     // ─── add_rms_norm (fused residual + RMSNorm) ───────────────────
     //
-    // `mt_add_rms_norm` fuses the transformer block's residual stream
+    // `ffai_add_rms_norm` fuses the transformer block's residual stream
     // and post-residual RMSNorm into one kernel. Each row uses TPG =
-    // n / 4 (4 elements per thread, same pattern as `mt_rms_norm`),
+    // n / 4 (4 elements per thread, same pattern as `ffai_rms_norm`),
     // so n must be a multiple of 4 AND n / 4 must stay within Apple
     // Silicon's 1024-thread-per-group cap → **n ≤ 4096**. Wider
     // hidden sizes (Gemma 4 27B+ at hidden 5376) MUST fall back to
     // separate `add` + `rmsNorm` calls.
 
-    /// Largest row width the fused `mt_add_rms_norm` kernel can take.
+    /// Largest row width the fused `ffai_add_rms_norm` kernel can take.
     /// Above this, callers should use separate `Ops.add` + `Ops.rmsNorm`.
     public static let addRmsNormMaxRowSize = 4096
 
@@ -280,7 +280,7 @@ public enum OpsValidation {
 
     // ─── gemv ──────────────────────────────────────────────────────
     //
-    // `mt_gemv` (MLX-derived). Adaptive `lsize` reduction → no GPU-pin
+    // `ffai_gemv` (MLX-derived). Adaptive `lsize` reduction → no GPU-pin
     // risk regardless of TPG. Caller-controllable shape (outDim, inDim);
     // the wrapper already checks shape consistency via the `weight`
     // tensor. Validation here just pins the basic positivity contract.
@@ -603,7 +603,7 @@ public enum OpsValidation {
     //      the per-lane state register array is capped at 8 (Dk ≤ 256).
     //   3. `Hv % Hk == 0` — the `hv → hk` GQA fan-out must be integer.
     //
-    // `mt_gated_delta_step` takes `(Dk, Dv, Hv, Hk)` as runtime
+    // `ffai_gated_delta_step` takes `(Dk, Dv, Hv, Hk)` as runtime
     // `#[constexpr]` scalars: a single PSO serves every model config,
     // so there is no per-tuple emission list to gate on. The checks
     // below are the genuine dispatch-geometry invariants.
@@ -643,7 +643,7 @@ public enum OpsValidation {
 
     // ─── ffai_rms_norm_residual + ffai_gated_rmsnorm ───────────────
     //
-    // Both kernels share `mt_add_rms_norm`'s row-width contract:
+    // Both kernels share `ffai_add_rms_norm`'s row-width contract:
     //   * `N = TPG * 4` → caller picks `TPG = n / 4`.
     //   * `TPG` must be a multiple of 32 (simdgroup floor) and ≤ 1024.
     //   * Combined: `n` multiple of 128 and `n ≤ 4096`.
@@ -667,7 +667,7 @@ public enum OpsValidation {
 
     /// Validate the row-width parameter for `Ops.gatedRmsNorm`.
     public static func validateGatedRmsNorm(n: Int) -> String? {
-        // Same invariants as `mt_add_rms_norm` / `rms_norm_residual` —
+        // Same invariants as `ffai_add_rms_norm` / `rms_norm_residual` —
         // TPG = n/4, multiple of 32, ≤ 1024.
         if n <= 0 {
             return "n must be positive (got \(n))"
@@ -682,10 +682,10 @@ public enum OpsValidation {
         return nil
     }
 
-    // ─── mt_rms_norm_small ─────────────────────────────────────────
+    // ─── ffai_rms_norm_small ─────────────────────────────────────────
     //
     // Per-head RMSNorm specialisation for n < 128 (the default
-    // `mt_rms_norm` floor). 2 elements/thread → TPG = n/2:
+    // `ffai_rms_norm` floor). 2 elements/thread → TPG = n/2:
     //   * TPG ≥ 32 (one full simdgroup) → n ≥ 64.
     //   * TPG ≤ 1024 (Apple cap) → n ≤ 2048.
     //   * n even (each thread loads 2 contiguous elements).

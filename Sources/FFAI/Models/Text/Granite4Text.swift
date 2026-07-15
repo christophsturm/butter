@@ -784,7 +784,7 @@ public final class Granite4Layer: Module, DecoderLayer {
             mixerOut = a.forward(xNorm, cache: kv, cmd: cmd, device: device)
         }
         // residual_multiplier already folded into the mixer output proj.
-        // Fused residual add + post-mixer RMSNorm via mt_add_rms_norm
+        // Fused residual add + post-mixer RMSNorm via ffai_add_rms_norm
         // (hidden ≤ 4096), but ONLY on the attention-mixer branch —
         // the task carve-out is "attention/FFN residuals, NOT the
         // SSM recurrence paths." Validator gate handles wider variants.

@@ -1054,7 +1054,7 @@ struct OpsSpecialPathTests {
     @Test("gatedDeltaChunk f32 — multi-token recurrence sweep stays finite")
     func gatedDeltaChunkSmoke() {
         // TODO: needs production-shape correctness reference — math
-        // matches `mt_gated_delta_step` over `T` tokens but the
+        // matches `ffai_gated_delta_step` over `T` tokens but the
         // CPU oracle requires the full Gated Delta Net recurrence to be
         // reimplemented in Swift. Smoke-test: assert dispatch finishes
         // and outputs are finite / correctly sized.
@@ -1337,7 +1337,7 @@ struct OpsSpecialPathTests {
 
     @Test("dequantGemmDynamicM f32 (bits=2) — T=32 fast path runs finite")
     func dequantGemmDynamicMInt2Smoke() {
-        // Smoke-test the 2-bit dispatch through mt_qmm_mma_int2. Same
+        // Smoke-test the 2-bit dispatch through ffai_qmm_mma_int2. Same
         // shape contract as the int4 smoke above but with packs sized
         // for 16 codes per u32 (kIn/16 packs per row).
         autoreleasepool {
