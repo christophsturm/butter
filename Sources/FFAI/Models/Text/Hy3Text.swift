@@ -327,7 +327,8 @@ private func hy3Int8CallMany(
         }
         blit.endEncoding()
     }
-    let outPad = Tensor.empty(shape: [mPad, n], dtype: dt, device: device)
+    let outPad = hy3ScratchTensor(
+        shape: [mPad, n], dtype: dt, tag: "hy3_int8_outpad_\(dt)_\(n)", device: device)
     guard let enc = cmd.makeComputeCommandEncoder() else {
         return lin.callMany(x, t: t, on: cmd, device: device)
     }
@@ -375,8 +376,12 @@ private func hy3ConcurrentGateUp(
         }
         blit.endEncoding()
     }
-    let gPad = Tensor.empty(shape: [mPad, gL.weight.shape[0]], dtype: dt, device: device)
-    let uPad = Tensor.empty(shape: [mPad, uL.weight.shape[0]], dtype: dt, device: device)
+    let gPad = hy3ScratchTensor(
+        shape: [mPad, gL.weight.shape[0]], dtype: dt,
+        tag: "hy3_gu_gpad_\(dt)_\(gL.weight.shape[0])", device: device)
+    let uPad = hy3ScratchTensor(
+        shape: [mPad, uL.weight.shape[0]], dtype: dt,
+        tag: "hy3_gu_upad_\(dt)_\(uL.weight.shape[0])", device: device)
     guard let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) else {
         return (
             gate.callMany(ffnIn, t: t, on: cmd, device: device),
@@ -425,8 +430,12 @@ private func hy3SdpaPrefill(
         // Compact K‖V on a concurrent encoder (two independent blits of the
         // strided cache into packed [nKV, kLen, d] slabs). Serial compact
         // was two full encoder open/close cycles per layer.
-        let kPacked = Tensor.empty(shape: [nKVHeads, kLen, headDim], dtype: .f16)
-        let vPacked = Tensor.empty(shape: [nKVHeads, kLen, headDim], dtype: .f16)
+        let kPacked = hy3ScratchTensor(
+            shape: [nKVHeads, kLen, headDim], dtype: .f16,
+            tag: "hy3_sdpa_kpack_\(nKVHeads)_\(kLen)_\(headDim)", device: Device.shared)
+        let vPacked = hy3ScratchTensor(
+            shape: [nKVHeads, kLen, headDim], dtype: .f16,
+            tag: "hy3_sdpa_vpack_\(nKVHeads)_\(kLen)_\(headDim)", device: Device.shared)
         if let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) {
             _ = Ops.compactKV_f16(
                 src: cacheK, nKV: nKVHeads, maxSeq: cache.maxSeq,
@@ -507,9 +516,15 @@ private func hy3ConcurrentQKV(
             }
             blit.endEncoding()
         }
-        let qPad = Tensor.empty(shape: [mPad, outDim(qL)], dtype: dt, device: device)
-        let kPad = Tensor.empty(shape: [mPad, outDim(kL)], dtype: dt, device: device)
-        let vPad = Tensor.empty(shape: [mPad, outDim(vL)], dtype: dt, device: device)
+        let qPad = hy3ScratchTensor(
+            shape: [mPad, outDim(qL)], dtype: dt,
+            tag: "hy3_qkv_qpad_\(dt)_\(outDim(qL))", device: device)
+        let kPad = hy3ScratchTensor(
+            shape: [mPad, outDim(kL)], dtype: dt,
+            tag: "hy3_qkv_kpad_\(dt)_\(outDim(kL))", device: device)
+        let vPad = hy3ScratchTensor(
+            shape: [mPad, outDim(vL)], dtype: dt,
+            tag: "hy3_qkv_vpad_\(dt)_\(outDim(vL))", device: device)
         guard let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
         else {
             return (
@@ -1383,10 +1398,12 @@ final class Hy3MoELayer: Hy3LayerProtocol {
                     }
                     blit.endEncoding()
                 }
-                let sgPad = Tensor.empty(
-                    shape: [mPad, g.weight.shape[0]], dtype: dt, device: device)
-                let suPad = Tensor.empty(
-                    shape: [mPad, u.weight.shape[0]], dtype: dt, device: device)
+                let sgPad = hy3ScratchTensor(
+                    shape: [mPad, g.weight.shape[0]], dtype: dt,
+                    tag: "hy3_shared_gpad_\(dt)_\(g.weight.shape[0])", device: device)
+                let suPad = hy3ScratchTensor(
+                    shape: [mPad, u.weight.shape[0]], dtype: dt,
+                    tag: "hy3_shared_upad_\(dt)_\(u.weight.shape[0])", device: device)
                 if let enc = sharedCmd.makeComputeCommandEncoder(dispatchType: .concurrent) {
                     Ops.encodeDequantGemmInt8Mpp(
                         input: xIn, weight: g.weight, scales: g.scales, biases: g.biases,
@@ -1765,10 +1782,12 @@ final class Hy3MoELayer: Hy3LayerProtocol {
                 blit.endEncoding()
                 sharedX = xPad
             }
-            sharedSgPad = Tensor.empty(
-                shape: [sharedMPad, g.weight.shape[0]], dtype: dt, device: device)
-            sharedSuPad = Tensor.empty(
-                shape: [sharedMPad, u.weight.shape[0]], dtype: dt, device: device)
+            sharedSgPad = hy3ScratchTensor(
+                shape: [sharedMPad, g.weight.shape[0]], dtype: dt,
+                tag: "hy3_shared_gpad_\(dt)_\(g.weight.shape[0])", device: device)
+            sharedSuPad = hy3ScratchTensor(
+                shape: [sharedMPad, u.weight.shape[0]], dtype: dt,
+                tag: "hy3_shared_upad_\(dt)_\(u.weight.shape[0])", device: device)
         }
 
         // FFAI_HY3_ACTIVE_EG=1: active-only expert-outer (f16) via compact +
@@ -2542,14 +2561,24 @@ private func hy3GpuZeros(
     shape: [Int], dtype: DType, tag: String,
     cmd: MTLCommandBuffer, device: Device
 ) -> Tensor {
-    let n = shape.reduce(1, *)
-    let bytes = n * dtype.byteSize
-    let buf = device.intermediateScratch(tag: tag, minBytes: bytes)
-    let t = Tensor(buffer: buf, offset: 0, shape: shape, dtype: dtype)
+    let t = hy3ScratchTensor(shape: shape, dtype: dtype, tag: tag, device: device)
+    let bytes = t.elementCount * t.dtype.byteSize
     let blit = cmd.makeBlitCommandEncoder()!
-    blit.fill(buffer: buf, range: 0 ..< bytes, value: 0)
+    blit.fill(buffer: t.buffer, range: t.offset ..< (t.offset + bytes), value: 0)
     blit.endEncoding()
     return t
+}
+
+/// Grow-once tagged intermediate for per-layer free-path pads (QKV/O/SDPA).
+/// Avoids `Tensor.empty` → fresh `makeBuffer` every layer × 80 (driver thrash
+/// and RSS spikes). Safe across CB stride: buffer stays alive for the process.
+private func hy3ScratchTensor(
+    shape: [Int], dtype: DType, tag: String, device: Device
+) -> Tensor {
+    let n = shape.reduce(1, *)
+    let bytes = max(n * dtype.byteSize, 64)
+    let buf = device.intermediateScratch(tag: tag, minBytes: bytes)
+    return Tensor(buffer: buf, offset: 0, shape: shape, dtype: dtype)
 }
 
 /// Pack host f32 expert_bias into a GPU tensor of activation dtype.
