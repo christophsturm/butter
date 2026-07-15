@@ -1522,27 +1522,31 @@ final class Hy3MoELayer: Hy3LayerProtocol {
             if let fs = fusedShared { sharedOut = fs }
         }
 
+        // Combine routed + shared into a scratch buffer (avoid fresh empty).
         var combined = routed
         if nShared > 0 && !skipShared {
+            let combFlat = hy3ScratchTensor(
+                shape: [nRows * hidden], dtype: routed.dtype,
+                tag: "hy3_moe_comb_\(routed.dtype)_\(nRows)_\(hidden)", device: device)
             if dualQueue, let sOut = sharedOut, let vDone = sharedDoneValue {
                 cmd.encodeWaitForEvent(device.syncEvent, value: vDone)
                 combined = Ops.add(
                     routed.reshaped(to: [nRows * hidden]),
                     sOut.reshaped(to: [nRows * hidden]),
-                    on: cmd
+                    on: cmd, into: combFlat
                 ).reshaped(to: [nRows, hidden])
             } else if noDual {
                 let sOut = runSharedMLP(on: cmd)
                 combined = Ops.add(
                     routed.reshaped(to: [nRows * hidden]),
                     sOut.reshaped(to: [nRows * hidden]),
-                    on: cmd
+                    on: cmd, into: combFlat
                 ).reshaped(to: [nRows, hidden])
             } else if let sOut = sharedOut {
                 combined = Ops.add(
                     routed.reshaped(to: [nRows * hidden]),
                     sOut.reshaped(to: [nRows * hidden]),
-                    on: cmd
+                    on: cmd, into: combFlat
                 ).reshaped(to: [nRows, hidden])
             }
         }
