@@ -12,19 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// MetalTileLibrary
+// FFAIKernelsLibrary
 //
 // Loads kernels.metallib once at process startup and exposes the underlying
 // MTLLibrary + a default MTLDevice and MTLCommandQueue. Designed to be a
-// process-wide singleton (`MetalTileLibrary.shared`).
+// process-wide singleton (`FFAIKernelsLibrary.shared`).
 //
 // kernels.metallib + manifest.json are produced at build time by
-// metaltile-emit. See planning/architecture.md §1.
+// ffai-kernels-emit. See planning/architecture.md §1.
 
 import Foundation
 import Metal
 
-public enum MetalTileLibraryError: Error, CustomStringConvertible {
+public enum FFAIKernelsLibraryError: Error, CustomStringConvertible {
     case noDefaultDevice
     case noCommandQueue
     case metallibNotFound(URL)
@@ -44,7 +44,7 @@ public enum MetalTileLibraryError: Error, CustomStringConvertible {
     }
 }
 
-public final class MetalTileLibrary: @unchecked Sendable {
+public final class FFAIKernelsLibrary: @unchecked Sendable {
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
     public let library: MTLLibrary
@@ -98,17 +98,17 @@ public final class MetalTileLibrary: @unchecked Sendable {
 
     /// Process-wide singleton. Lazily initialized; throws on first access if
     /// the system has no default Metal device or the metallib can't be loaded.
-    public static let shared: MetalTileLibrary = {
+    public static let shared: FFAIKernelsLibrary = {
         do {
-            return try MetalTileLibrary()
+            return try FFAIKernelsLibrary()
         } catch {
-            fatalError("MetalTileLibrary.shared init failed: \(error)")
+            fatalError("FFAIKernelsLibrary.shared init failed: \(error)")
         }
     }()
 
     public init() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
-            throw MetalTileLibraryError.noDefaultDevice
+            throw FFAIKernelsLibraryError.noDefaultDevice
         }
         // Cap in-flight cmdbuf count to apply backpressure at the Metal
         // layer. See `defaultMaxCommandBufferCount` for the rationale.
@@ -118,7 +118,7 @@ public final class MetalTileLibrary: @unchecked Sendable {
         // Remove once the freeze diagnostic settles.
         FileHandle.standardError.write(
             Data(
-                "[MetalTileLibrary] maxCommandBufferCount=\(cap) (FFAI_MAX_COMMAND_BUFFERS=\(ProcessInfo.processInfo.environment["FFAI_MAX_COMMAND_BUFFERS"] ?? "\(Self.defaultMaxCommandBufferCount)"))\n"
+                "[FFAIKernelsLibrary] maxCommandBufferCount=\(cap) (FFAI_MAX_COMMAND_BUFFERS=\(ProcessInfo.processInfo.environment["FFAI_MAX_COMMAND_BUFFERS"] ?? "\(Self.defaultMaxCommandBufferCount)"))\n"
                     .utf8
             ))
         guard
@@ -126,7 +126,7 @@ public final class MetalTileLibrary: @unchecked Sendable {
                 maxCommandBufferCount: cap
             )
         else {
-            throw MetalTileLibraryError.noCommandQueue
+            throw FFAIKernelsLibraryError.noCommandQueue
         }
         let url = try Self.locateMetallib()
         do {
@@ -136,7 +136,7 @@ public final class MetalTileLibrary: @unchecked Sendable {
             self.library = library
             self.metallibURL = url
         } catch {
-            throw MetalTileLibraryError.metallibLoadFailed(url, error)
+            throw FFAIKernelsLibraryError.metallibLoadFailed(url, error)
         }
     }
 
@@ -156,6 +156,6 @@ public final class MetalTileLibrary: @unchecked Sendable {
         let fallback = Bundle.module.bundleURL.appendingPathComponent(
             "Resources/kernels.metallib"
         )
-        throw MetalTileLibraryError.metallibNotFound(fallback)
+        throw FFAIKernelsLibraryError.metallibNotFound(fallback)
     }
 }

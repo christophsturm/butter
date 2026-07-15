@@ -56,7 +56,7 @@ import Metal
 /// The `Ops.gemm` K-tile width. Dynamic-resolution vision towers must
 /// align their patch-embed input dim + SwiGLU intermediate dim to a
 /// multiple of this so the projection dispatches as a single
-/// `Ops.gemm`. 16 is the metaltile `mt_gemm` minimum K-tile.
+/// `Ops.gemm`. 16 is the ffai-kernels `ffai_gemm` minimum K-tile.
 let gemmKTileWidth: Int = 16
 
 // MARK: - Bias broadcast

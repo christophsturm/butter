@@ -104,7 +104,7 @@ struct Mamba2TextIntegrationTests {
     /// only suite that covers it end-to-end. Coherence parity with the
     /// bf16 case confirms the gate-then-norm fusion is mathematically
     /// correct (the kernel is GPU-correctness-tested against a CPU oracle
-    /// in metaltile; this is the in-model integration check).
+    /// in ffai-kernels; this is the in-model integration check).
     @Test("4-bit — fused pre-gated RMSNorm + int4 out_proj decodes coherently")
     func loadAndGenerate4bit() async throws {
         let m = try await ModelLoadLock.shared.loadSerially {

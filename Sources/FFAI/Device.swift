@@ -18,7 +18,7 @@
 
 import Foundation
 import Metal
-import MetalTileSwift
+import FFAIKernelsSwift
 
 public final class Device: @unchecked Sendable {
     public let mtlDevice: MTLDevice
@@ -35,9 +35,9 @@ public final class Device: @unchecked Sendable {
     private let residencyLock = NSLock()
 
     public static let shared: Device = {
-        // Reuse the same MTLDevice + queue MetalTileSwift uses, so PSOs
+        // Reuse the same MTLDevice + queue FFAIKernelsSwift uses, so PSOs
         // and buffers are guaranteed compatible.
-        let lib = MetalTileLibrary.shared
+        let lib = FFAIKernelsLibrary.shared
         return Device(mtlDevice: lib.device, commandQueue: lib.commandQueue)
     }()
 

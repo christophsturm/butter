@@ -164,7 +164,7 @@ struct FoldedBN {
 // ─── NHWC convolution helpers ─────────────────────────────────────────
 
 /// Depthwise convolution in NHWC format — **GPU-backed** via
-/// `Ops.depthwiseConv2dNHWC` (the `depthwise_conv2d_nhwc` metaltile kernel).
+/// `Ops.depthwiseConv2dNHWC` (the `depthwise_conv2d_nhwc` ffai-kernels kernel).
 /// Weight layout: [outC, kH, kW, 1] OHWI (depthwise: inC_per_group = 1) ==
 /// `[C, kH, kW]` flat. Applies `padding` on all sides (same-padding when
 /// padding = (kH-1)/2).

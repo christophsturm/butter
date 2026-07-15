@@ -46,14 +46,14 @@ public enum PSOCacheError: Error, CustomStringConvertible {
 }
 
 public final class PSOCache: @unchecked Sendable {
-    public static let shared = PSOCache(library: MetalTileLibrary.shared)
+    public static let shared = PSOCache(library: FFAIKernelsLibrary.shared)
 
-    private let library: MetalTileLibrary
+    private let library: FFAIKernelsLibrary
     private let lock = NSLock()  // protects `cache` reads + writes
     private let compileLock = NSLock()  // single-flight PSO compilation
     private var cache: [String: MTLComputePipelineState] = [:]
 
-    public init(library: MetalTileLibrary) {
+    public init(library: FFAIKernelsLibrary) {
         self.library = library
     }
 
@@ -104,7 +104,7 @@ public final class PSOCache: @unchecked Sendable {
         }
         lock.unlock()
 
-        // MPP cooperative-tensor kernels (mt_*_mpp_*) must be live-compiled
+        // MPP cooperative-tensor kernels (ffai_*_mpp_*) must be live-compiled
         // from their .metal source, NOT loaded from the pre-built metallib.
         // The MetalPerformancePrimitives header inlines cooperative-tensor
         // type IDs + descriptor layouts that drift between SDK versions —
@@ -138,8 +138,8 @@ public final class PSOCache: @unchecked Sendable {
 
     /// Returns true for kernels that use `mpp::tensor_ops::matmul2d` and
     /// must be live-compiled from .metal source on the running OS. Detected
-    /// purely by name — every metaltile MPP kernel name contains `_mpp_`
-    /// (e.g. `mt_qmm_mma_mpp_*`, `mt_moe_gather_qmm_mma_int4_bm{8,16,64}_mpp_*`).
+    /// purely by name — every ffai-kernels MPP kernel name contains `_mpp_`
+    /// (e.g. `ffai_qmm_mma_mpp_*`, `ffai_moe_gather_qmm_mma_int4_bm{8,16,64}_mpp_*`).
     /// Non-MPP kernels (the bulk of the metallib) still load from
     /// kernels.metallib — much faster PSO build.
     private static func isMppKernel(_ name: String) -> Bool {
@@ -174,12 +174,12 @@ public final class PSOCache: @unchecked Sendable {
         return fn
     }
 
-    /// Locate `<name>.metal` next to the loaded metallib. `tile emit` writes
+    /// Locate `<name>.metal` next to the loaded metallib. `ffaik emit` writes
     /// per-kernel sources to `Resources/kernels/<name>.metal` alongside
     /// `Resources/kernels.metallib`, so we anchor the lookup off
     /// `library.metallibURL`.
     private static func locateMetalSource(_ name: String) throws -> URL {
-        let metallibURL = MetalTileLibrary.shared.metallibURL
+        let metallibURL = FFAIKernelsLibrary.shared.metallibURL
         let kernelsDir = metallibURL.deletingLastPathComponent()
             .appendingPathComponent("kernels", isDirectory: true)
         let url = kernelsDir.appendingPathComponent("\(name).metal")

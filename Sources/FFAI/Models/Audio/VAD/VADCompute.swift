@@ -19,7 +19,7 @@
 // elementwise, RMSNorm, SSM step, decode SDPA. The VAD models need a
 // different primitive set — strided/padded conv1d, an LSTM cell,
 // full-sequence multi-head attention, layer norm, GELU. Those kernels
-// do not exist in metaltile today, and inventing them is out of scope
+// do not exist in ffai-kernels today, and inventing them is out of scope
 // (and explicitly disallowed by the porting contract).
 //
 // VAD models are tiny — SileroVAD ~1.5M params, SmartTurn ~8M,

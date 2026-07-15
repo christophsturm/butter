@@ -20,7 +20,7 @@
 // repetition-penalty — we read the full vocab to CPU once per token and run
 // the pipeline here. At Qwen3 vocab=151_936 fp16 that's ~304 KB per token,
 // negligible bandwidth (~18 MB/s at 60 tok/s) on Apple Silicon's unified
-// memory. A GPU softmax+categorical sample kernel is on the metaltile
+// memory. A GPU softmax+categorical sample kernel is on the ffai-kernels
 // `ek/sampling-kernels` branch for the future fully-on-GPU path.
 //
 // Pipeline order (matches mlx-swift-lm / mlx-lm):

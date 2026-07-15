@@ -335,7 +335,7 @@ public final class MoELayer: Module, DecoderLayer {
     public let hidden: Int
 
     /// Stacked-expert weight handles for the batched gather BGEMM fast
-    /// path. When set, `decode` dispatches `mt_moe_gather_qmm_mma_int4_bm16`
+    /// path. When set, `decode` dispatches `ffai_moe_gather_qmm_mma_int4_bm16`
     /// instead of running `topK` sequential per-expert SwiGLU triplets —
     /// 3 kernel launches per token instead of `3 * topK` (24 → 3 at
     /// `topK=8`). Populated by the host model's MoE builder when (a) the
@@ -423,7 +423,7 @@ public final class MoELayer: Module, DecoderLayer {
     private var expertInnerScratches: [Tensor] = []
     private var expertOutScratches: [Tensor] = []
     /// GPU MoE router scratches — written once per layer per token by
-    /// `mt_moe_router_topk`, then consumed by the per-slot indexed qmms
+    /// `ffai_moe_router_topk`, then consumed by the per-slot indexed qmms
     /// and the scalarFMAChain8.
     private var routerIndicesScratch: Tensor?
     private var routerWeightsScratch: Tensor?
@@ -542,7 +542,7 @@ public final class MoELayer: Module, DecoderLayer {
         // ── 2a. GPU MoE router fast path ──────────────────────────────
         // When `FFAI_MOE_GPU_ROUTER=1` (default ON) AND the layer has
         // stacked int4 expert layout AND routing matches
-        // `mt_moe_router_topk`'s assumptions (softmax-then-topK + Qwen-
+        // `ffai_moe_router_topk`'s assumptions (softmax-then-topK + Qwen-
         // MoE-style renorm, topK=8), skip the CPU sync entirely. The
         // router writes topK indices + weights to a GPU buffer; per-
         // expert qmms read their slot's expert id from that buffer via
@@ -665,7 +665,7 @@ public final class MoELayer: Module, DecoderLayer {
     ///      Uses the same `Tensor.filled([hidden])` broadcast pattern as
     ///      the single-token `batchedSwiGLU`, mTotal times. Scatter-sum
     ///      is the dominant residual cost at large `mTotal`; a future
-    ///      `mt_moe_scatter_scale_add` kernel collapses these mTotal
+    ///      `ffai_moe_scatter_scale_add` kernel collapses these mTotal
     ///      dispatches into one.
     ///   9. Shared expert (if any): one per-row SwiGLU call across T
     ///      tokens (also currently a T-loop because the single-token
@@ -691,7 +691,7 @@ public final class MoELayer: Module, DecoderLayer {
         // gateLogitsAll shape: [T, nExperts]
 
         // ── 2. Routing — GPU fast path or CPU sync ──────────────────────
-        // When router config matches `mt_moe_router_topk`'s semantic
+        // When router config matches `ffai_moe_router_topk`'s semantic
         // envelope (softmax → topK + Qwen-MoE renorm, no expert bias,
         // k=8), run the T-batched router on GPU via
         // `Ops.moeRouterTopKMany`. Eliminates the T-parallel host
@@ -773,7 +773,7 @@ public final class MoELayer: Module, DecoderLayer {
             sortedWeightsHost.append(tuple.3)
         }
         // ── 4b. Build inv_perm + per-token-order weights for the
-        // mt_moe_unpermute fused scatter-sum kernel. `invPermHost[r·k+s]`
+        // ffai_moe_unpermute fused scatter-sum kernel. `invPermHost[r·k+s]`
         // = sortedIdx where (token r, slot s) landed in `downOut`.
         // `weightsTokenOrderHost[r·k+s]` = routings[r].weights[s]
         // (unsorted, matches the kernel's per-token lookup).
@@ -857,7 +857,7 @@ public final class MoELayer: Module, DecoderLayer {
         //     cooperative-tensor). Wrapper in tree but dispatch-shape
         //     fails the equivalence canary (argmax 220 — the same
         //     dispatchThreads/threadgroups grid bug we saw at m1).
-        //     Needs verification against the metaltile-ffai kernel
+        //     Needs verification against the ffai-kernels-ffai kernel
         //     source. **Default off** until that's resolved.
         //   - 16 ≤ mTotal → bm16 (the default `moeGatherDequant
         //     GemmInt4`). 16-deep tile fill across consecutive
@@ -902,7 +902,7 @@ public final class MoELayer: Module, DecoderLayer {
             indices, mTotal, hidden, moeIntermediate, groupSize, work, downOut)
 
         // ── 12. Weighted scatter-sum back to [T, hidden] via fused
-        // `mt_moe_unpermute` kernel — ONE dispatch over T·hidden
+        // `ffai_moe_unpermute` kernel — ONE dispatch over T·hidden
         // elements instead of mTotal·2 small `Tensor.filled([hidden])`
         // + mul + add per row. At Qwen3.6-A3B T=32 topK=8 mTotal=256
         // that's 512 dispatches → 1 per gate/up/down stage.
@@ -1002,7 +1002,7 @@ public final class MoELayer: Module, DecoderLayer {
         let dtype = stacked.dtype
         let useBm8 = topK <= 8 && useBm8Env
         // `FFAI_MOE_M1=1` routes the gather through the scalar m1
-        // kernel `mt_moe_gather_qmm_int4` — no MPP / cooperative-tensor
+        // kernel `ffai_moe_gather_qmm_int4` — no MPP / cooperative-tensor
         // overhead. At decode T=1 the cooperative-tensor variants
         // (bm8 / bm16 / bm64) lose ~15 % to descriptor setup cost; the
         // m1 path does a one-output-cell-per-TG dot-product with
@@ -1137,7 +1137,7 @@ public final class MoELayer: Module, DecoderLayer {
 
     /// One SwiGLU FFN: down(silu(gate(x)) * up(x)).
     ///
-    /// `silu(gate) * up` runs as a single fused `mt_swiglu` dispatch
+    /// `silu(gate) * up` runs as a single fused `ffai_swiglu` dispatch
     /// instead of two launches (silu → mul). Saves one elementwise
     /// kernel + one full-tensor RMW per call. At Qwen3.6-A3B decode T=1
     /// the per-expert intermediate is [moeIntermediate=768] so the win

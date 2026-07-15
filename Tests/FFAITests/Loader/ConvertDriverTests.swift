@@ -26,7 +26,7 @@
 //     it entirely for a pure downcast).
 //
 // These DON'T test numerical correctness of the quantize kernels —
-// `QuantizedOpsAffineTests.swift` and the metaltile-side
+// `QuantizedOpsAffineTests.swift` and the ffai-kernels-side
 // `qmm_mma_int*_gpu_correctness.rs` tests already pin those. The
 // convert-driver tests guard the *plumbing*: spec routing, storage
 // shape calculation, config.json rewriting, dtype handling.

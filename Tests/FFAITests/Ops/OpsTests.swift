@@ -631,12 +631,12 @@ struct OpsTests {
         }
     }
 
-    @Test("rmsNorm f32 — wide row (n=5376) routes to mt_rms_norm_wide")
+    @Test("rmsNorm f32 — wide row (n=5376) routes to ffai_rms_norm_wide")
     func rmsNormWideF32() {
         autoreleasepool {
             // n = 5376 (Gemma 4 31B hidden) is past the 4096 cap of the
             // 4-elements-per-thread kernel, so Ops.rmsNorm routes to the
-            // strided mt_rms_norm_wide kernel. eps eps=1e-6 like Gemma 4.
+            // strided ffai_rms_norm_wide kernel. eps eps=1e-6 like Gemma 4.
             let n = 5376
             let eps: Float = 1e-6
             let xs: [Float] = (0 ..< n).map { Float(($0 % 37) - 18) * 0.21 }
@@ -2066,7 +2066,7 @@ struct OpsTests {
             let v = ramp(nKVHeads * kvStride * headDim, 0.007, -0.3)
             let bias = (0 ..< nQHeads * relLen).map { (Float($0 % 7) - 3.0) * 0.05 }
 
-            // CPU naive reference (mirrors the metaltile oracle):
+            // CPU naive reference (mirrors the ffai-kernels oracle):
             // softmax_j( scale·Qᵢ·Kⱼ + bias[h, (j+relZero)-(baseKV+i)] )·Vⱼ.
             var expected = [Float](repeating: 0, count: nQuery * nQHeads * headDim)
             for r in 0 ..< nQuery {

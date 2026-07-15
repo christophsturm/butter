@@ -6,8 +6,8 @@
 #
 # Covers:
 #   - make build      (~10-15 s when the kernel cache is warm)
-#   - make test-unit  (~2 min — FFAITests + MetalTileSwiftTests at the
-#                      production cap, the MetalTileLibrary code default)
+#   - make test-unit  (~2 min — FFAITests + FFAIKernelsSwiftTests at the
+#                      production cap, the FFAIKernelsLibrary code default)
 #
 # NOT run here (too slow or environment-specific):
 #   - make test-integration  — multi-GB checkpoint downloads + per-family

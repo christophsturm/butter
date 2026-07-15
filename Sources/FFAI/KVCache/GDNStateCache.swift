@@ -22,10 +22,10 @@
 // Storage dtype is **fp32**: the recurrence
 //   S_t = g_t · S_{t-1} + β_t · k_t · (v_t − k_tᵀ · S_{t-1})ᵀ
 // accumulates a multiplicative gate + a rank-1 update over many decode
-// steps; bf16's 7-bit mantissa drifts fast. The metaltile kernel runs
+// steps; bf16's 7-bit mantissa drifts fast. The ffai-kernels kernel runs
 // `S` in fp32 regardless of the activation dtype, so the cache matches.
 //
-// Double-buffered. The `mt_gated_delta_step` kernel reads `state_in`
+// Double-buffered. The `ffai_gated_delta_step` kernel reads `state_in`
 // and writes a distinct `state_out` (it is NOT an in-place update like
 // `ssm_step`). The cache holds both buffers and `swap()` ping-pongs
 // them after each decode step so the freshly-written state becomes the

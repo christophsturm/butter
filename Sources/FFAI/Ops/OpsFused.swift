@@ -41,7 +41,7 @@
 
 import Foundation
 import Metal
-import MetalTileSwift
+import FFAIKernelsSwift
 
 extension Ops {
 
@@ -63,19 +63,19 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(gate.elementCount)
         switch gate.dtype {
         case .f32:
-            MetalTileKernels.mt_fused_gate_gelu_f32(
+            FFAIKernels.ffai_fused_gate_gelu_f32(
                 gate: gate.buffer, gateOffset: gate.offset,
                 up: up.buffer, upOffset: up.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_fused_gate_gelu_f16(
+            FFAIKernels.ffai_fused_gate_gelu_f16(
                 gate: gate.buffer, gateOffset: gate.offset,
                 up: up.buffer, upOffset: up.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_fused_gate_gelu_bf16(
+            FFAIKernels.ffai_fused_gate_gelu_bf16(
                 gate: gate.buffer, gateOffset: gate.offset,
                 up: up.buffer, upOffset: up.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -98,19 +98,19 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(gate.elementCount)
         switch gate.dtype {
         case .f32:
-            MetalTileKernels.mt_fused_gate_clipped_swiglu_f32(
+            FFAIKernels.ffai_fused_gate_clipped_swiglu_f32(
                 gate: gate.buffer, gateOffset: gate.offset,
                 up: up.buffer, upOffset: up.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_fused_gate_clipped_swiglu_f16(
+            FFAIKernels.ffai_fused_gate_clipped_swiglu_f16(
                 gate: gate.buffer, gateOffset: gate.offset,
                 up: up.buffer, upOffset: up.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_fused_gate_clipped_swiglu_bf16(
+            FFAIKernels.ffai_fused_gate_clipped_swiglu_bf16(
                 gate: gate.buffer, gateOffset: gate.offset,
                 up: up.buffer, upOffset: up.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -134,17 +134,17 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(a.elementCount)
         switch a.dtype {
         case .f32:
-            MetalTileKernels.mt_sigmoid_mul_f32(
+            FFAIKernels.ffai_sigmoid_mul_f32(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_sigmoid_mul_f16(
+            FFAIKernels.ffai_sigmoid_mul_f16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_sigmoid_mul_bf16(
+            FFAIKernels.ffai_sigmoid_mul_bf16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
@@ -188,7 +188,7 @@ extension Ops {
         let tg = MTLSize(width: tgSize, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            MetalTileKernels.ffai_rms_norm_residual_f32(
+            FFAIKernels.ffai_rms_norm_residual_f32(
                 x: x.buffer, xOffset: x.offset,
                 residual: residual.buffer, residualOffset: residual.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -196,7 +196,7 @@ extension Ops {
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_rms_norm_residual_f16(
+            FFAIKernels.ffai_rms_norm_residual_f16(
                 x: x.buffer, xOffset: x.offset,
                 residual: residual.buffer, residualOffset: residual.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -204,7 +204,7 @@ extension Ops {
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_rms_norm_residual_bf16(
+            FFAIKernels.ffai_rms_norm_residual_bf16(
                 x: x.buffer, xOffset: x.offset,
                 residual: residual.buffer, residualOffset: residual.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -250,7 +250,7 @@ extension Ops {
         let tg = MTLSize(width: tgSize, height: 1, depth: 1)
         switch z.dtype {
         case .f32:
-            MetalTileKernels.ffai_gated_rmsnorm_f32(
+            FFAIKernels.ffai_gated_rmsnorm_f32(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -258,7 +258,7 @@ extension Ops {
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_gated_rmsnorm_f16(
+            FFAIKernels.ffai_gated_rmsnorm_f16(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -266,7 +266,7 @@ extension Ops {
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_gated_rmsnorm_bf16(
+            FFAIKernels.ffai_gated_rmsnorm_bf16(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -279,10 +279,10 @@ extension Ops {
         return result
     }
 
-    // ─── mt_rms_norm_small ───────────────────────────────────────────
+    // ─── ffai_rms_norm_small ───────────────────────────────────────────
     //
     // RMSNorm specialised for "small" row widths (n ∈ {64, 96, 128, …}
-    // for per-head qnorm / knorm). The default `mt_rms_norm` uses 4
+    // for per-head qnorm / knorm). The default `ffai_rms_norm` uses 4
     // elements/thread so `TPG = n/4`; that hits the `TPG ≥ 32`
     // simdgroup floor only at `n ≥ 128`. The small variant uses 2
     // elements/thread (`TPG = n/2`), so `n ≥ 64` is supported, and
@@ -315,21 +315,21 @@ extension Ops {
         let tg = MTLSize(width: tgSize, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            MetalTileKernels.mt_rms_norm_small_f32(
+            FFAIKernels.ffai_rms_norm_small_f32(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_rms_norm_small_f16(
+            FFAIKernels.ffai_rms_norm_small_f16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_rms_norm_small_bf16(
+            FFAIKernels.ffai_rms_norm_small_bf16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -370,21 +370,21 @@ extension Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch out.dtype {
         case .f32:
-            MetalTileKernels.mt_scalar_fma_f32(
+            FFAIKernels.ffai_scalar_fma_f32(
                 scalar: scalar.buffer, scalarOffset: scalar.offset,
                 value: value.buffer, valueOffset: value.offset,
                 base: base.buffer, baseOffset: base.offset,
                 out: out.buffer, outOffset: out.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_scalar_fma_f16(
+            FFAIKernels.ffai_scalar_fma_f16(
                 scalar: scalar.buffer, scalarOffset: scalar.offset,
                 value: value.buffer, valueOffset: value.offset,
                 base: base.buffer, baseOffset: base.offset,
                 out: out.buffer, outOffset: out.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_scalar_fma_bf16(
+            FFAIKernels.ffai_scalar_fma_bf16(
                 scalar: scalar.buffer, scalarOffset: scalar.offset,
                 value: value.buffer, valueOffset: value.offset,
                 base: base.buffer, baseOffset: base.offset,
@@ -427,9 +427,9 @@ extension Ops {
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
         let psoName: String
         switch dt {
-        case .f32: psoName = "mt_scalar_fma_f32"
-        case .f16: psoName = "mt_scalar_fma_f16"
-        case .bf16: psoName = "mt_scalar_fma_bf16"
+        case .f32: psoName = "ffai_scalar_fma_f32"
+        case .f16: psoName = "ffai_scalar_fma_f16"
+        case .bf16: psoName = "ffai_scalar_fma_bf16"
         default: fatalError("Ops.scalarFMAMany: unsupported dtype \(dt)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -450,7 +450,7 @@ extension Ops {
     /// 8-way fused scalarFMA chain. Computes
     /// `out[i] = sum_{k=0..8} scalars[k][0] * values[k][i]` in ONE
     /// kernel dispatch. Collapses the topK=8 expert accumulator chain
-    /// (8 sequential `mt_scalar_fma` dispatches + 1 zero-fill of `acc`)
+    /// (8 sequential `ffai_scalar_fma` dispatches + 1 zero-fill of `acc`)
     /// into a single dispatch with 16 input buffers, saving 7 read +
     /// 7 write roundtrips of `acc` per MoE layer.
     public static func scalarFMAChain8(
@@ -478,7 +478,7 @@ extension Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch dt {
         case .f32:
-            MetalTileKernels.mt_scalar_fma_chain8_f32(
+            FFAIKernels.ffai_scalar_fma_chain8_f32(
                 scalar0: scalars[0].buffer, scalar0Offset: scalars[0].offset,
                 value0: values[0].buffer, value0Offset: values[0].offset,
                 scalar1: scalars[1].buffer, scalar1Offset: scalars[1].offset,
@@ -498,7 +498,7 @@ extension Ops {
                 out: out.buffer, outOffset: out.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_scalar_fma_chain8_f16(
+            FFAIKernels.ffai_scalar_fma_chain8_f16(
                 scalar0: scalars[0].buffer, scalar0Offset: scalars[0].offset,
                 value0: values[0].buffer, value0Offset: values[0].offset,
                 scalar1: scalars[1].buffer, scalar1Offset: scalars[1].offset,
@@ -518,7 +518,7 @@ extension Ops {
                 out: out.buffer, outOffset: out.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_scalar_fma_chain8_bf16(
+            FFAIKernels.ffai_scalar_fma_chain8_bf16(
                 scalar0: scalars[0].buffer, scalar0Offset: scalars[0].offset,
                 value0: values[0].buffer, value0Offset: values[0].offset,
                 scalar1: scalars[1].buffer, scalar1Offset: scalars[1].offset,
@@ -611,7 +611,7 @@ extension Ops {
         let tg = MTLSize(width: tpg, height: 1, depth: 1)
         switch output.dtype {
         case .f32:
-            MetalTileKernels.ffai_moe_down_swiglu_accum_int4_chain8_f32(
+            FFAIKernels.ffai_moe_down_swiglu_accum_int4_chain8_f32(
                 gate_0: gates[0].buffer, gate_0Offset: gates[0].offset,
                 up_0: ups[0].buffer, up_0Offset: ups[0].offset,
                 gate_1: gates[1].buffer, gate_1Offset: gates[1].offset,
@@ -638,7 +638,7 @@ extension Ops {
                 group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_moe_down_swiglu_accum_int4_chain8_f16(
+            FFAIKernels.ffai_moe_down_swiglu_accum_int4_chain8_f16(
                 gate_0: gates[0].buffer, gate_0Offset: gates[0].offset,
                 up_0: ups[0].buffer, up_0Offset: ups[0].offset,
                 gate_1: gates[1].buffer, gate_1Offset: gates[1].offset,
@@ -665,7 +665,7 @@ extension Ops {
                 group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_moe_down_swiglu_accum_int4_chain8_bf16(
+            FFAIKernels.ffai_moe_down_swiglu_accum_int4_chain8_bf16(
                 gate_0: gates[0].buffer, gate_0Offset: gates[0].offset,
                 up_0: ups[0].buffer, up_0Offset: ups[0].offset,
                 gate_1: gates[1].buffer, gate_1Offset: gates[1].offset,
@@ -724,7 +724,7 @@ extension Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch out.dtype {
         case .f32:
-            MetalTileKernels.mt_sigmoid_scalar_fma_residual_f32(
+            FFAIKernels.ffai_sigmoid_scalar_fma_residual_f32(
                 gate: gate.buffer, gateOffset: gate.offset,
                 value: value.buffer, valueOffset: value.offset,
                 base: base.buffer, baseOffset: base.offset,
@@ -732,7 +732,7 @@ extension Ops {
                 out: out.buffer, outOffset: out.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_sigmoid_scalar_fma_residual_f16(
+            FFAIKernels.ffai_sigmoid_scalar_fma_residual_f16(
                 gate: gate.buffer, gateOffset: gate.offset,
                 value: value.buffer, valueOffset: value.offset,
                 base: base.buffer, baseOffset: base.offset,
@@ -740,7 +740,7 @@ extension Ops {
                 out: out.buffer, outOffset: out.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_sigmoid_scalar_fma_residual_bf16(
+            FFAIKernels.ffai_sigmoid_scalar_fma_residual_bf16(
                 gate: gate.buffer, gateOffset: gate.offset,
                 value: value.buffer, valueOffset: value.offset,
                 base: base.buffer, baseOffset: base.offset,

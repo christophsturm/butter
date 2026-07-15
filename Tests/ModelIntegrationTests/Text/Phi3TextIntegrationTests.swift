@@ -75,7 +75,7 @@ struct Phi3TextIntegrationTests {
         // load + interface + cache-shape checks above pass; this forward
         // call (and the generate below) will crash with `head_dim must
         // be one of {64,128,256,512}` until the head_dim=96 kernel
-        // specialization lands in metaltile. Suite stays ENABLED so the
+        // specialization lands in ffai-kernels. Suite stays ENABLED so the
         // gap stays visible. Tracked as a follow-up.
         let logits = m.textEngine.forward(tokenId: 1, position: 0, caches: caches)
         #expect(logits.elementCount == 32_064)

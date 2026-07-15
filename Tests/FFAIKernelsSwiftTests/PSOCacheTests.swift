@@ -27,13 +27,13 @@ import Foundation
 @preconcurrency import Metal
 import Testing
 
-@testable import MetalTileSwift
+@testable import FFAIKernelsSwift
 
 @Suite("PSOCache")
 struct PSOCacheTests {
 
     private func makeCache() throws -> PSOCache {
-        let lib = try MetalTileLibrary()
+        let lib = try FFAIKernelsLibrary()
         return PSOCache(library: lib)
     }
 
@@ -115,7 +115,7 @@ struct PSOCacheTests {
         #expect(freshPso.maxTotalThreadsPerThreadgroup > 0)
         #expect(sharedPso.maxTotalThreadsPerThreadgroup > 0)
         // The two caches are backed by different MTLLibrary instances
-        // (each `MetalTileLibrary()` builds its own MTLLibrary), so the
+        // (each `FFAIKernelsLibrary()` builds its own MTLLibrary), so the
         // PSO instances will differ — but both must be live.
     }
 

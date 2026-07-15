@@ -118,7 +118,7 @@ public struct Granite4Hybrid: Granite4Variant {
                     + "n_groups (\(nGroups))")
         }
         // Granite's gated mixer RMSNorm is a single full-width RMSNorm
-        // over d_inner (NOT per-group like NemotronH). The metaltile
+        // over d_inner (NOT per-group like NemotronH). The ffai-kernels
         // rms_norm reduction kernel requires the row size to be a
         // multiple of 128 and ≤ 4096.
         guard dInner % 128 == 0, dInner <= 4096 else {
@@ -410,7 +410,7 @@ public struct Granite4Hybrid: Granite4Variant {
             outProj = AnyLinear(Linear(weight: outW))
         }
 
-        // conv1d.weight ships [conv_dim, 1, kernel]; the metaltile kernel
+        // conv1d.weight ships [conv_dim, 1, kernel]; the ffai-kernels kernel
         // wants [kernel, conv_dim].
         let convWSrc = try weights.tensor(named: "\(p).conv1d.weight")
         precondition(
@@ -1046,7 +1046,7 @@ public final class Granite4Layer: Module, DecoderLayer {
             mixerOut = a.forward(xNorm, cache: kv, cmd: cmd, device: device)
         }
         // residual_multiplier already folded into the mixer output proj.
-        // Fused residual add + post-mixer RMSNorm via mt_add_rms_norm
+        // Fused residual add + post-mixer RMSNorm via ffai_add_rms_norm
         // (hidden ≤ 4096), but ONLY on the attention-mixer branch —
         // the task carve-out is "attention/FFN residuals, NOT the
         // SSM recurrence paths." Validator gate handles wider variants.
@@ -1454,7 +1454,7 @@ private func tileDGMH(
     return writeFloatsGMH(tiled, shape: [nHeads * headDim], dtype: dtype, device: device)
 }
 
-/// Transpose HF conv1d.weight `[C, 1, K]` → `[K, C]` for the metaltile
+/// Transpose HF conv1d.weight `[C, 1, K]` → `[K, C]` for the ffai-kernels
 /// conv kernel.
 private func transposeConv1dWeightGMH(
     src: Tensor, kernel K: Int, channels C: Int,

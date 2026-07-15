@@ -615,7 +615,7 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
 /// serializes the buffer reuse across layers within a cmdbuf.
 ///
 /// Bit-width support today: **8**. int4 + int6 land as follow-up
-/// commits — the metaltile-side kernels are bit-specific
+/// commits — the ffai-kernels-side kernels are bit-specific
 /// (`quantize_kv_int8` / `bulk_dequant_kv_int8`); int4 + int6 will
 /// add their own kernel pairs alongside.
 public final class AffineQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {

@@ -24,7 +24,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-METALTILE_DIR="$PROJECT_ROOT/../metaltile"
+FFAI_KERNELS_DIR="$PROJECT_ROOT/../ffai-kernels"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -91,19 +91,19 @@ else
 fi
 
 # ─────────────────────────────────────────────
-# Sibling metaltile checkout
+# Sibling ffai-kernels checkout
 # ─────────────────────────────────────────────
 echo ""
-echo "Checking sibling metaltile repo..."
-if [ ! -d "$METALTILE_DIR" ]; then
-    warn "metaltile not found at $METALTILE_DIR"
+echo "Checking sibling ffai-kernels repo..."
+if [ ! -d "$FFAI_KERNELS_DIR" ]; then
+    warn "ffai-kernels not found at $FFAI_KERNELS_DIR"
     echo ""
     echo "Clone it with:"
-    echo "  cd $(dirname "$PROJECT_ROOT") && git clone https://github.com/thewafflehaus/metaltile"
+    echo "  cd $(dirname "$PROJECT_ROOT") && git clone https://github.com/thewafflehaus/ffai-kernels"
     echo ""
-    fail "metaltile checkout required for kernel generation"
+    fail "ffai-kernels checkout required for kernel generation"
 fi
-ok "metaltile: $METALTILE_DIR"
+ok "ffai-kernels: $FFAI_KERNELS_DIR"
 
 # ─────────────────────────────────────────────
 # Resolve packages

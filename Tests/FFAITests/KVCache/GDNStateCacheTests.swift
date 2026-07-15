@@ -180,8 +180,8 @@ struct GDNStateCacheTests {
     }
 
     /// Run `tSteps` of the GDN recurrence on the GPU by looping the
-    /// single-step `mt_gated_delta_step` kernel once per token —
-    /// `mt_gated_delta_step` performs exactly one recurrence step, so
+    /// single-step `ffai_gated_delta_step` kernel once per token —
+    /// `ffai_gated_delta_step` performs exactly one recurrence step, so
     /// multi-step prefill is a per-token loop, double-buffering state
     /// via `GDNStateCache.swap()`. Returns (finalState, y).
     private func gpuRun(

@@ -423,7 +423,7 @@ public struct NemotronHHybrid: NemotronHVariant {
                 Linear(weight: try weights.tensor(named: "\(p).out_proj.weight")))
         }
 
-        // conv1d.weight ships [conv_dim, 1, kernel]; the metaltile kernel
+        // conv1d.weight ships [conv_dim, 1, kernel]; the ffai-kernels kernel
         // wants [kernel, conv_dim].
         let convWSrc = try weights.tensor(named: "\(p).conv1d.weight")
         precondition(
@@ -906,7 +906,7 @@ public final class NemotronHMoELayer: Module, DecoderLayer {
         let xNorm = norm(h, on: cmd)
         let logitsTensor = gate(xNorm, on: cmd)
         // GPU router score: scores = sigmoid(logits) + bias, fused onto
-        // the same command buffer as the gate GEMV (the metaltile
+        // the same command buffer as the gate GEMV (the ffai-kernels
         // `ffai_moe_router_sigmoid_bias` kernel; f32-only, so cast the
         // gate logits to f32 first if the activation dtype differs).
         let logitsF32: Tensor
@@ -1414,7 +1414,7 @@ private func tileDNH(
     return writeFloatsNH(tiled, shape: [nHeads * headDim], dtype: dtype, device: device)
 }
 
-/// Transpose HF conv1d.weight `[C, 1, K]` → `[K, C]` for the metaltile
+/// Transpose HF conv1d.weight `[C, 1, K]` → `[K, C]` for the ffai-kernels
 /// conv kernel.
 private func transposeConv1dWeightNH(
     src: Tensor, kernel K: Int, channels C: Int,

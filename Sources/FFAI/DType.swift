@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Numeric types FFAI tensors can hold. Matches metaltile's DType subset
+// Numeric types FFAI tensors can hold. Matches ffai-kernels' DType subset
 // we actually use for inference.
 
 import Foundation
@@ -54,6 +54,6 @@ public enum DType: String, Sendable, Hashable, Codable {
         }
     }
 
-    /// Suffix used in metaltile-emit kernel names ("rms_norm_f16", etc.)
+    /// Suffix used in ffai-kernels-emit kernel names ("rms_norm_f16", etc.)
     public var kernelSuffix: String { rawValue }
 }

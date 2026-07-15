@@ -14,7 +14,7 @@
 //
 // OpsValidation — pure, testable wrapper precondition logic.
 //
-// Background: every `Ops.*` wrapper around a reduction-mode metaltile
+// Background: every `Ops.*` wrapper around a reduction-mode ffai-kernels
 // kernel has dispatch-shape invariants that, if violated, range from
 // silent miscompute to a non-preemptive GPU pin (system freeze).
 // Before this file existed, the invariants lived inline in each
@@ -42,12 +42,12 @@ public enum OpsValidation {
 
     // ─── rmsNorm + rmsNormRows ─────────────────────────────────────
     //
-    // `Ops.dispatchRmsNorm` routes by row width across two metaltile
-    // kernels (`crates/metaltile-std/src/mlx/rms_norm.rs`):
-    //   • `mt_rms_norm` (fast path). `N = TPG * 4` (4 elements per
+    // `Ops.dispatchRmsNorm` routes by row width across two ffai-kernels
+    // kernels (`crates/ffai-kernels-std/src/mlx/rms_norm.rs`):
+    //   • `ffai_rms_norm` (fast path). `N = TPG * 4` (4 elements per
     //     thread), `TPG = n / 4`, `TPG` a multiple of 32 ⇒ `n` a
     //     multiple of 128, `TPG ≤ 1024` ⇒ `n ≤ 4096`.
-    //   • `mt_rms_norm_wide` (any width). Each thread strides over the
+    //   • `ffai_rms_norm_wide` (any width). Each thread strides over the
     //     row with `TPG = 1024`; no 128-alignment or upper bound. Used
     //     when `n > 4096` (Gemma 4 27B+ hidden 5376) AND when `n` is
     //     not a multiple of 128 (SmolVLM2 vision tower d=960 etc).
@@ -69,7 +69,7 @@ public enum OpsValidation {
 
     // ─── sdpaDecode ────────────────────────────────────────────────
     //
-    // Kernel invariants (from `crates/metaltile-std/src/ffai/sdpa_decode.rs`
+    // Kernel invariants (from `crates/ffai-kernels-std/src/ffai/sdpa_decode.rs`
     // + `sdpa_decode_d64.rs` §"DISPATCH INVARIANTS"):
     //   1. `head_dim ∈ {64, 128, 256, 512}`. Each lane owns
     //      `head_dim / 32` consecutive Q/K/V elements; loads are
@@ -84,7 +84,7 @@ public enum OpsValidation {
     //   3. `n_kv ≤ kv_stride`. The kernel walks `[0, n_kv)` only;
     //      `kv_stride` is the pre-allocated maxSeq capacity.
     //   4. Sliding-window / sink fast path (head_dim=128 variants only,
-    //      added in metaltile PR #50): the kernel attends the sink
+    //      added in ffai-kernels PR #50): the kernel attends the sink
     //      range `[0, sink_end)` plus the window range
     //      `[window_start, n_kv)` and skips `[sink_end, window_start)`
     //      at the loop-bound level. Caller contract:
@@ -201,15 +201,15 @@ public enum OpsValidation {
 
     // ─── add_rms_norm (fused residual + RMSNorm) ───────────────────
     //
-    // `mt_add_rms_norm` fuses the transformer block's residual stream
+    // `ffai_add_rms_norm` fuses the transformer block's residual stream
     // and post-residual RMSNorm into one kernel. Each row uses TPG =
-    // n / 4 (4 elements per thread, same pattern as `mt_rms_norm`),
+    // n / 4 (4 elements per thread, same pattern as `ffai_rms_norm`),
     // so n must be a multiple of 4 AND n / 4 must stay within Apple
     // Silicon's 1024-thread-per-group cap → **n ≤ 4096**. Wider
     // hidden sizes (Gemma 4 27B+ at hidden 5376) MUST fall back to
     // separate `add` + `rmsNorm` calls.
 
-    /// Largest row width the fused `mt_add_rms_norm` kernel can take.
+    /// Largest row width the fused `ffai_add_rms_norm` kernel can take.
     /// Above this, callers should use separate `Ops.add` + `Ops.rmsNorm`.
     public static let addRmsNormMaxRowSize = 4096
 
@@ -249,11 +249,11 @@ public enum OpsValidation {
     public static let sdpaBidirectionalSupportedHeadDims: Set<Int> = [32, 64, 72, 80, 96]
 
     /// head_dim values whose GPU `Ops.sdpaBidirectional` path is **verified
-    /// safe at production shape** — a metaltile production-shape
+    /// safe at production shape** — a ffai-kernels production-shape
     /// GPU-correctness cell (16 heads × 576-patch vision tower /
     /// 1500-frame audio encoder; 9216–24000 threadgroups of 1024) exists,
     /// passes against the CPU oracle, and does NOT pin the GPU. See
-    /// `crates/metaltile-std/src/ffai/sdpa_bidirectional.rs`:
+    /// `crates/ffai-kernels-std/src/ffai/sdpa_bidirectional.rs`:
     /// `test_ffai_sdpa_bidirectional_d{64,80,96}_vision_tower` +
     /// `_d64_audio_encoder`.
     ///
@@ -312,7 +312,7 @@ public enum OpsValidation {
 
     // ─── gemv ──────────────────────────────────────────────────────
     //
-    // `mt_gemv` (MLX-derived). Adaptive `lsize` reduction → no GPU-pin
+    // `ffai_gemv` (MLX-derived). Adaptive `lsize` reduction → no GPU-pin
     // risk regardless of TPG. Caller-controllable shape (outDim, inDim);
     // the wrapper already checks shape consistency via the `weight`
     // tensor. Validation here just pins the basic positivity contract.
@@ -418,7 +418,7 @@ public enum OpsValidation {
 
     // ─── auraEncode ────────────────────────────────────────────────
     //
-    // Kernel invariants (from `crates/metaltile-std/src/ffai/aura_encode.rs`
+    // Kernel invariants (from `crates/ffai-kernels-std/src/ffai/aura_encode.rs`
     // §"DISPATCH INVARIANTS"):
     //   1. `TPG = dim` — one thread per rotated coordinate.
     //   2. `dim` must be a multiple of 32 (`simd_sum` reduction).
@@ -451,7 +451,7 @@ public enum OpsValidation {
 
     // ─── quantizeKV / bulkDequantKV (int4 / int8) ──────────────────
     //
-    // Affine KV-cache quant/dequant (`crates/metaltile-std/src/ffai/kv_cache.rs`).
+    // Affine KV-cache quant/dequant (`crates/ffai-kernels-std/src/ffai/kv_cache.rs`).
     // Grid3D mode — one thread per group (quantize) or per output
     // element (bulk dequant), so no GPU-pin risk. The footguns are
     // silent miscompute from integer-truncating divisions baked into
@@ -627,7 +627,7 @@ public enum OpsValidation {
     // ─── gatedDeltaStep ────────────────────────────────────────────
     //
     // Kernel invariants (from
-    // `crates/metaltile-std/src/ffai/gated_delta.rs`
+    // `crates/ffai-kernels-std/src/ffai/gated_delta.rs`
     // §"DISPATCH INVARIANTS"):
     //   1. TPG = 32 (exactly one simdgroup). The wrapper hard-codes
     //      this; the only caller-facing risk is the grid dimension.
@@ -635,7 +635,7 @@ public enum OpsValidation {
     //      the per-lane state register array is capped at 8 (Dk ≤ 256).
     //   3. `Hv % Hk == 0` — the `hv → hk` GQA fan-out must be integer.
     //
-    // `mt_gated_delta_step` takes `(Dk, Dv, Hv, Hk)` as runtime
+    // `ffai_gated_delta_step` takes `(Dk, Dv, Hv, Hk)` as runtime
     // `#[constexpr]` scalars: a single PSO serves every model config,
     // so there is no per-tuple emission list to gate on. The checks
     // below are the genuine dispatch-geometry invariants.
@@ -675,7 +675,7 @@ public enum OpsValidation {
 
     // ─── ffai_rms_norm_residual + ffai_gated_rmsnorm ───────────────
     //
-    // Both kernels share `mt_add_rms_norm`'s row-width contract:
+    // Both kernels share `ffai_add_rms_norm`'s row-width contract:
     //   * `N = TPG * 4` → caller picks `TPG = n / 4`.
     //   * `TPG` must be a multiple of 32 (simdgroup floor) and ≤ 1024.
     //   * Combined: `n` multiple of 128 and `n ≤ 4096`.
@@ -699,7 +699,7 @@ public enum OpsValidation {
 
     /// Validate the row-width parameter for `Ops.gatedRmsNorm`.
     public static func validateGatedRmsNorm(n: Int) -> String? {
-        // Same invariants as `mt_add_rms_norm` / `rms_norm_residual` —
+        // Same invariants as `ffai_add_rms_norm` / `rms_norm_residual` —
         // TPG = n/4, multiple of 32, ≤ 1024.
         if n <= 0 {
             return "n must be positive (got \(n))"
@@ -714,10 +714,10 @@ public enum OpsValidation {
         return nil
     }
 
-    // ─── mt_rms_norm_small ─────────────────────────────────────────
+    // ─── ffai_rms_norm_small ─────────────────────────────────────────
     //
     // Per-head RMSNorm specialisation for n < 128 (the default
-    // `mt_rms_norm` floor). 2 elements/thread → TPG = n/2:
+    // `ffai_rms_norm` floor). 2 elements/thread → TPG = n/2:
     //   * TPG ≥ 32 (one full simdgroup) → n ≥ 64.
     //   * TPG ≤ 1024 (Apple cap) → n ≤ 2048.
     //   * n even (each thread loads 2 contiguous elements).

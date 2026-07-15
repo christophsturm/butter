@@ -3,7 +3,7 @@
 // FFAI — F*cking Fast Apple Inference
 //
 // Apple Silicon LLM inference library built on pre-compiled Metal kernels
-// generated from the metaltile Rust DSL.
+// generated from the ffai-kernels Rust DSL.
 // See planning/plan.md and planning/architecture.md.
 
 import PackageDescription
@@ -21,8 +21,8 @@ let package = Package(
             targets: ["FFAI"]
         ),
         .library(
-            name: "MetalTileSwift",
-            targets: ["MetalTileSwift"]
+            name: "FFAIKernelsSwift",
+            targets: ["FFAIKernelsSwift"]
         ),
         .executable(
             name: "ffai",
@@ -39,13 +39,13 @@ let package = Package(
     ],
     targets: [
         // Pre-compiled Metal kernels + Swift dispatch wrappers.
-        // Resources are produced at build time by `tile build --emit all`
-        // (the metaltile-cli binary in the sibling metaltile workspace)
+        // Resources are produced at build time by `ffaik build --emit all`
+        // (the ffai-kernels-cli binary in the sibling ffai-kernels workspace)
         // and live under Resources/. Generated/ contains the typed Swift
-        // wrappers, also produced by `tile build`.
+        // wrappers, also produced by `ffaik build`.
         .target(
-            name: "MetalTileSwift",
-            path: "Sources/MetalTileSwift",
+            name: "FFAIKernelsSwift",
+            path: "Sources/FFAIKernelsSwift",
             resources: [
                 .copy("Resources")
             ]
@@ -56,7 +56,7 @@ let package = Package(
         .target(
             name: "FFAI",
             dependencies: [
-                "MetalTileSwift",
+                "FFAIKernelsSwift",
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
@@ -108,9 +108,9 @@ let package = Package(
 
         // Tests
         .testTarget(
-            name: "MetalTileSwiftTests",
-            dependencies: ["MetalTileSwift"],
-            path: "Tests/MetalTileSwiftTests"
+            name: "FFAIKernelsSwiftTests",
+            dependencies: ["FFAIKernelsSwift"],
+            path: "Tests/FFAIKernelsSwiftTests"
         ),
         .testTarget(
             name: "FFAITests",

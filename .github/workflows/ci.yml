@@ -6,7 +6,7 @@ name: CI
 #   - every PR targeting either branch
 #
 # Scope is intentionally limited to the **unit suite** (FFAITests +
-# MetalTileSwiftTests). The integration suite (ModelTests) downloads
+# FFAIKernelsSwiftTests). The integration suite (ModelTests) downloads
 # multi-GB HuggingFace snapshots + does real end-to-end inference —
 # too slow for every PR, and OOM-prone on the runner's 7 GB cap.
 # The release workflow exercises the integration suite right before
@@ -45,19 +45,19 @@ jobs:
         with:
           path: FFAI
 
-      - name: Checkout sibling metaltile
+      - name: Checkout sibling ffai-kernels
         # Pinned to `dev` for now because:
-        #   - thewafflehaus/metaltile main is behind upstream's CLI rework.
-        #   - upstream/metaltile main is a `gm` placeholder commit.
+        #   - thewafflehaus/ffai-kernels main is behind upstream's CLI rework.
+        #   - upstream/ffai-kernels main is a `gm` placeholder commit.
         #   - All the kernels FFAI's Ops.swift expects live on
-        #     thewafflehaus/metaltile dev (post the ek/std-kernels merge).
+        #     thewafflehaus/ffai-kernels dev (post the ek/std-kernels merge).
         # Move back to `main` once we sync our org's main from upstream's
-        # post-CLI-rework main, or cut a metaltile release tag and pin to it.
+        # post-CLI-rework main, or cut a ffai-kernels release tag and pin to it.
         uses: actions/checkout@v6
         with:
-          repository: thewafflehaus/metaltile
+          repository: thewafflehaus/ffai-kernels
           ref: dev
-          path: metaltile
+          path: ffai-kernels
 
       - name: Show toolchain
         run: |
@@ -70,14 +70,14 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo registry + metaltile build
+      - name: Cache cargo registry + ffai-kernels build
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ${{ github.workspace }}/metaltile/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('metaltile/Cargo.lock', 'metaltile/Cargo.toml') }}
+            ${{ github.workspace }}/ffai-kernels/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('ffai-kernels/Cargo.lock', 'ffai-kernels/Cargo.toml') }}
           restore-keys: |
             cargo-${{ runner.os }}-
 
@@ -94,19 +94,19 @@ jobs:
       - name: Resolve Swift packages
         run: swift package resolve
 
-      - name: Generate kernel artifacts (tile build --emit all)
-        # Compiles metaltile and produces kernels.metallib + manifest.json
-        # + Generated/MetalTileKernels.swift into FFAI/Sources/MetalTileSwift/.
-        # Once the `tile` binary ships via Homebrew this no longer needs
-        # the sibling metaltile checkout. Run from metaltile/ so its
+      - name: Generate kernel artifacts (ffaik build --emit all)
+        # Compiles ffai-kernels and produces kernels.metallib + manifest.json
+        # + Generated/FFAIKernels.swift into FFAI/Sources/FFAIKernelsSwift/.
+        # Once the `ffaik` binary ships via Homebrew this no longer needs
+        # the sibling ffai-kernels checkout. Run from ffai-kernels/ so its
         # rust-toolchain.toml (nightly, 2024 edition) is picked up.
-        working-directory: metaltile
+        working-directory: ffai-kernels
         run: |
-          cargo run --release --bin tile -- build --emit all \
-            --out ${{ github.workspace }}/FFAI/Sources/MetalTileSwift
+          cargo run --release --bin ffaik -- build --emit all \
+            --out ${{ github.workspace }}/FFAI/Sources/FFAIKernelsSwift
 
       - name: Run unit tests (with coverage)
-        # FFAITests + MetalTileSwiftTests (kernel round-trip).
+        # FFAITests + FFAIKernelsSwiftTests (kernel round-trip).
         # Integration tests (ModelTests) are deliberately excluded — they
         # ship a different way (release.yml runs them right before tagging).
         #
@@ -118,7 +118,7 @@ jobs:
         # symptom is tests pass but the run exits 1 with "The folder
         # 'codecov' doesn't exist". Letting swift test own the build keeps
         # the coverage and testability flags in lockstep.
-        run: swift test --enable-code-coverage --filter "FFAITests|MetalTileSwiftTests"
+        run: swift test --enable-code-coverage --filter "FFAITests|FFAIKernelsSwiftTests"
 
       - name: Coverage summary
         if: always()

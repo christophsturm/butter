@@ -17,7 +17,7 @@
 // Why this exists. The 2026-05-27 wrong-dispatch GPU pin (see
 // `papers/post-mortem-2026-05-19-dispatch-shape-gpu-freeze.md` for the
 // general failure-mode treatment and `planning/known-issues.md` §
-// "2026-05-27 GPU pin — mt_sdpa_bidirectional_d64_*" for that specific
+// "2026-05-27 GPU pin — ffai_sdpa_bidirectional_d64_*" for that specific
 // occurrence) cost a full system reboot mid-bisect. Running every
 // integration suite as one batch — when many are still unverified at
 // production shape — is the bisect-foot-gun the post-mortem warns about.
@@ -37,7 +37,7 @@
 //      `.enabled(if:)` trait entirely) so they stay green in future
 //      full-suite runs without depending on the group flag.
 //
-//   3. Suites that need metaltile work, an audio CPU→GPU port, or an
+//   3. Suites that need ffai-kernels work, an audio CPU→GPU port, or an
 //      uncached model **stay skipped** with a `.enabled(if: false,
 //      "<deferred reason>")` trait on the suite line, so the SKIP is
 //      visible in test output and the deferral reason travels with the

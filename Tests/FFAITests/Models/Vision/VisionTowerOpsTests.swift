@@ -34,7 +34,7 @@ import Testing
 struct VisionTowerOpsConstantsTests {
 
     /// The K-tile width is the contract between caller-side patch-embed
-    /// alignment and the `mt_gemm` kernel. 16 is the metaltile minimum;
+    /// alignment and the `ffai_gemm` kernel. 16 is the ffai-kernels minimum;
     /// changing this silently breaks every dynamic-resolution tower, so
     /// pin it.
     @Test("gemmKTileWidth is 16")

@@ -305,7 +305,7 @@ public final class Starcoder2Layer: Module {
         let oOut = oProj(attnReady, on: cmd)
 
         // Residual add + post-attention LayerNorm. LayerNorm has a
-        // bias the fused `mt_add_rms_norm` kernel doesn't model — so
+        // bias the fused `ffai_add_rms_norm` kernel doesn't model — so
         // we just stack `Ops.add` + `Ops.layerNorm` here. (The
         // fused-add-rms-norm fast path is RMSNorm-only.)
         let postAttn = Ops.add(h, oOut, on: cmd)

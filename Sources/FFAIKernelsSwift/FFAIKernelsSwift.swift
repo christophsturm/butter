@@ -12,14 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-import Testing
+// FFAIKernelsSwift — Swift runtime for pre-compiled ffai-kernels Metal kernels.
+//
+// Phase 0 stub. The real implementation lands as part of the Phase 0
+// plumbing milestone; see planning/plan.md.
+//
+// Responsibilities (Phase 0):
+// - Load Resources/kernels.metallib once into an MTLLibrary
+// - Maintain a PSO cache keyed by (kernel name, function constants)
+// - Expose typed Swift wrappers (the wrappers themselves live in
+//   Generated/FFAIKernels.swift, produced by ffai-kernels-emit)
 
-@testable import MetalTileSwift
+import Foundation
 
-@Suite("MetalTileSwift")
-struct MetalTileSwiftTests {
-    @Test("version is set")
-    func version() {
-        #expect(MetalTileSwift.version == "0.0.1-dev")
-    }
+public enum FFAIKernelsSwiftInfo {
+    public static let version = "0.0.1-dev"
 }

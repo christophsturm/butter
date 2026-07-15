@@ -7,8 +7,8 @@
 
 # ─── Paths ────────────────────────────────────────────────────────────
 PROJECT_ROOT := $(shell pwd)
-METALTILE_DIR := $(PROJECT_ROOT)/../metaltile
-KERNEL_OUT := $(PROJECT_ROOT)/Sources/MetalTileSwift
+FFAI_KERNELS_DIR := $(PROJECT_ROOT)/../ffai-kernels
+KERNEL_OUT := $(PROJECT_ROOT)/Sources/FFAIKernelsSwift
 
 # ─── Help ─────────────────────────────────────────────────────────────
 .PHONY: help
@@ -47,30 +47,30 @@ build-release: regenerate-kernels ## swift build (release)
 	swift build -c release
 
 .PHONY: regenerate-kernels
-regenerate-kernels: ## run `tile build --emit` to regenerate metallib + Swift wrappers
-	@if [ ! -d "$(METALTILE_DIR)" ]; then \
-	  echo "Error: metaltile not found at $(METALTILE_DIR)"; \
-	  echo "Clone the sibling metaltile repo at ../metaltile."; \
+regenerate-kernels: ## run `ffaik build --emit` to regenerate metallib + Swift wrappers
+	@if [ ! -d "$(FFAI_KERNELS_DIR)" ]; then \
+	  echo "Error: ffai-kernels not found at $(FFAI_KERNELS_DIR)"; \
+	  echo "Clone the sibling ffai-kernels repo at ../ffai-kernels."; \
 	  exit 1; \
 	fi
-	@# Run cargo from the metaltile dir so its rust-toolchain.toml (nightly,
+	@# Run cargo from the ffai-kernels dir so its rust-toolchain.toml (nightly,
 	@# 2024 edition) is honored. Running cargo from FFAI/ would use the
 	@# system default toolchain, which lacks edition=2024 support.
 	@#
-	@# `tile build --emit` writes:
+	@# `ffaik build --emit` writes:
 	@#   $(KERNEL_OUT)/Resources/kernels/<name>.metal     per-kernel MSL
 	@#   $(KERNEL_OUT)/Resources/kernels.metallib         compiled metallib
 	@#   $(KERNEL_OUT)/Resources/manifest.json            IR descriptor
-	@#   $(KERNEL_OUT)/Generated/MetalTileKernels.swift   dispatch wrappers
+	@#   $(KERNEL_OUT)/Generated/FFAIKernels.swift   dispatch wrappers
 	@#
-	cd $(METALTILE_DIR) && cargo run --release \
-	  --bin tile -- build --emit all --out $(KERNEL_OUT)
+	cd $(FFAI_KERNELS_DIR) && cargo run --release \
+	  --bin ffaik -- build --emit all --out $(KERNEL_OUT)
 	@# Prepend the `// swift-format-ignore-file` directive so swift-format
 	@# skips the generated wrappers. The directive needs to live on line 1
-	@# for swift-format to honor it. Until metaltile's codegen emits it
+	@# for swift-format to honor it. Until ffai-kernels' codegen emits it
 	@# directly (see planning/session-plan.md), prepend it post-emit so
 	@# `make format-check` stays clean across regenerations.
-	@gen=$(KERNEL_OUT)/Generated/MetalTileKernels.swift; \
+	@gen=$(KERNEL_OUT)/Generated/FFAIKernels.swift; \
 	  if [ -f "$$gen" ] && ! head -1 "$$gen" | grep -q swift-format-ignore-file; then \
 	    tmp="$$gen.tmp"; \
 	    { printf '// swift-format-ignore-file\n//\n'; cat "$$gen"; } > "$$tmp" && mv "$$tmp" "$$gen"; \
@@ -82,7 +82,7 @@ regenerate-kernels: ## run `tile build --emit` to regenerate metallib + Swift wr
 # wrong-dispatch-shape Ops wrappers — is fixed at the source (see the
 # post-mortem in papers/ and OpsValidation in Sources/FFAI/). Test
 # runs use the same in-flight command-buffer cap as production — the
-# code default in MetalTileLibrary.defaultMaxCommandBufferCount — so
+# code default in FFAIKernelsLibrary.defaultMaxCommandBufferCount — so
 # anything that passes in CI is proven safe under production load. To
 # set a custom command buffer count use FFAI_MAX_COMMAND_BUFFERS=16.
 #
@@ -105,7 +105,7 @@ regenerate-kernels: ## run `tile build --emit` to regenerate metallib + Swift wr
 #     loading at a time.
 #
 # Targets:
-# - `make test-unit`         — FFAITests + MetalTileSwiftTests at the
+# - `make test-unit`         — FFAITests + FFAIKernelsSwiftTests at the
 #                              production cap (the code default), serialized
 #                              (`--no-parallel`, the Swift Testing
 #                              global serializer) so concurrent GPU
@@ -139,7 +139,7 @@ test-unit: regenerate-kernels ## unit + Metal tests, serialized (--no-parallel) 
 	@# isolation. --no-parallel makes the gate reliable (verified 6/6 green vs
 	@# ~50% flake parallel; ~8s vs ~3s). The uncapped-parallel canary that
 	@# surfaces the dispatch-race class lives in `make test-stress`.
-	swift test --no-parallel --filter "FFAITests|MetalTileSwiftTests"
+	swift test --no-parallel --filter "FFAITests|FFAIKernelsSwiftTests"
 
 .PHONY: test-integration
 test-integration: regenerate-kernels ## end-to-end model tests; production cap + ModelLoadLock; matches release.yml
@@ -156,7 +156,7 @@ test-stress: regenerate-kernels ## canary; production cap with uncapped parallel
 	@echo "wrapper-precondition / PSOCache / ModelLoadLock defenses, this is"
 	@echo "where it surfaces."
 	@echo ""
-	swift test --filter "FFAITests|MetalTileSwiftTests"
+	swift test --filter "FFAITests|FFAIKernelsSwiftTests"
 	swift test --filter "ModelIntegrationTests"
 
 .PHONY: coverage
@@ -188,9 +188,9 @@ integration-bisect: regenerate-kernels ## run each ModelIntegrationTests/*Integr
 #
 # Files that should be skipped opt out at the source-file level via
 # `// swift-format-ignore-file` on line 1. See
-# Sources/MetalTileSwift/Generated/MetalTileKernels.swift for the
-# canonical example (the file is auto-regenerated by metaltile's
-# `tile build --emit swift`; the directive needs to be re-emitted at
+# Sources/FFAIKernelsSwift/Generated/FFAIKernels.swift for the
+# canonical example (the file is auto-regenerated by ffai-kernels'
+# `ffaik build --emit swift`; the directive needs to be re-emitted at
 # the top by the codegen — see planning/session-plan.md).
 .PHONY: format
 format: ## run swift-format on all .swift files
@@ -234,7 +234,7 @@ docs-verify: ## swift-docc target-by-target verification only (no website previe
 .PHONY: clean
 clean: ## remove .build and generated kernel artifacts
 	rm -rf .build
-	rm -f Sources/MetalTileSwift/Resources/kernels.metallib
-	rm -f Sources/MetalTileSwift/Resources/manifest.json
-	rm -rf Sources/MetalTileSwift/Resources/kernels
-	rm -rf Sources/MetalTileSwift/Generated/MetalTileKernels.swift
+	rm -f Sources/FFAIKernelsSwift/Resources/kernels.metallib
+	rm -f Sources/FFAIKernelsSwift/Resources/manifest.json
+	rm -rf Sources/FFAIKernelsSwift/Resources/kernels
+	rm -rf Sources/FFAIKernelsSwift/Generated/FFAIKernels.swift

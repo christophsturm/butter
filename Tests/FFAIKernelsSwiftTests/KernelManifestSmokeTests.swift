@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Manifest-driven smoke test for every kernel metaltile generates.
+// Manifest-driven smoke test for every kernel ffai-kernels generates.
 //
 // For each kernel listed in `kernels.metallib`'s manifest:
 //   1. The PSO can be created from the compiled metallib (catches link
@@ -23,9 +23,9 @@
 // Does NOT verify per-kernel numerical correctness — that lives in
 //   - FFAI's per-Op tests (Tests/FFAITests/Ops*Tests.swift), which
 //     exercise every wrapper FFAI actually calls via the Ops layer;
-//   - metaltile's `tile bench` (MLX side-by-side for kernels under
-//     `metaltile-std/src/mlx/`);
-//   - per-family wrapper tests (Tests/MetalTileSwiftTests/<Kernel>Tests.swift),
+//   - ffai-kernels' `ffaik bench` (MLX side-by-side for kernels under
+//     `ffai-kernels-std/src/mlx/`);
+//   - per-family wrapper tests (Tests/FFAIKernelsSwiftTests/<Kernel>Tests.swift),
 //     written incrementally as kernels change.  See `VectorAddTests`
 //     for the shape.
 //
@@ -40,12 +40,12 @@ import Foundation
 import Metal
 import Testing
 
-@testable import MetalTileSwift
+@testable import FFAIKernelsSwift
 
 @Suite("Kernel manifest PSO smoke")
 struct KernelManifestSmokeTests {
 
-    /// JSON shape mirrored from `metaltile-codegen::emit::write_manifest`.
+    /// JSON shape mirrored from `ffai-kernels-codegen::emit::write_manifest`.
     /// Only `name` is parsed — the rest is left flexible so manifest
     /// schema bumps don't fail the test.
     private struct ManifestEntry: Decodable {
@@ -66,7 +66,7 @@ struct KernelManifestSmokeTests {
                 domain: "KernelManifestSmoke", code: 1,
                 userInfo: [
                     NSLocalizedDescriptionKey:
-                        "manifest.json not bundled into MetalTileSwift"
+                        "manifest.json not bundled into FFAIKernelsSwift"
                 ]
             )
         }
@@ -77,7 +77,7 @@ struct KernelManifestSmokeTests {
     @Test("every kernel in the manifest compiles into a usable PSO")
     func everyKernelHasUsablePSO() throws {
         let manifest = try loadManifest()
-        let lib = try MetalTileLibrary()
+        let lib = try FFAIKernelsLibrary()
         let cache = PSOCache(library: lib)
 
         // ≥ 80 keeps this honest: if PR #19's macro regression had been
@@ -86,7 +86,7 @@ struct KernelManifestSmokeTests {
         // "manifest didn't accidentally truncate."
         #expect(
             manifest.kernels.count > 80,
-            "manifest.json has \(manifest.kernels.count) kernels — expected the metaltile-std surface (~200+)"
+            "manifest.json has \(manifest.kernels.count) kernels — expected the ffai-kernels-std surface (~200+)"
         )
 
         var failures: [String] = []
@@ -116,7 +116,7 @@ struct KernelManifestSmokeTests {
     /// PSO cache is doing its job and not recompiling per call.
     @Test("PSOCache returns the same instance for repeat lookups")
     func psoCacheDeduplicates() throws {
-        let lib = try MetalTileLibrary()
+        let lib = try FFAIKernelsLibrary()
         let cache = PSOCache(library: lib)
         let a = try cache.pipelineStateThrowing(for: "vector_add_f32")
         let b = try cache.pipelineStateThrowing(for: "vector_add_f32")

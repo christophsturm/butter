@@ -90,7 +90,7 @@
 
 import Foundation
 import Metal
-import MetalTileSwift
+import FFAIKernelsSwift
 
 // MARK: - Config helpers
 
@@ -1158,7 +1158,7 @@ public final class Gemma4Layer: Module {
         let oOut = oProj(attnOut.reshaped(to: [nHeads * headDim]), on: cmd)
         let normedAttn = postAttnNorm(oOut, on: cmd)
 
-        // Fused (h + normedAttn) → preFFNorm via mt_add_rms_norm
+        // Fused (h + normedAttn) → preFFNorm via ffai_add_rms_norm
         // (hidden ≤ 4096). Gemma 4 27B (hidden 5376) falls through the
         // validator gate to the unfused path.
         var hOut: Tensor
@@ -1215,7 +1215,7 @@ public final class Gemma4Layer: Module {
         let oOut = oProj(attnOut.reshaped(to: [nHeads * headDim]), on: postCmd)
         let normedAttn = postAttnNorm(oOut, on: postCmd)
 
-        // Fused (h + normedAttn) → preFFNorm via mt_add_rms_norm
+        // Fused (h + normedAttn) → preFFNorm via ffai_add_rms_norm
         // (hidden ≤ 4096). Gemma 4 27B (hidden 5376) falls through
         // the validator gate to the unfused path.
         var hOut: Tensor
@@ -1512,33 +1512,43 @@ enum Gemma4Ops {
         let nHeads = qk.elementCount / headDim
         let halfDim = headDim / 2  // pairing offset + freq denominator
         let rotatedPairs = rotatedDim / 2  // grid height — only these rotate
-        let grid = MTLSize(width: nHeads, height: rotatedPairs, depth: 1)
+        // ffai_rope_banded takes a [T] u32 positions buffer (T=1 for decode).
+        // depth = rotatedPairs so only the first rotatedPairs freq pairs
+        // rotate (partial rotary); half_dim stays the freq denominator.
+        // scaling off (scale/low/high=1, original_max_position=1).
+        let positions = Tensor.empty(shape: [1], dtype: .u32)
+        positions.copyIn(from: [UInt32(position)])
+        let rowStride = UInt32(nHeads * headDim)
+        let grid = MTLSize(width: 1, height: nHeads, depth: rotatedPairs)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         switch qk.dtype {
         case .f32:
-            MetalTileKernels.ffai_rope_llama_f32(
+            FFAIKernels.ffai_rope_banded_f32(
                 qk: qk.buffer, qkOffset: qk.offset,
+                positions: positions.buffer, positionsOffset: positions.offset,
                 out: qk.buffer, outOffset: qk.offset,
                 head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
-                position: UInt32(position), theta_base: thetaBase,
+                row_stride: rowStride, theta_base: thetaBase,
                 scale_factor: 1.0, low_freq_factor: 1.0,
                 high_freq_factor: 1.0, original_max_position: 1.0,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_rope_llama_f16(
+            FFAIKernels.ffai_rope_banded_f16(
                 qk: qk.buffer, qkOffset: qk.offset,
+                positions: positions.buffer, positionsOffset: positions.offset,
                 out: qk.buffer, outOffset: qk.offset,
                 head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
-                position: UInt32(position), theta_base: thetaBase,
+                row_stride: rowStride, theta_base: thetaBase,
                 scale_factor: 1.0, low_freq_factor: 1.0,
                 high_freq_factor: 1.0, original_max_position: 1.0,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_rope_llama_bf16(
+            FFAIKernels.ffai_rope_banded_bf16(
                 qk: qk.buffer, qkOffset: qk.offset,
+                positions: positions.buffer, positionsOffset: positions.offset,
                 out: qk.buffer, outOffset: qk.offset,
                 head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
-                position: UInt32(position), theta_base: thetaBase,
+                row_stride: rowStride, theta_base: thetaBase,
                 scale_factor: 1.0, low_freq_factor: 1.0,
                 high_freq_factor: 1.0, original_max_position: 1.0,
                 gridSize: grid, threadgroupSize: tg, on: cmd)

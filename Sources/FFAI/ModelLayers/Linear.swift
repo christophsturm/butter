@@ -100,7 +100,7 @@ public final class Linear: Module {
     /// (Rebase 2026-05-23: keep Tom's `callMany` API, drop my parallel
     /// `batched(_:nRows:)` from `3a87b78`. Both did the same job;
     /// Tom's QuantizedLinear.callMany variant actually wraps the
-    /// `mt_qmm_mma`-backed `Ops.dequantGemmDynamicM` kernel — what my
+    /// `ffai_qmm_mma`-backed `Ops.dequantGemmDynamicM` kernel — what my
     /// doc comment had flagged as a TODO.)
     public func callMany(_ x: Tensor, t: Int, on cmd: MTLCommandBuffer) -> Tensor {
         let y = Ops.gemm(weight: weight, input: x, nRows: t, on: cmd)
@@ -215,7 +215,7 @@ public final class QuantizedLinear: Module {
 
     /// T-batched. `x` is `[T, inDim]` flat row-major, returns
     /// `[T, outDim]` flat. Dispatches `Ops.dequantGemmDynamicM` — one
-    /// `mt_qmm_mma` kernel for T multiple of 32, or one padded
+    /// `ffai_qmm_mma` kernel for T multiple of 32, or one padded
     /// dispatch + host slice for ragged T. Matches the batched-prefill
     /// path (BP2).
     public func callMany(
@@ -225,7 +225,7 @@ public final class QuantizedLinear: Module {
     ) -> Tensor {
         let outDim = weight.shape[0]
         let inDim = scales.shape[scales.shape.count - 1] * groupSize
-        // 4-bit and 2-bit go through the fast mt_qmm_mma path when the
+        // 4-bit and 2-bit go through the fast ffai_qmm_mma path when the
         // output dimension is a multiple of 32 (the BN tile of the
         // underlying `dequantGemmDynamicM` kernel). Anything narrower —
         // including 4-bit shared_expert_gate at outDim=1 — falls through

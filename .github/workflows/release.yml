@@ -72,14 +72,14 @@ jobs:
           path: FFAI
           fetch-depth: 0   # full history so the release job can do tag math
 
-      - name: Checkout sibling metaltile
+      - name: Checkout sibling ffai-kernels
         # Pinned to `dev`; see ci.yml for why. Bump to `main` (or a
         # release tag) when upstream stabilizes.
         uses: actions/checkout@v6
         with:
-          repository: thewafflehaus/metaltile
+          repository: thewafflehaus/ffai-kernels
           ref: dev
-          path: metaltile
+          path: ffai-kernels
 
       - name: Show toolchain
         run: |
@@ -92,14 +92,14 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo registry + metaltile build
+      - name: Cache cargo registry + ffai-kernels build
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ${{ github.workspace }}/metaltile/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('metaltile/Cargo.lock', 'metaltile/Cargo.toml') }}
+            ${{ github.workspace }}/ffai-kernels/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('ffai-kernels/Cargo.lock', 'ffai-kernels/Cargo.toml') }}
           restore-keys: cargo-${{ runner.os }}-
 
       - name: Cache SwiftPM build artifacts
@@ -126,27 +126,27 @@ jobs:
       - name: Resolve Swift packages
         run: swift package resolve
 
-      - name: Generate kernel artifacts (tile build --emit all)
-        working-directory: metaltile
+      - name: Generate kernel artifacts (ffaik build --emit all)
+        working-directory: ffai-kernels
         run: |
-          cargo run --release --bin tile -- build --emit all \
-            --out ${{ github.workspace }}/FFAI/Sources/MetalTileSwift
+          cargo run --release --bin ffaik -- build --emit all \
+            --out ${{ github.workspace }}/FFAI/Sources/FFAIKernelsSwift
 
       - name: Build (release, with tests + testability)
         # `--build-tests` produces the xctest bundle so the subsequent
         # `swift test --skip-build` steps don't have to rebuild it.
         # `-Xswiftc -enable-testing` is needed in release config because
         # Swift PM only auto-enables testability in debug — without it,
-        # `@testable import MetalTileSwift` in MetalTileSwiftTests fails
+        # `@testable import FFAIKernelsSwift` in FFAIKernelsSwiftTests fails
         # at compile time with "module ... was not compiled for testing".
         run: swift build -c release --build-tests -Xswiftc -enable-testing
 
       - name: Run unit tests
-        # FFAITests + MetalTileSwiftTests. CI on the merged branch
+        # FFAITests + FFAIKernelsSwiftTests. CI on the merged branch
         # already ran these on the source commit; this is the
         # belt-and-suspenders pass on the exact commit we're about to
         # tag, in release config.
-        run: swift test -c release --skip-build --filter "FFAITests|MetalTileSwiftTests"
+        run: swift test -c release --skip-build --filter "FFAITests|FFAIKernelsSwiftTests"
 
       - name: Run integration tests (serialized — models load one at a time)
         # The real value-add of running tests inside the release

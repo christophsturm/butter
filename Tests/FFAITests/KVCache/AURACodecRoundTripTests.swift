@@ -19,12 +19,12 @@
 //
 // Origin: a degenerate-output regression in the aura8v4 / aura8v8
 // integration tests pointed at the 8-bit codec. Bisection through the
-// metaltile pass pipeline tracked it to the const_fold pass — it ran
+// ffai-kernels pass pipeline tracked it to the const_fold pass — it ran
 // only on nested blocks, never on `kernel.body`, so the bits=8 dequant
 // kernel ended up with a fold-eligible trip count that hid from the
 // unroll pass and the loop body was DCE'd out, leaving an empty
 // `for (...)` in the emitted MSL. (See the
-// `fix(const_fold): fold the entry block too` commit on metaltile.)
+// `fix(const_fold): fold the entry block too` commit on ffai-kernels.)
 //
 // After the fix, the unit-level codec is mathematically correct —
 // 8-bit mean error ≈ 0.0004 vs the prior ~0.07. These tests pin that

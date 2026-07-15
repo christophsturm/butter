@@ -18,7 +18,7 @@
 // rope, rms-norm, single-step causal conv). Neural codecs instead lean
 // on *general* 1-D convolution: arbitrary kernel sizes, strides,
 // dilations, grouping, and transposed (fractionally-strided) variants.
-// metaltile ships no kernel for that shape family, so — per the FFAI
+// ffai-kernels ships no kernel for that shape family, so — per the FFAI
 // porting contract — these primitives use a documented CPU path.
 //
 // All math runs on the host over shared-storage `MTLBuffer`s (every

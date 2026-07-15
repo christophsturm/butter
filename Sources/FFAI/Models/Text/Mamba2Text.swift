@@ -118,7 +118,7 @@ public struct Mamba2Dense: Mamba2Variant {
                 base: "\(p).mixer.out_proj", in: weights, quantization: quant)
 
             // conv1d.weight ships as [conv_dim, 1, kernel_size]; the
-            // metaltile kernel expects [kernel_size, conv_dim].
+            // ffai-kernels kernel expects [kernel_size, conv_dim].
             // Transpose CPU-side at load (~28 KB at bf16 for 130m).
             let convWSrc = try weights.tensor(named: "\(p).mixer.conv1d.weight")
             // HF ships various shape labelings — [C, 1, K], [C, K, 1],
@@ -577,7 +577,7 @@ private func tileDOverHeadDim(
 }
 
 /// HF conv1d.weight ships as `[C, 1, K]` (depthwise grouped conv,
-/// channel-major). The metaltile kernel expects `[K, C]` (kernel-tap
+/// channel-major). The ffai-kernels kernel expects `[K, C]` (kernel-tap
 /// major). Transpose CPU-side; tiny (~K*C floats) so the cost is in the
 /// noise at load time.
 private func transposeConv1dWeight(
