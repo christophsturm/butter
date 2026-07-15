@@ -155,6 +155,10 @@ public final class QuantizedLinear: Module {
     /// dropping it makes the model degenerate to one repeated token
     /// (DeepSeek-R1-Distill-Qwen-1.5B emitted "000000…" before this).
     public let additiveBias: Tensor?
+    /// Optional dense `[out, in]` cache for bits=8 decode. Filled by
+    /// `densify(on:device:)` once; single-token path then uses `Ops.gemv`
+    /// (often faster than int8 dequant-gemv for large matrices).
+    private var denseWeight: Tensor?
 
     public init(
         weight: Tensor, scales: Tensor, biases: Tensor,
@@ -198,11 +202,30 @@ public final class QuantizedLinear: Module {
         return [("weight", weight), ("scales", scales), ("biases", biases)]
     }
 
-    public func callAsFunction(_ x: Tensor, on cmd: MTLCommandBuffer) -> Tensor {
-        let y = Ops.dequantGemv(
+    /// One-shot densify for bits=8 (queued on `cmd`, no wait). Safe to
+    /// call once after load; subsequent `callAsFunction` uses the cache.
+    public func densify(on cmd: MTLCommandBuffer, device: Device) {
+        guard bits == 8, denseWeight == nil else { return }
+        let outDim = weight.shape[0]
+        let inDim = scales.shape[scales.shape.count - 1] * groupSize
+        let dense = Tensor.empty(shape: [outDim, inDim], dtype: scales.dtype, device: device)
+        Ops.affineDequantize(
             weight: weight, scales: scales, biases: biases,
-            input: x, bits: bits, groupSize: groupSize, on: cmd
-        )
+            outDim: outDim, inDim: inDim, groupSize: groupSize, bits: bits,
+            on: cmd, into: dense)
+        denseWeight = dense
+    }
+
+    public func callAsFunction(_ x: Tensor, on cmd: MTLCommandBuffer) -> Tensor {
+        let y: Tensor
+        if let dense = denseWeight {
+            y = Ops.gemv(weight: dense, input: x, on: cmd)
+        } else {
+            y = Ops.dequantGemv(
+                weight: weight, scales: scales, biases: biases,
+                input: x, bits: bits, groupSize: groupSize, on: cmd
+            )
+        }
         if let ab = additiveBias {
             return Ops.add(y, ab, on: cmd)
         }
@@ -221,17 +244,13 @@ public final class QuantizedLinear: Module {
     ) -> Tensor {
         let outDim = weight.shape[0]
         let inDim = scales.shape[scales.shape.count - 1] * groupSize
-        // 4-bit and 2-bit go through the fast mt_qmm_mma path when the
-        // output dimension is a multiple of 32 (the BN tile of the
-        // underlying `dequantGemmDynamicM` kernel). Anything narrower —
-        // including 4-bit shared_expert_gate at outDim=1 — falls through
-        // to the per-row `dequantGemv` loop. Other bit-widths (commonly
-        // 8-bit on the same narrow projections, plus 3/5/6) take the
-        // same fallback. Both fallbacks are bit-identical to the
-        // per-token path; their per-token launch overhead is in the
-        // noise on hidden→1 shapes.
+        // 2/4/8-bit affine go through `mt_qmm_mma{,_int2,_int8}` when
+        // outDim is a multiple of 32 (BN tile). Hy3 oQ2 stores attention
+        // + shared MLP as int8 — the old bits==8 path full-dequantized
+        // every callMany (~7 densify+gemm per layer × 80), which
+        // dominated prefill. Narrow outDim falls through as before.
         let out: Tensor
-        if (bits == 4 || bits == 2) && outDim % 32 == 0 {
+        if (bits == 2 || bits == 4 || bits == 8) && outDim % 32 == 0 {
             out = Tensor.empty(shape: [t, outDim], dtype: x.dtype, device: device)
             Ops.dequantGemmDynamicM(
                 input: x, weight: weight, scales: scales, biases: biases,

@@ -114,14 +114,23 @@ public final class PSOCache: @unchecked Sendable {
         // Live-compile via `makeLibrary(source:)` resolves MPP against the
         // running OS's header, dodging the skew. This is a known class of
         // MPP header-skew bug.
+        //
+        // Non-MPP path: primary metallib → extra metallibs (hy3_extra) →
+        // live-compile from Resources/kernels/<name>.metal. The last
+        // fallback ships Hy3 affine int2 expert-indexed kernels that
+        // are present as .metal sources but not yet in the main emit.
         let function: MTLFunction
         if Self.isMppKernel(name) {
             function = try liveCompileMppFunction(name)
-        } else {
-            guard let fn = library.library.makeFunction(name: name) else {
-                throw PSOCacheError.kernelNotFound(name)
-            }
+        } else if let fn = library.library.makeFunction(name: name) {
             function = fn
+        } else if let fn = Self.functionFromExtras(name, library: library) {
+            function = fn
+        } else if let fn = try? liveCompileMppFunction(name) {
+            // Reuse the .metal live-compile path for non-MPP extras too.
+            function = fn
+        } else {
+            throw PSOCacheError.kernelNotFound(name)
         }
         var pso: MTLComputePipelineState
         do {
@@ -198,6 +207,17 @@ public final class PSOCache: @unchecked Sendable {
             throw PSOCacheError.kernelNotFound(name)
         }
         return fn
+    }
+
+    private static func functionFromExtras(
+        _ name: String, library: MetalTileLibrary
+    ) -> MTLFunction? {
+        for extra in library.extraLibraries {
+            if let fn = extra.makeFunction(name: name) {
+                return fn
+            }
+        }
+        return nil
     }
 
     /// Locate `<name>.metal` next to the loaded metallib. `tile emit` writes
