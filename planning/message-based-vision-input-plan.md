@@ -7,11 +7,18 @@
 | Decisions | Content-parts message shape (HF/OpenAI-style); all ~15 VL families in one sweep; deprecate token-based `VisionRequest.promptTokens` |
 | Branch | `ek/fix-all-the-things` (current) |
 
-## Mechanism (per family, FFAI-controlled framing)
+## Mechanism (template-driven primary + FFAI-controlled fallback)
 
-messages(+media parts) → render chat template on text view w/ a media SLOT sentinel per media part → encode each media once (vision rows + count N) → replace slot with family markers + `placeholderId × N` → `VisionModel.generate` w/ pre-encoded rows. Encode ONCE (kills today's encode-twice).
+Verified against cached VL models (2026-07-15): Qwen2.5/3/3.5/3.6-VL, Gemma4, SmolVLM2, FastVLM chat templates all iterate content-parts (`content is string` / `is sequence` / `content.type == 'image'`) and emit the family's vision markers with **ONE placeholder token per image** (e.g. Qwen `<|vision_start|><|image_pad|><|vision_end|>`). This is the HF processor model: template inserts one marker, the processor expands it to the grid count.
 
-Framing markers per family are KNOWN (recap table). Promote them from test/CLI call-sites into per-family config on the model, so `generate(_:)` handles them.
+**Primary (template-driven):**
+1. `renderChatTemplate(messages w/ content-parts)` → tokens with 1 placeholder/image (+ family markers, straight from the shipped template).
+2. Encode each media once → vision rows + count N (`encodeImage().shape[0]` etc.).
+3. Expand each placeholder token (`imageTokenId`/`videoTokenId`/`audioTokenId`, already on `VisionModel`) in order → N copies.
+4. `VisionModel.splice` + `generate` with pre-encoded rows. Encode ONCE.
+- Needs ~no new per-family config: reuses existing `imageTokenId` + count strategy.
+
+**Fallback (FFAI-controlled framing):** if template render throws (swift-jinja can't handle the content-part constructs) OR emits no placeholder, splice the family's known markers (recap table) around `placeholderId × N` at the media slot (divergence-located). Per-family marker config lives here, exercised only for templates that don't support content-parts.
 
 ## Phases
 

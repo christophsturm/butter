@@ -41,6 +41,7 @@ public enum VisionModelError: Error, CustomStringConvertible {
     case videoPlaceholderCountMismatch(expected: Int, found: Int)
     case audioUnsupported(String)
     case audioPlaceholderCountMismatch(expected: Int, found: Int)
+    case templateFramingUnavailable(String)
 
     public var description: String {
         switch self {
@@ -66,6 +67,12 @@ public enum VisionModelError: Error, CustomStringConvertible {
         case .audioPlaceholderCountMismatch(let expected, let found):
             return "VisionModel: prompt has \(found) audio-placeholder tokens "
                 + "but the audio encoder produced \(expected) audio tokens"
+        case .templateFramingUnavailable(let family):
+            return "VisionModel: \(family)'s chat template did not emit a media "
+                + "placeholder for the supplied media (it likely doesn't handle "
+                + "image/video/audio content parts), and no FFAI-controlled "
+                + "fallback framing is configured for this family yet. Supply a "
+                + "pre-framed prompt via the token-based VisionRequest escape hatch."
         }
     }
 }

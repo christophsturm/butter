@@ -86,43 +86,85 @@ public struct SpeakRequest: Sendable {
     }
 }
 
+/// One media item bound positionally to a `.image` / `.video` / `.audio`
+/// slot in a `ChatMessage`'s content parts. The i-th media slot across all
+/// messages (in message + part order) pairs with `media[i]`.
+public enum VisionMedia: Sendable {
+    case image(RGBImage)
+    case video([RGBImage])
+    case audio([Float])
+}
+
 /// A vision / omni request routed through the composed `VisionModel`
-/// (image / video / audio-in → text). Carries at most one media modality —
-/// `videoFrames` takes precedence over `audio` over `image`; pass all three
-/// empty/nil to run the VLM backbone text-only. Output is text (the same
-/// `.text` / `.textDelta` the LLM path emits).
+/// (image / video / audio-in → text). Uniform with `.text`: pass chat
+/// `messages` whose content parts carry media slots, plus the `media`
+/// bound to those slots in order. `Model` renders the family's chat
+/// template, frames each slot's placeholder run, encodes the media, and
+/// generates. Output is text (the same `.text` / `.textDelta` the LLM
+/// path emits).
 ///
-/// NOTE: unlike `.text` (which takes chat `messages` and renders the
-/// template), this is **token-based** — `promptTokens` is the chat-rendered
-/// prompt with the family's media placeholder run already spliced in (e.g.
-/// `<image>` + N placeholders + `</image>`). The message-based form, where
-/// vision uses the exact same `messages` parameter as `.text`, is blocked on
-/// per-family multimodal prompt-framing (`updated-architecture-overview.md`
-/// §13 M1–M3); until that lands the caller builds `promptTokens` itself.
+/// The framing is template-driven where the family's chat template
+/// understands image/video/audio content parts (it emits the family's
+/// markers + one placeholder, which FFAI expands to the encoded count),
+/// with an FFAI-controlled per-family fallback otherwise. See
+/// `planning/message-based-vision-input-plan.md`.
+///
+/// `promptTokens` is a deprecated escape hatch for callers that want to
+/// supply a fully framed prompt themselves (bypasses the builder); when
+/// non-nil it takes precedence over `messages` / `media`.
 public struct VisionRequest: Sendable {
-    public var promptTokens: [Int]
-    public var image: RGBImage?
-    public var videoFrames: [RGBImage]
-    public var audio: [Float]?
+    /// Chat turns, with media slots in their content parts (primary path).
+    public var messages: [ChatMessage]
+    /// Media bound positionally to the messages' media slots.
+    public var media: [VisionMedia]
+    /// Chat-template rendering options (mirrors `TextRequest`).
+    public var templateOptions: ChatTemplateOptions
     public var maxTokens: Int
     public var parameters: GenerationParameters?
     public var eosTokenId: Int?
     public var eosTokenIds: [Int]
 
+    /// Advanced escape hatch: a fully framed token prompt. Non-nil
+    /// bypasses the message-based builder.
+    public var promptTokens: [Int]?
+
+    /// Message-based request (primary).
     public init(
-        promptTokens: [Int], image: RGBImage? = nil,
-        videoFrames: [RGBImage] = [], audio: [Float]? = nil,
+        messages: [ChatMessage], media: [VisionMedia] = [],
+        templateOptions: ChatTemplateOptions = .init(),
         maxTokens: Int = 512, parameters: GenerationParameters? = nil,
         eosTokenId: Int? = nil, eosTokenIds: [Int] = []
     ) {
-        self.promptTokens = promptTokens
-        self.image = image
-        self.videoFrames = videoFrames
-        self.audio = audio
+        self.messages = messages
+        self.media = media
+        self.templateOptions = templateOptions
         self.maxTokens = maxTokens
         self.parameters = parameters
         self.eosTokenId = eosTokenId
         self.eosTokenIds = eosTokenIds
+        self.promptTokens = nil
+    }
+
+    /// Token-based escape hatch: caller supplies the fully framed prompt
+    /// and the raw media to encode/splice. Prefer the message-based init.
+    @available(
+        *, deprecated,
+        message:
+            "Token-based framing is the advanced escape hatch; prefer the message-based init (messages:media:)."
+    )
+    public init(
+        promptTokens: [Int], media: [VisionMedia] = [],
+        maxTokens: Int = 512, parameters: GenerationParameters? = nil,
+        eosTokenId: Int? = nil, eosTokenIds: [Int] = []
+    ) {
+        self.messages = []
+        self.media = media
+        self.templateOptions = .init()
+        self.maxTokens = maxTokens
+        self.parameters = parameters
+        self.eosTokenId = eosTokenId
+        self.eosTokenIds = eosTokenIds
+        self.promptTokens = promptTokens
     }
 }
 
