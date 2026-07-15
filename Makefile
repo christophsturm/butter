@@ -50,29 +50,30 @@ build-release: regenerate-kernels ## swift build (release)
 	swift build -c release
 
 .PHONY: regenerate-kernels
-regenerate-kernels: ## run `tile build --emit` to regenerate metallib + Swift wrappers
-	@if [ ! -d "$(METALTILE_DIR)" ]; then \
-	  echo "Error: metaltile not found at $(METALTILE_DIR)"; \
-	  echo "Clone the sibling metaltile repo at ../metaltile."; \
+regenerate-kernels: ## run `ffaik build --emit` to regenerate metallib + Swift wrappers
+	@if [ ! -d "$(FFAI_KERNELS_DIR)" ]; then \
+	  echo "Error: ffai-kernels not found at $(FFAI_KERNELS_DIR)"; \
+	  echo "Clone the sibling repo at ../ffai-kernels."; \
 	  exit 1; \
 	fi
-	@# Run cargo from the metaltile dir so its rust-toolchain.toml (nightly,
-	@# 2024 edition) is honored. Running cargo from FFAI/ would use the
-	@# system default toolchain, which lacks edition=2024 support.
-	@#
-	@# `tile build --emit` writes:
-	@#   $(KERNEL_OUT)/Resources/kernels/<name>.metal     per-kernel MSL
-	@#   $(KERNEL_OUT)/Resources/kernels.metallib         compiled metallib
-	@#   $(KERNEL_OUT)/Resources/manifest.json            IR descriptor
-	@#   $(KERNEL_OUT)/Generated/FFAIKernels.swift   dispatch wrappers
-	@#
-	cd $(METALTILE_DIR) && cargo run --release \
-	  --bin tile -- build --emit all --out $(KERNEL_OUT)
-	@# Prepend the `// swift-format-ignore-file` directive so swift-format
-	@# skips the generated wrappers. The directive needs to live on line 1
-	@# for swift-format to honor it. Until metaltile's codegen emits it
-	@# directly (see planning/session-plan.md), prepend it post-emit so
-	@# `make format-check` stays clean across regenerations.
+	@# Run from ffai-kernels so its rust-toolchain.toml is honored.
+	@# `ffaik build` writes:
+	@#   $(KERNEL_OUT)/Resources/kernels/<name>.metal
+	@#   $(KERNEL_OUT)/Resources/kernels.metallib
+	@#   $(KERNEL_OUT)/Resources/manifest.json
+	@#   $(KERNEL_OUT)/Generated/FFAIKernels.swift
+	@# Build `__ffai_runner` too — ffaik spawns it by bare name via PATH.
+	@if [ -x "$(FFAI_KERNELS_DIR)/target/release/ffaik" ] && \
+	   [ -x "$(FFAI_KERNELS_DIR)/target/release/__ffai_runner" ]; then \
+	  (cd $(FFAI_KERNELS_DIR) && PATH="$$PWD/target/release:$$PATH" \
+	    ffaik build --emit all --out $(KERNEL_OUT)); \
+	else \
+	  (cd $(FFAI_KERNELS_DIR) && \
+	    cargo build --release --bin ffaik --bin __ffai_runner && \
+	    PATH="$$PWD/target/release:$$PATH" \
+	      ffaik build --emit all --out $(KERNEL_OUT)); \
+	fi
+	@# Prepend `// swift-format-ignore-file` so swift-format skips wrappers.
 	@gen=$(KERNEL_OUT)/Generated/FFAIKernels.swift; \
 	  if [ -f "$$gen" ] && ! head -1 "$$gen" | grep -q swift-format-ignore-file; then \
 	    tmp="$$gen.tmp"; \

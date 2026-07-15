@@ -94,20 +94,18 @@ jobs:
       - name: Resolve Swift packages
         run: swift package resolve
 
-      - name: Generate kernel artifacts (tile build --emit all)
+      - name: Generate kernel artifacts (ffaik build --emit all)
         # Compiles ffai-kernels and produces kernels.metallib + manifest.json
-        # + Generated/MetalTileKernels.swift into FFAI/Sources/MetalTileSwift/.
-        # Once the `tile` binary ships via Homebrew this no longer needs
-        # the sibling ffai-kernels checkout. Run from ffai-kernels/ so its
-        # rust-toolchain.toml (nightly, 2024 edition) is picked up.
+        # + Generated/FFAIKernels.swift into FFAI/Sources/MetalTileSwift/.
+        # Run from ffai-kernels/ so its rust-toolchain.toml is picked up.
         working-directory: ffai-kernels
-        # `tile build` spawns the `__tile_runner` subprocess (a ffai-kernels-std
-        # bin) for kernel discovery, resolved by bare name via PATH. Build both
-        # binaries and put target/release on PATH so the spawn resolves —
-        # `cargo run --bin tile` alone never builds the sibling runner.
+        # `ffaik build` spawns `__ffai_runner` (ffai-kernels-std bin) for
+        # kernel discovery, resolved by bare name via PATH. Build both and
+        # put target/release on PATH — building only `ffaik` never builds
+        # the sibling runner.
         run: |
-          cargo build --release --bin tile --bin __tile_runner
-          PATH="$PWD/target/release:$PATH" tile build --emit all \
+          cargo build --release --bin ffaik --bin __ffai_runner
+          PATH="$PWD/target/release:$PATH" ffaik build --emit all \
             --out ${{ github.workspace }}/FFAI/Sources/MetalTileSwift
 
       - name: Run unit tests (with coverage)
