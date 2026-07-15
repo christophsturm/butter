@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Approved — implementing |
+| Status | Core validated (P1+P3) — per-family sweep (P2/P4) remaining |
 | Goal | `Model.generate(.vision(messages:media:))` uniform with `.text`; no caller-built `promptTokens`/placeholders |
 | Decisions | Content-parts message shape (HF/OpenAI-style); all ~15 VL families in one sweep; deprecate token-based `VisionRequest.promptTokens` |
 | Branch | `ek/fix-all-the-things` (current) |
@@ -19,6 +19,14 @@ Verified against cached VL models (2026-07-15): Qwen2.5/3/3.5/3.6-VL, Gemma4, Sm
 - Needs ~no new per-family config: reuses existing `imageTokenId` + count strategy.
 
 **Fallback (FFAI-controlled framing):** if template render throws (swift-jinja can't handle the content-part constructs) OR emits no placeholder, splice the family's known markers (recap table) around `placeholderId × N` at the media slot (divergence-located). Per-family marker config lives here, exercised only for templates that don't support content-parts.
+
+## Progress
+- ✅ **P1a** (`f5bbcb4`): `ContentPart` + `ChatMessage.content: [ContentPart]`, back-compat String init, `asTemplateMessage` text/multimodal split.
+- ✅ **P1b + P3** (`b96c476`): message-based `VisionRequest` + `VisionMedia`; `VisionPromptBuilder` (template render → placeholder expand); `.vision` dispatch. Token path = deprecated escape hatch.
+- ✅ **Validated** (`46797a6`): text-fill in `.vision` dispatch; Qwen3-VL unified image test passes end-to-end against cached model (coherent dog caption, no hand-built tokens). Unit gate 1737/221 green throughout.
+- ⏳ **P4** (remaining): route the other ~13 VL + omni integration suites through `Model.generate(.vision(messages:media:))`; validate each family's template framing (GPU, ~5 min/family). Add video + audio unified tests.
+- ⏳ **P2** (remaining): FFAI-controlled fallback framing for any family whose template doesn't handle content-parts (currently throws `templateFramingUnavailable`). Determine which families need it during the P4 sweep.
+- ⏳ **Follow-ups**: multi-image / interleaved (dispatch caps at 1 media/request today); encode-once (builder + generateStream currently encode twice); CLI migration (drop `MultimodalPrompt`).
 
 ## Phases
 
