@@ -5826,13 +5826,15 @@ public enum Ops {
     /// Compact K/V `[nKV, maxSeq, D]` → packed `[nKV, kLen, D]` (f16).
     public static func compactKV_f16(
         src: Tensor, nKV: Int, maxSeq: Int, kLen: Int, headDim: Int,
-        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil,
+        encoder: MTLComputeCommandEncoder? = nil
     ) -> Tensor {
         precondition(src.dtype == .f16 && kLen > 0 && kLen <= maxSeq)
         let result = out ?? Tensor.empty(shape: [nKV, kLen, headDim], dtype: .f16)
         var nKVU = UInt32(nKV), maxU = UInt32(maxSeq), kU = UInt32(kLen), dU = UInt32(headDim)
         let pso = PSOCache.shared.pipelineState(for: "mt_compact_kv_f16")
-        guard let enc = cmd.makeComputeCommandEncoder() else { return result }
+        let ownsEnc = encoder == nil
+        guard let enc = encoder ?? cmd.makeComputeCommandEncoder() else { return result }
         enc.setComputePipelineState(pso)
         enc.setBuffer(src.buffer, offset: src.offset, index: 0)
         enc.setBuffer(result.buffer, offset: result.offset, index: 1)
@@ -5844,7 +5846,7 @@ public enum Ops {
         enc.dispatchThreads(
             MTLSize(width: nKV, height: td, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 1, height: min(td, 256), depth: 1))
-        enc.endEncoding()
+        if ownsEnc { enc.endEncoding() }
         return result
     }
 

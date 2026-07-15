@@ -422,12 +422,27 @@ private func hy3SdpaPrefill(
     if usePrefillMma {
         let kLen = position + nRows
         let qHTD = Ops.transposeTHD_f16(q, t: nRows, h: nHeads, d: headDim, on: cmd)
-        let kPacked = Ops.compactKV_f16(
-            src: cacheK, nKV: nKVHeads, maxSeq: cache.maxSeq,
-            kLen: kLen, headDim: headDim, on: cmd)
-        let vPacked = Ops.compactKV_f16(
-            src: cacheV, nKV: nKVHeads, maxSeq: cache.maxSeq,
-            kLen: kLen, headDim: headDim, on: cmd)
+        // Compact K‖V on a concurrent encoder (two independent blits of the
+        // strided cache into packed [nKV, kLen, d] slabs). Serial compact
+        // was two full encoder open/close cycles per layer.
+        let kPacked = Tensor.empty(shape: [nKVHeads, kLen, headDim], dtype: .f16)
+        let vPacked = Tensor.empty(shape: [nKVHeads, kLen, headDim], dtype: .f16)
+        if let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) {
+            _ = Ops.compactKV_f16(
+                src: cacheK, nKV: nKVHeads, maxSeq: cache.maxSeq,
+                kLen: kLen, headDim: headDim, on: cmd, into: kPacked, encoder: enc)
+            _ = Ops.compactKV_f16(
+                src: cacheV, nKV: nKVHeads, maxSeq: cache.maxSeq,
+                kLen: kLen, headDim: headDim, on: cmd, into: vPacked, encoder: enc)
+            enc.endEncoding()
+        } else {
+            _ = Ops.compactKV_f16(
+                src: cacheK, nKV: nKVHeads, maxSeq: cache.maxSeq,
+                kLen: kLen, headDim: headDim, on: cmd, into: kPacked)
+            _ = Ops.compactKV_f16(
+                src: cacheV, nKV: nKVHeads, maxSeq: cache.maxSeq,
+                kLen: kLen, headDim: headDim, on: cmd, into: vPacked)
+        }
         let outHTD = Ops.sdpaPrefillMma(
             q: qHTD, k: kPacked, v: vPacked,
             nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
