@@ -323,22 +323,17 @@ extension Model {
 
         // ─── Prefill ─────────────────────────────────────────────────
         //
-        // .6: chunked prefill. Pre-warm the KV cache for all but
-        // the last prompt position by calling `engine.forwardMulti(...)`
-        // in `prefillStepSize`-sized chunks (default 1024). Then sample
-        // the final position via the existing fused-kernel `sampleNext`
-        // path — that's the only position whose logits we actually need.
+        // Chunked prefill: `engine.forwardMulti(...)` in
+        // `prefillStepSize`-sized chunks over the full prompt. The last
+        // multi returns logits at the final prompt position; we sample
+        // the first generate token from those logits (no second stack).
         //
         // The default `forwardMulti` implementation in `LanguageModel`
         // falls back to a per-token loop, so families that haven't
-        // overridden it retain today's behaviour exactly. Optimised
-        // families (Llama, …) override `forwardMulti` with a single
-        // `Ops.sdpaMulti(causal: true)` dispatch over the whole chunk —
-        // that's the real long-prompt TTFT win.
+        // overridden it retain correct behaviour. Optimised families
+        // override `forwardMulti` with a batched attention/MLP path.
         //
-        // Empty prompts hit the early-return below. Single-token prompts
-        // skip the warm loop entirely (pos starts at 0, the while
-        // condition is false) and go straight to `sampleNext`.
+        // Empty prompts hit the early-return below.
         let prefillStart = Date()
         var nextToken = 0
         try profile.signpost("prefill") {
@@ -350,13 +345,18 @@ extension Model {
                 1,
                 params.prefillStepSize
                     ?? engine.defaultPrefillStepSize)
+            // Multi over the full prompt (all n tokens). The last multi
+            // returns logits at the final prompt position so we can sample
+            // the first generate token without a second full layer stack
+            // (previously multi was n-1 then sampleNext re-forwarded last).
             var pos = 0
-            while pos < n - 1 {
+            var lastLogits: Tensor?
+            while pos < n {
                 try Task.checkCancellation()
-                let end = min(pos + chunkSize, n - 1)
+                let end = min(pos + chunkSize, n)
                 let chunk = Array(promptTokens[pos ..< end])
                 let cmd = Device.shared.makeCommandBuffer()
-                _ = engine.forwardMulti(
+                lastLogits = engine.forwardMulti(
                     tokenIds: chunk, startingAt: pos,
                     caches: caches, on: cmd,
                     device: Device.shared)
@@ -365,10 +365,23 @@ extension Model {
                 memTracker.sample()
                 pos = end
             }
-            if n > 0 {
+            if n > 0, let logits = lastLogits {
                 try Task.checkCancellation()
-                let lastTok = promptTokens[n - 1]
-                nextToken = sampleNext(tokenId: lastTok, position: n - 1)
+                // Sample first generate token from multi logits (no re-forward).
+                let chosen: Int
+                if path == .greedyGPU || params.temperature == 0 {
+                    chosen = Sampling.argmax(logits)
+                } else {
+                    chosen = Sampling.sample(
+                        logits, parameters: params,
+                        rng: &rng, tokenHistory: tokenHistory)
+                }
+                if capturePPL {
+                    liveNLLSum += Perplexity.negLogSoftmaxAt(
+                        logits: logits, index: chosen)
+                    liveNLLCount += 1
+                }
+                nextToken = chosen
                 memTracker.sample()
             }
         }
