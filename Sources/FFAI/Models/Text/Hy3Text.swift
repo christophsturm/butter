@@ -830,16 +830,16 @@ final class Hy3DenseLayer: Hy3LayerProtocol {
             ffnIn: ffnIn, t: nRows,
             gate: gateProj, up: upProj,
             cmd: cmd, device: device)
-        let inner = Ops.swiglu(gate: g, up: u, on: cmd)
+        // SwiGLU into u (same shape); avoids fresh intermediate alloc.
+        _ = Ops.swiglu(gate: g, up: u, on: cmd, into: u)
         let ffn = hy3Int8CallMany(
-            downProj, inner, t: nRows, on: cmd, device: device)
-        let layerOut = hy3ScratchTensor(
-            shape: [nRows * hidden], dtype: h2.dtype,
-            tag: "hy3_layer_out_\(h2.dtype)_\(nRows)_\(hidden)", device: device)
+            downProj, u, t: nRows, on: cmd, device: device)
+        // In-place into residual (hPersist) — see MoE multi residual note.
         return Ops.add(
             h2.reshaped(to: [nRows * hidden]),
             ffn.reshaped(to: [nRows * hidden]),
-            on: cmd, into: layerOut
+            on: cmd,
+            into: residual.reshaped(to: [nRows * hidden])
         ).reshaped(to: [nRows, hidden])
     }
 }
@@ -1547,13 +1547,15 @@ final class Hy3MoELayer: Hy3LayerProtocol {
             }
         }
 
-        let layerOut = hy3ScratchTensor(
-            shape: [nRows * hidden], dtype: h2.dtype,
-            tag: "hy3_layer_out_\(h2.dtype)_\(nRows)_\(hidden)", device: device)
+        // Write layer residual back into `residual` (caller’s hPersist).
+        // After addAndRmsNorm, original residual is only needed as h2’s
+        // source (already in scratch) — in-place here drops the model
+        // loop’s per-layer Ops.copy of [T, hidden] × 80 layers.
         return Ops.add(
             h2.reshaped(to: [nRows * hidden]),
             combined.reshaped(to: [nRows * hidden]),
-            on: cmd, into: layerOut
+            on: cmd,
+            into: residual.reshaped(to: [nRows * hidden])
         ).reshaped(to: [nRows, hidden])
     }
 
@@ -1945,12 +1947,13 @@ final class Hy3MoELayer: Hy3LayerProtocol {
                     enc.endEncoding()
                 }
             }
-            let innerActive = Ops.swiglu(gate: gateOut, up: upOut, on: cmd)
+            _ = Ops.swiglu(gate: gateOut, up: upOut, on: cmd, into: upOut)
+            let innerActive = upOut
             var sharedInnerActive: Tensor?
             if let sgPad = sharedSgPad, let suPad = sharedSuPad {
                 let sg = sharedMPad == t ? sgPad : sgPad.slicedRows(start: 0, count: t)
                 let su = sharedMPad == t ? suPad : suPad.slicedRows(start: 0, count: t)
-                sharedInnerActive = Ops.swiglu(gate: sg, up: su, on: cmd)
+                sharedInnerActive = Ops.swiglu(gate: sg, up: su, on: cmd, into: su)
             }
             if skipDown {
                 zeroTensor(downOut)
@@ -2250,15 +2253,22 @@ final class Hy3MoELayer: Hy3LayerProtocol {
                 cmd, upOut)
         }
         // When GU+SwiGLU is fused, gateOut already holds silu(g)*u.
-        let inner =
-            useGUSwiglu
-            ? gateOut
-            : Ops.swiglu(gate: gateOut, up: upOut, on: cmd)
+        // Else SwiGLU into upOut (same shape as gate/up) — avoids a fresh
+        // [mTotal, moeInter] alloc per layer. Kernel loads gate/up then
+        // stores; up is only used as the multiplicand.
+        let inner: Tensor
+        if useGUSwiglu {
+            inner = gateOut
+        } else {
+            _ = Ops.swiglu(gate: gateOut, up: upOut, on: cmd, into: upOut)
+            inner = upOut
+        }
         var sharedInner: Tensor?
         if let sgPad = sharedSgPad, let suPad = sharedSuPad {
             let sg = sharedMPad == t ? sgPad : sgPad.slicedRows(start: 0, count: t)
             let su = sharedMPad == t ? suPad : suPad.slicedRows(start: 0, count: t)
-            sharedInner = Ops.swiglu(gate: sg, up: su, on: cmd)
+            // Reuse suPad for shared SwiGLU out (same shape).
+            sharedInner = Ops.swiglu(gate: sg, up: su, on: cmd, into: su)
         }
 
         if skipDown {
