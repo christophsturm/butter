@@ -426,16 +426,21 @@ private func hy3SdpaPrefill(
     }()
     if usePrefillMma {
         let kLen = position + nRows
-        let qHTD = Ops.transposeTHD_f16(q, t: nRows, h: nHeads, d: headDim, on: cmd)
-        // Compact K‖V on a concurrent encoder (two independent blits of the
-        // strided cache into packed [nKV, kLen, d] slabs). Serial compact
-        // was two full encoder open/close cycles per layer.
+        let dev = Device.shared
+        let qHTD = hy3ScratchTensor(
+            shape: [nHeads, nRows, headDim], dtype: .f16,
+            tag: "hy3_sdpa_qhtd_\(nHeads)_\(nRows)_\(headDim)", device: dev)
+        _ = Ops.transposeTHD_f16(
+            q, t: nRows, h: nHeads, d: headDim, on: cmd, into: qHTD)
+        // Compact K‖V on a concurrent encoder (two independent packs of the
+        // strided cache into [nKV, kLen, d] slabs). Serial compact was two
+        // full encoder open/close cycles per layer.
         let kPacked = hy3ScratchTensor(
             shape: [nKVHeads, kLen, headDim], dtype: .f16,
-            tag: "hy3_sdpa_kpack_\(nKVHeads)_\(kLen)_\(headDim)", device: Device.shared)
+            tag: "hy3_sdpa_kpack_\(nKVHeads)_\(kLen)_\(headDim)", device: dev)
         let vPacked = hy3ScratchTensor(
             shape: [nKVHeads, kLen, headDim], dtype: .f16,
-            tag: "hy3_sdpa_vpack_\(nKVHeads)_\(kLen)_\(headDim)", device: Device.shared)
+            tag: "hy3_sdpa_vpack_\(nKVHeads)_\(kLen)_\(headDim)", device: dev)
         if let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) {
             _ = Ops.compactKV_f16(
                 src: cacheK, nKV: nKVHeads, maxSeq: cache.maxSeq,
@@ -452,11 +457,18 @@ private func hy3SdpaPrefill(
                 src: cacheV, nKV: nKVHeads, maxSeq: cache.maxSeq,
                 kLen: kLen, headDim: headDim, on: cmd, into: vPacked)
         }
-        let outHTD = Ops.sdpaPrefillMma(
+        let outHTD = hy3ScratchTensor(
+            shape: [nHeads, nRows, headDim], dtype: .f16,
+            tag: "hy3_sdpa_outhtd_\(nHeads)_\(nRows)_\(headDim)", device: dev)
+        _ = Ops.sdpaPrefillMma(
             q: qHTD, k: kPacked, v: vPacked,
             nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-            qLen: nRows, kLen: kLen, scale: scale, on: cmd)
-        return Ops.transposeHTD_f16(outHTD, t: nRows, h: nHeads, d: headDim, on: cmd)
+            qLen: nRows, kLen: kLen, scale: scale, on: cmd, into: outHTD)
+        let outTHD = hy3ScratchTensor(
+            shape: [nRows, nHeads, headDim], dtype: .f16,
+            tag: "hy3_sdpa_outthd_\(nRows)_\(nHeads)_\(headDim)", device: dev)
+        return Ops.transposeHTD_f16(
+            outHTD, t: nRows, h: nHeads, d: headDim, on: cmd, into: outTHD)
     }
     return Ops.sdpaMulti(
         q: q, k: cacheK, v: cacheV,
@@ -576,12 +588,12 @@ private func hy3BatchedRopeAndKV(
 ) {
     let qDim = nHeads * headDim
     let kvDim = nKVHeads * headDim
-    let positionsBuf = device.makeBuffer(length: nRows * 4)
-    let positionsPtr = positionsBuf.contents().bindMemory(
-        to: UInt32.self, capacity: nRows)
+    let positionsT = hy3ScratchTensor(
+        shape: [nRows], dtype: .u32, tag: "hy3_rope_pos_\(nRows)", device: device)
+    let positionsPtr = positionsT.buffer.contents()
+        .advanced(by: positionsT.offset)
+        .bindMemory(to: UInt32.self, capacity: nRows)
     for r in 0 ..< nRows { positionsPtr[r] = UInt32(position + r) }
-    let positionsT = Tensor(
-        buffer: positionsBuf, offset: 0, shape: [nRows], dtype: .u32)
     // Full rotary (rotaryDim == headDim). In-place on q/k.
     Ops.ropePartialManyTwo(
         q: q, qNHeads: nHeads, qRowStride: qDim,
@@ -601,8 +613,8 @@ private func hy3BatchedRopeAndKV(
         }
         return
     }
-    let appendPositions = Tensor.empty(
-        shape: [nRows], dtype: .u32, device: device)
+    let appendPositions = hy3ScratchTensor(
+        shape: [nRows], dtype: .u32, tag: "hy3_kv_append_pos_\(nRows)", device: device)
     kv.reserveSlotsManyOnHost(t: nRows, into: appendPositions)
     kv.appendRangeOnGPUMany(
         kFlat: k, vFlat: v, t: nRows,
@@ -745,11 +757,14 @@ final class Hy3DenseLayer: Hy3LayerProtocol {
         let nRows = h.shape[0]
         precondition(h.shape == [nRows, hidden])
         let residual = h
-        let xNorm = Ops.rmsNormRows(
+        let xNormFlat = hy3ScratchTensor(
+            shape: [nRows * hidden], dtype: residual.dtype,
+            tag: "hy3_xnorm_\(residual.dtype)_\(nRows)_\(hidden)", device: device)
+        _ = Ops.rmsNormRows(
             h.reshaped(to: [nRows * hidden]),
             weight: inputNorm.weight, eps: inputNorm.eps,
-            nRows: nRows, rowSize: hidden, on: cmd
-        ).reshaped(to: [nRows, hidden])
+            nRows: nRows, rowSize: hidden, on: cmd, into: xNormFlat)
+        let xNorm = xNormFlat.reshaped(to: [nRows, hidden])
 
         let (qRaw, kRaw, v) = hy3ConcurrentQKV(
             xNorm: xNorm, t: nRows,
@@ -759,17 +774,23 @@ final class Hy3DenseLayer: Hy3LayerProtocol {
         var k = kRaw
 
         if let qn = qNorm {
+            let qNormOut = hy3ScratchTensor(
+                shape: [nRows * nHeads * headDim], dtype: q.dtype,
+                tag: "hy3_qn_\(q.dtype)_\(nRows)_\(nHeads)_\(headDim)", device: device)
             q = Ops.rmsNormRows(
                 q.reshaped(to: [nRows * nHeads * headDim]),
                 weight: qn.weight, eps: qn.eps,
-                nRows: nRows * nHeads, rowSize: headDim, on: cmd
+                nRows: nRows * nHeads, rowSize: headDim, on: cmd, into: qNormOut
             ).reshaped(to: [nRows, nHeads * headDim])
         }
         if let kn = kNorm {
+            let kNormOut = hy3ScratchTensor(
+                shape: [nRows * nKVHeads * headDim], dtype: k.dtype,
+                tag: "hy3_kn_\(k.dtype)_\(nRows)_\(nKVHeads)_\(headDim)", device: device)
             k = Ops.rmsNormRows(
                 k.reshaped(to: [nRows * nKVHeads * headDim]),
                 weight: kn.weight, eps: kn.eps,
-                nRows: nRows * nKVHeads, rowSize: headDim, on: cmd
+                nRows: nRows * nKVHeads, rowSize: headDim, on: cmd, into: kNormOut
             ).reshaped(to: [nRows, nKVHeads * headDim])
         }
 
@@ -789,11 +810,18 @@ final class Hy3DenseLayer: Hy3LayerProtocol {
         let oOut = hy3Int8CallMany(
             oProj, attnOut.reshaped(to: [nRows, nHeads * headDim]),
             t: nRows, on: cmd, device: device)
-        let (h2Flat, ffnInFlat) = Ops.addAndRmsNorm(
+        let h2Flat = hy3ScratchTensor(
+            shape: [nRows * hidden], dtype: residual.dtype,
+            tag: "hy3_h2_resid_\(residual.dtype)_\(nRows)_\(hidden)", device: device)
+        let ffnInFlat = hy3ScratchTensor(
+            shape: [nRows * hidden], dtype: residual.dtype,
+            tag: "hy3_ffnin_\(residual.dtype)_\(nRows)_\(hidden)", device: device)
+        _ = Ops.addAndRmsNorm(
             residual.reshaped(to: [nRows * hidden]),
             oOut.reshaped(to: [nRows * hidden]),
             weight: postAttnNorm.weight, eps: postAttnNorm.eps,
-            nRows: nRows, rowSize: hidden, on: cmd)
+            nRows: nRows, rowSize: hidden, on: cmd,
+            residualOut: h2Flat, normedOut: ffnInFlat)
         let h2 = h2Flat.reshaped(to: [nRows, hidden])
         let ffnIn = ffnInFlat.reshaped(to: [nRows, hidden])
         // Concurrent gate‖up (int8 MPP) — dense layer intermediate is huge
@@ -805,10 +833,13 @@ final class Hy3DenseLayer: Hy3LayerProtocol {
         let inner = Ops.swiglu(gate: g, up: u, on: cmd)
         let ffn = hy3Int8CallMany(
             downProj, inner, t: nRows, on: cmd, device: device)
+        let layerOut = hy3ScratchTensor(
+            shape: [nRows * hidden], dtype: h2.dtype,
+            tag: "hy3_layer_out_\(h2.dtype)_\(nRows)_\(hidden)", device: device)
         return Ops.add(
             h2.reshaped(to: [nRows * hidden]),
             ffn.reshaped(to: [nRows * hidden]),
-            on: cmd
+            on: cmd, into: layerOut
         ).reshaped(to: [nRows, hidden])
     }
 }
@@ -1271,11 +1302,14 @@ final class Hy3MoELayer: Hy3LayerProtocol {
         let nRows = h.shape[0]
         precondition(h.shape == [nRows, hidden])
         let residual = h
-        let xNorm = Ops.rmsNormRows(
+        let xNormFlat = hy3ScratchTensor(
+            shape: [nRows * hidden], dtype: residual.dtype,
+            tag: "hy3_xnorm_\(residual.dtype)_\(nRows)_\(hidden)", device: device)
+        _ = Ops.rmsNormRows(
             h.reshaped(to: [nRows * hidden]),
             weight: inputNorm.weight, eps: inputNorm.eps,
-            nRows: nRows, rowSize: hidden, on: cmd
-        ).reshaped(to: [nRows, hidden])
+            nRows: nRows, rowSize: hidden, on: cmd, into: xNormFlat)
+        let xNorm = xNormFlat.reshaped(to: [nRows, hidden])
 
         // Probe: FFAI_HY3_SKIP_ATTN=1 zeros QKV/SDPA/O (free-path ceiling).
         let skipAttn =
@@ -1300,17 +1334,23 @@ final class Hy3MoELayer: Hy3LayerProtocol {
             var k = kRaw
 
             if let qn = qNorm {
+                let qNormOut = hy3ScratchTensor(
+                    shape: [nRows * nHeads * headDim], dtype: q.dtype,
+                    tag: "hy3_qn_\(q.dtype)_\(nRows)_\(nHeads)_\(headDim)", device: device)
                 q = Ops.rmsNormRows(
                     q.reshaped(to: [nRows * nHeads * headDim]),
                     weight: qn.weight, eps: qn.eps,
-                    nRows: nRows * nHeads, rowSize: headDim, on: cmd
+                    nRows: nRows * nHeads, rowSize: headDim, on: cmd, into: qNormOut
                 ).reshaped(to: [nRows, nHeads * headDim])
             }
             if let kn = kNorm {
+                let kNormOut = hy3ScratchTensor(
+                    shape: [nRows * nKVHeads * headDim], dtype: k.dtype,
+                    tag: "hy3_kn_\(k.dtype)_\(nRows)_\(nKVHeads)_\(headDim)", device: device)
                 k = Ops.rmsNormRows(
                     k.reshaped(to: [nRows * nKVHeads * headDim]),
                     weight: kn.weight, eps: kn.eps,
-                    nRows: nRows * nKVHeads, rowSize: headDim, on: cmd
+                    nRows: nRows * nKVHeads, rowSize: headDim, on: cmd, into: kNormOut
                 ).reshaped(to: [nRows, nKVHeads * headDim])
             }
 
@@ -1339,11 +1379,19 @@ final class Hy3MoELayer: Hy3LayerProtocol {
                 t: nRows, on: cmd, device: device)
         }
         // Fused residual add + post-attn RMSNorm (one launch vs two).
-        let (h2Flat, ffnInFlat) = Ops.addAndRmsNorm(
+        // Scratch into: avoids 2× makeBuffer per layer for resid/normed.
+        let h2Flat = hy3ScratchTensor(
+            shape: [nRows * hidden], dtype: residual.dtype,
+            tag: "hy3_h2_resid_\(residual.dtype)_\(nRows)_\(hidden)", device: device)
+        let ffnInFlat = hy3ScratchTensor(
+            shape: [nRows * hidden], dtype: residual.dtype,
+            tag: "hy3_ffnin_\(residual.dtype)_\(nRows)_\(hidden)", device: device)
+        _ = Ops.addAndRmsNorm(
             residual.reshaped(to: [nRows * hidden]),
             oOut.reshaped(to: [nRows * hidden]),
             weight: postAttnNorm.weight, eps: postAttnNorm.eps,
-            nRows: nRows, rowSize: hidden, on: cmd)
+            nRows: nRows, rowSize: hidden, on: cmd,
+            residualOut: h2Flat, normedOut: ffnInFlat)
         let h2 = h2Flat.reshaped(to: [nRows, hidden])
         let ffnIn = ffnInFlat.reshaped(to: [nRows, hidden])
 
@@ -1499,10 +1547,13 @@ final class Hy3MoELayer: Hy3LayerProtocol {
             }
         }
 
+        let layerOut = hy3ScratchTensor(
+            shape: [nRows * hidden], dtype: h2.dtype,
+            tag: "hy3_layer_out_\(h2.dtype)_\(nRows)_\(hidden)", device: device)
         return Ops.add(
             h2.reshaped(to: [nRows * hidden]),
             combined.reshaped(to: [nRows * hidden]),
-            on: cmd
+            on: cmd, into: layerOut
         ).reshaped(to: [nRows, hidden])
     }
 
