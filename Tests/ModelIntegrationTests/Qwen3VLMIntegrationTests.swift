@@ -136,6 +136,44 @@ struct Qwen3VLMIntegrationTests {
         VisionTestHelpers.expectMentionsDog(text, label: "Qwen 3-VL")
     }
 
+    /// Same caption, but through the UNIFIED message-based surface —
+    /// `Model.generate(.vision(messages:media:))`. Exercises the whole
+    /// template-driven path with NO hand-built promptTokens: the Qwen 3-VL
+    /// chat template renders the `.image` content part into
+    /// `<|vision_start|><|image_pad|><|vision_end|>`, the builder expands the
+    /// single `<|image_pad|>` to the native-resolution token count, and
+    /// splice/decode run. Proves the message-based vision path end-to-end.
+    @Test("image via unified Model.generate(.vision) — describes the dog photo")
+    func imageTextGenerationUnified() async throws {
+        let m = try await Self.loaded.value
+        let image = try VisionTestHelpers.dogImage()
+
+        let messages = [
+            ChatMessage(
+                role: .user, content: [.image, .text("Describe this image.")])
+        ]
+        let out = try await m.generate(
+            .vision(
+                VisionRequest(
+                    messages: messages, media: [.image(image)],
+                    maxTokens: 200,
+                    parameters: m.defaultGenerationParameters.with {
+                        $0.temperature = 0
+                    },
+                    eosTokenId: m.config.eosTokenId,
+                    eosTokenIds: m.config.eosTokenIds)))
+
+        guard case .text(let result) = out else {
+            Issue.record("expected .text output from a VLM image request")
+            return
+        }
+        expectCoherentOutput(
+            result.generatedTokens, minTokens: 8,
+            label: "Qwen 3-VL unified image+text")
+        print("Qwen 3-VL unified generated: \(result.text)")
+        VisionTestHelpers.expectMentionsDog(result.text, label: "Qwen 3-VL unified")
+    }
+
     @Test("video + text prompt — describes the cat clip")
     func videoTextGeneration() async throws {
         let m = try await Self.loaded.value

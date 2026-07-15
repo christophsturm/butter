@@ -46,9 +46,18 @@ extension Model {
             // Drain the VLM stream into a GenerationResult — the same
             // collect-the-stream batch path the text case uses. The builder
             // returns the framed prompt tokens so we can count the prompt.
+            // The VLM stream yields token-only chunks (see
+            // VisionModel.generateMultimodalStream), so decode the generated
+            // text here to populate GenerationResult.text.
             let (tokens, stream) = try visionStream(req)
             let result = try await collectStream(stream, promptTokens: tokens)
-            return .text(result)
+            let text = textTokenizer.decode(
+                tokens: result.generatedTokens, skipSpecialTokens: true)
+            return .text(
+                GenerationResult(
+                    promptTokens: tokens,
+                    generatedTokens: result.generatedTokens,
+                    text: text, stats: result.stats))
 
         case .transcribe(let req):
             let engine = try transcribingEngine(for: input)
@@ -99,7 +108,20 @@ extension Model {
                     case .vision(let req):
                         let (_, stream) = try visionStream(req)
                         for try await chunk in stream {
-                            continuation.yield(.textDelta(chunk))
+                            // VLM chunks carry token ids only; fill in the
+                            // decoded delta so the streamed text matches the
+                            // LLM path.
+                            let text =
+                                chunk.text.isEmpty && !chunk.tokens.isEmpty
+                                ? textTokenizer.decode(
+                                    tokens: chunk.tokens, skipSpecialTokens: true)
+                                : chunk.text
+                            continuation.yield(
+                                .textDelta(
+                                    GenerationChunk(
+                                        text: text, tokens: chunk.tokens,
+                                        position: chunk.position,
+                                        stats: chunk.stats)))
                         }
 
                     case .transcribe(let req):
