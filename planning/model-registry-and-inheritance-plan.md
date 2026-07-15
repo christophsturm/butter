@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft — awaiting approval |
+| Status | Implemented (Phases 0–5 shipped) |
 | Scope | Loader, Model wrapper, all 3 registries, model-type abstraction, CLI catalog, unit-test layout |
 | Approach | Protocol composition (NOT class inheritance). Phased, behavior-preserving first. |
 | Branch | `ek/model-registry-consolidation` (off `dev`) |
