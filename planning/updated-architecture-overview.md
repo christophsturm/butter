@@ -10,7 +10,7 @@ and [`model-registry-and-inheritance-plan.md`](model-registry-and-inheritance-pl
 This document answers ten questions the team asked:
 
 1. Where to consolidate duplicate code.
-2. Where CPU-side inference remains (GPU-everywhere gaps) — Ops vs metaltile kernels.
+2. Where CPU-side inference remains (GPU-everywhere gaps) — Ops vs ffai-kernels kernels.
 3. Whether model loading is consistent across families.
 4. How to normalize integration tests to *load + per-modality inference only*.
 5. Dead code.
@@ -207,8 +207,8 @@ head-dim kernel choices) is small enough that consolidation is optional.
 
 ## 4. GPU-everywhere — remove CPU-side inference (Q2)
 
-**Headline:** No Ops are missing a backing kernel. The 159-family metaltile kernel
-tree (`~/Development/personal/ai/metaltile/crates/metaltile-std/src/ffai/`) covers
+**Headline:** No Ops are missing a backing kernel. The 159-family ffai-kernels kernel
+tree (`~/Development/personal/ai/ffai-kernels/crates/ffai-kernels-std/src/ffai/`) covers
 the entire `Ops.*` surface; every unusual op (lstm, vocoder, mel_spectrogram,
 adain1d, snake1d, audio_conv1d, resize_normalize, im2col_patch, patch_unfold_qwen,
 frame_diff_luma) maps to a real kernel. So the gap is **wiring**, not kernels.
@@ -223,7 +223,7 @@ frame_diff_luma) maps to a real kernel. So the gap is **wiring**, not kernels.
 ### 4.1 Sanctioned CPU paths — leave as-is
 
 One-time-per-utterance codec/DSP (`Audio/AudioPrimitives.swift` `AudioMath` — no
-metaltile general strided/grouped/transposed conv1d; backs BigVGAN/Encodec/Mimi/
+ffai-kernels general strided/grouped/transposed conv1d; backs BigVGAN/Encodec/Mimi/
 SNAC/DAC/Vocos), `Audio/Mimi*.swift`, `Audio/DeepFilterNetDSP.swift` (vDSP FFT),
 `VADCompute.swift` (tiny models), Kokoro/Soprano/FishSpeech acoustic stacks
 (GPU variants already exist alongside), and **load-time** weight folds

@@ -4,7 +4,7 @@ The high-level view of what's shipped and what's coming. For the fully phased bu
 
 ## Shipped today
 
-**Inference engine.** Apple Silicon Metal-only, no CPU hot-path fallback. One `MTLCommandBuffer` per token, one `commit + wait` per token, GPU-side sampling — only the 4-byte sampled token id crosses CPU↔GPU. Kernels are generated from the metaltile Rust DSL at build time and shipped as a pre-compiled `kernels.metallib` resource — no runtime JIT, no first-call Metal compile latency.
+**Inference engine.** Apple Silicon Metal-only, no CPU hot-path fallback. One `MTLCommandBuffer` per token, one `commit + wait` per token, GPU-side sampling — only the 4-byte sampled token id crosses CPU↔GPU. Kernels are generated from the ffai-kernels Rust DSL at build time and shipped as a pre-compiled `kernels.metallib` resource — no runtime JIT, no first-call Metal compile latency.
 
 **Loading.** HuggingFace Hub integration (`Model.load("org/repo")` — resumable, glob-filtered download; shared `~/.cache/huggingface` cache). Capability-driven loading (`Capability` enum — `.textIn`, `.textOut`, `.visionIn`, `.audioIn`, `.audioOut`, `.toolCalling`; disabled modalities skip weight allocation). Capability sets: `.textOnly` / `.textWithTools` / `.speechToText` / `.textToSpeech` / `.omniAudio` / `.speechToSpeech` (audio enhancement, source separation, audio segmentation). Async `AsyncStream<ModelLifecycleEvent>` lifecycle. mlx-format **2/3/4/5/6/8-bit** affine group quant, with **per-tensor bit-width derivation** so mixed-precision checkpoints (e.g. Gemma 4 26B-A4B, FFAI's own per-role `ffai convert` outputs) load correctly.
 
@@ -28,7 +28,7 @@ The high-level view of what's shipped and what's coming. For the fully phased bu
 **Kernels.** Full sampling pipeline (greedy-GPU / GPU-categorical / CPU-sample paths — `temperature`, `top-K`, `top-P`, `min-P`, `repetition penalty`, seeded sampling). AURA codec kernels. GDN (`gated_delta_step`) + Mamba 2 (`ssm_step`, `conv1d_causal_step`) recurrent kernels. Attention sinks + sliding-window mask. MoE router
 + per-expert dispatch. SDPA decode at head_dim {64, 128, 256, 512}. Patch-embed, conv2d, audio conv1d, mel spectrogram.
 
-**Tooling.** `ffai inspect` (architecture + tokens + logits), `ffai convert` (Swift-native MLX affine quantizer — every shipped bit-width 2 / 3 / 4 / 5 / 6 / 8 plus pure fp16 / bf16 downcast; per-tensor `QuantSpec` overrides via `--bits` / `--embedding-bits` / `--lm-head-bits` / `--vision-bits` produce mixed-precision checkpoints in a single pass; uses FFAI's `QuantizedOps.quantizeAffine` GPU kernel directly — no Python / `mlx-lm` / `mlx-vlm` dependency; succeeds where mlx-lm rejects custom-modeling architectures like Soprano, Nemotron-H, FastVLM), the `tile` metaltile CLI, a GPU-correctness test layer (naive-CPU oracle), `insta` MSL snapshots.
+**Tooling.** `ffai inspect` (architecture + tokens + logits), `ffai convert` (Swift-native MLX affine quantizer — every shipped bit-width 2 / 3 / 4 / 5 / 6 / 8 plus pure fp16 / bf16 downcast; per-tensor `QuantSpec` overrides via `--bits` / `--embedding-bits` / `--lm-head-bits` / `--vision-bits` produce mixed-precision checkpoints in a single pass; uses FFAI's `QuantizedOps.quantizeAffine` GPU kernel directly — no Python / `mlx-lm` / `mlx-vlm` dependency; succeeds where mlx-lm rejects custom-modeling architectures like Soprano, Nemotron-H, FastVLM), the `ffaik` ffai-kernels CLI, a GPU-correctness test layer (naive-CPU oracle), `insta` MSL snapshots.
 
 ## Planned
 
@@ -41,9 +41,9 @@ The roadmap is a high-level view; per-phase deliverables, kernels, and tests liv
 | AURA performance (Stage 1b + 3) | 6.3 | Two independent K/V codecs, two-phase prefill, compressed-domain `aura_flash` as the default decode path, strided-output encode + cache-layout flip. Perf/architecture only — AURA correctness is shipped. |
 | Profile injectable | 6.4 | `Profile` passed per `generate(...)` call instead of a singleton; per-sequence telemetry prereq for batched decode. |
 | Chunked (batched) prefill | 6.6 | `forwardMulti` over prompt chunks via the `sdpa_decode_batched_prefill` kernel — large TTFT win on long prompts. Also the Phase 8 speculative-decode prereq. |
-| GPU vision attention + depthwise conv | 6.5b | Move the Idefics3 / Paligemma / GlmOcr / FastVLM CPU bidirectional attention + depthwise conv2d onto metaltile. FastVLM cold inference at 1024px is the loudest signal. |
+| GPU vision attention + depthwise conv | 6.5b | Move the Idefics3 / Paligemma / GlmOcr / FastVLM CPU bidirectional attention + depthwise conv2d onto ffai-kernels. FastVLM cold inference at 1024px is the loudest signal. |
 | Speculative decoding + cache + serving (specs 013–043) | 8 | ngram / MTP / EAGLE speculative decode, prefix KV cache (in-mem + disk), batched / continuous decode, tree attention, sparse prefill, DFlash, KV-cache write fusion, flash-quantized SDPA, AURAFlash uplift. Sub-phases 8.0–8.23 — see `plan.md`. |
-| Argument-buffer / ICB dispatch modes + autotuner | 9 | Dispatch Mode 2 / 3 (`architecture.md §4a`); metaltile grid-search autotuner persisting to `tuning_cache.json`. |
+| Argument-buffer / ICB dispatch modes + autotuner | 9 | Dispatch Mode 2 / 3 (`architecture.md §4a`); ffai-kernels grid-search autotuner persisting to `tuning_cache.json`. |
 | GGUF support, Homebrew formula, full bench sweep, docs-site polish | 10 | |
 | `ffai convert` v2 — format + precision + source coverage | 10 | First-light `ffai convert` ships mlx-4bit-affine + local-or-HF source. v2 adds: (a) **mixed-precision recipes** — per-layer / per-tensor bit-width (already supported by the loader's `affineBits` map) so e.g. `embed_tokens`/`lm_head` quantize to 8-bit while linears stay at 4-bit, plus mlx-style `mixed_2_6` / `mixed_3_4` / `mixed_3_6` / `mixed_4_6` per-tensor recipes; (b) **GGUF read path** — load existing GGUF Q4/Q5/Q6/Q8 K-quant blocks, convert to the FFAI affine layout, write as mlx-4bit; (c) **GGUF write path** — emit GGUF directly so the convert can target llama.cpp consumers; (d) **streaming convert** — chunked safetensors read/write so 30B+ models don't need full RAM residency. Pairs with the existing GGUF support row above. |
 | `ffai bench --mactop` thermal-aware bench harness | 10 | Spawn `mactop` alongside `ffai bench`; capture CPU / GPU / memory / power / temperature samples to a sidecar; `--mactop-pin-fans` pins fans high for the bench window (requires sudo) so steady-state numbers aren't measured under thermal throttle. Design: [`bench-mactop-integration-design.md`](bench-mactop-integration-design.md). |
@@ -65,7 +65,7 @@ Concrete gaps in the shipped code, ranked by user-visible impact. Tracked in `pl
 These aren't on the current roadmap. Different projects, or hard technical mismatches with the static-kernel approach.
 
 - **CoreML / ANE backend.** Realistic only for boring kernels (RMSNorm, RoPE, plain GEMV at fp16/int8). AURA, FWHT, online softmax, recurrent SSM/GDN do not fit ANE constraints. (Spec 025 ANE primitives + spec 029 ANE-offloaded LM head are on the Phase 8 plan for the specific LM-head / PLE-projection use case where ANE *does* fit.)
-- **Swift macro frontend** for kernel authoring. metaltile IR is serde-serializable; a Swift `@kernel` macro emitting IR JSON could feed the same backend later. Wait for demand.
+- **Swift macro frontend** for kernel authoring. ffai-kernels IR is serde-serializable; a Swift `@kernel` macro emitting IR JSON could feed the same backend later. Wait for demand.
 - **Training / autograd.** Different project.
 - **CUDA / Linux backends.** Different project.
 - **ONNX format.** Graph format with embedded weights — needs a graph executor, which doesn't align with the static-kernel approach.

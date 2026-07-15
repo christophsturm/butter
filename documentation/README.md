@@ -4,10 +4,10 @@ Table of contents for the FFAI documentation. The top-level [`README`](../README
 
 ## Getting started
 
-- [Installation](installation.md) — SwiftPM / Xcode setup, platform requirements, sibling-metaltile checkout.
+- [Installation](installation.md) — SwiftPM / Xcode setup, platform requirements, sibling-ffai-kernels checkout.
 - [Quick start](quickstart.md) — generate text in 5 lines.
 - [Using the CLI](using-the-cli.md) — build the `ffai` binary and run it via `swift run`, the built path, or a `PATH` symlink.
-- [Architecture](architecture.md) — the three-layer stack (`metaltile` Rust → `MetalTileSwift` → `FFAI`), build pipeline, and per-token dispatch loop.
+- [Architecture](architecture.md) — the three-layer stack (`ffai-kernels` Rust → `MetalTileSwift` → `FFAI`), build pipeline, and per-token dispatch loop.
 - [Models](models.md) — the supported architecture families (dense text, SSM / GDN / conv+attention hybrids, MoE, vision-language, audio, neural codecs), per-family known gaps, and adding a new family.
 
 ## Cross-cutting topics

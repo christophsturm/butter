@@ -65,7 +65,7 @@ The main outstanding gaps vs MLX's hand-tuned fused kernels are:
 
 - **Fused `RMSNorm + gemv`.** MLX folds the RMSNorm scale into the pre-matmul rescale of the next gemv. We dispatch them separately. Expected ~10-15% on the hot QKV path.
 - **Fused QKV projection.** MLX dispatches one `gemv` for `Q`, `K`, `V` concatenated, instead of three. Expected ~5-10%.
-- **Online-softmax SDPA decode.** Our `sdpa_decode` is correct but not yet using the simdgroup-cooperative online-softmax pattern from metaltile-bench. Largest remaining headroom on long-context decode.
+- **Online-softmax SDPA decode.** Our `sdpa_decode` is correct but not yet using the simdgroup-cooperative online-softmax pattern from ffai-kernels-bench. Largest remaining headroom on long-context decode.
 - **Argument-buffers / ICB dispatch modes.** Pre-bind weights into a per-layer argument buffer (or pre-record the entire forward pass via Indirect Command Buffers), so per-token only the activations + KV offset get bound. ~5× fewer `setBuffer` calls. Pulled in once profiles show encoding cost still matters after AURA + chunked-prefill land.
 - **Autotuner.** Per-shape selection of `(tile_dims, threads, unroll, simd_matrix, async_copy)`. Tracked in [`planning/plan.md`](../planning/plan.md).
 

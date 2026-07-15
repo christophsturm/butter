@@ -15,7 +15,7 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
                            ──────────
 
   ┌──────────────────────────────────────────────────────────────┐
-  │  metaltile (Rust workspace, sibling repo)                    │
+  │  ffai-kernels (Rust workspace, sibling repo)                    │
   │                                                              │
   │   #[kernel] fn rms_norm<T>(x, w, out, eps, n) { … }          │
   │   #[kernel] fn rope(q, k, freqs, offset, n) { … }            │
@@ -24,8 +24,8 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
   │              │ proc-macro expansion → IR                     │
   │              ▼                                               │
   │   ┌──────────────────────────┐                               │
-  │   │  metaltile-core          │   SSA IR (Kernel, Op,         │
-  │   │  metaltile-codegen       │   Block, ConstExpr, …)        │
+  │   │  ffai-kernels-core          │   SSA IR (Kernel, Op,         │
+  │   │  ffai-kernels-codegen       │   Block, ConstExpr, …)        │
   │   │                          │                               │
   │   │  6-pass pipeline:        │                               │
   │   │  TypeCheck → ConstFold   │                               │
@@ -39,8 +39,8 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
                       │
                       ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │  tile build --emit all --out Sources/MetalTileSwift          │
-  │  (metaltile-cli, dev sibling repo)                           │
+  │  ffaik build --emit all --out Sources/MetalTileSwift          │
+  │  (ffai-kernels-cli, dev sibling repo)                           │
   │                                                              │
   │  Walks the inventory of `BenchSpec`-registered kernels,      │
   │  for each (kernel × dtype):                                  │
@@ -54,7 +54,7 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
   │   xcrun -sdk macosx metal -c   *.metal → *.air               │
   │   xcrun -sdk macosx metallib   *.air   → kernels.metallib    │
   │                                                              │
-  │  Emit logic lives in metaltile-codegen::emit so other        │
+  │  Emit logic lives in ffai-kernels-codegen::emit so other        │
   │  tooling (build scripts, future SPM plugins) can consume     │
   │  it without going through the CLI binary.                    │
   └───────────────────┬──────────────────────────────────────────┘
@@ -71,7 +71,7 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
   └──────────────────────────────────────────────────────────────┘
 
            │
-           │  `make regenerate-kernels` runs `tile build --emit all` before
+           │  `make regenerate-kernels` runs `ffaik build --emit all` before
            │  every `make build` / `make test`
            ▼
    swift build / swift test  →  ready Swift package
@@ -82,8 +82,8 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
 - Kernel changes never require Swift source edits — the wrappers and metallib are regenerated.
 - The `.metal` files are checked in (per `.gitignore` policy: optional; default is regenerate). This makes diffs reviewable and lets contributors inspect what got generated without running cargo.
 - All compilation happens at build time. **Zero runtime JIT.**
-- Kernel sources in metaltile-std are split into `crates/metaltile-std/src/mlx/` (each kernel has an MLX side-by-side comparison via `tile bench` + `check_equiv`) and `crates/metaltile-std/src/ffai/` (model-specific kernels with no MLX upstream counterpart at the pinned `MLX_COMMIT`; correctness validated by FFAI integration tests against real models). Kernels graduate from `ffai/` to `mlx/` when an MLX counterpart ships upstream or someone wires a hand-written runner. The `tile build --emit all` pipeline is agnostic — both folders feed the same `kernels.metallib` + `manifest.json` + `MetalTileKernels.swift` outputs.
-- **No CPU interpreter.** The `metaltile-interp` crate was dropped in upstream PRs #16 / #17. Correctness verification now runs through three layers on the Apple Silicon GPU: (1) per-kernel `<kernel>_gpu_correctness.rs` tests under `crates/metaltile-std/tests/` comparing against a naive CPU reference in fp32 (pattern from PR #35); (2) MLX side-by-side via `tile bench` + `check_equiv` for `mlx/` kernels with an upstream counterpart; (3) FFAI integration tests on real models for `ffai/` kernels. Codegen-side text diffs are caught by `insta` MSL golden snapshots under `crates/metaltile-codegen/tests/snapshots/` (PR #25).
+- Kernel sources in ffai-kernels-std are split into `crates/ffai-kernels-std/src/mlx/` (each kernel has an MLX side-by-side comparison via `ffaik bench` + `check_equiv`) and `crates/ffai-kernels-std/src/ffai/` (model-specific kernels with no MLX upstream counterpart at the pinned `MLX_COMMIT`; correctness validated by FFAI integration tests against real models). Kernels graduate from `ffai/` to `mlx/` when an MLX counterpart ships upstream or someone wires a hand-written runner. The `ffaik build --emit all` pipeline is agnostic — both folders feed the same `kernels.metallib` + `manifest.json` + `MetalTileKernels.swift` outputs.
+- **No CPU interpreter.** The `ffai-kernels-interp` crate was dropped in upstream PRs #16 / #17. Correctness verification now runs through three layers on the Apple Silicon GPU: (1) per-kernel `<kernel>_gpu_correctness.rs` tests under `crates/ffai-kernels-std/tests/` comparing against a naive CPU reference in fp32 (pattern from PR #35); (2) MLX side-by-side via `ffaik bench` + `check_equiv` for `mlx/` kernels with an upstream counterpart; (3) FFAI integration tests on real models for `ffai/` kernels. Codegen-side text diffs are caught by `insta` MSL golden snapshots under `crates/ffai-kernels-codegen/tests/snapshots/` (PR #25).
 
 ---
 
@@ -983,7 +983,7 @@ The throughput win comes from amortising one verifier forward over multiple acce
 | Tensor type | `MLXArray` (lazy graph node, hides MTLBuffer) | `Tensor` (direct MTLBuffer + offset + shape) |
 | Dispatch timing | Lazy: graph traversal + planning + encode + submit on `eval()` | Eager: Swift code is the dispatch order, no graph traversal step |
 | Dispatch modes | One mode (lazy graph) | Three modes (Eager / Argument buffers / ICB) selectable at load time |
-| Op fusion | Automatic via lazy graph compiler | Manual via fused kernels in metaltile (compile-time, profileable) |
+| Op fusion | Automatic via lazy graph compiler | Manual via fused kernels in ffai-kernels (compile-time, profileable) |
 | Sampling | CPU readback per token (~60-200KB) | On-GPU sampling kernel, 4-byte readback |
 | Custom kernel cost | ~55-95µs per call (Swift→C→C++→Metal marshaling) | ~5-10µs per call eager / sub-µs amortized in ICB mode |
 | Kernel iteration | Edit MLX C++ → mlx-c → mlx-swift → mlx-swift-lm | Edit Rust `#[kernel]` → rebuild Swift package |
@@ -1047,13 +1047,13 @@ The throughput win comes from amortising one verifier forward over multiple acce
 
   Build-time only (not in runtime graph):
   ┌──────────────────────────────────────────────────────────┐
-  │  metaltile (Rust workspace, sibling repo)                │
+  │  ffai-kernels (Rust workspace, sibling repo)                │
   │  Generates kernels.metallib + manifest + Swift wrappers  │
-  │  via the `tile build --emit all --out <dir>` CLI command │
-  │  (metaltile-cli).                                        │
+  │  via the `ffaik build --emit all --out <dir>` CLI command │
+  │  (ffai-kernels-cli).                                        │
   └──────────────────────────────────────────────────────────┘
 ```
 
 **Runtime dependencies:** Metal framework, swift-huggingface, swift-transformers. That's it.
 
-**Build-time dependencies:** add Xcode (for `xcrun metal`), a Rust toolchain (for `tile`), and the metaltile sibling repo checkout until the `tile` binary ships via Homebrew.
+**Build-time dependencies:** add Xcode (for `xcrun metal`), a Rust toolchain (for `ffaik`), and the ffai-kernels sibling repo checkout until the `ffaik` binary ships via Homebrew.

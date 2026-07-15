@@ -1,6 +1,6 @@
 # Architecture
 
-FFAI is three layers, all in this repo except `metaltile` (a sibling Rust crate). The longer-form diagrams live in [`planning/architecture.md`](../planning/architecture.md); this page covers the user-facing model — what each layer is responsible for and how a single token moves through the stack.
+FFAI is three layers, all in this repo except `ffai-kernels` (a sibling Rust crate). The longer-form diagrams live in [`planning/architecture.md`](../planning/architecture.md); this page covers the user-facing model — what each layer is responsible for and how a single token moves through the stack.
 
 ## The three layers
 
@@ -22,18 +22,18 @@ FFAI is three layers, all in this repo except `metaltile` (a sibling Rust crate)
 └────────────────────────┬────────────────────────────────┘
                          │ resources from
 ┌────────────────────────▼────────────────────────────────┐
-│  metaltile (Rust, sibling repo)                         │
+│  ffai-kernels (Rust, sibling repo)                         │
 │   • #[kernel] DSL → IR → MSL                            │
-│   • `tile build --emit all` (metaltile-cli) produces:               │
+│   • `ffaik build --emit all` (ffai-kernels-cli) produces:               │
 │       kernels.metallib   (compiled by xcrun metal)      │
 │       manifest.json      (kernel metadata)              │
 │       MetalTileKernels.swift  (typed wrappers)          │
 └─────────────────────────────────────────────────────────┘
 ```
 
-### `metaltile` (Rust)
+### `ffai-kernels` (Rust)
 
-A `#[kernel]` proc-macro lowers a small Rust DSL into an IR; the codegen back-end emits Metal Shading Language. Authoring lives here: new kernels are Rust `pub fn`s in `crates/metaltile-std/src/ops/`, annotated with `#[bench_kernel(...)]` so the registry picks them up. End users never touch Rust — they consume the artifacts shipped in `Sources/MetalTileSwift/Resources/`.
+A `#[kernel]` proc-macro lowers a small Rust DSL into an IR; the codegen back-end emits Metal Shading Language. Authoring lives here: new kernels are Rust `pub fn`s in `crates/ffai-kernels-std/src/ops/`, annotated with `#[bench_kernel(...)]` so the registry picks them up. End users never touch Rust — they consume the artifacts shipped in `Sources/MetalTileSwift/Resources/`.
 
 ### `MetalTileSwift`
 
@@ -53,7 +53,7 @@ The user-facing layer:
 ## The build pipeline
 
 ```
-┌──────────────┐ tile build        ┌──────────────────┐  xcrun metal   ┌────────────────────┐
+┌──────────────┐ ffaik build        ┌──────────────────┐  xcrun metal   ┌────────────────────┐
 │  Rust kernels│ --emit all --out  │  *.metal sources │   + metallib   │  kernels.metallib  │
 │  (#[kernel]) │ ─────────────────▶│  manifest.json   │ ──────────────▶│  manifest.json     │
 └──────────────┘                   │  MetalTileKernels│                │  MetalTileKernels  │

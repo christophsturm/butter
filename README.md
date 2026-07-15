@@ -2,7 +2,7 @@
 
 **F*cking Fast Apple Inference.**
 
-A minimal, dependency-light LLM inference library for Apple Silicon, built on pre-compiled Metal kernels generated from the [metaltile](https://github.com/thewafflehaus/metaltile) DSL. No Python. No MLX. No C compilation. No JIT. No four-repo dependency chain.
+A minimal, dependency-light LLM inference library for Apple Silicon, built on pre-compiled Metal kernels generated from the [ffai-kernels](https://github.com/thewafflehaus/ffai-kernels) DSL. No Python. No MLX. No C compilation. No JIT. No four-repo dependency chain.
 
 **Just really f*cking fast AI on your Mac!** 🚀
 
@@ -121,9 +121,9 @@ Full flag list + recipes: [`using-the-cli.md` § `convert`](documentation/using-
 └────────────────────────┬────────────────────────────────┘
                          │ resources from
 ┌────────────────────────▼────────────────────────────────┐
-│  metaltile (Rust, sibling repo)                         │
+│  ffai-kernels (Rust, sibling repo)                         │
 │   • #[kernel] DSL → IR → MSL                            │
-│   • `tile emit` (metaltile-cli) produces:               │
+│   • `ffaik emit` (ffai-kernels-cli) produces:               │
 │       kernels.metallib   (compiled by xcrun metal)      │
 │       manifest.json      (kernel metadata)              │
 │       MetalTileKernels.swift  (typed wrappers)          │

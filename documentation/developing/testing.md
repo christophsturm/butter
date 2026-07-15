@@ -54,7 +54,7 @@ Tests/
                             clips, … shared via the helpers).
 ```
 
-There are **no golden fixtures**. Cross-implementation token-parity vs mlx-lm proved to be a measure of rounding-mode alignment, not correctness — it was dropped. Numerical correctness now comes from the metaltile-side per-kernel GPU-correctness tests (compared to a naive CPU oracle); the FFAI integration tests assert that the model *pipeline* produces coherent text.
+There are **no golden fixtures**. Cross-implementation token-parity vs mlx-lm proved to be a measure of rounding-mode alignment, not correctness — it was dropped. Numerical correctness now comes from the ffai-kernels-side per-kernel GPU-correctness tests (compared to a naive CPU oracle); the FFAI integration tests assert that the model *pipeline* produces coherent text.
 
 ## Integration testing
 
@@ -146,7 +146,7 @@ struct FishSpeechIntegrationTests {
 
 Both patterns serialize through the same lock so the multi-GB downloads / GPU footprint stay capped regardless of how many integration suites the runner picks up.
 
-A non-trivial kernel lands with a paired metaltile GPU-correctness test in the **same commit** (see metaltile `docs/testing.md`).
+A non-trivial kernel lands with a paired ffai-kernels GPU-correctness test in the **same commit** (see ffai-kernels `docs/testing.md`).
 
 ## CI
 

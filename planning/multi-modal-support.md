@@ -70,7 +70,7 @@
    `for`; Gemma 4 patch-unfold / pool / embedder; the audio magnitude-mel CPU
    DFT) — these become a per-frame tax at real-time fps and are the **kernel
    backlog in §12**. When a needed kernel is missing, **write the kernel**
-   (metaltile, with a paired GPU-correctness test) rather than falling back to
+   (ffai-kernels, with a paired GPU-correctness test) rather than falling back to
    CPU. Goal: a fully GPU-resident decode→preprocess→tower→LLM path.
 3. **AVFoundation over ffmpeg (for now).** FFAI targets Apple Silicon;
    AVFoundation is already used for audio, is hardware-accelerated, and avoids a
@@ -336,7 +336,7 @@ lands.
    output — routing through `Generate.generateStream` — is still §7a / #9.)*
 3. ✅ **DONE** — **`MediaUtils` foundation + K1/K2 kernels**. Wrote the fused
    **`ffai_resize_normalize`** kernel (bilinear resize + per-channel normalize
-   + interleaved→NCHW, runtime dims, K1+K2 in one Grid3D dispatch; metaltile
+   + interleaved→NCHW, runtime dims, K1+K2 in one Grid3D dispatch; ffai-kernels
    oracle test max|Δ| 2.4e-7). Added `Ops.resizeNormalize` + OpsTest and
    `Sources/FFAI/Media/MediaUtils.swift` (`resizeNormalize(RGBImage,…)` GPU
    path). The preprocessing base is now GPU. *(Folding `ImagePreprocessing`/
@@ -384,7 +384,7 @@ lands.
 ## 12. Kernel backlog (GPU/parallel — write these, don't CPU-fall-back)
 
 Per §2.2, every media op must be GPU-kernel-backed (or `concurrentPerform`).
-This is the **backlog of missing kernels** — each is `metaltile` work with a
+This is the **backlog of missing kernels** — each is `ffai-kernels` work with a
 paired GPU-correctness test (the transpose / clamp kernels are the template),
 then an `Ops.*` wrapper + `OpsTests`. Drawn from by the features that need them.
 

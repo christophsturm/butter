@@ -7,7 +7,7 @@ Repo layout, the `make` workflow, and how to regenerate kernels.
 ```bash
 cd ~/Development
 git clone https://github.com/thewafflehaus/FFAI
-git clone https://github.com/thewafflehaus/metaltile     # sibling repo, required
+git clone https://github.com/thewafflehaus/ffai-kernels     # sibling repo, required
 cd FFAI
 make setup-dev      # wraps ./scripts/setup-dev.sh
 make install-hooks  # point core.hooksPath at scripts/hooks/
@@ -18,9 +18,9 @@ make install-hooks  # point core.hooksPath at scripts/hooks/
 - Xcode CLI tools (`xcode-select -p`)
 - `xcrun metal` (the full Xcode IDE, not just CLI tools, is required)
 - Swift toolchain (`swift --version`)
-- Cargo (Rust, for `metaltile`)
+- Cargo (Rust, for `ffai-kernels`)
 - `swift-format` (auto-installed via Homebrew if missing — needed by `make format-check` and the pre-commit hook)
-- The sibling `metaltile` checkout at `../metaltile`
+- The sibling `ffai-kernels` checkout at `../ffai-kernels`
 
 Then resolves SPM deps and runs `make build` to produce `kernels.metallib`.
 
@@ -62,7 +62,7 @@ make install-hooks      # install pre-commit / commit-msg / pre-push
 make uninstall-hooks    # clear core.hooksPath (opt out of the hooks)
 make build              # regenerate kernels + swift build (debug)
 make build-release      # regenerate kernels + swift build -c release
-make regenerate-kernels # run `tile build --emit all` only
+make regenerate-kernels # run `ffaik build --emit all` only
 make test               # regenerate kernels + swift test (unit + integration)
 make test-unit          # FFAITests + MetalTileSwiftTests only (fast)
 make test-integration   # ModelIntegrationTests only (multi-GB downloads)
@@ -105,7 +105,7 @@ Phrase summary lines as `Test results — 7/7` rather than `Tests: 7/7` to dodge
 ## How kernel regeneration works
 
 ```
-~/Development/metaltile          ←  Rust kernel source
+~/Development/ffai-kernels          ←  Rust kernel source
    cargo run --bin tile          ←  generates →  Sources/MetalTileSwift/
    -- emit                                           Resources/kernels.metallib
    --out Sources/MetalTileSwift                     Resources/kernels/*.metal
@@ -116,15 +116,15 @@ Phrase summary lines as `Test results — 7/7` rather than `Tests: 7/7` to dodge
                                                     the generated typed wrappers
 ```
 
-`make regenerate-kernels` runs `cargo run --release --bin tile -- emit --out Sources/MetalTileSwift` from the sibling metaltile repo. Cargo runs from the metaltile dir so its `rust-toolchain.toml` (nightly, 2024 edition) is honored. Eventually the `tile` binary will ship via Homebrew so this won't need a metaltile checkout — only kernel authors will need the repo.
+`make regenerate-kernels` runs `cargo run --release --bin tile -- emit --out Sources/MetalTileSwift` from the sibling ffai-kernels repo. Cargo runs from the ffai-kernels dir so its `rust-toolchain.toml` (nightly, 2024 edition) is honored. Eventually the `ffaik` binary will ship via Homebrew so this won't need a ffai-kernels checkout — only kernel authors will need the repo.
 
-The generated artifacts are checked into the FFAI repo so end-user SPM consumers don't need Cargo or the metaltile checkout.
+The generated artifacts are checked into the FFAI repo so end-user SPM consumers don't need Cargo or the ffai-kernels checkout.
 
 ## Writing a new kernel
 
-Kernels are Rust functions in metaltile, not Swift. The flow:
+Kernels are Rust functions in ffai-kernels, not Swift. The flow:
 
-1. Add a `#[kernel]` Rust function to `crates/metaltile-std/src/ops/<file>.rs` in the metaltile sibling repo.
+1. Add a `#[kernel]` Rust function to `crates/ffai-kernels-std/src/ops/<file>.rs` in the ffai-kernels sibling repo.
 2. Annotate it with `#[bench_kernel(op="…", subop="…", class=…, …)]` so the registry picks it up. For kernels without an MLX-comparable bench, submit a hand-rolled `BenchSpec` with `shapes: &[]` and the right `kernel_mode: Some(KernelMode::…)` instead.
 3. `make regenerate-kernels` from the FFAI repo — picks up the new kernel, regenerates `kernels.metallib` + `MetalTileKernels.swift`.
 4. Add a thin `Ops.swift` wrapper if the typed `MetalTileKernels` signature isn't ergonomic enough for callers.
@@ -146,13 +146,13 @@ See [testing.md](testing.md) for running tests, the `expectCoherentOutput` integ
 
 - **Swift formatting** — `swift-format` per `.swift-format`. CI gates on `make format-check`.
 - **Comments** — sparing. Lead with WHY, not WHAT. The Tensor/Module/Layer naming carries the WHAT.
-- **No mocking the GPU.** Every test runs real Metal dispatches on the CI runner (Apple Silicon). Numerical correctness comes from the metaltile-side per-kernel GPU-correctness tests (vs a naive CPU oracle); FFAI integration tests assert the model pipeline produces coherent text. There are no golden fixtures.
+- **No mocking the GPU.** Every test runs real Metal dispatches on the CI runner (Apple Silicon). Numerical correctness comes from the ffai-kernels-side per-kernel GPU-correctness tests (vs a naive CPU oracle); FFAI integration tests assert the model pipeline produces coherent text. There are no golden fixtures.
 - **No unused / speculative code.** Build only what the active phase needs. Future-phase fields go into `LoadOptions` with a comment pointer to the phase, not stubs in the call path.
 
 ## Common pitfalls
 
-- **Forgot the metaltile checkout.** `make regenerate-kernels` will fail with `metaltile not found at ../metaltile`. Clone it.
-- **Used Cargo from the FFAI repo.** Will fail with edition=2024 errors. Always `cd metaltile && cargo run …` (the Makefile does this for you).
+- **Forgot the ffai-kernels checkout.** `make regenerate-kernels` will fail with `ffai-kernels not found at ../ffai-kernels`. Clone it.
+- **Used Cargo from the FFAI repo.** Will fail with edition=2024 errors. Always `cd ffai-kernels && cargo run …` (the Makefile does this for you).
 - **Hit the page-alignment crash** when adding a new tensor loader. `MTLBuffer.bytesNoCopy` requires page-aligned (16KiB) pointers; per- tensor offsets aren't aligned. Use `device.makeBuffer(bytes:length:)` instead — the existing SafeTensors path already does.
 - **Sendable warnings on Metal types.** `MTLBuffer` / `MTLDevice` aren't `Sendable`. Wrap holders in `@unchecked Sendable` rather than fighting the compiler.
 

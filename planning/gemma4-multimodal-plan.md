@@ -37,12 +37,12 @@ Owner directive (2026-05-30): "We have a Gemma 4 reference model. Build it."
 - **`output_proj`** 1024 → 1536 (`output_proj_dims`) into the text hidden dim.
 - **"Clipped linears"** (`use_clipped_linears: true`): every audio linear ships `input_min/input_max/output_min/output_max` tensors — activation clipping ranges (clip input to [in_min,in_max], matmul, clip output to [out_min,out_max]). A Gemma-4-audio-specific quantization-robustness scheme. Must be applied or audio output is wrong. Confirm exact semantics against the `transformers` Gemma4 audio modeling code.
 
-## Kernels likely needed (metaltile)
+## Kernels likely needed (ffai-kernels)
 - **Local/chunked SDPA** with left-context window + logit softcap (chunk 12 / left 13 / right 0). Possibly expressible via the existing sliding-window SDPA + softcap; confirm.
 - **Depthwise conv1d** (kernel 5) for the conv module — check `audio_conv1d` / `conv1d_causal_step` coverage; this is non-causal within the chunk.
 - **Conv subsampling** (strided conv2d/1d over mel) — may reuse existing conv kernels.
 - **Clipped linear** — a clamp-matmul-clamp; can be CPU/host-composed first, kernel later.
-Each new kernel ships a paired `*_gpu_correctness` test (metaltile) per the repo standard.
+Each new kernel ships a paired `*_gpu_correctness` test (ffai-kernels) per the repo standard.
 
 ## Phased build (each phase independently committable + testable)
 
@@ -55,7 +55,7 @@ Each new kernel ships a paired `*_gpu_correctness` test (metaltile) per the repo
 
 ## Confirmed 2026-05-30 — fully de-risked, ready to build the encoder
 
-- **Kernels: ALL needed ops already exist** (regenerated off metaltile `dev` @ `dcbe860`, 411 ok). **No new metaltile branch required for pass 1.** Reuse: `Ops.conv2d` (SSCP subsampling), `Ops.audioConv1d` (depthwise conv module), `Ops.gemm` (attention scores / projections), `Ops.softmax`, `Ops.layerNorm` (SSCP channel norm), `Ops.rmsNormRows`, `Ops.silu`/`sigmoid`/`softplus`/`add`/`mul`, plus the mel front-end kernels `mel_spectrogram` / `mel_filterbank` / `mel_stft_window` / FFT. `clip`/`tanh`/relative-shift do on CPU (encoder-scale).
+- **Kernels: ALL needed ops already exist** (regenerated off ffai-kernels `dev` @ `dcbe860`, 411 ok). **No new ffai-kernels branch required for pass 1.** Reuse: `Ops.conv2d` (SSCP subsampling), `Ops.audioConv1d` (depthwise conv module), `Ops.gemm` (attention scores / projections), `Ops.softmax`, `Ops.layerNorm` (SSCP channel norm), `Ops.rmsNormRows`, `Ops.silu`/`sigmoid`/`softplus`/`add`/`mul`, plus the mel front-end kernels `mel_spectrogram` / `mel_filterbank` / `mel_stft_window` / FFT. `clip`/`tanh`/relative-shift do on CPU (encoder-scale).
 - **Validation oracle ready:** `mlx-community/gemma-4-e2b-4bit` downloaded (3.4 GB, ungated) at `~/.cache/huggingface/hub/models--mlx-community--gemma-4-e2b-4bit`.
 - **Reference (port target):** `mlx_vlm/models/gemma4/audio.py` (509 lines, complete) at `~/Development/personal/ai/gemma4-benchmark/.venv/lib/python3.10/site-packages/mlx_vlm/models/gemma4/` — plus `vision.py::ClippableLinear`, `config.py::AudioConfig`, `processing_gemma4.py`, and `gemma4.py` (the `masked_scatter` splice). Mirror FFAI's `Gemma4VLVisionBlock` style (token-major rows, GPU GEMMs via `projectRows`, CPU attention).
 - **Exact algorithm** (from the reference):
