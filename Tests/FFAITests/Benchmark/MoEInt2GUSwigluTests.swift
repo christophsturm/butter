@@ -65,9 +65,10 @@ struct MoEInt2GUSwigluTests {
         return (w, s, b)
     }
 
-    @Test("GU+SwiGLU matches separate gate+up+swiglu")
+    @Test(
+        "GU+SwiGLU matches separate gate+up+swiglu",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func guSwigluMatchesSeparate() throws {
-        try #require(Self.mppAvailable)
         let mTotal = 128
         let nOut = 128
         let kIn = 128
@@ -133,9 +134,10 @@ struct MoEInt2GUSwigluTests {
         #expect(nBad == 0, "GU+SwiGLU mismatch \(nBad)/\(got.count) maxAbs=\(maxAbs)")
     }
 
-    @Test("microbench GU+SwiGLU vs 2xEG+swiglu Hy3 shape")
+    @Test(
+        "microbench GU+SwiGLU vs 2xEG+swiglu Hy3 shape",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func microbenchHy3() throws {
-        try #require(Self.mppAvailable)
         let mTotal = 2048
         let nOut = 1536
         let kIn = 4096

@@ -66,9 +66,10 @@ struct MoEInt2DensifyTests {
         return (w, s, b)
     }
 
-    @Test("densify+remap+dense EG matches sparse EG")
+    @Test(
+        "densify+remap+dense EG matches sparse EG",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func densifyMatchesSparse() throws {
-        try #require(Self.mppAvailable)
         let mTotal = 256
         let nOut = 128
         let kIn = 128
@@ -150,9 +151,10 @@ struct MoEInt2DensifyTests {
         #expect(nBad == 0, "densify mismatch: \(nBad)/\(got.count) maxAbs=\(maxAbs)")
     }
 
-    @Test("microbench densify+dense EG vs sparse EG Hy3 shape")
+    @Test(
+        "microbench densify+dense EG vs sparse EG Hy3 shape",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func microbenchHy3() throws {
-        try #require(Self.mppAvailable)
         let mTotal = 2048
         let nOut = 1536
         let kIn = 4096

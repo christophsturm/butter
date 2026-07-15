@@ -95,9 +95,10 @@ struct MoEInt2EgBm32Tests {
         return (x, w, scales, biases, indices)
     }
 
-    @Test("BM32 EG matches BM16 EG on multi-expert f16 shape")
+    @Test(
+        "BM32 EG matches BM16 EG on multi-expert f16 shape",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func bm32MatchesBm16() throws {
-        try #require(Self.mppAvailable)
         let mTotal = 128
         let nOut = 128
         let kIn = 128
@@ -155,9 +156,10 @@ struct MoEInt2EgBm32Tests {
         #expect(nBad == 0, "BM32 vs BM16: \(nBad)/\(got.count) exceed tol; maxAbs=\(maxAbs)")
     }
 
-    @Test("microbench BM16 vs BM32 EG at Hy3 GU shape (synthetic)")
+    @Test(
+        "microbench BM16 vs BM32 EG at Hy3 GU shape (synthetic)",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func microbenchHy3Shape() throws {
-        try #require(Self.mppAvailable)
         // Hy3 GU: mTotal=2048, N=1536, K=4096, ~90 active of 192.
         let mTotal = 2048
         let nOut = 1536

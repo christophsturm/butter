@@ -34,9 +34,10 @@ struct MoEInt2DenseQmmVsEgTests {
         #expect(cmd.status == .completed)
     }
 
-    @Test("microbench EG vs per-expert dense int2 QMM vs one fat dense QMM")
+    @Test(
+        "microbench EG vs per-expert dense int2 QMM vs one fat dense QMM",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func microbenchPaths() throws {
-        try #require(Self.mppAvailable)
         // Hy3 GU: mTotal=2048, N=1536, K=4096, ~90 active of 192.
         let mTotal = 2048
         let nOut = 1536

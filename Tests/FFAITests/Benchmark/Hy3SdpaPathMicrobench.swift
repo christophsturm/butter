@@ -28,9 +28,10 @@ struct Hy3SdpaPathMicrobench {
         #expect(cmd.status == .completed)
     }
 
-    @Test("microbench SDPA MMA+compact vs sdpaMulti at Hy3 T256")
+    @Test(
+        "microbench SDPA MMA+compact vs sdpaMulti at Hy3 T256",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func microbenchHy3Shape() throws {
-        try #require(Self.mppAvailable)
         // Hy3 free-path attention shape.
         let nRows = 256
         let nHeads = 64

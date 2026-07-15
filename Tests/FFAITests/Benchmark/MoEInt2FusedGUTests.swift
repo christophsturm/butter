@@ -70,9 +70,10 @@ struct MoEInt2FusedGUTests {
         return (w, scales, biases)
     }
 
-    @Test("fused GU matches two separate EG dispatches")
+    @Test(
+        "fused GU matches two separate EG dispatches",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func fusedMatchesSeparate() throws {
-        try #require(Self.mppAvailable)
         let mTotal = 128
         let nOut = 128
         let kIn = 128
@@ -150,9 +151,10 @@ struct MoEInt2FusedGUTests {
         check(uGot, uRef, "up")
     }
 
-    @Test("microbench fused GU vs 2× EG at Hy3 shape")
+    @Test(
+        "microbench fused GU vs 2× EG at Hy3 shape",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func microbenchHy3Shape() throws {
-        try #require(Self.mppAvailable)
         let mTotal = 2048
         let nOut = 1536
         let kIn = 4096

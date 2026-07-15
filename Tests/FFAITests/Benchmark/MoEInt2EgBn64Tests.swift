@@ -112,9 +112,10 @@ struct MoEInt2EgBn64Tests {
         return (x, w, scales, biases, indices, out)
     }
 
-    @Test("BN64 EG matches BN32 EG on multi-expert f16 shape")
+    @Test(
+        "BN64 EG matches BN32 EG on multi-expert f16 shape",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func bn64MatchesBn32() throws {
-        try #require(Self.mppAvailable)
         // Modest shape: M=128, N=128, K=128, 8 experts all active.
         let mTotal = 128
         let nOut = 128
@@ -175,9 +176,10 @@ struct MoEInt2EgBn64Tests {
         #expect(nBad == 0, "BN64 vs BN32: \(nBad)/\(got.count) exceed tol; maxAbs=\(maxAbs)")
     }
 
-    @Test("microbench BN32 vs BN64 EG at Hy3 GU shape (synthetic)")
+    @Test(
+        "microbench BN32 vs BN64 EG at Hy3 GU shape (synthetic)",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func microbenchHy3Shape() throws {
-        try #require(Self.mppAvailable)
         // Hy3 gate: M=2048 (T256×top8), N=1536, K=4096, E=192, ~90 active.
         let mTotal = 2048
         let nOut = 1536
@@ -251,9 +253,10 @@ struct MoEInt2EgBn64Tests {
         #expect(ms64 < ms32 * 3.0, "BN64 >3× slower than BN32: \(line)")
     }
 
-    @Test("microbench empty-TG tax: nExperts=90 dense vs 192 sparse")
+    @Test(
+        "microbench empty-TG tax: nExperts=90 dense vs 192 sparse",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func microbenchEmptyTGTax() throws {
-        try #require(Self.mppAvailable)
         let mTotal = 2048
         let nOut = 1536
         let kIn = 4096
