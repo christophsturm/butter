@@ -303,7 +303,7 @@ public final class NemotronDiffusionLayer: Module {
         }
         let oOut = oProj(attnReady, on: cmd)
 
-        // Fused residual add + post-attn RMSNorm via mt_add_rms_norm
+        // Fused residual add + post-attn RMSNorm via ffai_add_rms_norm
         // (NemotronDiffusion hidden=3072 fits the ≤ 4096 cap).
         // Validator gate keeps the unfused path for any future wider
         // variant.
@@ -418,7 +418,7 @@ public final class NemotronDiffusionLayer: Module {
             let loraDelta = Ops.gemm(weight: lb, input: aOut, nRows: n, on: cmd)
             oBlock = Ops.add(oBlock, loraDelta, on: cmd)
         }
-        // Fused residual add + post-attn RMSNorm via mt_add_rms_norm
+        // Fused residual add + post-attn RMSNorm via ffai_add_rms_norm
         // over [n, hidden] rows (hidden=3072 fits the ≤ 4096 cap).
         let postAttn: Tensor
         let mlpNorm: Tensor

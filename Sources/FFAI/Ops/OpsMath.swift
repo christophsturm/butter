@@ -44,15 +44,15 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(a.elementCount)
         switch a.dtype {
         case .f32:
-            MetalTileKernels.mt_sub_f32(
+            MetalTileKernels.ffai_sub_f32(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_sub_f16(
+            MetalTileKernels.ffai_sub_f16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_sub_bf16(
+            MetalTileKernels.ffai_sub_bf16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.sub: unsupported dtype \(a.dtype)")
@@ -71,15 +71,15 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(a.elementCount)
         switch a.dtype {
         case .f32:
-            MetalTileKernels.mt_div_f32(
+            MetalTileKernels.ffai_div_f32(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_div_f16(
+            MetalTileKernels.ffai_div_f16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_div_bf16(
+            MetalTileKernels.ffai_div_bf16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.div: unsupported dtype \(a.dtype)")
@@ -98,15 +98,15 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(a.elementCount)
         switch a.dtype {
         case .f32:
-            MetalTileKernels.mt_pow_f32(
+            MetalTileKernels.ffai_pow_f32(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_pow_f16(
+            MetalTileKernels.ffai_pow_f16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_pow_bf16(
+            MetalTileKernels.ffai_pow_bf16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.pow: unsupported dtype \(a.dtype)")
@@ -127,15 +127,15 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(a.elementCount)
         switch a.dtype {
         case .f32:
-            MetalTileKernels.mt_max_elem_f32(
+            MetalTileKernels.ffai_max_elem_f32(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_max_elem_f16(
+            MetalTileKernels.ffai_max_elem_f16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_max_elem_bf16(
+            MetalTileKernels.ffai_max_elem_bf16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.maxElem: unsupported dtype \(a.dtype)")
@@ -154,15 +154,15 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(a.elementCount)
         switch a.dtype {
         case .f32:
-            MetalTileKernels.mt_min_elem_f32(
+            MetalTileKernels.ffai_min_elem_f32(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_min_elem_f16(
+            MetalTileKernels.ffai_min_elem_f16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_min_elem_bf16(
+            MetalTileKernels.ffai_min_elem_bf16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.minElem: unsupported dtype \(a.dtype)")
@@ -199,17 +199,17 @@ extension Ops {
         runUnary(
             x, out, "neg",
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_neg_f32(
+                MetalTileKernels.ffai_neg_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_neg_f16(
+                MetalTileKernels.ffai_neg_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_neg_bf16(
+                MetalTileKernels.ffai_neg_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -221,17 +221,17 @@ extension Ops {
         runUnary(
             x, out, "abs",
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_abs_f32(
+                MetalTileKernels.ffai_abs_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_abs_f16(
+                MetalTileKernels.ffai_abs_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_abs_bf16(
+                MetalTileKernels.ffai_abs_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -243,17 +243,17 @@ extension Ops {
         runUnary(
             x, out, "exp",
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_exp_f32(
+                MetalTileKernels.ffai_exp_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_exp_f16(
+                MetalTileKernels.ffai_exp_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_exp_bf16(
+                MetalTileKernels.ffai_exp_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -265,17 +265,17 @@ extension Ops {
         runUnary(
             x, out, "log",
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_log_f32(
+                MetalTileKernels.ffai_log_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_log_f16(
+                MetalTileKernels.ffai_log_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_log_bf16(
+                MetalTileKernels.ffai_log_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -289,17 +289,17 @@ extension Ops {
         runUnary(
             x, out, "sqrt",
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_sqrt_f32(
+                MetalTileKernels.ffai_sqrt_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_sqrt_f16(
+                MetalTileKernels.ffai_sqrt_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_sqrt_bf16(
+                MetalTileKernels.ffai_sqrt_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -313,17 +313,17 @@ extension Ops {
         runUnary(
             x, out, "square",
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_square_f32(
+                MetalTileKernels.ffai_square_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_square_f16(
+                MetalTileKernels.ffai_square_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_square_bf16(
+                MetalTileKernels.ffai_square_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -337,17 +337,17 @@ extension Ops {
         runUnary(
             x, out, "recip",
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_recip_f32(
+                MetalTileKernels.ffai_recip_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_recip_f16(
+                MetalTileKernels.ffai_recip_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_recip_bf16(
+                MetalTileKernels.ffai_recip_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -361,17 +361,17 @@ extension Ops {
         runUnary(
             x, out, "floor",
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_floor_f32(
+                MetalTileKernels.ffai_floor_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_floor_f16(
+                MetalTileKernels.ffai_floor_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_floor_bf16(
+                MetalTileKernels.ffai_floor_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -385,17 +385,17 @@ extension Ops {
         runUnary(
             x, out, "ceil",
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_ceil_f32(
+                MetalTileKernels.ffai_ceil_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_ceil_f16(
+                MetalTileKernels.ffai_ceil_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_ceil_bf16(
+                MetalTileKernels.ffai_ceil_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -410,17 +410,17 @@ extension Ops {
         runUnary(
             x, out, "round",
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_round_f32(
+                MetalTileKernels.ffai_round_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_round_f16(
+                MetalTileKernels.ffai_round_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                MetalTileKernels.mt_round_bf16(
+                MetalTileKernels.ffai_round_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -430,7 +430,7 @@ extension Ops {
     // ─── GPU copy (kernel) ───────────────────────────────────────────
     //
     // `Ops.copy` (in Ops.swift) is a blit copy. `copyKernel` exposes the
-    // metaltile `mt_copy_*` kernel — same semantics, but it runs as a
+    // metaltile `ffai_copy_*` kernel — same semantics, but it runs as a
     // compute kernel rather than a blit, which is occasionally useful
     // for kernel-fusion / command-encoder ordering reasons (a blit forces
     // an encoder boundary; a compute dispatch chains with neighbouring
@@ -447,15 +447,15 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(src.elementCount)
         switch src.dtype {
         case .f32:
-            MetalTileKernels.mt_copy_f32(
+            MetalTileKernels.ffai_copy_f32(
                 a: src.buffer, aOffset: src.offset, out: dst.buffer, outOffset: dst.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_copy_f16(
+            MetalTileKernels.ffai_copy_f16(
                 a: src.buffer, aOffset: src.offset, out: dst.buffer, outOffset: dst.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_copy_bf16(
+            MetalTileKernels.ffai_copy_bf16(
                 a: src.buffer, aOffset: src.offset, out: dst.buffer, outOffset: dst.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.copyKernel: unsupported dtype \(src.dtype)")
@@ -489,7 +489,7 @@ extension Ops {
             let startBuf = dev.scalarBuffer(start)
             let stepBuf = dev.scalarBuffer(step)
             let (grid, tg) = elementwiseGrid(n)
-            MetalTileKernels.mt_arange_f32(
+            MetalTileKernels.ffai_arange_f32(
                 out: out.buffer, outOffset: out.offset,
                 start: startBuf, startOffset: 0,
                 step: stepBuf, stepOffset: 0,
@@ -503,7 +503,7 @@ extension Ops {
 
     /// Numerically-stable softmax over the last dim of a row-major
     /// 2D `[rows, n]` tensor (or a 1D `[n]` tensor treated as `rows=1`).
-    /// Wraps `mt_softmax_*`: one threadgroup per row, online max + sum
+    /// Wraps `ffai_softmax_*`: one threadgroup per row, online max + sum
     /// reduction, then a second pass writes the normalised output. The
     /// vocab length `n` is a runtime constexpr — no per-vocab PSO churn.
     public static func softmax(
@@ -523,15 +523,15 @@ extension Ops {
         let tg = MTLSize(width: tgSize, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            MetalTileKernels.mt_softmax_f32(
+            MetalTileKernels.ffai_softmax_f32(
                 inp: x.buffer, inpOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_softmax_f16(
+            MetalTileKernels.ffai_softmax_f16(
                 inp: x.buffer, inpOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_softmax_bf16(
+            MetalTileKernels.ffai_softmax_bf16(
                 inp: x.buffer, inpOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.softmax: unsupported dtype \(x.dtype)")
@@ -560,15 +560,15 @@ extension Ops {
         let tg = MTLSize(width: tgSize, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            MetalTileKernels.mt_logsumexp_f32(
+            MetalTileKernels.ffai_logsumexp_f32(
                 inp: x.buffer, inpOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_logsumexp_f16(
+            MetalTileKernels.ffai_logsumexp_f16(
                 inp: x.buffer, inpOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_logsumexp_bf16(
+            MetalTileKernels.ffai_logsumexp_bf16(
                 inp: x.buffer, inpOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.logsumexp: unsupported dtype \(x.dtype)")
@@ -594,15 +594,15 @@ extension Ops {
         let tg = MTLSize(width: tgSize, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            MetalTileKernels.mt_argmin_f32(
+            MetalTileKernels.ffai_argmin_f32(
                 inp: x.buffer, inpOffset: x.offset, out: out.buffer, outOffset: out.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_argmin_f16(
+            MetalTileKernels.ffai_argmin_f16(
                 inp: x.buffer, inpOffset: x.offset, out: out.buffer, outOffset: out.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_argmin_bf16(
+            MetalTileKernels.ffai_argmin_bf16(
                 inp: x.buffer, inpOffset: x.offset, out: out.buffer, outOffset: out.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.argmin: unsupported dtype \(x.dtype)")

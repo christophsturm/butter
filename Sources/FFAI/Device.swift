@@ -23,6 +23,13 @@ import MetalTileSwift
 public final class Device: @unchecked Sendable {
     public let mtlDevice: MTLDevice
     public let commandQueue: MTLCommandQueue
+    /// Second queue for concurrent compute (e.g. MoE gate ‖ up).
+    public let commandQueueB: MTLCommandQueue
+    /// Device-local event for cross-queue MoE / shared-expert sync.
+    public let syncEvent: MTLEvent
+    /// Monotonic value for `syncEvent` (encode signal/wait pairs).
+    private let syncEventLock = NSLock()
+    private var syncEventCounter: UInt64 = 0
 
     /// Lazy MTLResidencySet that pins the model's weight buffers so
     /// every command buffer skips per-allocation residency tracking.
@@ -44,6 +51,32 @@ public final class Device: @unchecked Sendable {
     public init(mtlDevice: MTLDevice, commandQueue: MTLCommandQueue) {
         self.mtlDevice = mtlDevice
         self.commandQueue = commandQueue
+        // Sibling queue for parallel dispatches (shared device/PSO cache).
+        guard let qB = mtlDevice.makeCommandQueue(
+            maxCommandBufferCount: MetalTileLibrary.defaultMaxCommandBufferCount)
+        else {
+            fatalError("Device: failed to create secondary command queue")
+        }
+        self.commandQueueB = qB
+        guard let ev = mtlDevice.makeEvent() else {
+            fatalError("Device: failed to create MTLEvent")
+        }
+        self.syncEvent = ev
+    }
+
+    public func makeCommandBufferB() -> MTLCommandBuffer {
+        guard let cb = commandQueueB.makeCommandBuffer() else {
+            fatalError("Device.makeCommandBufferB() returned nil")
+        }
+        return cb
+    }
+
+    /// Next monotonic value for cross-queue `syncEvent` signal/wait pairs.
+    public func nextSyncValue() -> UInt64 {
+        syncEventLock.lock()
+        defer { syncEventLock.unlock() }
+        syncEventCounter &+= 1
+        return syncEventCounter
     }
 
     // ─── Scratch slab — generic transient-buffer allocator ────────────
@@ -65,7 +98,12 @@ public final class Device: @unchecked Sendable {
     // `Device.makeBuffer` instead.
     public var scratchSlabBytes: Int = 256 * 1024 * 1024  // 256 MB cap
     private var scratchBuffer: MTLBuffer?
+    /// Optional second slab for ping-pong prefill (encode layer N+1 while
+    /// GPU runs layer N). Nil until `ensureScratchSlabPingPong` is called.
+    private var scratchBufferB: MTLBuffer?
     private var scratchOffset: Int = 0
+    /// Which physical slab `scratchBuffer` currently aliases (0 or 1).
+    private var scratchPingPongIndex: Int = 0
 
     /// When `true`, `Tensor.empty(...)` routes through the scratch slab
     /// instead of allocating a fresh MTLBuffer. Set by
@@ -202,6 +240,49 @@ public final class Device: @unchecked Sendable {
         guard scratchBuffer != nil else {
             fatalError("ensureScratchSlab: failed to allocate \(bytes)-byte slab")
         }
+    }
+
+    /// Ensure both ping-pong slabs are ≥ `bytes`. Prefill can encode on
+    /// slab A while GPU executes from slab B, then flip.
+    public func ensureScratchSlabPingPong(_ bytes: Int) {
+        ensureScratchSlab(bytes)
+        if let b = scratchBufferB, b.length >= bytes { return }
+        precondition(
+            scratchOffset == 0,
+            "ensureScratchSlabPingPong: cannot resize with live slices")
+        scratchBufferB = mtlDevice.makeBuffer(length: bytes, options: .storageModeShared)
+        guard scratchBufferB != nil else {
+            fatalError("ensureScratchSlabPingPong: failed to allocate B slab (\(bytes) bytes)")
+        }
+    }
+
+    /// Swap active scratch slab with the alternate and rewind offset.
+    /// Caller must have waited for any GPU work that still references
+    /// the slab about to become active.
+    public func flipScratchSlab() {
+        precondition(
+            scratchOffset == 0 || !scratchModeActive,
+            "flipScratchSlab: active live slices — resetScratch first")
+        guard let b = scratchBufferB else {
+            fatalError("flipScratchSlab: call ensureScratchSlabPingPong first")
+        }
+        let a = scratchBuffer
+        scratchBuffer = b
+        scratchBufferB = a
+        scratchOffset = 0
+        scratchPingPongIndex ^= 1
+    }
+
+    /// Drop large prefill slabs so decode is not squeezed by 1–2 GB of
+    /// idle scratch. Next prefill re-allocates via ensureScratchSlab*.
+    public func releaseScratchSlabs() {
+        precondition(
+            !scratchModeActive && scratchOffset == 0,
+            "releaseScratchSlabs: scratch still active")
+        scratchBuffer = nil
+        scratchBufferB = nil
+        scratchSlabBytes = 256 * 1024 * 1024
+        scratchPingPongIndex = 0
     }
 
     // Cache of 4-byte scalar-argument buffers, keyed by value. Kernel

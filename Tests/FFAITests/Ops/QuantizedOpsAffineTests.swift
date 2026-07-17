@@ -221,7 +221,7 @@ struct QuantizedOpsAffineTests {
 
     @Test("validateAffineQuantize rejects group_size != 64")
     func rejectGroupNotEqual64() {
-        // The metaltile quantize kernels (`mt_affine_quantize_int{2,4,8}`)
+        // The metaltile quantize kernels (`ffai_affine_quantize_int{2,4,8}`)
         // bake in one simdgroup × 2 elements/lane = 64 elements/group via
         // the `lane * 2` / `lane * 2 + 1` loads + `simd_min` / `simd_max`
         // reduction. Only group_size=64 is emitted; anything else either

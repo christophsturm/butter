@@ -717,7 +717,7 @@ public final class LFM2Layer: Module, DecoderLayer {
 
         // ── Mixer half ────────────────────────────────────────────────
         // The attention-mixer branch fuses (h + mixerOut) → ffnNorm via
-        // mt_add_rms_norm (hidden ≤ 4096). The conv-mixer branch is the
+        // ffai_add_rms_norm (hidden ≤ 4096). The conv-mixer branch is the
         // SSM recurrence path and per the task carve-out keeps the
         // separate add + norm sequence.
         var workCmd = cmd

@@ -126,15 +126,23 @@ jobs:
       - name: Resolve Swift packages
         run: swift package resolve
 
-      - name: Generate kernel artifacts (tile build --emit all)
+      - name: Generate kernel artifacts (ffaik build --emit all)
         working-directory: ffai-kernels
-        # Build `__tile_runner` (ffai-kernels-std bin) alongside `tile` and put it
-        # on PATH — `tile build` spawns it by bare name and `cargo run --bin
-        # tile` never builds the sibling runner.
+        # Build `__ffai_runner` (ffai-kernels-std bin) alongside `ffaik` and put
+        # it on PATH — `ffaik build` spawns it by bare name and building only
+        # `ffaik` never builds the sibling runner.
         run: |
-          cargo build --release --bin tile --bin __tile_runner
-          PATH="$PWD/target/release:$PATH" tile build --emit all \
+          cargo build --release --bin ffaik --bin __ffai_runner
+          PATH="$PWD/target/release:$PATH" ffaik build --emit all \
             --out ${{ github.workspace }}/FFAI/Sources/MetalTileSwift
+          OUT="${{ github.workspace }}/FFAI/Sources/MetalTileSwift/Generated"
+          printf '// swift-format-ignore-file\n//\npublic typealias MetalTileKernels = FFAIKernels\n' \
+            > "$OUT/MetalTileKernels.swift"
+          if [ -f "$OUT/FFAIKernels.swift" ] && ! head -1 "$OUT/FFAIKernels.swift" | grep -q swift-format-ignore-file; then
+            tmp="$OUT/FFAIKernels.swift.tmp"
+            { printf '// swift-format-ignore-file\n//\n'; cat "$OUT/FFAIKernels.swift"; } > "$tmp"
+            mv "$tmp" "$OUT/FFAIKernels.swift"
+          fi
 
       - name: Build (release, with tests + testability)
         # `--build-tests` produces the xctest bundle so the subsequent

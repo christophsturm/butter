@@ -497,7 +497,7 @@ public final class FalconH1DecoderLayer: Module, DecoderLayer {
 
         // Parallel-hybrid join: residual + mixer + attention.
         // Fuse the final (temp + attnH) → preFfNorm pair into
-        // mt_add_rms_norm (hidden ≤ 4096). The first inner add stays
+        // ffai_add_rms_norm (hidden ≤ 4096). The first inner add stays
         // separate — fused kernel only collapses one add+norm pair.
         let temp = Ops.add(h, mambaH, on: cmd)
         let postMix: Tensor

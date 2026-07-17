@@ -42,7 +42,7 @@ import Foundation
 public enum QuantSpec: Sendable, Equatable {
     /// Affine-quantize this tensor to `n` bits per code via
     /// `QuantizedOps.quantizeAffine`. Supported widths: 2 / 3 / 4 /
-    /// 5 / 6 / 8 — matches what `mt_affine_quantize_int{N}_*` ships.
+    /// 5 / 6 / 8 — matches what `ffai_affine_quantize_int{N}_*` ships.
     case bits(Int)
 
     /// Downcast this tensor to IEEE-754 fp16 (no quantization). Used

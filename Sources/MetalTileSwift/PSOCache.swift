@@ -114,14 +114,14 @@ public final class PSOCache: @unchecked Sendable {
         // Live-compile via `makeLibrary(source:)` resolves MPP against the
         // running OS's header, dodging the skew. This is a known class of
         // MPP header-skew bug.
+        //
         let function: MTLFunction
         if Self.isMppKernel(name) {
             function = try liveCompileMppFunction(name)
-        } else {
-            guard let fn = library.library.makeFunction(name: name) else {
-                throw PSOCacheError.kernelNotFound(name)
-            }
+        } else if let fn = library.library.makeFunction(name: name) {
             function = fn
+        } else {
+            throw PSOCacheError.kernelNotFound(name)
         }
         var pso: MTLComputePipelineState
         do {

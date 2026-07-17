@@ -522,8 +522,8 @@ public final class GLMASRModel: @unchecked Sendable {
             nRows: seqLen, rowSize: hidden, on: cmd)
         // Q/K/V projections via GPU gemm (handles quantized weights).
         // `normed` is [seqLen, hidden] — must go through callMany so the
-        // dispatch is `mt_gemm` / `dequantGemmDynamicM`, not the single-row
-        // `mt_gemv` / `dequantGemv` (which would treat the flat
+        // dispatch is `ffai_gemm` / `dequantGemmDynamicM`, not the single-row
+        // `ffai_gemv` / `dequantGemv` (which would treat the flat
         // seqLen*hidden length as one row and trip the in_dim precondition,
         // crashing as "input 65280 ≠ in_dim 1280" per the 2026-05-24 bisect).
         let qRaw = layer.qProj.callMany(normed, t: seqLen, on: cmd, device: device)

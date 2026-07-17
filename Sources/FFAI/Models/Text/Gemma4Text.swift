@@ -1156,7 +1156,7 @@ public final class Gemma4Layer: Module {
         let oOut = oProj(attnOut.reshaped(to: [nHeads * headDim]), on: cmd)
         let normedAttn = postAttnNorm(oOut, on: cmd)
 
-        // Fused (h + normedAttn) → preFFNorm via mt_add_rms_norm
+        // Fused (h + normedAttn) → preFFNorm via ffai_add_rms_norm
         // (hidden ≤ 4096). Gemma 4 27B (hidden 5376) falls through the
         // validator gate to the unfused path.
         var hOut: Tensor
@@ -1213,7 +1213,7 @@ public final class Gemma4Layer: Module {
         let oOut = oProj(attnOut.reshaped(to: [nHeads * headDim]), on: postCmd)
         let normedAttn = postAttnNorm(oOut, on: postCmd)
 
-        // Fused (h + normedAttn) → preFFNorm via mt_add_rms_norm
+        // Fused (h + normedAttn) → preFFNorm via ffai_add_rms_norm
         // (hidden ≤ 4096). Gemma 4 27B (hidden 5376) falls through
         // the validator gate to the unfused path.
         var hOut: Tensor
@@ -1495,7 +1495,7 @@ enum Gemma4Ops {
         let rotatedPairs = rotatedDim / 2  // grid height — only these rotate
         let grid = MTLSize(width: 1, height: nHeads, depth: rotatedPairs)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
-        // mt_rope_banded reads position from a per-row `positions: [T]` u32
+        // ffai_rope_banded reads position from a per-row `positions: [T]` u32
         // buffer (decode = the T=1 case: a 1-element buffer); `row_stride` is
         // the per-token stride in qk (`n_heads * head_dim`). Single-token decode
         // here so a 1-element positions buffer + grid depth 1.
@@ -1505,7 +1505,7 @@ enum Gemma4Ops {
         let rowStride = UInt32(nHeads * headDim)
         switch qk.dtype {
         case .f32:
-            MetalTileKernels.mt_rope_banded_f32(
+            MetalTileKernels.ffai_rope_banded_f32(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
@@ -1515,7 +1515,7 @@ enum Gemma4Ops {
                 high_freq_factor: 1.0, original_max_position: 1.0,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.mt_rope_banded_f16(
+            MetalTileKernels.ffai_rope_banded_f16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
@@ -1525,7 +1525,7 @@ enum Gemma4Ops {
                 high_freq_factor: 1.0, original_max_position: 1.0,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_rope_banded_bf16(
+            MetalTileKernels.ffai_rope_banded_bf16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,

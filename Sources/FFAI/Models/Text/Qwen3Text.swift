@@ -428,7 +428,7 @@ public final class Qwen3Layer: Module {
         }
         let oOut = oProj(attnReadyForOProj, on: cmd)
 
-        // Fused residual add + post-attn RMSNorm via mt_add_rms_norm
+        // Fused residual add + post-attn RMSNorm via ffai_add_rms_norm
         // (hidden ≤ 4096). Validator gate falls through for Qwen 3 14B/32B
         // (hidden 5120) and similarly wide variants.
         let postAttn: Tensor
@@ -553,7 +553,7 @@ public final class Qwen3Layer: Module {
         let attnFlat = attnOut.reshaped(to: [nRows, nHeads * headDim])
         let oOut = oProj.callMany(attnFlat, t: nRows, on: cmd, device: device)
 
-        // Fused residual add + post-attn RMSNorm via mt_add_rms_norm
+        // Fused residual add + post-attn RMSNorm via ffai_add_rms_norm
         // (hidden ≤ 4096). Validator gate covers wider Qwen 3 variants.
         let postAttn: Tensor
         let mlpNorm: Tensor

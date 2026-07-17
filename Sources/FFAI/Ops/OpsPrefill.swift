@@ -28,17 +28,17 @@ extension Ops {
         let i = UInt32(inDim); let o = UInt32(outDim); let n = UInt32(nRows)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_gemm_q8_f16(
+            MetalTileKernels.ffai_gemm_q8_f16(
                 qs: qs.buffer, qsOffset: qs.offset, d_f32: dF32.buffer, d_f32Offset: dF32.offset,
                 input: input.buffer, inputOffset: input.offset, out: out.buffer, outOffset: out.offset,
                 in_dim: i, out_dim: o, n_rows: n, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_gemm_q8_f32(
+            MetalTileKernels.ffai_gemm_q8_f32(
                 qs: qs.buffer, qsOffset: qs.offset, d_f32: dF32.buffer, d_f32Offset: dF32.offset,
                 input: input.buffer, inputOffset: input.offset, out: out.buffer, outOffset: out.offset,
                 in_dim: i, out_dim: o, n_rows: n, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_gemm_q8_bf16(
+            MetalTileKernels.ffai_gemm_q8_bf16(
                 qs: qs.buffer, qsOffset: qs.offset, d_f32: dF32.buffer, d_f32Offset: dF32.offset,
                 input: input.buffer, inputOffset: input.offset, out: out.buffer, outOffset: out.offset,
                 in_dim: i, out_dim: o, n_rows: n, gridSize: grd, threadgroupSize: tg, on: cmd)
@@ -61,21 +61,21 @@ extension Ops {
         let hpg = UInt32(headsPerGroup); let w = UInt32(window); let kb = UInt32(kvBase)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_sdpa_prefill_d512_sink_f16(
+            MetalTileKernels.ffai_sdpa_prefill_d512_sink_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, sink_logit: sinkLogit.buffer, sink_logitOffset: sinkLogit.offset,
                 out: out.buffer, outOffset: out.offset, head_dim: hd, n_q_heads: nq, kv_stride: ks,
                 heads_per_group: hpg, window: w, kv_base: kb, scale: scale,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_sdpa_prefill_d512_sink_f32(
+            MetalTileKernels.ffai_sdpa_prefill_d512_sink_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, sink_logit: sinkLogit.buffer, sink_logitOffset: sinkLogit.offset,
                 out: out.buffer, outOffset: out.offset, head_dim: hd, n_q_heads: nq, kv_stride: ks,
                 heads_per_group: hpg, window: w, kv_base: kb, scale: scale,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_sdpa_prefill_d512_sink_bf16(
+            MetalTileKernels.ffai_sdpa_prefill_d512_sink_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, sink_logit: sinkLogit.buffer, sink_logitOffset: sinkLogit.offset,
                 out: out.buffer, outOffset: out.offset, head_dim: hd, n_q_heads: nq, kv_stride: ks,
@@ -98,21 +98,21 @@ extension Ops {
         let m = UInt32(mTotal); let n = UInt32(nOut); let k = UInt32(kIn)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_moe_gather_bgemm_iq2xxs_mpp_f16(
+            MetalTileKernels.ffai_moe_gather_bgemm_iq2xxs_mpp_f16(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 d_f32: dAll.buffer, d_f32Offset: dAll.offset, grid: grid.buffer, gridOffset: grid.offset,
                 signs: signs.buffer, signsOffset: signs.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_moe_gather_bgemm_iq2xxs_mpp_f32(
+            MetalTileKernels.ffai_moe_gather_bgemm_iq2xxs_mpp_f32(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 d_f32: dAll.buffer, d_f32Offset: dAll.offset, grid: grid.buffer, gridOffset: grid.offset,
                 signs: signs.buffer, signsOffset: signs.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_moe_gather_bgemm_iq2xxs_mpp_bf16(
+            MetalTileKernels.ffai_moe_gather_bgemm_iq2xxs_mpp_bf16(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 d_f32: dAll.buffer, d_f32Offset: dAll.offset, grid: grid.buffer, gridOffset: grid.offset,
                 signs: signs.buffer, signsOffset: signs.offset, indices: indices.buffer, indicesOffset: indices.offset,
@@ -143,19 +143,19 @@ extension Ops {
         let eStride = UInt32(expertByteStride)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_moe_bgemm_iq2xxs_view_f16(
+            MetalTileKernels.ffai_moe_bgemm_iq2xxs_view_f16(
                 x: x.buffer, xOffset: x.offset, view_u8: viewBuf, view_u8Offset: 0, grid: grid.buffer, gridOffset: grid.offset,
                 signs: signs.buffer, signsOffset: signs.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 tensor_byte_off: tOff, expert_byte_stride: eStride, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_moe_bgemm_iq2xxs_view_f32(
+            MetalTileKernels.ffai_moe_bgemm_iq2xxs_view_f32(
                 x: x.buffer, xOffset: x.offset, view_u8: viewBuf, view_u8Offset: 0, grid: grid.buffer, gridOffset: grid.offset,
                 signs: signs.buffer, signsOffset: signs.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 tensor_byte_off: tOff, expert_byte_stride: eStride, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_moe_bgemm_iq2xxs_view_bf16(
+            MetalTileKernels.ffai_moe_bgemm_iq2xxs_view_bf16(
                 x: x.buffer, xOffset: x.offset, view_u8: viewBuf, view_u8Offset: 0, grid: grid.buffer, gridOffset: grid.offset,
                 signs: signs.buffer, signsOffset: signs.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
@@ -181,19 +181,19 @@ extension Ops {
         let tOff = UInt32(tensorByteOff + viewByteOffset); let eStride = UInt32(expertByteStride)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_moe_bgemm_iq2xxs_view_u16_bm64_f16_threadgroups(
+            MetalTileKernels.ffai_moe_bgemm_iq2xxs_view_u16_bm64_f16_threadgroups(
                 x: x.buffer, xOffset: x.offset, view_u16: viewBuf, view_u16Offset: 0, view_f16: viewBuf, view_f16Offset: 0, grid: grid.buffer, gridOffset: grid.offset,
                 signs: signs.buffer, signsOffset: signs.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 tensor_byte_off: tOff, expert_byte_stride: eStride, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_moe_bgemm_iq2xxs_view_u16_bm64_f32_threadgroups(
+            MetalTileKernels.ffai_moe_bgemm_iq2xxs_view_u16_bm64_f32_threadgroups(
                 x: x.buffer, xOffset: x.offset, view_u16: viewBuf, view_u16Offset: 0, view_f16: viewBuf, view_f16Offset: 0, grid: grid.buffer, gridOffset: grid.offset,
                 signs: signs.buffer, signsOffset: signs.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 tensor_byte_off: tOff, expert_byte_stride: eStride, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_moe_bgemm_iq2xxs_view_u16_bm64_bf16_threadgroups(
+            MetalTileKernels.ffai_moe_bgemm_iq2xxs_view_u16_bm64_bf16_threadgroups(
                 x: x.buffer, xOffset: x.offset, view_u16: viewBuf, view_u16Offset: 0, view_f16: viewBuf, view_f16Offset: 0, grid: grid.buffer, gridOffset: grid.offset,
                 signs: signs.buffer, signsOffset: signs.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
@@ -213,21 +213,21 @@ extension Ops {
         let m = UInt32(mTotal); let n = UInt32(nOut); let k = UInt32(kIn)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_moe_gather_bgemm_q2k_mpp_f16(
+            MetalTileKernels.ffai_moe_gather_bgemm_q2k_mpp_f16(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 scales: scalesAll.buffer, scalesOffset: scalesAll.offset, d_f32: dAll.buffer, d_f32Offset: dAll.offset,
                 dmin_f32: dminAll.buffer, dmin_f32Offset: dminAll.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_moe_gather_bgemm_q2k_mpp_f32(
+            MetalTileKernels.ffai_moe_gather_bgemm_q2k_mpp_f32(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 scales: scalesAll.buffer, scalesOffset: scalesAll.offset, d_f32: dAll.buffer, d_f32Offset: dAll.offset,
                 dmin_f32: dminAll.buffer, dmin_f32Offset: dminAll.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_moe_gather_bgemm_q2k_mpp_bf16(
+            MetalTileKernels.ffai_moe_gather_bgemm_q2k_mpp_bf16(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 scales: scalesAll.buffer, scalesOffset: scalesAll.offset, d_f32: dAll.buffer, d_f32Offset: dAll.offset,
                 dmin_f32: dminAll.buffer, dmin_f32Offset: dminAll.offset, indices: indices.buffer, indicesOffset: indices.offset,
@@ -257,17 +257,17 @@ extension Ops {
         let tOff = UInt32(tensorByteOff + viewByteOffset); let eStride = UInt32(expertByteStride)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_moe_bgemm_q2k_view_u16_bm64_f16_threadgroups(
+            MetalTileKernels.ffai_moe_bgemm_q2k_view_u16_bm64_f16_threadgroups(
                 x: x.buffer, xOffset: x.offset, view_u16: viewBuf, view_u16Offset: 0, view_f16: viewBuf, view_f16Offset: 0,
                 indices: indices.buffer, indicesOffset: indices.offset, out: out.buffer, outOffset: out.offset,
                 m_total: m, n_out: n, k_in: k, tensor_byte_off: tOff, expert_byte_stride: eStride, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_moe_bgemm_q2k_view_u16_bm64_f32_threadgroups(
+            MetalTileKernels.ffai_moe_bgemm_q2k_view_u16_bm64_f32_threadgroups(
                 x: x.buffer, xOffset: x.offset, view_u16: viewBuf, view_u16Offset: 0, view_f16: viewBuf, view_f16Offset: 0,
                 indices: indices.buffer, indicesOffset: indices.offset, out: out.buffer, outOffset: out.offset,
                 m_total: m, n_out: n, k_in: k, tensor_byte_off: tOff, expert_byte_stride: eStride, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_moe_bgemm_q2k_view_u16_bm64_bf16_threadgroups(
+            MetalTileKernels.ffai_moe_bgemm_q2k_view_u16_bm64_bf16_threadgroups(
                 x: x.buffer, xOffset: x.offset, view_u16: viewBuf, view_u16Offset: 0, view_f16: viewBuf, view_f16Offset: 0,
                 indices: indices.buffer, indicesOffset: indices.offset, out: out.buffer, outOffset: out.offset,
                 m_total: m, n_out: n, k_in: k, tensor_byte_off: tOff, expert_byte_stride: eStride, gridSize: grd, threadgroupSize: tg, on: cmd)
@@ -289,19 +289,19 @@ extension Ops {
         let eStride = UInt32(expertByteStride)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_moe_bgemm_q2k_view_f16(
+            MetalTileKernels.ffai_moe_bgemm_q2k_view_f16(
                 x: x.buffer, xOffset: x.offset, view_u8: viewBuf, view_u8Offset: 0,
                 indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 tensor_byte_off: tOff, expert_byte_stride: eStride, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_moe_bgemm_q2k_view_f32(
+            MetalTileKernels.ffai_moe_bgemm_q2k_view_f32(
                 x: x.buffer, xOffset: x.offset, view_u8: viewBuf, view_u8Offset: 0,
                 indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 tensor_byte_off: tOff, expert_byte_stride: eStride, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_moe_bgemm_q2k_view_bf16(
+            MetalTileKernels.ffai_moe_bgemm_q2k_view_bf16(
                 x: x.buffer, xOffset: x.offset, view_u8: viewBuf, view_u8Offset: 0,
                 indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
@@ -324,21 +324,21 @@ extension Ops {
         let k = UInt32(kIn); let mo = UInt32(mOut); let mt = UInt32(mTotal)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_moe_gemv_rows_iq2xxs_f16(
+            MetalTileKernels.ffai_moe_gemv_rows_iq2xxs_f16(
                 x: x.buffer, xOffset: x.offset, qs_all: qsAll.buffer, qs_allOffset: qsAll.offset,
                 d_all: dAll.buffer, d_allOffset: dAll.offset, expert_ids: expertIds.buffer, expert_idsOffset: expertIds.offset,
                 grid: grid.buffer, gridOffset: grid.offset, signs: signs.buffer, signsOffset: signs.offset,
                 out: out.buffer, outOffset: out.offset, k_in: k, m_out: mo, m_total: mt,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_moe_gemv_rows_iq2xxs_f32(
+            MetalTileKernels.ffai_moe_gemv_rows_iq2xxs_f32(
                 x: x.buffer, xOffset: x.offset, qs_all: qsAll.buffer, qs_allOffset: qsAll.offset,
                 d_all: dAll.buffer, d_allOffset: dAll.offset, expert_ids: expertIds.buffer, expert_idsOffset: expertIds.offset,
                 grid: grid.buffer, gridOffset: grid.offset, signs: signs.buffer, signsOffset: signs.offset,
                 out: out.buffer, outOffset: out.offset, k_in: k, m_out: mo, m_total: mt,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_moe_gemv_rows_iq2xxs_bf16(
+            MetalTileKernels.ffai_moe_gemv_rows_iq2xxs_bf16(
                 x: x.buffer, xOffset: x.offset, qs_all: qsAll.buffer, qs_allOffset: qsAll.offset,
                 d_all: dAll.buffer, d_allOffset: dAll.offset, expert_ids: expertIds.buffer, expert_idsOffset: expertIds.offset,
                 grid: grid.buffer, gridOffset: grid.offset, signs: signs.buffer, signsOffset: signs.offset,
@@ -361,17 +361,17 @@ extension Ops {
         let n = UInt32(nRows); let o = UInt32(outDim); let k = UInt32(inDim)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_gemm_q8_mpp_f16(
+            MetalTileKernels.ffai_gemm_q8_mpp_f16(
                 x: input.buffer, xOffset: input.offset, qs: qs.buffer, qsOffset: qs.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset, out: out.buffer, outOffset: out.offset,
                 n_rows: n, out_dim: o, k_in: k, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_gemm_q8_mpp_f32(
+            MetalTileKernels.ffai_gemm_q8_mpp_f32(
                 x: input.buffer, xOffset: input.offset, qs: qs.buffer, qsOffset: qs.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset, out: out.buffer, outOffset: out.offset,
                 n_rows: n, out_dim: o, k_in: k, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_gemm_q8_mpp_bf16(
+            MetalTileKernels.ffai_gemm_q8_mpp_bf16(
                 x: input.buffer, xOffset: input.offset, qs: qs.buffer, qsOffset: qs.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset, out: out.buffer, outOffset: out.offset,
                 n_rows: n, out_dim: o, k_in: k, gridSize: grd, threadgroupSize: tg, on: cmd)
@@ -392,19 +392,19 @@ extension Ops {
         let ng = UInt32(nGroups); let rpg = UInt32(rowsPerGroup)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_grouped_gemm_q8_mpp_f16(
+            MetalTileKernels.ffai_grouped_gemm_q8_mpp_f16(
                 x: input.buffer, xOffset: input.offset, qs: qs.buffer, qsOffset: qs.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset, out: out.buffer, outOffset: out.offset,
                 n_rows: n, out_dim: o, k_in: k, n_groups: ng, rows_per_group: rpg,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_grouped_gemm_q8_mpp_f32(
+            MetalTileKernels.ffai_grouped_gemm_q8_mpp_f32(
                 x: input.buffer, xOffset: input.offset, qs: qs.buffer, qsOffset: qs.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset, out: out.buffer, outOffset: out.offset,
                 n_rows: n, out_dim: o, k_in: k, n_groups: ng, rows_per_group: rpg,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_grouped_gemm_q8_mpp_bf16(
+            MetalTileKernels.ffai_grouped_gemm_q8_mpp_bf16(
                 x: input.buffer, xOffset: input.offset, qs: qs.buffer, qsOffset: qs.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset, out: out.buffer, outOffset: out.offset,
                 n_rows: n, out_dim: o, k_in: k, n_groups: ng, rows_per_group: rpg,
@@ -429,19 +429,19 @@ extension Ops {
         let ng = UInt32(nGroups); let rpg = UInt32(rowsPerGroup)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_grouped_gemm_q8_f16(
+            MetalTileKernels.ffai_grouped_gemm_q8_f16(
                 qs: qs.buffer, qsOffset: qs.offset, d_f32: dF32.buffer, d_f32Offset: dF32.offset,
                 input: input.buffer, inputOffset: input.offset, out: out.buffer, outOffset: out.offset,
                 in_dim: i, out_dim: o, n_rows: n, n_groups: ng, rows_per_group: rpg,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_grouped_gemm_q8_f32(
+            MetalTileKernels.ffai_grouped_gemm_q8_f32(
                 qs: qs.buffer, qsOffset: qs.offset, d_f32: dF32.buffer, d_f32Offset: dF32.offset,
                 input: input.buffer, inputOffset: input.offset, out: out.buffer, outOffset: out.offset,
                 in_dim: i, out_dim: o, n_rows: n, n_groups: ng, rows_per_group: rpg,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_grouped_gemm_q8_bf16(
+            MetalTileKernels.ffai_grouped_gemm_q8_bf16(
                 qs: qs.buffer, qsOffset: qs.offset, d_f32: dF32.buffer, d_f32Offset: dF32.offset,
                 input: input.buffer, inputOffset: input.offset, out: out.buffer, outOffset: out.offset,
                 in_dim: i, out_dim: o, n_rows: n, n_groups: ng, rows_per_group: rpg,
@@ -465,21 +465,21 @@ extension Ops {
         let k = UInt32(kIn); let mo = UInt32(mOut); let mt = UInt32(mTotal); let rpt = UInt32(rowsPerTile)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_moe_gemv_ws_iq2xxs_f16(
+            MetalTileKernels.ffai_moe_gemv_ws_iq2xxs_f16(
                 x: x.buffer, xOffset: x.offset, qs_all: qsAll.buffer, qs_allOffset: qsAll.offset,
                 d_all: dAll.buffer, d_allOffset: dAll.offset, expert_ids: expertIds.buffer, expert_idsOffset: expertIds.offset,
                 grid: grid.buffer, gridOffset: grid.offset, signs: signs.buffer, signsOffset: signs.offset,
                 out: out.buffer, outOffset: out.offset, k_in: k, m_out: mo, m_total: mt, rows_per_tile: rpt,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_moe_gemv_ws_iq2xxs_f32(
+            MetalTileKernels.ffai_moe_gemv_ws_iq2xxs_f32(
                 x: x.buffer, xOffset: x.offset, qs_all: qsAll.buffer, qs_allOffset: qsAll.offset,
                 d_all: dAll.buffer, d_allOffset: dAll.offset, expert_ids: expertIds.buffer, expert_idsOffset: expertIds.offset,
                 grid: grid.buffer, gridOffset: grid.offset, signs: signs.buffer, signsOffset: signs.offset,
                 out: out.buffer, outOffset: out.offset, k_in: k, m_out: mo, m_total: mt, rows_per_tile: rpt,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_moe_gemv_ws_iq2xxs_bf16(
+            MetalTileKernels.ffai_moe_gemv_ws_iq2xxs_bf16(
                 x: x.buffer, xOffset: x.offset, qs_all: qsAll.buffer, qs_allOffset: qsAll.offset,
                 d_all: dAll.buffer, d_allOffset: dAll.offset, expert_ids: expertIds.buffer, expert_idsOffset: expertIds.offset,
                 grid: grid.buffer, gridOffset: grid.offset, signs: signs.buffer, signsOffset: signs.offset,
@@ -500,21 +500,21 @@ extension Ops {
         let k = UInt32(kIn); let mo = UInt32(mOut); let mt = UInt32(mTotal)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_moe_gemv_rows_q2k_f16(
+            MetalTileKernels.ffai_moe_gemv_rows_q2k_f16(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 scales: scalesAll.buffer, scalesOffset: scalesAll.offset, d_f32: dAll.buffer, d_f32Offset: dAll.offset,
                 dmin_f32: dminAll.buffer, dmin_f32Offset: dminAll.offset, expert_ids: expertIds.buffer, expert_idsOffset: expertIds.offset,
                 out: out.buffer, outOffset: out.offset, k_in: k, m_out: mo, m_total: mt,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_moe_gemv_rows_q2k_f32(
+            MetalTileKernels.ffai_moe_gemv_rows_q2k_f32(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 scales: scalesAll.buffer, scalesOffset: scalesAll.offset, d_f32: dAll.buffer, d_f32Offset: dAll.offset,
                 dmin_f32: dminAll.buffer, dmin_f32Offset: dminAll.offset, expert_ids: expertIds.buffer, expert_idsOffset: expertIds.offset,
                 out: out.buffer, outOffset: out.offset, k_in: k, m_out: mo, m_total: mt,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_moe_gemv_rows_q2k_bf16(
+            MetalTileKernels.ffai_moe_gemv_rows_q2k_bf16(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 scales: scalesAll.buffer, scalesOffset: scalesAll.offset, d_f32: dAll.buffer, d_f32Offset: dAll.offset,
                 dmin_f32: dminAll.buffer, dmin_f32Offset: dminAll.offset, expert_ids: expertIds.buffer, expert_idsOffset: expertIds.offset,
@@ -539,21 +539,21 @@ extension Ops {
         let m = UInt32(mTotal); let n = UInt32(nOut); let k = UInt32(kIn)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_moe_bgemm_iq2xxs_bm64_f16_threadgroups(
+            MetalTileKernels.ffai_moe_bgemm_iq2xxs_bm64_f16_threadgroups(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 d_f32: dAll.buffer, d_f32Offset: dAll.offset, grid: grid.buffer, gridOffset: grid.offset,
                 signs: signs.buffer, signsOffset: signs.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_moe_bgemm_iq2xxs_bm64_f32_threadgroups(
+            MetalTileKernels.ffai_moe_bgemm_iq2xxs_bm64_f32_threadgroups(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 d_f32: dAll.buffer, d_f32Offset: dAll.offset, grid: grid.buffer, gridOffset: grid.offset,
                 signs: signs.buffer, signsOffset: signs.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_moe_bgemm_iq2xxs_bm64_bf16_threadgroups(
+            MetalTileKernels.ffai_moe_bgemm_iq2xxs_bm64_bf16_threadgroups(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 d_f32: dAll.buffer, d_f32Offset: dAll.offset, grid: grid.buffer, gridOffset: grid.offset,
                 signs: signs.buffer, signsOffset: signs.offset, indices: indices.buffer, indicesOffset: indices.offset,
@@ -575,21 +575,21 @@ extension Ops {
         let m = UInt32(mTotal); let n = UInt32(nOut); let k = UInt32(kIn)
         switch out.dtype {
         case .f16:
-            MetalTileKernels.mt_moe_bgemm_q2k_bm64_f16_threadgroups(
+            MetalTileKernels.ffai_moe_bgemm_q2k_bm64_f16_threadgroups(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 scales: scalesAll.buffer, scalesOffset: scalesAll.offset, d_f32: dAll.buffer, d_f32Offset: dAll.offset,
                 dmin_f32: dminAll.buffer, dmin_f32Offset: dminAll.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            MetalTileKernels.mt_moe_bgemm_q2k_bm64_f32_threadgroups(
+            MetalTileKernels.ffai_moe_bgemm_q2k_bm64_f32_threadgroups(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 scales: scalesAll.buffer, scalesOffset: scalesAll.offset, d_f32: dAll.buffer, d_f32Offset: dAll.offset,
                 dmin_f32: dminAll.buffer, dmin_f32Offset: dminAll.offset, indices: indices.buffer, indicesOffset: indices.offset,
                 out: out.buffer, outOffset: out.offset, m_total: m, n_out: n, k_in: k,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.mt_moe_bgemm_q2k_bm64_bf16_threadgroups(
+            MetalTileKernels.ffai_moe_bgemm_q2k_bm64_bf16_threadgroups(
                 x: x.buffer, xOffset: x.offset, qs: qsAll.buffer, qsOffset: qsAll.offset,
                 scales: scalesAll.buffer, scalesOffset: scalesAll.offset, d_f32: dAll.buffer, d_f32Offset: dAll.offset,
                 dmin_f32: dminAll.buffer, dmin_f32Offset: dminAll.offset, indices: indices.buffer, indicesOffset: indices.offset,

@@ -699,6 +699,16 @@ public enum ModelRegistry {
                 options: options, device: device)
         }
 
+        // Hy3 (Tencent Hunyuan hy_v3) — 295B MoE, sigmoid+bias router
+        // (Path B), ungated shared expert, QK-norm before RoPE.
+        if Hy3.architectures.contains(config.architecture ?? "")
+            || Hy3.modelTypes.contains(config.modelType ?? "")
+        {
+            return try loadHy3(
+                config: config, weights: weights,
+                options: options, device: device)
+        }
+
         // DeepSeek V4 — hybrid full / CSA / HCA attention over a
         // 43-layer MoE backbone with MLA latent KV, Lightning Indexer
         // top-k sparse routing, and `sqrtsoftplus` MoE gating. The
@@ -883,6 +893,20 @@ public enum ModelRegistry {
         options: LoadOptions, device: Device
     ) throws -> Loaded {
         let variant = try NemotronH.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(
+            engine: engine,
+            defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
+
+    public static func loadHy3(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try Hy3.variant(for: config)
         let engine = try variant.loadModel(
             config: config, weights: weights,
             options: options, device: device
