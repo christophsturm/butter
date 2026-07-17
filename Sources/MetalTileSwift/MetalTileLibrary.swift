@@ -49,11 +49,6 @@ public final class MetalTileLibrary: @unchecked Sendable {
     public let commandQueue: MTLCommandQueue
     public let library: MTLLibrary
     public let metallibURL: URL
-    /// Optional secondary metallibs (e.g. `hy3_extra.metallib` with
-    /// affine int2 expert-indexed + gather kernels not yet merged into
-    /// the main emit). Looked up by `PSOCache` when the primary library
-    /// lacks a function name.
-    public let extraLibraries: [MTLLibrary]
 
     /// Maximum number of in-flight (uncompleted) `MTLCommandBuffer`s the
     /// shared command queue keeps before `makeCommandBuffer()` blocks on
@@ -138,7 +133,6 @@ public final class MetalTileLibrary: @unchecked Sendable {
             self.commandQueue = queue
             self.library = library
             self.metallibURL = url
-            self.extraLibraries = Self.loadExtraMetallibs(device: device, beside: url)
         } catch {
             throw MetalTileLibraryError.metallibLoadFailed(url, error)
         }
@@ -161,49 +155,5 @@ public final class MetalTileLibrary: @unchecked Sendable {
             "Resources/kernels.metallib"
         )
         throw MetalTileLibraryError.metallibNotFound(fallback)
-    }
-
-    /// Load optional sibling metallibs next to `kernels.metallib` and from
-    /// the resource bundle. Failures are silent (stderr note only) so a
-    /// missing extra does not block startup; PSOCache falls through to
-    /// live-compile of `.metal` sources when needed.
-    private static func loadExtraMetallibs(device: MTLDevice, beside primary: URL) -> [MTLLibrary] {
-        var libs: [MTLLibrary] = []
-        var seen = Set<String>()
-        let candidates: [URL] = {
-            var urls: [URL] = []
-            let sibling = primary.deletingLastPathComponent()
-                .appendingPathComponent("hy3_extra.metallib")
-            urls.append(sibling)
-            if let bundleURL = Bundle.module.url(
-                forResource: "hy3_extra", withExtension: "metallib", subdirectory: "Resources"
-            ) {
-                urls.append(bundleURL)
-            }
-            if let bundleURL = Bundle.module.url(forResource: "hy3_extra", withExtension: "metallib")
-            {
-                urls.append(bundleURL)
-            }
-            return urls
-        }()
-        for url in candidates {
-            let path = url.path
-            guard !seen.contains(path), FileManager.default.fileExists(atPath: path) else {
-                continue
-            }
-            seen.insert(path)
-            do {
-                let lib = try device.makeLibrary(URL: url)
-                libs.append(lib)
-                FileHandle.standardError.write(
-                    Data("[MetalTileLibrary] loaded extra metallib \(path)\n".utf8))
-            } catch {
-                FileHandle.standardError.write(
-                    Data(
-                        "[MetalTileLibrary] failed to load extra metallib \(path): \(error)\n"
-                            .utf8))
-            }
-        }
-        return libs
     }
 }

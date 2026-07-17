@@ -80,9 +80,8 @@ public enum MoEGatingMode: Sendable {
     ///   biased   = unbiased + expert_bias          (selection only)
     ///   top-K by biased; weights = renorm(unbiased[chosen]) if
     ///   `normTopKProb`, then × `routedScalingFactor`.
-    /// Requires non-nil `expertBias`. Confirmed against vLLM
-    /// `FusedMoE(scoring_func="sigmoid", e_score_correction_bias=…)`
-    /// and llama.cpp `hy-v3.cpp` (`LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID`).
+    /// Requires non-nil `expertBias`. Confirmed against reference
+    /// implementations of hy_v3 (sigmoid scoring + expert-bias selection).
     case sigmoidBiasedTopK
 }
 

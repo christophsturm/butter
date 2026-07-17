@@ -14,8 +14,8 @@
 //
 // Hy3 family root — Tencent Hunyuan Hy3 (`hy_v3` / `HYV3ForCausalLM`).
 //
-// Architecture (confirmed against HF config + vLLM hy_v3.py + llama.cpp
-// hy-v3.cpp):
+// Architecture (confirmed against the HF config and reference
+// implementations of hy_v3):
 //   • 80 decoder layers, hidden=4096, GQA 64/8 head_dim=128
 //   • first_k_dense_replace=1 dense SwiGLU layer, then MoE layers
 //   • MoE: 192 experts top-8, expert intermediate 1536, 1 ungated shared

@@ -701,12 +701,9 @@ public enum ModelRegistry {
 
         // Hy3 (Tencent Hunyuan hy_v3) — 295B MoE, sigmoid+bias router
         // (Path B), ungated shared expert, QK-norm before RoPE.
-        if let arch = config.architecture, Hy3.architectures.contains(arch) {
-            return try loadHy3(
-                config: config, weights: weights,
-                options: options, device: device)
-        }
-        if let mt = config.modelType, Hy3.modelTypes.contains(mt) {
+        if Hy3.architectures.contains(config.architecture ?? "")
+            || Hy3.modelTypes.contains(config.modelType ?? "")
+        {
             return try loadHy3(
                 config: config, weights: weights,
                 options: options, device: device)

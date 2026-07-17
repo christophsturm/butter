@@ -19,6 +19,55 @@
 // tensors (`mlp.switch_mlp.{gate,up,down}_proj`, shape [E, M, packed_K]).
 // Decode uses on-device Path B routing + int2 affine expert-indexed GEMV.
 // MTP (`num_nextn_predict_layers`) is not loaded yet.
+//
+// ── FFAI_HY3_* probe / tuning surface ──────────────────────────────────
+//
+// Every `FFAI_HY3_*` env var this family (and the Hy3-specific dispatches
+// in Ops.swift) reads, in one place so a probe doesn't require grepping
+// the whole file. All are off/default unless noted.
+//
+//   FFAI_HY3_MAX_SEQ=N           Override the default clamped context
+//                                length (see Hy3Dense.loadModel).
+//   FFAI_HY3_BF16=1              Keep checkpoint bf16 scales/biases
+//                                as-is (skip the in-place → f16 cast).
+//   FFAI_HY3_DENSIFY_INT8=1      Densify int8 attn/shared weights for
+//                                decode gemv (~10 GB extra).
+//   FFAI_HY3_SERIAL_QKV=1        Serial QKV callMany (no concurrent
+//                                encoder).
+//   FFAI_HY3_SDPA_PREFILL_MMA=1  Force the MMA-based SDPA prefill path.
+//   FFAI_HY3_NO_SDPA_PREFILL_MMA=1  Disable it (default: on for nRows≥32).
+//   FFAI_HY3_DUAL_QUEUE=1        Dual-queue shared-expert / MoE overlap.
+//   FFAI_HY3_NO_DUAL=1           Force serial shared-expert after MoE.
+//   FFAI_HY3_SKIP_ATTN=1         Zero QKV/SDPA/O (free-path ceiling probe).
+//   FFAI_HY3_SKIP_SDPA=1         Keep QKV/O but zero the SDPA body.
+//   FFAI_HY3_SKIP_MOE=1          Zero the routed MoE path (profile
+//                                residual = attn + shared only).
+//   FFAI_HY3_SKIP_SHARED=1       Zero the shared-expert path.
+//   FFAI_HY3_MOE_M1=1            Force the reduction-style (M1) gather
+//                                instead of the tiled-BM dispatch.
+//   FFAI_HY3_MOE_SERIAL_GU=1     Serial gate/up gather (no concurrent
+//                                encoder).
+//   FFAI_HY3_DUAL_MOE_GU=1       Dual-queue gate/up (mutually exclusive
+//                                with FFAI_HY3_DUAL_QUEUE).
+//   FFAI_HY3_MOE_BM64=1          Opt-in BM64 MPP gather tile.
+//   FFAI_HY3_MOE_BM8=1           Opt-in BM8 MPP gather tile.
+//   FFAI_HY3_MOE_MMA=1           Opt-in simdgroup-MMA BM16 gather.
+//   FFAI_HY3_EXPERT_GRID=1       Force the expert-outer grid dispatch.
+//   FFAI_HY3_NO_EXPERT_GRID=1    Disable it (default: on for mTotal≥1536).
+//   FFAI_HY3_ACTIVE_EG=1         Active-only expert-outer gather via
+//                                compact + indirect dispatch.
+//   FFAI_HY3_MOE_SKIP_GU=1       Zero the gate/up gather output (probe).
+//   FFAI_HY3_MOE_SKIP_DOWN=1     Zero the down-projection output (probe).
+//   FFAI_HY3_SCRATCH=1           Opt-in grow-only prefill scratch slab
+//                                (default off — regressed e2e prefill).
+//   FFAI_HY3_MEGA_CB=1           One command buffer for all layers.
+//   FFAI_HY3_CB_STRIDE=N         Commit every N layers (default 4).
+//   FFAI_HY3_PROFILE=1           Emit `[hy3-profile]` per-call timing.
+//   FFAI_HY3_QMM_MMA=1           Use the MMA QMM path instead of the
+//                                default MPP/NAX int8 live-compile path
+//                                (Ops.swift shared/expert-indexed GEMV).
+//   FFAI_HY3_SERIAL_EXPERT_GEMV=1  Force a serial encoder for
+//                                  expert-indexed GEMV (Ops.swift).
 
 import Foundation
 import Metal
@@ -69,9 +118,16 @@ public enum Hy3Dense: Hy3Variant {
             }
             return 2048
         }()
+        let maxPos = tc.int("max_position_embeddings")
         let maxSeq =
             options.maxContextLength
-            ?? min(tc.int("max_position_embeddings") ?? defaultMaxSeq, defaultMaxSeq)
+            ?? min(maxPos ?? defaultMaxSeq, defaultMaxSeq)
+        if let maxPos, maxSeq < maxPos {
+            fputs(
+                "[hy3] context clamped to \(maxSeq) (checkpoint advertises \(maxPos)); "
+                    + "raise with LoadOptions.maxContextLength or FFAI_HY3_MAX_SEQ\n",
+                stderr)
+        }
         let eps = Float(tc.float("rms_norm_eps") ?? 1e-5)
         let routeNorm = tc.bool("route_norm") ?? true
         let routerScale = Float(tc.float("router_scaling_factor") ?? 1.0)
@@ -91,7 +147,7 @@ public enum Hy3Dense: Hy3Variant {
         let groupSize = quant?.groupSize ?? 64
 
         // Default f16 activations for oQ2. Checkpoint scales/biases are BF16;
-        // promote with in-place GPU cast (same width). FFAI_HY3_BF16=1 keeps bf16.
+        // promote with in-place GPU cast (same width).
         let preferF16 =
             ProcessInfo.processInfo.environment["FFAI_HY3_BF16"] == nil
         let dtype: DType = preferF16 ? .f16 : (quant != nil ? .bf16 : .f16)
@@ -278,14 +334,12 @@ public enum Hy3Dense: Hy3Variant {
             fputs("[hy3] promoted checkpoint BF16 scales/biases → f16 (GPU in-place)\n", stderr)
         }
 
-        _ = options
         let model = Hy3Model(
             embedTokens: embedTokens, layers: layers, finalNorm: finalNorm, lmHead: lmHead,
             hidden: hidden, nLayers: nLayers, nHeads: nHeads, nKVHeads: nKVHeads,
             headDim: headDim, vocab: vocab, maxSeq: maxSeq, dtype: dtype)
         // Optional densify of int8 attn/shared for decode gemv (~10 GB).
         // Default OFF — thrashing on 128 GB with 75 GB oQ2 weights.
-        // Enable with FFAI_HY3_DENSIFY_INT8=1 when free RAM allows.
         if ProcessInfo.processInfo.environment["FFAI_HY3_DENSIFY_INT8"] != nil {
             model.densifyInt8Linears(device: Device.shared)
         }
@@ -482,7 +536,6 @@ private func hy3ConcurrentQKV(
     qProj: AnyLinear, kProj: AnyLinear, vProj: AnyLinear,
     cmd: MTLCommandBuffer, device: Device
 ) -> (Tensor, Tensor, Tensor) {
-    // FFAI_HY3_SERIAL_QKV=1 forces serial callMany (no concurrent encoder).
     if ProcessInfo.processInfo.environment["FFAI_HY3_SERIAL_QKV"] != nil {
         return (
             hy3Int8CallMany(qProj, xNorm, t: t, on: cmd, device: device),
@@ -1311,10 +1364,8 @@ final class Hy3MoELayer: Hy3LayerProtocol {
             nRows: nRows, rowSize: hidden, on: cmd, into: xNormFlat)
         let xNorm = xNormFlat.reshaped(to: [nRows, hidden])
 
-        // Probe: FFAI_HY3_SKIP_ATTN=1 zeros QKV/SDPA/O (free-path ceiling).
         let skipAttn =
             ProcessInfo.processInfo.environment["FFAI_HY3_SKIP_ATTN"] != nil
-        // Probe: FFAI_HY3_SKIP_SDPA=1 keeps QKV/O but zeros SDPA body.
         let skipSdpa =
             ProcessInfo.processInfo.environment["FFAI_HY3_SKIP_SDPA"] != nil
 
@@ -1398,13 +1449,10 @@ final class Hy3MoELayer: Hy3LayerProtocol {
         precondition(
             gateBits == 2 && upBits == 2 && downBits == 2 && router.topK == 8,
             "Hy3 forwardMulti: only int2 topK=8 Path B gather is implemented")
-        // FFAI_HY3_SKIP_MOE=1: zero routed path (profile residual = attn+shared).
         let skipMoE = ProcessInfo.processInfo.environment["FFAI_HY3_SKIP_MOE"] != nil
         let skipShared = ProcessInfo.processInfo.environment["FFAI_HY3_SKIP_SHARED"] != nil
         // Default: fuse shared gate‖up onto the same concurrent encoder as
-        // MoE gate‖up after gather (no dual-queue events). Opt-in dual-queue
-        // with `FFAI_HY3_DUAL_QUEUE=1`; serial shared after MoE with
-        // FFAI_HY3_NO_DUAL=1: serial shared after MoE.
+        // MoE gate‖up after gather (no dual-queue events).
         let dualQueue =
             ProcessInfo.processInfo.environment["FFAI_HY3_DUAL_QUEUE"] != nil
         let noDual =
@@ -1569,18 +1617,6 @@ final class Hy3MoELayer: Hy3LayerProtocol {
         ensurePrefillWorkspaces(t: t, device: device)
     }
 
-    /// After GPU wait, return unique expert count in the last sort plan
-    /// (host-coherent shared storage). Diagnostic only.
-    func uniqueExpertsInLastPlan(mTotal: Int) -> Int? {
-        guard let se = pfSortedExperts, mTotal > 0, mTotal <= se.elementCount else {
-            return nil
-        }
-        let view = Tensor(
-            buffer: se.buffer, offset: se.offset, shape: [mTotal], dtype: .u32)
-        let ids = view.toArray(as: UInt32.self)
-        return Set(ids).count
-    }
-
     /// Alias another layer's prefill workspaces (sequential reuse).
     func sharePrefillWorkspaces(from other: Hy3MoELayer) {
         prefillCapT = other.prefillCapT
@@ -1659,16 +1695,7 @@ final class Hy3MoELayer: Hy3LayerProtocol {
         fuseShared: Bool = false
     ) -> (Tensor, Tensor?) {
         let nExperts = router.nExperts
-        let topKFull = router.topK
-        // Diagnostic: FFAI_HY3_FAKE_TOPK=N uses only first N of topK (speed ceiling probe).
-        let topK: Int = {
-            if let s = ProcessInfo.processInfo.environment["FFAI_HY3_FAKE_TOPK"],
-               let n = Int(s), n > 0, n < topKFull
-            {
-                return n
-            }
-            return topKFull
-        }()
+        let topK = router.topK
         let mTotal = t * topK
         let dt = ffnIn.dtype
         ensurePrefillWorkspaces(t: t, device: device)
@@ -1736,31 +1763,15 @@ final class Hy3MoELayer: Hy3LayerProtocol {
         let idsFlat = Tensor(
             buffer: indicesAll.buffer, offset: indicesAll.offset,
             shape: [mTotal], dtype: .u32)
-        let noSort = ProcessInfo.processInfo.environment["FFAI_HY3_NO_SORT"] != nil
-        if noSort {
-            // Token-order plan (identity): source = m/topK, inv_perm = id,
-            // Token-order plan (identity) for FFAI_HY3_NO_SORT diagnostics.
-            var src = [UInt32](repeating: 0, count: mTotal)
-            var inv = [UInt32](repeating: 0, count: mTotal)
-            for m in 0 ..< mTotal {
-                src[m] = UInt32(m / topK)
-                inv[m] = UInt32(m)
-            }
-            sourceT.copyIn(from: src)
-            invPermT.copyIn(from: inv)
-            Ops.copy(idsFlat, into: sortedExperts, on: cmd)
-        } else {
-            Ops.moeSortPlan(
-                topkIds: idsFlat, sortedExperts: sortedExperts,
-                sourceTokens: sourceT, invPerm: invPermT,
-                mTotal: mTotal, k: topK, on: cmd)
-        }
+        Ops.moeSortPlan(
+            topkIds: idsFlat, sortedExperts: sortedExperts,
+            sourceTokens: sourceT, invPerm: invPermT,
+            mTotal: mTotal, k: topK, on: cmd)
         let wTokenOrder = Tensor(
             buffer: weightsAll.buffer, offset: weightsAll.offset,
             shape: [mTotal], dtype: dt)
 
         _ = Ops.gather(table: ffnIn, tokenIds: sourceT, on: cmd, into: xGathered)
-        // FFAI_HY3_MOE_M1=1 forces reduction-style gather instead of tiled BM.
         let forceM1 = ProcessInfo.processInfo.environment["FFAI_HY3_MOE_M1"] != nil
         let useBm =
             !forceM1 && (moeIntermediate % 32 == 0) && (hidden % 32 == 0)
@@ -1768,17 +1779,6 @@ final class Hy3MoELayer: Hy3LayerProtocol {
             ProcessInfo.processInfo.environment["FFAI_HY3_MOE_SKIP_GU"] != nil
         let skipDown =
             ProcessInfo.processInfo.environment["FFAI_HY3_MOE_SKIP_DOWN"] != nil
-        // FFAI_HY3_MOE_CHUNK=N (N>0): row-chunked gather QMM.
-        let moeChunkRows: Int = {
-            if let s = ProcessInfo.processInfo.environment["FFAI_HY3_MOE_CHUNK"],
-               let n = Int(s), n > 0
-            {
-                return n
-            }
-            return 0
-        }()
-        // Concurrent gate‖up by default. FFAI_HY3_MOE_SERIAL_GU=1 for serial;
-        // FFAI_HY3_DUAL_MOE_GU=1 for dual-queue GU (not with DUAL_QUEUE).
         let serialGU =
             ProcessInfo.processInfo.environment["FFAI_HY3_MOE_SERIAL_GU"] != nil
         let dualMoeGU =
@@ -1786,21 +1786,6 @@ final class Hy3MoELayer: Hy3LayerProtocol {
             && ProcessInfo.processInfo.environment["FFAI_HY3_DUAL_QUEUE"] == nil
         let useSerialGU = serialGU && !dualMoeGU
         let useConcurrentGU = !serialGU && !dualMoeGU
-        // FFAI_HY3_FUSED_GU=1: fused gate+up expert-grid gather (f16).
-        let useFusedGU: Bool = {
-            guard useBm, dt == .f16, nExperts > 0, moeChunkRows == 0,
-                  !dualMoeGU, !useSerialGU
-            else { return false }
-            return ProcessInfo.processInfo.environment["FFAI_HY3_FUSED_GU"] != nil
-        }()
-        // FFAI_HY3_GU_SWIGLU=1: dual-SG fused gate+up+SwiGLU EG → single inner.
-        // Off by default (e2e lags concurrent dual EG + separate swiglu).
-        let useGUSwiglu: Bool = {
-            guard useBm, dt == .f16, nExperts > 0, moeChunkRows == 0,
-                  !dualMoeGU, !useSerialGU, !useFusedGU
-            else { return false }
-            return ProcessInfo.processInfo.environment["FFAI_HY3_GU_SWIGLU"] != nil
-        }()
 
         // Optional shared-expert fuse: pad ffnIn once, concurrent gate‖up with MoE.
         var sharedX: Tensor?
@@ -1847,9 +1832,8 @@ final class Hy3MoELayer: Hy3LayerProtocol {
                 tag: "hy3_shared_upad_\(dt)_\(u.weight.shape[0])", device: device)
         }
 
-        // FFAI_HY3_ACTIVE_EG=1: active-only expert-outer (f16) via compact +
-        // indirect dispatch. Opt-in — e2e ties/slight loss vs full EG with
-        // early-exit empty TGs at current unique≈80–100.
+        // Opt-in — e2e ties/slight loss vs full EG with early-exit empty
+        // TGs at current unique≈80–100.
         let useActiveEG: Bool = {
             guard dt == .f16,
                   pfActiveExperts != nil, pfIndirectGU != nil, pfIndirectDown != nil
@@ -1866,6 +1850,31 @@ final class Hy3MoELayer: Hy3LayerProtocol {
                 range: tns.offset ..< (tns.offset + bytes),
                 value: 0)
             blit.endEncoding()
+        }
+
+        // Shared-expert gate+up dequant-GEMM pair, identical across every
+        // MoE dispatch branch below. If `encoder` is given, encodes onto it
+        // (caller owns ending the encoder); otherwise opens + closes its
+        // own `.concurrent` encoder.
+        func encodeSharedGateUp(
+            _ g: QuantizedLinear, _ u: QuantizedLinear, _ xS: Tensor,
+            _ sgPad: Tensor, _ suPad: Tensor,
+            encoder: MTLComputeCommandEncoder? = nil
+        ) {
+            let ownsEnc = encoder == nil
+            guard let enc = encoder ?? cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
+            else { return }
+            let inDimG = g.scales.shape[g.scales.shape.count - 1] * g.groupSize
+            let inDimU = u.scales.shape[u.scales.shape.count - 1] * u.groupSize
+            Ops.encodeDequantGemmInt8Mpp(
+                input: xS, weight: g.weight, scales: g.scales,
+                biases: g.biases, m: sharedMPad, n: g.weight.shape[0],
+                k: inDimG, groupSize: g.groupSize, into: sgPad, encoder: enc)
+            Ops.encodeDequantGemmInt8Mpp(
+                input: xS, weight: u.weight, scales: u.scales,
+                biases: u.biases, m: sharedMPad, n: u.weight.shape[0],
+                k: inDimU, groupSize: u.groupSize, into: suPad, encoder: enc)
+            if ownsEnc { enc.endEncoding() }
         }
 
         if useBm && useActiveEG,
@@ -1905,16 +1914,7 @@ final class Hy3MoELayer: Hy3LayerProtocol {
                 if let g = sharedG, let u = sharedU, let xS = sharedX,
                    let sgPad = sharedSgPad, let suPad = sharedSuPad
                 {
-                    let inDimG = g.scales.shape[g.scales.shape.count - 1] * g.groupSize
-                    let inDimU = u.scales.shape[u.scales.shape.count - 1] * u.groupSize
-                    Ops.encodeDequantGemmInt8Mpp(
-                        input: xS, weight: g.weight, scales: g.scales,
-                        biases: g.biases, m: sharedMPad, n: g.weight.shape[0],
-                        k: inDimG, groupSize: g.groupSize, into: sgPad, encoder: enc)
-                    Ops.encodeDequantGemmInt8Mpp(
-                        input: xS, weight: u.weight, scales: u.scales,
-                        biases: u.biases, m: sharedMPad, n: u.weight.shape[0],
-                        k: inDimU, groupSize: u.groupSize, into: suPad, encoder: enc)
+                    encodeSharedGateUp(g, u, xS, sgPad, suPad, encoder: enc)
                 }
                 enc.endEncoding()
             } else {
@@ -1935,20 +1935,9 @@ final class Hy3MoELayer: Hy3LayerProtocol {
                     groupSize: groupSize, on: cmd, into: upOut,
                     indirectArgs: indGU)
                 if let g = sharedG, let u = sharedU, let xS = sharedX,
-                   let sgPad = sharedSgPad, let suPad = sharedSuPad,
-                   let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
+                   let sgPad = sharedSgPad, let suPad = sharedSuPad
                 {
-                    let inDimG = g.scales.shape[g.scales.shape.count - 1] * g.groupSize
-                    let inDimU = u.scales.shape[u.scales.shape.count - 1] * u.groupSize
-                    Ops.encodeDequantGemmInt8Mpp(
-                        input: xS, weight: g.weight, scales: g.scales,
-                        biases: g.biases, m: sharedMPad, n: g.weight.shape[0],
-                        k: inDimG, groupSize: g.groupSize, into: sgPad, encoder: enc)
-                    Ops.encodeDequantGemmInt8Mpp(
-                        input: xS, weight: u.weight, scales: u.scales,
-                        biases: u.biases, m: sharedMPad, n: u.weight.shape[0],
-                        k: inDimU, groupSize: u.groupSize, into: suPad, encoder: enc)
-                    enc.endEncoding()
+                    encodeSharedGateUp(g, u, xS, sgPad, suPad)
                 }
             }
             _ = Ops.swiglu(gate: gateOut, up: upOut, on: cmd, into: upOut)
@@ -1985,116 +1974,6 @@ final class Hy3MoELayer: Hy3LayerProtocol {
         } else if useBm {
             if skipGU {
                 zeroTensor(gateOut); zeroTensor(upOut)
-            } else if useGUSwiglu {
-                // Fused gate+up+SwiGLU → gateOut holds inner for down.
-                if let g = sharedG, let u = sharedU, let xS = sharedX,
-                   let sgPad = sharedSgPad, let suPad = sharedSuPad,
-                   let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
-                {
-                    Ops.moeGatherDequantGemmInt2GUSwiglu(
-                        input: xGathered,
-                        gateWeight: switchGate.weight, gateScales: switchGate.scales,
-                        gateBiases: switchGate.biases,
-                        upWeight: switchUp.weight, upScales: switchUp.scales,
-                        upBiases: switchUp.biases,
-                        indices: sortedExperts,
-                        mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
-                        groupSize: groupSize, nExperts: nExperts,
-                        on: cmd, intoInner: gateOut, encoder: enc)
-                    let inDimG = g.scales.shape[g.scales.shape.count - 1] * g.groupSize
-                    let inDimU = u.scales.shape[u.scales.shape.count - 1] * u.groupSize
-                    Ops.encodeDequantGemmInt8Mpp(
-                        input: xS, weight: g.weight, scales: g.scales,
-                        biases: g.biases, m: sharedMPad, n: g.weight.shape[0],
-                        k: inDimG, groupSize: g.groupSize, into: sgPad, encoder: enc)
-                    Ops.encodeDequantGemmInt8Mpp(
-                        input: xS, weight: u.weight, scales: u.scales,
-                        biases: u.biases, m: sharedMPad, n: u.weight.shape[0],
-                        k: inDimU, groupSize: u.groupSize, into: suPad, encoder: enc)
-                    enc.endEncoding()
-                } else {
-                    Ops.moeGatherDequantGemmInt2GUSwiglu(
-                        input: xGathered,
-                        gateWeight: switchGate.weight, gateScales: switchGate.scales,
-                        gateBiases: switchGate.biases,
-                        upWeight: switchUp.weight, upScales: switchUp.scales,
-                        upBiases: switchUp.biases,
-                        indices: sortedExperts,
-                        mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
-                        groupSize: groupSize, nExperts: nExperts,
-                        on: cmd, intoInner: gateOut)
-                    if let g = sharedG, let u = sharedU, let xS = sharedX,
-                       let sgPad = sharedSgPad, let suPad = sharedSuPad,
-                       let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
-                    {
-                        let inDimG = g.scales.shape[g.scales.shape.count - 1] * g.groupSize
-                        let inDimU = u.scales.shape[u.scales.shape.count - 1] * u.groupSize
-                        Ops.encodeDequantGemmInt8Mpp(
-                            input: xS, weight: g.weight, scales: g.scales,
-                            biases: g.biases, m: sharedMPad, n: g.weight.shape[0],
-                            k: inDimG, groupSize: g.groupSize, into: sgPad, encoder: enc)
-                        Ops.encodeDequantGemmInt8Mpp(
-                            input: xS, weight: u.weight, scales: u.scales,
-                            biases: u.biases, m: sharedMPad, n: u.weight.shape[0],
-                            k: inDimU, groupSize: u.groupSize, into: suPad, encoder: enc)
-                        enc.endEncoding()
-                    }
-                }
-            } else if useFusedGU {
-                // Single fused gate+up EG dispatch; optional shared concurrent.
-                if let g = sharedG, let u = sharedU, let xS = sharedX,
-                   let sgPad = sharedSgPad, let suPad = sharedSuPad,
-                   let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
-                {
-                    Ops.moeGatherDequantGemmInt2FusedGU(
-                        input: xGathered,
-                        gateWeight: switchGate.weight, gateScales: switchGate.scales,
-                        gateBiases: switchGate.biases,
-                        upWeight: switchUp.weight, upScales: switchUp.scales,
-                        upBiases: switchUp.biases,
-                        indices: sortedExperts,
-                        mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
-                        groupSize: groupSize, nExperts: nExperts,
-                        on: cmd, intoGate: gateOut, intoUp: upOut, encoder: enc)
-                    let inDimG = g.scales.shape[g.scales.shape.count - 1] * g.groupSize
-                    let inDimU = u.scales.shape[u.scales.shape.count - 1] * u.groupSize
-                    Ops.encodeDequantGemmInt8Mpp(
-                        input: xS, weight: g.weight, scales: g.scales,
-                        biases: g.biases, m: sharedMPad, n: g.weight.shape[0],
-                        k: inDimG, groupSize: g.groupSize, into: sgPad, encoder: enc)
-                    Ops.encodeDequantGemmInt8Mpp(
-                        input: xS, weight: u.weight, scales: u.scales,
-                        biases: u.biases, m: sharedMPad, n: u.weight.shape[0],
-                        k: inDimU, groupSize: u.groupSize, into: suPad, encoder: enc)
-                    enc.endEncoding()
-                } else {
-                    Ops.moeGatherDequantGemmInt2FusedGU(
-                        input: xGathered,
-                        gateWeight: switchGate.weight, gateScales: switchGate.scales,
-                        gateBiases: switchGate.biases,
-                        upWeight: switchUp.weight, upScales: switchUp.scales,
-                        upBiases: switchUp.biases,
-                        indices: sortedExperts,
-                        mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
-                        groupSize: groupSize, nExperts: nExperts,
-                        on: cmd, intoGate: gateOut, intoUp: upOut)
-                    if let g = sharedG, let u = sharedU, let xS = sharedX,
-                       let sgPad = sharedSgPad, let suPad = sharedSuPad,
-                       let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
-                    {
-                        let inDimG = g.scales.shape[g.scales.shape.count - 1] * g.groupSize
-                        let inDimU = u.scales.shape[u.scales.shape.count - 1] * u.groupSize
-                        Ops.encodeDequantGemmInt8Mpp(
-                            input: xS, weight: g.weight, scales: g.scales,
-                            biases: g.biases, m: sharedMPad, n: g.weight.shape[0],
-                            k: inDimG, groupSize: g.groupSize, into: sgPad, encoder: enc)
-                        Ops.encodeDequantGemmInt8Mpp(
-                            input: xS, weight: u.weight, scales: u.scales,
-                            biases: u.biases, m: sharedMPad, n: u.weight.shape[0],
-                            k: inDimU, groupSize: u.groupSize, into: suPad, encoder: enc)
-                        enc.endEncoding()
-                    }
-                }
             } else if dualMoeGU {
                 // Gate on primary CB; up on queue B after gather. Shared
                 // expert (if fused) stays on primary concurrent with gate.
@@ -2123,16 +2002,7 @@ final class Hy3MoELayer: Hy3LayerProtocol {
                         mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
                         groupSize: groupSize, on: cmd, into: gateOut, encoder: enc,
                         nExperts: nExperts)
-                    let inDimG = g.scales.shape[g.scales.shape.count - 1] * g.groupSize
-                    let inDimU = u.scales.shape[u.scales.shape.count - 1] * u.groupSize
-                    Ops.encodeDequantGemmInt8Mpp(
-                        input: xS, weight: g.weight, scales: g.scales,
-                        biases: g.biases, m: sharedMPad, n: g.weight.shape[0],
-                        k: inDimG, groupSize: g.groupSize, into: sgPad, encoder: enc)
-                    Ops.encodeDequantGemmInt8Mpp(
-                        input: xS, weight: u.weight, scales: u.scales,
-                        biases: u.biases, m: sharedMPad, n: u.weight.shape[0],
-                        k: inDimU, groupSize: u.groupSize, into: suPad, encoder: enc)
+                    encodeSharedGateUp(g, u, xS, sgPad, suPad, encoder: enc)
                     enc.endEncoding()
                 } else {
                     Ops.moeGatherDequantGemmInt2(
@@ -2144,59 +2014,29 @@ final class Hy3MoELayer: Hy3LayerProtocol {
                         nExperts: nExperts)
                 }
                 cmd.encodeWaitForEvent(device.syncEvent, value: vUpDone)
-            } else if useSerialGU || moeChunkRows > 0 {
-                // Chunked path forces serial GU (each chunk is its own dispatch).
+            } else if useSerialGU {
                 let gs = groupSize
                 let mi = moeIntermediate
                 let hid = hidden
-                if moeChunkRows > 0 {
-                    Ops.moeGatherDequantGemmInt2Chunked(
-                        input: xGathered,
-                        weight: switchGate.weight, scales: switchGate.scales,
-                        biases: switchGate.biases, indices: sortedExperts,
-                        mTotal: mTotal, nOut: mi, kIn: hid,
-                        groupSize: gs, on: cmd, into: gateOut,
-                        nExperts: nExperts, chunkRows: moeChunkRows)
-                    Ops.moeGatherDequantGemmInt2Chunked(
-                        input: xGathered,
-                        weight: switchUp.weight, scales: switchUp.scales,
-                        biases: switchUp.biases, indices: sortedExperts,
-                        mTotal: mTotal, nOut: mi, kIn: hid,
-                        groupSize: gs, on: cmd, into: upOut,
-                        nExperts: nExperts, chunkRows: moeChunkRows)
-                } else {
-                    Ops.moeGatherDequantGemmInt2(
-                        input: xGathered,
-                        weight: switchGate.weight, scales: switchGate.scales,
-                        biases: switchGate.biases, indices: sortedExperts,
-                        mTotal: mTotal, nOut: mi, kIn: hid,
-                        groupSize: gs, on: cmd, into: gateOut,
-                        nExperts: nExperts)
-                    Ops.moeGatherDequantGemmInt2(
-                        input: xGathered,
-                        weight: switchUp.weight, scales: switchUp.scales,
-                        biases: switchUp.biases, indices: sortedExperts,
-                        mTotal: mTotal, nOut: mi, kIn: hid,
-                        groupSize: gs, on: cmd, into: upOut,
-                        nExperts: nExperts)
-                }
+                Ops.moeGatherDequantGemmInt2(
+                    input: xGathered,
+                    weight: switchGate.weight, scales: switchGate.scales,
+                    biases: switchGate.biases, indices: sortedExperts,
+                    mTotal: mTotal, nOut: mi, kIn: hid,
+                    groupSize: gs, on: cmd, into: gateOut,
+                    nExperts: nExperts)
+                Ops.moeGatherDequantGemmInt2(
+                    input: xGathered,
+                    weight: switchUp.weight, scales: switchUp.scales,
+                    biases: switchUp.biases, indices: sortedExperts,
+                    mTotal: mTotal, nOut: mi, kIn: hid,
+                    groupSize: gs, on: cmd, into: upOut,
+                    nExperts: nExperts)
                 // Shared gate‖up after serial MoE (no concurrent BW fight).
                 if let g = sharedG, let u = sharedU, let xS = sharedX,
                    let sgPad = sharedSgPad, let suPad = sharedSuPad
                 {
-                    let inDimG = g.scales.shape[g.scales.shape.count - 1] * g.groupSize
-                    let inDimU = u.scales.shape[u.scales.shape.count - 1] * u.groupSize
-                    if let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) {
-                        Ops.encodeDequantGemmInt8Mpp(
-                            input: xS, weight: g.weight, scales: g.scales,
-                            biases: g.biases, m: sharedMPad, n: g.weight.shape[0],
-                            k: inDimG, groupSize: g.groupSize, into: sgPad, encoder: enc)
-                        Ops.encodeDequantGemmInt8Mpp(
-                            input: xS, weight: u.weight, scales: u.scales,
-                            biases: u.biases, m: sharedMPad, n: u.weight.shape[0],
-                            k: inDimU, groupSize: u.groupSize, into: suPad, encoder: enc)
-                        enc.endEncoding()
-                    }
+                    encodeSharedGateUp(g, u, xS, sgPad, suPad)
                 }
             } else if useConcurrentGU,
                       let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
@@ -2218,16 +2058,7 @@ final class Hy3MoELayer: Hy3LayerProtocol {
                 if let g = sharedG, let u = sharedU, let xS = sharedX,
                    let sgPad = sharedSgPad, let suPad = sharedSuPad
                 {
-                    let inDimG = g.scales.shape[g.scales.shape.count - 1] * g.groupSize
-                    let inDimU = u.scales.shape[u.scales.shape.count - 1] * u.groupSize
-                    Ops.encodeDequantGemmInt8Mpp(
-                        input: xS, weight: g.weight, scales: g.scales,
-                        biases: g.biases, m: sharedMPad, n: g.weight.shape[0],
-                        k: inDimG, groupSize: g.groupSize, into: sgPad, encoder: enc)
-                    Ops.encodeDequantGemmInt8Mpp(
-                        input: xS, weight: u.weight, scales: u.scales,
-                        biases: u.biases, m: sharedMPad, n: u.weight.shape[0],
-                        k: inDimU, groupSize: u.groupSize, into: suPad, encoder: enc)
+                    encodeSharedGateUp(g, u, xS, sgPad, suPad, encoder: enc)
                 }
                 enc.endEncoding()
             } else {
@@ -2256,17 +2087,11 @@ final class Hy3MoELayer: Hy3LayerProtocol {
                 sortedExperts, mTotal, moeIntermediate, hidden, nExperts, groupSize,
                 cmd, upOut)
         }
-        // When GU+SwiGLU is fused, gateOut already holds silu(g)*u.
-        // Else SwiGLU into upOut (same shape as gate/up) — avoids a fresh
+        // SwiGLU into upOut (same shape as gate/up) — avoids a fresh
         // [mTotal, moeInter] alloc per layer. Kernel loads gate/up then
         // stores; up is only used as the multiplicand.
-        let inner: Tensor
-        if useGUSwiglu {
-            inner = gateOut
-        } else {
-            _ = Ops.swiglu(gate: gateOut, up: upOut, on: cmd, into: upOut)
-            inner = upOut
-        }
+        _ = Ops.swiglu(gate: gateOut, up: upOut, on: cmd, into: upOut)
+        let inner = upOut
         var sharedInner: Tensor?
         if let sgPad = sharedSgPad, let suPad = sharedSuPad {
             let sg = sharedMPad == t ? sgPad : sgPad.slicedRows(start: 0, count: t)
@@ -2277,14 +2102,6 @@ final class Hy3MoELayer: Hy3LayerProtocol {
 
         if skipDown {
             zeroTensor(downOut)
-        } else if useBm && moeChunkRows > 0 {
-            Ops.moeGatherDequantGemmInt2Chunked(
-                input: inner,
-                weight: switchDown.weight, scales: switchDown.scales,
-                biases: switchDown.biases, indices: sortedExperts,
-                mTotal: mTotal, nOut: hidden, kIn: moeIntermediate,
-                groupSize: groupSize, on: cmd, into: downOut,
-                nExperts: nExperts, chunkRows: moeChunkRows)
         } else if useBm {
             Ops.moeGatherDequantGemmInt2(
                 input: inner,
@@ -2478,7 +2295,7 @@ public final class Hy3Model: LanguageModel {
         // Grow-only prefill scratch slab (opt-in). Default OFF — e2e with
         // default ON added ~4 GB and regressed full prefill (~156 vs ~264)
         // under residual swap; MoE pf* workspaces already avoid per-layer
-        // MoE alloc. Enable with FFAI_HY3_SCRATCH=1 when free RAM is large.
+        // MoE alloc.
         let useScratch =
             ProcessInfo.processInfo.environment["FFAI_HY3_SCRATCH"] != nil
         if useScratch {
@@ -2516,8 +2333,6 @@ public final class Hy3Model: LanguageModel {
             on: workCmd)
         h = hPersist
 
-        // FFAI_HY3_MEGA_CB=1: one CB for all layers.
-        // FFAI_HY3_CB_STRIDE=N: commit every N layers (default 4).
         let megaCB =
             ProcessInfo.processInfo.environment["FFAI_HY3_MEGA_CB"] != nil
         let cbStride: Int = {
@@ -2586,18 +2401,6 @@ public final class Hy3Model: LanguageModel {
                     (CFAbsoluteTimeGetCurrent() - tStack0) * 1000, n, layers.count),
                 stderr)
         }
-        if ProcessInfo.processInfo.environment["FFAI_HY3_COUNT_EXPERTS"] != nil,
-           let moe = layers.compactMap({ $0 as? Hy3MoELayer }).first
-        {
-            let mTotal = n * 8  // topK=8
-            if let uniq = moe.uniqueExpertsInLastPlan(mTotal: mTotal) {
-                fputs(
-                    "[hy3] unique experts (last MoE layer plan): \(uniq)/192 "
-                        + "(T=\(n) mTotal=\(mTotal))\n",
-                    stderr)
-            }
-        }
-
         // Logits at last position only.
         let last = h.slicedRows(start: n - 1, count: 1).reshaped(to: [hidden])
         let normed = finalNorm(last, on: cmd)

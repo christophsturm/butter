@@ -7047,7 +7047,7 @@ public enum Ops {
         let tgWidth = min(n, 256)
         let grid = MTLSize(width: n, height: 1, depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
-        let pso = PSOCache.shared.pipelineState(for: "ffai_cast_bf16_to_f16")
+        let pso = PSOCache.shared.pipelineState(for: "ffai_cast_bf16_to_f16_f32")
         guard let enc = cmd.makeComputeCommandEncoder() else {
             return Tensor(
                 buffer: out.buffer, offset: out.offset, shape: out.shape, dtype: .f16)
@@ -7897,7 +7897,7 @@ public enum Ops {
         var nOutGUU = UInt32(nOutGU)
         var nOutDownU = UInt32(nOutDown)
         var capU = UInt32(nExpertsCap)
-        let pso = PSOCache.shared.pipelineState(for: "ffai_moe_compact_active_experts")
+        let pso = PSOCache.shared.pipelineState(for: "ffai_moe_compact_active_experts_f32")
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
         enc.setBuffer(sortedExperts.buffer, offset: sortedExperts.offset, index: 0)
@@ -7936,7 +7936,7 @@ public enum Ops {
         var packsU = UInt32(packsPerRow)
         var groupsU = UInt32(groupsPerRow)
         var nActiveU = UInt32(nActive)
-        let pso = PSOCache.shared.pipelineState(for: "ffai_moe_densify_int2_experts")
+        let pso = PSOCache.shared.pipelineState(for: "ffai_moe_densify_int2_experts_f16")
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
         enc.setBuffer(weightSrc.buffer, offset: weightSrc.offset, index: 0)
@@ -7968,7 +7968,7 @@ public enum Ops {
         precondition(denseIndices.dtype == .u32 && denseIndices.elementCount >= mTotal)
         var mTotalU = UInt32(mTotal)
         var nActiveU = UInt32(nActive)
-        let pso = PSOCache.shared.pipelineState(for: "ffai_moe_remap_experts_dense")
+        let pso = PSOCache.shared.pipelineState(for: "ffai_moe_remap_experts_dense_f32")
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
         enc.setBuffer(sortedExperts.buffer, offset: sortedExperts.offset, index: 0)
@@ -8051,50 +8051,6 @@ public enum Ops {
         if ownsEnc { enc.endEncoding() }
     }
 
-    /// Run gather QMM in **row chunks** of the expert-sorted sequence so
-    /// only a handful of unique experts are hot in L2 at a time (full
-    /// mTotal thrashs ~100 experts × 1.5MB ≈ 150MB ≫ L2).
-    /// `chunkRows` ≤ 0 → single dispatch (no chunking).
-    public static func moeGatherDequantGemmInt2Chunked(
-        input: Tensor,
-        weight: Tensor, scales: Tensor, biases: Tensor,
-        indices: Tensor,
-        mTotal: Int, nOut: Int, kIn: Int,
-        groupSize: Int,
-        on cmd: MTLCommandBuffer,
-        into out: Tensor,
-        nExperts: Int = 0,
-        chunkRows: Int
-    ) {
-        let chunk = chunkRows > 0 ? chunkRows : mTotal
-        var lo = 0
-        while lo < mTotal {
-            let hi = min(lo + chunk, mTotal)
-            let n = hi - lo
-            // Views into the sorted [mTotal, …] slabs for this row range.
-            let xChunk = Tensor(
-                buffer: input.buffer,
-                offset: input.offset + lo * kIn * input.dtype.byteSize,
-                shape: [n, kIn], dtype: input.dtype)
-            let idxChunk = Tensor(
-                buffer: indices.buffer,
-                offset: indices.offset + lo * 4,
-                shape: [n], dtype: .u32)
-            let outChunk = Tensor(
-                buffer: out.buffer,
-                offset: out.offset + lo * nOut * out.dtype.byteSize,
-                shape: [n, nOut], dtype: out.dtype)
-            moeGatherDequantGemmInt2(
-                input: xChunk,
-                weight: weight, scales: scales, biases: biases,
-                indices: idxChunk,
-                mTotal: n, nOut: nOut, kIn: kIn,
-                groupSize: groupSize, on: cmd, into: outChunk,
-                nExperts: 0)  // force BM16 path inside chunk
-            lo = hi
-        }
-    }
-
     /// Affine int2 MoE gather QMM — BM=16/BN=32 (default), BM=BN=64 (opt-in),
     /// or expert-outer grid. Prefer expert-sorted `indices` so contiguous
     /// runs share weight loads.
@@ -8103,7 +8059,7 @@ public enum Ops {
     /// live-compile from Resources/kernels).
     /// - `FFAI_HY3_MOE_BM64=1` (+ `nOut%64==0`, `kIn%32==0`): BM64 MPP
     ///   (4 SG, tpg=128) — better for fat experts / long runs.
-    /// - `FFAI_HY3_MOE_MMA=1`: simdgroup-MMA BM16 (tpg=64) in hy3_extra.
+    /// - `FFAI_HY3_MOE_MMA=1`: simdgroup-MMA BM16 (tpg=64), live-compiled.
     /// - `FFAI_HY3_EXPERT_GRID=1` + `nExperts`: expert-outer MPP.
     public static func moeGatherDequantGemmInt2(
         input: Tensor,
@@ -8149,18 +8105,6 @@ public enum Ops {
             }
             return mTotal >= 1536
         }()
-        // FFAI_HY3_MOE_BN64=1: dual-N expert-grid (f16, nOut multiple of 64).
-        let useEgBn64: Bool = {
-            guard useExpertGrid, nOut % 64 == 0, input.dtype == .f16 else { return false }
-            return ProcessInfo.processInfo.environment["FFAI_HY3_MOE_BN64"] != nil
-        }()
-        // Dual-M BM32 EG (f16): opt-in. Microbench ~1.03× vs BM16 EG; e2e
-        // full prefill regressed (~224 vs ~286) under concurrent gate‖up.
-        // Enable with FFAI_HY3_MOE_BM32=1.
-        let useEgBm32: Bool = {
-            guard useExpertGrid, !useEgBn64, input.dtype == .f16 else { return false }
-            return ProcessInfo.processInfo.environment["FFAI_HY3_MOE_BM32"] != nil
-        }()
         let useBm64 =
             !useExpertGrid
             && ProcessInfo.processInfo.environment["FFAI_HY3_MOE_BM64"] != nil
@@ -8173,8 +8117,8 @@ public enum Ops {
         let useMma =
             !useExpertGrid && !useBm64 && !useBm8
             && ProcessInfo.processInfo.environment["FFAI_HY3_MOE_MMA"] != nil
-        // BM64: 4 SG; EG BN64 / EG BM32 / BM16 MMA: 2 SG; BM16/BM8 MPP: 1 SG.
-        let tgWidth = useBm64 ? 128 : ((useMma || useEgBn64 || useEgBm32) ? 64 : 32)
+        // BM64: 4 SG; BM16 MMA: 2 SG; expert-grid/BM16/BM8 MPP: 1 SG.
+        let tgWidth = useBm64 ? 128 : (useMma ? 64 : 32)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         var mTotalU = UInt32(mTotal)
         var nOutU = UInt32(nOut)
@@ -8183,18 +8127,12 @@ public enum Ops {
         var nExpertsU = UInt32(nExperts)
         let psoName: String
         if useExpertGrid {
-            if useEgBn64 {
-                psoName = "ffai_moe_gather_qmm_mma_eg_int2_bn64_mpp_f16"
-            } else if useEgBm32 {
-                psoName = "ffai_moe_gather_qmm_mma_eg_int2_bm32_mpp_f16"
-            } else {
-                switch input.dtype {
-                case .f32: psoName = "ffai_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_f32"
-                case .f16: psoName = "ffai_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_f16"
-                case .bf16: psoName = "ffai_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_bf16"
-                default:
-                    fatalError("Ops.moeGatherDequantGemmInt2: unsupported dtype \(input.dtype)")
-                }
+            switch input.dtype {
+            case .f32: psoName = "ffai_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_f32"
+            case .f16: psoName = "ffai_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_f16"
+            case .bf16: psoName = "ffai_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_bf16"
+            default:
+                fatalError("Ops.moeGatherDequantGemmInt2: unsupported dtype \(input.dtype)")
             }
         } else if useBm64 {
             switch input.dtype {
@@ -8248,9 +8186,8 @@ public enum Ops {
         }
         let tgGrid: MTLSize
         if useExpertGrid {
-            // BN64 EG: one TG per 64 N-cols; BN32 EG: one TG per 32 N-cols.
-            let nTiles = useEgBn64 ? (nOut / 64) : (nOut / 32)
-            tgGrid = MTLSize(width: nTiles, height: nExperts, depth: 1)
+            // One TG per 32 N-cols.
+            tgGrid = MTLSize(width: nOut / 32, height: nExperts, depth: 1)
         } else if useBm64 {
             tgGrid = MTLSize(
                 width: nOut / 64,
@@ -8271,119 +8208,10 @@ public enum Ops {
         if ownsEnc { enc.endEncoding() }
     }
 
-    /// Fused gate+up expert-grid int2 gather with SwiGLU epilogue (f16).
-    /// Writes only `inner = silu(gate) * up`. Live-compile
-    /// `ffai_moe_gather_qmm_mma_eg_int2_gu_swiglu_mpp_f16`.
-    public static func moeGatherDequantGemmInt2GUSwiglu(
-        input: Tensor,
-        gateWeight: Tensor, gateScales: Tensor, gateBiases: Tensor,
-        upWeight: Tensor, upScales: Tensor, upBiases: Tensor,
-        indices: Tensor,
-        mTotal: Int, nOut: Int, kIn: Int,
-        groupSize: Int,
-        nExperts: Int,
-        on cmd: MTLCommandBuffer,
-        intoInner inner: Tensor,
-        encoder: MTLComputeCommandEncoder? = nil
-    ) {
-        precondition(gateWeight.dtype == .u32 && upWeight.dtype == .u32)
-        precondition(input.dtype == .f16)
-        precondition(indices.dtype == .u32 && indices.elementCount == mTotal)
-        precondition(nOut % 32 == 0 && kIn % 16 == 0)
-        precondition(kIn.isMultiple(of: groupSize))
-        precondition(nExperts > 0)
-        precondition(inner.elementCount == mTotal * nOut)
-        let pso = PSOCache.shared.pipelineState(
-            for: "ffai_moe_gather_qmm_mma_eg_int2_gu_swiglu_mpp_f16")
-        let ownsEnc = encoder == nil
-        guard let enc = encoder ?? cmd.makeComputeCommandEncoder() else { return }
-        enc.setComputePipelineState(pso)
-        var mTotalU = UInt32(mTotal)
-        var nOutU = UInt32(nOut)
-        var kInU = UInt32(kIn)
-        var groupSizeU = UInt32(groupSize)
-        var nExpertsU = UInt32(nExperts)
-        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
-        enc.setBuffer(gateWeight.buffer, offset: gateWeight.offset, index: 1)
-        enc.setBuffer(gateScales.buffer, offset: gateScales.offset, index: 2)
-        enc.setBuffer(gateBiases.buffer, offset: gateBiases.offset, index: 3)
-        enc.setBuffer(upWeight.buffer, offset: upWeight.offset, index: 4)
-        enc.setBuffer(upScales.buffer, offset: upScales.offset, index: 5)
-        enc.setBuffer(upBiases.buffer, offset: upBiases.offset, index: 6)
-        enc.setBuffer(indices.buffer, offset: indices.offset, index: 7)
-        enc.setBuffer(inner.buffer, offset: inner.offset, index: 8)
-        enc.setBytes(&mTotalU, length: 4, index: 9)
-        enc.setBytes(&nOutU, length: 4, index: 10)
-        enc.setBytes(&kInU, length: 4, index: 11)
-        enc.setBytes(&groupSizeU, length: 4, index: 12)
-        enc.setBytes(&nExpertsU, length: 4, index: 13)
-        // 2 simdgroups: SG0 gate, SG1 up.
-        let tg = MTLSize(width: 64, height: 1, depth: 1)
-        let grid = MTLSize(width: nOut / 32, height: nExperts, depth: 1)
-        enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
-        if ownsEnc { enc.endEncoding() }
-    }
-
-    /// Fused gate+up expert-grid int2 gather QMM (f16). Loads X once per K
-    /// step and accumulates both projections. Requires `nExperts > 0`,
-    /// `nOut % 32 == 0`, f16. Live-compile
-    /// `ffai_moe_gather_qmm_mma_eg_int2_fused_gu_mpp_f16`.
-    public static func moeGatherDequantGemmInt2FusedGU(
-        input: Tensor,
-        gateWeight: Tensor, gateScales: Tensor, gateBiases: Tensor,
-        upWeight: Tensor, upScales: Tensor, upBiases: Tensor,
-        indices: Tensor,
-        mTotal: Int, nOut: Int, kIn: Int,
-        groupSize: Int,
-        nExperts: Int,
-        on cmd: MTLCommandBuffer,
-        intoGate gateOut: Tensor,
-        intoUp upOut: Tensor,
-        encoder: MTLComputeCommandEncoder? = nil
-    ) {
-        precondition(gateWeight.dtype == .u32 && upWeight.dtype == .u32)
-        precondition(input.dtype == .f16, "fused GU: f16 only (got \(input.dtype))")
-        precondition(indices.dtype == .u32 && indices.elementCount == mTotal)
-        precondition(nOut % 32 == 0 && kIn % 16 == 0)
-        precondition(kIn.isMultiple(of: groupSize))
-        precondition(nExperts > 0)
-        precondition(gateOut.elementCount == mTotal * nOut)
-        precondition(upOut.elementCount == mTotal * nOut)
-        let pso = PSOCache.shared.pipelineState(
-            for: "ffai_moe_gather_qmm_mma_eg_int2_fused_gu_mpp_f16")
-        let ownsEnc = encoder == nil
-        guard let enc = encoder ?? cmd.makeComputeCommandEncoder() else { return }
-        enc.setComputePipelineState(pso)
-        var mTotalU = UInt32(mTotal)
-        var nOutU = UInt32(nOut)
-        var kInU = UInt32(kIn)
-        var groupSizeU = UInt32(groupSize)
-        var nExpertsU = UInt32(nExperts)
-        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
-        enc.setBuffer(gateWeight.buffer, offset: gateWeight.offset, index: 1)
-        enc.setBuffer(gateScales.buffer, offset: gateScales.offset, index: 2)
-        enc.setBuffer(gateBiases.buffer, offset: gateBiases.offset, index: 3)
-        enc.setBuffer(upWeight.buffer, offset: upWeight.offset, index: 4)
-        enc.setBuffer(upScales.buffer, offset: upScales.offset, index: 5)
-        enc.setBuffer(upBiases.buffer, offset: upBiases.offset, index: 6)
-        enc.setBuffer(indices.buffer, offset: indices.offset, index: 7)
-        enc.setBuffer(gateOut.buffer, offset: gateOut.offset, index: 8)
-        enc.setBuffer(upOut.buffer, offset: upOut.offset, index: 9)
-        enc.setBytes(&mTotalU, length: 4, index: 10)
-        enc.setBytes(&nOutU, length: 4, index: 11)
-        enc.setBytes(&kInU, length: 4, index: 12)
-        enc.setBytes(&groupSizeU, length: 4, index: 13)
-        enc.setBytes(&nExpertsU, length: 4, index: 14)
-        let tg = MTLSize(width: 32, height: 1, depth: 1)
-        let grid = MTLSize(width: nOut / 32, height: nExperts, depth: 1)
-        enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
-        if ownsEnc { enc.endEncoding() }
-    }
-
     /// Gather QMM for **int2 affine** (MLX oQ2, scales+biases) — Hy3
     /// reduction-style fallback. `expertIds` is `[tRows]` u32 expert index per
-    /// gathered row (token-order or expert-sorted). Kernel lives in
-    /// `hy3_extra.metallib` / live-compile from Resources/kernels.
+    /// gathered row (token-order or expert-sorted). Kernel is
+    /// live-compiled from `Resources/kernels/`.
     public static func moeGatherDequantGemmInt2M1(
         _ x: Tensor, _ weight: Tensor, _ scales: Tensor, _ biases: Tensor,
         _ expertIds: Tensor,
