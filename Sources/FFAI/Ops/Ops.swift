@@ -6693,26 +6693,30 @@ public enum Ops {
     /// instead of computing them internally from raw `a_raw`/`b_raw` +
     /// `a_log`/`dt_bias`.
     ///
-    /// Math (identical to `gatedDeltaPrepChunk`'s internal per-token
-    /// g/beta — un-clamped softplus, matching `ffai_gdn_wy_plan`'s module
-    /// doc convention exactly):
-    ///   - `dt   = softplus(a_raw + dt_bias)`        (un-clamped: `Ops.softplus`
-    ///     computes the numerically-stable form, which is the exact same
-    ///     real value as `log(1+exp(x))` away from overflow — a_raw/dt_bias
-    ///     are small learned/activation values, never in the overflow
-    ///     regime, so this is not a precision compromise.)
+    /// Dispatches the fused `ffai_gdn_gate_beta` kernel (one dispatch),
+    /// replacing what used to be a ~6-dispatch elementwise chain (sigmoid,
+    /// two broadcasts, add, softplus, mul, exp — see git history for the
+    /// old implementation).
+    ///
+    /// Math (identical to `gatedDeltaPrepChunk`'s internal per-token g/beta
+    /// — same un-clamped softplus `ffai_gated_delta_prep_chunk` bakes in,
+    /// `log(exp(x)+1)`; the fused kernel now matches that production
+    /// oracle's formula exactly, superseding the old chain's use of the
+    /// numerically-stable `ffai_softplus` kernel — the same real value
+    /// away from overflow, which the learned `a_raw`/`dt_bias` activations
+    /// never approach):
+    ///   - `dt   = log(exp(a_raw + dt_bias) + 1)`
     ///   - `g    = exp(-exp(a_log) * dt) = exp(negExpALog * dt)`
     ///   - `beta = sigmoid(b_raw)`
     ///
     /// `negExpALog = -exp(a_log)` is precomputed once on the host at model
     /// load (`a_log` is a static per-head weight, not runtime data — see
-    /// `Qwen35GDNMixer.negExpALogTF32`), sidestepping the fact that the
-    /// elementwise kernel set has no standalone negate/scalar-affine op.
+    /// `Qwen35GDNMixer.negExpALogTF32`).
     ///
     /// `dt_bias`/`negExpALog` are `[Hv]`; `a_raw`/`b_raw` (and `g`/`beta`)
-    /// are `[rows, Hv]` (`rows = B·T`, B=1 here) — broadcasts the `[Hv]`
-    /// constants against the `[rows, Hv]` runtime chunk via `stridedCopyNd`
-    /// (a stride-0 outer axis).
+    /// are `[rows, Hv]` (`rows = B·T`, B=1 here) — the kernel broadcasts
+    /// the `[Hv]` constants against the `[rows, Hv]` runtime chunk via
+    /// `idx % hv` internally (no host-side broadcast dispatch needed).
     public static func gdnGateBeta(
         aRaw: Tensor, bRaw: Tensor,
         dtBias: Tensor, negExpALog: Tensor,
@@ -6732,48 +6736,19 @@ public enum Ops {
                 && negExpALog.dtype == .f32 && g.dtype == .f32 && beta.dtype == .f32,
             "Ops.gdnGateBeta: fp32 only (matches gatedDeltaPrepChunk's fp32 g/beta convention)")
 
-        // Flat [rows·hv] views — callers may pass [B,T,Hv]-shaped tensors
-        // (`add`/`mul` require exact shape equality, and the scratch
-        // intermediates below are 1-D).
-        let aRawFlat = Tensor(
-            buffer: aRaw.buffer, offset: aRaw.offset, shape: [rows * hv], dtype: .f32)
-        let bRawFlat = Tensor(
-            buffer: bRaw.buffer, offset: bRaw.offset, shape: [rows * hv], dtype: .f32)
-        let gFlat = Tensor(buffer: g.buffer, offset: g.offset, shape: [rows * hv], dtype: .f32)
-        let betaFlat = Tensor(
-            buffer: beta.buffer, offset: beta.offset, shape: [rows * hv], dtype: .f32)
-
-        // beta = sigmoid(b_raw) — same shape, no broadcast needed.
-        _ = sigmoid(bRawFlat, on: cmd, into: betaFlat)
-
-        // Broadcast dt_bias / negExpALog [hv] -> [rows, hv] (stride-0 outer
-        // axis), tagged grow-once scratch (reused across layers/chunks of
-        // the same [rows,hv] shape).
-        let dtBiasFull = wyScratchTensor(
-            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_dtbias_full_\(rows)x\(hv)", device: device)
-        let negExpALogFull = wyScratchTensor(
-            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_negexpalog_full_\(rows)x\(hv)", device: device)
-        stridedCopyNd(
-            srcBuffer: dtBias.buffer, srcByteOffset: dtBias.offset, dtype: .f32,
-            shape: [rows, hv], strides: [0, 1],
-            outBuffer: dtBiasFull.buffer, outByteOffset: dtBiasFull.offset,
-            on: cmd, device: device)
-        stridedCopyNd(
-            srcBuffer: negExpALog.buffer, srcByteOffset: negExpALog.offset, dtype: .f32,
-            shape: [rows, hv], strides: [0, 1],
-            outBuffer: negExpALogFull.buffer, outByteOffset: negExpALogFull.offset,
-            on: cmd, device: device)
-
-        let sum = wyScratchTensor(
-            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_sum_\(rows)x\(hv)", device: device)
-        _ = add(aRawFlat, dtBiasFull, on: cmd, into: sum)
-        let dt = wyScratchTensor(
-            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_dt_\(rows)x\(hv)", device: device)
-        _ = softplus(sum, on: cmd, into: dt)
-        let scaled = wyScratchTensor(
-            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_scaled_\(rows)x\(hv)", device: device)
-        _ = mul(negExpALogFull, dt, on: cmd, into: scaled)
-        _ = exp(scaled, on: cmd, into: gFlat)
+        let n = rows * hv
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        MetalTileKernels.ffai_gdn_gate_beta_f32(
+            a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+            b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+            dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+            neg_exp_a_log: negExpALog.buffer, neg_exp_a_logOffset: negExpALog.offset,
+            g: g.buffer, gOffset: g.offset,
+            beta: beta.buffer, betaOffset: beta.offset,
+            hv: UInt32(hv),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
     }
 
     /// Chunked-WY GDN prefill — two-kernel (`ffai_gdn_wy_plan` +
