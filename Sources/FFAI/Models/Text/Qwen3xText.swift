@@ -1208,8 +1208,13 @@ public final class Qwen35GDNMixer: Module {
     //   kNormWeightF32 : [Hk·Dk] fp32, filled with `invKeyScale`.
     //   aLogTF32       : [Hv]    fp32.
     //   dtBiasTF32     : [Hv]    fp32.
+    //   negExpALogTF32 : [Hv]    fp32, `-exp(a_log)` — precomputed once
+    //                    here (host-side, `a_log` is a static per-head
+    //                    weight) for the chunked-WY prefill path's
+    //                    `Ops.gdnGateBeta`, which needs `g =
+    //                    exp(-exp(a_log)·dt)` but has no GPU negate op.
     let qNormWeightF32, kNormWeightF32: Tensor
-    let aLogTF32, dtBiasTF32: Tensor
+    let aLogTF32, dtBiasTF32, negExpALogTF32: Tensor
 
     /// fp32 epsilon as a 1-element buffer for `Ops.gatedMixerNorm`.
     /// Built once in init so the GPU-side phase-2 path doesn't pay an
@@ -1307,6 +1312,7 @@ public final class Qwen35GDNMixer: Module {
             [Float](repeating: kScale, count: hkDk), device: device)
         self.aLogTF32 = makeF32Tensor35(aLog, device: device)
         self.dtBiasTF32 = makeF32Tensor35(dtBias, device: device)
+        self.negExpALogTF32 = makeF32Tensor35(aLog.map { -Foundation.exp($0) }, device: device)
         self.epsBufFused = makeF32Tensor35([eps], device: device)
         // Fused-prep is DEFAULT ON for Qwen3.6-A3B. The legacy host-loop
         // path lives behind `FFAI_GDN_NO_FUSED_PREP=1` for precision
@@ -1892,17 +1898,44 @@ public final class Qwen35GDNMixer: Module {
             hv: numValueHeads, hk: numKeyHeads,
             on: cmd)
 
-        Ops.gatedDeltaPrepChunk(
-            convOut: convOutAllF32,
-            aLog: aLogTF32, dtBias: dtBiasTF32,
-            aRaw: aRawF32All, bRaw: bRawF32All,
-            qNormed: qNormedAll, kNormed: kNormedAll,
-            stateIn: cache.gdn.current, stateOut: cache.gdn.next,
-            y: yF32All,
-            tLen: tLenScalar,
-            batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
-            hv: numValueHeads, hk: numKeyHeads,
-            on: cmd)
+        // `FFAI_GDN_WY=1` opts into the chunked-WY prefill pipeline
+        // (`ffai_gdn_wy_plan` + `ffai_gdn_wy_scan`, see `Ops.swift`) —
+        // default OFF, `gatedDeltaPrepChunk` above stays the production
+        // path untouched. The WY kernels' v1 require `t` to be an exact
+        // multiple of their fixed chunk size `c=64`; `prefillStepSize`
+        // (1024 by default) keeps every chunk but the last divisible by
+        // 64, so the ragged tail — and any caller passing a non-64-multiple
+        // `t` — falls back to `gatedDeltaPrepChunk` here. Padding the tail
+        // up to a multiple of 64 upstream (so WY can run unconditionally)
+        // is a documented follow-up, not implemented yet.
+        let useWY =
+            ProcessInfo.processInfo.environment["FFAI_GDN_WY"] != nil && t % 64 == 0
+            && valueHeadDim % 32 == 0 && keyHeadDim % 16 == 0 && valueHeadDim % 16 == 0
+        if useWY {
+            Ops.gatedDeltaWYPrefill(
+                convOut: convOutAllF32,
+                dtBias: dtBiasTF32, negExpALog: negExpALogTF32,
+                aRaw: aRawF32All, bRaw: bRawF32All,
+                qNormed: qNormedAll, kNormed: kNormedAll,
+                stateIn: cache.gdn.current, stateOut: cache.gdn.next,
+                y: yF32All,
+                tLen: tLenScalar, t: t,
+                dk: keyHeadDim, dv: valueHeadDim,
+                hv: numValueHeads, hk: numKeyHeads,
+                on: cmd, device: device)
+        } else {
+            Ops.gatedDeltaPrepChunk(
+                convOut: convOutAllF32,
+                aLog: aLogTF32, dtBias: dtBiasTF32,
+                aRaw: aRawF32All, bRaw: bRawF32All,
+                qNormed: qNormedAll, kNormed: kNormedAll,
+                stateIn: cache.gdn.current, stateOut: cache.gdn.next,
+                y: yF32All,
+                tLen: tLenScalar,
+                batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
+                hv: numValueHeads, hk: numKeyHeads,
+                on: cmd)
+        }
         cache.gdn.swap()
         for _ in 0 ..< t { cache.advance() }
 
