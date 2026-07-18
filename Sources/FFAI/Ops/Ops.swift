@@ -5539,6 +5539,17 @@ public enum Ops {
     // internally — BM=16 with boundary masking). Grid =
     //   [N / 32, ceil(mTotal / 16), 1]
     // Threadgroup = [64, 1, 1] (2 simdgroups).
+    /// Whether the MPP auto-default may fire: Apple GPU Family 9+ (M3+)
+    /// and macOS 26+ (Metal 4 — the MPP header live-compile requires it).
+    /// Cached once; explicit FFAI_MOE_BGEMM_MPP=1 bypasses this.
+    private static let mppAutoCapable: Bool = {
+        guard
+            ProcessInfo.processInfo.isOperatingSystemAtLeast(
+                OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0))
+        else { return false }
+        return Device.shared.mtlDevice.supportsFamily(.apple9)
+    }()
+
     public static func moeGatherDequantGemmInt4(
         input: Tensor,
         weight: Tensor, scales: Tensor, biases: Tensor,
@@ -5587,9 +5598,23 @@ public enum Ops {
         // generated Swift wrapper calls `dispatchThreads` (grid counted
         // in TOTAL threads) so total threads = grid × tg per axis.
         //
-        // FFAI_MOE_BGEMM_MPP=1 opts into the NAX cooperative-tensor
-        // path — macOS 26.2+ on gen-≥17 GPU silicon only (M5 Max yes).
-        let useMpp = ProcessInfo.processInfo.environment["FFAI_MOE_BGEMM_MPP"] != nil
+        // NAX cooperative-tensor (MPP): macOS 26.2+ / gen-≥17 (M5 Max).
+        // Force on: FFAI_MOE_BGEMM_MPP=1. Force off: FFAI_MOE_BGEMM_NO_MPP=1.
+        // Default: on when mTotal ≥ 1024 (short-T e2e prefers simdgroup bm16)
+        // AND the device/OS can actually run MPP — the auto path must not
+        // route M1–M4 or pre-Metal-4 machines into a live-compile that
+        // cannot find the MPP header (same .apple9 gate the MPP test
+        // suites use). Force-on skips the gate: explicit opt-in owns the
+        // consequences on unsupported hardware.
+        let env = ProcessInfo.processInfo.environment
+        let useMpp: Bool
+        if env["FFAI_MOE_BGEMM_NO_MPP"] != nil {
+            useMpp = false
+        } else if env["FFAI_MOE_BGEMM_MPP"] != nil {
+            useMpp = true
+        } else {
+            useMpp = mTotal >= 1024 && Self.mppAutoCapable
+        }
         let tgWidth = useMpp ? 32 : 64
         let grid = MTLSize(
             width: (nOut / 32) * tgWidth,
@@ -5625,9 +5650,21 @@ public enum Ops {
                     m_total: mTotalU, n_out: nOutU, k_in: kInU,
                     group_size: groupSizeU,
                     gridSize: grid, threadgroupSize: tg, on: cmd)
+            case .bf16:
+                // Qwen3.x activations are often bf16; kernel is already emitted.
+                MetalTileKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_bf16(
+                    x: input.buffer, xOffset: input.offset,
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    indices: indices.buffer, indicesOffset: indices.offset,
+                    out: out.buffer, outOffset: out.offset,
+                    m_total: mTotalU, n_out: nOutU, k_in: kInU,
+                    group_size: groupSizeU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
             default:
                 fatalError(
-                    "Ops.moeGatherDequantGemmInt4: MPP variant only emits f32/f16 (got \(input.dtype))"
+                    "Ops.moeGatherDequantGemmInt4: MPP unsupported dtype \(input.dtype)"
                 )
             }
             return
