@@ -504,6 +504,10 @@ public enum Ops {
         return result
     }
 
+    // Note: `Ops.exp` (wrapping `ffai_exp_*`) already exists in
+    // `OpsMath.swift` — `gdnGateBeta` below reuses it directly rather than
+    // redeclaring it here.
+
     /// Embedding lookup. `table` is [vocab, dim], `tokenIds` is [n_tokens]
     /// (u32), output is [n_tokens, dim].
     public static func gather(
@@ -6596,6 +6600,304 @@ public enum Ops {
         default:
             fatalError("Ops.gatedDeltaPrepChunk: unsupported dtype \(convOut.dtype)")
         }
+    }
+
+    // ─── Chunked-WY GDN prefill (`ffai_gdn_wy_plan` + `ffai_gdn_wy_scan`) ──
+    //
+    // Opt-in alternative to `gatedDeltaPrepChunk` — see
+    // `Qwen35GDNMixer.forwardManyChunked` for the `FFAI_GDN_WY=1` gate and
+    // the `t % c == 0` fallback to `gatedDeltaPrepChunk` for ragged chunks.
+
+    /// Grow-once tagged scratch tensor for the chunked-WY GDN prefill path.
+    /// Same discipline as `Hy3Text.swift`'s (file-private) `hy3ScratchTensor`
+    /// — reuses `Device.intermediateScratch`'s tagged, grow-to-largest-size
+    /// buffer instead of a fresh `Tensor.empty` per layer/chunk, keyed by a
+    /// tag that encodes the shape so distinct shapes never alias.
+    private static func wyScratchTensor(
+        shape: [Int], dtype: DType, tag: String, device: Device
+    ) -> Tensor {
+        let n = shape.reduce(1, *)
+        let bytes = max(n * dtype.byteSize, 64)
+        let buf = device.intermediateScratch(tag: tag, minBytes: bytes)
+        return Tensor(buffer: buf, offset: 0, shape: shape, dtype: dtype)
+    }
+
+    /// General N-D strided copy/broadcast, wrapping `ffai_strided_copy_nd`
+    /// (module doc: handles padded copies, transposes, broadcasts via a
+    /// zero stride, and arbitrary slices). `shape`/`strides` are **element**
+    /// counts, not bytes; `rank = shape.count`. `srcBuffer`/`srcByteOffset`
+    /// are taken raw (rather than a `Tensor`) so callers can point at an
+    /// arbitrary sub-slab of a larger buffer (e.g. the `v` slice inside
+    /// `gatedDeltaWYPrefill`'s packed `conv_out`).
+    ///
+    /// `shape`/`strides` are packed into two fresh tiny `MTLBuffer`s per
+    /// call (mirrors `forwardManyChunked`'s `tLenBuf` — a fresh buffer per
+    /// dispatch, not a tagged scratch slab, since these are 2-rank/8-byte
+    /// constants and a shared tagged buffer would race across pipelined
+    /// command buffers).
+    private static func stridedCopyNd(
+        srcBuffer: MTLBuffer, srcByteOffset: Int, dtype: DType,
+        shape: [Int], strides: [Int],
+        outBuffer: MTLBuffer, outByteOffset: Int,
+        on cmd: MTLCommandBuffer, device: Device
+    ) {
+        precondition(
+            shape.count == strides.count,
+            "Ops.stridedCopyNd: shape/strides rank mismatch")
+        let rank = shape.count
+        let nOut = shape.reduce(1, *)
+        var shapeVals = shape.map { UInt32($0) }
+        var strideVals = strides.map { UInt32($0) }
+        let shapeBuf = device.makeBuffer(length: rank * 4)
+        let stridesBuf = device.makeBuffer(length: rank * 4)
+        _ = shapeVals.withUnsafeMutableBytes { raw in
+            memcpy(shapeBuf.contents(), raw.baseAddress!, rank * 4)
+        }
+        _ = strideVals.withUnsafeMutableBytes { raw in
+            memcpy(stridesBuf.contents(), raw.baseAddress!, rank * 4)
+        }
+        let (grid, tg) = elementwiseGrid(nOut)
+        switch dtype {
+        case .f32:
+            MetalTileKernels.ffai_strided_copy_nd_f32(
+                src: srcBuffer, srcOffset: srcByteOffset,
+                shape: shapeBuf, shapeOffset: 0,
+                strides: stridesBuf, stridesOffset: 0,
+                out: outBuffer, outOffset: outByteOffset,
+                rank: UInt32(rank),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_strided_copy_nd_f16(
+                src: srcBuffer, srcOffset: srcByteOffset,
+                shape: shapeBuf, shapeOffset: 0,
+                strides: stridesBuf, stridesOffset: 0,
+                out: outBuffer, outOffset: outByteOffset,
+                rank: UInt32(rank),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_strided_copy_nd_bf16(
+                src: srcBuffer, srcOffset: srcByteOffset,
+                shape: shapeBuf, shapeOffset: 0,
+                strides: stridesBuf, stridesOffset: 0,
+                out: outBuffer, outOffset: outByteOffset,
+                rank: UInt32(rank),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.stridedCopyNd: unsupported dtype \(dtype)")
+        }
+    }
+
+    /// Per-token GDN gate/beta for the chunked-WY prefill pipeline
+    /// (`ffai_gdn_wy_plan`/`ffai_gdn_wy_scan`), which — unlike
+    /// `gatedDeltaPrepChunk` — consume precomputed `g`/`beta` tensors
+    /// instead of computing them internally from raw `a_raw`/`b_raw` +
+    /// `a_log`/`dt_bias`.
+    ///
+    /// Math (identical to `gatedDeltaPrepChunk`'s internal per-token
+    /// g/beta — un-clamped softplus, matching `ffai_gdn_wy_plan`'s module
+    /// doc convention exactly):
+    ///   - `dt   = softplus(a_raw + dt_bias)`        (un-clamped: `Ops.softplus`
+    ///     computes the numerically-stable form, which is the exact same
+    ///     real value as `log(1+exp(x))` away from overflow — a_raw/dt_bias
+    ///     are small learned/activation values, never in the overflow
+    ///     regime, so this is not a precision compromise.)
+    ///   - `g    = exp(-exp(a_log) * dt) = exp(negExpALog * dt)`
+    ///   - `beta = sigmoid(b_raw)`
+    ///
+    /// `negExpALog = -exp(a_log)` is precomputed once on the host at model
+    /// load (`a_log` is a static per-head weight, not runtime data — see
+    /// `Qwen35GDNMixer.negExpALogTF32`), sidestepping the fact that the
+    /// elementwise kernel set has no standalone negate/scalar-affine op.
+    ///
+    /// `dt_bias`/`negExpALog` are `[Hv]`; `a_raw`/`b_raw` (and `g`/`beta`)
+    /// are `[rows, Hv]` (`rows = B·T`, B=1 here) — broadcasts the `[Hv]`
+    /// constants against the `[rows, Hv]` runtime chunk via `stridedCopyNd`
+    /// (a stride-0 outer axis).
+    public static func gdnGateBeta(
+        aRaw: Tensor, bRaw: Tensor,
+        dtBias: Tensor, negExpALog: Tensor,
+        g: Tensor, beta: Tensor,
+        rows: Int, hv: Int,
+        on cmd: MTLCommandBuffer, device: Device
+    ) {
+        precondition(
+            aRaw.elementCount == rows * hv && bRaw.elementCount == rows * hv
+                && g.elementCount == rows * hv && beta.elementCount == rows * hv,
+            "Ops.gdnGateBeta: aRaw/bRaw/g/beta must be [rows·hv]")
+        precondition(
+            dtBias.elementCount == hv && negExpALog.elementCount == hv,
+            "Ops.gdnGateBeta: dtBias/negExpALog must be [hv]")
+        precondition(
+            aRaw.dtype == .f32 && bRaw.dtype == .f32 && dtBias.dtype == .f32
+                && negExpALog.dtype == .f32 && g.dtype == .f32 && beta.dtype == .f32,
+            "Ops.gdnGateBeta: fp32 only (matches gatedDeltaPrepChunk's fp32 g/beta convention)")
+
+        // Flat [rows·hv] views — callers may pass [B,T,Hv]-shaped tensors
+        // (`add`/`mul` require exact shape equality, and the scratch
+        // intermediates below are 1-D).
+        let aRawFlat = Tensor(
+            buffer: aRaw.buffer, offset: aRaw.offset, shape: [rows * hv], dtype: .f32)
+        let bRawFlat = Tensor(
+            buffer: bRaw.buffer, offset: bRaw.offset, shape: [rows * hv], dtype: .f32)
+        let gFlat = Tensor(buffer: g.buffer, offset: g.offset, shape: [rows * hv], dtype: .f32)
+        let betaFlat = Tensor(
+            buffer: beta.buffer, offset: beta.offset, shape: [rows * hv], dtype: .f32)
+
+        // beta = sigmoid(b_raw) — same shape, no broadcast needed.
+        _ = sigmoid(bRawFlat, on: cmd, into: betaFlat)
+
+        // Broadcast dt_bias / negExpALog [hv] -> [rows, hv] (stride-0 outer
+        // axis), tagged grow-once scratch (reused across layers/chunks of
+        // the same [rows,hv] shape).
+        let dtBiasFull = wyScratchTensor(
+            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_dtbias_full_\(rows)x\(hv)", device: device)
+        let negExpALogFull = wyScratchTensor(
+            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_negexpalog_full_\(rows)x\(hv)", device: device)
+        stridedCopyNd(
+            srcBuffer: dtBias.buffer, srcByteOffset: dtBias.offset, dtype: .f32,
+            shape: [rows, hv], strides: [0, 1],
+            outBuffer: dtBiasFull.buffer, outByteOffset: dtBiasFull.offset,
+            on: cmd, device: device)
+        stridedCopyNd(
+            srcBuffer: negExpALog.buffer, srcByteOffset: negExpALog.offset, dtype: .f32,
+            shape: [rows, hv], strides: [0, 1],
+            outBuffer: negExpALogFull.buffer, outByteOffset: negExpALogFull.offset,
+            on: cmd, device: device)
+
+        let sum = wyScratchTensor(
+            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_sum_\(rows)x\(hv)", device: device)
+        _ = add(aRawFlat, dtBiasFull, on: cmd, into: sum)
+        let dt = wyScratchTensor(
+            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_dt_\(rows)x\(hv)", device: device)
+        _ = softplus(sum, on: cmd, into: dt)
+        let scaled = wyScratchTensor(
+            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_scaled_\(rows)x\(hv)", device: device)
+        _ = mul(negExpALogFull, dt, on: cmd, into: scaled)
+        _ = exp(scaled, on: cmd, into: gFlat)
+    }
+
+    /// Chunked-WY GDN prefill — two-kernel (`ffai_gdn_wy_plan` +
+    /// `ffai_gdn_wy_scan`) alternative to `gatedDeltaPrepChunk`. Opt-in via
+    /// `FFAI_GDN_WY=1`, default OFF (see `Qwen35GDNMixer.forwardManyChunked`,
+    /// which also owns the `t % c == 0` fallback — this function
+    /// preconditions on it rather than silently falling back, so callers
+    /// must check before dispatching here; `_plan`/`_scan`'s `v1` require a
+    /// full multiple of `c=64`, a ragged tail is a documented follow-up in
+    /// both kernels' module docs).
+    ///
+    /// Shape contract (B=1, matching the mixer's batching):
+    ///   - `convOut`         : `[T, 2·Hk·Dk + Hv·Dv]` fp32 — the `v` slab is
+    ///     sliced out of its packed row here (`ffai_gdn_wy_plan` wants a
+    ///     dense `[T,Hv,Dv]`, unlike `gatedDeltaPrepChunk`, which reads the
+    ///     packed layout directly).
+    ///   - `qNormed`/`kNormed` : `[T, Hk, Dk]` fp32, from
+    ///     `gatedDeltaQKNormPrepass` (reused as-is — already the dense
+    ///     layout `ffai_gdn_wy_plan` wants).
+    ///   - `aRaw`/`bRaw`     : `[T, Hv]` fp32, from `castToF32Two`.
+    ///   - `stateIn`/`stateOut` : `[Hv, Dv, Dk]` fp32 recurrent state.
+    ///   - `y`               : `[T, Hv, Dv]` fp32 (matches `gatedDeltaPrepChunk`'s `y`).
+    public static func gatedDeltaWYPrefill(
+        convOut: Tensor,
+        dtBias: Tensor, negExpALog: Tensor,
+        aRaw: Tensor, bRaw: Tensor,
+        qNormed: Tensor, kNormed: Tensor,
+        stateIn: Tensor, stateOut: Tensor, y: Tensor,
+        tLen: Tensor, t: Int,
+        dk: Int, dv: Int, hv: Int, hk: Int,
+        on cmd: MTLCommandBuffer, device: Device
+    ) {
+        let c = 64
+        precondition(
+            t % c == 0,
+            "Ops.gatedDeltaWYPrefill: t (\(t)) must be a multiple of c=\(c) — "
+                + "caller must fall back to gatedDeltaPrepChunk for ragged chunk tails")
+        precondition(
+            dk % 16 == 0 && dv % 16 == 0,
+            "Ops.gatedDeltaWYPrefill: dk/dv (\(dk)/\(dv)) must be multiples of 16 (ffai_gdn_wy_plan MMA tiling)")
+        precondition(
+            dv % 32 == 0,
+            "Ops.gatedDeltaWYPrefill: dv (\(dv)) must be a multiple of 32 (ffai_gdn_wy_scan v1 requirement)")
+        precondition(
+            hv % hk == 0,
+            "Ops.gatedDeltaWYPrefill: hv (\(hv)) must be a multiple of hk (\(hk)) (GQA)")
+        precondition(
+            convOut.dtype == .f32 && qNormed.dtype == .f32 && kNormed.dtype == .f32
+                && stateIn.dtype == .f32 && stateOut.dtype == .f32 && y.dtype == .f32,
+            "Ops.gatedDeltaWYPrefill: fp32 only (matches the mixer's fused-prep fp32 convention)")
+
+        let nc = t / c
+        let n = hv  // B=1
+        let convDim = 2 * hk * dk + hv * dv
+        let dtBytes = DType.f32.byteSize
+
+        // ── v: dense [T, Hv, Dv] sliced out of conv_out's packed row ────
+        let vAll = wyScratchTensor(
+            shape: [t * hv * dv], dtype: .f32, tag: "gdn_wy_v_\(t)x\(hv)x\(dv)", device: device)
+        stridedCopyNd(
+            srcBuffer: convOut.buffer,
+            srcByteOffset: convOut.offset + (2 * hk * dk) * dtBytes,
+            dtype: .f32,
+            shape: [t, hv * dv], strides: [convDim, 1],
+            outBuffer: vAll.buffer, outByteOffset: vAll.offset,
+            on: cmd, device: device)
+
+        // ── g/beta from a_raw/b_raw + dt_bias/negExpALog ────────────────
+        let gAll = wyScratchTensor(
+            shape: [t * hv], dtype: .f32, tag: "gdn_wy_g_\(t)x\(hv)", device: device)
+        let betaAll = wyScratchTensor(
+            shape: [t * hv], dtype: .f32, tag: "gdn_wy_beta_\(t)x\(hv)", device: device)
+        gdnGateBeta(
+            aRaw: aRaw, bRaw: bRaw, dtBias: dtBias, negExpALog: negExpALog,
+            g: gAll, beta: betaAll, rows: t, hv: hv, on: cmd, device: device)
+
+        // ── K1 intermediates (grow-once tagged scratch, tag by shape) ───
+        let u = wyScratchTensor(
+            shape: [n * nc * c * dv], dtype: .f32, tag: "gdn_wy_u_\(n)x\(nc)x\(c)x\(dv)", device: device)
+        let yLocal = wyScratchTensor(
+            shape: [n * nc * c * dv], dtype: .f32, tag: "gdn_wy_ylocal_\(n)x\(nc)x\(c)x\(dv)",
+            device: device)
+        let qEff = wyScratchTensor(
+            shape: [n * nc * c * dk], dtype: .f32, tag: "gdn_wy_qeff_\(n)x\(nc)x\(c)x\(dk)",
+            device: device)
+        let pS = wyScratchTensor(
+            shape: [n * nc * dk * dk], dtype: .f32, tag: "gdn_wy_ps_\(n)x\(nc)x\(dk)x\(dk)", device: device)
+        let uS = wyScratchTensor(
+            shape: [n * nc * dv * dk], dtype: .f32, tag: "gdn_wy_us_\(n)x\(nc)x\(dv)x\(dk)", device: device)
+
+        // ── K1: ffai_gdn_wy_plan — chunk-parallel, dispatchThreadgroups
+        // (coop_tile/MMA kernel). Grid (TGs): [T/C, B·Hv, 1], TG [512,1,1].
+        let gridK1 = MTLSize(width: nc, height: n, depth: 1)
+        let tgK1 = MTLSize(width: 512, height: 1, depth: 1)
+        MetalTileKernels.ffai_gdn_wy_plan_f32_threadgroups(
+            q: qNormed.buffer, qOffset: qNormed.offset,
+            k: kNormed.buffer, kOffset: kNormed.offset,
+            v: vAll.buffer, vOffset: vAll.offset,
+            g: gAll.buffer, gOffset: gAll.offset,
+            beta: betaAll.buffer, betaOffset: betaAll.offset,
+            t_len: tLen.buffer, t_lenOffset: tLen.offset,
+            u: u.buffer, uOffset: u.offset,
+            y_local: yLocal.buffer, y_localOffset: yLocal.offset,
+            q_eff: qEff.buffer, q_effOffset: qEff.offset,
+            p_s: pS.buffer, p_sOffset: pS.offset,
+            u_s: uS.buffer, u_sOffset: uS.offset,
+            dk: UInt32(dk), dv: UInt32(dv), hv: UInt32(hv), hk: UInt32(hk), c: UInt32(c),
+            gridSize: gridK1, threadgroupSize: tgK1, on: cmd)
+
+        // ── K2: ffai_gdn_wy_scan — chunk-sequential, dispatchThreadgroups.
+        // Grid (TGs): [Dv/32, B·Hv, 1], TG [128,1,1].
+        let gridK2 = MTLSize(width: dv / 32, height: n, depth: 1)
+        let tgK2 = MTLSize(width: 128, height: 1, depth: 1)
+        MetalTileKernels.ffai_gdn_wy_scan_f32_threadgroups(
+            q_eff: qEff.buffer, q_effOffset: qEff.offset,
+            y_local: yLocal.buffer, y_localOffset: yLocal.offset,
+            p_s: pS.buffer, p_sOffset: pS.offset,
+            u_s: uS.buffer, u_sOffset: uS.offset,
+            state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+            state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+            y: y.buffer, yOffset: y.offset,
+            t_len: tLen.buffer, t_lenOffset: tLen.offset,
+            dk: UInt32(dk), dv: UInt32(dv), hv: UInt32(hv), c: UInt32(c),
+            gridSize: gridK2, threadgroupSize: tgK2, on: cmd)
     }
 
     // ─── Dynamic-M batched-prefill int4 qmm ───────────────────────────
