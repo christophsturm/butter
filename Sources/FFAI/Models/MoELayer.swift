@@ -966,7 +966,10 @@ public final class MoELayer: Module, DecoderLayer {
             indices, mTotal, moeIntermediate, hidden, groupSize, work, upOut)
 
         // ── 10. SwiGLU fused: silu(gate) * up ────────────────────────────
-        let inner = Ops.swiglu(gate: gateOut, up: upOut, on: work)
+        // Write into `gateOut` in-place so we don't allocate a third
+        // [mTotal, inter] slab (gate + up already live). Down QMM then
+        // reads `gateOut` as its activation matrix.
+        let inner = Ops.swiglu(gate: gateOut, up: upOut, on: work, into: gateOut)
 
         // ── 11. Down BGEMM → [mTotal, hidden] ────────────────────────────
         let downOut = Tensor.empty(
@@ -1172,7 +1175,8 @@ public final class MoELayer: Module, DecoderLayer {
         }
 
         // ── SwiGLU activation: silu(gate) * up — fused into one dispatch ──
-        let inner = Ops.swiglu(gate: gateOut, up: upOut, on: cmd)
+        // In-place into `gateOut` — drop the third [topK, inter] slab.
+        let inner = Ops.swiglu(gate: gateOut, up: upOut, on: cmd, into: gateOut)
 
         // ── Down projection: [topK, hidden] ──
         let downOut = Tensor.empty(shape: [topK, hidden], dtype: dtype, device: device)

@@ -5598,14 +5598,16 @@ public enum Ops {
         // generated Swift wrapper calls `dispatchThreads` (grid counted
         // in TOTAL threads) so total threads = grid × tg per axis.
         //
-        // NAX cooperative-tensor (MPP): macOS 26.2+ / gen-≥17 (M5 Max).
+        // NAX cooperative-tensor (MPP): macOS 26+ / Apple GPU Family 9+ (M3+).
         // Force on: FFAI_MOE_BGEMM_MPP=1. Force off: FFAI_MOE_BGEMM_NO_MPP=1.
-        // Default: on when mTotal ≥ 1024 (short-T e2e prefers simdgroup bm16)
-        // AND the device/OS can actually run MPP — the auto path must not
-        // route M1–M4 or pre-Metal-4 machines into a live-compile that
-        // cannot find the MPP header (same .apple9 gate the MPP test
-        // suites use). Force-on skips the gate: explicit opt-in owns the
-        // consequences on unsupported hardware.
+        // Optional floor: FFAI_MOE_BGEMM_MPP_MIN=<mTotal> (default 0 = always
+        // when hardware allows). Measured 2026-07-18 M5 Max Qwen3.6-A3B:
+        // force-on beats simdgroup at short T too (T=57 +9%, T=82 +6%)
+        // and is neutral/better at long T — the old mTotal≥1024 floor was
+        // leaving short/mid prefill on the slower path. Auto must still
+        // not route M1–M2 or pre-Metal-4 into a live-compile that cannot
+        // find the MPP header (same .apple9 gate the MPP tests use).
+        // Force-on skips the gate: explicit opt-in owns unsupported HW.
         let env = ProcessInfo.processInfo.environment
         let useMpp: Bool
         if env["FFAI_MOE_BGEMM_NO_MPP"] != nil {
@@ -5613,7 +5615,8 @@ public enum Ops {
         } else if env["FFAI_MOE_BGEMM_MPP"] != nil {
             useMpp = true
         } else {
-            useMpp = mTotal >= 1024 && Self.mppAutoCapable
+            let mppMin = Int(env["FFAI_MOE_BGEMM_MPP_MIN"] ?? "") ?? 0
+            useMpp = mTotal >= mppMin && Self.mppAutoCapable
         }
         let tgWidth = useMpp ? 32 : 64
         let grid = MTLSize(
