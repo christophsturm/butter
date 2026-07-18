@@ -43,6 +43,14 @@ import Testing
 
 @Suite("Ops.gatedDeltaWYPrefill — chunked-WY GDN prefill vs prep-chunk")
 struct GatedDeltaWYPrefillTests {
+    /// The WY kernels are MPP cooperative-tensor (live-compiled) — the
+    /// MPP matmul2d body does not compile below Apple GPU Family 9, so
+    /// gate exactly like the other MPP suites (CI runners skip).
+    static let mppAvailable: Bool = {
+        guard let device = MTLCreateSystemDefaultDevice() else { return false }
+        return device.supportsFamily(.apple9)
+    }()
+
 
     /// Runs both paths on identical inputs and compares y + stateOut.
     /// `aLog0` conditions the gate magnitude: −3 (benign, prep-chunk
@@ -158,7 +166,9 @@ struct GatedDeltaWYPrefillTests {
     // Benign gates (prep-chunk fixture conditioning, aLog ≤ −3 → g ≈ 0.97):
     // validates the wiring (layouts, grids, g/beta math, v slicing) without
     // stressing the gate-product range. T=128 = 2 chunks of C=64, GQA 2:1.
-    @Test("benign gates — T=128, Hv=4, Hk=2, Dv=32, Dk=32: WY matches prep-chunk")
+    @Test(
+        "benign gates — T=128, Hv=4, Hk=2, Dv=32, Dk=32: WY matches prep-chunk",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func benignGatesMatch() {
         Self.runCase(t: 128, hv: 4, hk: 2, dv: 32, dk: 32, aLog0: -3.0, tol: 5e-3)
     }
@@ -167,14 +177,18 @@ struct GatedDeltaWYPrefillTests {
     // 64-token prefix product ~e⁻²⁵⁶ — f32-underflow regime. Guards the
     // plan kernel's log-space gate accumulation (naive prefix products NaN
     // here and emitted "!!!…" garbage e2e before the fix).
-    @Test("realistic gates — T=128, Hv=4, Hk=2, Dv=32, Dk=32: WY matches prep-chunk")
+    @Test(
+        "realistic gates — T=128, Hv=4, Hk=2, Dv=32, Dk=32: WY matches prep-chunk",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func realisticGatesMatch() {
         Self.runCase(t: 128, hv: 4, hk: 2, dv: 32, dk: 32, aLog0: 2.08, tol: 5e-3)
     }
 
     // Production geometry (Dk=Dv=128, GQA 2:1) at reduced head count for
     // test speed — exercises the full-width MMA tiles + 4-Dv-tile scan.
-    @Test("production dims — T=64, Hv=4, Hk=2, Dv=128, Dk=128: WY matches prep-chunk")
+    @Test(
+        "production dims — T=64, Hv=4, Hk=2, Dv=128, Dk=128: WY matches prep-chunk",
+        .enabled(if: mppAvailable, "MPP cooperative tensor — Apple GPU Family 9+"))
     func productionDimsMatch() {
         Self.runCase(t: 64, hv: 4, hk: 2, dv: 128, dk: 128, aLog0: 2.08, tol: 5e-3)
     }
