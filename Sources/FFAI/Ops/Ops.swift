@@ -6507,11 +6507,13 @@ public enum Ops {
         precondition(
             tLen.dtype == .u32 && tLen.elementCount == 1,
             "Ops.gatedDeltaPrepChunk: tLen must be a [1] u32 scalar buffer")
-        // One simdgroup per (head, dv index) ; grid sweeps batch · hv
-        // along Y. Kernel walks tLen tokens internally.
-        let tgWidth = 32
+        // 4 SGs per TG pack 4 Dv slots (reference Metal GDN geometry).
+        // Grid TGs: [ceil(Dv/4), batch·Hv, 1], TG 128. Kernel walks tLen
+        // tokens internally with state register-resident.
+        let tgWidth = 128
+        let dvTiles = (dv + 3) / 4
         let grid = MTLSize(
-            width: dv * tgWidth,
+            width: dvTiles * tgWidth,
             height: batchSize * hv,
             depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
