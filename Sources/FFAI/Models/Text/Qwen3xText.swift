@@ -1053,7 +1053,8 @@ public final class Qwen35MoEFFN: Module {
         let xRows = xNormFlat.reshaped(to: [t, hidden])
         let sgAll = sharedGateProj.callMany(xRows, t: t, on: work, device: device)
         let suAll = sharedUpProj.callMany(xRows, t: t, on: work, device: device)
-        let sharedInnerAll = Ops.swiglu(gate: sgAll, up: suAll, on: work)
+        // In-place SwiGLU into gate slab — same pattern as MoELayer.decodeMany.
+        let sharedInnerAll = Ops.swiglu(gate: sgAll, up: suAll, on: work, into: sgAll)
         let sharedOutAll = sharedDownProj.callMany(
             sharedInnerAll, t: t,
             on: work, device: device)
@@ -3264,6 +3265,10 @@ public final class Qwen35Model: LanguageModel {
         var nAttn = 0, nGdn = 0, nOther = 0
 
         for (i, layer) in layers.enumerated() {
+            // Drain ObjC autorelease traffic from per-layer Tensor.empty /
+            // makeBuffer so multi-chunk prefill does not pin intermediate
+            // MTLBuffers until the outer pool drains (#38 class of bug).
+            autoreleasepool {
             let layerStart = profileLayers ? CFAbsoluteTimeGetCurrent() : 0
             if let attn = layer as? Qwen35AttentionLayer {
                 h = attn.decodeMany(
@@ -3351,6 +3356,7 @@ public final class Qwen35Model: LanguageModel {
                     nOther += 1
                 }
             }
+            }  // autoreleasepool
         }
 
         if profileLayers {
