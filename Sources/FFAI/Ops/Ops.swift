@@ -5568,6 +5568,17 @@ public enum Ops {
         return Device.shared.mtlDevice.supportsFamily(.apple9)
     }()
 
+    /// Whether `moeGatherDequantGemmInt4` will take the MPP path for this
+    /// `mTotal`. Shared with `MoELayer.decodeMany` so gather-fusion and the
+    /// kernel path never drift.
+    public static func moeGatherUsesMpp(mTotal: Int) -> Bool {
+        let env = ProcessInfo.processInfo.environment
+        if env["FFAI_MOE_BGEMM_NO_MPP"] != nil { return false }
+        if env["FFAI_MOE_BGEMM_MPP"] != nil { return true }
+        let mppMin = Int(env["FFAI_MOE_BGEMM_MPP_MIN"] ?? "") ?? 0
+        return mTotal >= mppMin && mppAutoCapable
+    }
+
     public static func moeGatherDequantGemmInt4(
         input: Tensor,
         weight: Tensor, scales: Tensor, biases: Tensor,
@@ -5575,7 +5586,12 @@ public enum Ops {
         mTotal: Int, nOut: Int, kIn: Int,
         groupSize: Int,
         on cmd: MTLCommandBuffer,
-        into out: Tensor
+        into out: Tensor,
+        /// Optional row map for the MPP path: `x_rows[i]` selects which row
+        /// of `input` feeds expert-sorted output row `i`. `nil` → identity
+        /// (pre-gathered X). Non-nil fuses the token gather into the QMM
+        /// (pass unpermuted `[T, kIn]` + source-token ids).
+        xRows: Tensor? = nil
     ) {
         // Shape / dtype invariants. The kernel itself does no validation
         // so any mismatch silently produces garbage.
@@ -5589,10 +5605,19 @@ public enum Ops {
         precondition(
             out.dtype == input.dtype,
             "moeGatherDequantGemmInt4: out dtype must match input")
-        precondition(
-            input.elementCount == mTotal * kIn,
-            "moeGatherDequantGemmInt4: input has \(input.elementCount) elements, expected \(mTotal * kIn) (mTotal=\(mTotal) * kIn=\(kIn))"
-        )
+        if let xRows {
+            precondition(
+                xRows.dtype == .u32 && xRows.elementCount == mTotal,
+                "moeGatherDequantGemmInt4: xRows must be [mTotal] u32")
+            precondition(
+                input.elementCount % kIn == 0,
+                "moeGatherDequantGemmInt4: fused-gather input size \(input.elementCount) not multiple of kIn \(kIn)")
+        } else {
+            precondition(
+                input.elementCount == mTotal * kIn,
+                "moeGatherDequantGemmInt4: input has \(input.elementCount) elements, expected \(mTotal * kIn) (mTotal=\(mTotal) * kIn=\(kIn))"
+            )
+        }
         precondition(
             out.elementCount == mTotal * nOut,
             "moeGatherDequantGemmInt4: out has \(out.elementCount) elements, expected \(mTotal * nOut)"
@@ -5626,16 +5651,10 @@ public enum Ops {
         // not route M1–M2 or pre-Metal-4 into a live-compile that cannot
         // find the MPP header (same .apple9 gate the MPP tests use).
         // Force-on skips the gate: explicit opt-in owns unsupported HW.
-        let env = ProcessInfo.processInfo.environment
-        let useMpp: Bool
-        if env["FFAI_MOE_BGEMM_NO_MPP"] != nil {
-            useMpp = false
-        } else if env["FFAI_MOE_BGEMM_MPP"] != nil {
-            useMpp = true
-        } else {
-            let mppMin = Int(env["FFAI_MOE_BGEMM_MPP_MIN"] ?? "") ?? 0
-            useMpp = mTotal >= mppMin && Self.mppAutoCapable
-        }
+        let useMpp = moeGatherUsesMpp(mTotal: mTotal)
+        precondition(
+            xRows == nil || useMpp,
+            "moeGatherDequantGemmInt4: fused-gather xRows requires MPP path")
         let tgWidth = useMpp ? 32 : 64
         let grid = MTLSize(
             width: (nOut / 32) * tgWidth,
@@ -5648,8 +5667,17 @@ public enum Ops {
         let groupSizeU = UInt32(groupSize)
 
         if useMpp {
-            // Identity x_rows: X is pre-gathered, row i reads x[i, :].
-            let idRows = Self.identityRowsBuffer(minCount: mTotal, device: Device.shared)
+            // x_rows: caller-supplied source-token map, or identity for
+            // the classic pre-gathered layout.
+            let xRowsBuf: MTLBuffer
+            let xRowsOff: Int
+            if let xRows {
+                xRowsBuf = xRows.buffer
+                xRowsOff = xRows.offset
+            } else {
+                xRowsBuf = Self.identityRowsBuffer(minCount: mTotal, device: Device.shared)
+                xRowsOff = 0
+            }
             switch input.dtype {
             case .f32:
                 MetalTileKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_f32(
@@ -5658,7 +5686,7 @@ public enum Ops {
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
                     indices: indices.buffer, indicesOffset: indices.offset,
-                    x_rows: idRows, x_rowsOffset: 0,
+                    x_rows: xRowsBuf, x_rowsOffset: xRowsOff,
                     out: out.buffer, outOffset: out.offset,
                     m_total: mTotalU, n_out: nOutU, k_in: kInU,
                     group_size: groupSizeU,
@@ -5670,7 +5698,7 @@ public enum Ops {
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
                     indices: indices.buffer, indicesOffset: indices.offset,
-                    x_rows: idRows, x_rowsOffset: 0,
+                    x_rows: xRowsBuf, x_rowsOffset: xRowsOff,
                     out: out.buffer, outOffset: out.offset,
                     m_total: mTotalU, n_out: nOutU, k_in: kInU,
                     group_size: groupSizeU,
@@ -5683,7 +5711,7 @@ public enum Ops {
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
                     indices: indices.buffer, indicesOffset: indices.offset,
-                    x_rows: idRows, x_rowsOffset: 0,
+                    x_rows: xRowsBuf, x_rowsOffset: xRowsOff,
                     out: out.buffer, outOffset: out.offset,
                     m_total: mTotalU, n_out: nOutU, k_in: kInU,
                     group_size: groupSizeU,

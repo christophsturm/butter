@@ -910,75 +910,115 @@ public final class MoELayer: Module, DecoderLayer {
             indices = Tensor(buffer: expertIdsBuf, offset: 0, shape: [mTotal], dtype: .u32)
         }
 
-        // ── 8. Gather activations: [mTotal, hidden] ──────────────────────
-        // Source rows are picked from h[sourceToken] — one dispatch.
-        let xGathered = Ops.gather(table: hRows, tokenIds: gatherIdxTensor, on: work)
-        precondition(
-            xGathered.elementCount == mTotal * hidden,
-            "MoELayer.decodeMany: gather output unexpected size")
+        // ── 8–11. Gather (optional) + gate / up / SwiGLU / down ──────────
+        // Tile selection:
+        //   - FFAI_MOE_BGEMM_BM64=1 + mTotal≥1024 → bm64_mpp (opt-in)
+        //   - FFAI_MOE_BGEMM_BM8=1 + mTotal≤8 → bm8
+        //   - else bm16 (MPP when `Ops.moeGatherUsesMpp`)
+        // MPP fuses the token gather: X = unpermuted `[T, hidden]`,
+        // x_rows = source-token ids. Drops one [mTotal, hidden] write +
+        // two re-reads on gate/up. simdgroup/bm64/bm8 still materialise.
+        let useBm64 = self.bm64Env && !self.noBGEMMBm64 && mTotal >= 1024
+        let useBm8 = !useBm64 && topK <= 8 && useBm8Env && mTotal <= 8
+        // Opt-in fuse: FFAI_MOE_GATHER_FUSE=1. Fair A/B (MPP both sides)
+        // was ~flat to −2% e2e (scattered X vs sequential post-gather) —
+        // do not default-on. Dual shared-A gate‖up still e2e-regresses
+        // vs MPP (~−5–9%); leave unshipped.
+        let fuseGather =
+            !useBm64 && !useBm8 && Ops.moeGatherUsesMpp(mTotal: mTotal)
+            && ProcessInfo.processInfo.environment["FFAI_MOE_GATHER_FUSE"] != nil
 
-        // ── 9. Gate / up BGEMM → [mTotal, moeIntermediate] ───────────────
+        let xForGu: Tensor
+        let xRowsGu: Tensor?
+        if fuseGather {
+            xForGu = hRows
+            xRowsGu = gatherIdxTensor
+        } else {
+            let xGathered = Ops.gather(table: hRows, tokenIds: gatherIdxTensor, on: work)
+            precondition(
+                xGathered.elementCount == mTotal * hidden,
+                "MoELayer.decodeMany: gather output unexpected size")
+            xForGu = xGathered
+            xRowsGu = nil
+        }
+
         let gateOut = Tensor.empty(
             shape: [mTotal, moeIntermediate], dtype: dt,
             device: device)
         let upOut = Tensor.empty(
             shape: [mTotal, moeIntermediate], dtype: dt,
             device: device)
-        // Tile selection for the batched-prefill regime:
-        //   - mTotal ≥ 64 + `FFAI_MOE_BGEMM_BM64=1` → bm64_mpp (NAX
-        //     cooperative-tensor). Wrapper in tree but dispatch-shape
-        //     fails the equivalence canary (argmax 220 — the same
-        //     dispatchThreads/threadgroups grid bug we saw at m1).
-        //     Needs verification against the metaltile-ffai kernel
-        //     source. **Default off** until that's resolved.
-        //   - 16 ≤ mTotal → bm16 (the default `moeGatherDequant
-        //     GemmInt4`). 16-deep tile fill across consecutive
-        //     sorted-by-expert rows. THIS is the path that drives the
-        //     2.69× T=32 win.
-        //   - mTotal ≤ 8 + `FFAI_MOE_BGEMM_BM8=1` → bm8 (decode T=1
-        //     fallback).
-        // bm16 (simdgroup-MMA `moeGatherDequantGemmInt4`) is the default:
-        // it is fastest across every measured prefill mTotal for this
-        // model's narrow experts (moeIntermediate 512), +3-5% end-to-end
-        // over bm64_mpp at mTotal 1024..16384 on an M5 Max, wikitext-2
-        // perplexity unchanged. bm64_mpp (NAX cooperative-tensor) is
-        // retained as opt-in via FFAI_MOE_BGEMM_BM64=1 for wider-expert
-        // models / other hardware where its larger tile may win.
-        let useBm64 = self.bm64Env && !self.noBGEMMBm64 && mTotal >= 1024
-        let useBm8 = !useBm64 && topK <= 8 && useBm8Env && mTotal <= 8
-        let bgemm:
-            (Tensor, Tensor, Tensor, Tensor, Tensor, Int, Int, Int, Int, MTLCommandBuffer, Tensor)
-                -> Void
-        if useBm64 {
-            bgemm = Ops.moeGatherDequantGemmInt4Bm64Mpp
-        } else if useBm8 {
-            bgemm = Ops.moeGatherDequantGemmInt4Bm8
-        } else {
-            bgemm = Ops.moeGatherDequantGemmInt4
-        }
-        bgemm(
-            xGathered,
-            stacked.gateWeight, stacked.gateScales, stacked.gateBiases,
-            indices, mTotal, moeIntermediate, hidden, groupSize, work, gateOut)
-        bgemm(
-            xGathered,
-            stacked.upWeight, stacked.upScales, stacked.upBiases,
-            indices, mTotal, moeIntermediate, hidden, groupSize, work, upOut)
 
-        // ── 10. SwiGLU fused: silu(gate) * up ────────────────────────────
-        // Write into `gateOut` in-place so we don't allocate a third
-        // [mTotal, inter] slab (gate + up already live). Down QMM then
-        // reads `gateOut` as its activation matrix.
+        if useBm64 {
+            Ops.moeGatherDequantGemmInt4Bm64Mpp(
+                input: xForGu,
+                weight: stacked.gateWeight, scales: stacked.gateScales,
+                biases: stacked.gateBiases, indices: indices,
+                mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                groupSize: groupSize, on: work, into: gateOut)
+            Ops.moeGatherDequantGemmInt4Bm64Mpp(
+                input: xForGu,
+                weight: stacked.upWeight, scales: stacked.upScales,
+                biases: stacked.upBiases, indices: indices,
+                mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                groupSize: groupSize, on: work, into: upOut)
+        } else if useBm8 {
+            Ops.moeGatherDequantGemmInt4Bm8(
+                input: xForGu,
+                weight: stacked.gateWeight, scales: stacked.gateScales,
+                biases: stacked.gateBiases, indices: indices,
+                mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                groupSize: groupSize, on: work, into: gateOut)
+            Ops.moeGatherDequantGemmInt4Bm8(
+                input: xForGu,
+                weight: stacked.upWeight, scales: stacked.upScales,
+                biases: stacked.upBiases, indices: indices,
+                mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                groupSize: groupSize, on: work, into: upOut)
+        } else {
+            Ops.moeGatherDequantGemmInt4(
+                input: xForGu,
+                weight: stacked.gateWeight, scales: stacked.gateScales,
+                biases: stacked.gateBiases, indices: indices,
+                mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                groupSize: groupSize, on: work, into: gateOut, xRows: xRowsGu)
+            Ops.moeGatherDequantGemmInt4(
+                input: xForGu,
+                weight: stacked.upWeight, scales: stacked.upScales,
+                biases: stacked.upBiases, indices: indices,
+                mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                groupSize: groupSize, on: work, into: upOut, xRows: xRowsGu)
+        }
+
+        // SwiGLU in-place into gateOut — no third [mTotal, inter] slab.
         let inner = Ops.swiglu(gate: gateOut, up: upOut, on: work, into: gateOut)
 
-        // ── 11. Down BGEMM → [mTotal, hidden] ────────────────────────────
+        // Down reads contiguous post-SwiGLU rows — never fused-gather.
         let downOut = Tensor.empty(
             shape: [mTotal, hidden], dtype: dt,
             device: device)
-        bgemm(
-            inner,
-            stacked.downWeight, stacked.downScales, stacked.downBiases,
-            indices, mTotal, hidden, moeIntermediate, groupSize, work, downOut)
+        if useBm64 {
+            Ops.moeGatherDequantGemmInt4Bm64Mpp(
+                input: inner,
+                weight: stacked.downWeight, scales: stacked.downScales,
+                biases: stacked.downBiases, indices: indices,
+                mTotal: mTotal, nOut: hidden, kIn: moeIntermediate,
+                groupSize: groupSize, on: work, into: downOut)
+        } else if useBm8 {
+            Ops.moeGatherDequantGemmInt4Bm8(
+                input: inner,
+                weight: stacked.downWeight, scales: stacked.downScales,
+                biases: stacked.downBiases, indices: indices,
+                mTotal: mTotal, nOut: hidden, kIn: moeIntermediate,
+                groupSize: groupSize, on: work, into: downOut)
+        } else {
+            Ops.moeGatherDequantGemmInt4(
+                input: inner,
+                weight: stacked.downWeight, scales: stacked.downScales,
+                biases: stacked.downBiases, indices: indices,
+                mTotal: mTotal, nOut: hidden, kIn: moeIntermediate,
+                groupSize: groupSize, on: work, into: downOut)
+        }
 
         // ── 12. Weighted scatter-sum back to [T, hidden] via fused
         // `ffai_moe_unpermute` kernel — ONE dispatch over T·hidden
@@ -1158,20 +1198,32 @@ public final class MoELayer: Module, DecoderLayer {
                 offsetsT,
                 topK, moeIntermediate, hidden,
                 nExperts, groupSize, cmd, upOut)
+        } else if useBm8 {
+            Ops.moeGatherDequantGemmInt4Bm8(
+                input: xGathered,
+                weight: stacked.gateWeight, scales: stacked.gateScales,
+                biases: stacked.gateBiases, indices: indices,
+                mTotal: topK, nOut: moeIntermediate, kIn: hidden,
+                groupSize: groupSize, on: cmd, into: gateOut)
+            Ops.moeGatherDequantGemmInt4Bm8(
+                input: xGathered,
+                weight: stacked.upWeight, scales: stacked.upScales,
+                biases: stacked.upBiases, indices: indices,
+                mTotal: topK, nOut: moeIntermediate, kIn: hidden,
+                groupSize: groupSize, on: cmd, into: upOut)
         } else {
-            let bgemm = useBm8 ? Ops.moeGatherDequantGemmInt4Bm8 : Ops.moeGatherDequantGemmInt4
-            bgemm(
-                xGathered,
-                stacked.gateWeight, stacked.gateScales, stacked.gateBiases,
-                indices,
-                topK, moeIntermediate, hidden,
-                groupSize, cmd, gateOut)
-            bgemm(
-                xGathered,
-                stacked.upWeight, stacked.upScales, stacked.upBiases,
-                indices,
-                topK, moeIntermediate, hidden,
-                groupSize, cmd, upOut)
+            Ops.moeGatherDequantGemmInt4(
+                input: xGathered,
+                weight: stacked.gateWeight, scales: stacked.gateScales,
+                biases: stacked.gateBiases, indices: indices,
+                mTotal: topK, nOut: moeIntermediate, kIn: hidden,
+                groupSize: groupSize, on: cmd, into: gateOut)
+            Ops.moeGatherDequantGemmInt4(
+                input: xGathered,
+                weight: stacked.upWeight, scales: stacked.upScales,
+                biases: stacked.upBiases, indices: indices,
+                mTotal: topK, nOut: moeIntermediate, kIn: hidden,
+                groupSize: groupSize, on: cmd, into: upOut)
         }
 
         // ── SwiGLU activation: silu(gate) * up — fused into one dispatch ──
@@ -1188,14 +1240,20 @@ public final class MoELayer: Module, DecoderLayer {
                 offsetsT,
                 topK, hidden, moeIntermediate,
                 nExperts, groupSize, cmd, downOut)
+        } else if useBm8 {
+            Ops.moeGatherDequantGemmInt4Bm8(
+                input: inner,
+                weight: stacked.downWeight, scales: stacked.downScales,
+                biases: stacked.downBiases, indices: indices,
+                mTotal: topK, nOut: hidden, kIn: moeIntermediate,
+                groupSize: groupSize, on: cmd, into: downOut)
         } else {
-            let bgemm = useBm8 ? Ops.moeGatherDequantGemmInt4Bm8 : Ops.moeGatherDequantGemmInt4
-            bgemm(
-                inner,
-                stacked.downWeight, stacked.downScales, stacked.downBiases,
-                indices,
-                topK, hidden, moeIntermediate,
-                groupSize, cmd, downOut)
+            Ops.moeGatherDequantGemmInt4(
+                input: inner,
+                weight: stacked.downWeight, scales: stacked.downScales,
+                biases: stacked.downBiases, indices: indices,
+                mTotal: topK, nOut: hidden, kIn: moeIntermediate,
+                groupSize: groupSize, on: cmd, into: downOut)
         }
 
         // ── Weighted scatter-sum back to a single [hidden] vector ──
