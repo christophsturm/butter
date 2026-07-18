@@ -1066,15 +1066,22 @@ public final class Qwen35MoEFFN: Module {
             commitAtEnd: !chainOnCmd)
 
         let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
-        Ops.sigmoidRowFMA(
-            gate: gateLogitsAll, value: sharedOutAll, base: routed,
-            into: outFlat, t: t, hidden: hidden, on: work)
         if let residual = residual {
             precondition(
                 residual.elementCount == t * hidden
                     && residual.dtype == dt,
                 "Qwen35MoEFFN.forwardMany: residual must be [T·hidden] \(dt)")
-            _ = Ops.add(residual, outFlat, on: work, into: outFlat)
+            // Fused 4-input prefill: result = residual + routed +
+            // sigmoid(gate) · sharedOut. Saves 1 dispatch + 1
+            // [T·hidden] DRAM roundtrip vs sigmoidRowFMA then Ops.add.
+            Ops.sigmoidRowFMAResidual(
+                gate: gateLogitsAll, value: sharedOutAll, base: routed,
+                residual: residual, into: outFlat, t: t, hidden: hidden,
+                on: work)
+        } else {
+            Ops.sigmoidRowFMA(
+                gate: gateLogitsAll, value: sharedOutAll, base: routed,
+                into: outFlat, t: t, hidden: hidden, on: work)
         }
         work.commit()
         return outFlat
