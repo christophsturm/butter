@@ -7163,12 +7163,31 @@ public enum Ops {
     /// `dispatchThreads` counts total threads per axis, so grid.x = N/32·128.
     /// `bits` selects the int4 (unsuffixed) or int2 variant; the int2 kernel
     /// uses the same geometry but unpacks 16 codes per u32 (vs 8 nibbles).
+    ///
+    /// `m` must already be a multiple of 32 (BM tile) — callers pad ragged
+    /// `T` up to 32 before reaching here (`dequantGemmDynamicM`'s slow
+    /// path); the `m/32` grid math below silently truncates otherwise.
+    ///
+    /// bits=4 additionally prefers the MPP/NAX cooperative-tensor kernel
+    /// (`ffai_qmm_mma_mpp`, live-compiled via `MetalPerformancePrimitives`)
+    /// over the manual simdgroup ladder, same idea as the existing bits=8
+    /// MPP arm below. Gate: `Ops.mppAutoCapable` (Apple GPU Family 9+ /
+    /// macOS 26+, the same cached capability check the MoE bgemm work
+    /// added — reused here rather than duplicated), overridable via
+    /// `FFAI_QMM_MPP=0` (force off) / `FFAI_QMM_MPP=1` (force on). The
+    /// int4 MPP kernel bakes `group_size=64` (Qwen3.6-A3B's default —
+    /// see its module doc); a caller quantized at a different group size
+    /// falls back to the simdgroup path regardless of the gate, since the
+    /// MPP kernel would silently read scales/biases at the wrong stride.
     private static func dispatchQmmMma(
         weight: Tensor, scales: Tensor, biases: Tensor,
         input: Tensor, output: Tensor,
         m: Int, n: Int, k: Int, gsPerRow: Int, bits: Int,
         on cmd: MTLCommandBuffer
     ) {
+        precondition(
+            m % 32 == 0,
+            "Ops.dispatchQmmMma: m (\(m)) must be a multiple of 32 (BM tile) — caller must pad")
         // Prefer threadgroups dispatch for MMA (grid = tile counts).
         let tgWidth = 128
         let tgGrid = MTLSize(width: n / 32, height: m / 32, depth: 1)
@@ -7181,34 +7200,75 @@ public enum Ops {
         let kU = UInt32(k)
         let nU = UInt32(n)
         let gsU = UInt32(gsPerRow)
+        let env = ProcessInfo.processInfo.environment
+        let mppRequested4: Bool
+        switch env["FFAI_QMM_MPP"] {
+        case "0": mppRequested4 = false
+        case "1": mppRequested4 = true
+        default: mppRequested4 = Self.mppAutoCapable
+        }
+        let useMpp4 = mppRequested4 && gsPerRow > 0 && k % gsPerRow == 0 && k / gsPerRow == 64
         switch (bits, input.dtype) {
         case (4, .f32):
-            MetalTileKernels.ffai_qmm_mma_f32(
-                w: weight.buffer, wOffset: weight.offset,
-                scales: scales.buffer, scalesOffset: scales.offset,
-                biases: biases.buffer, biasesOffset: biases.offset,
-                x: input.buffer, xOffset: input.offset,
-                out: output.buffer, outOffset: output.offset,
-                k: kU, n: nU, gs_per_row: gsU,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
+            if useMpp4 {
+                MetalTileKernels.ffai_qmm_mma_mpp_f32_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                MetalTileKernels.ffai_qmm_mma_f32(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            }
         case (4, .f16):
-            MetalTileKernels.ffai_qmm_mma_f16(
-                w: weight.buffer, wOffset: weight.offset,
-                scales: scales.buffer, scalesOffset: scales.offset,
-                biases: biases.buffer, biasesOffset: biases.offset,
-                x: input.buffer, xOffset: input.offset,
-                out: output.buffer, outOffset: output.offset,
-                k: kU, n: nU, gs_per_row: gsU,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
+            if useMpp4 {
+                MetalTileKernels.ffai_qmm_mma_mpp_f16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                MetalTileKernels.ffai_qmm_mma_f16(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            }
         case (4, .bf16):
-            MetalTileKernels.ffai_qmm_mma_bf16(
-                w: weight.buffer, wOffset: weight.offset,
-                scales: scales.buffer, scalesOffset: scales.offset,
-                biases: biases.buffer, biasesOffset: biases.offset,
-                x: input.buffer, xOffset: input.offset,
-                out: output.buffer, outOffset: output.offset,
-                k: kU, n: nU, gs_per_row: gsU,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
+            if useMpp4 {
+                MetalTileKernels.ffai_qmm_mma_mpp_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                MetalTileKernels.ffai_qmm_mma_bf16(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            }
         case (2, .f32):
             MetalTileKernels.ffai_qmm_mma_int2_f32(
                 w: weight.buffer, wOffset: weight.offset,
