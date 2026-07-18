@@ -52,10 +52,10 @@ use std::sync::{Arc, Mutex};
 use ffai_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
 use ffai_kernels_core::ir::ParamKind;
 use ffai_kernels_runtime::{
-    BatchDispatch, MetalTileError, VulkanDevice as MtVulkanDevice, VulkanPipeline, VulkanRawBuffer,
+    BatchDispatch, FFAIError, VulkanDevice as MtVulkanDevice, VulkanPipeline, VulkanRawBuffer,
 };
 
-fn dispatch_err(e: MetalTileError) -> Error {
+fn dispatch_err(e: FFAIError) -> Error {
     Error::Dispatch(e.to_string())
 }
 

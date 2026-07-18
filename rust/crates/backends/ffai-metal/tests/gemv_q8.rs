@@ -10,6 +10,34 @@ use ffai_metal::MetalDevice;
 fn tb_f32(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn tb_u32(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn fb(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() }
+// f32<->f16 for the q4 coalesced kernel, whose scales are f16 (see ffai-kernels
+// gemv_quantized: ffai_gemv_q4_coalesced reads f16 scales). Feed f16 + reference
+// against the f16-rounded scale so kernel and CPU oracle agree exactly.
+fn f32_to_f16(f: f32) -> u16 {
+    let x = f.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let e = ((x >> 23) & 0xff) as i32 - 112;
+    if e <= 0 { return sign; }
+    if e >= 0x1f { return sign | 0x7c00; }
+    let m = (x >> 13) & 0x3ff;
+    let round = (x >> 12) & 1;
+    sign | ((((e as u32) << 10) | m) + round) as u16
+}
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h as u32 & 0x8000) << 16;
+    let exp = (h as u32 >> 10) & 0x1f;
+    let mant = h as u32 & 0x3ff;
+    let bits = if exp == 0 {
+        if mant == 0 { sign } else {
+            let mut e = -1i32; let mut m = mant;
+            while m & 0x400 == 0 { m <<= 1; e -= 1; } m &= 0x3ff;
+            sign | (((e + 127 - 14) as u32) << 23) | (m << 13)
+        }
+    } else if exp == 0x1f { sign | 0x7f80_0000 | (mant << 13) }
+    else { sign | ((exp + 112) << 23) | (mant << 13) };
+    f32::from_bits(bits)
+}
+fn tb_f16(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|&f| f32_to_f16(f).to_le_bytes()).collect() }
 
 #[test]
 fn gemv_q8_matches_cpu_dequant_dot() {
@@ -98,6 +126,8 @@ fn gemv_q4_matches_cpu_dequant() {
     let w: Vec<f32> = (0..m * k).map(|_| rng()).collect();
     let x: Vec<f32> = (0..k).map(|_| rng()).collect();
     let (qs, sc) = ffai_ops::quantize_q4(&w, m, k);
+    // kernel uses f16 scales -> reference against the f16-rounded value
+    let sc: Vec<f32> = sc.iter().map(|&v| f16_to_f32(f32_to_f16(v))).collect();
     let bpr = k / 32;
     let mut want = vec![0f32; m];
     for r in 0..m { let mut a = 0f32;
@@ -106,7 +136,7 @@ fn gemv_q4_matches_cpu_dequant() {
                 let q = nib as i32 - if nib > 7 { 16 } else { 0 }; a += dd * q as f32 * x[b*32+i]; } }
         want[r] = a; }
     let qt = Tensor::new(d.upload(&tb_u32(&qs)).unwrap(), vec![qs.len()], DType::U32);
-    let st = Tensor::new(d.upload(&tb_f32(&sc)).unwrap(), vec![sc.len()], DType::F32);
+    let st = Tensor::new(d.upload(&tb_f16(&sc)).unwrap(), vec![sc.len()], DType::F16);
     let xt = Tensor::new(d.upload(&tb_f32(&x)).unwrap(), vec![k], DType::F32);
     let ot = ffai_ops::gemv_q4(d, &qt, &st, &xt, m, k, m).unwrap();
     let mut ob = vec![0u8; m*4]; d.download(ot.buffer.as_ref(), &mut ob).unwrap();

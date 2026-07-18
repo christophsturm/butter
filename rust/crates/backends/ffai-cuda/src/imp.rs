@@ -15,9 +15,9 @@ use std::sync::{Arc, RwLock};
 use ffai_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
 use ffai_kernels_codegen::{CodegenBackend, CudaGenerator};
 use ffai_kernels_core::ir::KernelMode;
-use ffai_kernels_runtime::{CudaDevice as MtCudaDevice, CudaModule, MetalTileError};
+use ffai_kernels_runtime::{CudaDevice as MtCudaDevice, CudaModule, FFAIError};
 
-fn dispatch_err(e: MetalTileError) -> Error {
+fn dispatch_err(e: FFAIError) -> Error {
     Error::Dispatch(e.to_string())
 }
 

@@ -143,8 +143,8 @@ fn ffai_ops_elementwise_on_cuda() {
     eprintln!("ffai_ops::add + ffai_ops::mul on CUDA: OK (max|Δ|={err:.1e})");
 }
 
-/// Heavier ops via the registered-kernel lookup: rms_norm (mt_rms_norm) and
-/// gemv (mt_gemv), driven through the shared Device trait on CUDA and
+/// Heavier ops via the registered-kernel lookup: rms_norm (ffai_rms_norm) and
+/// gemv (ffai_gemv), driven through the shared Device trait on CUDA and
 /// checked against a CPU reference. This is the mechanism every transformer
 /// op rides on.
 #[test]
@@ -180,7 +180,7 @@ fn ffai_ops_rms_norm_and_gemv_on_cuda() {
         }
     }
     assert!(rms_err <= 1e-4, "rms_norm on CUDA mismatch: max|Δ|={rms_err:.3e}");
-    eprintln!("ffai_ops::rms_norm (mt_rms_norm) on CUDA: OK (max|Δ|={rms_err:.1e})");
+    eprintln!("ffai_ops::rms_norm (ffai_rms_norm) on CUDA: OK (max|Δ|={rms_err:.1e})");
 
     // ── gemv: [M,K] @ [K] ────────────────────────────────────────────
     const M: usize = 64;
@@ -202,7 +202,7 @@ fn ffai_ops_rms_norm_and_gemv_on_cuda() {
         gemv_err = gemv_err.max((got[r] - want).abs());
     }
     assert!(gemv_err <= 1e-3, "gemv on CUDA mismatch: max|Δ|={gemv_err:.3e}");
-    eprintln!("ffai_ops::gemv (mt_gemv) on CUDA: OK (max|Δ|={gemv_err:.1e})");
+    eprintln!("ffai_ops::gemv (ffai_gemv) on CUDA: OK (max|Δ|={gemv_err:.1e})");
 }
 
 fn sigmoid(x: f32) -> f32 {
@@ -231,7 +231,7 @@ fn ffai_ops_transformer_ops_on_cuda() {
         e = e.max((s[i] - g[i] * sigmoid(g[i])).abs());
     }
     assert!(e <= 1e-5, "silu mismatch: {e:.2e}");
-    eprintln!("ffai_ops::silu (mt_silu) on CUDA: OK (max|Δ|={e:.1e})");
+    eprintln!("ffai_ops::silu (ffai_silu) on CUDA: OK (max|Δ|={e:.1e})");
 
     // ── swiglu ───────────────────────────────────────────────────────
     let up: Vec<f32> = (0..1024).map(|i| (i % 13) as f32 * 0.05).collect();
@@ -246,7 +246,7 @@ fn ffai_ops_transformer_ops_on_cuda() {
         e = e.max((w[i] - g[i] * sigmoid(g[i]) * up[i]).abs());
     }
     assert!(e <= 1e-5, "swiglu mismatch: {e:.2e}");
-    eprintln!("ffai_ops::swiglu (mt_swiglu) on CUDA: OK (max|Δ|={e:.1e})");
+    eprintln!("ffai_ops::swiglu (ffai_swiglu) on CUDA: OK (max|Δ|={e:.1e})");
 
     // ── gather (embedding) ───────────────────────────────────────────
     const VOCAB: usize = 8;
@@ -291,7 +291,7 @@ fn ffai_ops_transformer_ops_on_cuda() {
         }
     }
     assert!(e <= 1e-5, "softmax mismatch: {e:.2e}");
-    eprintln!("ffai_ops::softmax (mt_softmax) on CUDA: OK (max|Δ|={e:.1e})");
+    eprintln!("ffai_ops::softmax (ffai_softmax) on CUDA: OK (max|Δ|={e:.1e})");
 }
 
 /// Decode-time attention (sdpa_decode) on CUDA vs a CPU reference, single

@@ -138,7 +138,7 @@ dependencies = [
 [[package]]
 name = "ffai-kernels"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#d4cafc60ea4a43b411fdec98ede42cfeec3cd49d"
+source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
 dependencies = [
  "bytemuck",
  "ffai-kernels-codegen",
@@ -157,7 +157,7 @@ dependencies = [
 [[package]]
 name = "ffai-kernels-codegen"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#d4cafc60ea4a43b411fdec98ede42cfeec3cd49d"
+source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
 dependencies = [
  "ffai-kernels-core",
  "inventory",
@@ -172,7 +172,7 @@ dependencies = [
 [[package]]
 name = "ffai-kernels-core"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#d4cafc60ea4a43b411fdec98ede42cfeec3cd49d"
+source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
 dependencies = [
  "ffai-kernels-macros",
  "inventory",
@@ -186,7 +186,7 @@ dependencies = [
 [[package]]
 name = "ffai-kernels-macros"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#d4cafc60ea4a43b411fdec98ede42cfeec3cd49d"
+source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -196,7 +196,7 @@ dependencies = [
 [[package]]
 name = "ffai-kernels-runtime"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#d4cafc60ea4a43b411fdec98ede42cfeec3cd49d"
+source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
 dependencies = [
  "ffai-kernels-codegen",
  "ffai-kernels-core",
@@ -213,7 +213,7 @@ dependencies = [
 [[package]]
 name = "ffai-kernels-std"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#d4cafc60ea4a43b411fdec98ede42cfeec3cd49d"
+source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
 dependencies = [
  "ffai-kernels",
  "half",

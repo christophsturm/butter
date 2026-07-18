@@ -2868,13 +2868,13 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let amax_dn = Tensor::new(d.alloc_zeroed(4).unwrap(), vec![1], DType::U32);
                                 let (off0, st0, sw0) = moe_dev.as_ref().unwrap();
                                 let (st_e, sw_e, off_e) = ffai_ops::moe_extend_groups(d, st0, sw0, off0, mt, s, n_exp).unwrap();
-                                let mt_e = mt + 2 * s;
-                                let up_out = pf!(11, 2.0*mt_e as f64*inter as f64*hid as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xs_in, uwp, uwsc, ugw, &off_e, n_exp + 2, mt_e, inter, hid, 0, 0.0, None, Some((&amax_dn, 1, inv)), Some(&st_e)).unwrap());
-                                let dn_out = pf!(11, 2.0*mt_e as f64*hid as f64*inter as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &up_out, dwp, dwsc, dgw, &off_e, n_exp + 2, mt_e, hid, inter, 1, inv, Some(&amax_dn), None, None).unwrap());
+                                let ffai_e = mt + 2 * s;
+                                let up_out = pf!(11, 2.0*ffai_e as f64*inter as f64*hid as f64,
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xs_in, uwp, uwsc, ugw, &off_e, n_exp + 2, ffai_e, inter, hid, 0, 0.0, None, Some((&amax_dn, 1, inv)), Some(&st_e)).unwrap());
+                                let dn_out = pf!(11, 2.0*ffai_e as f64*hid as f64*inter as f64,
+                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &up_out, dwp, dwsc, dgw, &off_e, n_exp + 2, ffai_e, hid, inter, 1, inv, Some(&amax_dn), None, None).unwrap());
                                 let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
-                                moe_scatter_add_det_dev(d, &dn_out, &st_e, &sw_e, &acc_dev, s, mt_e, hid, 256.0f32, true).unwrap();
+                                moe_scatter_add_det_dev(d, &dn_out, &st_e, &sw_e, &acc_dev, s, ffai_e, hid, 256.0f32, true).unwrap();
                                 shared_folded = true;
                                 if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
                             } else if fp4_moe {

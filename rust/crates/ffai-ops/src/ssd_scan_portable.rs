@@ -138,7 +138,7 @@ pub fn ssm_prefill_scan_ssd_portable(
                   o_stride: usize|
      -> Result<()> {
         let kern = cached_ir("ffai_gemm_batched", DType::F32, || {
-            let mut k = ffai_kernels_std::kernels::gemm::dense::mt_gemm_batched::kernel_ir_for(DType::F32);
+            let mut k = ffai_kernels_std::kernels::gemm::dense::ffai_gemm_batched::kernel_ir_for(DType::F32);
             k.mode = KernelMode::Reduction;
             k
         });
@@ -317,15 +317,15 @@ pub fn ssm_prefill_scan_ssd_portable(
 fn build_ssd_ir(name: &str) -> ffai_core::Kernel {
     use ffai_kernels_std::kernels::ssm;
     match name {
-        "ssd_lcs" => ssm::scan::mt_ssd_lcs::kernel_ir_for(),
-        "ssd_gather_bc" => ssm::scan::mt_ssd_gather_bc::kernel_ir_for(),
-        "ssd_xt" => ssm::scan::mt_ssd_xt::kernel_ir_for(),
-        "ssd_mmask" => ssm::scan::mt_ssd_mmask::kernel_ir_for(),
-        "ssd_bdt" => ssm::scan::mt_ssd_bdt::kernel_ir_for(),
-        "ssd_recur" => ssm::scan::mt_ssd_recur::kernel_ir_for(),
-        "ssd_combine" => ssm::scan::mt_ssd_combine::kernel_ir_for(),
-        "ssd_g1_cb" => ssm::scan::mt_ssd_g1_cb::kernel_ir_for(),
-        "ssd_g4_cs" => ssm::scan::mt_ssd_g4_cs::kernel_ir_for(),
+        "ssd_lcs" => ssm::scan::ffai_ssd_lcs::kernel_ir_for(),
+        "ssd_gather_bc" => ssm::scan::ffai_ssd_gather_bc::kernel_ir_for(),
+        "ssd_xt" => ssm::scan::ffai_ssd_xt::kernel_ir_for(),
+        "ssd_mmask" => ssm::scan::ffai_ssd_mmask::kernel_ir_for(),
+        "ssd_bdt" => ssm::scan::ffai_ssd_bdt::kernel_ir_for(),
+        "ssd_recur" => ssm::scan::ffai_ssd_recur::kernel_ir_for(),
+        "ssd_combine" => ssm::scan::ffai_ssd_combine::kernel_ir_for(),
+        "ssd_g1_cb" => ssm::scan::ffai_ssd_g1_cb::kernel_ir_for(),
+        "ssd_g4_cs" => ssm::scan::ffai_ssd_g4_cs::kernel_ir_for(),
         other => panic!("build_ssd_ir: unknown ssd kernel {other}"),
     }
 }

@@ -16,13 +16,13 @@
 //! (preserves in-place reads + readback) and invalidate the stale resident copy.
 
 use ffai_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
-use ffai_kernels_runtime::{Context, DispatchSpec, MetalTileError, ResidentBuffer};
+use ffai_kernels_runtime::{Context, DispatchSpec, FFAIError, ResidentBuffer};
 use parking_lot::{Mutex, RwLock};
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-fn err(e: MetalTileError) -> Error {
+fn err(e: FFAIError) -> Error {
     Error::Dispatch(e.to_string())
 }
 
