@@ -2571,18 +2571,26 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
             xNormFlat, t: t, cache: gc, cmd: cmd, device: device
         ).reshaped(to: [t * hidden])
 
-        // ── Residual add ────────────────────────────────────────────────
-        let postMix = Ops.add(hFlat, mixerOutFlat, on: cmd)
+        // Residual + post-norm (same fuse as attention when hidden fits).
+        let postMix: Tensor
+        let ffnNorm: Tensor?
+        if OpsValidation.validateAddRmsNorm(n: hidden) == nil {
+            let fused = Ops.addAndRmsNorm(
+                hFlat, mixerOutFlat,
+                weight: postNorm.weight, eps: postNorm.eps,
+                nRows: t, rowSize: hidden, on: cmd)
+            postMix = fused.residual
+            ffnNorm = fused.normed
+        } else {
+            postMix = Ops.add(hFlat, mixerOutFlat, on: cmd)
+            ffnNorm = nil
+        }
 
-        // ── FFN half — T-batched via qwen35ApplyFFNMany. ─────────────────
-        // For MoE FFN this dispatches `moe.decodeMany` (one BGEMM per
-        // gate/up/down at mTotal=T·topK + scatter-sum). For dense FFN
-        // it dispatches `mlp.forwardMany` (3 gemms). Mirrors the
-        // attention-layer's FFN dispatch.
         return qwen35ApplyFFNMany(
             ffn, postMix: postMix, t: t,
             postNorm: postNorm, hidden: hidden,
-            cmd: cmd, device: device)
+            cmd: cmd, device: device,
+            preNormed: ffnNorm)
     }
 }
 
