@@ -1901,15 +1901,15 @@ public final class Qwen35GDNMixer: Module {
         // `FFAI_GDN_WY=1` opts into the chunked-WY prefill pipeline
         // (`ffai_gdn_wy_plan` + `ffai_gdn_wy_scan`, see `Ops.swift`) —
         // default OFF, `gatedDeltaPrepChunk` above stays the production
-        // path untouched. The WY kernels' v1 require `t` to be an exact
-        // multiple of their fixed chunk size `c=64`; `prefillStepSize`
-        // (1024 by default) keeps every chunk but the last divisible by
-        // 64, so the ragged tail — and any caller passing a non-64-multiple
-        // `t` — falls back to `gatedDeltaPrepChunk` here. Padding the tail
-        // up to a multiple of 64 upstream (so WY can run unconditionally)
-        // is a documented follow-up, not implemented yet.
+        // path untouched. The WY kernels' v1 require `t_len` to be an
+        // exact multiple of their fixed chunk size `c=64`; `Ops
+        // .gatedDeltaWYPrefill` now pads any ragged tail up to a multiple
+        // of 64 internally (zero q/k/v, `g=1`/`beta=0` no-op tokens — see
+        // its doc comment), so the only remaining fallback to
+        // `gatedDeltaPrepChunk` is `t < 64` (no full chunk to pad up to at
+        // all).
         let useWY =
-            ProcessInfo.processInfo.environment["FFAI_GDN_WY"] != nil && t % 64 == 0
+            ProcessInfo.processInfo.environment["FFAI_GDN_WY"] != nil && t >= 64
             && valueHeadDim % 32 == 0 && keyHeadDim % 16 == 0 && valueHeadDim % 16 == 0
         if useWY {
             Ops.gatedDeltaWYPrefill(

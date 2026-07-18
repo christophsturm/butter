@@ -6753,12 +6753,21 @@ public enum Ops {
 
     /// Chunked-WY GDN prefill — two-kernel (`ffai_gdn_wy_plan` +
     /// `ffai_gdn_wy_scan`) alternative to `gatedDeltaPrepChunk`. Opt-in via
-    /// `FFAI_GDN_WY=1`, default OFF (see `Qwen35GDNMixer.forwardManyChunked`,
-    /// which also owns the `t % c == 0` fallback — this function
-    /// preconditions on it rather than silently falling back, so callers
-    /// must check before dispatching here; `_plan`/`_scan`'s `v1` require a
-    /// full multiple of `c=64`, a ragged tail is a documented follow-up in
-    /// both kernels' module docs).
+    /// `FFAI_GDN_WY=1`, default OFF (see `Qwen35GDNMixer.forwardManyChunked`).
+    ///
+    /// `_plan`/`_scan`'s v1 require `t_len` to be an exact multiple of
+    /// their fixed chunk size `c=64` — both kernels' module docs document
+    /// this as: FFAI pads a short prefill tail up to a multiple of `c`
+    /// upstream with `g=1, β=0` no-op tokens (a true no-op on the
+    /// recurrence: decay ×1, delta ×0 → state unchanged; the padded rows'
+    /// `y` output is simply never read). This function IS that upstream
+    /// pad: real `t` only needs to be `>= c` (the caller — see
+    /// `Qwen35GDNMixer.forwardManyChunked` — still falls back to
+    /// `gatedDeltaPrepChunk` for `t < c`, where there's no full chunk to
+    /// pad up to). When `t` is already a multiple of `c` (the common case
+    /// — `prefillStepSize` keeps every chunk but the last aligned) this is
+    /// a pure passthrough with zero extra dispatches; padding only kicks
+    /// in for a genuinely ragged tail/short prompt.
     ///
     /// Shape contract (B=1, matching the mixer's batching):
     ///   - `convOut`         : `[T, 2·Hk·Dk + Hv·Dv]` fp32 — the `v` slab is
@@ -6770,7 +6779,8 @@ public enum Ops {
     ///     layout `ffai_gdn_wy_plan` wants).
     ///   - `aRaw`/`bRaw`     : `[T, Hv]` fp32, from `castToF32Two`.
     ///   - `stateIn`/`stateOut` : `[Hv, Dv, Dk]` fp32 recurrent state.
-    ///   - `y`               : `[T, Hv, Dv]` fp32 (matches `gatedDeltaPrepChunk`'s `y`).
+    ///   - `y`               : `[T, Hv, Dv]` fp32 (matches `gatedDeltaPrepChunk`'s `y`) —
+    ///     always real-`t`-sized regardless of internal padding.
     public static func gatedDeltaWYPrefill(
         convOut: Tensor,
         dtBias: Tensor, negExpALog: Tensor,
@@ -6783,9 +6793,9 @@ public enum Ops {
     ) {
         let c = 64
         precondition(
-            t % c == 0,
-            "Ops.gatedDeltaWYPrefill: t (\(t)) must be a multiple of c=\(c) — "
-                + "caller must fall back to gatedDeltaPrepChunk for ragged chunk tails")
+            t >= c,
+            "Ops.gatedDeltaWYPrefill: t (\(t)) must be >= c=\(c) — "
+                + "caller must fall back to gatedDeltaPrepChunk when there's no full chunk")
         precondition(
             dk % 16 == 0 && dv % 16 == 0,
             "Ops.gatedDeltaWYPrefill: dk/dv (\(dk)/\(dv)) must be multiples of 16 (ffai_gdn_wy_plan MMA tiling)")
@@ -6800,14 +6810,20 @@ public enum Ops {
                 && stateIn.dtype == .f32 && stateOut.dtype == .f32 && y.dtype == .f32,
             "Ops.gatedDeltaWYPrefill: fp32 only (matches the mixer's fused-prep fp32 convention)")
 
-        let nc = t / c
+        let tPadded = ((t + c - 1) / c) * c
+        let nc = tPadded / c
         let n = hv  // B=1
         let convDim = 2 * hk * dk + hv * dv
         let dtBytes = DType.f32.byteSize
+        let ragged = tPadded != t
 
-        // ── v: dense [T, Hv, Dv] sliced out of conv_out's packed row ────
+        // ── v: dense [Tpadded, Hv, Dv] sliced out of conv_out's packed
+        // row; zero-filled tail when ragged (zero v-row is itself already
+        // a no-op contribution, but the tail's real no-op-ness comes from
+        // g=1/beta=0 below — v's own value there doesn't matter).
         let vAll = wyScratchTensor(
-            shape: [t * hv * dv], dtype: .f32, tag: "gdn_wy_v_\(t)x\(hv)x\(dv)", device: device)
+            shape: [tPadded * hv * dv], dtype: .f32, tag: "gdn_wy_v_\(tPadded)x\(hv)x\(dv)",
+            device: device)
         stridedCopyNd(
             srcBuffer: convOut.buffer,
             srcByteOffset: convOut.offset + (2 * hk * dk) * dtBytes,
@@ -6815,15 +6831,109 @@ public enum Ops {
             shape: [t, hv * dv], strides: [convDim, 1],
             outBuffer: vAll.buffer, outByteOffset: vAll.offset,
             on: cmd, device: device)
+        if ragged {
+            let validBytes = t * hv * dv * dtBytes
+            let tailBytes = (tPadded - t) * hv * dv * dtBytes
+            let blit = cmd.makeBlitCommandEncoder()!
+            blit.fill(
+                buffer: vAll.buffer,
+                range: (vAll.offset + validBytes) ..< (vAll.offset + validBytes + tailBytes),
+                value: 0)
+            blit.endEncoding()
+        }
 
-        // ── g/beta from a_raw/b_raw + dt_bias/negExpALog ────────────────
+        // ── g/beta from a_raw/b_raw + dt_bias/negExpALog over the real
+        // `t` rows; ragged tail padded to the documented (g=1, beta=0)
+        // no-op via a stride-0 broadcast from a 1-element scalar buffer
+        // (same broadcast idiom `stridedCopyNd` already uses for
+        // dt_bias/negExpALog above — `blit.fill` can't express a non-zero
+        // fp32 bit pattern like 1.0f, which isn't a uniform byte).
         let gAll = wyScratchTensor(
-            shape: [t * hv], dtype: .f32, tag: "gdn_wy_g_\(t)x\(hv)", device: device)
+            shape: [tPadded * hv], dtype: .f32, tag: "gdn_wy_g_\(tPadded)x\(hv)", device: device)
         let betaAll = wyScratchTensor(
-            shape: [t * hv], dtype: .f32, tag: "gdn_wy_beta_\(t)x\(hv)", device: device)
+            shape: [tPadded * hv], dtype: .f32, tag: "gdn_wy_beta_\(tPadded)x\(hv)", device: device)
         gdnGateBeta(
             aRaw: aRaw, bRaw: bRaw, dtBias: dtBias, negExpALog: negExpALog,
-            g: gAll, beta: betaAll, rows: t, hv: hv, on: cmd, device: device)
+            g: Tensor(buffer: gAll.buffer, offset: gAll.offset, shape: [t * hv], dtype: .f32),
+            beta: Tensor(buffer: betaAll.buffer, offset: betaAll.offset, shape: [t * hv], dtype: .f32),
+            rows: t, hv: hv, on: cmd, device: device)
+        if ragged {
+            let padRows = tPadded - t
+            stridedCopyNd(
+                srcBuffer: device.scalarBuffer(1.0), srcByteOffset: 0, dtype: .f32,
+                shape: [padRows * hv], strides: [0],
+                outBuffer: gAll.buffer, outByteOffset: gAll.offset + t * hv * dtBytes,
+                on: cmd, device: device)
+            stridedCopyNd(
+                srcBuffer: device.scalarBuffer(0.0), srcByteOffset: 0, dtype: .f32,
+                shape: [padRows * hv], strides: [0],
+                outBuffer: betaAll.buffer, outByteOffset: betaAll.offset + t * hv * dtBytes,
+                on: cmd, device: device)
+        }
+
+        // ── q/k: passthrough when already chunk-aligned; zero-padded
+        // grow-once scratch copies when ragged (mirrors the ragged-T qmm
+        // pad pattern in `dequantGemmDynamicM`).
+        let qForKernel: Tensor
+        let kForKernel: Tensor
+        if ragged {
+            let qPadded = wyScratchTensor(
+                shape: [tPadded * hk * dk], dtype: .f32, tag: "gdn_wy_qpad_\(tPadded)x\(hk)x\(dk)",
+                device: device)
+            let kPadded = wyScratchTensor(
+                shape: [tPadded * hk * dk], dtype: .f32, tag: "gdn_wy_kpad_\(tPadded)x\(hk)x\(dk)",
+                device: device)
+            let validBytes = t * hk * dk * dtBytes
+            let tailBytes = (tPadded - t) * hk * dk * dtBytes
+            let blit = cmd.makeBlitCommandEncoder()!
+            blit.copy(
+                from: qNormed.buffer, sourceOffset: qNormed.offset,
+                to: qPadded.buffer, destinationOffset: qPadded.offset, size: validBytes)
+            blit.copy(
+                from: kNormed.buffer, sourceOffset: kNormed.offset,
+                to: kPadded.buffer, destinationOffset: kPadded.offset, size: validBytes)
+            blit.fill(
+                buffer: qPadded.buffer,
+                range: (qPadded.offset + validBytes) ..< (qPadded.offset + validBytes + tailBytes),
+                value: 0)
+            blit.fill(
+                buffer: kPadded.buffer,
+                range: (kPadded.offset + validBytes) ..< (kPadded.offset + validBytes + tailBytes),
+                value: 0)
+            blit.endEncoding()
+            qForKernel = qPadded
+            kForKernel = kPadded
+        } else {
+            qForKernel = qNormed
+            kForKernel = kNormed
+        }
+
+        // ── y: write straight into the caller's buffer when aligned;
+        // otherwise scratch at Tpadded, sliced back to the real `t` rows
+        // the caller actually allocated/reads.
+        let yForKernel: Tensor
+        if ragged {
+            yForKernel = wyScratchTensor(
+                shape: [tPadded * hv * dv], dtype: .f32, tag: "gdn_wy_ypad_\(tPadded)x\(hv)x\(dv)",
+                device: device)
+        } else {
+            yForKernel = y
+        }
+
+        // ── t_len: the plan/scan kernels need the PADDED length (their
+        // `NC = t_len/c` sizes the chunk loop) — a fresh tiny buffer per
+        // ragged dispatch, same discipline as `stridedCopyNd`'s
+        // shape/strides buffers (not tagged scratch: a shared buffer would
+        // race across pipelined command buffers).
+        let tLenForKernel: Tensor
+        if ragged {
+            let buf = device.makeBuffer(length: 4)
+            var tPaddedU32 = UInt32(tPadded)
+            memcpy(buf.contents(), &tPaddedU32, 4)
+            tLenForKernel = Tensor(buffer: buf, offset: 0, shape: [1], dtype: .u32)
+        } else {
+            tLenForKernel = tLen
+        }
 
         // ── K1 intermediates (grow-once tagged scratch, tag by shape) ───
         let u = wyScratchTensor(
@@ -6840,16 +6950,16 @@ public enum Ops {
             shape: [n * nc * dv * dk], dtype: .f32, tag: "gdn_wy_us_\(n)x\(nc)x\(dv)x\(dk)", device: device)
 
         // ── K1: ffai_gdn_wy_plan — chunk-parallel, dispatchThreadgroups
-        // (coop_tile/MMA kernel). Grid (TGs): [T/C, B·Hv, 1], TG [512,1,1].
+        // (coop_tile/MMA kernel). Grid (TGs): [Tpadded/C, B·Hv, 1], TG [512,1,1].
         let gridK1 = MTLSize(width: nc, height: n, depth: 1)
         let tgK1 = MTLSize(width: 512, height: 1, depth: 1)
         MetalTileKernels.ffai_gdn_wy_plan_f32_threadgroups(
-            q: qNormed.buffer, qOffset: qNormed.offset,
-            k: kNormed.buffer, kOffset: kNormed.offset,
+            q: qForKernel.buffer, qOffset: qForKernel.offset,
+            k: kForKernel.buffer, kOffset: kForKernel.offset,
             v: vAll.buffer, vOffset: vAll.offset,
             g: gAll.buffer, gOffset: gAll.offset,
             beta: betaAll.buffer, betaOffset: betaAll.offset,
-            t_len: tLen.buffer, t_lenOffset: tLen.offset,
+            t_len: tLenForKernel.buffer, t_lenOffset: tLenForKernel.offset,
             u: u.buffer, uOffset: u.offset,
             y_local: yLocal.buffer, y_localOffset: yLocal.offset,
             q_eff: qEff.buffer, q_effOffset: qEff.offset,
@@ -6869,10 +6979,21 @@ public enum Ops {
             u_s: uS.buffer, u_sOffset: uS.offset,
             state_in: stateIn.buffer, state_inOffset: stateIn.offset,
             state_out: stateOut.buffer, state_outOffset: stateOut.offset,
-            y: y.buffer, yOffset: y.offset,
-            t_len: tLen.buffer, t_lenOffset: tLen.offset,
+            y: yForKernel.buffer, yOffset: yForKernel.offset,
+            t_len: tLenForKernel.buffer, t_lenOffset: tLenForKernel.offset,
             dk: UInt32(dk), dv: UInt32(dv), hv: UInt32(hv), c: UInt32(c),
             gridSize: gridK2, threadgroupSize: tgK2, on: cmd)
+
+        // ── Slice yForKernel's real-t rows back into the caller's `y`
+        // when we dispatched into padded scratch.
+        if ragged {
+            let blit = cmd.makeBlitCommandEncoder()!
+            blit.copy(
+                from: yForKernel.buffer, sourceOffset: yForKernel.offset,
+                to: y.buffer, destinationOffset: y.offset,
+                size: t * hv * dv * dtBytes)
+            blit.endEncoding()
+        }
     }
 
     // ─── Dynamic-M batched-prefill int4 qmm ───────────────────────────
