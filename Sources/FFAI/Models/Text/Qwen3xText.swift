@@ -1037,51 +1037,45 @@ public final class Qwen35MoEFFN: Module {
         return result
     }
 
-    /// T-batched MoE FFN. `xNormFlat` is `[T, hidden]` flat; returns
-    /// `[T, hidden]` flat. `MoELayer.decodeMany` commits the caller's
-    /// `cmd`; the shared-expert SwiGLU runs on a fresh `work` cmd and
-    /// the per-row sigmoidScalarFMA fan-out on fresh `fmaCmd`s. Mirrors
-    /// the single-token `forward`'s commit pattern; the returned
-    /// `outFlat` is in-flight on the last committed `fmaCmd` and
-    /// downstream reads hazard-track against it.
+    /// T-batched MoE FFN. Optional `residual` folds `postMix + ffn` into
+    /// the final FMA cmd (caller must not add residual again). DEVPLAN2
+    /// chains shared + routed + FMA on one buffer and commits once.
     func forwardMany(
         _ xNormFlat: Tensor, t: Int,
-        cmd: MTLCommandBuffer, device: Device
+        cmd: MTLCommandBuffer, device: Device,
+        residual: Tensor? = nil
     ) -> Tensor {
         let dt = xNormFlat.dtype
-        let dtBytes = dt.byteSize
+        let chainOnCmd = moe.prefillChainsOnCallerCmd
+        let work = chainOnCmd ? cmd : device.makeCommandBuffer()
 
-        // ── Routed top-K experts — commits `cmd`. ────────────────────────
-        let routed = moe.decodeMany(xNormFlat, t: t, cmd: cmd, device: device)
-        // routed: `[T, hidden]` flat, on `work`-internal-committed cmd.
-
-        // ── Shared expert batched: SwiGLU + scalar gate logit ────────────
-        let work = device.makeCommandBuffer()
+        // Shared expert first (independent of routed).
         let xRows = xNormFlat.reshaped(to: [t, hidden])
         let sgAll = sharedGateProj.callMany(xRows, t: t, on: work, device: device)
         let suAll = sharedUpProj.callMany(xRows, t: t, on: work, device: device)
-        // Fused SwiGLU.
         let sharedInnerAll = Ops.swiglu(gate: sgAll, up: suAll, on: work)
         let sharedOutAll = sharedDownProj.callMany(
             sharedInnerAll, t: t,
             on: work, device: device)
-        // sharedExpertGate is `hidden → 1`; per row this is one scalar.
         let gateLogitsAll = sharedExpertGate.callMany(
             xRows, t: t,
             on: work, device: device)
-        // ── Batched sigmoid-gated fan-in (single dispatch) ───────────────
+
+        let routed = moe.decodeMany(
+            xNormFlat, t: t, cmd: cmd, device: device,
+            commitAtEnd: !chainOnCmd)
+
         let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
-        let _ = dtBytes
-        // One row-broadcast FMA over all T rows on the SAME `work` cmd
-        // (before its commit). The previous shape was T separate command
-        // buffers each carrying one sigmoidScalarFMA dispatch — ~82k
-        // command buffers per 2k-token prefill across 40 MoE layers,
-        // which dominated prefill wall clock. `routed` lives on the
-        // moe-internal committed cmd; Metal hazard tracking orders the
-        // cross-command read exactly as it did for the per-row loop.
         Ops.sigmoidRowFMA(
             gate: gateLogitsAll, value: sharedOutAll, base: routed,
             into: outFlat, t: t, hidden: hidden, on: work)
+        if let residual = residual {
+            precondition(
+                residual.elementCount == t * hidden
+                    && residual.dtype == dt,
+                "Qwen35MoEFFN.forwardMany: residual must be [T·hidden] \(dt)")
+            _ = Ops.add(residual, outFlat, on: work, into: outFlat)
+        }
         work.commit()
         return outFlat
     }
@@ -2833,15 +2827,10 @@ private func qwen35ApplyFFNMany(
         let ffnOut = mlp.forwardMany(ffnNorm, t: t, cmd: cmd, device: device)
         return Ops.add(postMix, ffnOut.reshaped(to: [t * hidden]), on: cmd)
     case .moe(let moe):
-        // moe.forwardMany commits cmd; returns `[T, hidden]` flat on a
-        // fresh in-flight buffer. Run the residual add on a fresh
-        // addCmd so the returned tensor is independent of the
-        // already-committed cmd chain.
-        let ffnOut = moe.forwardMany(ffnNorm, t: t, cmd: cmd, device: device)
-        let addCmd = device.makeCommandBuffer()
-        let resultFlat = Ops.add(postMix, ffnOut, on: addCmd)
-        addCmd.commit()
-        return resultFlat
+        // Residual folded into forwardMany (no separate addCmd).
+        return moe.forwardMany(
+            ffnNorm, t: t, cmd: cmd, device: device,
+            residual: postMix)
     }
 }
 

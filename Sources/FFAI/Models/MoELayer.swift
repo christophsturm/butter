@@ -554,6 +554,20 @@ public final class MoELayer: Module, DecoderLayer {
         self.bm64Env = env["FFAI_MOE_BGEMM_BM64"] != nil
     }
 
+    /// DEVPLAN2 + stacked int4: expert path can stay on the caller's cmd.
+    /// Single source of truth for the token-order device plan — `decodeMany`
+    /// branches on this same predicate, so caller chaining (`commitAtEnd:
+    /// false`) and the internal no-mid-commit path can never disagree.
+    public var prefillChainsOnCallerCmd: Bool {
+        ProcessInfo.processInfo.environment["DEVPLAN2"] != "0"
+            && gpuRouterEnabled
+            && router.gatingMode == .softmaxThenTopK
+            && router.normTopKProb
+            && router.expertBias == nil
+            && router.topK == 8
+            && stackedInt4Experts != nil
+    }
+
     public func parameters() -> [(String, Tensor)] {
         var out: [(String, Tensor)] = []
         for (k, v) in gate.parameters() { out.append(("gate.\(k)", v)) }
@@ -692,50 +706,14 @@ public final class MoELayer: Module, DecoderLayer {
         }  // Profile.signpost("moe.decode")
     }
 
-    /// T-batched MoE forward. `hFlat` is `[T, hidden]` flat; returns
-    /// `[T, hidden]` flat. The mTotal = T·topK rows fan into a single
-    /// `Ops.moeGatherDequantGemmInt4` (or bm8 variant) per projection
-    /// instead of T·topK sequential per-expert SwiGLU triplets. At
-    /// Qwen3.6-A3B T=32, topK=8 → mTotal=256 fills the BM=16 tiles
-    /// 16-deep — the regime where cooperative-tensor weight sharing
-    /// PAYS (the same kernels regress at T=1 because every row is a
-    /// unique expert with no shared weight).
-    ///
-    /// Requires `stackedInt4Experts` (the BGEMM weights layout). Falls
-    /// back to per-token `decode` loop otherwise.
-    ///
-    /// Architecture:
-    ///   1. Gate gemv batched (`gate.callMany`) → `[T, nExperts]`.
-    ///   2. `cmd.commit() + wait` — router needs logits on CPU.
-    ///   3. Per-token routing on host (T calls, each O(nExperts) + a
-    ///      partial sort).
-    ///   4. Build plan over T·topK rows: `sourceToken[m]`,
-    ///      `expertId[m]`, `weight[m]`. Sort by `expertId` ascending so
-    ///      consecutive rows share an expert (the kernel walks rows in
-    ///      tile order; sorted = weight tile reuse across rows in a
-    ///      tile).
-    ///   5. `Ops.gather(h, gatherIdx)` → `xGathered [mTotal, hidden]`
-    ///      in one dispatch (vs T·topK host memcpys).
-    ///   6. `moeGatherDequantGemmInt4` × 3 (gate / up / down) on the
-    ///      gathered batch — one dispatch each.
-    ///   7. `Ops.swiglu` element-wise across `[mTotal, moeIntermediate]`.
-    ///   8. Weighted scatter-sum: for each `m`, scale `downOut[m]` by
-    ///      `weights[m]` and accumulate into `outFlat[sourceToken[m]]`.
-    ///      Uses the same `Tensor.filled([hidden])` broadcast pattern as
-    ///      the single-token `batchedSwiGLU`, mTotal times. Scatter-sum
-    ///      is the dominant residual cost at large `mTotal`; a future
-    ///      `ffai_moe_scatter_scale_add` kernel collapses these mTotal
-    ///      dispatches into one.
-    ///   9. Shared expert (if any): one per-row SwiGLU call across T
-    ///      tokens (also currently a T-loop because the single-token
-    ///      `swiGLU` path is the standing API).
-    ///
-    /// All work after the gate-readback runs on a fresh `work` cmd that
-    /// commits once at the end. The caller's `cmd` is consumed by the
-    /// gate gemv and the commit + wait.
+    /// T-batched MoE (`[T·hidden]` flat in/out). Stacked int4 → gather
+    /// BGEMM ×3 + unpermute; else per-token `decode`. DEVPLAN2 keeps the
+    /// path on `cmd` (no mid-commit). `commitAtEnd: false` lets the caller
+    /// chain more work before commit.
     public func decodeMany(
         _ hFlat: Tensor, t: Int,
-        cmd: MTLCommandBuffer, device: Device
+        cmd: MTLCommandBuffer, device: Device,
+        commitAtEnd: Bool = true
     ) -> Tensor {
         precondition(
             hFlat.elementCount == t * hidden,
@@ -762,15 +740,9 @@ public final class MoELayer: Module, DecoderLayer {
         // Token-order device plan (DEVPLAN2, default on): the GPU router
         // writes indices+weights; we run the expert GEMMs in token order
         // (no expert sort), so no readback / waitUntilCompleted / host sort.
-        // source_tokens = i/topK (iota), inv_perm = identity, both constant.
-        let useDevPlan2 =
-            ProcessInfo.processInfo.environment["DEVPLAN2"] != "0"
-            && self.gpuRouterEnabled
-            && router.gatingMode == .softmaxThenTopK
-            && router.normTopKProb
-            && router.expertBias == nil
-            && router.topK == 8
-            && stackedInt4Experts != nil
+        // Same predicate as `prefillChainsOnCallerCmd` — callers use it to
+        // decide `commitAtEnd`, so the two must never drift.
+        let useDevPlan2 = prefillChainsOnCallerCmd
         var d2Indices: Tensor? = nil
         var d2Source: Tensor? = nil
         var d2InvPerm: Tensor? = nil
@@ -797,7 +769,6 @@ public final class MoELayer: Module, DecoderLayer {
             let st = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
             let ip = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
             Ops.moeSortPlan(topkIds: idsFlat, sortedExperts: se, sourceTokens: st, invPerm: ip, mTotal: mTot, k: topK, on: cmd)
-            cmd.commit()  // no wait: downstream `work` hazard-tracks these buffers
             d2Source = st
             d2InvPerm = ip
             d2Indices = se
@@ -915,7 +886,8 @@ public final class MoELayer: Module, DecoderLayer {
         }
 
         // ── 6. Work cmd for the rest of the layer ────────────────────────
-        let work = device.makeCommandBuffer()
+        // DEVPLAN2 reuses `cmd`; host-router paths already committed it.
+        let work = useDevPlan2 ? cmd : device.makeCommandBuffer()
         let moeIntermediate = stacked.moeIntermediate
         let groupSize = stacked.groupSize
 
@@ -1069,10 +1041,10 @@ public final class MoELayer: Module, DecoderLayer {
             }
         }
 
-        // ── 14. Commit without wait — outFlat is in-flight; the caller's
-        // next read hazard-tracks against this write. Mirrors decode's
-        // commit pattern.
-        work.commit()
+        // Commit without wait; skip when the caller will chain + commit.
+        if commitAtEnd {
+            work.commit()
+        }
         return outFlat
     }
 
