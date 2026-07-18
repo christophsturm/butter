@@ -35,9 +35,10 @@
 //     scalar-broadcast FMA for the MoE top-K expert accumulator path
 //     (avoids materializing a `Tensor.filled([hidden], weight)`
 //     broadcast buffer per expert).
-//   * `sigmoidScalarFMAResidual` — `sigmoidScalarFMA` with the
-//     residual add folded in for the post-MoE-FFN path (the bare
-//     `sigmoidScalarFMA` sibling lives in `Ops.swift`).
+//   * `sigmoidScalarFMAResidual` / `sigmoidRowFMAResidual` —
+//     `sigmoid*FMA` with the residual add folded in for the
+//     post-MoE-FFN path (the bare `sigmoidScalarFMA` /
+//     `sigmoidRowFMA` siblings live in `Ops.swift`).
 
 import Foundation
 import Metal
@@ -749,6 +750,68 @@ extension Ops {
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.sigmoidScalarFMAResidual: unsupported dtype \(out.dtype)")
+        }
+    }
+
+    /// Row-broadcast form of `sigmoidScalarFMAResidual` over a
+    /// `[T, hidden]` layout:
+    /// `out[r,h] = residual[r,h] + base[r,h] + sigmoid(gate[r]) * value[r,h]`.
+    /// Collapses the MoE post-FFN prefill chain
+    /// `sigmoidRowFMA(gate, sharedOut, routed) → ffnOut` followed by
+    /// `Ops.add(postMix, ffnOut)` into one kernel, saving a full
+    /// `[T, hidden]` DRAM roundtrip + one dispatch per MoE layer.
+    public static func sigmoidRowFMAResidual(
+        gate: Tensor, value: Tensor, base: Tensor, residual: Tensor,
+        into out: Tensor, t: Int, hidden: Int, on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            gate.dtype == value.dtype && value.dtype == base.dtype
+                && base.dtype == residual.dtype && residual.dtype == out.dtype,
+            "Ops.sigmoidRowFMAResidual: all tensors must share dtype")
+        precondition(
+            gate.elementCount == t,
+            "Ops.sigmoidRowFMAResidual: gate must be [T] (got \(gate.elementCount), T=\(t))")
+        precondition(
+            value.elementCount == t * hidden
+                && base.elementCount == t * hidden
+                && residual.elementCount == t * hidden
+                && out.elementCount == t * hidden,
+            "Ops.sigmoidRowFMAResidual: value/base/residual/out must be T*hidden")
+        let n = t * hidden
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let hiddenU = UInt32(hidden)
+        switch out.dtype {
+        case .f32:
+            MetalTileKernels.ffai_sigmoid_row_fma_residual_f32(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_sigmoid_row_fma_residual_f16(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_sigmoid_row_fma_residual_bf16(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.sigmoidRowFMAResidual: unsupported dtype \(out.dtype)")
         }
     }
 }

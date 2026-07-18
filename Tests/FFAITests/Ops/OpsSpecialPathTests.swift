@@ -381,6 +381,41 @@ struct OpsSpecialPathTests {
         }
     }
 
+    @Test("sigmoidRowFMAResidual f32 — out[r,h] = residual + base + sigmoid(gate[r]) * value")
+    func sigmoidRowFMAResidualF32() {
+        autoreleasepool {
+            let t = 2
+            let hidden = 4
+            // gate[0] = 0 → sigmoid 0.5; gate[1] → large → sigmoid ≈ 1
+            let gate = Tensor.empty(shape: [t], dtype: .f32)
+            gate.copyIn(from: [Float(0), 20])
+            let value = Tensor.empty(shape: [t * hidden], dtype: .f32)
+            value.copyIn(from: [Float(2), 4, 6, 8, 1, 2, 3, 4])
+            let base = Tensor.empty(shape: [t * hidden], dtype: .f32)
+            base.copyIn(from: [Float(10), 20, 30, 40, 50, 60, 70, 80])
+            let residual = Tensor.empty(shape: [t * hidden], dtype: .f32)
+            residual.copyIn(from: [Float(100), 200, 300, 400, 500, 600, 700, 800])
+            let out = Tensor.empty(shape: [t * hidden], dtype: .f32)
+            out.zero()
+            runAndWait { cb in
+                Ops.sigmoidRowFMAResidual(
+                    gate: gate, value: value, base: base, residual: residual,
+                    into: out, t: t, hidden: hidden, on: cb)
+            }
+            // row0: residual + base + 0.5 * value
+            // row1: residual + base + 1.0 * value (sigmoid(20) ≈ 1)
+            let r = out.toArray(as: Float.self)
+            #expect(abs(r[0] - 111) < 1e-4)
+            #expect(abs(r[1] - 222) < 1e-4)
+            #expect(abs(r[2] - 333) < 1e-4)
+            #expect(abs(r[3] - 444) < 1e-4)
+            #expect(abs(r[4] - 551) < 1e-3)
+            #expect(abs(r[5] - 662) < 1e-3)
+            #expect(abs(r[6] - 773) < 1e-3)
+            #expect(abs(r[7] - 884) < 1e-3)
+        }
+    }
+
     @Test("scalarFMA f32 — out = base + scalar * value")
     func scalarFMAF32() {
         autoreleasepool {
