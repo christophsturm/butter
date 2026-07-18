@@ -5539,6 +5539,24 @@ public enum Ops {
     // internally — BM=16 with boundary masking). Grid =
     //   [N / 32, ceil(mTotal / 16), 1]
     // Threadgroup = [64, 1, 1] (2 simdgroups).
+    /// Grow-only identity row-map (`x_rows[i] = i`) for the bm16 MPP
+    /// gather family's pre-gathered-X layout. An iota of capacity N
+    /// serves any mTotal <= N — the kernel reads only the first m_total
+    /// entries. Refilled only on growth.
+    private static let identityRowsLock = NSLock()
+    nonisolated(unsafe) private static var identityRowsBuf: MTLBuffer?
+    static func identityRowsBuffer(minCount: Int, device: Device) -> MTLBuffer {
+        identityRowsLock.lock()
+        defer { identityRowsLock.unlock() }
+        if let buf = identityRowsBuf, buf.length >= minCount * 4 { return buf }
+        let cap = max(minCount, 8192)
+        let buf = device.makeBuffer(length: cap * 4)
+        let ptr = buf.contents().bindMemory(to: UInt32.self, capacity: cap)
+        for i in 0 ..< cap { ptr[i] = UInt32(i) }
+        identityRowsBuf = buf
+        return buf
+    }
+
     /// Whether the MPP auto-default may fire: Apple GPU Family 9+ (M3+)
     /// and macOS 26+ (Metal 4 — the MPP header live-compile requires it).
     /// Cached once; explicit FFAI_MOE_BGEMM_MPP=1 bypasses this.
@@ -5630,6 +5648,8 @@ public enum Ops {
         let groupSizeU = UInt32(groupSize)
 
         if useMpp {
+            // Identity x_rows: X is pre-gathered, row i reads x[i, :].
+            let idRows = Self.identityRowsBuffer(minCount: mTotal, device: Device.shared)
             switch input.dtype {
             case .f32:
                 MetalTileKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_f32(
@@ -5638,6 +5658,7 @@ public enum Ops {
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
                     indices: indices.buffer, indicesOffset: indices.offset,
+                    x_rows: idRows, x_rowsOffset: 0,
                     out: out.buffer, outOffset: out.offset,
                     m_total: mTotalU, n_out: nOutU, k_in: kInU,
                     group_size: groupSizeU,
@@ -5649,6 +5670,7 @@ public enum Ops {
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
                     indices: indices.buffer, indicesOffset: indices.offset,
+                    x_rows: idRows, x_rowsOffset: 0,
                     out: out.buffer, outOffset: out.offset,
                     m_total: mTotalU, n_out: nOutU, k_in: kInU,
                     group_size: groupSizeU,
@@ -5661,6 +5683,7 @@ public enum Ops {
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
                     indices: indices.buffer, indicesOffset: indices.offset,
+                    x_rows: idRows, x_rowsOffset: 0,
                     out: out.buffer, outOffset: out.offset,
                     m_total: mTotalU, n_out: nOutU, k_in: kInU,
                     group_size: groupSizeU,
@@ -8222,13 +8245,27 @@ public enum Ops {
         enc.setBuffer(scales.buffer, offset: scales.offset, index: 2)
         enc.setBuffer(biases.buffer, offset: biases.offset, index: 3)
         enc.setBuffer(indices.buffer, offset: indices.offset, index: 4)
-        enc.setBuffer(out.buffer, offset: out.offset, index: 5)
-        enc.setBytes(&mTotalU, length: 4, index: 6)
-        enc.setBytes(&nOutU, length: 4, index: 7)
-        enc.setBytes(&kInU, length: 4, index: 8)
-        enc.setBytes(&groupSizeU, length: 4, index: 9)
-        if useExpertGrid {
-            enc.setBytes(&nExpertsU, length: 4, index: 10)
+        // The bm16_mpp family carries an x_rows row-map (identity here —
+        // X is pre-gathered); its out/constexpr bindings shift by one.
+        // The other tiles keep the original ABI.
+        let hasXRows = !useExpertGrid && !useBm64 && !useBm8 && !useMma
+        if hasXRows {
+            let idRows = Self.identityRowsBuffer(minCount: mTotal, device: Device.shared)
+            enc.setBuffer(idRows, offset: 0, index: 5)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 6)
+            enc.setBytes(&mTotalU, length: 4, index: 7)
+            enc.setBytes(&nOutU, length: 4, index: 8)
+            enc.setBytes(&kInU, length: 4, index: 9)
+            enc.setBytes(&groupSizeU, length: 4, index: 10)
+        } else {
+            enc.setBuffer(out.buffer, offset: out.offset, index: 5)
+            enc.setBytes(&mTotalU, length: 4, index: 6)
+            enc.setBytes(&nOutU, length: 4, index: 7)
+            enc.setBytes(&kInU, length: 4, index: 8)
+            enc.setBytes(&groupSizeU, length: 4, index: 9)
+            if useExpertGrid {
+                enc.setBytes(&nExpertsU, length: 4, index: 10)
+            }
         }
         let tgGrid: MTLSize
         if useExpertGrid {
