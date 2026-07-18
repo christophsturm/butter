@@ -6606,50 +6606,54 @@ public enum Ops {
             return
         }
 
-        // Slow path: pad X to mPadded with zero rows, dispatch into a
-        // padded output, copy the first T rows back to `out`. Reuse
-        // device intermediateScratch slabs so Hy3 prefill (T not a
-        // multiple of 32) does not allocate a fresh pair of large
-        // buffers on every callMany (q/k/v/o/shared × 80 layers).
-        let inBytes = mPadded * kIn * input.dtype.byteSize
-        let outBytes = mPadded * nOut * input.dtype.byteSize
-        let xPadBuf = device.intermediateScratch(
-            tag: "qmm_mma_xpad_\(input.dtype)", minBytes: inBytes)
-        let outPadBuf = device.intermediateScratch(
-            tag: "qmm_mma_opad_\(input.dtype)", minBytes: outBytes)
-        let xPadded = Tensor(
-            buffer: xPadBuf, offset: 0, shape: [mPadded, kIn], dtype: input.dtype)
-        let outPadded = Tensor(
-            buffer: outPadBuf, offset: 0, shape: [mPadded, nOut], dtype: input.dtype)
-        let validInBytes = t * kIn * input.dtype.byteSize
-        let tailZeroBytes = (mPadded - t) * kIn * input.dtype.byteSize
-        let blit = cmd.makeBlitCommandEncoder()!
-        blit.copy(
-            from: input.buffer, sourceOffset: input.offset,
-            to: xPadded.buffer, destinationOffset: xPadded.offset,
-            size: validInBytes)
-        if tailZeroBytes > 0 {
-            blit.fill(
-                buffer: xPadded.buffer,
-                range: (xPadded.offset + validInBytes)
-                    ..< (xPadded.offset + validInBytes + tailZeroBytes),
-                value: 0)
-        }
-        blit.endEncoding()
-        dispatchQmmMma(
-            weight: weight, scales: scales, biases: biases,
-            input: xPadded, output: outPadded,
-            m: mPadded, n: nOut, k: kIn, gsPerRow: gsPerRow, bits: bits,
-            on: cmd)
+        // Slow path: pad X → mPadded, qmm, slice first T rows to `out`.
+        // Per-call pads (not one shared intermediateScratch pair): a
+        // single pad false-hazards every concurrent callMany on the same
+        // cmd when T%32!=0. `Tensor.empty` / scratch-slab bumps stay unique;
+        // the cmd retains the buffer until GPU completion.
+        //
+        // autoreleasepool is CRITICAL here: outside scratch mode each call
+        // allocates a fresh pad pair via `mtlDevice.makeBuffer` (no pool),
+        // and ObjC-bridged buffers are pinned by the enclosing autorelease
+        // pool until it drains — hundreds of ragged callManys per prefill
+        // would accumulate GBs of RSS (the DeepSeekV4 prefill freeze class).
+        // The cmd retains the pads at encode time, so releasing our
+        // references at pool exit is safe.
+        autoreleasepool {
+            let xPadded = Tensor.empty(
+                shape: [mPadded, kIn], dtype: input.dtype, device: device)
+            let outPadded = Tensor.empty(
+                shape: [mPadded, nOut], dtype: input.dtype, device: device)
+            let validInBytes = t * kIn * input.dtype.byteSize
+            let tailZeroBytes = (mPadded - t) * kIn * input.dtype.byteSize
+            let blit = cmd.makeBlitCommandEncoder()!
+            blit.copy(
+                from: input.buffer, sourceOffset: input.offset,
+                to: xPadded.buffer, destinationOffset: xPadded.offset,
+                size: validInBytes)
+            if tailZeroBytes > 0 {
+                blit.fill(
+                    buffer: xPadded.buffer,
+                    range: (xPadded.offset + validInBytes)
+                        ..< (xPadded.offset + validInBytes + tailZeroBytes),
+                    value: 0)
+            }
+            blit.endEncoding()
+            dispatchQmmMma(
+                weight: weight, scales: scales, biases: biases,
+                input: xPadded, output: outPadded,
+                m: mPadded, n: nOut, k: kIn, gsPerRow: gsPerRow, bits: bits,
+                on: cmd)
 
-        // Slice first T rows of outPadded → out (MTLBlit on `cmd`).
-        let validOutBytes = t * nOut * input.dtype.byteSize
-        let outBlit = cmd.makeBlitCommandEncoder()!
-        outBlit.copy(
-            from: outPadded.buffer, sourceOffset: outPadded.offset,
-            to: out.buffer, destinationOffset: out.offset,
-            size: validOutBytes)
-        outBlit.endEncoding()
+            // Slice first T rows of outPadded → out (MTLBlit on `cmd`).
+            let validOutBytes = t * nOut * input.dtype.byteSize
+            let outBlit = cmd.makeBlitCommandEncoder()!
+            outBlit.copy(
+                from: outPadded.buffer, sourceOffset: outPadded.offset,
+                to: out.buffer, destinationOffset: out.offset,
+                size: validOutBytes)
+            outBlit.endEncoding()
+        }
     }
 
     /// Encode an int8 affine MPP QMM onto an existing (possibly concurrent)
