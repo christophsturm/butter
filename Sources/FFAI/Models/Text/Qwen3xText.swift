@@ -3220,7 +3220,18 @@ public final class Qwen35Model: LanguageModel {
         idsHost.withUnsafeBytes { _ = memcpy(idsBuf.contents(), $0.baseAddress!, t * 4) }
         let idsTensor = Tensor(buffer: idsBuf, offset: 0, shape: [t], dtype: .u32)
 
+        // FFAI_PROFILE_LAYERS=1|2: per-layer commit+wait for attribution
+        // only (kills pipelining). =2 also records per-layer phases.
+        // GPU windows cover the outer workCmd only — layers that commit
+        // internal buffers (MoE FFN paths) undercount slightly.
+        let profileLayers =
+            ProcessInfo.processInfo.environment["FFAI_PROFILE_LAYERS"] == "1"
+                || ProcessInfo.processInfo.environment["FFAI_PROFILE_LAYERS"] == "2"
+        let profilePerLayer =
+            ProcessInfo.processInfo.environment["FFAI_PROFILE_LAYERS"] == "2"
+
         var workCmd = device.makeCommandBuffer()
+        let embWall0 = profileLayers ? CFAbsoluteTimeGetCurrent() : 0
         var h = embedTokens(idsTensor, on: workCmd).reshaped(to: [t * hidden])
         // h is `[T, hidden]` flat. Dtype follows the embedding output —
         // for QuantizedEmbedding that's `scales.dtype` (model running
@@ -3230,14 +3241,47 @@ public final class Qwen35Model: LanguageModel {
         let dt = h.dtype
         let dtBytes = dt.byteSize
 
+        if profileLayers {
+            workCmd.commit()
+            workCmd.waitUntilCompleted()
+            let embWall = CFAbsoluteTimeGetCurrent() - embWall0
+            let embGpu = max(0, workCmd.gpuEndTime - workCmd.gpuStartTime)
+            Profile.shared.recordPhase("prefill.embed_wall", durationS: embWall)
+            Profile.shared.recordPhase("prefill.embed_gpu", durationS: embGpu)
+            workCmd = device.makeCommandBuffer()
+        }
+
+        var attnWall = 0.0, attnGpu = 0.0
+        var gdnWall = 0.0, gdnGpu = 0.0
+        var otherWall = 0.0, otherGpu = 0.0
+        var nAttn = 0, nGdn = 0, nOther = 0
+
         for (i, layer) in layers.enumerated() {
+            let layerStart = profileLayers ? CFAbsoluteTimeGetCurrent() : 0
             if let attn = layer as? Qwen35AttentionLayer {
                 h = attn.decodeMany(
                     h, t: t, startPosition: startPosition,
                     cache: caches[i],
                     cmd: workCmd, device: device)
                 // attn.decodeMany commits workCmd if MoE FFN. Refresh.
-                if attn.commitsCommandBuffer {
+                if profileLayers {
+                    if !attn.commitsCommandBuffer {
+                        workCmd.commit()
+                    }
+                    workCmd.waitUntilCompleted()
+                    let wall = CFAbsoluteTimeGetCurrent() - layerStart
+                    let gpu = max(0, workCmd.gpuEndTime - workCmd.gpuStartTime)
+                    attnWall += wall
+                    attnGpu += gpu
+                    nAttn += 1
+                    if profilePerLayer {
+                        Profile.shared.recordPhase(
+                            "L\(i).attn_wall", durationS: wall)
+                        Profile.shared.recordPhase(
+                            "L\(i).attn_gpu", durationS: gpu)
+                    }
+                    workCmd = device.makeCommandBuffer()
+                } else if attn.commitsCommandBuffer {
                     workCmd = device.makeCommandBuffer()
                 }
             } else if let gdn = layer as? Qwen35GDNLayer, gdn.mixer.fused {
@@ -3246,7 +3290,23 @@ public final class Qwen35Model: LanguageModel {
                     cache: caches[i],
                     cmd: workCmd, device: device)
                 // GDN's commitsCommandBuffer is always true; refresh.
-                workCmd = device.makeCommandBuffer()
+                if profileLayers {
+                    workCmd.waitUntilCompleted()
+                    let wall = CFAbsoluteTimeGetCurrent() - layerStart
+                    let gpu = max(0, workCmd.gpuEndTime - workCmd.gpuStartTime)
+                    gdnWall += wall
+                    gdnGpu += gpu
+                    nGdn += 1
+                    if profilePerLayer {
+                        Profile.shared.recordPhase(
+                            "L\(i).gdn_wall", durationS: wall)
+                        Profile.shared.recordPhase(
+                            "L\(i).gdn_gpu", durationS: gpu)
+                    }
+                    workCmd = device.makeCommandBuffer()
+                } else {
+                    workCmd = device.makeCommandBuffer()
+                }
             } else {
                 // GDN (legacy non-fused) or other — per-token loop with
                 // blit-back.
@@ -3275,7 +3335,40 @@ public final class Qwen35Model: LanguageModel {
                     if committed { workCmd = device.makeCommandBuffer() }
                 }
                 blitCmd.commit()
+                if profileLayers {
+                    blitCmd.waitUntilCompleted()
+                    let wall = CFAbsoluteTimeGetCurrent() - layerStart
+                    let gpu = max(0, blitCmd.gpuEndTime - blitCmd.gpuStartTime)
+                    otherWall += wall
+                    otherGpu += gpu
+                    nOther += 1
+                }
             }
+        }
+
+        if profileLayers {
+            // Stable phase keys (layer counts live in the stderr summary
+            // line, not the key — dynamic keys fragment the profile table).
+            Profile.shared.recordPhase("prefill.attn_wall", durationS: attnWall)
+            Profile.shared.recordPhase("prefill.attn_gpu", durationS: attnGpu)
+            Profile.shared.recordPhase("prefill.gdn_wall", durationS: gdnWall)
+            Profile.shared.recordPhase("prefill.gdn_gpu", durationS: gdnGpu)
+            if nOther > 0 {
+                Profile.shared.recordPhase("prefill.other_wall", durationS: otherWall)
+                Profile.shared.recordPhase("prefill.other_gpu", durationS: otherGpu)
+            }
+            let totalGpu = attnGpu + gdnGpu + otherGpu
+            fputs(
+                String(
+                    format:
+                        "[PROFILE_LAYERS] T=%d  attn: wall=%.1fms gpu=%.1fms (%.0f%%)  gdn: wall=%.1fms gpu=%.1fms (%.0f%%)  total_gpu=%.1fms  (n_attn=%d n_gdn=%d)\n",
+                    t,
+                    attnWall * 1000, attnGpu * 1000,
+                    totalGpu > 0 ? 100 * attnGpu / totalGpu : 0,
+                    gdnWall * 1000, gdnGpu * 1000,
+                    totalGpu > 0 ? 100 * gdnGpu / totalGpu : 0,
+                    totalGpu * 1000, nAttn, nGdn),
+                stderr)
         }
 
         // Make sure all in-flight writes to `h` are resident before the
