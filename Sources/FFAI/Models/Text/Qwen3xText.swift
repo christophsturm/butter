@@ -2448,15 +2448,38 @@ public final class Qwen35AttentionMixer: Module {
             kFlat: kNormed, vFlat: vOut, t: t,
             positions: appendPositions, on: cmd)
 
-        // ── SDPA — fuse the T-token causal attention into ONE
-        // `Ops.sdpaMulti` dispatch. d=128 wraps `ffai_sdpa_multi`;
-        // d=256 (Qwen3.6-A3B full-attention layers) wraps
-        // `ffai_sdpa_multi_d256` — same semantics, head_dim-256 2-phase
-        // output reduction internally. T-loop `sdpaDecode` fallback only
-        // fires for other head_dims.
+        // ── SDPA (fuse the T-token causal attention into ONE dispatch).
+        // d=128 wraps `ffai_sdpa_multi` (`Ops.sdpaMulti`, unchanged). d=256
+        // (Qwen3.6-A3B full-attention layers) defaults to
+        // `Ops.sdpaPrefillQtiledD256` (`ffai_sdpa_prefill_qtiled_d256`):
+        // BQ=16 query rows share each loaded K/V block before advancing,
+        // vs the legacy `ffai_sdpa_multi_d256` (one threadgroup per
+        // (query, q_head), no K/V reuse across rows, so HBM traffic for
+        // K/V scales with T per row, T^2 total). That's exactly the
+        // "append regime" bandwidth waste the F-85 prefill-attention
+        // campaign attribution identified as the root of the ~4.4x
+        // llama.cpp gap.
+        // Measured e2e prefill win on Qwen3.6-35B-A3B (M5 Max): +1.6% at
+        // T=1024, +7.2% at T=4096, +13.9% at T=8488, +27.4% at T=16889,
+        // no regression at any T down to 124; quality gate (cosine vs
+        // the legacy path) held >=0.998 at T=512..16889 across 6
+        // non-repeating prompts. `FFAI_SDPA_LEGACY_D256=1` reverts to the
+        // legacy kernel for bisection.
+        let useLegacyD256 =
+            headDim == 256
+                && ProcessInfo.processInfo.environment["FFAI_SDPA_LEGACY_D256"] == "1"
+        let useQtiled = headDim == 256 && !useLegacyD256
         let (cacheK, cacheV) = kv.prepareForAttention(on: cmd)
         let attnAll: Tensor
-        if headDim == 128 || headDim == 256 {
+        if useQtiled {
+            let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
+            attnAll = Ops.sdpaPrefillQtiledD256(
+                q: qBlock, k: cacheK, v: cacheV,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
+                causal: true, scale: scale, on: cmd
+            ).reshaped(to: [t * qDim])
+        } else if headDim == 128 || headDim == 256 {
             // qNormed is `[T, nHeads, headDim]` flat. Reshape into the
             // shape sdpaMulti expects (same buffer, no copy).
             let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
