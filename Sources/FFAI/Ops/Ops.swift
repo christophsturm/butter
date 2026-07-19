@@ -6693,26 +6693,30 @@ public enum Ops {
     /// instead of computing them internally from raw `a_raw`/`b_raw` +
     /// `a_log`/`dt_bias`.
     ///
-    /// Math (identical to `gatedDeltaPrepChunk`'s internal per-token
-    /// g/beta — un-clamped softplus, matching `ffai_gdn_wy_plan`'s module
-    /// doc convention exactly):
-    ///   - `dt   = softplus(a_raw + dt_bias)`        (un-clamped: `Ops.softplus`
-    ///     computes the numerically-stable form, which is the exact same
-    ///     real value as `log(1+exp(x))` away from overflow — a_raw/dt_bias
-    ///     are small learned/activation values, never in the overflow
-    ///     regime, so this is not a precision compromise.)
+    /// Dispatches the fused `ffai_gdn_gate_beta` kernel (one dispatch),
+    /// replacing what used to be a ~6-dispatch elementwise chain (sigmoid,
+    /// two broadcasts, add, softplus, mul, exp — see git history for the
+    /// old implementation).
+    ///
+    /// Math (identical to `gatedDeltaPrepChunk`'s internal per-token g/beta
+    /// — same un-clamped softplus `ffai_gated_delta_prep_chunk` bakes in,
+    /// `log(exp(x)+1)`; the fused kernel now matches that production
+    /// oracle's formula exactly, superseding the old chain's use of the
+    /// numerically-stable `ffai_softplus` kernel — the same real value
+    /// away from overflow, which the learned `a_raw`/`dt_bias` activations
+    /// never approach):
+    ///   - `dt   = log(exp(a_raw + dt_bias) + 1)`
     ///   - `g    = exp(-exp(a_log) * dt) = exp(negExpALog * dt)`
     ///   - `beta = sigmoid(b_raw)`
     ///
     /// `negExpALog = -exp(a_log)` is precomputed once on the host at model
     /// load (`a_log` is a static per-head weight, not runtime data — see
-    /// `Qwen35GDNMixer.negExpALogTF32`), sidestepping the fact that the
-    /// elementwise kernel set has no standalone negate/scalar-affine op.
+    /// `Qwen35GDNMixer.negExpALogTF32`).
     ///
     /// `dt_bias`/`negExpALog` are `[Hv]`; `a_raw`/`b_raw` (and `g`/`beta`)
-    /// are `[rows, Hv]` (`rows = B·T`, B=1 here) — broadcasts the `[Hv]`
-    /// constants against the `[rows, Hv]` runtime chunk via `stridedCopyNd`
-    /// (a stride-0 outer axis).
+    /// are `[rows, Hv]` (`rows = B·T`, B=1 here) — the kernel broadcasts
+    /// the `[Hv]` constants against the `[rows, Hv]` runtime chunk via
+    /// `idx % hv` internally (no host-side broadcast dispatch needed).
     public static func gdnGateBeta(
         aRaw: Tensor, bRaw: Tensor,
         dtBias: Tensor, negExpALog: Tensor,
@@ -6732,58 +6736,38 @@ public enum Ops {
                 && negExpALog.dtype == .f32 && g.dtype == .f32 && beta.dtype == .f32,
             "Ops.gdnGateBeta: fp32 only (matches gatedDeltaPrepChunk's fp32 g/beta convention)")
 
-        // Flat [rows·hv] views — callers may pass [B,T,Hv]-shaped tensors
-        // (`add`/`mul` require exact shape equality, and the scratch
-        // intermediates below are 1-D).
-        let aRawFlat = Tensor(
-            buffer: aRaw.buffer, offset: aRaw.offset, shape: [rows * hv], dtype: .f32)
-        let bRawFlat = Tensor(
-            buffer: bRaw.buffer, offset: bRaw.offset, shape: [rows * hv], dtype: .f32)
-        let gFlat = Tensor(buffer: g.buffer, offset: g.offset, shape: [rows * hv], dtype: .f32)
-        let betaFlat = Tensor(
-            buffer: beta.buffer, offset: beta.offset, shape: [rows * hv], dtype: .f32)
-
-        // beta = sigmoid(b_raw) — same shape, no broadcast needed.
-        _ = sigmoid(bRawFlat, on: cmd, into: betaFlat)
-
-        // Broadcast dt_bias / negExpALog [hv] -> [rows, hv] (stride-0 outer
-        // axis), tagged grow-once scratch (reused across layers/chunks of
-        // the same [rows,hv] shape).
-        let dtBiasFull = wyScratchTensor(
-            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_dtbias_full_\(rows)x\(hv)", device: device)
-        let negExpALogFull = wyScratchTensor(
-            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_negexpalog_full_\(rows)x\(hv)", device: device)
-        stridedCopyNd(
-            srcBuffer: dtBias.buffer, srcByteOffset: dtBias.offset, dtype: .f32,
-            shape: [rows, hv], strides: [0, 1],
-            outBuffer: dtBiasFull.buffer, outByteOffset: dtBiasFull.offset,
-            on: cmd, device: device)
-        stridedCopyNd(
-            srcBuffer: negExpALog.buffer, srcByteOffset: negExpALog.offset, dtype: .f32,
-            shape: [rows, hv], strides: [0, 1],
-            outBuffer: negExpALogFull.buffer, outByteOffset: negExpALogFull.offset,
-            on: cmd, device: device)
-
-        let sum = wyScratchTensor(
-            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_sum_\(rows)x\(hv)", device: device)
-        _ = add(aRawFlat, dtBiasFull, on: cmd, into: sum)
-        let dt = wyScratchTensor(
-            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_dt_\(rows)x\(hv)", device: device)
-        _ = softplus(sum, on: cmd, into: dt)
-        let scaled = wyScratchTensor(
-            shape: [rows * hv], dtype: .f32, tag: "gdn_wy_scaled_\(rows)x\(hv)", device: device)
-        _ = mul(negExpALogFull, dt, on: cmd, into: scaled)
-        _ = exp(scaled, on: cmd, into: gFlat)
+        let n = rows * hv
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        MetalTileKernels.ffai_gdn_gate_beta_f32(
+            a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+            b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+            dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+            neg_exp_a_log: negExpALog.buffer, neg_exp_a_logOffset: negExpALog.offset,
+            g: g.buffer, gOffset: g.offset,
+            beta: beta.buffer, betaOffset: beta.offset,
+            hv: UInt32(hv),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
     }
 
     /// Chunked-WY GDN prefill — two-kernel (`ffai_gdn_wy_plan` +
     /// `ffai_gdn_wy_scan`) alternative to `gatedDeltaPrepChunk`. Opt-in via
-    /// `FFAI_GDN_WY=1`, default OFF (see `Qwen35GDNMixer.forwardManyChunked`,
-    /// which also owns the `t % c == 0` fallback — this function
-    /// preconditions on it rather than silently falling back, so callers
-    /// must check before dispatching here; `_plan`/`_scan`'s `v1` require a
-    /// full multiple of `c=64`, a ragged tail is a documented follow-up in
-    /// both kernels' module docs).
+    /// `FFAI_GDN_WY=1`, default OFF (see `Qwen35GDNMixer.forwardManyChunked`).
+    ///
+    /// `_plan`/`_scan`'s v1 require `t_len` to be an exact multiple of
+    /// their fixed chunk size `c=64` — both kernels' module docs document
+    /// this as: FFAI pads a short prefill tail up to a multiple of `c`
+    /// upstream with `g=1, β=0` no-op tokens (a true no-op on the
+    /// recurrence: decay ×1, delta ×0 → state unchanged; the padded rows'
+    /// `y` output is simply never read). This function IS that upstream
+    /// pad: real `t` only needs to be `>= c` (the caller — see
+    /// `Qwen35GDNMixer.forwardManyChunked` — still falls back to
+    /// `gatedDeltaPrepChunk` for `t < c`, where there's no full chunk to
+    /// pad up to). When `t` is already a multiple of `c` (the common case
+    /// — `prefillStepSize` keeps every chunk but the last aligned) this is
+    /// a pure passthrough with zero extra dispatches; padding only kicks
+    /// in for a genuinely ragged tail/short prompt.
     ///
     /// Shape contract (B=1, matching the mixer's batching):
     ///   - `convOut`         : `[T, 2·Hk·Dk + Hv·Dv]` fp32 — the `v` slab is
@@ -6795,7 +6779,8 @@ public enum Ops {
     ///     layout `ffai_gdn_wy_plan` wants).
     ///   - `aRaw`/`bRaw`     : `[T, Hv]` fp32, from `castToF32Two`.
     ///   - `stateIn`/`stateOut` : `[Hv, Dv, Dk]` fp32 recurrent state.
-    ///   - `y`               : `[T, Hv, Dv]` fp32 (matches `gatedDeltaPrepChunk`'s `y`).
+    ///   - `y`               : `[T, Hv, Dv]` fp32 (matches `gatedDeltaPrepChunk`'s `y`) —
+    ///     always real-`t`-sized regardless of internal padding.
     public static func gatedDeltaWYPrefill(
         convOut: Tensor,
         dtBias: Tensor, negExpALog: Tensor,
@@ -6808,9 +6793,9 @@ public enum Ops {
     ) {
         let c = 64
         precondition(
-            t % c == 0,
-            "Ops.gatedDeltaWYPrefill: t (\(t)) must be a multiple of c=\(c) — "
-                + "caller must fall back to gatedDeltaPrepChunk for ragged chunk tails")
+            t >= c,
+            "Ops.gatedDeltaWYPrefill: t (\(t)) must be >= c=\(c) — "
+                + "caller must fall back to gatedDeltaPrepChunk when there's no full chunk")
         precondition(
             dk % 16 == 0 && dv % 16 == 0,
             "Ops.gatedDeltaWYPrefill: dk/dv (\(dk)/\(dv)) must be multiples of 16 (ffai_gdn_wy_plan MMA tiling)")
@@ -6825,14 +6810,20 @@ public enum Ops {
                 && stateIn.dtype == .f32 && stateOut.dtype == .f32 && y.dtype == .f32,
             "Ops.gatedDeltaWYPrefill: fp32 only (matches the mixer's fused-prep fp32 convention)")
 
-        let nc = t / c
+        let tPadded = ((t + c - 1) / c) * c
+        let nc = tPadded / c
         let n = hv  // B=1
         let convDim = 2 * hk * dk + hv * dv
         let dtBytes = DType.f32.byteSize
+        let ragged = tPadded != t
 
-        // ── v: dense [T, Hv, Dv] sliced out of conv_out's packed row ────
+        // ── v: dense [Tpadded, Hv, Dv] sliced out of conv_out's packed
+        // row; zero-filled tail when ragged (zero v-row is itself already
+        // a no-op contribution, but the tail's real no-op-ness comes from
+        // g=1/beta=0 below — v's own value there doesn't matter).
         let vAll = wyScratchTensor(
-            shape: [t * hv * dv], dtype: .f32, tag: "gdn_wy_v_\(t)x\(hv)x\(dv)", device: device)
+            shape: [tPadded * hv * dv], dtype: .f32, tag: "gdn_wy_v_\(tPadded)x\(hv)x\(dv)",
+            device: device)
         stridedCopyNd(
             srcBuffer: convOut.buffer,
             srcByteOffset: convOut.offset + (2 * hk * dk) * dtBytes,
@@ -6840,15 +6831,109 @@ public enum Ops {
             shape: [t, hv * dv], strides: [convDim, 1],
             outBuffer: vAll.buffer, outByteOffset: vAll.offset,
             on: cmd, device: device)
+        if ragged {
+            let validBytes = t * hv * dv * dtBytes
+            let tailBytes = (tPadded - t) * hv * dv * dtBytes
+            let blit = cmd.makeBlitCommandEncoder()!
+            blit.fill(
+                buffer: vAll.buffer,
+                range: (vAll.offset + validBytes) ..< (vAll.offset + validBytes + tailBytes),
+                value: 0)
+            blit.endEncoding()
+        }
 
-        // ── g/beta from a_raw/b_raw + dt_bias/negExpALog ────────────────
+        // ── g/beta from a_raw/b_raw + dt_bias/negExpALog over the real
+        // `t` rows; ragged tail padded to the documented (g=1, beta=0)
+        // no-op via a stride-0 broadcast from a 1-element scalar buffer
+        // (same broadcast idiom `stridedCopyNd` already uses for
+        // dt_bias/negExpALog above — `blit.fill` can't express a non-zero
+        // fp32 bit pattern like 1.0f, which isn't a uniform byte).
         let gAll = wyScratchTensor(
-            shape: [t * hv], dtype: .f32, tag: "gdn_wy_g_\(t)x\(hv)", device: device)
+            shape: [tPadded * hv], dtype: .f32, tag: "gdn_wy_g_\(tPadded)x\(hv)", device: device)
         let betaAll = wyScratchTensor(
-            shape: [t * hv], dtype: .f32, tag: "gdn_wy_beta_\(t)x\(hv)", device: device)
+            shape: [tPadded * hv], dtype: .f32, tag: "gdn_wy_beta_\(tPadded)x\(hv)", device: device)
         gdnGateBeta(
             aRaw: aRaw, bRaw: bRaw, dtBias: dtBias, negExpALog: negExpALog,
-            g: gAll, beta: betaAll, rows: t, hv: hv, on: cmd, device: device)
+            g: Tensor(buffer: gAll.buffer, offset: gAll.offset, shape: [t * hv], dtype: .f32),
+            beta: Tensor(buffer: betaAll.buffer, offset: betaAll.offset, shape: [t * hv], dtype: .f32),
+            rows: t, hv: hv, on: cmd, device: device)
+        if ragged {
+            let padRows = tPadded - t
+            stridedCopyNd(
+                srcBuffer: device.scalarBuffer(1.0), srcByteOffset: 0, dtype: .f32,
+                shape: [padRows * hv], strides: [0],
+                outBuffer: gAll.buffer, outByteOffset: gAll.offset + t * hv * dtBytes,
+                on: cmd, device: device)
+            stridedCopyNd(
+                srcBuffer: device.scalarBuffer(0.0), srcByteOffset: 0, dtype: .f32,
+                shape: [padRows * hv], strides: [0],
+                outBuffer: betaAll.buffer, outByteOffset: betaAll.offset + t * hv * dtBytes,
+                on: cmd, device: device)
+        }
+
+        // ── q/k: passthrough when already chunk-aligned; zero-padded
+        // grow-once scratch copies when ragged (mirrors the ragged-T qmm
+        // pad pattern in `dequantGemmDynamicM`).
+        let qForKernel: Tensor
+        let kForKernel: Tensor
+        if ragged {
+            let qPadded = wyScratchTensor(
+                shape: [tPadded * hk * dk], dtype: .f32, tag: "gdn_wy_qpad_\(tPadded)x\(hk)x\(dk)",
+                device: device)
+            let kPadded = wyScratchTensor(
+                shape: [tPadded * hk * dk], dtype: .f32, tag: "gdn_wy_kpad_\(tPadded)x\(hk)x\(dk)",
+                device: device)
+            let validBytes = t * hk * dk * dtBytes
+            let tailBytes = (tPadded - t) * hk * dk * dtBytes
+            let blit = cmd.makeBlitCommandEncoder()!
+            blit.copy(
+                from: qNormed.buffer, sourceOffset: qNormed.offset,
+                to: qPadded.buffer, destinationOffset: qPadded.offset, size: validBytes)
+            blit.copy(
+                from: kNormed.buffer, sourceOffset: kNormed.offset,
+                to: kPadded.buffer, destinationOffset: kPadded.offset, size: validBytes)
+            blit.fill(
+                buffer: qPadded.buffer,
+                range: (qPadded.offset + validBytes) ..< (qPadded.offset + validBytes + tailBytes),
+                value: 0)
+            blit.fill(
+                buffer: kPadded.buffer,
+                range: (kPadded.offset + validBytes) ..< (kPadded.offset + validBytes + tailBytes),
+                value: 0)
+            blit.endEncoding()
+            qForKernel = qPadded
+            kForKernel = kPadded
+        } else {
+            qForKernel = qNormed
+            kForKernel = kNormed
+        }
+
+        // ── y: write straight into the caller's buffer when aligned;
+        // otherwise scratch at Tpadded, sliced back to the real `t` rows
+        // the caller actually allocated/reads.
+        let yForKernel: Tensor
+        if ragged {
+            yForKernel = wyScratchTensor(
+                shape: [tPadded * hv * dv], dtype: .f32, tag: "gdn_wy_ypad_\(tPadded)x\(hv)x\(dv)",
+                device: device)
+        } else {
+            yForKernel = y
+        }
+
+        // ── t_len: the plan/scan kernels need the PADDED length (their
+        // `NC = t_len/c` sizes the chunk loop) — a fresh tiny buffer per
+        // ragged dispatch, same discipline as `stridedCopyNd`'s
+        // shape/strides buffers (not tagged scratch: a shared buffer would
+        // race across pipelined command buffers).
+        let tLenForKernel: Tensor
+        if ragged {
+            let buf = device.makeBuffer(length: 4)
+            var tPaddedU32 = UInt32(tPadded)
+            memcpy(buf.contents(), &tPaddedU32, 4)
+            tLenForKernel = Tensor(buffer: buf, offset: 0, shape: [1], dtype: .u32)
+        } else {
+            tLenForKernel = tLen
+        }
 
         // ── K1 intermediates (grow-once tagged scratch, tag by shape) ───
         let u = wyScratchTensor(
@@ -6865,16 +6950,16 @@ public enum Ops {
             shape: [n * nc * dv * dk], dtype: .f32, tag: "gdn_wy_us_\(n)x\(nc)x\(dv)x\(dk)", device: device)
 
         // ── K1: ffai_gdn_wy_plan — chunk-parallel, dispatchThreadgroups
-        // (coop_tile/MMA kernel). Grid (TGs): [T/C, B·Hv, 1], TG [512,1,1].
+        // (coop_tile/MMA kernel). Grid (TGs): [Tpadded/C, B·Hv, 1], TG [512,1,1].
         let gridK1 = MTLSize(width: nc, height: n, depth: 1)
         let tgK1 = MTLSize(width: 512, height: 1, depth: 1)
         MetalTileKernels.ffai_gdn_wy_plan_f32_threadgroups(
-            q: qNormed.buffer, qOffset: qNormed.offset,
-            k: kNormed.buffer, kOffset: kNormed.offset,
+            q: qForKernel.buffer, qOffset: qForKernel.offset,
+            k: kForKernel.buffer, kOffset: kForKernel.offset,
             v: vAll.buffer, vOffset: vAll.offset,
             g: gAll.buffer, gOffset: gAll.offset,
             beta: betaAll.buffer, betaOffset: betaAll.offset,
-            t_len: tLen.buffer, t_lenOffset: tLen.offset,
+            t_len: tLenForKernel.buffer, t_lenOffset: tLenForKernel.offset,
             u: u.buffer, uOffset: u.offset,
             y_local: yLocal.buffer, y_localOffset: yLocal.offset,
             q_eff: qEff.buffer, q_effOffset: qEff.offset,
@@ -6894,10 +6979,21 @@ public enum Ops {
             u_s: uS.buffer, u_sOffset: uS.offset,
             state_in: stateIn.buffer, state_inOffset: stateIn.offset,
             state_out: stateOut.buffer, state_outOffset: stateOut.offset,
-            y: y.buffer, yOffset: y.offset,
-            t_len: tLen.buffer, t_lenOffset: tLen.offset,
+            y: yForKernel.buffer, yOffset: yForKernel.offset,
+            t_len: tLenForKernel.buffer, t_lenOffset: tLenForKernel.offset,
             dk: UInt32(dk), dv: UInt32(dv), hv: UInt32(hv), c: UInt32(c),
             gridSize: gridK2, threadgroupSize: tgK2, on: cmd)
+
+        // ── Slice yForKernel's real-t rows back into the caller's `y`
+        // when we dispatched into padded scratch.
+        if ragged {
+            let blit = cmd.makeBlitCommandEncoder()!
+            blit.copy(
+                from: yForKernel.buffer, sourceOffset: yForKernel.offset,
+                to: y.buffer, destinationOffset: y.offset,
+                size: t * hv * dv * dtBytes)
+            blit.endEncoding()
+        }
     }
 
     // ─── Dynamic-M batched-prefill int4 qmm ───────────────────────────
@@ -7067,12 +7163,31 @@ public enum Ops {
     /// `dispatchThreads` counts total threads per axis, so grid.x = N/32·128.
     /// `bits` selects the int4 (unsuffixed) or int2 variant; the int2 kernel
     /// uses the same geometry but unpacks 16 codes per u32 (vs 8 nibbles).
+    ///
+    /// `m` must already be a multiple of 32 (BM tile) — callers pad ragged
+    /// `T` up to 32 before reaching here (`dequantGemmDynamicM`'s slow
+    /// path); the `m/32` grid math below silently truncates otherwise.
+    ///
+    /// bits=4 additionally prefers the MPP/NAX cooperative-tensor kernel
+    /// (`ffai_qmm_mma_mpp`, live-compiled via `MetalPerformancePrimitives`)
+    /// over the manual simdgroup ladder, same idea as the existing bits=8
+    /// MPP arm below. Gate: `Ops.mppAutoCapable` (Apple GPU Family 9+ /
+    /// macOS 26+, the same cached capability check the MoE bgemm work
+    /// added — reused here rather than duplicated), overridable via
+    /// `FFAI_QMM_MPP=0` (force off) / `FFAI_QMM_MPP=1` (force on). The
+    /// int4 MPP kernel bakes `group_size=64` (Qwen3.6-A3B's default —
+    /// see its module doc); a caller quantized at a different group size
+    /// falls back to the simdgroup path regardless of the gate, since the
+    /// MPP kernel would silently read scales/biases at the wrong stride.
     private static func dispatchQmmMma(
         weight: Tensor, scales: Tensor, biases: Tensor,
         input: Tensor, output: Tensor,
         m: Int, n: Int, k: Int, gsPerRow: Int, bits: Int,
         on cmd: MTLCommandBuffer
     ) {
+        precondition(
+            m % 32 == 0,
+            "Ops.dispatchQmmMma: m (\(m)) must be a multiple of 32 (BM tile) — caller must pad")
         // Prefer threadgroups dispatch for MMA (grid = tile counts).
         let tgWidth = 128
         let tgGrid = MTLSize(width: n / 32, height: m / 32, depth: 1)
@@ -7085,34 +7200,75 @@ public enum Ops {
         let kU = UInt32(k)
         let nU = UInt32(n)
         let gsU = UInt32(gsPerRow)
+        let env = ProcessInfo.processInfo.environment
+        let mppRequested4: Bool
+        switch env["FFAI_QMM_MPP"] {
+        case "0": mppRequested4 = false
+        case "1": mppRequested4 = true
+        default: mppRequested4 = Self.mppAutoCapable
+        }
+        let useMpp4 = mppRequested4 && gsPerRow > 0 && k % gsPerRow == 0 && k / gsPerRow == 64
         switch (bits, input.dtype) {
         case (4, .f32):
-            MetalTileKernels.ffai_qmm_mma_f32(
-                w: weight.buffer, wOffset: weight.offset,
-                scales: scales.buffer, scalesOffset: scales.offset,
-                biases: biases.buffer, biasesOffset: biases.offset,
-                x: input.buffer, xOffset: input.offset,
-                out: output.buffer, outOffset: output.offset,
-                k: kU, n: nU, gs_per_row: gsU,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
+            if useMpp4 {
+                MetalTileKernels.ffai_qmm_mma_mpp_f32_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                MetalTileKernels.ffai_qmm_mma_f32(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            }
         case (4, .f16):
-            MetalTileKernels.ffai_qmm_mma_f16(
-                w: weight.buffer, wOffset: weight.offset,
-                scales: scales.buffer, scalesOffset: scales.offset,
-                biases: biases.buffer, biasesOffset: biases.offset,
-                x: input.buffer, xOffset: input.offset,
-                out: output.buffer, outOffset: output.offset,
-                k: kU, n: nU, gs_per_row: gsU,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
+            if useMpp4 {
+                MetalTileKernels.ffai_qmm_mma_mpp_f16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                MetalTileKernels.ffai_qmm_mma_f16(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            }
         case (4, .bf16):
-            MetalTileKernels.ffai_qmm_mma_bf16(
-                w: weight.buffer, wOffset: weight.offset,
-                scales: scales.buffer, scalesOffset: scales.offset,
-                biases: biases.buffer, biasesOffset: biases.offset,
-                x: input.buffer, xOffset: input.offset,
-                out: output.buffer, outOffset: output.offset,
-                k: kU, n: nU, gs_per_row: gsU,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
+            if useMpp4 {
+                MetalTileKernels.ffai_qmm_mma_mpp_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                MetalTileKernels.ffai_qmm_mma_bf16(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            }
         case (2, .f32):
             MetalTileKernels.ffai_qmm_mma_int2_f32(
                 w: weight.buffer, wOffset: weight.offset,
