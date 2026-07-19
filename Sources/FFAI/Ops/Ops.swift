@@ -6025,20 +6025,37 @@ public enum Ops {
     /// uses the cooperative-tensor `mpp::tensor_ops::matmul2d` per the
     /// metaltile MPP NAX primitive landing.
     ///
-    /// WARNING — KNOWN CORRECTNESS ISSUE (2026-05-21). Dispatch shape
-    /// matches the metaltile-std `moe_gather_qmm_mpp_bm64_correctness`
-    /// test
-    /// (grid = `[ceil(N/64), ceil(M/64), 1]` threadgroups,
-    /// tg = `[128, 1, 1]` for 4 SGs WM=WN=2), but `forwardManyEquivalence`
-    /// at T=8 mTotal=64 produces top-1 argmax 279 with logit 12.25 vs
-    /// reference argmax 52290 logit 17.125 — the tokens are present in
-    /// both top-5 lists but with a ~5-logit scale drift. Suspected
-    /// bf16-output-scale or buffer-binding mismatch between the
-    /// Swift-side wrapper and the kernel's expected layout. Cosine
-    /// ≥ 0.999 in the upstream test (f32 output) — bf16 output path
-    /// may need its own verification. Use **only** behind
-    /// `FFAI_MOE_BGEMM_BM64=1` after re-verifying against the kernel
-    /// source. Bm16 default ships the 2.69× T=32 win.
+    /// FIXED (2026-07-18, round-3 MoE tile lever). The 2026-05-21 note
+    /// below described a real bug, now root-caused: this call used the
+    /// plain `dispatchThreads`-based wrapper with `gridSize` scaled to
+    /// TOTAL THREADS (`(nOut/64)*128`), but `ffai_moe_gather_qmm_mma_
+    /// int4_bm64_mpp` is a coop_tile / cooperative-tensor kernel, and the
+    /// codegen itself documents that `dispatchThreads` puts Metal in
+    /// non-uniform-threadgroup mode. That silently produces wrong
+    /// results for `matmul2d`, even when the grid divides evenly by the
+    /// threadgroup size (see `emit_swift_wrapper_threadgroups` in
+    /// ffai-kernels-codegen/src/emit.rs). The already-shipped Hy3 int2
+    /// BM64 / expert-grid path (`moeGatherDequantGemmInt2` above) never
+    /// hit this because it hand-encodes `dispatchThreadgroups` directly
+    /// instead of going through the generated wrapper. That is the
+    /// reference fix, applied here via the codegen's `_threadgroups`
+    /// wrapper variant (grid now in THREADGROUP counts, not threads).
+    /// A CPU-oracle test extended with a skewed/ragged routing fixture
+    /// (empty experts plus one heavy expert straddling tile boundaries,
+    /// `moe_gather_qmm_mma_int4_bm64_mpp_matches_m1_skewed_ragged`)
+    /// confirms the kernel's own math was already correct, so the bug
+    /// was Swift-side dispatch, not the tile logic.
+    ///
+    /// Old warning (2026-05-21, root cause now known): dispatch shape
+    /// matched the metaltile-std `moe_gather_qmm_mpp_bm64_correctness`
+    /// test (grid = `[ceil(N/64), ceil(M/64), 1]` threadgroups, tg =
+    /// `[128, 1, 1]` for 4 SGs WM=WN=2), but `forwardManyEquivalence` at
+    /// T=8 mTotal=64 produced top-1 argmax 279 with logit 12.25 vs
+    /// reference argmax 52290 logit 17.125. The tokens were present in
+    /// both top-5 lists but with a scale drift, the signature of a
+    /// non-uniform-dispatch coop_tile miscompile rather than a wrong
+    /// offset. Still opt-in via `FFAI_MOE_BGEMM_BM64=1`, default stays
+    /// off pending a measured e2e win (bm16 ships the shipped baseline).
     public static func moeGatherDequantGemmInt4Bm64Mpp(
         input: Tensor,
         weight: Tensor, scales: Tensor, biases: Tensor,
@@ -6082,10 +6099,19 @@ public enum Ops {
         // Per `metaltile-std/src/ffai/moe_mpp_bm64.rs`:
         //   BM = BN = 64, BK = 32. 4 SGs per TG, WM = WN = 2.
         //   Threadgroup size [128, 1, 1]. Grid [N/64, ceil(M/64), 1].
-        // dispatchThreads (total threads): width = (N/64)·128.
+        // This is a coop_tile (cooperative-tensor matmul2d) kernel, so the
+        // grid MUST be dispatched in THREADGROUP counts via the codegen's
+        // `_threadgroups` wrapper (raw `dispatchThreadgroups`), matching
+        // the already-shipped Hy3 int2 BM64 / expert-grid path just above.
+        // The plain (thread-count, `dispatchThreads`) wrapper puts Metal
+        // in non-uniform-threadgroup mode, which is documented (see
+        // ffai-kernels-codegen/src/emit.rs) to silently corrupt
+        // cooperative-tensor kernels even on an evenly-divided grid, and
+        // was the actual cause of the 2026-05-21 correctness bug this
+        // kernel was gated off for.
         let tgWidth = 128
         let grid = MTLSize(
-            width: (nOut / 64) * tgWidth,
+            width: nOut / 64,
             height: (mTotal + 63) / 64,
             depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
@@ -6096,7 +6122,7 @@ public enum Ops {
 
         switch input.dtype {
         case .f32:
-            MetalTileKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_f32(
+            MetalTileKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_f32_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -6107,7 +6133,7 @@ public enum Ops {
                 group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_f16(
+            MetalTileKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_f16_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -6118,7 +6144,7 @@ public enum Ops {
                 group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            MetalTileKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_bf16(
+            MetalTileKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_bf16_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
