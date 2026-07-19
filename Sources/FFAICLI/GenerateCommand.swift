@@ -38,6 +38,11 @@ struct GenerateCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Print top-5 next-token distribution instead of generating.")
     var verbose: Bool = false
 
+    @Option(
+        name: .long,
+        help: "Diagnostic. Run the chunked prefill path over the prompt and write the final-position logits as raw little-endian f32 to this path, then exit.")
+    var dumpPrefillLogits: String?
+
     @Flag(
         name: .long,
         help: "Print a [STATS] block (per-phase memory, tok/s, TTFT, KV cache, wired ticket).")
@@ -204,6 +209,42 @@ struct GenerateCommand: AsyncParsableCommand {
         }
         let m = try await Model.load(model, options: loadOpts)
         print("loaded in \(String(format: "%.2f", Date().timeIntervalSince(loadStart)))s")
+
+        if let dumpPath = dumpPrefillLogits {
+            // Mirror driveGeneration's chunk loop so this exercises the exact
+            // prefill path (forwardMulti in prefillStepSize chunks), not the
+            // per-token forward the verbose flag uses.
+            let promptTokens = m.tokenizer.encode(text: prompt)
+            let caches = m.engine.makeLayerCaches()
+            let chunkSize = max(
+                1,
+                ProcessInfo.processInfo.environment["FFAI_PREFILL_STEP"].flatMap(Int.init)
+                    ?? m.engine.defaultPrefillStepSize)
+            var pos = 0
+            var lastLogits: Tensor?
+            while pos < promptTokens.count {
+                let end = min(pos + chunkSize, promptTokens.count)
+                let chunk = Array(promptTokens[pos ..< end])
+                let cmd = Device.shared.makeCommandBuffer()
+                lastLogits = m.engine.forwardMulti(
+                    tokenIds: chunk, startingAt: pos,
+                    caches: caches, on: cmd, device: Device.shared)
+                cmd.commit()
+                await cmd.completed()
+                pos = end
+            }
+            guard let l = lastLogits else { return }
+            let floats = l.toFloatArray()
+            var data = Data(count: floats.count * 4)
+            data.withUnsafeMutableBytes { raw in
+                floats.withUnsafeBytes { src in
+                    raw.copyMemory(from: src)
+                }
+            }
+            try data.write(to: URL(fileURLWithPath: dumpPath))
+            print("wrote \(floats.count) f32 logits to \(dumpPath)")
+            return
+        }
 
         if verbose {
             // Run prefill once, print top-5 next tokens with their logits.
