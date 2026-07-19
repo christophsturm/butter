@@ -2349,17 +2349,20 @@ public final class Qwen35AttentionMixer: Module {
         let qDim = nHeads * headDim
         let kvDim = nKVHeads * headDim
 
-        // ── Projections — fused QKV qmm when constraints match ──────────
-        // `Ops.batchedQkvQmmFast` produces all three Q/K/V projections
-        // in ONE dispatch when the three QuantizedLinear projections
-        // share `bits=4`, `groupSize=64`, and `in_dim%512==0` /
-        // `out_*%8==0`. Replaces 3 `callMany` qmm encoders with 1 fused
-        // encoder. Predicate is the same `fusedQKVEligible` flag the
-        // single-token path uses.
+        // ── Projections ─────────────────────────────────────────────────
+        // `Ops.batchedQkvQmmFast` is a per-row GEMV-shaped kernel — a win
+        // at decode (T=1: 3 encoders → 1) but ~8× slower than the MMA qmm
+        // path at prefill M (measured M=1024: fused ~11.5ms vs 3 MMA qmms
+        // ~1.6ms per layer; routing it to prefill cost ~16% e2e). Use the
+        // fused kernel only for tiny T; batched prefill takes the three
+        // MMA `callMany` qmms. FFAI_FUSED_QKV_PREFILL=1 forces the old
+        // routing for A/B.
+        let fusedQkvAtPrefill =
+            ProcessInfo.processInfo.environment["FFAI_FUSED_QKV_PREFILL"] != nil || t <= 8
         let qOut: Tensor
         let kOut: Tensor
         let vOut: Tensor
-        if fusedQKVEligible, let bq = batchedQKV {
+        if fusedQKVEligible, fusedQkvAtPrefill, let bq = batchedQKV {
             let qDimW = bq.qW.shape[0]
             let kDimW = bq.kW.shape[0]
             let vDimW = bq.vW.shape[0]
