@@ -341,9 +341,14 @@ extension Model {
             // Honour the caller's explicit `prefillStepSize` if set;
             // otherwise fall through to the engine's tuned default
             // (1024 generic, 2048 GPT-OSS, 4096 Gemma 4 / Qwen 3.5 MoE).
+            // FFAI_PREFILL_STEP=<n> overrides both for chunk-size sweeps —
+            // larger chunks amortize per-chunk costs (KV append, gate/beta,
+            // sort plans, attention prefix re-reads) at the cost of larger
+            // transient activations.
             let chunkSize = max(
                 1,
-                params.prefillStepSize
+                ProcessInfo.processInfo.environment["FFAI_PREFILL_STEP"].flatMap(Int.init)
+                    ?? params.prefillStepSize
                     ?? engine.defaultPrefillStepSize)
             // Multi over the full prompt (all n tokens). The last multi
             // returns logits at the final prompt position so we can sample
