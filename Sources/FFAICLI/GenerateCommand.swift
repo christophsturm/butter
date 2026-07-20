@@ -216,9 +216,17 @@ struct GenerateCommand: AsyncParsableCommand {
             // per-token forward the verbose flag uses.
             let promptTokens = m.tokenizer.encode(text: prompt)
             let caches = m.engine.makeLayerCaches()
+            // Resolve chunk size through the SAME chain as the real generate
+            // path (Generate.swift): env override, then the family/param-level
+            // override, then the engine default. Skipping the middle link here
+            // used to let a param-only chunk-size override go unseen by this
+            // diagnostic, so a quality gate run through the dump could
+            // validate a different chunk configuration than generation
+            // actually uses.
             let chunkSize = max(
                 1,
                 ProcessInfo.processInfo.environment["FFAI_PREFILL_STEP"].flatMap(Int.init)
+                    ?? m.defaultGenerationParameters.prefillStepSize
                     ?? m.engine.defaultPrefillStepSize)
             var pos = 0
             var lastLogits: Tensor?
