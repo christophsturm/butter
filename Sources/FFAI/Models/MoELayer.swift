@@ -926,11 +926,16 @@ public final class MoELayer: Module, DecoderLayer {
             device: device)
         // Tile selection for the batched-prefill regime:
         //   - mTotal ≥ 64 + `FFAI_MOE_BGEMM_BM64=1` → bm64_mpp (NAX
-        //     cooperative-tensor). Wrapper in tree but dispatch-shape
-        //     fails the equivalence canary (argmax 220 — the same
-        //     dispatchThreads/threadgroups grid bug we saw at m1).
-        //     Needs verification against the metaltile-ffai kernel
-        //     source. **Default off** until that's resolved.
+        //     cooperative-tensor). Originally gated off after the
+        //     equivalence canary tripped (argmax drift) at m1; the root
+        //     cause was `Ops.moeGatherDequantGemmInt4Bm64Mpp` dispatching
+        //     via `dispatchThreads` instead of `dispatchThreadgroups`,
+        //     fixed in the commit titled "dispatch bm64 int4 MPP kernel
+        //     as threadgroups, not threads". Post-fix quality gate is
+        //     cosine 1.0 / top1 match / zero max-logit delta vs bm16 at
+        //     mTotal 1024/2067/4096, so the wrapper itself is correct.
+        //     It stays opt-in for the perf reason below, not a
+        //     correctness gate.
         //   - 16 ≤ mTotal → bm16 (the default `moeGatherDequant
         //     GemmInt4`). 16-deep tile fill across consecutive
         //     sorted-by-expert rows. THIS is the path that drives the
