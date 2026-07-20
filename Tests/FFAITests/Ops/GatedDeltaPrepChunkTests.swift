@@ -216,4 +216,193 @@ struct GatedDeltaPrepChunkTests {
     func noGqaChunkMatchesOracle() {
         Self.runCase(b: 1, t: 3, hv: 4, hk: 4, dv: 32, dk: 32, tol: 1e-4)
     }
+
+    // F-85 follow-up audit gap: `git grep` found no XCTest/Swift-Testing
+    // coverage at all for `Ops.gatedDeltaPrepChunkFast` (only the generic
+    // `Ops.gatedDeltaPrepChunk` above was covered) despite it being the
+    // default dispatch path for this model's production GDN shape, see
+    // `Qwen35GDNMixer.forwardManyChunked`'s `fastShapeMatches` /
+    // `FFAI_GDN_NO_PREP_CHUNK_FAST` gate. Same oracle/math as
+    // `gqaChunkMatchesOracle` above (the fast kernel is a pure shape
+    // specialization, bit-identical formula), dispatched via
+    // `Ops.gatedDeltaPrepChunkFast` at the fixed production shape
+    // (Dk=Dv=128, Hv=32, Hk=16) that wrapper hardcodes internally.
+    static func runCaseFast(t: Int, tol: Float) {
+        let (b, hv, hk, dv, dk) = (1, 32, 16, 128, 128)
+        autoreleasepool {
+            let strideB = 2 * hk * dk + hv * dv
+            let convOutVals = (0 ..< b * t * strideB).map { Float(sin(Double($0) * 0.0131) * 0.02) }
+            let aLogVals = (0 ..< hv).map { Float(-3.0 - Double($0) * 0.05) }
+            let dtBiasVals = (0 ..< hv).map { Float(-0.5 + Double($0) * 0.05) }
+            let aRawVals = (0 ..< b * t * hv).map { Float(-0.3 + Double($0) * 0.01) }
+            let bRawVals = (0 ..< b * t * hv).map { Float(-0.2 + Double($0) * 0.008) }
+            let qNormedVals = (0 ..< b * t * hk * dk).map {
+                Float(sin(Double($0) * 0.017 + 0.3) * 0.3)
+            }
+            let kNormedVals = (0 ..< b * t * hk * dk).map {
+                Float(cos(Double($0) * 0.019 + 0.1) * 0.3)
+            }
+            let stateInVals = (0 ..< b * hv * dv * dk).map {
+                Float(cos(Double($0) * 0.0073) * 0.01)
+            }
+
+            let (yExp, stateExp) = oracle(
+                convOut: convOutVals, aLog: aLogVals, dtBias: dtBiasVals,
+                aRaw: aRawVals, bRaw: bRawVals,
+                qNormed: qNormedVals, kNormed: kNormedVals, stateIn: stateInVals,
+                b: b, t: t, hv: hv, hk: hk, dv: dv, dk: dk)
+
+            let convOut = Tensor.empty(shape: [b, t, strideB], dtype: .f32)
+            convOut.copyIn(from: convOutVals)
+            let aLog = Tensor.empty(shape: [hv], dtype: .f32)
+            aLog.copyIn(from: aLogVals)
+            let dtBias = Tensor.empty(shape: [hv], dtype: .f32)
+            dtBias.copyIn(from: dtBiasVals)
+            let aRaw = Tensor.empty(shape: [b, t, hv], dtype: .f32)
+            aRaw.copyIn(from: aRawVals)
+            let bRaw = Tensor.empty(shape: [b, t, hv], dtype: .f32)
+            bRaw.copyIn(from: bRawVals)
+            let qNormed = Tensor.empty(shape: [b, t, hk, dk], dtype: .f32)
+            qNormed.copyIn(from: qNormedVals)
+            let kNormed = Tensor.empty(shape: [b, t, hk, dk], dtype: .f32)
+            kNormed.copyIn(from: kNormedVals)
+            let stateIn = Tensor.empty(shape: [b, hv, dv, dk], dtype: .f32)
+            stateIn.copyIn(from: stateInVals)
+            let stateOut = Tensor.empty(shape: [b, hv, dv, dk], dtype: .f32)
+            stateOut.zero()
+            let y = Tensor.empty(shape: [b, t, hv, dv], dtype: .f32)
+            y.zero()
+            let tLen = Tensor.empty(shape: [1], dtype: .u32)
+            tLen.copyIn(from: [UInt32(t)])
+
+            runAndWait { cb in
+                Ops.gatedDeltaPrepChunkFast(
+                    convOut: convOut, aLog: aLog, dtBias: dtBias,
+                    aRaw: aRaw, bRaw: bRaw,
+                    qNormed: qNormed, kNormed: kNormed,
+                    stateIn: stateIn, stateOut: stateOut, y: y,
+                    tLen: tLen,
+                    batchSize: b, on: cb)
+            }
+
+            let yGot = y.toArray(as: Float.self)
+            #expect(yGot.count == yExp.count)
+            var yMaxErr: Float = 0
+            for i in 0 ..< yExp.count { yMaxErr = max(yMaxErr, abs(yGot[i] - yExp[i])) }
+            #expect(yMaxErr < tol, "y max-abs err \(yMaxErr) ≥ tol \(tol)")
+
+            let stateGot = stateOut.toArray(as: Float.self)
+            #expect(stateGot.count == stateExp.count)
+            var sMaxErr: Float = 0
+            for i in 0 ..< stateExp.count { sMaxErr = max(sMaxErr, abs(stateGot[i] - stateExp[i])) }
+            #expect(sMaxErr < tol, "stateOut max-abs err \(sMaxErr) ≥ tol \(tol)")
+        }
+    }
+
+    // Qwen3.6-35B-A3B production shape (Dk=Dv=128, Hv=32, Hk=16), the
+    // exact shape `Qwen35GDNMixer.forwardManyChunked`'s `fastShapeMatches`
+    // guard requires before dispatching this kernel. T kept small (3
+    // tokens) for a fast correctness check; isolated/end-to-end perf are
+    // covered by the Rust kernel benches, not this suite. Tol matches the
+    // Rust `test_ffai_gated_delta_prep_chunk_fast_d128_128_32_16` cell.
+    @Test("fast path production shape, Dk=Dv=128, Hv=32, Hk=16, T=3: y + stateOut match CPU oracle")
+    func fastPathProductionShapeMatchesOracle() {
+        Self.runCaseFast(t: 3, tol: 1e-2)
+    }
+
+    // Confirms the fast and generic kernels agree with EACH OTHER, not just
+    // with the CPU oracle independently: a pure shape specialization
+    // should be bit-identical math, so this is the same invariant the
+    // Rust-side quality gate checks (cosine 1.0 expected), pinned here at
+    // the Ops-dispatch layer too. Dv=128/Hv=32/Hk=16/Dk=128 is required by
+    // `gatedDeltaPrepChunkFast`; the generic kernel accepts the identical
+    // shape via its `dk`/`dv`/`hv`/`hk` params, so both sides run the exact
+    // same inputs.
+    @Test("fast path matches generic kernel bit-for-bit at the shared production shape")
+    func fastPathMatchesGenericKernel() {
+        let (b, t, hv, hk, dv, dk) = (1, 3, 32, 16, 128, 128)
+        autoreleasepool {
+            let strideB = 2 * hk * dk + hv * dv
+            let convOutVals = (0 ..< b * t * strideB).map { Float(sin(Double($0) * 0.0131) * 0.02) }
+            let aLogVals = (0 ..< hv).map { Float(-3.0 - Double($0) * 0.05) }
+            let dtBiasVals = (0 ..< hv).map { Float(-0.5 + Double($0) * 0.05) }
+            let aRawVals = (0 ..< b * t * hv).map { Float(-0.3 + Double($0) * 0.01) }
+            let bRawVals = (0 ..< b * t * hv).map { Float(-0.2 + Double($0) * 0.008) }
+            let qNormedVals = (0 ..< b * t * hk * dk).map {
+                Float(sin(Double($0) * 0.017 + 0.3) * 0.3)
+            }
+            let kNormedVals = (0 ..< b * t * hk * dk).map {
+                Float(cos(Double($0) * 0.019 + 0.1) * 0.3)
+            }
+            let stateInVals = (0 ..< b * hv * dv * dk).map {
+                Float(cos(Double($0) * 0.0073) * 0.01)
+            }
+
+            func buffers() -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
+                let convOut = Tensor.empty(shape: [b, t, strideB], dtype: .f32)
+                convOut.copyIn(from: convOutVals)
+                let aLog = Tensor.empty(shape: [hv], dtype: .f32)
+                aLog.copyIn(from: aLogVals)
+                let dtBias = Tensor.empty(shape: [hv], dtype: .f32)
+                dtBias.copyIn(from: dtBiasVals)
+                let aRaw = Tensor.empty(shape: [b, t, hv], dtype: .f32)
+                aRaw.copyIn(from: aRawVals)
+                let bRaw = Tensor.empty(shape: [b, t, hv], dtype: .f32)
+                bRaw.copyIn(from: bRawVals)
+                let qNormed = Tensor.empty(shape: [b, t, hk, dk], dtype: .f32)
+                qNormed.copyIn(from: qNormedVals)
+                let kNormed = Tensor.empty(shape: [b, t, hk, dk], dtype: .f32)
+                kNormed.copyIn(from: kNormedVals)
+                let stateIn = Tensor.empty(shape: [b, hv, dv, dk], dtype: .f32)
+                stateIn.copyIn(from: stateInVals)
+                let stateOut = Tensor.empty(shape: [b, hv, dv, dk], dtype: .f32)
+                stateOut.zero()
+                let y = Tensor.empty(shape: [b, t, hv, dv], dtype: .f32)
+                y.zero()
+                let tLen = Tensor.empty(shape: [1], dtype: .u32)
+                tLen.copyIn(from: [UInt32(t)])
+                return (convOut, aLog, dtBias, aRaw, bRaw, qNormed, kNormed, stateIn, stateOut, y, tLen)
+            }
+
+            let (convOutG, aLogG, dtBiasG, aRawG, bRawG, qNormedG, kNormedG, stateInG, stateOutG, yG, tLenG) =
+                buffers()
+            runAndWait { cb in
+                Ops.gatedDeltaPrepChunk(
+                    convOut: convOutG, aLog: aLogG, dtBias: dtBiasG,
+                    aRaw: aRawG, bRaw: bRawG,
+                    qNormed: qNormedG, kNormed: kNormedG,
+                    stateIn: stateInG, stateOut: stateOutG, y: yG,
+                    tLen: tLenG,
+                    batchSize: b, dk: dk, dv: dv, hv: hv, hk: hk, on: cb)
+            }
+
+            let (convOutF, aLogF, dtBiasF, aRawF, bRawF, qNormedF, kNormedF, stateInF, stateOutF, yF, tLenF) =
+                buffers()
+            runAndWait { cb in
+                Ops.gatedDeltaPrepChunkFast(
+                    convOut: convOutF, aLog: aLogF, dtBias: dtBiasF,
+                    aRaw: aRawF, bRaw: bRawF,
+                    qNormed: qNormedF, kNormed: kNormedF,
+                    stateIn: stateInF, stateOut: stateOutF, y: yF,
+                    tLen: tLenF,
+                    batchSize: b, on: cb)
+            }
+
+            let yGenVals = yG.toArray(as: Float.self)
+            let yFastVals = yF.toArray(as: Float.self)
+            #expect(yGenVals.count == yFastVals.count)
+            for i in 0 ..< yGenVals.count {
+                #expect(yGenVals[i] == yFastVals[i], "y[\(i)] generic=\(yGenVals[i]) fast=\(yFastVals[i])")
+            }
+
+            let stateGenVals = stateOutG.toArray(as: Float.self)
+            let stateFastVals = stateOutF.toArray(as: Float.self)
+            #expect(stateGenVals.count == stateFastVals.count)
+            for i in 0 ..< stateGenVals.count {
+                #expect(
+                    stateGenVals[i] == stateFastVals[i],
+                    "stateOut[\(i)] generic=\(stateGenVals[i]) fast=\(stateFastVals[i])")
+            }
+        }
+    }
 }
