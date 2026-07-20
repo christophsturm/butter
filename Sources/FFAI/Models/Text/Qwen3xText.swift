@@ -1314,6 +1314,22 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //   FFAI_MOE_NO_DEQUANT_GATE=1
 //     Opt out of caching the lazily-dequantized gate weight. Default:
 //     ON (cached) when the gate projection is 8-bit quantized.
+//   FFAI_MOE_TILEPLAN=0
+//     Opt out of the F-85 expert-aligned tile-plan gather-BGEMM
+//     (`ffai_moe_gather_qmm_mma_int4_bm16_mpp_tileplan`) at prefill,
+//     reverting to the fixed-16-row-stride bm16 default. Tile
+//     boundaries normally come from a device-built plan
+//     (`ffai_moe_build_tile_plan`) instead of that fixed stride, so
+//     every dispatched tile is single-expert and pays exactly one
+//     K-dimension pass, fixing the 28-39% skewed-routing penalty the
+//     fixed-stride kernel pays at low T. Only takes effect on the
+//     DEVPLAN2 device-sorted-plan path (see `DEVPLAN2` below) and
+//     when bm64/bm8 are not also selected. Default: ON. Gated on
+//     `--dump-prefill-logits` cosine 1.0 (bit-exact) + greedy-token
+//     match at T=512/1024/4096/16384 and a 1.02-1.03x e2e prefill win
+//     at every T from 512 through 32768, no high-T regression. Tests:
+//     kernels repo `moe_build_tile_plan_correctness.rs` +
+//     `moe_gather_qmm_tileplan_correctness.rs`.
 //   DEVPLAN2=0
 //     Opt out of chaining the MoE prefill expert path onto the
 //     caller's own command buffer. Note: no `FFAI_` prefix (older

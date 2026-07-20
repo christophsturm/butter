@@ -460,6 +460,10 @@ public final class MoELayer: Module, DecoderLayer {
     let forceBGEMMAtT1: Bool
     let noBGEMMBm64: Bool
     let bm64Env: Bool
+    /// F-85 expert-aligned tile-plan MoE gather GEMM gate. Raw env string
+    /// cached at init (same reasoning as the other env-flag caches above);
+    /// `tilePlanEnabled` below is the single place that interprets it.
+    let tilePlanEnvRaw: String?
 
     /// Lazy dequant of the gate weight + cached output. Skipped when
     /// `gate.inner` is not a 8-bit QuantizedLinear or env
@@ -552,6 +556,23 @@ public final class MoELayer: Module, DecoderLayer {
         self.forceBGEMMAtT1 = env["FFAI_MOE_BGEMM_FORCE_T1"] != nil
         self.noBGEMMBm64 = env["FFAI_MOE_BGEMM_NO_BM64"] != nil
         self.bm64Env = env["FFAI_MOE_BGEMM_BM64"] != nil
+        self.tilePlanEnvRaw = env["FFAI_MOE_TILEPLAN"]
+    }
+
+    /// F-85 expert-aligned tile-plan gate. Default ON as of the wiring
+    /// pass's quality + speed gates: `--dump-prefill-logits` cosine 1.0 /
+    /// top1 / top5 set+order match on 3 prompts each at T=512/1024/4096/
+    /// 16384 (bit-exact, not just close - max_abs_dlogit 0.0 everywhere),
+    /// greedy 32-token generation token-for-token identical to bm16 at
+    /// every T tested, and an order-balanced interleaved e2e prefill
+    /// speed gate showing a consistent 1.02-1.03x win at every T from 512
+    /// through 32768 (median of 3-4 trials per config per T, no high-T
+    /// regression). Escape hatch: `FFAI_MOE_TILEPLAN=0` reverts to bm16.
+    /// Only wired into the DEVPLAN2 device-sorted-plan path
+    /// (`prefillChainsOnCallerCmd`); other routing paths keep bm16
+    /// regardless of this flag (see `decodeMany`).
+    public var tilePlanEnabled: Bool {
+        tilePlanEnvRaw != "0"
     }
 
     /// DEVPLAN2 + stacked int4: expert path can stay on the caller's cmd.
@@ -961,14 +982,87 @@ public final class MoELayer: Module, DecoderLayer {
         } else {
             bgemm = Ops.moeGatherDequantGemmInt4
         }
-        bgemm(
-            xGathered,
-            stacked.gateWeight, stacked.gateScales, stacked.gateBiases,
-            indices, mTotal, moeIntermediate, hidden, groupSize, work, gateOut)
-        bgemm(
-            xGathered,
-            stacked.upWeight, stacked.upScales, stacked.upBiases,
-            indices, mTotal, moeIntermediate, hidden, groupSize, work, upOut)
+
+        // F-85 expert-aligned tile-plan MoE gather GEMM (default ON, see
+        // `tilePlanEnabled`; escape hatch FFAI_MOE_TILEPLAN=0). Only
+        // wired into the DEVPLAN2 device-sorted-plan path: `indices` there is already
+        // expert-sorted ascending on device (ffai_moe_sort_plan's own
+        // output, no host readback) - exactly what
+        // `ffai_moe_build_tile_plan` needs, and preserving that no-sync
+        // property is the whole point of building the plan on-device
+        // instead of reading `indices` back to the host. The other
+        // routing paths (host GPU-router sync, CPU router) keep bm16
+        // regardless of this flag - they already pay a host round-trip
+        // elsewhere in this function, and wiring tileplan there would
+        // need a Swift port of `build_tile_plan` this pass didn't need
+        // for the measured prefill path. bm64/bm8 opt-ins also take
+        // priority when set - tileplan only replaces the bm16 default.
+        let useTilePlan = useDevPlan2 && !useBm64 && !useBm8 && self.tilePlanEnabled
+        var tilePlanTileExpert: Tensor?
+        var tilePlanTileRowStart: Tensor?
+        var tilePlanTileRowCount: Tensor?
+        var tilePlanCapacity = 0
+        var tilePlanXRows: Tensor?
+        if useTilePlan {
+            // Host-computable worst-case capacity - no GPU-to-CPU sync (see
+            // `Ops.moeTilePlanCapacity`). Plan buffers must start
+            // zero-filled: the plan-builder kernel only writes the real
+            // `[0, realTileCount)` entries; padding out to `capacity`
+            // stays at this zero fill (`tile_expert = 0` - a valid expert
+            // id - and `tile_row_count = 0`, which the GEMM kernel's tail
+            // mask turns into an inert dispatched tile).
+            let capacity = Ops.moeTilePlanCapacity(mTotal: mTotal, nExperts: nExperts)
+            let teBuf = device.makeBuffer(length: capacity * 4)
+            memset(teBuf.contents(), 0, capacity * 4)
+            let trsBuf = device.makeBuffer(length: capacity * 4)
+            memset(trsBuf.contents(), 0, capacity * 4)
+            let trcBuf = device.makeBuffer(length: capacity * 4)
+            memset(trcBuf.contents(), 0, capacity * 4)
+            let tileExpert = Tensor(buffer: teBuf, offset: 0, shape: [capacity], dtype: .u32)
+            let tileRowStart = Tensor(buffer: trsBuf, offset: 0, shape: [capacity], dtype: .u32)
+            let tileRowCount = Tensor(buffer: trcBuf, offset: 0, shape: [capacity], dtype: .u32)
+            Ops.moeBuildTilePlan(
+                sortedExperts: indices,
+                tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
+                mTotal: mTotal, nExperts: nExperts, on: work)
+            // xGathered is already pre-gathered (step 8 above) - identity
+            // row map, same helper the bm16 MPP path uses.
+            let idRows = Ops.identityRowsBuffer(minCount: mTotal, device: device)
+            tilePlanXRows = Tensor(buffer: idRows, offset: 0, shape: [mTotal], dtype: .u32)
+            tilePlanTileExpert = tileExpert
+            tilePlanTileRowStart = tileRowStart
+            tilePlanTileRowCount = tileRowCount
+            tilePlanCapacity = capacity
+        }
+
+        if useTilePlan,
+            let tileExpert = tilePlanTileExpert, let tileRowStart = tilePlanTileRowStart,
+            let tileRowCount = tilePlanTileRowCount, let xRows = tilePlanXRows
+        {
+            Ops.moeGatherDequantGemmInt4TilePlan(
+                input: xGathered,
+                weight: stacked.gateWeight, scales: stacked.gateScales, biases: stacked.gateBiases,
+                tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
+                xRows: xRows,
+                capacity: tilePlanCapacity, nOut: moeIntermediate, kIn: hidden,
+                groupSize: groupSize, on: work, into: gateOut)
+            Ops.moeGatherDequantGemmInt4TilePlan(
+                input: xGathered,
+                weight: stacked.upWeight, scales: stacked.upScales, biases: stacked.upBiases,
+                tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
+                xRows: xRows,
+                capacity: tilePlanCapacity, nOut: moeIntermediate, kIn: hidden,
+                groupSize: groupSize, on: work, into: upOut)
+        } else {
+            bgemm(
+                xGathered,
+                stacked.gateWeight, stacked.gateScales, stacked.gateBiases,
+                indices, mTotal, moeIntermediate, hidden, groupSize, work, gateOut)
+            bgemm(
+                xGathered,
+                stacked.upWeight, stacked.upScales, stacked.upBiases,
+                indices, mTotal, moeIntermediate, hidden, groupSize, work, upOut)
+        }
 
         // ── 10. SwiGLU fused: silu(gate) * up ────────────────────────────
         // Write into `gateOut` in-place so we don't allocate a third
@@ -980,10 +1074,23 @@ public final class MoELayer: Module, DecoderLayer {
         let downOut = Tensor.empty(
             shape: [mTotal, hidden], dtype: dt,
             device: device)
-        bgemm(
-            inner,
-            stacked.downWeight, stacked.downScales, stacked.downBiases,
-            indices, mTotal, hidden, moeIntermediate, groupSize, work, downOut)
+        if useTilePlan,
+            let tileExpert = tilePlanTileExpert, let tileRowStart = tilePlanTileRowStart,
+            let tileRowCount = tilePlanTileRowCount, let xRows = tilePlanXRows
+        {
+            Ops.moeGatherDequantGemmInt4TilePlan(
+                input: inner,
+                weight: stacked.downWeight, scales: stacked.downScales, biases: stacked.downBiases,
+                tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
+                xRows: xRows,
+                capacity: tilePlanCapacity, nOut: hidden, kIn: moeIntermediate,
+                groupSize: groupSize, on: work, into: downOut)
+        } else {
+            bgemm(
+                inner,
+                stacked.downWeight, stacked.downScales, stacked.downBiases,
+                indices, mTotal, hidden, moeIntermediate, groupSize, work, downOut)
+        }
 
         // ── 12. Weighted scatter-sum back to [T, hidden] via fused
         // `ffai_moe_unpermute` kernel — ONE dispatch over T·hidden
