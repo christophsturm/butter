@@ -1226,6 +1226,16 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //     (`ffai_sdpa_multi_d256`, one threadgroup per query with no K/V
 //     reuse across rows). Only takes effect when
 //     `FFAI_SDPA_QTILED_D256` is NOT also set. Opt-out, two steps back.
+//   FFAI_SDPA_BK16=0
+//     Revert the MMA d256 kernel's f16/bf16 dispatch from the BK=16
+//     K-block follow-up (`ffai_sdpa_prefill_mma_d256_bk16`) back to the
+//     BK=8 kernel (`ffai_sdpa_prefill_mma_d256`). f32 always uses BK=8
+//     (BK=16's threadgroup allocation exceeds the 32 KiB ceiling at
+//     f32, so there is no f32 BK=16 kernel to route to). Default: BK=16
+//     ON for f16/bf16. Only takes effect via `Ops.sdpaPrefillMmaD256`,
+//     so it composes with `FFAI_SDPA_QTILED_D256` / `FFAI_SDPA_LEGACY_D256`
+//     above the same way (those two bypass this kernel entirely; this
+//     gate only matters when neither is set).
 //   FFAI_FUSED_QKV_PREFILL=1
 //     Force the fused single-dispatch QKV kernel at prefill T > 8 too
 //     (normally reserved for T <= 8, where it beats the 3-separate-MMA-

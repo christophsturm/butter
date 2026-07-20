@@ -4506,6 +4506,15 @@ public enum Ops {
     /// `dispatchThreads` entry point (see `sdpaPrefillMma`'s note
     /// below on this being a silent-corruption bug for coop-matrix
     /// kernels, not just a perf one).
+    ///
+    /// f16/bf16 default to the BK=16 follow-up kernel
+    /// (`ffai_sdpa_prefill_mma_d256_bk16`, see `crates/ffai-kernels-std/
+    /// src/kernels/sdpa/sdpa_prefill_mma_d256_bk16.rs`): it halves the
+    /// K-block loop's iteration count by reusing each cooperative K/V
+    /// load across twice as many query rows, at a threadgroup-memory
+    /// cost that only fits f16/bf16 (33792 B at f32 would blow the 32
+    /// KiB ceiling, so f32 always stays on the BK=8 kernel below).
+    /// `FFAI_SDPA_BK16=0` reverts f16/bf16 to BK=8 for bisection.
     public static func sdpaPrefillMmaD256(
         q: Tensor, k: Tensor, v: Tensor,
         nQHeads: Int, nKVHeads: Int, headDim: Int,
@@ -4534,6 +4543,7 @@ public enum Ops {
         let tgGrid = MTLSize(width: tgX, height: nQHeads, depth: 1)
         let tg = MTLSize(width: 128, height: 1, depth: 1)
         let causalFlag = UInt32(causal ? 1 : 0)
+        let useBK16 = ProcessInfo.processInfo.environment["FFAI_SDPA_BK16"] != "0"
         switch q.dtype {
         case .f32:
             MetalTileKernels.ffai_sdpa_prefill_mma_d256_f32_threadgroups(
@@ -4545,23 +4555,45 @@ public enum Ops {
                 causal: causalFlag, scale: scale,
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         case .f16:
-            MetalTileKernels.ffai_sdpa_prefill_mma_d256_f16_threadgroups(
-                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
-                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
-                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
-                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
-                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
-                causal: causalFlag, scale: scale,
-                gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            if useBK16 {
+                MetalTileKernels.ffai_sdpa_prefill_mma_d256_bk16_f16_threadgroups(
+                    q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                    v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                    head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                    base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                    kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                    causal: causalFlag, scale: scale,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                MetalTileKernels.ffai_sdpa_prefill_mma_d256_f16_threadgroups(
+                    q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                    v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                    head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                    base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                    kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                    causal: causalFlag, scale: scale,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            }
         case .bf16:
-            MetalTileKernels.ffai_sdpa_prefill_mma_d256_bf16_threadgroups(
-                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
-                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
-                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
-                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
-                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
-                causal: causalFlag, scale: scale,
-                gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            if useBK16 {
+                MetalTileKernels.ffai_sdpa_prefill_mma_d256_bk16_bf16_threadgroups(
+                    q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                    v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                    head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                    base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                    kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                    causal: causalFlag, scale: scale,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                MetalTileKernels.ffai_sdpa_prefill_mma_d256_bf16_threadgroups(
+                    q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                    v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                    head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                    base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                    kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                    causal: causalFlag, scale: scale,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            }
         default:
             fatalError(
                 "Ops.sdpaPrefillMmaD256: unsupported dtype \(q.dtype) "
