@@ -40,8 +40,9 @@ We should add support for the following model families:
 - Tencent Hy2 - use https://huggingface.co/tencent/Hy-MT2-1.8B as our reference and test model. They have other model sizes including an MoE https://huggingface.co/tencent/Hy-MT2-30B-A3B. We should support them all.
 - LFM2 24B - use https://huggingface.co/LiquidAI/LFM2-24B-A2B as a reference
 - Microsoft Bitnet - use https://huggingface.co/microsoft/bitnet-b1.58-2B-4T as a reference
-- Bonsai Ternary - https://huggingface.co/collections/prism-ml/ternary-bonsai (ternary bit text llm, same concept as Bitnet, high priority!)
+- Bonsai Ternary - https://huggingface.co/collections/prism-ml/ternary-bonsai (Qwen tuned ternary bit text llm, same concept as Bitnet, high priority!)
 - Bonsai Image - https://huggingface.co/collections/prism-ml/bonsai-image (ternary image gen model)
+- Ornith 1.0 - https://huggingface.co/collections/deepreinforce-ai/ornith-10 (Qwen fine tune on tracing)
 - Nemotron OCR 2 - use https://huggingface.co/nvidia/nemotron-ocr-v2 as reference (image OCR)
 - Nvidia Canary - https://huggingface.co/nvidia/canary-1b-v2 (multi-lingual audio model)
 - Nvidia Nemotron Speech Streaming - https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b (streaming audio)
