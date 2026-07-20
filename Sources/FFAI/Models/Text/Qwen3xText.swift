@@ -149,9 +149,31 @@ public struct Qwen35Hybrid: Qwen35Variant {
 
     /// Qwen3.5 ships both base + instruction-tuned checkpoints. Greedy
     /// by default keeps the integration suite deterministic.
+    ///
+    /// `prefillStepSize` is left `nil` here on purpose so the real
+    /// `ffai generate` path defers to `Qwen35Model.defaultPrefillStepSize`
+    /// (4096, since every layer here carries an MoE FFN). This field used
+    /// to hardcode 1024, silently overriding that tuned engine default
+    /// down to a quarter of its value on every real generation call. A
+    /// chunk-size sweep on an M5 Max (Qwen3.6-35B-A3B 4-bit, T =
+    /// 1024..32768, 3 interleaved trials per cell, `FFAI_PREFILL_STEP`
+    /// override) found the outer prefill chunk boundary has zero
+    /// numerical effect at this chunk-size range: `--dump-prefill-logits`
+    /// cosine was exactly 1.0 (bit-identical, not just close) at every
+    /// chunk size tested against the old 1024 default, and greedy
+    /// 32-token generation matched token-for-token across chunk sizes.
+    /// So raising the default from 1024 to 4096 is a pure throughput
+    /// lever here, not a quality tradeoff: it recovered 3.5 to 6.9
+    /// percent prefill throughput at T >= 4096 (drift-robust min of 3
+    /// interleaved trials), with no measurable change at T <= 1024
+    /// (already a single chunk there). 8192 was also swept and
+    /// rejected as the default: no further throughput win over 4096 at
+    /// T=16384/32768 (slightly slower, in fact) while peak process RSS
+    /// roughly doubled (about 80-88 GB vs 59-61 GB at T=16384/32768 on
+    /// this 128 GB machine). `FFAI_PREFILL_STEP=<n>` still overrides
+    /// either value for further experimentation.
     public static let defaultGenerationParameters = GenerationParameters(
         maxTokens: 256,
-        prefillStepSize: 1024,
         temperature: 0.0,
         topP: 1.0,
         topK: 0,
