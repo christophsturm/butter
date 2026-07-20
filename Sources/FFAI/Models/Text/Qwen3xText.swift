@@ -1183,6 +1183,144 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
     }
 }
 
+// ─── Prefill hot-path env var reference ──────────────────────────────
+//
+// This campaign added a number of env toggles across the Qwen3x prefill
+// and decode paths (attention, GDN, MoE). They have mixed polarity
+// (some opt IN to a new path with `=1`, some opt OUT of a new default
+// back to an older path), so this block is the one place to look them
+// up rather than re-deriving polarity from call sites scattered across
+// this file, `Ops.swift`, and `MoELayer.swift`. Grep each name for the
+// exact gate if the summary below isn't enough context.
+//
+// Reproduce the pre-campaign stack (attention back to the original
+// per-query-row kernel, GDN back to the generic non-specialized path,
+// prefill chunk size back to the old 1024 default):
+//
+//   FFAI_SDPA_LEGACY_D256=1 FFAI_GDN_NO_PREP_CHUNK_FAST=1 \
+//   FFAI_PREFILL_STEP=1024 <ffai command>
+//
+// (`FFAI_SDPA_LEGACY_D256=1` alone reverts d=256 attention two steps
+// past the current default: MMA -> Q-tiled -> legacy. Leave
+// `FFAI_SDPA_QTILED_D256` unset when using it, see the table below.)
+//
+// ── Chunk size ─────────────────────────────────────────────────────
+//   FFAI_PREFILL_STEP=<n>
+//     Override the prefill chunk size. Opt-in override, highest
+//     priority link in the resolution chain (env, then
+//     `GenerationParameters.prefillStepSize`, then
+//     `engine.defaultPrefillStepSize`) in both the real generate path
+//     (`Generate.swift`) and the `--dump-prefill-logits` diagnostic
+//     (`GenerateCommand.swift`): the two paths must resolve through
+//     the same chain or a param-level override silently diverges
+//     between what generation runs and what the diagnostic validates.
+//     Default when unset: family-tuned (4096 for Qwen3.5 MoE / 3.6).
+//
+// ── Attention (d=256 full-attention layers) ────────────────────────
+//   FFAI_SDPA_QTILED_D256=1
+//     Revert prefill d=256 attention from the default MMA kernel
+//     (`Ops.sdpaPrefillMmaD256`) to the prior scalar Q-tiled kernel
+//     (`Ops.sdpaPrefillQtiledD256`). Opt-out of the current default.
+//   FFAI_SDPA_LEGACY_D256=1
+//     Revert further, to the original per-query-row kernel
+//     (`ffai_sdpa_multi_d256`, one threadgroup per query with no K/V
+//     reuse across rows). Only takes effect when
+//     `FFAI_SDPA_QTILED_D256` is NOT also set. Opt-out, two steps back.
+//   FFAI_FUSED_QKV_PREFILL=1
+//     Force the fused single-dispatch QKV kernel at prefill T > 8 too
+//     (normally reserved for T <= 8, where it beats the 3-separate-MMA-
+//     qmm default; routing it to large prefill M costs ~16% e2e).
+//     Opt-in, A/B only.
+//   FFAI_NO_FUSED_QKV=1
+//     Opt out of the fused-QKV eligibility check entirely (affects the
+//     small-T / decode routing above, not the general prefill default).
+//   FFAI_SDPA_2PASS_THRESHOLD=<n>
+//     Decode-only. KV length above which 2-pass flash-decoding kicks
+//     in for the attention mixer. Default 1024 when unset.
+//
+// ── GDN (Gated DeltaNet recurrent mixer) ────────────────────────────
+//   FFAI_GDN_NO_FUSED_PREP=1
+//     Opt out of the fused prep+recurrence single-token kernel
+//     (`ffai_gated_delta_prep_step`); revert to the legacy host-loop
+//     prep + `Ops.gatedDeltaStep`. Default: fused ON.
+//   FFAI_NO_FUSED_GDN_4=1
+//     Opt out of the batched 4-projection (qkv/z/b/a) single-dispatch
+//     fast path at decode. Default: ON when the shape is eligible
+//     (int4 weights, matching group size, dims divisible by 8/512).
+//   FFAI_GDN_NO_PREP_CHUNK=1
+//     Opt out of the chunked prep+recurrence prefill path
+//     (`forwardManyChunked`); revert to the per-token T-loop. Default:
+//     chunked ON.
+//   FFAI_GDN_NO_PREP_CHUNK_FAST=1
+//     Opt out of the shape-specialized fast GDN prep_chunk kernel
+//     (`Ops.gatedDeltaPrepChunkFast`, Dk/Dv/Hv/Hk baked as compile-time
+//     constants instead of `#[constexpr]` runtime params, measured
+//     ~3.7-4.2x faster at the production shape); revert to the generic
+//     kernel. Default: fast ON when the shape matches (Dk=Dv=128,
+//     Hv=32, Hk=16) and the WY path below is not active.
+//   FFAI_GDN_WY=1
+//     Opt in to the chunked-WY prefill pipeline (`ffai_gdn_wy_plan` +
+//     `ffai_gdn_wy_scan`) at T >= 64. Default: OFF, uses
+//     `gatedDeltaPrepChunk`/`gatedDeltaPrepChunkFast` instead.
+//   FFAI_NO_CONV1D_MANY=1
+//     Opt out of the batched T-token conv1d dispatch
+//     (`conv1dCausalStepSiluCastMany`); revert to per-token conv
+//     dispatches. Default: batched ON (conv_kernel == 4 only).
+//
+// ── Model-level forward routing ─────────────────────────────────────
+//   FFAI_LEGACY_FORWARDMANY=1
+//     Revert the whole multi-token decode path
+//     (`Qwen35Model.forwardMany`) to the old per-token loop. Default:
+//     batched forward.
+//   FFAI_PROFILE_LAYERS=1 | 2
+//     Per-layer commit+wait for GPU-time attribution (kills
+//     pipelining); =2 also records per-layer phase timings. Default:
+//     off (no profiling overhead).
+//
+// ── MoE (Qwen3.5 MoE checkpoints; `MoELayer` / `Qwen35MoEFFN`) ──────
+//   FFAI_MOE_BGEMM=1
+//     Opt in to the batched gather-BGEMM fast path at DECODE (T=1)
+//     only. It currently regresses vs the sequential per-expert matvec
+//     path at this model's topK=8/m_total=8 decode shape, so it stays
+//     opt-in there. Prefill (`decodeMany`, T > 1) always uses BGEMM
+//     unconditionally; this var does not affect prefill.
+//   FFAI_MOE_BGEMM_BM64=1
+//     Within the BGEMM path, opt in to the bm64 NAX cooperative-tensor
+//     tile kernel for mTotal >= 1024. Default: OFF (bm16 wins by
+//     3-5% end-to-end for this model's narrow experts); bm64 is kept
+//     available for wider-expert models or other hardware.
+//   FFAI_MOE_BGEMM_NO_BM64=1
+//     Force bm64 off even if `FFAI_MOE_BGEMM_BM64=1` is also set.
+//   FFAI_MOE_BGEMM_BM8=1
+//     Opt in to the bm8 tile kernel for decode T=1 (topK <= 8,
+//     mTotal <= 8). Default: OFF (bm16 default).
+//   FFAI_MOE_BGEMM_FORCE_T1=1
+//     Force BGEMM to also engage at mTotal == 1, for A/B comparison.
+//   FFAI_MOE_BGEMM_MPP=1
+//     Force the MPP (NAX cooperative-tensor, Apple GPU Family 9+ /
+//     macOS 26+) bm16 sub-variant on, bypassing the hardware
+//     auto-capability gate. Force off with `FFAI_MOE_BGEMM_NO_MPP=1`.
+//     Default: auto-detected (`FFAI_MOE_BGEMM_MPP_MIN=<mTotal>` sets an
+//     optional floor below which auto-MPP won't fire even on capable
+//     hardware; default floor 0 = always when hardware allows).
+//   FFAI_MOE_M1=1
+//     Route the decode-T=1 gather through the scalar `ffai_moe_gather
+//     _qmm_int4` kernel instead of the cooperative-tensor bm8/bm16/bm64
+//     variants (those lose ~15% to descriptor setup cost at T=1).
+//     Only takes effect when bm8 is not also selected.
+//   FFAI_MOE_GPU_ROUTER=0
+//     Opt out of the GPU-resident top-K router; revert to a per-token
+//     host `waitUntilCompleted` router. Default: GPU router ON.
+//   FFAI_MOE_NO_DEQUANT_GATE=1
+//     Opt out of caching the lazily-dequantized gate weight. Default:
+//     ON (cached) when the gate projection is 8-bit quantized.
+//   DEVPLAN2=0
+//     Opt out of chaining the MoE prefill expert path onto the
+//     caller's own command buffer. Note: no `FFAI_` prefix (older
+//     name, predates this campaign's convention). Default: chains on
+//     the caller's command buffer when the GPU router is enabled and
+//     gating is softmax-then-topK.
+
 // ─── Qwen35GDNMixer — Gated Delta Net recurrent mixer ────────────────
 //
 // GPU owns every projection, the conv, the GDN recurrence kernel, the
