@@ -4489,6 +4489,87 @@ public enum Ops {
         return result
     }
 
+    /// MMA (simdgroup-matrix) Q-tiled prefill-append SDPA for
+    /// `headDim == 256`. Same external contract as
+    /// `sdpaPrefillQtiledD256` (baseKV/nQuery/kvStride/causal-flag
+    /// prefill-append signature, GQA via nQHeads/nKVHeads, ragged
+    /// nQuery guarded inside the kernel) but each threadgroup owns
+    /// `BQ = 32` query rows for a single q_head, computed via
+    /// multi-simdgroup `simdgroup_matrix` MMA fragments rather than
+    /// `sdpaPrefillQtiledD256`'s scalar simd_sum dot products. Wraps
+    /// `ffai_sdpa_prefill_mma_d256`; see `crates/ffai-kernels-std/src/
+    /// kernels/sdpa/sdpa_prefill_mma_d256.rs`.
+    /// TPG = 128 (4 simdgroups x 32 lanes); grid = `(ceil(nQuery/32),
+    /// nQHeads, 1)` THREADGROUPS -- this is a coop-matrix MMA kernel,
+    /// so it must be dispatched with `dispatchThreadgroups` (the
+    /// `_threadgroups` generated variant), never the plain
+    /// `dispatchThreads` entry point (see `sdpaPrefillMma`'s note
+    /// below on this being a silent-corruption bug for coop-matrix
+    /// kernels, not just a perf one).
+    public static func sdpaPrefillMmaD256(
+        q: Tensor, k: Tensor, v: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        baseKV: Int, nQuery: Int, kvStride: Int,
+        causal: Bool, scale: Float,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        if let reason = OpsValidation.validateSdpaMulti(
+            headDim: headDim, nQHeads: nQHeads, nKVHeads: nKVHeads,
+            baseKV: baseKV, nQuery: nQuery, kvStride: kvStride
+        ) {
+            preconditionFailure("Ops.sdpaPrefillMmaD256: \(reason)")
+        }
+        precondition(
+            headDim == 256,
+            "Ops.sdpaPrefillMmaD256: only headDim == 256 is emitted, got \(headDim)")
+        let headsPerGroup = nQHeads / nKVHeads
+        let result = out ?? Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: q.dtype)
+        // Grid in THREADGROUPS directly: (ceil(nQuery/32), nQHeads, 1).
+        // Do NOT scale by tg.width the way the dispatchThreads-based
+        // sdpaPrefillQtiledD256 does above -- dispatchThreadgroups
+        // takes a threadgroup-count grid, not a total-thread grid.
+        let bq = 32
+        let tgX = (nQuery + bq - 1) / bq
+        let tgGrid = MTLSize(width: tgX, height: nQHeads, depth: 1)
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        let causalFlag = UInt32(causal ? 1 : 0)
+        switch q.dtype {
+        case .f32:
+            MetalTileKernels.ffai_sdpa_prefill_mma_d256_f32_threadgroups(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_sdpa_prefill_mma_d256_f16_threadgroups(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_sdpa_prefill_mma_d256_bf16_threadgroups(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError(
+                "Ops.sdpaPrefillMmaD256: unsupported dtype \(q.dtype) "
+                    + "(only f32/f16/bf16 are emitted)")
+        }
+        return result
+    }
+
     /// Tree-causal `sdpaMulti` — same dispatch contract but the
     /// scalar `causal` boolean is replaced by an additive
     /// `[nQuery, nQuery]` mask tensor consulted only for in-block KV

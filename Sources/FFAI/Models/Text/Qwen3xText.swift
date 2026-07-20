@@ -2451,27 +2451,45 @@ public final class Qwen35AttentionMixer: Module {
         // ── SDPA (fuse the T-token causal attention into ONE dispatch).
         // d=128 wraps `ffai_sdpa_multi` (`Ops.sdpaMulti`, unchanged). d=256
         // (Qwen3.6-A3B full-attention layers) defaults to
-        // `Ops.sdpaPrefillQtiledD256` (`ffai_sdpa_prefill_qtiled_d256`):
-        // BQ=16 query rows share each loaded K/V block before advancing,
-        // vs the legacy `ffai_sdpa_multi_d256` (one threadgroup per
-        // (query, q_head), no K/V reuse across rows, so HBM traffic for
-        // K/V scales with T per row, T^2 total). That's exactly the
-        // "append regime" bandwidth waste the F-85 prefill-attention
-        // campaign attribution identified as the root of the ~4.4x
-        // llama.cpp gap.
-        // Measured e2e prefill win on Qwen3.6-35B-A3B (M5 Max): +1.6% at
-        // T=1024, +7.2% at T=4096, +13.9% at T=8488, +27.4% at T=16889,
-        // no regression at any T down to 124; quality gate (cosine vs
-        // the legacy path) held >=0.998 at T=512..16889 across 6
-        // non-repeating prompts. `FFAI_SDPA_LEGACY_D256=1` reverts to the
-        // legacy kernel for bisection.
-        let useLegacyD256 =
+        // `Ops.sdpaPrefillMmaD256` (`ffai_sdpa_prefill_mma_d256`): a Stage-B
+        // follow-up on the F-85 attention attribution that replaces the
+        // prior default `ffai_sdpa_prefill_qtiled_d256`'s scalar simd_sum
+        // Q.K/P.V dot products with simdgroup-matrix MMA (BQ=32 vs the
+        // scalar kernel's BQ=16; motivated by Stage-A profiling showing
+        // the attention mixer's prefill GPU-time share growing from ~25%
+        // (T=4096) to ~70% (T=32768) while GDN/MoE per-chunk costs stayed
+        // flat). Quality gate (cosine vs the qtiled kernel) held
+        // >=0.994 at T=512..16384 across 3 non-repeating prompts per
+        // length, top1 match at every cell, deterministic greedy
+        // 32-token generation. Measured e2e prefill win on
+        // Qwen3.6-35B-A3B (M5 Max), median of 3 interleaved trials:
+        // 1.20x at T=4096, 1.67x at T=16384, 2.11x at T=32768 (the win
+        // grows with T, tracking attention's growing share of total
+        // prefill time). `FFAI_SDPA_QTILED_D256=1` reverts to the prior
+        // default (the scalar Q-tiled kernel) for bisection.
+        // `FFAI_SDPA_LEGACY_D256=1` reverts further, to the original
+        // `ffai_sdpa_multi_d256` (one threadgroup per (query, q_head),
+        // no K/V reuse across rows) that the F-85 campaign identified
+        // as the source of the original append-regime bandwidth waste.
+        let useQtiledD256 =
             headDim == 256
+                && ProcessInfo.processInfo.environment["FFAI_SDPA_QTILED_D256"] == "1"
+        let useLegacyD256 =
+            headDim == 256 && !useQtiledD256
                 && ProcessInfo.processInfo.environment["FFAI_SDPA_LEGACY_D256"] == "1"
-        let useQtiled = headDim == 256 && !useLegacyD256
+        let useMmaD256 = headDim == 256 && !useLegacyD256 && !useQtiledD256
+        let useQtiled = useQtiledD256
         let (cacheK, cacheV) = kv.prepareForAttention(on: cmd)
         let attnAll: Tensor
-        if useQtiled {
+        if useMmaD256 {
+            let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
+            attnAll = Ops.sdpaPrefillMmaD256(
+                q: qBlock, k: cacheK, v: cacheV,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
+                causal: true, scale: scale, on: cmd
+            ).reshaped(to: [t * qDim])
+        } else if useQtiled {
             let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
             attnAll = Ops.sdpaPrefillQtiledD256(
                 q: qBlock, k: cacheK, v: cacheV,
