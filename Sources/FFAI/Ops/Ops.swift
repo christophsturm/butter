@@ -6792,6 +6792,112 @@ public enum Ops {
         }
     }
 
+    /// Shape-specialized fast path for `gatedDeltaPrepChunk`, valid ONLY at
+    /// the Qwen3.6-35B-A3B production GDN shape (Dk=Dv=128, Hv=32, Hk=16;
+    /// see `config.json`'s `linear_key_head_dim` / `linear_value_head_dim` /
+    /// `linear_num_value_heads` / `linear_num_key_heads`).
+    ///
+    /// Root cause this works around: the generic kernel's `dk`/`dv`/`hv`/`hk`
+    /// are `#[constexpr]` DSL params, but the MSL backend lowers every
+    /// `#[constexpr]` to an ordinary runtime `constant T &name [[buffer(N)]]`,
+    /// so `n_per_t = dk / 32` is NOT a compile-time constant to the Metal
+    /// shader compiler, and the per-lane `state_reg`/`k_cache` arrays can't
+    /// be unrolled into registers; every iteration of the T-token recurrence
+    /// pays a real indexed-memory round trip instead. This dispatches a
+    /// sibling kernel (`ffai_gated_delta_prep_chunk_fast_d128_128_32_16`)
+    /// that bakes `Dk`/`Dv`/`Hv`/`Hk` as true Rust-level compile-time
+    /// constants (`#[kernel(variants(...))]`, the same mechanism already
+    /// used by `ffai_gated_delta_step_record`'s shape specialization), so
+    /// the Metal compiler can fully unroll and register-promote. Measured
+    /// ~3.7-4.2x faster than the generic kernel at this exact shape (see
+    /// `bench_gated_delta_prep_chunk_fast_t1024` / `_t4096` vs
+    /// `bench_gated_delta_prep_chunk_prod_t1024` / `_t4096` in
+    /// `gated_delta_prep_chunk.rs`). Same grid/TG geometry as
+    /// `gatedDeltaPrepChunk`; this does not change grid-level parallelism.
+    ///
+    /// No `dk`/`dv`/`hv`/`hk` parameters. Callers must confirm the shape
+    /// matches before calling (see `Qwen35GDNMixer.forwardManyChunked`'s
+    /// guard). `batchSize`/`hv` are still needed for grid sizing.
+    public static func gatedDeltaPrepChunkFast(
+        convOut: Tensor,
+        aLog: Tensor, dtBias: Tensor,
+        aRaw: Tensor, bRaw: Tensor,
+        qNormed: Tensor, kNormed: Tensor,
+        stateIn: Tensor, stateOut: Tensor, y: Tensor,
+        tLen: Tensor,
+        batchSize: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            convOut.dtype == aLog.dtype && aLog.dtype == dtBias.dtype
+                && dtBias.dtype == aRaw.dtype && aRaw.dtype == bRaw.dtype
+                && bRaw.dtype == qNormed.dtype && qNormed.dtype == kNormed.dtype
+                && kNormed.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
+                && stateOut.dtype == y.dtype,
+            "Ops.gatedDeltaPrepChunkFast: every tensor must share dtype")
+        precondition(
+            tLen.dtype == .u32 && tLen.elementCount == 1,
+            "Ops.gatedDeltaPrepChunkFast: tLen must be a [1] u32 scalar buffer")
+        // Fixed production shape: Dv=128, Hv=32 (Dk/Hk are baked into the
+        // kernel and never touch grid sizing; grid math mirrors
+        // `gatedDeltaPrepChunk` exactly at dv=128/hv=32).
+        let dv = 128
+        let hv = 32
+        let tgWidth = 128
+        let dvTiles = (dv + 3) / 4
+        let grid = MTLSize(
+            width: dvTiles * tgWidth,
+            height: batchSize * hv,
+            depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch convOut.dtype {
+        case .f32:
+            MetalTileKernels.ffai_gated_delta_prep_chunk_fast_d128_128_32_16_f32(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_gated_delta_prep_chunk_fast_d128_128_32_16_f16(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_gated_delta_prep_chunk_fast_d128_128_32_16_bf16(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.gatedDeltaPrepChunkFast: unsupported dtype \(convOut.dtype)")
+        }
+    }
+
     // ─── Chunked-WY GDN prefill (`ffai_gdn_wy_plan` + `ffai_gdn_wy_scan`) ──
     //
     // Opt-in alternative to `gatedDeltaPrepChunk` — see

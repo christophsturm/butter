@@ -1933,6 +1933,22 @@ public final class Qwen35GDNMixer: Module {
         let useWY =
             ProcessInfo.processInfo.environment["FFAI_GDN_WY"] != nil && t >= 64
             && valueHeadDim % 32 == 0 && keyHeadDim % 16 == 0 && valueHeadDim % 16 == 0
+        // Shape-specialized fast path: dispatches
+        // `ffai_gated_delta_prep_chunk_fast_d128_128_32_16` in place of the
+        // generic `gatedDeltaPrepChunk`: same math, same grid/TG geometry,
+        // but Dk/Dv/Hv/Hk baked as compile-time constants instead of
+        // `#[constexpr]` runtime buffer params, which is what let the Metal
+        // compiler register-promote the per-lane recurrence state (measured
+        // ~3.7-4.2x faster at this exact shape; see `Ops.gatedDeltaPrepChunkFast`
+        // doc for the root-cause writeup). Only valid at Qwen3.6-35B-A3B's
+        // production GDN shape, so guard on the exact dims before dispatching,
+        // and keep an escape hatch back to the generic kernel for any other
+        // GDN-bearing shape or for A/B verification.
+        let fastShapeMatches =
+            keyHeadDim == 128 && valueHeadDim == 128 && numValueHeads == 32 && numKeyHeads == 16
+        let useFast =
+            !useWY && fastShapeMatches
+            && ProcessInfo.processInfo.environment["FFAI_GDN_NO_PREP_CHUNK_FAST"] == nil
         if useWY {
             Ops.gatedDeltaWYPrefill(
                 convOut: convOutAllF32,
@@ -1945,6 +1961,17 @@ public final class Qwen35GDNMixer: Module {
                 dk: keyHeadDim, dv: valueHeadDim,
                 hv: numValueHeads, hk: numKeyHeads,
                 on: cmd, device: device)
+        } else if useFast {
+            Ops.gatedDeltaPrepChunkFast(
+                convOut: convOutAllF32,
+                aLog: aLogTF32, dtBias: dtBiasTF32,
+                aRaw: aRawF32All, bRaw: bRawF32All,
+                qNormed: qNormedAll, kNormed: kNormedAll,
+                stateIn: cache.gdn.current, stateOut: cache.gdn.next,
+                y: yF32All,
+                tLen: tLenScalar,
+                batchSize: 1,
+                on: cmd)
         } else {
             Ops.gatedDeltaPrepChunk(
                 convOut: convOutAllF32,
