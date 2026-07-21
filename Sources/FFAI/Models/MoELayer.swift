@@ -487,6 +487,10 @@ public final class MoELayer: Module, DecoderLayer {
     /// `useCoopTilePlan` dispatch and the paired lever's "own" dispatch -
     /// see `coopIndirectEnabled` below). Raw env string cached at init.
     let coopIndirectEnvRaw: String?
+    /// Bucketed counting-sort gate for `ffai_moe_sort_plan` (F-85 prefill
+    /// gate). Raw env string cached at init; `sortPlanCountingEnabled`
+    /// below is the single place that interprets it.
+    let sortPlanCountingEnvRaw: String?
 
     /// Lazy dequant of the gate weight + cached output. Skipped when
     /// `gate.inner` is not a 8-bit QuantizedLinear or env
@@ -671,6 +675,7 @@ public final class MoELayer: Module, DecoderLayer {
         self.pairedMaxMTotalEnvRaw = env["FFAI_MOE_PAIRED_MAX_MTOTAL"]
         self.pairedIndirectEnvRaw = env["FFAI_MOE_PAIRED_INDIRECT"]
         self.coopIndirectEnvRaw = env["FFAI_MOE_COOP_INDIRECT"]
+        self.sortPlanCountingEnvRaw = env["FFAI_MOE_COUNTING_SORT"]
     }
 
     /// F-85 expert-aligned tile-plan gate. Default ON as of the wiring
@@ -687,6 +692,24 @@ public final class MoELayer: Module, DecoderLayer {
     /// regardless of this flag (see `decodeMany`).
     public var tilePlanEnabled: Bool {
         tilePlanEnvRaw != "0"
+    }
+
+    /// F-85 bucketed counting-sort gate for `ffai_moe_sort_plan`
+    /// (`Ops.moeSortPlanCounting`, `moe_sort_plan_counting.rs`). Replaces
+    /// the original kernel's O(mTotal^2) per-thread linear scan with a
+    /// three-pass O(mTotal * nExperts) histogram -> prefix-sum -> scatter
+    /// pipeline, same stable order (`--dump-prefill-logits` byte-identical
+    /// at every T tested, deterministic across repeat dispatch, checked
+    /// against the original kernel's own GPU output directly, not just a
+    /// CPU oracle). Isolated kernel bench (Zipf-seeded routing draws,
+    /// same shape as production) shows the win growing with mTotal as the
+    /// asymptotics predict: ~6-9x at mTotal 4096/8192, ~10-15x at 16384,
+    /// ~38x at 32768. Default ON. Escape hatch: `FFAI_MOE_COUNTING_SORT=0`
+    /// reverts to the original kernel. Only wired into the DEVPLAN2
+    /// device-sorted-plan path (`useDevPlan2`) - the only path that calls
+    /// `ffai_moe_sort_plan` at all.
+    public var sortPlanCountingEnabled: Bool {
+        sortPlanCountingEnvRaw != "0"
     }
 
     /// F-85 coop-core MoE gather GEMM gate (BM=32 tile plan over
@@ -1132,7 +1155,20 @@ public final class MoELayer: Module, DecoderLayer {
             let se = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
             let st = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
             let ip = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
-            Ops.moeSortPlan(topkIds: idsFlat, sortedExperts: se, sourceTokens: st, invPerm: ip, mTotal: mTot, k: topK, on: cmd)
+            // F-85 bucketed counting-sort (default ON, see
+            // `sortPlanCountingEnabled`; escape hatch
+            // FFAI_MOE_COUNTING_SORT=0 reverts to the O(mTotal^2) original).
+            // Block size 256 - see `moe_sort_plan_counting.rs`'s isolated
+            // bench sweep at production mTotal.
+            if self.sortPlanCountingEnabled {
+                Ops.moeSortPlanCounting(
+                    topkIds: idsFlat, sortedExperts: se, sourceTokens: st, invPerm: ip,
+                    mTotal: mTot, k: topK, nExperts: nExperts, blockSize: 256, on: cmd)
+            } else {
+                Ops.moeSortPlan(
+                    topkIds: idsFlat, sortedExperts: se, sourceTokens: st, invPerm: ip,
+                    mTotal: mTot, k: topK, on: cmd)
+            }
             d2Source = st
             d2InvPerm = ip
             d2Indices = se

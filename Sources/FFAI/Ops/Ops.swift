@@ -620,6 +620,66 @@ public enum Ops {
             gridSize: grid, threadgroupSize: tg, on: cmd)
     }
 
+    /// Bucketed counting-sort replacement for `moeSortPlan` (F-85 prefill
+    /// gate). Same stable-order output contract, three dispatches on the
+    /// caller's command buffer instead of one, no readback between them,
+    /// same no-sync DEVPLAN2 property as the kernel it replaces:
+    ///   1. `ffai_moe_sort_plan_hist`    computes per-(block, expert) row counts.
+    ///   2. `ffai_moe_sort_plan_offsets` turns counts into each block's per-expert
+    ///      write offset.
+    ///   3. `ffai_moe_sort_plan_scatter` has each row write itself using its
+    ///      block's offset plus an in-block stable rank.
+    /// `blockCounts`/`blockOffsets` are fresh scratch each call (sized off
+    /// `mTotal`, which varies per prefill chunk), not cached, matching how
+    /// `sortedExperts`/`sourceTokens`/`invPerm` are already allocated fresh
+    /// per `decodeMany` call at this call site.
+    public static func moeSortPlanCounting(
+        topkIds: Tensor, sortedExperts: Tensor, sourceTokens: Tensor, invPerm: Tensor,
+        mTotal: Int, k: Int, nExperts: Int, blockSize: Int, on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            nExperts <= 256,
+            "moeSortPlanCounting: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let nBlocks = (mTotal + blockSize - 1) / blockSize
+        let blockCountsBuf = device.makeBuffer(length: nBlocks * nExperts * 4)
+        let blockOffsetsBuf = device.makeBuffer(length: nBlocks * nExperts * 4)
+
+        // Pass 1: per-block histogram. grid = nBlocks threadgroups, one
+        // lane per expert.
+        MetalTileKernels.ffai_moe_sort_plan_hist_f32_threadgroups(
+            topk_ids: topkIds.buffer, topk_idsOffset: topkIds.offset,
+            block_counts: blockCountsBuf, block_countsOffset: 0,
+            m_total: UInt32(mTotal), n_experts: UInt32(nExperts), block_size: UInt32(blockSize),
+            gridSize: MTLSize(width: nBlocks, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: nExperts, height: 1, depth: 1),
+            on: cmd)
+
+        // Pass 2: counts -> per-block per-expert write offsets. One
+        // threadgroup, one lane per expert.
+        MetalTileKernels.ffai_moe_sort_plan_offsets_f32_threadgroups(
+            block_counts: blockCountsBuf, block_countsOffset: 0,
+            block_offsets: blockOffsetsBuf, block_offsetsOffset: 0,
+            n_blocks: UInt32(nBlocks), n_experts: UInt32(nExperts),
+            gridSize: MTLSize(width: 1, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: nExperts, height: 1, depth: 1),
+            on: cmd)
+
+        // Pass 3: scatter. Same dispatchThreads convention as the
+        // original `ffai_moe_sort_plan` (grid in threads, data-sized).
+        let tgWidth = min(mTotal, 256)
+        MetalTileKernels.ffai_moe_sort_plan_scatter_f32(
+            topk_ids: topkIds.buffer, topk_idsOffset: topkIds.offset,
+            block_offsets: blockOffsetsBuf, block_offsetsOffset: 0,
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            source_tokens: sourceTokens.buffer, source_tokensOffset: sourceTokens.offset,
+            inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+            m_total: UInt32(mTotal), k: UInt32(k), n_experts: UInt32(nExperts), block_size: UInt32(blockSize),
+            gridSize: MTLSize(width: mTotal, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: tgWidth, height: 1, depth: 1),
+            on: cmd)
+    }
+
     /// Dequantize an mlx int4 affine-quantized `[outDim, inDim]` weight to a
     /// dense `[outDim, inDim]` tensor in one dispatch (one thread per packed
     /// u32 = 8 nibbles). Used to batch narrow-outDim projections (e.g. a
