@@ -7482,7 +7482,10 @@ public enum Ops {
 
     // ─── Dynamic-M batched-prefill int4 qmm ───────────────────────────
     //
-    // Host-side driver around `ffai_qmm_mma`. The kernel's dispatch grid is
+    // Host-side driver around `ffai_qmm_mma` (and, at bits=4 on eligible
+    // shapes/hardware, the faster `ffai_qmm_coop` / `ffai_qmm_mma_mpp`
+    // cooperative-tensor tiers; see `dispatchQmmMma`'s doc for the
+    // priority order). The BN=32 kernels' dispatch grid is
     // `[N/32, ceil(M/32), 1]` × tg `[128, 1, 1]` — M is purely grid-Y
     // sized at runtime, so any `M % 32 == 0` is a clean dispatch. The
     // driver pads ragged `T → mPadded = ceil(T/32) * 32` with zero rows
@@ -7495,7 +7498,7 @@ public enum Ops {
     // 7/7 GPU correctness cells including the bf16 T=4096 N=K=2048 Qwen3.6
     // production shape (cos 0.999999). This Swift wrapper is the host-side
     // equivalent — same padding contract, same dispatch geometry, dispatched
-    // through the regenerated `MetalTileKernels.ffai_qmm_mma_*` bindings.
+    // through the regenerated `MetalTileKernels.ffai_qmm_*` bindings.
     //
     // Use this when `T > 1` (the batched-prefill case). For T=1 the regular
     // per-token dequant path is faster (the mma kernel pays full weight-tile
@@ -7652,17 +7655,31 @@ public enum Ops {
     /// `T` up to 32 before reaching here (`dequantGemmDynamicM`'s slow
     /// path); the `m/32` grid math below silently truncates otherwise.
     ///
-    /// bits=4 additionally prefers the MPP/NAX cooperative-tensor kernel
-    /// (`ffai_qmm_mma_mpp`, live-compiled via `MetalPerformancePrimitives`)
-    /// over the manual simdgroup ladder, same idea as the existing bits=8
-    /// MPP arm below. Gate: `Ops.mppAutoCapable` (Apple GPU Family 9+ /
-    /// macOS 26+, the same cached capability check the MoE bgemm work
-    /// added — reused here rather than duplicated), overridable via
-    /// `FFAI_QMM_MPP=0` (force off) / `FFAI_QMM_MPP=1` (force on). The
-    /// int4 MPP kernel bakes `group_size=64` (Qwen3.6-A3B's default —
-    /// see its module doc); a caller quantized at a different group size
-    /// falls back to the simdgroup path regardless of the gate, since the
-    /// MPP kernel would silently read scales/biases at the wrong stride.
+    /// bits=4 additionally prefers, in order:
+    ///  1. `ffai_qmm_coop` (BN=64 wide-N cooperative-tensor kernel, two
+    ///     `matmul2d` ops per simdgroup sharing one staged X-tile; see its
+    ///     module doc for the isolated-bench case for widening past MPP's
+    ///     BN=32). Requires `n % 64 == 0` in addition to the group-size
+    ///     gate below; a caller with a narrower N (not a multiple of 64,
+    ///     e.g. some vision-tower FFN dims) falls through to tier 2/3
+    ///     regardless of the gate. Gate: `FFAI_QMM_COOP=0` (force off) /
+    ///     `=1` (force on); unset auto-detects on `Ops.mppAutoCapable`
+    ///     hardware (default ON there; this is the fastest of the three
+    ///     tiers on every dense int4 shape measured so far).
+    ///  2. `ffai_qmm_mma_mpp` (MPP/NAX cooperative-tensor kernel,
+    ///     live-compiled via `MetalPerformancePrimitives`) over the manual
+    ///     simdgroup ladder, same idea as the existing bits=8 MPP arm
+    ///     below. Gate: `Ops.mppAutoCapable` (Apple GPU Family 9+ /
+    ///     macOS 26+, the same cached capability check the MoE bgemm work
+    ///     added; reused here rather than duplicated), overridable via
+    ///     `FFAI_QMM_MPP=0` (force off) / `FFAI_QMM_MPP=1` (force on).
+    ///  3. `ffai_qmm_mma` (manual simdgroup ladder), the fallback for any
+    ///     shape or hardware neither tier above can serve.
+    /// Both cooperative-tensor kernels bake `group_size=64` (Qwen3.6-A3B's
+    /// default; see their module docs); a caller quantized at a different
+    /// group size falls back to the simdgroup path regardless of either
+    /// gate, since those kernels would silently read scales/biases at the
+    /// wrong stride otherwise.
     private static func dispatchQmmMma(
         weight: Tensor, scales: Tensor, biases: Tensor,
         input: Tensor, output: Tensor,
@@ -7681,6 +7698,9 @@ public enum Ops {
             width: tgGrid.width * tgWidth,
             height: tgGrid.height,
             depth: 1)
+        // ffai_qmm_coop's BN=64 tile halves the N-tile count vs the BN=32
+        // tiers above.
+        let coopGrid = MTLSize(width: n / 64, height: m / 32, depth: 1)
         let kU = UInt32(k)
         let nU = UInt32(n)
         let gsU = UInt32(gsPerRow)
@@ -7692,9 +7712,27 @@ public enum Ops {
         default: mppRequested4 = Self.mppAutoCapable
         }
         let useMpp4 = mppRequested4 && gsPerRow > 0 && k % gsPerRow == 0 && k / gsPerRow == 64
+        let coopRequested4: Bool
+        switch env["FFAI_QMM_COOP"] {
+        case "0": coopRequested4 = false
+        case "1": coopRequested4 = true
+        default: coopRequested4 = Self.mppAutoCapable
+        }
+        let useCoop4 =
+            coopRequested4 && n % 64 == 0 && gsPerRow > 0 && k % gsPerRow == 0
+            && k / gsPerRow == 64
         switch (bits, input.dtype) {
         case (4, .f32):
-            if useMpp4 {
+            if useCoop4 {
+                MetalTileKernels.ffai_qmm_coop_f32_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: coopGrid, threadgroupSize: tg, on: cmd)
+            } else if useMpp4 {
                 MetalTileKernels.ffai_qmm_mma_mpp_f32_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -7714,7 +7752,16 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             }
         case (4, .f16):
-            if useMpp4 {
+            if useCoop4 {
+                MetalTileKernels.ffai_qmm_coop_f16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: coopGrid, threadgroupSize: tg, on: cmd)
+            } else if useMpp4 {
                 MetalTileKernels.ffai_qmm_mma_mpp_f16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -7734,7 +7781,16 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             }
         case (4, .bf16):
-            if useMpp4 {
+            if useCoop4 {
+                MetalTileKernels.ffai_qmm_coop_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: coopGrid, threadgroupSize: tg, on: cmd)
+            } else if useMpp4 {
                 MetalTileKernels.ffai_qmm_mma_mpp_bf16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,

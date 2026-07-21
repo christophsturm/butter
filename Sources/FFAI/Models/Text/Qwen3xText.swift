@@ -1248,6 +1248,30 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //     Decode-only. KV length above which 2-pass flash-decoding kicks
 //     in for the attention mixer. Default 1024 when unset.
 //
+// ── Dense int4 GEMM (batched-prefill quantized projections, T > 1) ──
+//   Routes through `Ops.dequantGemmDynamicM` / `Ops.dispatchQmmMma`, the
+//   shared entry for `QuantizedLinear.callMany`, covering GDN
+//   in-projections, attention QKV/out, and every other dense int4
+//   projection at prefill. Priority order at bits=4:
+//   `ffai_qmm_coop` (BN=64) > `ffai_qmm_mma_mpp` (BN=32) > `ffai_qmm_mma`
+//   (manual simdgroup fallback).
+//   FFAI_QMM_COOP=0
+//     Force off the BN=64 wide-N cooperative-tensor kernel
+//     (`ffai_qmm_coop`); falls through to the MPP tier below. Default: ON
+//     on `Ops.mppAutoCapable` hardware (Apple GPU Family 9+ / macOS 26+)
+//     when the shape is eligible (`n % 64 == 0`, group_size 64). The
+//     fastest of the three dense int4 tiers on every shape measured.
+//   FFAI_QMM_COOP=1
+//     Force the coop kernel on even off the auto-capability check (A/B
+//     only; the kernel needs the same MPP/NAX hardware support as
+//     `ffai_qmm_mma_mpp`, this does not bypass that requirement).
+//   FFAI_QMM_MPP=0 | =1
+//     Force off / on the BN=32 MPP/NAX cooperative-tensor kernel
+//     (`ffai_qmm_mma_mpp`), the tier below coop. Default: auto-detected
+//     the same way as `FFAI_QMM_COOP`. Only reached when coop is off or
+//     the shape fails coop's `n % 64 == 0` guard (e.g. some vision-tower
+//     FFN dims).
+//
 // ── GDN (Gated DeltaNet recurrent mixer) ────────────────────────────
 //   FFAI_GDN_NO_FUSED_PREP=1
 //     Opt out of the fused prep+recurrence single-token kernel
