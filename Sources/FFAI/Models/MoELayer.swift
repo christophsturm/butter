@@ -468,6 +468,25 @@ public final class MoELayer: Module, DecoderLayer {
     /// inner loop). Raw env string cached at init; `coopEnabled` below is
     /// the single place that interprets it.
     let coopEnvRaw: String?
+    /// F-85 two-expert tile-pairing lever gate (`ffai_moe_gather_qmm_coop_paired`,
+    /// only takes effect where `coopEnabled` already holds). Raw env
+    /// string cached at init; `pairedEnabled` below is the single place
+    /// that interprets it.
+    let pairedEnvRaw: String?
+    /// F-85 tile-pairing mTotal threshold override. Raw env string cached
+    /// at init; `pairedMaxMTotal` below is the single place that
+    /// interprets it.
+    let pairedMaxMTotalEnvRaw: String?
+    /// F-85 paired-GEMM indirect-dispatch gate (only takes effect where
+    /// `useCoopPaired` already holds). Raw env string cached at init;
+    /// `pairedIndirectEnabled` below is the single place that interprets
+    /// it.
+    let pairedIndirectEnvRaw: String?
+    /// F-85 idle-tile-cost indirect-dispatch gate for the PRODUCTION coop
+    /// path (`ffai_moe_gather_qmm_coop` itself, both the plain
+    /// `useCoopTilePlan` dispatch and the paired lever's "own" dispatch -
+    /// see `coopIndirectEnabled` below). Raw env string cached at init.
+    let coopIndirectEnvRaw: String?
 
     /// Lazy dequant of the gate weight + cached output. Skipped when
     /// `gate.inner` is not a 8-bit QuantizedLinear or env
@@ -491,6 +510,92 @@ public final class MoELayer: Module, DecoderLayer {
     /// and the scalarFMAChain8.
     private var routerIndicesScratch: Tensor?
     private var routerWeightsScratch: Tensor?
+
+    /// F-85 tile-pairing plan buffers (see `useCoopPaired` in
+    /// `decodeMany`) - allocated ONCE, lazily, on this instance's first
+    /// paired-path call, then reused for every subsequent call. Fixed
+    /// size: `moePairedTilePlanCapacity(nExperts:)` depends only on
+    /// `nExperts` (a per-instance constant via `router.nExperts`), never
+    /// on `mTotal`, so unlike the tile-plan-capacity scratches above
+    /// there is no resize case to handle - first-alloc size is the only
+    /// size this instance will ever need. Follows the same per-instance
+    /// cached-scratch pattern as `routerIndicesScratch` / `accumulatorScratch`
+    /// above; same threading contract (see the class doc comment) - a
+    /// given instance's calls are serialised by the caller, so no lock
+    /// is needed here either.
+    ///
+    /// Safety of reuse ACROSS forward calls on one instance: Metal
+    /// enables automatic hazard tracking by default for plain
+    /// `device.makeBuffer` allocations (not heap/untracked), and this
+    /// codebase's whole per-layer command-buffer chaining already
+    /// depends on command buffers committed to one `MTLCommandQueue`
+    /// executing in commit order with no explicit inter-buffer fence
+    /// (see `Qwen3xText._forwardManyBatched`'s `workCmd` rotation - a
+    /// fresh command buffer is made and committed per MoE layer, with no
+    /// `waitUntilCompleted` between layers outside of `FFAI_PROFILE_LAYERS`).
+    /// The paired-plan builder dispatch (write) for call N+1 and the
+    /// paired GEMM dispatch (read) for call N therefore only ever touch
+    /// this buffer from commands that Metal schedules and executes in
+    /// the SAME order they were committed - the builder's write cannot
+    /// run ahead of the previous call's GEMM read of the same buffer.
+    /// This is the identical assumption the rest of the forward pass
+    /// already relies on to get correct (not just fast) results without
+    /// a host-side wait between every layer, so reusing these six
+    /// buffers introduces no NEW cross-call hazard beyond what every
+    /// other per-layer buffer in this file already accepts.
+    ///
+    /// Buffers are never shared BETWEEN MoELayer instances (each
+    /// transformer layer owns its own `MoELayer`, hence its own copy of
+    /// these six buffers) - so there is no cross-LAYER aliasing question
+    /// to reason about at all, only same-layer call-N vs call-(N+1)
+    /// reuse, per the above.
+    private var pairedTileExpertABuf: MTLBuffer?
+    private var pairedTileRowStartABuf: MTLBuffer?
+    private var pairedTileRowCountABuf: MTLBuffer?
+    private var pairedTileExpertBBuf: MTLBuffer?
+    private var pairedTileRowStartBBuf: MTLBuffer?
+    private var pairedTileRowCountBBuf: MTLBuffer?
+    private var pairedTileBufCapacity = 0
+
+    /// F-85 indirect-dispatch args for the paired GEMM (see
+    /// `Ops.moeGatherDequantGemmInt4CoopTilePlanPairedIndirect`) - the
+    /// root-cause fix for `pairedEnabled`'s worst-case-capacity regression
+    /// (see that property's doc). Layout per buffer: 3 x u32 =
+    /// `[n_out_tiles, pair_count, 1]`, the exact
+    /// `MTLDispatchThreadgroupsIndirectArguments` triple. TWO buffers, not
+    /// one, because the gate/up leg (`n_out = moeIntermediate`) and the
+    /// down leg (`n_out = hidden`) need independent word-0 values; both
+    /// receive the SAME device-computed `pair_count` (word 1) every call,
+    /// since the real paired-tile count does not depend on which leg is
+    /// dispatching. Same lazy-alloc-once, reuse-across-calls pattern and
+    /// same cross-call GPU-ordering safety argument as
+    /// `pairedTileExpertABuf` above - word 1 is the only word a GPU
+    /// dispatch ever writes post-alloc, and that write (this call's
+    /// builder) always precedes the read (this call's paired GEMM) in the
+    /// same command-buffer-chain order. Words 0/2 are written ONCE, from
+    /// the CPU, at allocation time (see `pairedIndirectArgsBuffers`) -
+    /// `moeIntermediate`/`hidden` never change after init, so there is
+    /// never a need to rewrite them.
+    private var pairedIndirectArgsGateUpBuf: MTLBuffer?
+    private var pairedIndirectArgsDownBuf: MTLBuffer?
+
+    /// F-85 idle-tile-cost indirect-dispatch args for the PRODUCTION coop
+    /// GEMM (`ffai_moe_gather_qmm_coop` - see
+    /// `Ops.moeGatherDequantGemmInt4CoopTilePlanIndirect`). Same layout
+    /// and same lazy-alloc-once / cross-call GPU-ordering safety argument
+    /// as `pairedIndirectArgsGateUpBuf` above: `[n_out_tiles, real_tile_count, 1]`,
+    /// words 0/2 written once from the CPU, word 1 device-written every
+    /// call before this call's GEMM read of the same buffer (same command-
+    /// buffer-chain ordering the rest of this file already depends on).
+    ///
+    /// Shared between the two call sites that feed the SAME production
+    /// kernel with a BM=32 tile plan: the plain `useCoopTilePlan` path
+    /// (not paired) and the paired lever's "own" dispatch (`useCoopPaired`).
+    /// Safe to share because exactly one of those two branches executes
+    /// per `decodeMany` call on a given instance (mutually exclusive on
+    /// `useCoopPaired`), so there is never a same-call double-write.
+    private var coopIndirectArgsGateUpBuf: MTLBuffer?
+    private var coopIndirectArgsDownBuf: MTLBuffer?
 
     /// - gate: hidden → nExperts router projection.
     /// - gateProj/upProj/downProj: `nExperts`-long arrays of per-expert
@@ -562,6 +667,10 @@ public final class MoELayer: Module, DecoderLayer {
         self.bm64Env = env["FFAI_MOE_BGEMM_BM64"] != nil
         self.tilePlanEnvRaw = env["FFAI_MOE_TILEPLAN"]
         self.coopEnvRaw = env["FFAI_MOE_COOP"]
+        self.pairedEnvRaw = env["FFAI_MOE_PAIRED"]
+        self.pairedMaxMTotalEnvRaw = env["FFAI_MOE_PAIRED_MAX_MTOTAL"]
+        self.pairedIndirectEnvRaw = env["FFAI_MOE_PAIRED_INDIRECT"]
+        self.coopIndirectEnvRaw = env["FFAI_MOE_COOP_INDIRECT"]
     }
 
     /// F-85 expert-aligned tile-plan gate. Default ON as of the wiring
@@ -603,6 +712,117 @@ public final class MoELayer: Module, DecoderLayer {
         coopEnvRaw != "0"
     }
 
+    /// F-85 two-expert tile-pairing lever gate (`ffai_moe_gather_qmm_coop_paired`,
+    /// splits the coop tile plan into an "own" plan for full/17-31-row
+    /// remainders, fed the UNCHANGED `ffai_moe_gather_qmm_coop` dispatch,
+    /// plus a "paired" plan for `1..=16`-row remainders packed two experts
+    /// to a tile, fed the new paired-GEMM dispatch - see
+    /// `moe_tile_plan_builder_paired.rs`'s module doc). Isolated kernel
+    /// bench GO/NO-GO verdict (own+paired dispatch time vs the unpaired
+    /// coop core's single-dispatch time, same Zipf-seeded routing draws):
+    /// paired-total beats unpaired by 7-12% at mTotal=4096, 4-9% at 8192,
+    /// parity at 16384, and LOSES by 3-6% at 32768 (the 2x per-tile
+    /// dequant cost of pairing stops paying for itself once padding is
+    /// already near zero at high mTotal - see `paired_coverage`'s doc).
+    ///
+    /// DEFAULT OFF - opt in with `FFAI_MOE_PAIRED=1`. A follow-up round
+    /// preallocated the six paired-plan buffers this file used to
+    /// `device.makeBuffer` fresh every layer, every forward call (see
+    /// `pairedTilePlanBuffers`) and re-measured: the e2e regression this
+    /// gate originally shipped with (15.6% at T=512, 10.6% at T=1024)
+    /// barely moved (~14.7% at T=512 with the buffers preallocated), so
+    /// the buffer-allocation hypothesis this doc used to carry was WRONG,
+    /// or at best a minor contributor. An ablation (env-gated skip of the
+    /// paired builder dispatch vs the paired GEMM dispatch, isolating
+    /// each) pinned the actual cost on the paired GEMM dispatch itself,
+    /// independent of whether it has any real rows to process: the
+    /// dispatch grid's height is `moePairedTilePlanCapacity(nExperts:)`
+    /// (`ceil(nExperts/2)`, a STATIC worst-case bound, 128 at this
+    /// model's 256 experts) - not the actual number of paired tiles a
+    /// given routing draw produces, which is typically far smaller at
+    /// low mTotal. Every dispatch therefore launches ~128 threadgroups
+    /// per leg per layer regardless of how many are real, and the
+    /// kernel's masking (`x_in_run` et al.) only zeroes the loaded row
+    /// data for an inert tile - it does not shrink the K-loop / coop-matmul
+    /// work that threadgroup still runs. The isolated kernel bench that
+    /// produced the 7-12%-win verdict above dispatches at the ACTUAL
+    /// paired-tile count for its routing draw, not this worst-case
+    /// capacity, which is why its verdict does not reproduce here: real
+    /// wiring cannot know the actual count without a GPU-to-CPU
+    /// readback (which DEVPLAN2 exists specifically to avoid), so it
+    /// must always dispatch at capacity.
+    ///
+    /// A follow-up round built the indirect dispatch this doc called for
+    /// (`dispatchThreadgroupsIndirect` fed the device-computed real
+    /// paired-tile count - see `pairedIndirectEnabled`, default ON
+    /// wherever this gate is opted into). Honest result: it is a REAL,
+    /// bit-exact-verified improvement, not a full fix. Same-binary
+    /// interleaved A/B/C (base / old-capacity-dispatch / new-indirect-
+    /// dispatch, 7 trials each) measured the regression at T=512 going
+    /// from -14.9% (old) to -10.6% (new indirect) vs base, and at T=1024
+    /// from -9.7% (old) to -6.2% (new indirect) vs base - roughly a third
+    /// to two-fifths of the regression recovered, but paired STILL loses
+    /// to the unpaired coop path at both T. This means the fixed
+    /// per-dispatch overhead (a second compute-encoder creation, PSO
+    /// bind, and buffer sets for the paired GEMM, plus the paired
+    /// builder's own dispatch, every layer, every forward call) is a
+    /// real, separate cost from the capacity-padding this round fixed -
+    /// not yet isolated or addressed. Given that, this gate STAYS DEFAULT
+    /// OFF - the indirect-dispatch fix is real but not sufficient on its
+    /// own to flip the default. Opt-in either way: `FFAI_MOE_PAIRED=1`
+    /// enables, unset or `=0` stays off. Only takes effect where
+    /// `useCoopTilePlan` already holds - see `decodeMany`.
+    public var pairedEnabled: Bool {
+        pairedEnvRaw == "1"
+    }
+
+    /// mTotal threshold for the tile-pairing lever (see `pairedEnabled`):
+    /// paired dispatch runs when `mTotal < pairedMaxMTotal`, the unpaired
+    /// single-dispatch coop path otherwise. Default 16384 - the measured
+    /// parity boundary, chosen over 32768 (where pairing measures a 3-6%
+    /// LOSS) so the default never dispatches the extra pass where it
+    /// cannot win. Override via `FFAI_MOE_PAIRED_MAX_MTOTAL=<mTotal>`.
+    public var pairedMaxMTotal: Int {
+        if let raw = pairedMaxMTotalEnvRaw, let v = Int(raw) {
+            return v
+        }
+        return 16384
+    }
+
+    /// F-85 paired-GEMM indirect-dispatch gate (root-cause fix for the
+    /// worst-case-capacity regression `pairedEnabled`'s doc measured).
+    /// Default ON wherever `useCoopPaired` already holds - the dispatch
+    /// grid then comes from the device-computed real paired-tile count
+    /// (`Ops.moeBuildTilePlanBm32Paired`'s `pairCountGateUp`/`pairCountDown`
+    /// outputs, fed through `dispatchThreadgroupsIndirect`) instead of the
+    /// static `moePairedTilePlanCapacity(nExperts:)` bound. Escape hatch
+    /// `FFAI_MOE_PAIRED_INDIRECT=0` reverts to the old direct/capacity
+    /// dispatch, kept only for A/B measurement against this fix - not a
+    /// production fallback (the old path is the one that regressed).
+    public var pairedIndirectEnabled: Bool {
+        pairedIndirectEnvRaw != "0"
+    }
+
+    /// F-85 idle-tile-cost indirect-dispatch gate for the PRODUCTION coop
+    /// GEMM (`ffai_moe_gather_qmm_coop`). An ablation on this kernel's
+    /// guard structure found no early exit before the K-loop: every
+    /// dispatched threadgroup, including worst-case-capacity padding whose
+    /// `tileRowCount == 0`, pays the full W dequant and `coop_tile_run`
+    /// matmul - same-binary capacity-vs-real-tile-count dispatch measured
+    /// 10-21% idle-tile cost at the F-85 low-context mTotal targets, well
+    /// past the round's 5% materiality bar. Default ON wherever
+    /// `useCoopTilePlan` already holds (both the plain path and the
+    /// paired lever's "own" dispatch) - the dispatch grid then comes from
+    /// the device-computed real tile count
+    /// (`Ops.moeBuildTilePlanBm32`/`Own`'s `tileCountGateUp`/`tileCountDown`
+    /// outputs, fed through `dispatchThreadgroupsIndirect`) instead of the
+    /// static `moeTilePlanCapacityBm32(mTotal:nExperts:)` bound. Escape
+    /// hatch `FFAI_MOE_COOP_INDIRECT=0` reverts to the old direct/capacity
+    /// dispatch, for A/B measurement against this fix.
+    public var coopIndirectEnabled: Bool {
+        coopIndirectEnvRaw != "0"
+    }
+
     /// DEVPLAN2 + stacked int4: expert path can stay on the caller's cmd.
     /// Single source of truth for the token-order device plan — `decodeMany`
     /// branches on this same predicate, so caller chaining (`commitAtEnd:
@@ -639,6 +859,101 @@ public final class MoELayer: Module, DecoderLayer {
             for (k, v) in sd.parameters() { out.append(("shared_expert.down_proj.\(k)", v)) }
         }
         return out
+    }
+
+    /// Lazily allocates (once per instance) and returns the six F-85
+    /// paired-tile-plan buffers, then zero-fills all six before handing
+    /// them back. See the property doc above `pairedTileExpertABuf` for
+    /// the allocation-reuse design and why re-zeroing every call is still
+    /// required for correctness (the real per-call paired-tile count is
+    /// data-dependent, so a previous call's tail past THIS call's real
+    /// count would otherwise leak stale expert/row_start/row_count into
+    /// what the paired GEMM kernel expects to be an inert dead tile).
+    /// The zero-fill itself is a few KB (`6 * pairedCap * 4` bytes) -
+    /// negligible; the `device.makeBuffer` calls this replaces were the
+    /// actual per-layer, per-forward-call cost.
+    private func pairedTilePlanBuffers(
+        pairedCap: Int, device: Device
+    ) -> (
+        expertA: MTLBuffer, rowStartA: MTLBuffer, rowCountA: MTLBuffer,
+        expertB: MTLBuffer, rowStartB: MTLBuffer, rowCountB: MTLBuffer
+    ) {
+        if pairedTileExpertABuf == nil || pairedTileBufCapacity != pairedCap {
+            pairedTileExpertABuf = device.makeBuffer(length: pairedCap * 4)
+            pairedTileRowStartABuf = device.makeBuffer(length: pairedCap * 4)
+            pairedTileRowCountABuf = device.makeBuffer(length: pairedCap * 4)
+            pairedTileExpertBBuf = device.makeBuffer(length: pairedCap * 4)
+            pairedTileRowStartBBuf = device.makeBuffer(length: pairedCap * 4)
+            pairedTileRowCountBBuf = device.makeBuffer(length: pairedCap * 4)
+            pairedTileBufCapacity = pairedCap
+        }
+        let teaBuf = pairedTileExpertABuf!
+        let trsaBuf = pairedTileRowStartABuf!
+        let trcaBuf = pairedTileRowCountABuf!
+        let tebBuf = pairedTileExpertBBuf!
+        let trsbBuf = pairedTileRowStartBBuf!
+        let trcbBuf = pairedTileRowCountBBuf!
+        memset(teaBuf.contents(), 0, pairedCap * 4)
+        memset(trsaBuf.contents(), 0, pairedCap * 4)
+        memset(trcaBuf.contents(), 0, pairedCap * 4)
+        memset(tebBuf.contents(), 0, pairedCap * 4)
+        memset(trsbBuf.contents(), 0, pairedCap * 4)
+        memset(trcbBuf.contents(), 0, pairedCap * 4)
+        return (teaBuf, trsaBuf, trcaBuf, tebBuf, trsbBuf, trcbBuf)
+    }
+
+    /// Lazily allocates (once per instance) the two paired-GEMM indirect-args
+    /// buffers - see the property doc above `pairedIndirectArgsGateUpBuf`.
+    /// Pre-fills `n_out_tiles` (word 0) and `z=1` (word 2) from the CPU;
+    /// leaves `pair_count` (word 1) untouched for
+    /// `Ops.moeBuildTilePlanBm32Paired` to write every call. Safe to only
+    /// do this once: `moeIntermediate % 64 == 0` / `hidden % 64 == 0`
+    /// already hold by the time this is called (gated on `useCoopTilePlan`
+    /// upstream), so the division is exact.
+    private func pairedIndirectArgsBuffers(
+        moeIntermediate: Int, hidden: Int, device: Device
+    ) -> (gateUp: MTLBuffer, down: MTLBuffer) {
+        if pairedIndirectArgsGateUpBuf == nil {
+            let gateUpBuf = device.makeBuffer(length: 3 * 4)
+            let downBuf = device.makeBuffer(length: 3 * 4)
+            let gateUpWords = gateUpBuf.contents().bindMemory(to: UInt32.self, capacity: 3)
+            gateUpWords[0] = UInt32(moeIntermediate / 64)
+            gateUpWords[1] = 0
+            gateUpWords[2] = 1
+            let downWords = downBuf.contents().bindMemory(to: UInt32.self, capacity: 3)
+            downWords[0] = UInt32(hidden / 64)
+            downWords[1] = 0
+            downWords[2] = 1
+            pairedIndirectArgsGateUpBuf = gateUpBuf
+            pairedIndirectArgsDownBuf = downBuf
+        }
+        return (pairedIndirectArgsGateUpBuf!, pairedIndirectArgsDownBuf!)
+    }
+
+    /// Lazily allocates (once per instance) the two indirect-args buffers
+    /// for the PRODUCTION coop GEMM - see the property doc above
+    /// `coopIndirectArgsGateUpBuf` for the sharing argument between the
+    /// plain `useCoopTilePlan` path and the paired lever's "own" dispatch.
+    /// Same word layout and same CPU-fills-words-0/2-once contract as
+    /// `pairedIndirectArgsBuffers`.
+    private func coopIndirectArgsBuffers(
+        moeIntermediate: Int, hidden: Int, device: Device
+    ) -> (gateUp: MTLBuffer, down: MTLBuffer) {
+        if coopIndirectArgsGateUpBuf == nil {
+            let gateUpBuf = device.makeBuffer(length: 3 * 4)
+            let downBuf = device.makeBuffer(length: 3 * 4)
+            let gateUpWords = gateUpBuf.contents().bindMemory(to: UInt32.self, capacity: 3)
+            gateUpWords[0] = UInt32(moeIntermediate / 64)
+            gateUpWords[1] = 0
+            gateUpWords[2] = 1
+            let downWords = downBuf.contents().bindMemory(to: UInt32.self, capacity: 3)
+            downWords[0] = UInt32(hidden / 64)
+            downWords[1] = 0
+            downWords[2] = 1
+            coopIndirectArgsGateUpBuf = gateUpBuf
+            coopIndirectArgsDownBuf = downBuf
+        }
+        return (coopIndirectArgsGateUpBuf!, coopIndirectArgsDownBuf!)
     }
 
     /// `DecoderLayer` conformance. `cache` is a `StatelessLayerCache`
@@ -1039,11 +1354,39 @@ public final class MoELayer: Module, DecoderLayer {
             useTilePlan && self.coopEnabled
             && moeIntermediate.isMultiple(of: 64) && hidden.isMultiple(of: 64)
             && groupSize == 64
+        // F-85 two-expert tile-pairing lever (see `pairedEnabled` /
+        // `pairedMaxMTotal` doc) - only takes over from the single-dispatch
+        // coop path when the coop core is already active AND mTotal is
+        // below the measured parity/loss boundary.
+        let useCoopPaired =
+            useCoopTilePlan && self.pairedEnabled && mTotal < self.pairedMaxMTotal
         var tilePlanTileExpert: Tensor?
         var tilePlanTileRowStart: Tensor?
         var tilePlanTileRowCount: Tensor?
         var tilePlanCapacity = 0
         var tilePlanXRows: Tensor?
+        // Paired-tile plan halves (see `useCoopPaired`) - only built when
+        // that gate holds; `tilePlanTileExpert`/etc above then hold the
+        // "own" plan (full/17-31-row remainders) instead of the regular
+        // combined plan.
+        var pairedTileExpertA: Tensor?
+        var pairedTileRowStartA: Tensor?
+        var pairedTileRowCountA: Tensor?
+        var pairedTileExpertB: Tensor?
+        var pairedTileRowStartB: Tensor?
+        var pairedTileRowCountB: Tensor?
+        var pairedCapacity = 0
+        // F-85 indirect-dispatch args (see `pairedIndirectArgsGateUpBuf`
+        // doc) - only populated alongside the paired plan above.
+        var pairedIndirectArgsGateUp: MTLBuffer?
+        var pairedIndirectArgsDown: MTLBuffer?
+        // F-85 idle-tile-cost indirect-dispatch args for the PRODUCTION
+        // coop GEMM (see `coopIndirectArgsGateUpBuf` doc) - populated by
+        // EITHER the plain `useCoopTilePlan` builder call or the paired
+        // lever's "own" builder call below, whichever this call takes
+        // (mutually exclusive on `useCoopPaired`).
+        var coopIndirectArgsGateUp: MTLBuffer?
+        var coopIndirectArgsDown: MTLBuffer?
         if useTilePlan {
             // Host-computable worst-case capacity - no GPU-to-CPU sync (see
             // `Ops.moeTilePlanCapacity` / `Ops.moeTilePlanCapacityBm32`).
@@ -1065,11 +1408,96 @@ public final class MoELayer: Module, DecoderLayer {
             let tileExpert = Tensor(buffer: teBuf, offset: 0, shape: [capacity], dtype: .u32)
             let tileRowStart = Tensor(buffer: trsBuf, offset: 0, shape: [capacity], dtype: .u32)
             let tileRowCount = Tensor(buffer: trcBuf, offset: 0, shape: [capacity], dtype: .u32)
-            if useCoopTilePlan {
+            if useCoopPaired {
+                // "own" plan: same buffers/capacity as the regular coop
+                // tile plan, but built by the pairing-aware own builder -
+                // it skips the 1..16-row remainders the paired dispatch
+                // below covers instead, so the two dispatches never
+                // double-write the same row.
+                // F-85 idle-tile-cost indirect-dispatch args (see
+                // `coopIndirectArgsGateUpBuf` doc) - `tileCountGateUp`/
+                // `tileCountDown` below are 1-element views into word 1
+                // (byte offset 4) of each buffer; the "own" builder writes
+                // the SAME real own-tile count into both.
+                let (ownIndirectGateUpBuf, ownIndirectDownBuf) = coopIndirectArgsBuffers(
+                    moeIntermediate: moeIntermediate, hidden: hidden, device: device)
+                let ownTileCountGateUp = Tensor(
+                    buffer: ownIndirectGateUpBuf, offset: 4, shape: [1], dtype: .u32)
+                let ownTileCountDown = Tensor(
+                    buffer: ownIndirectDownBuf, offset: 4, shape: [1], dtype: .u32)
+                Ops.moeBuildTilePlanBm32Own(
+                    sortedExperts: indices,
+                    tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
+                    tileCountGateUp: ownTileCountGateUp, tileCountDown: ownTileCountDown,
+                    mTotal: mTotal, nExperts: nExperts, on: work)
+                coopIndirectArgsGateUp = ownIndirectGateUpBuf
+                coopIndirectArgsDown = ownIndirectDownBuf
+
+                // Preallocated, per-instance, reused across layers/calls
+                // (see `pairedTilePlanBuffers` / the property doc above
+                // `pairedTileExpertABuf`) - was six fresh `device.makeBuffer`
+                // calls every layer, every forward call (240+ allocs per
+                // forward at Qwen3.6-35B-A3B's ~40 MoE layers). Removes
+                // that allocation churn regardless, but see `pairedEnabled`'s
+                // doc: re-measurement showed this was NOT the regression's
+                // dominant cost - the paired GEMM dispatch's fixed
+                // worst-case-capacity grid is.
+                let pairedCap = Ops.moePairedTilePlanCapacity(nExperts: nExperts)
+                let (teaBuf, trsaBuf, trcaBuf, tebBuf, trsbBuf, trcbBuf) =
+                    pairedTilePlanBuffers(pairedCap: pairedCap, device: device)
+                let tileExpertA = Tensor(buffer: teaBuf, offset: 0, shape: [pairedCap], dtype: .u32)
+                let tileRowStartA = Tensor(
+                    buffer: trsaBuf, offset: 0, shape: [pairedCap], dtype: .u32)
+                let tileRowCountA = Tensor(
+                    buffer: trcaBuf, offset: 0, shape: [pairedCap], dtype: .u32)
+                let tileExpertB = Tensor(buffer: tebBuf, offset: 0, shape: [pairedCap], dtype: .u32)
+                let tileRowStartB = Tensor(
+                    buffer: trsbBuf, offset: 0, shape: [pairedCap], dtype: .u32)
+                let tileRowCountB = Tensor(
+                    buffer: trcbBuf, offset: 0, shape: [pairedCap], dtype: .u32)
+                // F-85 indirect-dispatch args (see `pairedIndirectArgsGateUpBuf`
+                // doc) - `pairCountGateUp`/`pairCountDown` below are 1-element
+                // views into word 1 (byte offset 4) of each buffer; the
+                // builder writes the SAME real paired-tile count into both.
+                let (indirectGateUpBuf, indirectDownBuf) = pairedIndirectArgsBuffers(
+                    moeIntermediate: moeIntermediate, hidden: hidden, device: device)
+                let pairCountGateUp = Tensor(
+                    buffer: indirectGateUpBuf, offset: 4, shape: [1], dtype: .u32)
+                let pairCountDown = Tensor(
+                    buffer: indirectDownBuf, offset: 4, shape: [1], dtype: .u32)
+                Ops.moeBuildTilePlanBm32Paired(
+                    sortedExperts: indices,
+                    tileExpertA: tileExpertA, tileRowStartA: tileRowStartA,
+                    tileRowCountA: tileRowCountA,
+                    tileExpertB: tileExpertB, tileRowStartB: tileRowStartB,
+                    tileRowCountB: tileRowCountB,
+                    pairCountGateUp: pairCountGateUp, pairCountDown: pairCountDown,
+                    mTotal: mTotal, nExperts: nExperts, on: work)
+                pairedTileExpertA = tileExpertA
+                pairedTileRowStartA = tileRowStartA
+                pairedTileRowCountA = tileRowCountA
+                pairedTileExpertB = tileExpertB
+                pairedTileRowStartB = tileRowStartB
+                pairedTileRowCountB = tileRowCountB
+                pairedCapacity = pairedCap
+                pairedIndirectArgsGateUp = indirectGateUpBuf
+                pairedIndirectArgsDown = indirectDownBuf
+            } else if useCoopTilePlan {
+                // F-85 idle-tile-cost indirect-dispatch args - see
+                // `coopIndirectArgsGateUpBuf` doc.
+                let (indirectGateUpBuf, indirectDownBuf) = coopIndirectArgsBuffers(
+                    moeIntermediate: moeIntermediate, hidden: hidden, device: device)
+                let tileCountGateUp = Tensor(
+                    buffer: indirectGateUpBuf, offset: 4, shape: [1], dtype: .u32)
+                let tileCountDown = Tensor(
+                    buffer: indirectDownBuf, offset: 4, shape: [1], dtype: .u32)
                 Ops.moeBuildTilePlanBm32(
                     sortedExperts: indices,
                     tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
+                    tileCountGateUp: tileCountGateUp, tileCountDown: tileCountDown,
                     mTotal: mTotal, nExperts: nExperts, on: work)
+                coopIndirectArgsGateUp = indirectGateUpBuf
+                coopIndirectArgsDown = indirectDownBuf
             } else {
                 Ops.moeBuildTilePlan(
                     sortedExperts: indices,
@@ -1086,37 +1514,131 @@ public final class MoELayer: Module, DecoderLayer {
             tilePlanCapacity = capacity
         }
 
-        if useTilePlan,
-            let tileExpert = tilePlanTileExpert, let tileRowStart = tilePlanTileRowStart,
-            let tileRowCount = tilePlanTileRowCount, let xRows = tilePlanXRows
-        {
-            let tilePlanGemm =
-                useCoopTilePlan
-                ? Ops.moeGatherDequantGemmInt4CoopTilePlan : Ops.moeGatherDequantGemmInt4TilePlan
-            tilePlanGemm(
-                xGathered,
-                stacked.gateWeight, stacked.gateScales, stacked.gateBiases,
-                tileExpert, tileRowStart, tileRowCount,
-                xRows,
-                tilePlanCapacity, moeIntermediate, hidden,
-                groupSize, work, gateOut)
-            tilePlanGemm(
-                xGathered,
-                stacked.upWeight, stacked.upScales, stacked.upBiases,
-                tileExpert, tileRowStart, tileRowCount,
-                xRows,
-                tilePlanCapacity, moeIntermediate, hidden,
-                groupSize, work, upOut)
-        } else {
-            bgemm(
-                xGathered,
-                stacked.gateWeight, stacked.gateScales, stacked.gateBiases,
-                indices, mTotal, moeIntermediate, hidden, groupSize, work, gateOut)
-            bgemm(
-                xGathered,
-                stacked.upWeight, stacked.upScales, stacked.upBiases,
-                indices, mTotal, moeIntermediate, hidden, groupSize, work, upOut)
+        // Gate/up/down all route through this same tile-plan-or-bgemm
+        // selection - factored into one closure rather than repeating the
+        // useCoopPaired / useTilePlan branch at each of the three call
+        // sites. Below `pairedMaxMTotal` this issues the own-tiles
+        // dispatch (existing coop wrapper, fed the own plan) followed by
+        // the pairs dispatch (paired-GEMM wrapper, fed the paired plan)
+        // into the SAME output tensor - the two plans partition the
+        // sorted-row space with no overlap, so no sync is needed between
+        // them beyond Metal's ordinary same-buffer write ordering.
+        func dispatchGatherGemm(
+            _ input: Tensor, _ weight: Tensor, _ scales: Tensor, _ biases: Tensor,
+            nOutLeg: Int, kInLeg: Int, into out: Tensor
+        ) {
+            if useCoopPaired,
+                let tileExpert = tilePlanTileExpert, let tileRowStart = tilePlanTileRowStart,
+                let tileRowCount = tilePlanTileRowCount, let xRows = tilePlanXRows,
+                let teA = pairedTileExpertA, let trsA = pairedTileRowStartA,
+                let trcA = pairedTileRowCountA,
+                let teB = pairedTileExpertB, let trsB = pairedTileRowStartB,
+                let trcB = pairedTileRowCountB,
+                let indirectGateUpBuf = pairedIndirectArgsGateUp,
+                let indirectDownBuf = pairedIndirectArgsDown
+            {
+                // F-85 idle-tile-cost indirect dispatch for the "own" leg
+                // (see `coopIndirectEnabled` doc) - this leg's utilization
+                // against the shared worst-case capacity is typically
+                // WORSE than the plain path's own utilization at the same
+                // mTotal (stripping the pairing candidates out shrinks the
+                // real own-tile count while the capacity bound stays the
+                // same), so this fix matters more here, not less.
+                if self.coopIndirectEnabled, let ownIndirectGateUpBuf = coopIndirectArgsGateUp,
+                    let ownIndirectDownBuf = coopIndirectArgsDown
+                {
+                    let ownIndirectArgs = nOutLeg == moeIntermediate ? ownIndirectGateUpBuf : ownIndirectDownBuf
+                    Ops.moeGatherDequantGemmInt4CoopTilePlanIndirect(
+                        input: input, weight: weight, scales: scales, biases: biases,
+                        tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
+                        xRows: xRows, indirectArgs: ownIndirectArgs, indirectArgsOffset: 0,
+                        nOut: nOutLeg, kIn: kInLeg,
+                        groupSize: groupSize, on: work, into: out)
+                } else {
+                    // Escape hatch to the old direct/worst-case-capacity
+                    // dispatch, for A/B measurement against the indirect
+                    // fix above - see `coopIndirectEnabled`.
+                    Ops.moeGatherDequantGemmInt4CoopTilePlan(
+                        input: input, weight: weight, scales: scales, biases: biases,
+                        tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
+                        xRows: xRows, capacity: tilePlanCapacity, nOut: nOutLeg, kIn: kInLeg,
+                        groupSize: groupSize, on: work, into: out)
+                }
+                // F-85 indirect dispatch (see `pairedIndirectEnabled` doc) -
+                // the root-cause fix for the worst-case-capacity padding
+                // `pairedEnabled`'s doc measured. `nOutLeg == moeIntermediate`
+                // picks the gate/up-shaped indirect-args triple; the down
+                // leg (`nOutLeg == hidden`) uses the other - see
+                // `pairedIndirectArgsBuffers`.
+                if self.pairedIndirectEnabled {
+                    let indirectArgs = nOutLeg == moeIntermediate ? indirectGateUpBuf : indirectDownBuf
+                    Ops.moeGatherDequantGemmInt4CoopTilePlanPairedIndirect(
+                        input: input, weight: weight, scales: scales, biases: biases,
+                        tileExpertA: teA, tileRowStartA: trsA, tileRowCountA: trcA,
+                        tileExpertB: teB, tileRowStartB: trsB, tileRowCountB: trcB,
+                        xRows: xRows, indirectArgs: indirectArgs, indirectArgsOffset: 0,
+                        nOut: nOutLeg, kIn: kInLeg,
+                        groupSize: groupSize, on: work, into: out)
+                } else {
+                    // Escape hatch to the old direct/worst-case-capacity
+                    // dispatch, for A/B measurement against the indirect
+                    // fix above - see `pairedIndirectEnabled`.
+                    Ops.moeGatherDequantGemmInt4CoopTilePlanPaired(
+                        input: input, weight: weight, scales: scales, biases: biases,
+                        tileExpertA: teA, tileRowStartA: trsA, tileRowCountA: trcA,
+                        tileExpertB: teB, tileRowStartB: trsB, tileRowCountB: trcB,
+                        xRows: xRows, capacity: pairedCapacity, nOut: nOutLeg, kIn: kInLeg,
+                        groupSize: groupSize, on: work, into: out)
+                }
+            } else if useCoopTilePlan,
+                let tileExpert = tilePlanTileExpert, let tileRowStart = tilePlanTileRowStart,
+                let tileRowCount = tilePlanTileRowCount, let xRows = tilePlanXRows,
+                self.coopIndirectEnabled,
+                let indirectGateUpBuf = coopIndirectArgsGateUp,
+                let indirectDownBuf = coopIndirectArgsDown
+            {
+                // F-85 idle-tile-cost indirect dispatch (see
+                // `coopIndirectEnabled` doc) - the plain (non-paired) coop
+                // path's default. `nOutLeg == moeIntermediate` picks the
+                // gate/up-shaped indirect-args triple; the down leg
+                // (`nOutLeg == hidden`) uses the other.
+                let indirectArgs = nOutLeg == moeIntermediate ? indirectGateUpBuf : indirectDownBuf
+                Ops.moeGatherDequantGemmInt4CoopTilePlanIndirect(
+                    input: input, weight: weight, scales: scales, biases: biases,
+                    tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
+                    xRows: xRows, indirectArgs: indirectArgs, indirectArgsOffset: 0,
+                    nOut: nOutLeg, kIn: kInLeg,
+                    groupSize: groupSize, on: work, into: out)
+            } else if useTilePlan,
+                let tileExpert = tilePlanTileExpert, let tileRowStart = tilePlanTileRowStart,
+                let tileRowCount = tilePlanTileRowCount, let xRows = tilePlanXRows
+            {
+                // Escape hatch (`FFAI_MOE_COOP_INDIRECT=0`, or the bm16
+                // tileplan default when the coop core's shape requirements
+                // don't hold - see `useCoopTilePlan`) - old direct/
+                // worst-case-capacity dispatch, unchanged.
+                let tilePlanGemm =
+                    useCoopTilePlan
+                    ? Ops.moeGatherDequantGemmInt4CoopTilePlan : Ops.moeGatherDequantGemmInt4TilePlan
+                tilePlanGemm(
+                    input, weight, scales, biases,
+                    tileExpert, tileRowStart, tileRowCount,
+                    xRows,
+                    tilePlanCapacity, nOutLeg, kInLeg,
+                    groupSize, work, out)
+            } else {
+                bgemm(
+                    input, weight, scales, biases,
+                    indices, mTotal, nOutLeg, kInLeg, groupSize, work, out)
+            }
         }
+
+        dispatchGatherGemm(
+            xGathered, stacked.gateWeight, stacked.gateScales, stacked.gateBiases,
+            nOutLeg: moeIntermediate, kInLeg: hidden, into: gateOut)
+        dispatchGatherGemm(
+            xGathered, stacked.upWeight, stacked.upScales, stacked.upBiases,
+            nOutLeg: moeIntermediate, kInLeg: hidden, into: upOut)
 
         // ── 10. SwiGLU fused: silu(gate) * up ────────────────────────────
         // Write into `gateOut` in-place so we don't allocate a third
@@ -1128,26 +1650,9 @@ public final class MoELayer: Module, DecoderLayer {
         let downOut = Tensor.empty(
             shape: [mTotal, hidden], dtype: dt,
             device: device)
-        if useTilePlan,
-            let tileExpert = tilePlanTileExpert, let tileRowStart = tilePlanTileRowStart,
-            let tileRowCount = tilePlanTileRowCount, let xRows = tilePlanXRows
-        {
-            let tilePlanGemm =
-                useCoopTilePlan
-                ? Ops.moeGatherDequantGemmInt4CoopTilePlan : Ops.moeGatherDequantGemmInt4TilePlan
-            tilePlanGemm(
-                inner,
-                stacked.downWeight, stacked.downScales, stacked.downBiases,
-                tileExpert, tileRowStart, tileRowCount,
-                xRows,
-                tilePlanCapacity, hidden, moeIntermediate,
-                groupSize, work, downOut)
-        } else {
-            bgemm(
-                inner,
-                stacked.downWeight, stacked.downScales, stacked.downBiases,
-                indices, mTotal, hidden, moeIntermediate, groupSize, work, downOut)
-        }
+        dispatchGatherGemm(
+            inner, stacked.downWeight, stacked.downScales, stacked.downBiases,
+            nOutLeg: hidden, kInLeg: moeIntermediate, into: downOut)
 
         // ── 12. Weighted scatter-sum back to [T, hidden] via fused
         // `ffai_moe_unpermute` kernel — ONE dispatch over T·hidden

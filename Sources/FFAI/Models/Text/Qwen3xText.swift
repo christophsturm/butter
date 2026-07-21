@@ -1364,6 +1364,30 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //     at every T from 512 through 32768, no high-T regression. Tests:
 //     kernels repo `moe_build_tile_plan_correctness.rs` +
 //     `moe_gather_qmm_tileplan_correctness.rs`.
+//   FFAI_MOE_PAIRED=0
+//     Opt out of the F-85 two-expert tile-pairing lever
+//     (`ffai_moe_gather_qmm_coop_paired`) at prefill, reverting to the
+//     coop core's single unpaired dispatch across every mTotal. Below
+//     `FFAI_MOE_PAIRED_MAX_MTOTAL` (see below), the coop tile plan splits
+//     into an "own" plan (full/17-31-row remainders, fed the UNCHANGED
+//     `ffai_moe_gather_qmm_coop` dispatch) and a "paired" plan (1-16-row
+//     remainders packed two experts to a tile, fed the new paired-GEMM
+//     dispatch), eliminating the masked-out padding those short
+//     remainders otherwise cost. Only takes effect where
+//     `FFAI_MOE_TILEPLAN` + `FFAI_MOE_COOP` are also active. Default: ON.
+//     Gated on `--dump-prefill-logits` bit-exact (cosine 1.0,
+//     max_abs_dlogit 0.0) + greedy-token match at T=512/1024/4096/16384;
+//     isolated kernel bench GO/NO-GO shows a 7-12% win at mTotal=4096,
+//     4-9% at 8192, parity at 16384, and a 3-6% loss at 32768. Tests:
+//     kernels repo `moe_build_tile_plan_bm32_own_correctness.rs` +
+//     `moe_build_tile_plan_bm32_paired_correctness.rs` +
+//     `moe_gather_qmm_coop_paired.rs`'s kernel_tests.
+//   FFAI_MOE_PAIRED_MAX_MTOTAL=<mTotal>
+//     Override the tile-pairing mTotal threshold (paired dispatch runs
+//     when mTotal < this value). Default: 16384, the measured
+//     parity boundary - chosen over 32768 (a measured 3-6% loss there)
+//     so the default never dispatches the extra pass where it cannot
+//     win.
 //   DEVPLAN2=0
 //     Opt out of chaining the MoE prefill expert path onto the
 //     caller's own command buffer. Note: no `FFAI_` prefix (older

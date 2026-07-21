@@ -6108,9 +6108,17 @@ public enum Ops {
     /// `tileRowCount` for BM=32 tiles - just the tile-height constant
     /// doubled. Caller must zero-fill the plan buffers out to
     /// `moeTilePlanCapacityBm32` before this call, same padding contract.
+    /// `tileCountGateUp`/`tileCountDown` (F-85 idle-tile-cost follow-up):
+    /// one-element u32 views the caller has already positioned at the
+    /// "count" word (word 1) of its own two
+    /// `MTLDispatchThreadgroupsIndirectArguments`-shaped triples - see
+    /// `Ops.moeGatherDequantGemmInt4CoopTilePlanIndirect`. The two legs
+    /// need independent triples because they differ in `n_out` (word 0),
+    /// but both receive the SAME device-computed real tile count here.
     public static func moeBuildTilePlanBm32(
         sortedExperts: Tensor,
         tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        tileCountGateUp: Tensor, tileCountDown: Tensor,
         mTotal: Int, nExperts: Int,
         on cmd: MTLCommandBuffer
     ) {
@@ -6119,6 +6127,9 @@ public enum Ops {
         precondition(
             tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
             "moeBuildTilePlanBm32: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            tileCountGateUp.dtype == .u32 && tileCountDown.dtype == .u32,
+            "moeBuildTilePlanBm32: tileCountGateUp/tileCountDown must be u32")
         precondition(
             nExperts <= 256,
             "moeBuildTilePlanBm32: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
@@ -6130,6 +6141,8 @@ public enum Ops {
             tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
             tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
             tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+            tile_count_gateup: tileCountGateUp.buffer, tile_count_gateupOffset: tileCountGateUp.offset,
+            tile_count_down: tileCountDown.buffer, tile_count_downOffset: tileCountDown.offset,
             m_total: UInt32(mTotal), n_experts: UInt32(nExperts),
             gridSize: grid, threadgroupSize: tg, on: cmd)
     }
@@ -6230,6 +6243,425 @@ public enum Ops {
         default:
             fatalError("Ops.moeGatherDequantGemmInt4CoopTilePlan: unsupported dtype \(input.dtype)")
         }
+    }
+
+    /// Indirect-dispatch sibling of `moeGatherDequantGemmInt4CoopTilePlan`
+    /// (F-85 idle-tile-cost follow-up). An ablation on the production
+    /// coop kernel's guard structure found no early exit before the
+    /// K-loop: every dispatched threadgroup, including worst-case-capacity
+    /// padding whose `tileRowCount == 0`, pays the full W dequant and
+    /// `coop_tile_run` matmul, not a cheap masked skip - same-binary
+    /// capacity-vs-real-tile-count dispatch measured 10-21% idle-tile cost
+    /// at the F-85 low-context mTotal targets. Same kernel, same buffer
+    /// contract as `moeGatherDequantGemmInt4CoopTilePlan` - the only
+    /// difference is the dispatch grid comes from a device-written
+    /// `MTLDispatchThreadgroupsIndirectArguments` triple
+    /// (`indirectArgs`/`indirectArgsOffset`, produced by
+    /// `Ops.moeBuildTilePlanBm32`'s `tileCountGateUp`/`tileCountDown`
+    /// outputs) instead of the host worst-case `capacity` bound, so idle
+    /// tiles beyond the REAL tile count launch zero threadgroups instead
+    /// of running a masked-but-still-full K-loop.
+    ///
+    /// Hand-encoded rather than routed through a generated `_threadgroups`
+    /// wrapper: the generated Swift bindings only emit a fixed
+    /// `dispatchThreadgroups(_:threadsPerThreadgroup:)` call taking a
+    /// host-computed `MTLSize`, with no indirect-buffer variant (metaltile
+    /// codegen limitation - out of scope to change for this fix). The PSO
+    /// itself is unchanged (same pipeline the generated wrapper uses,
+    /// fetched by the same name from the shared `PSOCache`), and every
+    /// `setBuffer`/`setBytes` call below mirrors the generated
+    /// `..._threadgroups` wrapper's binding order index-for-index - see
+    /// `ffai_moe_gather_qmm_coop_<dtype>_threadgroups` in
+    /// `FFAIKernels.swift` for the reference this must stay in sync with
+    /// if that kernel's signature ever changes.
+    public static func moeGatherDequantGemmInt4CoopTilePlanIndirect(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        xRows: Tensor,
+        indirectArgs: MTLBuffer, indirectArgsOffset: Int = 0,
+        nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(
+            weight.dtype == .u32, "moeGatherDequantGemmInt4CoopTilePlanIndirect: weight must be u32 packed")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeGatherDequantGemmInt4CoopTilePlanIndirect: tile_expert/tile_row_start/tile_row_count must be u32"
+        )
+        precondition(
+            xRows.dtype == .u32, "moeGatherDequantGemmInt4CoopTilePlanIndirect: xRows must be u32")
+        precondition(
+            input.dtype == scales.dtype && scales.dtype == biases.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlanIndirect: input/scales/biases dtype must match")
+        precondition(
+            out.dtype == input.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlanIndirect: out dtype must match input")
+        precondition(
+            nOut % 64 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlanIndirect: nOut (\(nOut)) must be multiple of 64 (BN tile)")
+        precondition(
+            kIn % 32 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlanIndirect: kIn (\(kIn)) must be multiple of 32 (BK tile)")
+        precondition(
+            kIn.isMultiple(of: groupSize) && kIn / groupSize > 0,
+            "moeGatherDequantGemmInt4CoopTilePlanIndirect: groupSize (\(groupSize)) must divide kIn (\(kIn))")
+
+        let kernelName: String
+        switch input.dtype {
+        case .f32: kernelName = "ffai_moe_gather_qmm_coop_f32"
+        case .f16: kernelName = "ffai_moe_gather_qmm_coop_f16"
+        case .bf16: kernelName = "ffai_moe_gather_qmm_coop_bf16"
+        default:
+            fatalError("Ops.moeGatherDequantGemmInt4CoopTilePlanIndirect: unsupported dtype \(input.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: kernelName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(weight.buffer, offset: weight.offset, index: 1)
+        enc.setBuffer(scales.buffer, offset: scales.offset, index: 2)
+        enc.setBuffer(biases.buffer, offset: biases.offset, index: 3)
+        enc.setBuffer(tileExpert.buffer, offset: tileExpert.offset, index: 4)
+        enc.setBuffer(tileRowStart.buffer, offset: tileRowStart.offset, index: 5)
+        enc.setBuffer(tileRowCount.buffer, offset: tileRowCount.offset, index: 6)
+        enc.setBuffer(xRows.buffer, offset: xRows.offset, index: 7)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 8)
+        var nOutV = UInt32(nOut)
+        enc.setBytes(&nOutV, length: 4, index: 9)
+        var kInV = UInt32(kIn)
+        enc.setBytes(&kInV, length: 4, index: 10)
+        var groupSizeV = UInt32(groupSize)
+        enc.setBytes(&groupSizeV, length: 4, index: 11)
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        enc.dispatchThreadgroups(
+            indirectBuffer: indirectArgs, indirectBufferOffset: indirectArgsOffset,
+            threadsPerThreadgroup: tg)
+        enc.endEncoding()
+    }
+
+    /// Worst-case tile-plan capacity for `moeBuildTilePlanBm32Paired` /
+    /// `moeGatherDequantGemmInt4CoopTilePlanPaired`: `ceil(nExperts / 2)`
+    /// paired tiles at most (every candidate expert pairs with at most one
+    /// other; an odd leftover still costs one tile with an inert B half).
+    public static func moePairedTilePlanCapacity(nExperts: Int) -> Int {
+        (nExperts + 1) / 2
+    }
+
+    /// Device-side "own" BM=32 tile-plan builder for the F-85 tile-pairing
+    /// lever (`ffai_moe_build_tile_plan_bm32_own`). Same contract and same
+    /// worst-case capacity as `moeBuildTilePlanBm32` - the only difference
+    /// is that an expert's `1..=16`-row remainder does not get a tile here
+    /// (those rows are pairing candidates, handled by the separate
+    /// `moeBuildTilePlanBm32Paired` / `moeGatherDequantGemmInt4CoopTilePlanPaired`
+    /// dispatch instead). Caller zero-fills the plan buffers out to
+    /// `moeTilePlanCapacityBm32` before this call, same padding contract.
+    /// `tileCountGateUp`/`tileCountDown` (F-85 idle-tile-cost follow-up):
+    /// same contract as `moeBuildTilePlanBm32`'s own outputs - the real
+    /// "own" tile count, which is typically a much smaller fraction of the
+    /// shared worst-case capacity than the unpaired builder's own count
+    /// (stripping the pairing candidates out shrinks the real count while
+    /// the capacity bound stays the same), so this leg's indirect-dispatch
+    /// win is larger whenever the pairing lever is opted into.
+    public static func moeBuildTilePlanBm32Own(
+        sortedExperts: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        tileCountGateUp: Tensor, tileCountDown: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeBuildTilePlanBm32Own: sortedExperts must be u32")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeBuildTilePlanBm32Own: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            tileCountGateUp.dtype == .u32 && tileCountDown.dtype == .u32,
+            "moeBuildTilePlanBm32Own: tileCountGateUp/tileCountDown must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeBuildTilePlanBm32Own: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let grid = MTLSize(width: nExperts, height: 1, depth: 1)
+        let tg = MTLSize(width: nExperts, height: 1, depth: 1)
+        MetalTileKernels.ffai_moe_build_tile_plan_bm32_own_f32(
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+            tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+            tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+            tile_count_gateup: tileCountGateUp.buffer, tile_count_gateupOffset: tileCountGateUp.offset,
+            tile_count_down: tileCountDown.buffer, tile_count_downOffset: tileCountDown.offset,
+            m_total: UInt32(mTotal), n_experts: UInt32(nExperts),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Device-side PAIR-ONLY BM=32 tile-plan builder for the F-85
+    /// tile-pairing lever (`ffai_moe_build_tile_plan_bm32_paired`). Reads
+    /// the SAME `sortedExperts` array as `moeBuildTilePlanBm32Own` and
+    /// produces the complementary `1..=16`-row remainder tiles those rows
+    /// were excluded from, packed two experts to a tile (`_a`/`_b` halves,
+    /// `tile_row_count_b == 0` marks an odd leftover's inert B half).
+    /// Caller zero-fills all six plan buffers out to
+    /// `moePairedTilePlanCapacity(nExperts:)` before this call - required,
+    /// not just a courtesy, since the odd-leftover case depends on the
+    /// zero fill.
+    /// `pairCountGateUp`/`pairCountDown` (F-85 follow-up): one-element u32
+    /// views the caller has already positioned at the "count" word (word 1)
+    /// of its own two `MTLDispatchThreadgroupsIndirectArguments`-shaped
+    /// triples - see `Ops.moeGatherDequantGemmInt4CoopTilePlanPairedIndirect`.
+    /// The two legs need independent triples because they differ in
+    /// `n_out` (word 0), but both receive the SAME device-computed value
+    /// here (the real paired-tile count does not depend on `n_out`).
+    public static func moeBuildTilePlanBm32Paired(
+        sortedExperts: Tensor,
+        tileExpertA: Tensor, tileRowStartA: Tensor, tileRowCountA: Tensor,
+        tileExpertB: Tensor, tileRowStartB: Tensor, tileRowCountB: Tensor,
+        pairCountGateUp: Tensor, pairCountDown: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeBuildTilePlanBm32Paired: sortedExperts must be u32")
+        precondition(
+            tileExpertA.dtype == .u32 && tileRowStartA.dtype == .u32 && tileRowCountA.dtype == .u32
+                && tileExpertB.dtype == .u32 && tileRowStartB.dtype == .u32
+                && tileRowCountB.dtype == .u32,
+            "moeBuildTilePlanBm32Paired: all six tile_*_a/_b buffers must be u32")
+        precondition(
+            pairCountGateUp.dtype == .u32 && pairCountDown.dtype == .u32,
+            "moeBuildTilePlanBm32Paired: pairCountGateUp/pairCountDown must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeBuildTilePlanBm32Paired: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let grid = MTLSize(width: nExperts, height: 1, depth: 1)
+        let tg = MTLSize(width: nExperts, height: 1, depth: 1)
+        MetalTileKernels.ffai_moe_build_tile_plan_bm32_paired_f32(
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            tile_expert_a: tileExpertA.buffer, tile_expert_aOffset: tileExpertA.offset,
+            tile_row_start_a: tileRowStartA.buffer, tile_row_start_aOffset: tileRowStartA.offset,
+            tile_row_count_a: tileRowCountA.buffer, tile_row_count_aOffset: tileRowCountA.offset,
+            tile_expert_b: tileExpertB.buffer, tile_expert_bOffset: tileExpertB.offset,
+            tile_row_start_b: tileRowStartB.buffer, tile_row_start_bOffset: tileRowStartB.offset,
+            tile_row_count_b: tileRowCountB.buffer, tile_row_count_bOffset: tileRowCountB.offset,
+            pair_count_gateup: pairCountGateUp.buffer, pair_count_gateupOffset: pairCountGateUp.offset,
+            pair_count_down: pairCountDown.buffer, pair_count_downOffset: pairCountDown.offset,
+            m_total: UInt32(mTotal), n_experts: UInt32(nExperts),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Two-expert PAIRED-tile MoE gather GEMM (`ffai_moe_gather_qmm_coop_paired`,
+    /// F-85 tile-pairing lever). Separate dispatch from
+    /// `moeGatherDequantGemmInt4CoopTilePlan` - fed the `moeBuildTilePlanBm32Paired`
+    /// plan instead of the regular tile plan, over the SAME sorted-row
+    /// space (`xRows`/`out`), covering only the `1..=16`-row remainder
+    /// rows that plan's "own" sibling excludes. `capacity` is
+    /// `moePairedTilePlanCapacity(nExperts:)`'s host worst-case bound, not
+    /// the real paired-tile count - same zero-fill/inert-tile padding
+    /// contract as the unpaired sibling. Same shape requirements
+    /// (`nOut % 64 == 0`, `groupSize == 64`) as the unpaired coop core -
+    /// this kernel reuses its inner loop/staging geometry per-half.
+    public static func moeGatherDequantGemmInt4CoopTilePlanPaired(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        tileExpertA: Tensor, tileRowStartA: Tensor, tileRowCountA: Tensor,
+        tileExpertB: Tensor, tileRowStartB: Tensor, tileRowCountB: Tensor,
+        xRows: Tensor,
+        capacity: Int, nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(
+            weight.dtype == .u32, "moeGatherDequantGemmInt4CoopTilePlanPaired: weight must be u32 packed")
+        precondition(
+            tileExpertA.dtype == .u32 && tileRowStartA.dtype == .u32 && tileRowCountA.dtype == .u32
+                && tileExpertB.dtype == .u32 && tileRowStartB.dtype == .u32
+                && tileRowCountB.dtype == .u32,
+            "moeGatherDequantGemmInt4CoopTilePlanPaired: all six tile_*_a/_b buffers must be u32")
+        precondition(
+            xRows.dtype == .u32, "moeGatherDequantGemmInt4CoopTilePlanPaired: xRows must be u32")
+        precondition(
+            input.dtype == scales.dtype && scales.dtype == biases.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlanPaired: input/scales/biases dtype must match")
+        precondition(
+            out.dtype == input.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlanPaired: out dtype must match input")
+        precondition(
+            nOut % 64 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlanPaired: nOut (\(nOut)) must be multiple of 64 (BN tile)")
+        precondition(
+            kIn % 32 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlanPaired: kIn (\(kIn)) must be multiple of 32 (BK tile)")
+        precondition(
+            kIn.isMultiple(of: groupSize) && kIn / groupSize > 0,
+            "moeGatherDequantGemmInt4CoopTilePlanPaired: groupSize (\(groupSize)) must divide kIn (\(kIn))")
+
+        let grid = MTLSize(width: nOut / 64, height: capacity, depth: 1)
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        let nOutU = UInt32(nOut)
+        let kInU = UInt32(kIn)
+        let groupSizeU = UInt32(groupSize)
+
+        switch input.dtype {
+        case .f32:
+            MetalTileKernels.ffai_moe_gather_qmm_coop_paired_f32_threadgroups(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert_a: tileExpertA.buffer, tile_expert_aOffset: tileExpertA.offset,
+                tile_row_start_a: tileRowStartA.buffer, tile_row_start_aOffset: tileRowStartA.offset,
+                tile_row_count_a: tileRowCountA.buffer, tile_row_count_aOffset: tileRowCountA.offset,
+                tile_expert_b: tileExpertB.buffer, tile_expert_bOffset: tileExpertB.offset,
+                tile_row_start_b: tileRowStartB.buffer, tile_row_start_bOffset: tileRowStartB.offset,
+                tile_row_count_b: tileRowCountB.buffer, tile_row_count_bOffset: tileRowCountB.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_moe_gather_qmm_coop_paired_f16_threadgroups(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert_a: tileExpertA.buffer, tile_expert_aOffset: tileExpertA.offset,
+                tile_row_start_a: tileRowStartA.buffer, tile_row_start_aOffset: tileRowStartA.offset,
+                tile_row_count_a: tileRowCountA.buffer, tile_row_count_aOffset: tileRowCountA.offset,
+                tile_expert_b: tileExpertB.buffer, tile_expert_bOffset: tileExpertB.offset,
+                tile_row_start_b: tileRowStartB.buffer, tile_row_start_bOffset: tileRowStartB.offset,
+                tile_row_count_b: tileRowCountB.buffer, tile_row_count_bOffset: tileRowCountB.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_moe_gather_qmm_coop_paired_bf16_threadgroups(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert_a: tileExpertA.buffer, tile_expert_aOffset: tileExpertA.offset,
+                tile_row_start_a: tileRowStartA.buffer, tile_row_start_aOffset: tileRowStartA.offset,
+                tile_row_count_a: tileRowCountA.buffer, tile_row_count_aOffset: tileRowCountA.offset,
+                tile_expert_b: tileExpertB.buffer, tile_expert_bOffset: tileExpertB.offset,
+                tile_row_start_b: tileRowStartB.buffer, tile_row_start_bOffset: tileRowStartB.offset,
+                tile_row_count_b: tileRowCountB.buffer, tile_row_count_bOffset: tileRowCountB.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.moeGatherDequantGemmInt4CoopTilePlanPaired: unsupported dtype \(input.dtype)")
+        }
+    }
+
+    /// Indirect-dispatch sibling of `moeGatherDequantGemmInt4CoopTilePlanPaired`
+    /// (F-85 follow-up - the root-cause fix for the padding regression that
+    /// gate documented). Same kernel, same buffer contract - the only
+    /// difference is the dispatch grid comes from a device-written
+    /// `MTLDispatchThreadgroupsIndirectArguments` triple
+    /// (`indirectArgs`/`indirectArgsOffset`, produced by
+    /// `Ops.moeBuildTilePlanBm32Paired`'s `pairCountGateUp`/`pairCountDown`
+    /// outputs) instead of the host worst-case `capacity` bound, so idle
+    /// tiles beyond the REAL paired-tile count launch zero threadgroups
+    /// instead of running a masked-but-still-full K-loop.
+    ///
+    /// Hand-encoded rather than routed through a generated `_threadgroups`
+    /// wrapper: the generated Swift bindings only emit a fixed
+    /// `dispatchThreadgroups(_:threadsPerThreadgroup:)` call taking a
+    /// host-computed `MTLSize`, with no indirect-buffer variant (metaltile
+    /// codegen limitation - out of scope to change for this fix). The PSO
+    /// itself is unchanged (same pipeline the generated wrapper uses,
+    /// fetched by the same name from the shared `PSOCache`), and every
+    /// `setBuffer`/`setBytes` call below mirrors the generated
+    /// `..._threadgroups` wrapper's binding order index-for-index - see
+    /// `ffai_moe_gather_qmm_coop_paired_<dtype>_threadgroups` in
+    /// `FFAIKernels.swift` for the reference this must stay in sync with
+    /// if that kernel's signature ever changes.
+    public static func moeGatherDequantGemmInt4CoopTilePlanPairedIndirect(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        tileExpertA: Tensor, tileRowStartA: Tensor, tileRowCountA: Tensor,
+        tileExpertB: Tensor, tileRowStartB: Tensor, tileRowCountB: Tensor,
+        xRows: Tensor,
+        indirectArgs: MTLBuffer, indirectArgsOffset: Int = 0,
+        nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(
+            weight.dtype == .u32,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: weight must be u32 packed")
+        precondition(
+            tileExpertA.dtype == .u32 && tileRowStartA.dtype == .u32 && tileRowCountA.dtype == .u32
+                && tileExpertB.dtype == .u32 && tileRowStartB.dtype == .u32
+                && tileRowCountB.dtype == .u32,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: all six tile_*_a/_b buffers must be u32"
+        )
+        precondition(
+            xRows.dtype == .u32,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: xRows must be u32")
+        precondition(
+            input.dtype == scales.dtype && scales.dtype == biases.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: input/scales/biases dtype must match"
+        )
+        precondition(
+            out.dtype == input.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: out dtype must match input")
+        precondition(
+            nOut % 64 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: nOut (\(nOut)) must be multiple of 64 (BN tile)"
+        )
+        precondition(
+            kIn % 32 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: kIn (\(kIn)) must be multiple of 32 (BK tile)"
+        )
+        precondition(
+            kIn.isMultiple(of: groupSize) && kIn / groupSize > 0,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: groupSize (\(groupSize)) must divide kIn (\(kIn))"
+        )
+
+        let kernelName: String
+        switch input.dtype {
+        case .f32: kernelName = "ffai_moe_gather_qmm_coop_paired_f32"
+        case .f16: kernelName = "ffai_moe_gather_qmm_coop_paired_f16"
+        case .bf16: kernelName = "ffai_moe_gather_qmm_coop_paired_bf16"
+        default:
+            fatalError(
+                "Ops.moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: unsupported dtype \(input.dtype)"
+            )
+        }
+        let pso = PSOCache.shared.pipelineState(for: kernelName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(weight.buffer, offset: weight.offset, index: 1)
+        enc.setBuffer(scales.buffer, offset: scales.offset, index: 2)
+        enc.setBuffer(biases.buffer, offset: biases.offset, index: 3)
+        enc.setBuffer(tileExpertA.buffer, offset: tileExpertA.offset, index: 4)
+        enc.setBuffer(tileRowStartA.buffer, offset: tileRowStartA.offset, index: 5)
+        enc.setBuffer(tileRowCountA.buffer, offset: tileRowCountA.offset, index: 6)
+        enc.setBuffer(tileExpertB.buffer, offset: tileExpertB.offset, index: 7)
+        enc.setBuffer(tileRowStartB.buffer, offset: tileRowStartB.offset, index: 8)
+        enc.setBuffer(tileRowCountB.buffer, offset: tileRowCountB.offset, index: 9)
+        enc.setBuffer(xRows.buffer, offset: xRows.offset, index: 10)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 11)
+        var nOutV = UInt32(nOut)
+        enc.setBytes(&nOutV, length: 4, index: 12)
+        var kInV = UInt32(kIn)
+        enc.setBytes(&kInV, length: 4, index: 13)
+        var groupSizeV = UInt32(groupSize)
+        enc.setBytes(&groupSizeV, length: 4, index: 14)
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        enc.dispatchThreadgroups(
+            indirectBuffer: indirectArgs, indirectBufferOffset: indirectArgsOffset,
+            threadsPerThreadgroup: tg)
+        enc.endEncoding()
     }
 
     // MARK: - Batched-T prefill kernels (Qwen3.5 / Qwen3.6 hybrid prefill)
