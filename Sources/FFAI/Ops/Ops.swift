@@ -6091,6 +6091,147 @@ public enum Ops {
         }
     }
 
+    // MARK: - F-85 coop-core MoE gather GEMM (BM=32 tile plan)
+
+    /// BM=32 sibling of `moeTilePlanCapacity`: `ceil(mTotal/32) + nExperts`,
+    /// the worst-case tile count for `moeBuildTilePlanBm32` /
+    /// `moeGatherDequantGemmInt4CoopTilePlan`. Same proof as the BM=16
+    /// bound (every expert contributes at most one "ceiling" tile beyond
+    /// its exact `count/32` share) with the tile height doubled.
+    public static func moeTilePlanCapacityBm32(mTotal: Int, nExperts: Int) -> Int {
+        (mTotal + 31) / 32 + nExperts
+    }
+
+    /// Device-side BM=32 tile-plan builder (`ffai_moe_build_tile_plan_bm32`).
+    /// Same contract as `moeBuildTilePlan` - reads the already expert-sorted
+    /// `sortedExperts` buffer, writes `tileExpert`/`tileRowStart`/
+    /// `tileRowCount` for BM=32 tiles - just the tile-height constant
+    /// doubled. Caller must zero-fill the plan buffers out to
+    /// `moeTilePlanCapacityBm32` before this call, same padding contract.
+    public static func moeBuildTilePlanBm32(
+        sortedExperts: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeBuildTilePlanBm32: sortedExperts must be u32")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeBuildTilePlanBm32: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeBuildTilePlanBm32: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let grid = MTLSize(width: nExperts, height: 1, depth: 1)
+        let tg = MTLSize(width: nExperts, height: 1, depth: 1)
+        MetalTileKernels.ffai_moe_build_tile_plan_bm32_f32(
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+            tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+            tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+            m_total: UInt32(mTotal), n_experts: UInt32(nExperts),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Coop-core MoE gather GEMM (`ffai_moe_gather_qmm_coop`, F-85 gather
+    /// variant). Reuses `ffai_qmm_coop`'s inner loop/staging (TPG=128, 4 SG
+    /// 2x2 warp grid, BN=64) against a BM=32 tile plan - the tile height
+    /// matches this core's native M-tile exactly, so a plan tile maps to
+    /// one threadgroup with no pairing logic, mirroring
+    /// `moeGatherDequantGemmInt4TilePlan`'s BM=16 dispatch shape one tile
+    /// height up. `capacity` is `moeTilePlanCapacityBm32`'s host worst-case
+    /// bound (the dispatch grid's tile-axis extent), not the real tile
+    /// count - same zero-fill/inert-tile padding contract as the BM=16
+    /// sibling. Requires `nOut % 64 == 0` (BN=64) and `groupSize == 64`
+    /// (baked group-size assumption shared with the dense coop core);
+    /// callers outside that shape must use the BM=16 tileplan path instead.
+    public static func moeGatherDequantGemmInt4CoopTilePlan(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        xRows: Tensor,
+        capacity: Int, nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(weight.dtype == .u32, "moeGatherDequantGemmInt4CoopTilePlan: weight must be u32 packed")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeGatherDequantGemmInt4CoopTilePlan: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            xRows.dtype == .u32, "moeGatherDequantGemmInt4CoopTilePlan: xRows must be u32")
+        precondition(
+            input.dtype == scales.dtype && scales.dtype == biases.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlan: input/scales/biases dtype must match")
+        precondition(
+            out.dtype == input.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlan: out dtype must match input")
+        precondition(
+            nOut % 64 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlan: nOut (\(nOut)) must be multiple of 64 (BN tile)")
+        precondition(
+            kIn % 32 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlan: kIn (\(kIn)) must be multiple of 32 (BK tile)")
+        precondition(
+            kIn.isMultiple(of: groupSize) && kIn / groupSize > 0,
+            "moeGatherDequantGemmInt4CoopTilePlan: groupSize (\(groupSize)) must divide kIn (\(kIn))")
+
+        // 4-SG coop-core dispatch: threadgroup-counted grid, tile axis =
+        // capacity (host worst-case bound, static - see
+        // moeTilePlanCapacityBm32).
+        let grid = MTLSize(width: nOut / 64, height: capacity, depth: 1)
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        let nOutU = UInt32(nOut)
+        let kInU = UInt32(kIn)
+        let groupSizeU = UInt32(groupSize)
+
+        switch input.dtype {
+        case .f32:
+            MetalTileKernels.ffai_moe_gather_qmm_coop_f32_threadgroups(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+                tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+                tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_moe_gather_qmm_coop_f16_threadgroups(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+                tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+                tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_moe_gather_qmm_coop_bf16_threadgroups(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+                tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+                tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.moeGatherDequantGemmInt4CoopTilePlan: unsupported dtype \(input.dtype)")
+        }
+    }
+
     // MARK: - Batched-T prefill kernels (Qwen3.5 / Qwen3.6 hybrid prefill)
 
     /// Multi-token Gated Delta Net recurrence over a chunk of `T` tokens.

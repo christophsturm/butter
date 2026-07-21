@@ -464,6 +464,10 @@ public final class MoELayer: Module, DecoderLayer {
     /// cached at init (same reasoning as the other env-flag caches above);
     /// `tilePlanEnabled` below is the single place that interprets it.
     let tilePlanEnvRaw: String?
+    /// F-85 coop-core MoE gather GEMM gate (BM=32 tile plan, `ffai_qmm_coop`'s
+    /// inner loop). Raw env string cached at init; `coopEnabled` below is
+    /// the single place that interprets it.
+    let coopEnvRaw: String?
 
     /// Lazy dequant of the gate weight + cached output. Skipped when
     /// `gate.inner` is not a 8-bit QuantizedLinear or env
@@ -557,6 +561,7 @@ public final class MoELayer: Module, DecoderLayer {
         self.noBGEMMBm64 = env["FFAI_MOE_BGEMM_NO_BM64"] != nil
         self.bm64Env = env["FFAI_MOE_BGEMM_BM64"] != nil
         self.tilePlanEnvRaw = env["FFAI_MOE_TILEPLAN"]
+        self.coopEnvRaw = env["FFAI_MOE_COOP"]
     }
 
     /// F-85 expert-aligned tile-plan gate. Default ON as of the wiring
@@ -573,6 +578,29 @@ public final class MoELayer: Module, DecoderLayer {
     /// regardless of this flag (see `decodeMany`).
     public var tilePlanEnabled: Bool {
         tilePlanEnvRaw != "0"
+    }
+
+    /// F-85 coop-core MoE gather GEMM gate (BM=32 tile plan over
+    /// `ffai_moe_gather_qmm_coop`, the gather counterpart of the dense
+    /// `ffai_qmm_coop` core). Default ON as of the wiring pass's quality +
+    /// speed gates, same evidence bar as `tilePlanEnabled` above:
+    /// isolated kernel bench vs the BM=16 tileplan incumbent shows +31-98%
+    /// GB/s across mTotal 4096/16384/32768, both legs, 3 Zipf-seeded
+    /// routing draws (see `moe_gather_qmm_coop.rs`'s bench sweep and its
+    /// `moe_mpp_tileplan.rs` isolated-comparison counterpart);
+    /// `--dump-prefill-logits` is bit-exact (cosine 1.0, max_abs_dlogit
+    /// 0.0, top1/top5 set+order match) at T=512/1024/4096/16384; decode
+    /// (T=1) tok/s unchanged (expected - this path only engages on the
+    /// DEVPLAN2 batched-prefill route); and an order-balanced interleaved
+    /// e2e prefill speed gate (base vs coop, 2 trials/T) shows a consistent
+    /// 14-23% win at every T from 512 through 32768 with no regression at
+    /// any point already at or above the reference bar. Escape hatch:
+    /// `FFAI_MOE_COOP=0` reverts to the BM=16 tileplan default. Only
+    /// applies where `useTilePlan` already holds (DEVPLAN2 path) and the
+    /// coop core's own shape gate passes (`nOut % 64 == 0` on both legs,
+    /// `groupSize == 64`) - see `useCoopTilePlan` in `decodeMany`.
+    public var coopEnabled: Bool {
+        coopEnvRaw != "0"
     }
 
     /// DEVPLAN2 + stacked int4: expert path can stay on the caller's cmd.
@@ -998,6 +1026,19 @@ public final class MoELayer: Module, DecoderLayer {
         // for the measured prefill path. bm64/bm8 opt-ins also take
         // priority when set - tileplan only replaces the bm16 default.
         let useTilePlan = useDevPlan2 && !useBm64 && !useBm8 && self.tilePlanEnabled
+        // F-85 coop-core MoE gather GEMM (BM=32 tile plan over
+        // `ffai_moe_gather_qmm_coop`, see `coopEnabled`). Only takes over
+        // from the bm16 tileplan default when the coop core's shape
+        // requirements hold for BOTH gate/up (nOut=moeIntermediate) and
+        // down (nOut=hidden) legs at this layer - `nOut % 64 == 0` (BN=64)
+        // and `groupSize == 64` (the dense core's baked group assumption,
+        // shared here). A layer that fails either check silently keeps the
+        // bm16 tileplan path even with the env flag set, rather than
+        // half-switching one leg.
+        let useCoopTilePlan =
+            useTilePlan && self.coopEnabled
+            && moeIntermediate.isMultiple(of: 64) && hidden.isMultiple(of: 64)
+            && groupSize == 64
         var tilePlanTileExpert: Tensor?
         var tilePlanTileRowStart: Tensor?
         var tilePlanTileRowCount: Tensor?
@@ -1005,13 +1046,16 @@ public final class MoELayer: Module, DecoderLayer {
         var tilePlanXRows: Tensor?
         if useTilePlan {
             // Host-computable worst-case capacity - no GPU-to-CPU sync (see
-            // `Ops.moeTilePlanCapacity`). Plan buffers must start
-            // zero-filled: the plan-builder kernel only writes the real
-            // `[0, realTileCount)` entries; padding out to `capacity`
-            // stays at this zero fill (`tile_expert = 0` - a valid expert
-            // id - and `tile_row_count = 0`, which the GEMM kernel's tail
-            // mask turns into an inert dispatched tile).
-            let capacity = Ops.moeTilePlanCapacity(mTotal: mTotal, nExperts: nExperts)
+            // `Ops.moeTilePlanCapacity` / `Ops.moeTilePlanCapacityBm32`).
+            // Plan buffers must start zero-filled: the plan-builder kernel
+            // only writes the real `[0, realTileCount)` entries; padding
+            // out to `capacity` stays at this zero fill (`tile_expert = 0`
+            // - a valid expert id - and `tile_row_count = 0`, which the
+            // GEMM kernel's tail mask turns into an inert dispatched tile).
+            let capacity =
+                useCoopTilePlan
+                ? Ops.moeTilePlanCapacityBm32(mTotal: mTotal, nExperts: nExperts)
+                : Ops.moeTilePlanCapacity(mTotal: mTotal, nExperts: nExperts)
             let teBuf = device.makeBuffer(length: capacity * 4)
             memset(teBuf.contents(), 0, capacity * 4)
             let trsBuf = device.makeBuffer(length: capacity * 4)
@@ -1021,10 +1065,17 @@ public final class MoELayer: Module, DecoderLayer {
             let tileExpert = Tensor(buffer: teBuf, offset: 0, shape: [capacity], dtype: .u32)
             let tileRowStart = Tensor(buffer: trsBuf, offset: 0, shape: [capacity], dtype: .u32)
             let tileRowCount = Tensor(buffer: trcBuf, offset: 0, shape: [capacity], dtype: .u32)
-            Ops.moeBuildTilePlan(
-                sortedExperts: indices,
-                tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
-                mTotal: mTotal, nExperts: nExperts, on: work)
+            if useCoopTilePlan {
+                Ops.moeBuildTilePlanBm32(
+                    sortedExperts: indices,
+                    tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
+                    mTotal: mTotal, nExperts: nExperts, on: work)
+            } else {
+                Ops.moeBuildTilePlan(
+                    sortedExperts: indices,
+                    tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
+                    mTotal: mTotal, nExperts: nExperts, on: work)
+            }
             // xGathered is already pre-gathered (step 8 above) - identity
             // row map, same helper the bm16 MPP path uses.
             let idRows = Ops.identityRowsBuffer(minCount: mTotal, device: device)
@@ -1039,20 +1090,23 @@ public final class MoELayer: Module, DecoderLayer {
             let tileExpert = tilePlanTileExpert, let tileRowStart = tilePlanTileRowStart,
             let tileRowCount = tilePlanTileRowCount, let xRows = tilePlanXRows
         {
-            Ops.moeGatherDequantGemmInt4TilePlan(
-                input: xGathered,
-                weight: stacked.gateWeight, scales: stacked.gateScales, biases: stacked.gateBiases,
-                tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
-                xRows: xRows,
-                capacity: tilePlanCapacity, nOut: moeIntermediate, kIn: hidden,
-                groupSize: groupSize, on: work, into: gateOut)
-            Ops.moeGatherDequantGemmInt4TilePlan(
-                input: xGathered,
-                weight: stacked.upWeight, scales: stacked.upScales, biases: stacked.upBiases,
-                tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
-                xRows: xRows,
-                capacity: tilePlanCapacity, nOut: moeIntermediate, kIn: hidden,
-                groupSize: groupSize, on: work, into: upOut)
+            let tilePlanGemm =
+                useCoopTilePlan
+                ? Ops.moeGatherDequantGemmInt4CoopTilePlan : Ops.moeGatherDequantGemmInt4TilePlan
+            tilePlanGemm(
+                xGathered,
+                stacked.gateWeight, stacked.gateScales, stacked.gateBiases,
+                tileExpert, tileRowStart, tileRowCount,
+                xRows,
+                tilePlanCapacity, moeIntermediate, hidden,
+                groupSize, work, gateOut)
+            tilePlanGemm(
+                xGathered,
+                stacked.upWeight, stacked.upScales, stacked.upBiases,
+                tileExpert, tileRowStart, tileRowCount,
+                xRows,
+                tilePlanCapacity, moeIntermediate, hidden,
+                groupSize, work, upOut)
         } else {
             bgemm(
                 xGathered,
@@ -1078,13 +1132,16 @@ public final class MoELayer: Module, DecoderLayer {
             let tileExpert = tilePlanTileExpert, let tileRowStart = tilePlanTileRowStart,
             let tileRowCount = tilePlanTileRowCount, let xRows = tilePlanXRows
         {
-            Ops.moeGatherDequantGemmInt4TilePlan(
-                input: inner,
-                weight: stacked.downWeight, scales: stacked.downScales, biases: stacked.downBiases,
-                tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
-                xRows: xRows,
-                capacity: tilePlanCapacity, nOut: hidden, kIn: moeIntermediate,
-                groupSize: groupSize, on: work, into: downOut)
+            let tilePlanGemm =
+                useCoopTilePlan
+                ? Ops.moeGatherDequantGemmInt4CoopTilePlan : Ops.moeGatherDequantGemmInt4TilePlan
+            tilePlanGemm(
+                inner,
+                stacked.downWeight, stacked.downScales, stacked.downBiases,
+                tileExpert, tileRowStart, tileRowCount,
+                xRows,
+                tilePlanCapacity, hidden, moeIntermediate,
+                groupSize, work, downOut)
         } else {
             bgemm(
                 inner,
