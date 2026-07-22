@@ -491,6 +491,10 @@ public final class MoELayer: Module, DecoderLayer {
     /// gate). Raw env string cached at init; `sortPlanCountingEnabled`
     /// below is the single place that interprets it.
     let sortPlanCountingEnvRaw: String?
+    /// Parallelized tile-plan builder gate (F-85 small-M follow-up). Raw
+    /// env string cached at init; `parallelPlanEnabled` below is the
+    /// single place that interprets it.
+    let parallelPlanEnvRaw: String?
 
     /// Lazy dequant of the gate weight + cached output. Skipped when
     /// `gate.inner` is not a 8-bit QuantizedLinear or env
@@ -676,6 +680,7 @@ public final class MoELayer: Module, DecoderLayer {
         self.pairedIndirectEnvRaw = env["FFAI_MOE_PAIRED_INDIRECT"]
         self.coopIndirectEnvRaw = env["FFAI_MOE_COOP_INDIRECT"]
         self.sortPlanCountingEnvRaw = env["FFAI_MOE_COUNTING_SORT"]
+        self.parallelPlanEnvRaw = env["FFAI_MOE_PARALLEL_PLAN"]
     }
 
     /// F-85 expert-aligned tile-plan gate. Default ON as of the wiring
@@ -710,6 +715,29 @@ public final class MoELayer: Module, DecoderLayer {
     /// `ffai_moe_sort_plan` at all.
     public var sortPlanCountingEnabled: Bool {
         sortPlanCountingEnvRaw != "0"
+    }
+
+    /// F-85 parallelized tile-plan builder gate (small-M follow-up to the
+    /// idle-tile-cost/counting-sort round). `ffai_moe_build_tile_plan` /
+    /// `_bm32` / `_bm32_own` each dispatch ONE threadgroup for the whole
+    /// plan build - every expert's binary search, the prefix sum, and
+    /// every tile emission all run on a single GPU core, a per-layer fixed
+    /// cost that does not shrink with `mTotal` and was found
+    /// disproportionately expensive at low prefill `T`. The parallel
+    /// replacements (`Ops.moeBuildTilePlanParallel`/`Bm32Parallel`/
+    /// `Bm32OwnParallel`, see `moe_tile_plan_expert_counts.rs`'s module
+    /// doc) split the per-expert row-range search out to `nExperts`
+    /// threadgroups (one per expert, running concurrently across the
+    /// GPU's cores) followed by a small single-threadgroup prefix-sum +
+    /// emission pass - same output format/contract, byte-exact against the
+    /// original builders across the full fixture set (dual CPU-oracle +
+    /// live-original-kernel checks). Default ON. Escape hatch:
+    /// `FFAI_MOE_PARALLEL_PLAN=0` reverts to the single-threadgroup
+    /// builders. Applies wherever `useTilePlan` holds - the plain bm16
+    /// path, the default `useCoopTilePlan` path, and the paired lever's
+    /// "own" dispatch (see `decodeMany`).
+    public var parallelPlanEnabled: Bool {
+        parallelPlanEnvRaw != "0"
     }
 
     /// F-85 coop-core MoE gather GEMM gate (BM=32 tile plan over
@@ -1461,11 +1489,23 @@ public final class MoELayer: Module, DecoderLayer {
                     buffer: ownIndirectGateUpBuf, offset: 4, shape: [1], dtype: .u32)
                 let ownTileCountDown = Tensor(
                     buffer: ownIndirectDownBuf, offset: 4, shape: [1], dtype: .u32)
-                Ops.moeBuildTilePlanBm32Own(
-                    sortedExperts: indices,
-                    tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
-                    tileCountGateUp: ownTileCountGateUp, tileCountDown: ownTileCountDown,
-                    mTotal: mTotal, nExperts: nExperts, on: work)
+                // F-85 parallelized builder (see `parallelPlanEnabled`) -
+                // default ON, escape hatch FFAI_MOE_PARALLEL_PLAN=0.
+                if self.parallelPlanEnabled {
+                    Ops.moeBuildTilePlanBm32OwnParallel(
+                        sortedExperts: indices,
+                        tileExpert: tileExpert, tileRowStart: tileRowStart,
+                        tileRowCount: tileRowCount,
+                        tileCountGateUp: ownTileCountGateUp, tileCountDown: ownTileCountDown,
+                        mTotal: mTotal, nExperts: nExperts, on: work)
+                } else {
+                    Ops.moeBuildTilePlanBm32Own(
+                        sortedExperts: indices,
+                        tileExpert: tileExpert, tileRowStart: tileRowStart,
+                        tileRowCount: tileRowCount,
+                        tileCountGateUp: ownTileCountGateUp, tileCountDown: ownTileCountDown,
+                        mTotal: mTotal, nExperts: nExperts, on: work)
+                }
                 coopIndirectArgsGateUp = ownIndirectGateUpBuf
                 coopIndirectArgsDown = ownIndirectDownBuf
 
@@ -1527,18 +1567,43 @@ public final class MoELayer: Module, DecoderLayer {
                     buffer: indirectGateUpBuf, offset: 4, shape: [1], dtype: .u32)
                 let tileCountDown = Tensor(
                     buffer: indirectDownBuf, offset: 4, shape: [1], dtype: .u32)
-                Ops.moeBuildTilePlanBm32(
-                    sortedExperts: indices,
-                    tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
-                    tileCountGateUp: tileCountGateUp, tileCountDown: tileCountDown,
-                    mTotal: mTotal, nExperts: nExperts, on: work)
+                // F-85 parallelized builder (see `parallelPlanEnabled`) -
+                // default ON, escape hatch FFAI_MOE_PARALLEL_PLAN=0. This is
+                // the default production coop path's builder call.
+                if self.parallelPlanEnabled {
+                    Ops.moeBuildTilePlanBm32Parallel(
+                        sortedExperts: indices,
+                        tileExpert: tileExpert, tileRowStart: tileRowStart,
+                        tileRowCount: tileRowCount,
+                        tileCountGateUp: tileCountGateUp, tileCountDown: tileCountDown,
+                        mTotal: mTotal, nExperts: nExperts, on: work)
+                } else {
+                    Ops.moeBuildTilePlanBm32(
+                        sortedExperts: indices,
+                        tileExpert: tileExpert, tileRowStart: tileRowStart,
+                        tileRowCount: tileRowCount,
+                        tileCountGateUp: tileCountGateUp, tileCountDown: tileCountDown,
+                        mTotal: mTotal, nExperts: nExperts, on: work)
+                }
                 coopIndirectArgsGateUp = indirectGateUpBuf
                 coopIndirectArgsDown = indirectDownBuf
             } else {
-                Ops.moeBuildTilePlan(
-                    sortedExperts: indices,
-                    tileExpert: tileExpert, tileRowStart: tileRowStart, tileRowCount: tileRowCount,
-                    mTotal: mTotal, nExperts: nExperts, on: work)
+                // F-85 parallelized builder (see `parallelPlanEnabled`) -
+                // bm16 fallback path (coop core off or shape doesn't
+                // qualify - see `useCoopTilePlan`).
+                if self.parallelPlanEnabled {
+                    Ops.moeBuildTilePlanParallel(
+                        sortedExperts: indices,
+                        tileExpert: tileExpert, tileRowStart: tileRowStart,
+                        tileRowCount: tileRowCount,
+                        mTotal: mTotal, nExperts: nExperts, on: work)
+                } else {
+                    Ops.moeBuildTilePlan(
+                        sortedExperts: indices,
+                        tileExpert: tileExpert, tileRowStart: tileRowStart,
+                        tileRowCount: tileRowCount,
+                        mTotal: mTotal, nExperts: nExperts, on: work)
+                }
             }
             // xGathered is already pre-gathered (step 8 above) - identity
             // row map, same helper the bm16 MPP path uses.

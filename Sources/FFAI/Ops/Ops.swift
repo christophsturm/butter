@@ -6457,6 +6457,184 @@ public enum Ops {
             gridSize: grid, threadgroupSize: tg, on: cmd)
     }
 
+    /// Phase 1 of the parallelized tile-plan builders (F-85 small-M
+    /// follow-up, `ffai_moe_tile_plan_expert_counts`). Dispatches ONE
+    /// THREADGROUP PER EXPERT (`nExperts` groups, one thread each) so every
+    /// expert's binary search over `sortedExperts` runs concurrently across
+    /// the GPU's cores instead of serially on the single core the original
+    /// builders' one-threadgroup dispatch confines all `nExperts` lanes to.
+    /// Writes `expertRowBase[e]`/`expertCount[e]`, the same row-range values
+    /// any of the three single-threadgroup builders would compute locally
+    /// for expert `e` - shared by all three tile-height variants below,
+    /// since the row range a sorted-expert array implies for an expert does
+    /// not depend on the tile height it will be sliced into.
+    ///
+    /// Callers (`moeBuildTilePlanParallel`/`Bm32Parallel`/`Bm32OwnParallel`
+    /// below) allocate `expertRowBase`/`expertCount` as fresh per-call
+    /// scratch, matching `moeSortPlanCounting`'s `blockCounts`/
+    /// `blockOffsets` convention - not cached, since `nExperts` is fixed
+    /// per model but this keeps every caller's allocation lifetime obvious.
+    public static func moeTilePlanExpertCounts(
+        sortedExperts: Tensor,
+        expertRowBase: Tensor, expertCount: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeTilePlanExpertCounts: sortedExperts must be u32")
+        precondition(
+            expertRowBase.dtype == .u32 && expertCount.dtype == .u32,
+            "moeTilePlanExpertCounts: expertRowBase/expertCount must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeTilePlanExpertCounts: nExperts (\(nExperts)) exceeds the kernel's 256-expert scope"
+        )
+        let grid = MTLSize(width: nExperts, height: 1, depth: 1)
+        let tg = MTLSize(width: 1, height: 1, depth: 1)
+        MetalTileKernels.ffai_moe_tile_plan_expert_counts_f32_threadgroups(
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            expert_row_base: expertRowBase.buffer, expert_row_baseOffset: expertRowBase.offset,
+            expert_count: expertCount.buffer, expert_countOffset: expertCount.offset,
+            m_total: UInt32(mTotal),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Parallelized sibling of `moeBuildTilePlan` (F-85 small-M follow-up):
+    /// dispatches `moeTilePlanExpertCounts` (phase 1, per-expert parallel)
+    /// then `ffai_moe_build_tile_plan_parallel` (phase 2 - prefix sum +
+    /// tile emission only, no per-lane binary search left). Identical
+    /// output format/contract to `moeBuildTilePlan` - same
+    /// `tileExpert`/`tileRowStart`/`tileRowCount`, same worst-case capacity
+    /// and zero-fill padding convention. Gated by `FFAI_MOE_PARALLEL_PLAN`
+    /// in `MoELayer.swift`; `moeBuildTilePlan` remains the escape hatch.
+    public static func moeBuildTilePlanParallel(
+        sortedExperts: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeBuildTilePlanParallel: sortedExperts must be u32")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeBuildTilePlanParallel: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeBuildTilePlanParallel: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let rowBaseBuf = device.makeBuffer(length: nExperts * 4)
+        let countBuf = device.makeBuffer(length: nExperts * 4)
+        let expertRowBase = Tensor(buffer: rowBaseBuf, offset: 0, shape: [nExperts], dtype: .u32)
+        let expertCount = Tensor(buffer: countBuf, offset: 0, shape: [nExperts], dtype: .u32)
+        moeTilePlanExpertCounts(
+            sortedExperts: sortedExperts, expertRowBase: expertRowBase, expertCount: expertCount,
+            mTotal: mTotal, nExperts: nExperts, on: cmd)
+
+        let grid = MTLSize(width: 1, height: 1, depth: 1)
+        let tg = MTLSize(width: nExperts, height: 1, depth: 1)
+        MetalTileKernels.ffai_moe_build_tile_plan_parallel_f32_threadgroups(
+            expert_row_base: expertRowBase.buffer, expert_row_baseOffset: expertRowBase.offset,
+            expert_count: expertCount.buffer, expert_countOffset: expertCount.offset,
+            tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+            tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+            tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+            n_experts: UInt32(nExperts),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Parallelized sibling of `moeBuildTilePlanBm32` (F-85 small-M
+    /// follow-up) - same two-phase split as `moeBuildTilePlanParallel`,
+    /// BM=32 tile height, including the `tileCountGateUp`/`tileCountDown`
+    /// indirect-dispatch outputs. Gated by `FFAI_MOE_PARALLEL_PLAN`;
+    /// `moeBuildTilePlanBm32` remains the escape hatch.
+    public static func moeBuildTilePlanBm32Parallel(
+        sortedExperts: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        tileCountGateUp: Tensor, tileCountDown: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeBuildTilePlanBm32Parallel: sortedExperts must be u32")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeBuildTilePlanBm32Parallel: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            tileCountGateUp.dtype == .u32 && tileCountDown.dtype == .u32,
+            "moeBuildTilePlanBm32Parallel: tileCountGateUp/tileCountDown must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeBuildTilePlanBm32Parallel: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let rowBaseBuf = device.makeBuffer(length: nExperts * 4)
+        let countBuf = device.makeBuffer(length: nExperts * 4)
+        let expertRowBase = Tensor(buffer: rowBaseBuf, offset: 0, shape: [nExperts], dtype: .u32)
+        let expertCount = Tensor(buffer: countBuf, offset: 0, shape: [nExperts], dtype: .u32)
+        moeTilePlanExpertCounts(
+            sortedExperts: sortedExperts, expertRowBase: expertRowBase, expertCount: expertCount,
+            mTotal: mTotal, nExperts: nExperts, on: cmd)
+
+        let grid = MTLSize(width: 1, height: 1, depth: 1)
+        let tg = MTLSize(width: nExperts, height: 1, depth: 1)
+        MetalTileKernels.ffai_moe_build_tile_plan_bm32_parallel_f32_threadgroups(
+            expert_row_base: expertRowBase.buffer, expert_row_baseOffset: expertRowBase.offset,
+            expert_count: expertCount.buffer, expert_countOffset: expertCount.offset,
+            tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+            tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+            tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+            tile_count_gateup: tileCountGateUp.buffer, tile_count_gateupOffset: tileCountGateUp.offset,
+            tile_count_down: tileCountDown.buffer, tile_count_downOffset: tileCountDown.offset,
+            n_experts: UInt32(nExperts),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Parallelized sibling of `moeBuildTilePlanBm32Own` (F-85 small-M
+    /// follow-up) - same two-phase split, excludes `1..=16`-row pairing
+    /// candidates like the original "own" builder. Gated by
+    /// `FFAI_MOE_PARALLEL_PLAN`; `moeBuildTilePlanBm32Own` remains the
+    /// escape hatch.
+    public static func moeBuildTilePlanBm32OwnParallel(
+        sortedExperts: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        tileCountGateUp: Tensor, tileCountDown: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeBuildTilePlanBm32OwnParallel: sortedExperts must be u32"
+        )
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeBuildTilePlanBm32OwnParallel: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            tileCountGateUp.dtype == .u32 && tileCountDown.dtype == .u32,
+            "moeBuildTilePlanBm32OwnParallel: tileCountGateUp/tileCountDown must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeBuildTilePlanBm32OwnParallel: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let rowBaseBuf = device.makeBuffer(length: nExperts * 4)
+        let countBuf = device.makeBuffer(length: nExperts * 4)
+        let expertRowBase = Tensor(buffer: rowBaseBuf, offset: 0, shape: [nExperts], dtype: .u32)
+        let expertCount = Tensor(buffer: countBuf, offset: 0, shape: [nExperts], dtype: .u32)
+        moeTilePlanExpertCounts(
+            sortedExperts: sortedExperts, expertRowBase: expertRowBase, expertCount: expertCount,
+            mTotal: mTotal, nExperts: nExperts, on: cmd)
+
+        let grid = MTLSize(width: 1, height: 1, depth: 1)
+        let tg = MTLSize(width: nExperts, height: 1, depth: 1)
+        MetalTileKernels.ffai_moe_build_tile_plan_bm32_own_parallel_f32_threadgroups(
+            expert_row_base: expertRowBase.buffer, expert_row_baseOffset: expertRowBase.offset,
+            expert_count: expertCount.buffer, expert_countOffset: expertCount.offset,
+            tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+            tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+            tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+            tile_count_gateup: tileCountGateUp.buffer, tile_count_gateupOffset: tileCountGateUp.offset,
+            tile_count_down: tileCountDown.buffer, tile_count_downOffset: tileCountDown.offset,
+            n_experts: UInt32(nExperts),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
     /// Device-side PAIR-ONLY BM=32 tile-plan builder for the F-85
     /// tile-pairing lever (`ffai_moe_build_tile_plan_bm32_paired`). Reads
     /// the SAME `sortedExperts` array as `moeBuildTilePlanBm32Own` and
