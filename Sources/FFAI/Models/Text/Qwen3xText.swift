@@ -1265,6 +1265,11 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //     Force the coop kernel on even off the auto-capability check (A/B
 //     only; the kernel needs the same MPP/NAX hardware support as
 //     `ffai_qmm_mma_mpp`, this does not bypass that requirement).
+//     CAUTION: unlike the shape/group-size checks (still enforced),
+//     forcing this on hardware below the MPP/NAX capability floor is
+//     untested territory - the auto-capability gate exists specifically
+//     to keep this kernel off such hardware, and no test in this repo
+//     exercises the forced-on + incapable-hardware combination.
 //   FFAI_QMM_MPP=0 | =1
 //     Force off / on the BN=32 MPP/NAX cooperative-tensor kernel
 //     (`ffai_qmm_mma_mpp`), the tier below coop. Default: auto-detected
@@ -1364,30 +1369,91 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //     at every T from 512 through 32768, no high-T regression. Tests:
 //     kernels repo `moe_build_tile_plan_correctness.rs` +
 //     `moe_gather_qmm_tileplan_correctness.rs`.
-//   FFAI_MOE_PAIRED=0
-//     Opt out of the F-85 two-expert tile-pairing lever
-//     (`ffai_moe_gather_qmm_coop_paired`) at prefill, reverting to the
-//     coop core's single unpaired dispatch across every mTotal. Below
+//   FFAI_MOE_COOP=0
+//     Opt out of the F-85 coop-core MoE gather GEMM (BM=32 tile plan
+//     over `ffai_moe_gather_qmm_coop`) at prefill, reverting to the
+//     BM=16 tileplan default. Only takes effect where `FFAI_MOE_TILEPLAN`
+//     is also active and the coop core's own shape gate passes
+//     (`nOut % 64 == 0` on both legs, `groupSize == 64`) - a layer that
+//     fails either check stays on the BM=16 tileplan path regardless of
+//     this flag. Default: auto-detected on `Ops.mppAutoCapable` hardware
+//     (Apple GPU Family 9+ / macOS 26+ - the same requirement
+//     `FFAI_QMM_COOP`'s auto-default checks, since this kernel wraps the
+//     same `matmul2d` cooperative-tensor core). `FFAI_MOE_COOP=1` force-
+//     enables past the hardware check (untested on incapable hardware,
+//     same caveat as `FFAI_QMM_COOP=1`). Isolated kernel bench shows
+//     +31-98% GB/s vs the BM=16 tileplan incumbent across mTotal
+//     4096/16384/32768; `--dump-prefill-logits` bit-exact (cosine 1.0,
+//     max_abs_dlogit 0.0) at T=512/1024/4096/16384; e2e prefill win
+//     14-23% at every T from 512 through 32768 (measured on
+//     `Ops.mppAutoCapable` hardware).
+//   FFAI_MOE_COOP_INDIRECT=0
+//     Opt out of the idle-tile-cost indirect dispatch for the coop GEMM
+//     above (`dispatchThreadgroupsIndirect` fed the device-computed real
+//     tile count instead of the static worst-case-capacity bound),
+//     reverting to the old direct/capacity dispatch - kept for A/B
+//     measurement, not a production fallback (the old path pays 10-21%
+//     idle-tile cost at the F-85 low-context mTotal targets). Only takes
+//     effect where `FFAI_MOE_COOP` is also active (both the plain path
+//     and the paired lever's "own" dispatch below). Default: ON.
+//   FFAI_MOE_PAIRED=1
+//     Opt IN to the F-85 two-expert tile-pairing lever
+//     (`ffai_moe_gather_qmm_coop_paired`) at prefill. Below
 //     `FFAI_MOE_PAIRED_MAX_MTOTAL` (see below), the coop tile plan splits
 //     into an "own" plan (full/17-31-row remainders, fed the UNCHANGED
 //     `ffai_moe_gather_qmm_coop` dispatch) and a "paired" plan (1-16-row
 //     remainders packed two experts to a tile, fed the new paired-GEMM
 //     dispatch), eliminating the masked-out padding those short
 //     remainders otherwise cost. Only takes effect where
-//     `FFAI_MOE_TILEPLAN` + `FFAI_MOE_COOP` are also active. Default: ON.
-//     Gated on `--dump-prefill-logits` bit-exact (cosine 1.0,
-//     max_abs_dlogit 0.0) + greedy-token match at T=512/1024/4096/16384;
-//     isolated kernel bench GO/NO-GO shows a 7-12% win at mTotal=4096,
-//     4-9% at 8192, parity at 16384, and a 3-6% loss at 32768. Tests:
-//     kernels repo `moe_build_tile_plan_bm32_own_correctness.rs` +
+//     `FFAI_MOE_TILEPLAN` + `FFAI_MOE_COOP` are also active.
+//     DEFAULT OFF (opt-in, unlike every other MoE gate in this section -
+//     unset or `=0` stays off, `=1` enables). Isolated kernel bench
+//     GO/NO-GO shows a 7-12% win at mTotal=4096, 4-9% at 8192, parity at
+//     16384, and a 3-6% loss at 32768, but the real wiring must always
+//     dispatch the paired GEMM at its static worst-case tile capacity
+//     (no GPU-to-CPU readback of the real paired-tile count before
+//     dispatch), which the indirect-dispatch fix below only partially
+//     recovers - see `pairedEnabled`'s doc in `MoELayer.swift` for the
+//     full measurement history of why this stays opt-in. Gated on
+//     `--dump-prefill-logits` bit-exact (cosine 1.0, max_abs_dlogit 0.0)
+//     + greedy-token match at T=512/1024/4096/16384. Tests: kernels repo
+//     `moe_build_tile_plan_bm32_own_correctness.rs` +
 //     `moe_build_tile_plan_bm32_paired_correctness.rs` +
 //     `moe_gather_qmm_coop_paired.rs`'s kernel_tests.
+//   FFAI_MOE_PAIRED_INDIRECT=0
+//     Opt out of the paired-GEMM's own idle-tile-cost indirect dispatch
+//     (the root-cause fix for the worst-case-capacity regression
+//     `FFAI_MOE_PAIRED` above pays), reverting to the old direct/capacity
+//     dispatch - kept for A/B measurement against the indirect fix, not
+//     a production fallback. Only takes effect where `FFAI_MOE_PAIRED`
+//     is also active. Default: ON.
 //   FFAI_MOE_PAIRED_MAX_MTOTAL=<mTotal>
 //     Override the tile-pairing mTotal threshold (paired dispatch runs
 //     when mTotal < this value). Default: 16384, the measured
 //     parity boundary - chosen over 32768 (a measured 3-6% loss there)
 //     so the default never dispatches the extra pass where it cannot
 //     win.
+//   FFAI_MOE_COUNTING_SORT=0
+//     Opt out of the F-85 bucketed counting-sort replacement for
+//     `ffai_moe_sort_plan` (histogram -> prefix-sum -> scatter, same
+//     stable expert-ascending order), reverting to the original kernel's
+//     O(mTotal^2) per-thread linear scan. Only takes effect on the
+//     DEVPLAN2 device-sorted-plan path (`useDevPlan2`) - the only path
+//     that calls the sort-plan kernel at all. Default: ON.
+//     `--dump-prefill-logits` byte-identical at every T tested; isolated
+//     kernel bench shows the win growing with mTotal: ~6-9x at
+//     4096/8192, ~10-15x at 16384, ~38x at 32768.
+//   FFAI_MOE_PARALLEL_PLAN=0
+//     Opt out of the parallelized MoE tile-plan builders
+//     (`ffai_moe_build_tile_plan_parallel` / `_bm32_parallel` /
+//     `_bm32_own_parallel` - one threadgroup per expert instead of a
+//     single threadgroup owning the whole plan build), reverting to the
+//     single-threadgroup builders. Applies wherever `FFAI_MOE_TILEPLAN`
+//     is active - the plain bm16 path, the `FFAI_MOE_COOP` path, and the
+//     `FFAI_MOE_PAIRED` lever's "own" dispatch. Default: ON. Byte-exact
+//     against the original single-threadgroup builders across the full
+//     kernels-repo fixture set (dual CPU-oracle + live-original-kernel
+//     checks).
 //   DEVPLAN2=0
 //     Opt out of chaining the MoE prefill expert path onto the
 //     caller's own command buffer. Note: no `FFAI_` prefix (older
@@ -1461,6 +1527,19 @@ public final class Qwen35GDNMixer: Module {
     /// it — when fused, the mixer keeps `cmd` in-flight so the residual
     /// add + FFN chain onto the same command buffer.
     let fused: Bool
+
+    /// Chunked-WY prefill pipeline eligibility (shape half of `useWY` in
+    /// `forwardManyChunked`; the `t >= 64` half stays a per-call check
+    /// since `t` varies). Cached at init for the same reason as `fused`
+    /// above - `FFAI_GDN_WY` and the head-dim shape guards are all
+    /// instance-constant, so re-reading the env on every chunk was a
+    /// dictionary lookup this mixer's forward path never needed.
+    let wyShapeEligible: Bool
+    /// Shape-specialized fast prep_chunk kernel eligibility (shape +
+    /// env half of `useFast` in `forwardManyChunked`; the `!useWY` half
+    /// stays a per-call check since `useWY` depends on per-call `t`).
+    /// Cached at init, same reasoning as `wyShapeEligible` above.
+    let fastPrepChunkEligible: Bool
 
     /// Pre-allocated per-call scratch tensors. The fused GDN path
     /// writes / reads these inside one command buffer per decode token;
@@ -1553,6 +1632,15 @@ public final class Qwen35GDNMixer: Module {
         // comparison.
         self.fused =
             ProcessInfo.processInfo.environment["FFAI_GDN_NO_FUSED_PREP"] == nil
+        // See `wyShapeEligible`/`fastPrepChunkEligible` doc above - cached
+        // once here instead of read from `forwardManyChunked` on every
+        // chunk.
+        self.wyShapeEligible =
+            ProcessInfo.processInfo.environment["FFAI_GDN_WY"] != nil
+            && valueHeadDim % 32 == 0 && keyHeadDim % 16 == 0 && valueHeadDim % 16 == 0
+        self.fastPrepChunkEligible =
+            keyHeadDim == 128 && valueHeadDim == 128 && numValueHeads == 32 && numKeyHeads == 16
+            && ProcessInfo.processInfo.environment["FFAI_GDN_NO_PREP_CHUNK_FAST"] == nil
 
         // Per-decode-token scratch — pre-allocated once at init so the
         // fused GDN path doesn't pay 6 × MTLBuffer allocations per call.
@@ -2142,9 +2230,9 @@ public final class Qwen35GDNMixer: Module {
         // its doc comment), so the only remaining fallback to
         // `gatedDeltaPrepChunk` is `t < 64` (no full chunk to pad up to at
         // all).
-        let useWY =
-            ProcessInfo.processInfo.environment["FFAI_GDN_WY"] != nil && t >= 64
-            && valueHeadDim % 32 == 0 && keyHeadDim % 16 == 0 && valueHeadDim % 16 == 0
+        // Env + shape eligibility cached at init (`wyShapeEligible`) - only
+        // the `t >= 64` half varies per call.
+        let useWY = wyShapeEligible && t >= 64
         // Shape-specialized fast path: dispatches
         // `ffai_gated_delta_prep_chunk_fast_d128_128_32_16` in place of the
         // generic `gatedDeltaPrepChunk`: same math, same grid/TG geometry,
@@ -2155,12 +2243,10 @@ public final class Qwen35GDNMixer: Module {
         // doc for the root-cause writeup). Only valid at Qwen3.6-35B-A3B's
         // production GDN shape, so guard on the exact dims before dispatching,
         // and keep an escape hatch back to the generic kernel for any other
-        // GDN-bearing shape or for A/B verification.
-        let fastShapeMatches =
-            keyHeadDim == 128 && valueHeadDim == 128 && numValueHeads == 32 && numKeyHeads == 16
-        let useFast =
-            !useWY && fastShapeMatches
-            && ProcessInfo.processInfo.environment["FFAI_GDN_NO_PREP_CHUNK_FAST"] == nil
+        // GDN-bearing shape or for A/B verification. Env + shape eligibility
+        // cached at init (`fastPrepChunkEligible`) - only the `!useWY` half
+        // varies per call (`useWY` itself depends on per-call `t`).
+        let useFast = !useWY && fastPrepChunkEligible
         if useWY {
             Ops.gatedDeltaWYPrefill(
                 convOut: convOutAllF32,
@@ -2291,6 +2377,18 @@ public final class Qwen35AttentionMixer: Module {
         return 1024  // default: only kick in at long KV
     }()
 
+    /// D=256 attention kernel tier, cached at init (same reasoning as
+    /// `sdpa2PassThreshold` above): `headDim` is instance-constant, so
+    /// re-deriving this from `ProcessInfo.environment` on every
+    /// `forwardMany` call (once per attention layer per prefill chunk,
+    /// and once per attention layer per decode token when the batched
+    /// decode path is active - see `FFAI_LEGACY_FORWARDMANY`) always
+    /// produced the same answer for the life of the mixer. Set together
+    /// in `init` below since `useLegacyD256Cached` only feeds
+    /// `useMmaD256Cached`'s derivation and has no other caller.
+    private let useMmaD256Cached: Bool
+    private let useQtiledD256Cached: Bool
+
     init(
         qProj: AnyLinear, kProj: AnyLinear, vProj: AnyLinear, oProj: AnyLinear,
         qNorm: RMSNorm, kNorm: RMSNorm,
@@ -2311,6 +2409,16 @@ public final class Qwen35AttentionMixer: Module {
         self.ropeTheta = ropeTheta
         self.attnOutputGate = attnOutputGate
         self.scale = 1.0 / Float(Double(headDim).squareRoot())
+        // See `useMmaD256Cached`/`useQtiledD256Cached` doc above - cached
+        // once here instead of read from `forwardMany` on every call.
+        let qtiledD256 =
+            headDim == 256
+                && ProcessInfo.processInfo.environment["FFAI_SDPA_QTILED_D256"] == "1"
+        let legacyD256 =
+            headDim == 256 && !qtiledD256
+                && ProcessInfo.processInfo.environment["FFAI_SDPA_LEGACY_D256"] == "1"
+        self.useQtiledD256Cached = qtiledD256
+        self.useMmaD256Cached = headDim == 256 && !legacyD256 && !qtiledD256
         if attnOutputGate {
             // Pre-build the row-index tensors for the gate-split
             // gather. Even rows = queries, odd rows = gates.
@@ -2732,14 +2840,15 @@ public final class Qwen35AttentionMixer: Module {
         // `ffai_sdpa_multi_d256` (one threadgroup per (query, q_head),
         // no K/V reuse across rows) that the F-85 campaign identified
         // as the source of the original append-regime bandwidth waste.
-        let useQtiledD256 =
-            headDim == 256
-                && ProcessInfo.processInfo.environment["FFAI_SDPA_QTILED_D256"] == "1"
-        let useLegacyD256 =
-            headDim == 256 && !useQtiledD256
-                && ProcessInfo.processInfo.environment["FFAI_SDPA_LEGACY_D256"] == "1"
-        let useMmaD256 = headDim == 256 && !useLegacyD256 && !useQtiledD256
-        let useQtiled = useQtiledD256
+        // Tier selection is instance-constant (depends only on `headDim`
+        // and the env, both fixed for this mixer's lifetime) - cached
+        // once in `init` as `useMmaD256Cached`/`useQtiledD256Cached`
+        // instead of re-read from `ProcessInfo.environment` on every
+        // `forwardMany` call (once per attention layer per prefill chunk,
+        // and once per attention layer per decode token on the batched
+        // decode path).
+        let useMmaD256 = useMmaD256Cached
+        let useQtiled = useQtiledD256Cached
         let (cacheK, cacheV) = kv.prepareForAttention(on: cmd)
         let attnAll: Tensor
         if useMmaD256 {

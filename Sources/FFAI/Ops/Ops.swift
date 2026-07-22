@@ -4574,7 +4574,15 @@ public enum Ops {
     /// load across twice as many query rows, at a threadgroup-memory
     /// cost that only fits f16/bf16 (33792 B at f32 would blow the 32
     /// KiB ceiling, so f32 always stays on the BK=8 kernel below).
-    /// `FFAI_SDPA_BK16=0` reverts f16/bf16 to BK=8 for bisection.
+    /// `FFAI_SDPA_BK16=0` reverts f16/bf16 to BK=8 for bisection. Cached
+    /// once (`sdpaBK16Enabled` below) rather than read from
+    /// `ProcessInfo.environment` on every call - this is the default
+    /// d=256 prefill attention kernel, dispatched once per attention
+    /// layer per prefill chunk and once per attention layer per decode
+    /// token on the batched decode path.
+    private static let sdpaBK16Enabled: Bool =
+        ProcessInfo.processInfo.environment["FFAI_SDPA_BK16"] != "0"
+
     public static func sdpaPrefillMmaD256(
         q: Tensor, k: Tensor, v: Tensor,
         nQHeads: Int, nKVHeads: Int, headDim: Int,
@@ -4603,7 +4611,7 @@ public enum Ops {
         let tgGrid = MTLSize(width: tgX, height: nQHeads, depth: 1)
         let tg = MTLSize(width: 128, height: 1, depth: 1)
         let causalFlag = UInt32(causal ? 1 : 0)
-        let useBK16 = ProcessInfo.processInfo.environment["FFAI_SDPA_BK16"] != "0"
+        let useBK16 = Self.sdpaBK16Enabled
         switch q.dtype {
         case .f32:
             MetalTileKernels.ffai_sdpa_prefill_mma_d256_f32_threadgroups(
@@ -5820,7 +5828,17 @@ public enum Ops {
     /// Whether the MPP auto-default may fire: Apple GPU Family 9+ (M3+)
     /// and macOS 26+ (Metal 4 — the MPP header live-compile requires it).
     /// Cached once; explicit FFAI_MOE_BGEMM_MPP=1 bypasses this.
-    private static let mppAutoCapable: Bool = {
+    ///
+    /// Module-visible (not `private`) rather than duplicated: `MoELayer`'s
+    /// F-85 coop-core MoE gather gate (`coopEnabled`) also wraps a
+    /// `matmul2d`/cooperative-tensor kernel (`ffai_moe_gather_qmm_coop`)
+    /// with the same Family-9/macOS-26 requirement, and unlike
+    /// `dispatchQmmMma`'s coop tier below (which falls back to a cheaper
+    /// tier on incapable hardware), that kernel has no lower-level
+    /// fallback of its own once dispatched - the capability check has to
+    /// happen at the `MoELayer` call site, so it reuses this same cached
+    /// check instead of re-deriving it.
+    static let mppAutoCapable: Bool = {
         guard
             ProcessInfo.processInfo.isOperatingSystemAtLeast(
                 OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0))
@@ -6906,7 +6924,7 @@ public enum Ops {
 
     /// Multi-token Gated Delta Net recurrence over a chunk of `T` tokens.
     ///
-    /// Wraps `ffai_gated_delta_chunk` — same recurrence math as
+    /// Wraps `ffai_gated_delta_chunk` - same recurrence math as
     /// `gatedDeltaStep` but runs the per-token loop *inside* the kernel
     /// with the recurrent state kept in per-lane registers across the
     /// entire `T` sweep. A single dispatch replaces `T` independent
@@ -6919,17 +6937,17 @@ public enum Ops {
     ///   * `v, y`  : `[T, Hv, Dv]`   row-major
     ///   * `g, beta` : `[T, Hv]`     row-major
     ///   * `stateIn / stateOut` : `[Hv, Dv, Dk]` (one state per `hv`)
-    ///   * `tLen`  : `[1]` u32 — number of tokens in this chunk (runtime
+    ///   * `tLen`  : `[1]` u32 - number of tokens in this chunk (runtime
     ///                scalar, NOT a constexpr; same PSO works for every
     ///                chunk length).
     ///
-    /// All input tensors must share the activation dtype `T` — the
+    /// All input tensors must share the activation dtype `T` - the
     /// kernel is emitted in f32 / f16 / bf16 variants. For Qwen3.5 the
     /// state is f32 (see `GDNStateCache.dtype`); pass q/k/v/g/beta as f32
     /// tensors as well.
     ///
     /// Dispatch: grid `(Dv, Hv)` threadgroups, 32 threads (one simdgroup)
-    /// per group — identical to `ffai_gated_delta_step` apart from the
+    /// per group - identical to `ffai_gated_delta_step` apart from the
     /// runtime `tLen`. `Dk % 32 == 0` invariant applies (max Dk = 256, so
     /// `n_per_t = Dk/32 ≤ 8` register entries per lane).
     public static func gatedDeltaChunk(
@@ -8456,6 +8474,18 @@ public enum Ops {
         encoder.dispatchThreadgroups(tgGrid, threadsPerThreadgroup: tg)
     }
 
+    /// `FFAI_QMM_MPP` / `FFAI_QMM_COOP` raw env strings, cached once.
+    /// `dispatchQmmMma` below is the shared entry for every dense int4
+    /// projection at prefill (GDN in-projections, attention QKV/out,
+    /// every other quantized linear), so this fires many times per layer
+    /// per forward call; re-fetching the whole process environment
+    /// dictionary that often was pure overhead once the tier decision
+    /// stabilizes for the life of the process.
+    private static let qmmMppEnvRaw: String? =
+        ProcessInfo.processInfo.environment["FFAI_QMM_MPP"]
+    private static let qmmCoopEnvRaw: String? =
+        ProcessInfo.processInfo.environment["FFAI_QMM_COOP"]
+
     /// Inner dispatcher for `dequantGemmDynamicM`. Grid is `[N/32, M/32, 1]`
     /// × tg `[128, 1, 1]` (4 SGs WM=WN=2 per the canonical `ffai_qmm_mma`).
     /// `dispatchThreads` counts total threads per axis, so grid.x = N/32·128.
@@ -8515,16 +8545,15 @@ public enum Ops {
         let kU = UInt32(k)
         let nU = UInt32(n)
         let gsU = UInt32(gsPerRow)
-        let env = ProcessInfo.processInfo.environment
         let mppRequested4: Bool
-        switch env["FFAI_QMM_MPP"] {
+        switch Self.qmmMppEnvRaw {
         case "0": mppRequested4 = false
         case "1": mppRequested4 = true
         default: mppRequested4 = Self.mppAutoCapable
         }
         let useMpp4 = mppRequested4 && gsPerRow > 0 && k % gsPerRow == 0 && k / gsPerRow == 64
         let coopRequested4: Bool
-        switch env["FFAI_QMM_COOP"] {
+        switch Self.qmmCoopEnvRaw {
         case "0": coopRequested4 = false
         case "1": coopRequested4 = true
         default: coopRequested4 = Self.mppAutoCapable

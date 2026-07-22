@@ -605,6 +605,43 @@ public final class MoELayer: Module, DecoderLayer {
     private var coopIndirectArgsGateUpBuf: MTLBuffer?
     private var coopIndirectArgsDownBuf: MTLBuffer?
 
+    /// F-85 tile-plan buffers for the `useTilePlan` gather GEMM (plain
+    /// bm16 tileplan default AND the coop BM=32 default that supersedes
+    /// it, see `useTilePlan`/`useCoopTilePlan` in `decodeMany`) - allocated
+    /// lazily, per instance, then reused/grown across calls, unlike
+    /// `pairedTileExpertABuf` above this was still a fresh
+    /// `device.makeBuffer` triple every layer, every forward call on the
+    /// DEFAULT path (tilePlanEnabled/coopEnabled both default ON) until
+    /// this cache was added - the paired lever's own buffers got the
+    /// reuse treatment in the same round that shipped this gate, but the
+    /// plain/coop tile-plan buffers this gate always uses first were
+    /// missed.
+    ///
+    /// Unlike `pairedTileBufCapacity` (constant per instance - depends
+    /// only on `nExperts`), this capacity depends on `mTotal`, which
+    /// varies per prefill chunk (every chunk but the last is the same
+    /// configured step size, so in practice this grows once then holds
+    /// steady). Grow-only, matching `Ops.identityRowsBuffer`'s pattern:
+    /// a call needing less than the cached capacity just uses a
+    /// `[requestedCapacity]`-shaped view into the larger buffer (the
+    /// dispatch grid and the zero-fill below both use the PER-CALL
+    /// capacity, never the buffer's full backing length), so holding
+    /// onto the largest capacity seen so far is always safe and never
+    /// wastes a downstream dispatch on stale tail data.
+    ///
+    /// Same cross-call GPU-ordering safety argument as
+    /// `pairedTileExpertABuf` above (this file's whole per-layer
+    /// command-buffer chaining already depends on committed-order
+    /// execution with no inter-buffer fence), and the zero-fill every
+    /// call is still required for the same reason: a previous call's
+    /// tail past THIS call's real tile count would otherwise leak stale
+    /// `tile_row_count` values the GEMM kernel needs to read as zero to
+    /// treat that tile as inert padding.
+    private var tilePlanTileExpertBuf: MTLBuffer?
+    private var tilePlanTileRowStartBuf: MTLBuffer?
+    private var tilePlanTileRowCountBuf: MTLBuffer?
+    private var tilePlanBufCapacity = 0
+
     /// - gate: hidden → nExperts router projection.
     /// - gateProj/upProj/downProj: `nExperts`-long arrays of per-expert
     ///   SwiGLU projections, index-aligned with the expert id.
@@ -759,8 +796,24 @@ public final class MoELayer: Module, DecoderLayer {
     /// applies where `useTilePlan` already holds (DEVPLAN2 path) and the
     /// coop core's own shape gate passes (`nOut % 64 == 0` on both legs,
     /// `groupSize == 64`) - see `useCoopTilePlan` in `decodeMany`.
+    ///
+    /// Auto-default gates on `Ops.mppAutoCapable` (Apple GPU Family 9+ /
+    /// macOS 26+) - the same hardware requirement `dispatchQmmMma`'s coop
+    /// tier checks for the dense GEMM, since `ffai_moe_gather_qmm_coop`
+    /// wraps the identical `matmul2d` cooperative-tensor core. Unlike the
+    /// dense path (which falls back to a cheaper simdgroup tier when
+    /// incapable), this kernel has no such fallback once dispatched, so
+    /// the check has to live here rather than inside the Ops wrapper.
+    /// `FFAI_MOE_COOP=1` force-enables past this check (A/B only, same
+    /// "does not bypass the hardware requirement" caveat as
+    /// `FFAI_QMM_COOP=1` - forcing this on incapable hardware is
+    /// untested).
     public var coopEnabled: Bool {
-        coopEnvRaw != "0"
+        switch coopEnvRaw {
+        case "0": return false
+        case "1": return true
+        default: return Ops.mppAutoCapable
+        }
     }
 
     /// F-85 two-expert tile-pairing lever gate (`ffai_moe_gather_qmm_coop_paired`,
@@ -910,6 +963,34 @@ public final class MoELayer: Module, DecoderLayer {
             for (k, v) in sd.parameters() { out.append(("shared_expert.down_proj.\(k)", v)) }
         }
         return out
+    }
+
+    /// Lazily allocates (grow-only, once-or-on-growth per instance) and
+    /// returns the three F-85 tile-plan buffers backing `useTilePlan` /
+    /// `useCoopTilePlan`, then zero-fills the requested `capacity` prefix
+    /// of each before handing them back. See the property doc above
+    /// `tilePlanTileExpertBuf` for the grow-only reuse design and why
+    /// re-zeroing the requested prefix every call is still required for
+    /// correctness (a previous, possibly larger, call's tail past THIS
+    /// call's real tile count would otherwise leak stale
+    /// expert/row_start/row_count into what the GEMM kernel expects to
+    /// be an inert dead tile).
+    private func tilePlanBuffers(
+        capacity: Int, device: Device
+    ) -> (tileExpert: MTLBuffer, tileRowStart: MTLBuffer, tileRowCount: MTLBuffer) {
+        if tilePlanTileExpertBuf == nil || tilePlanBufCapacity < capacity {
+            tilePlanTileExpertBuf = device.makeBuffer(length: capacity * 4)
+            tilePlanTileRowStartBuf = device.makeBuffer(length: capacity * 4)
+            tilePlanTileRowCountBuf = device.makeBuffer(length: capacity * 4)
+            tilePlanBufCapacity = capacity
+        }
+        let teBuf = tilePlanTileExpertBuf!
+        let trsBuf = tilePlanTileRowStartBuf!
+        let trcBuf = tilePlanTileRowCountBuf!
+        memset(teBuf.contents(), 0, capacity * 4)
+        memset(trsBuf.contents(), 0, capacity * 4)
+        memset(trcBuf.contents(), 0, capacity * 4)
+        return (teBuf, trsBuf, trcBuf)
     }
 
     /// Lazily allocates (once per instance) and returns the six F-85
@@ -1463,12 +1544,13 @@ public final class MoELayer: Module, DecoderLayer {
                 useCoopTilePlan
                 ? Ops.moeTilePlanCapacityBm32(mTotal: mTotal, nExperts: nExperts)
                 : Ops.moeTilePlanCapacity(mTotal: mTotal, nExperts: nExperts)
-            let teBuf = device.makeBuffer(length: capacity * 4)
-            memset(teBuf.contents(), 0, capacity * 4)
-            let trsBuf = device.makeBuffer(length: capacity * 4)
-            memset(trsBuf.contents(), 0, capacity * 4)
-            let trcBuf = device.makeBuffer(length: capacity * 4)
-            memset(trcBuf.contents(), 0, capacity * 4)
+            // Preallocated, per-instance, grow-only reuse (see
+            // `tilePlanBuffers` / the property doc above
+            // `tilePlanTileExpertBuf`) - was three fresh `device.makeBuffer`
+            // calls every layer, every forward call on this gate's default
+            // (bm16-tileplan-or-coop) path, same allocation-churn class the
+            // paired lever's buffers were already fixed for.
+            let (teBuf, trsBuf, trcBuf) = tilePlanBuffers(capacity: capacity, device: device)
             let tileExpert = Tensor(buffer: teBuf, offset: 0, shape: [capacity], dtype: .u32)
             let tileRowStart = Tensor(buffer: trsBuf, offset: 0, shape: [capacity], dtype: .u32)
             let tileRowCount = Tensor(buffer: trcBuf, offset: 0, shape: [capacity], dtype: .u32)
