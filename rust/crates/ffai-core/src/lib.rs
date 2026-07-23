@@ -269,6 +269,34 @@ pub trait Device: Send + Sync {
     ) -> Result<()> {
         Err(Error::Msg("moe_grouped_cutlass unsupported on this backend".into()))
     }
+    /// Validated NVFP4 grouped-MoE GEMM (marlin). Device buffers; routing arrays
+    /// (`sorted_token_ids`/`expert_ids`/`num_tokens_past_padded`) are DEVICE i32.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_marlin_gemm(
+        &self,
+        _a: &dyn DeviceBuffer, _b: &dyn DeviceBuffer, _c: &dyn DeviceBuffer, _c_tmp: &dyn DeviceBuffer,
+        _b_scales: &dyn DeviceBuffer, _global_scale: &dyn DeviceBuffer, _topk_weights: &dyn DeviceBuffer,
+        _sorted_token_ids: &dyn DeviceBuffer, _expert_ids: &dyn DeviceBuffer, _num_tokens_past_padded: &dyn DeviceBuffer,
+        _workspace: &dyn DeviceBuffer,
+        _moe_block: usize, _num_experts: usize, _top_k: usize, _mul_topk_weights: bool,
+        _prob_m: usize, _prob_n: usize, _prob_k: usize, _num_groups: usize, _group_size: usize,
+        _sms: i32, _use_fp32_reduce: bool,
+    ) -> Result<()> {
+        Err(Error::Msg("moe_marlin_gemm unsupported on this backend".into()))
+    }
+
+    /// Repack one expert's GPTQ-packed `[K/8,N]` u32 weights into marlin tile layout.
+    #[allow(clippy::too_many_arguments)]
+    fn marlin_repack(
+        &self, _b_q: &dyn DeviceBuffer, _out: &dyn DeviceBuffer,
+        _size_k: usize, _size_n: usize, _sms: i32, _max_shared_mem: i32,
+    ) -> Result<()> {
+        Err(Error::Msg("marlin_repack unsupported on this backend".into()))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn marlin_build_routing(&self, _off:&dyn DeviceBuffer,_n_exp:usize,_blk:usize,_mt:usize,_stid:&dyn DeviceBuffer,_eid:&dyn DeviceBuffer,_ntpp:&dyn DeviceBuffer)->Result<()>{
+        Err(Error::Msg("marlin_build_routing unsupported on this backend".into()))
+    }
 
     /// CUTLASS grouped block-scaled NVFP4 MoE GEMM: `out[t,n] = Σ_k a[t,k]·
     /// w[eid(t)][n,k]` over sorted-token groups, both operands packed e2m1 +

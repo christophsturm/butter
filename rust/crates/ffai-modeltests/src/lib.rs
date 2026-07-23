@@ -31,7 +31,14 @@ pub fn verify_gpt2(d: &dyn Device, plat: &str) {
 
     let (hid, nh, hd, n_layers, vocab, eps) = (768usize, 12usize, 64usize, 12usize, 50257usize, 1e-5f32);
     let scale = 1.0 / (hd as f32).sqrt();
-    let g = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0 };
+    let g = |name: &str| -> Vec<f32> {
+        if std::env::var("NEMOTRON_MARLIN_CKPT").is_ok() {
+            if let Ok(b) = std::fs::read(format!("/home/pidtom/ckpt-f32/{name}.bin")) {
+                return b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            }
+        }
+        st.tensor_f32(name).unwrap().0
+    };
     let up = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
     let dl = |t: &Tensor, n: usize| -> Vec<f32> { let mut b = vec![0u8; n * 4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
     let conv_t = |w: &[f32], nin: usize, nout: usize| -> Vec<f32> { let mut o = vec![0.0f32; nin * nout]; for i in 0..nin { for j in 0..nout { o[j * nin + i] = w[i * nout + j]; } } o };
@@ -94,7 +101,14 @@ pub fn verify_mamba2(d: &dyn Device, plat: &str) {
     let (hid, di, nh, dh, ds, ng, kc, vocab, eps) = (768usize, 1536usize, 24usize, 64usize, 128usize, 1usize, 4usize, 50288usize, 1e-5f32);
     let conv_dim = di + 2 * ng * ds;
     let n_layers = 24usize;
-    let g = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0 };
+    let g = |name: &str| -> Vec<f32> {
+        if std::env::var("NEMOTRON_MARLIN_CKPT").is_ok() {
+            if let Ok(b) = std::fs::read(format!("/home/pidtom/ckpt-f32/{name}.bin")) {
+                return b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            }
+        }
+        st.tensor_f32(name).unwrap().0
+    };
     let up = |v: &[f32]| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), vec![v.len()], DType::F32) };
     let upm = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
     let dl = |t: &Tensor, n: usize| -> Vec<f32> { let mut b = vec![0u8; n * 4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
@@ -160,6 +174,628 @@ pub fn run_all(d: &dyn Device, plat: &str) {
     verify_olmoe(d, plat);
     verify_mamba2(d, plat);
     verify_falcon_h1(d, plat);
+    verify_laguna(d, plat);
+}
+
+/// Laguna-S-2.1 decode smoke test: env-gated on `FFAI_LAGUNA_GGUF` (path to
+/// the model's GGUF file). Loads straight from GGUF (no HF safetensors dir —
+/// this model doesn't have a small reference checkpoint to compare against),
+/// runs a handful of decode steps from BOS + a short token sequence with a
+/// persistent KV cache, and prints the logits argmax per step. No HF oracle
+/// assertion (unlike the other `verify_*` — there's no cheap reference to
+/// compare against for a 117B model), just a load-bearing "it runs and
+/// produces finite, plausible-looking output" smoke check.
+/// Host-only Laguna GGUF dequant sanity: dump amax/rms per tensor for a few
+/// layer-0 weights. A healthy checkpoint has projection weights of O(0.01..1);
+/// amax in the hundreds+ means the k-quant dequant path is mis-unpacking
+/// (scale/min layout). Env-gated on FFAI_LAGUNA_GGUF, no device needed.
+pub fn verify_laguna_host_dequant() {
+    let Ok(path) = std::env::var("FFAI_LAGUNA_GGUF") else {
+        eprintln!("FFAI_LAGUNA_GGUF not set, skipping host dequant check");
+        return;
+    };
+    let g = match ffai_loader::gguf::Gguf::open(&path) {
+        Ok(g) => g,
+        Err(e) => { eprintln!("gguf open failed: {e:?}"); return; }
+    };
+    // FFAI_LAGUNA_DECODE_IDS="69377,13829": detokenize ids without a model
+    // load (fast oracle-comparison helper).
+    if let Ok(ids_s) = std::env::var("FFAI_LAGUNA_DECODE_IDS") {
+        if let Ok(tok) = ffai_models::gguf_tokenizer::GgufTokenizer::from_gguf(&g) {
+            let ids: Vec<u32> = ids_s.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            for &id in &ids {
+                eprintln!("token {id} -> {:?}", tok.decode(&[id]));
+            }
+            eprintln!("joined: {:?}", tok.decode(&ids));
+        }
+        return;
+    }
+    for name in [
+        "token_embd.weight",
+        "blk.0.attn_norm.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_gate.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.attn_q_norm.weight",
+    ] {
+        let Some(t) = g.tensor(name) else { eprintln!("{name}: MISSING"); continue; };
+        let ty = t.ggml_type;
+        match g.dequant_f32(name) {
+            Ok(f) => {
+                let n = f.len();
+                let amax = f.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                let rms = (f.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / n as f64).sqrt();
+                let n_nan = f.iter().filter(|v| !v.is_finite()).count();
+                eprintln!("{name}: dtype={ty:?} n={n} amax={amax:.4e} rms={rms:.4e} nonfinite={n_nan} head={:?}", &f[..4.min(n)]);
+            }
+            Err(e) => eprintln!("{name}: dequant failed: {e:?}"),
+        }
+    }
+}
+
+/// Laguna-S-2.1 EXACT host f32 reference for layer 0, single decode step,
+/// token id 2 (BOS) at position 0. Companion to the device instrumented run
+/// (`FFAI_LAGUNA_DEBUG=2` in `ffai_models::laguna::decode_layer`): every
+/// sub-step below prints the same head/|x|2/amax stats so the two logs can be
+/// diffed by eye to find the first place the device path goes wrong.
+///
+/// Every projection is computed TWO ways: `exact` (plain f32 matvec on the
+/// GGUF-dequantized weight) and `roundtrip` (that same weight pushed through
+/// [`ffai_ops::quantize_q4`] and dequantized back on host, with the block
+/// scale pushed through an f32->f16->f32 roundtrip first, matching how the
+/// device stores Q4 scales). The device output should be compared against
+/// `roundtrip`, not `exact` — decode always runs on Q4 weights regardless of
+/// the GGUF's original per-tensor dtype (see `ffai_models::laguna::load_dense`).
+///
+/// Env-gated on FFAI_LAGUNA_GGUF, no device/CUDA needed.
+pub fn verify_laguna_host_layer0() {
+    let Ok(path) = std::env::var("FFAI_LAGUNA_GGUF") else {
+        eprintln!("FFAI_LAGUNA_GGUF not set, skipping host layer-0 reference");
+        return;
+    };
+    let g = match ffai_loader::gguf::Gguf::open(&path) {
+        Ok(g) => g,
+        Err(e) => { eprintln!("gguf open failed: {e:?}"); return; }
+    };
+
+    // Laguna-S-2.1 layer-0 spec constants (dense SwiGLU MLP, full-attention
+    // layer — see ffai_models::laguna::LagunaConfig::defaults).
+    let hidden = 3072usize;
+    let head_dim = 128usize;
+    let n_head = 48usize;
+    let n_kv = 8usize;
+    let heads_per_group = n_head / n_kv; // 6
+    let n_ff = 12288usize;
+    let eps = 1e-6f32;
+    let token = 2usize;
+
+    // Position-0 YaRN detail: the full-attention layer's rope has ext_factor
+    // != 0, so the kernel re-multiplies attn_factor by (1 + 0.1*ln(1/freq_scale))
+    // (freq_scale = 1/128, so 1/freq_scale = 128). At position 0 every
+    // rotation angle is zero (theta_extrap = position * ... = 0), so this
+    // collapses to a scalar multiply by mscale over the first n_rot dims of
+    // every head; dims [n_rot, head_dim) pass through untouched.
+    let attn_factor = 1.4852030263919618f32;
+    // mscale = attn_factor exactly: the reference stack pre-divides on the
+    // host to cancel its kernel's internal re-multiply, so the net magnitude
+    // scale equals the stored attention_factor. Our kernel applies it directly.
+    let mscale = attn_factor;
+    let n_rot = 64usize; // full-layer rope.dimension_count
+
+    let dq = |name: &str| -> Vec<f32> {
+        g.dequant_f32(name).unwrap_or_else(|e| panic!("dequant {name} failed: {e:?}"))
+    };
+
+    // f32 <-> f16 (round-to-nearest), matching the device's scale-upload path
+    // (`ffai_models::laguna::f32s_to_f16_bytes`) — the gemv_q4 kernels read
+    // per-block Q4 scales as f16.
+    fn f32_to_f16(f: f32) -> u16 {
+        let x = f.to_bits();
+        let sign = ((x >> 16) & 0x8000) as u16;
+        let e = ((x >> 23) & 0xff) as i32 - 112;
+        if e <= 0 { return sign; }
+        if e >= 0x1f { return sign | 0x7c00; }
+        let m = (x >> 13) & 0x3ff;
+        let round = (x >> 12) & 1;
+        let v = ((e as u32) << 10) | m;
+        sign | ((v + round) as u16)
+    }
+    fn f16_to_f32(bits: u16) -> f32 {
+        let sign = ((bits >> 15) & 1) as u32;
+        let exp = ((bits >> 10) & 0x1f) as u32;
+        let mant = (bits & 0x3ff) as u32;
+        let out = if exp == 0 {
+            if mant == 0 { sign << 31 } else {
+                let mut e = -1i32;
+                let mut m = mant;
+                while m & 0x400 == 0 { m <<= 1; e -= 1; }
+                (sign << 31) | (((e + 127 - 15) as u32) << 23) | ((m & 0x3ff) << 13)
+            }
+        } else if exp == 0x1f {
+            (sign << 31) | (0xff << 23) | (mant << 13)
+        } else {
+            (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
+        };
+        f32::from_bits(out)
+    }
+
+    // Q4 round-trip: quantize_q4 (block 32, symmetric int4 in [-7,7], scale =
+    // amax/7), then push the scale through f16 before dequantizing back —
+    // mirrors exactly what the CUDA gemv_q4 kernel reads for its scales.
+    let q4_roundtrip = |w: &[f32], m: usize, k: usize| -> Vec<f32> {
+        let (qs, scales) = ffai_ops::quantize_q4(w, m, k);
+        let bpr = k / 32;
+        let mut out = vec![0f32; m * k];
+        for r in 0..m {
+            for b in 0..bpr {
+                let d = f16_to_f32(f32_to_f16(scales[r * bpr + b]));
+                for word in 0..4 {
+                    let packed = qs[r * bpr * 4 + b * 4 + word];
+                    for i in 0..8 {
+                        let nib = ((packed >> (i * 4)) & 0xf) as i32;
+                        let q = if nib >= 8 { nib - 16 } else { nib };
+                        out[r * k + b * 32 + word * 8 + i] = q as f32 * d;
+                    }
+                }
+            }
+        }
+        out
+    };
+
+    // Row-major [m,k] @ [k] matvec, f64 accumulation (reference precision).
+    let matvec = |w: &[f32], m: usize, k: usize, x: &[f32]| -> Vec<f32> {
+        let mut out = vec![0f32; m];
+        for r in 0..m {
+            let row = &w[r * k..(r + 1) * k];
+            let mut acc = 0f64;
+            for i in 0..k { acc += row[i] as f64 * x[i] as f64; }
+            out[r] = acc as f32;
+        }
+        out
+    };
+
+    let rms_norm = |x: &[f32], w: &[f32], eps: f32| -> Vec<f32> {
+        let n = x.len();
+        let ms = x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / n as f64;
+        let inv = 1.0 / (ms + eps as f64).sqrt();
+        (0..n).map(|i| (x[i] as f64 * inv) as f32 * w[i]).collect()
+    };
+
+    // Per-head RMSNorm: same formula, applied independently over each
+    // head_dim-length row (q_norm/k_norm weight is shared across heads).
+    let rms_norm_perhead = |x: &[f32], w: &[f32], n_heads: usize, hd: usize, eps: f32| -> Vec<f32> {
+        let mut out = vec![0f32; n_heads * hd];
+        for hh in 0..n_heads {
+            let row = rms_norm(&x[hh * hd..(hh + 1) * hd], w, eps);
+            out[hh * hd..(hh + 1) * hd].copy_from_slice(&row);
+        }
+        out
+    };
+
+    let softplus = |x: f32| -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } };
+    let silu = |x: f32| -> f32 { x / (1.0 + (-x).exp()) };
+
+    let stats = |label: &str, v: &[f32]| {
+        let l2 = v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+        let amax = v.iter().fold(0f32, |a, &x| a.max(x.abs()));
+        eprintln!("    {label}: head={:?} |x|2={l2:.3e} amax={amax:.3e}", &v[..4.min(v.len())]);
+    };
+
+    // Flags a sub-step whose first 4 values differ from the device dbg line
+    // (pasted from the instrumented CUDA run) by more than 5% relative.
+    let check = |label: &str, v: &[f32], device_head: &[f32]| {
+        let mut worst = 0f32;
+        for i in 0..device_head.len().min(v.len()) {
+            let dv = device_head[i];
+            let rel = if dv.abs() > 1e-12 { (v[i] - dv).abs() / dv.abs() } else { (v[i] - dv).abs() };
+            worst = worst.max(rel);
+        }
+        if worst > 0.05 {
+            eprintln!("    {label}: MISMATCH? max rel diff over head vs device = {worst:.3}");
+        }
+    };
+
+    eprintln!("── Laguna-S-2.1 host f32 reference, layer 0, token {token}, pos 0 ──");
+
+    // (a) embed: dequant_f32 gives row-major [vocab, hidden] (GGUF fastest-
+    // dim-first == hidden fastest, matching load_gguf's load_embed_like).
+    let embd = dq("token_embd.weight");
+    let x: Vec<f32> = embd[token * hidden..(token + 1) * hidden].to_vec();
+    stats("x_in", &x);
+    check("x_in", &x, &[0.28873444, -0.12119293, 0.08377075, -0.12119293]);
+
+    // (b) attn_norm
+    let attn_norm_w = dq("blk.0.attn_norm.weight");
+    let h = rms_norm(&x, &attn_norm_w, eps);
+    stats("attn_norm", &h);
+
+    // weights
+    let wq = dq("blk.0.attn_q.weight");
+    let wk = dq("blk.0.attn_k.weight");
+    let wv = dq("blk.0.attn_v.weight");
+    let wo = dq("blk.0.attn_output.weight");
+    let wg = dq("blk.0.attn_gate.weight");
+    let q_norm_w = dq("blk.0.attn_q_norm.weight");
+    let k_norm_w = dq("blk.0.attn_k_norm.weight");
+    let ffn_norm_w = dq("blk.0.ffn_norm.weight");
+    let w_gate_ffn = dq("blk.0.ffn_gate.weight");
+    let w_up_ffn = dq("blk.0.ffn_up.weight");
+    let w_down_ffn = dq("blk.0.ffn_down.weight");
+
+    let qdim = n_head * head_dim; // 6144
+    let kvdim = n_kv * head_dim; // 1024
+
+    let wq_rt = q4_roundtrip(&wq, qdim, hidden);
+    let wk_rt = q4_roundtrip(&wk, kvdim, hidden);
+    let wv_rt = q4_roundtrip(&wv, kvdim, hidden);
+    let wg_rt = q4_roundtrip(&wg, n_head, hidden);
+
+    // (d) q/k/v/g projections
+    let q_exact = matvec(&wq, qdim, hidden, &h);
+    let q_rt = matvec(&wq_rt, qdim, hidden, &h);
+    stats("q_proj exact", &q_exact);
+    stats("q_proj roundtrip", &q_rt);
+    check("q_proj", &q_rt, &[-0.0017298572, 0.041349545, -0.016936049, -0.0050829584]);
+
+    let k_exact = matvec(&wk, kvdim, hidden, &h);
+    let k_rt = matvec(&wk_rt, kvdim, hidden, &h);
+    stats("k_proj exact", &k_exact);
+    stats("k_proj roundtrip", &k_rt);
+
+    let v_exact = matvec(&wv, kvdim, hidden, &h);
+    let v_rt = matvec(&wv_rt, kvdim, hidden, &h);
+    stats("v_proj exact", &v_exact);
+    stats("v_proj roundtrip", &v_rt);
+
+    let g_exact = matvec(&wg, n_head, hidden, &h);
+    let g_rt = matvec(&wg_rt, n_head, hidden, &h);
+    stats("g_proj exact", &g_exact);
+    stats("g_proj roundtrip", &g_rt);
+
+    // (e) per-head QK RMSNorm
+    let q_norm_exact = rms_norm_perhead(&q_exact, &q_norm_w, n_head, head_dim, eps);
+    let q_norm_rt = rms_norm_perhead(&q_rt, &q_norm_w, n_head, head_dim, eps);
+    let k_norm_exact = rms_norm_perhead(&k_exact, &k_norm_w, n_kv, head_dim, eps);
+    let k_norm_rt = rms_norm_perhead(&k_rt, &k_norm_w, n_kv, head_dim, eps);
+    stats("q_norm exact", &q_norm_exact);
+    stats("q_norm roundtrip", &q_norm_rt);
+    check("q_norm", &q_norm_rt, &[-0.04173411, 1.265691, -0.5209586, -0.06744661]);
+    stats("k_norm exact", &k_norm_exact);
+    stats("k_norm roundtrip", &k_norm_rt);
+
+    // (f) RoPE at position 0 (see mscale comment above).
+    let apply_rope0 = |v: &[f32], n_heads: usize| -> Vec<f32> {
+        let mut out = v.to_vec();
+        for hh in 0..n_heads {
+            for i in 0..n_rot { out[hh * head_dim + i] *= mscale; }
+        }
+        out
+    };
+    let q_rope_exact = apply_rope0(&q_norm_exact, n_head);
+    let q_rope_rt = apply_rope0(&q_norm_rt, n_head);
+    let k_rope_exact = apply_rope0(&k_norm_exact, n_kv);
+    let k_rope_rt = apply_rope0(&k_norm_rt, n_kv);
+    stats("q_rope exact", &q_rope_exact);
+    stats("q_rope roundtrip", &q_rope_rt);
+    stats("k_rope exact", &k_rope_exact);
+    stats("k_rope roundtrip", &k_rope_rt);
+
+    // (g) attention, n_kv_used = 1: softmax over a single cached position is
+    // always 1, so every q-head's output is just its group's cached v.
+    let sdpa = |v_h: &[f32]| -> Vec<f32> {
+        let mut out = vec![0f32; n_head * head_dim];
+        for qh in 0..n_head {
+            let kvh = qh / heads_per_group;
+            out[qh * head_dim..(qh + 1) * head_dim]
+                .copy_from_slice(&v_h[kvh * head_dim..(kvh + 1) * head_dim]);
+        }
+        out
+    };
+    let sdpa_exact = sdpa(&v_exact);
+    let sdpa_rt = sdpa(&v_rt);
+    stats("sdpa exact", &sdpa_exact);
+    stats("sdpa roundtrip", &sdpa_rt);
+    check("sdpa", &sdpa_rt, &[-0.0042726835, -0.119657904, 0.03584555, -0.02707379]);
+
+    // (h) per-head softplus gate, applied before o_proj.
+    let gate_mul = |attn: &[f32], gate: &[f32]| -> Vec<f32> {
+        let mut out = vec![0f32; attn.len()];
+        for hh in 0..n_head {
+            let sp = softplus(gate[hh]);
+            for i in 0..head_dim { out[hh * head_dim + i] = attn[hh * head_dim + i] * sp; }
+        }
+        out
+    };
+    let gated_exact = gate_mul(&sdpa_exact, &g_exact);
+    let gated_rt = gate_mul(&sdpa_rt, &g_rt);
+    stats("gated exact", &gated_exact);
+    stats("gated roundtrip", &gated_rt);
+    check("gated", &gated_rt, &[-0.0016357758, -0.04581044, 0.013723293, -0.010365067]);
+
+    // (i) o_proj
+    let wo_rt = q4_roundtrip(&wo, hidden, qdim);
+    let o_exact = matvec(&wo, hidden, qdim, &gated_exact);
+    let o_rt = matvec(&wo_rt, hidden, qdim, &gated_rt);
+    stats("o_proj exact", &o_exact);
+    stats("o_proj roundtrip", &o_rt);
+    check("o_proj", &o_rt, &[-0.037135, 0.013525429, -0.012531518, -0.044919115]);
+
+    // (j) residual
+    let x1_exact: Vec<f32> = (0..hidden).map(|i| x[i] + o_exact[i]).collect();
+    let x1_rt: Vec<f32> = (0..hidden).map(|i| x[i] + o_rt[i]).collect();
+    stats("x_attn_res exact", &x1_exact);
+    stats("x_attn_res roundtrip", &x1_rt);
+    check("x_attn_res", &x1_rt, &[0.25159943, -0.107667506, 0.07123923, -0.16611205]);
+
+    // (k) dense SwiGLU FFN
+    let h2_exact = rms_norm(&x1_exact, &ffn_norm_w, eps);
+    let h2_rt = rms_norm(&x1_rt, &ffn_norm_w, eps);
+    stats("ffn_norm exact", &h2_exact);
+    stats("ffn_norm roundtrip", &h2_rt);
+    check("ffn_norm", &h2_rt, &[0.0009642678, 0.00045515582, 0.00072807475, 0.0006906503]);
+
+    let w_gate_rt = q4_roundtrip(&w_gate_ffn, n_ff, hidden);
+    let w_up_rt = q4_roundtrip(&w_up_ffn, n_ff, hidden);
+    let w_down_rt = q4_roundtrip(&w_down_ffn, hidden, n_ff);
+
+    let gate_exact = matvec(&w_gate_ffn, n_ff, hidden, &h2_exact);
+    let gate_rt = matvec(&w_gate_rt, n_ff, hidden, &h2_rt);
+    let up_exact = matvec(&w_up_ffn, n_ff, hidden, &h2_exact);
+    let up_rt = matvec(&w_up_rt, n_ff, hidden, &h2_rt);
+
+    let act_exact: Vec<f32> = (0..n_ff).map(|i| silu(gate_exact[i]) * up_exact[i]).collect();
+    let act_rt: Vec<f32> = (0..n_ff).map(|i| silu(gate_rt[i]) * up_rt[i]).collect();
+    stats("ffn_act exact", &act_exact);
+    stats("ffn_act roundtrip", &act_rt);
+    check("ffn_act", &act_rt, &[5.9853085e-7, -0.00017139639, 5.882993e-9, -4.645081e-5]);
+
+    let down_exact = matvec(&w_down_ffn, hidden, n_ff, &act_exact);
+    let down_rt = matvec(&w_down_rt, hidden, n_ff, &act_rt);
+    stats("ffn_down exact", &down_exact);
+    stats("ffn_down roundtrip", &down_rt);
+    check("ffn_down", &down_rt, &[-0.0008143601, 0.00016136278, -0.00094114855, -0.00012908175]);
+
+    let x2_exact: Vec<f32> = (0..hidden).map(|i| x1_exact[i] + down_exact[i]).collect();
+    let x2_rt: Vec<f32> = (0..hidden).map(|i| x1_rt[i] + down_rt[i]).collect();
+    stats("x2 (layer0 out) exact", &x2_exact);
+    stats("x2 (layer0 out) roundtrip", &x2_rt);
+
+    eprintln!("── Laguna-S-2.1 host layer-0 reference complete ──");
+}
+
+pub fn verify_laguna(d: &dyn Device, plat: &str) {
+    use ffai_models::gguf_tokenizer::GgufTokenizer;
+    use ffai_models::laguna;
+
+    let Ok(path) = std::env::var("FFAI_LAGUNA_GGUF") else {
+        eprintln!("FFAI_LAGUNA_GGUF not set — skipping Laguna-S-2.1 decode smoke test");
+        return;
+    };
+    let Ok(g) = ffai_loader::gguf::Gguf::open(&path) else {
+        eprintln!("Laguna: failed to open GGUF at {path} — skipping");
+        return;
+    };
+
+    let model = match laguna::load_gguf(d, &g) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Laguna: load_gguf failed: {e:?} — skipping");
+            return;
+        }
+    };
+
+    let bos = g.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(0);
+    // A short prompt: BOS + whatever the tokenizer produces for a trivial
+    // string, falling back to a couple of low-valued ids if the tokenizer
+    // metadata is unavailable (this is a decode-plumbing smoke test, not a
+    // semantic eval — any valid token ids exercise the same code path).
+    let mut tokens = vec![bos];
+    if let Ok(tok) = GgufTokenizer::from_gguf(&g) {
+        tokens.extend(tok.encode("Hello"));
+    } else {
+        tokens.extend_from_slice(&[1, 2]);
+    }
+
+    let max_seq = tokens.len()
+        + std::env::var("FFAI_LAGUNA_GEN").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16)
+        + 1;
+    let Ok(kv) = laguna::LagunaKvCache::new(d, &model.cfg, max_seq) else {
+        eprintln!("Laguna: KV cache alloc failed — skipping");
+        return;
+    };
+
+    // FFAI_LAGUNA_SWEEP="moe_rpt,gemv_rpt;moe_rpt,gemv_rpt;...": bench each
+    // warp-count combo in ONE process (the 71G load dominates a bench cycle,
+    // so re-capturing a fresh graph per combo amortizes it). Each combo gets
+    // a fresh KV cache + decode ctx; graph capture bakes the env values read
+    // at capture time, so set_var before ctx creation takes effect per combo.
+    if let Ok(sweep) = std::env::var("FFAI_LAGUNA_SWEEP") {
+        let n_gen: usize = std::env::var("FFAI_LAGUNA_GEN").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        for combo in sweep.split(';').filter(|s| !s.is_empty()) {
+            let parts: Vec<&str> = combo.split(',').collect();
+            if parts.len() != 2 { eprintln!("sweep: bad combo {combo:?}"); continue; }
+            // set_var is unsafe in this edition; single-threaded bench context.
+            unsafe {
+                std::env::set_var("MT_MOE_RPT", parts[0].trim());
+                std::env::set_var("MT_GEMV_RPT", parts[1].trim());
+            }
+            let Ok(kv2) = laguna::LagunaKvCache::new(d, &model.cfg, tokens.len() + n_gen + 1) else {
+                eprintln!("sweep: kv alloc failed"); return;
+            };
+            let Ok(mut ctx2) = laguna::LagunaDecodeCtx::new(d, &model, &kv2, tokens.len() + n_gen + 1) else {
+                eprintln!("sweep: ctx failed"); return;
+            };
+            let mut cur2: Option<u32> = None;
+            let mut t0 = std::time::Instant::now();
+            let total2 = tokens.len() + n_gen;
+            let mut first_gen: Vec<u32> = Vec::new();
+            let mut died = false;
+            for pos in 0..total2 {
+                let tok = if pos < tokens.len() { tokens[pos] } else { cur2.unwrap() };
+                match ctx2.step(d, &model, &kv2, tok, pos as u32) {
+                    Ok(logits) => {
+                        let am = match ffai_ops::argmax_f32_device(d, &logits) {
+                            Ok(a) => a,
+                            Err(e) => { eprintln!("sweep argmax failed: {e:?}"); died = true; break; }
+                        };
+                        let mut ib = [0u8; 4];
+                        let _ = d.synchronize();
+                        if d.download(am.buffer.as_ref(), &mut ib).is_err() { died = true; break; }
+                        let a = u32::from_le_bytes(ib);
+                        if pos >= tokens.len() && first_gen.len() < 6 { first_gen.push(a); }
+                        cur2 = Some(a);
+                        if pos + 1 == tokens.len() { t0 = std::time::Instant::now(); }
+                    }
+                    Err(e) => { eprintln!("sweep combo {combo}: step failed: {e:?}"); died = true; break; }
+                }
+            }
+            if !died {
+                let tps = n_gen as f64 / t0.elapsed().as_secs_f64();
+                eprintln!("SWEEP moe_rpt={} gemv_rpt={}: {tps:.2} tok/s first_gen={first_gen:?}", parts[0].trim(), parts[1].trim());
+            }
+        }
+        eprintln!("✅ Laguna sweep complete ({plat}).");
+        return;
+    }
+
+    // FFAI_LAGUNA_GRAPH=1: capture one full decode step as a CUDA graph and
+    // replay it per token instead of relaunching ~1000+ kernels every step
+    // (see `ffai_models::laguna::LagunaDecodeCtx`). Default (unset): plain
+    // eager `decode_step`, now reading a persistent per-step workspace
+    // instead of uploading fresh token-id/position buffers every call —
+    // same kernels, same scalars, byte-identical output to before.
+    let graph_mode = std::env::var("FFAI_LAGUNA_GRAPH").is_ok();
+    let mode_label = if graph_mode { "graph" } else { "eager" };
+    let ws = if graph_mode {
+        None
+    } else {
+        match laguna::DecodeWorkspace::new(d) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                eprintln!("Laguna: decode workspace alloc failed: {e:?} — skipping");
+                return;
+            }
+        }
+    };
+    let mut ctx = if graph_mode {
+        match laguna::LagunaDecodeCtx::new(d, &model, &kv, max_seq) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("Laguna: LagunaDecodeCtx::new failed: {e:?} — skipping");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Greedy generation: feed the prompt, then feed each argmax back in.
+    // FFAI_LAGUNA_GEN overrides the generated-token count (default 16).
+    // Prints the detokenized continuation for direct comparison against the
+    // reference engine's temp-0 output on the same prompt, plus decode t/s
+    // over the generation phase (each step is one full 48-layer forward).
+    let n_gen: usize = std::env::var("FFAI_LAGUNA_GEN").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let tok_dec = GgufTokenizer::from_gguf(&g).ok();
+    let mut generated: Vec<u32> = Vec::new();
+    let mut cur: Option<u32> = None;
+    let mut gen_t0 = std::time::Instant::now();
+    let total = tokens.len() + n_gen;
+    // FFAI_LAGUNA_FAST=1: device-side argmax, download 4 bytes/step instead
+    // of the full 400KB logit row (the bench-honest greedy path). Default
+    // keeps the full download for logit stats/top-5 debugging.
+    let fast = std::env::var("FFAI_LAGUNA_FAST").map(|v| v == "1").unwrap_or(false);
+    for pos in 0..total {
+        let tok = if pos < tokens.len() { tokens[pos] } else { cur.unwrap() };
+        // Graph mode: LagunaDecodeCtx internally warms up (eager), captures
+        // once, then replays the captured graph. Eager mode: refresh the
+        // persistent workspace by hand, then call decode_step directly —
+        // the argmax/download below still happen outside either path,
+        // exactly as before.
+        let step_result = if let Some(ctx) = ctx.as_mut() {
+            ctx.step(d, &model, &kv, tok, pos as u32)
+        } else {
+            let w = ws.as_ref().expect("eager path always has a workspace");
+            if let Err(e) = w.update(d, &model.cfg, tok, pos as u32) {
+                eprintln!("Laguna step {pos}: workspace update failed: {e:?}");
+                return;
+            }
+            laguna::decode_step(d, &model, &kv, w, pos as u32)
+        };
+        match step_result {
+            Ok(logits) => {
+                if fast {
+                    let Ok(am) = ffai_ops::argmax_f32_device(d, &logits) else {
+                        eprintln!("Laguna step {pos}: device argmax failed");
+                        return;
+                    };
+                    let mut ib = [0u8; 4];
+                    let _ = d.synchronize();
+                    if d.download(am.buffer.as_ref(), &mut ib).is_err() {
+                        eprintln!("Laguna step {pos}: argmax download failed");
+                        return;
+                    }
+                    let argmax = u32::from_le_bytes(ib);
+                    if pos >= tokens.len() {
+                        generated.push(argmax);
+                    }
+                    cur = Some(argmax);
+                    if pos + 1 == tokens.len() {
+                        gen_t0 = std::time::Instant::now();
+                    }
+                    if pos + 1 == total {
+                        let dt = gen_t0.elapsed().as_secs_f64();
+                        let tps = n_gen as f64 / dt;
+                        let text = tok_dec.as_ref().map(|t| t.decode(&generated)).unwrap_or_default();
+                        eprintln!("Laguna greedy continuation ({n_gen} tokens, {tps:.2} tok/s device-argmax, {mode_label}): {text:?}");
+                    }
+                    continue;
+                }
+                let mut lb = vec![0u8; model.cfg.vocab * 4];
+                let _ = d.synchronize();
+                if d.download(logits.buffer.as_ref(), &mut lb).is_err() {
+                    eprintln!("Laguna step {pos} (token {tok}): logits download failed");
+                    return;
+                }
+                let lf: Vec<f32> = lb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                let argmax = ffai_runtime::argmax(&lf);
+                // Logit sanity: NaN/inf counts, range, and top-5 ids. An argmax
+                // parked at the last vocab id is the classic all-NaN signature.
+                let n_nan = lf.iter().filter(|v| v.is_nan()).count();
+                let n_inf = lf.iter().filter(|v| v.is_infinite()).count();
+                let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+                for &v in &lf {
+                    if v.is_finite() {
+                        if v < mn { mn = v; }
+                        if v > mx { mx = v; }
+                    }
+                }
+                let mut order: Vec<usize> = (0..lf.len()).collect();
+                order.sort_by(|&a, &b| lf[b].total_cmp(&lf[a]));
+                let top5: Vec<(usize, f32)> = order.iter().take(5).map(|&i| (i, lf[i])).collect();
+                eprintln!("Laguna-S-2.1 decode step {pos} (token {tok}) on {plat}: argmax = {argmax}");
+                eprintln!("  logits: nan={n_nan} inf={n_inf} finite range [{mn:.4}, {mx:.4}] top5={top5:?}");
+                if pos >= tokens.len() {
+                    generated.push(argmax as u32);
+                }
+                cur = Some(argmax as u32);
+                if pos + 1 == tokens.len() {
+                    gen_t0 = std::time::Instant::now(); // time the pure-generation phase
+                }
+                if pos + 1 == total {
+                    let dt = gen_t0.elapsed().as_secs_f64();
+                    let tps = n_gen as f64 / dt;
+                    let text = tok_dec.as_ref().map(|t| t.decode(&generated)).unwrap_or_default();
+                    eprintln!("Laguna greedy continuation ({n_gen} tokens, {tps:.2} tok/s incl logit download, {mode_label}): {text:?}");
+                }
+            }
+            Err(e) => {
+                eprintln!("Laguna step {pos} (token {tok}) failed: {e:?}");
+                return;
+            }
+        }
+    }
+    eprintln!("✅ Laguna-S-2.1 decode smoke test completed ({plat}).");
 }
 
 // exact-erf GELU (Abramowitz-Stegun) — shared by GPT-NeoX / Whisper-style nets
@@ -179,7 +815,14 @@ pub fn verify_pythia(d: &dyn Device, plat: &str) {
     let Ok(st) = SafeTensors::open(&path) else { eprintln!("no model at {path} — skipping"); return; };
     let (hid, nh, hd, inter, n_layers, vocab, eps) = (768usize, 12usize, 64usize, 3072usize, 12usize, 50304usize, 1e-5f32);
     let scale = 1.0 / (hd as f32).sqrt();
-    let g = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0 };
+    let g = |name: &str| -> Vec<f32> {
+        if std::env::var("NEMOTRON_MARLIN_CKPT").is_ok() {
+            if let Ok(b) = std::fs::read(format!("/home/pidtom/ckpt-f32/{name}.bin")) {
+                return b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            }
+        }
+        st.tensor_f32(name).unwrap().0
+    };
     let up = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
     let dl = |t: &Tensor, n: usize| -> Vec<f32> { let mut b = vec![0u8; n * 4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
     let token = 5usize;
@@ -214,7 +857,14 @@ pub fn verify_olmo2(d: &dyn Device, plat: &str) {
     let Ok(st) = SafeTensors::open_dir(&dir) else { eprintln!("no model at {dir} — skipping"); return; };
     let (hid, nq, nkv, hd, inter, n_layers, vocab, eps) = (2048usize, 16usize, 16usize, 128usize, 8192usize, 16usize, 100352usize, 1e-6f32);
     let (qdim, kvdim) = (nq*hd, nkv*hd); let scale = 1.0/(hd as f32).sqrt();
-    let g = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0 };
+    let g = |name: &str| -> Vec<f32> {
+        if std::env::var("NEMOTRON_MARLIN_CKPT").is_ok() {
+            if let Ok(b) = std::fs::read(format!("/home/pidtom/ckpt-f32/{name}.bin")) {
+                return b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            }
+        }
+        st.tensor_f32(name).unwrap().0
+    };
     let up = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
     let dl = |t: &Tensor, n: usize| -> Vec<f32> { let mut b = vec![0u8; n*4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
     let token = 9707usize;
@@ -256,7 +906,14 @@ pub fn verify_gptneo(d: &dyn Device, plat: &str) {
     let Ok(st) = SafeTensors::open(&path) else { eprintln!("no model at {path} — skipping"); return; };
     let (hid, nh, hd, inter, n_layers, vocab, eps) = (768usize, 12usize, 64usize, 3072usize, 12usize, 50257usize, 1e-5f32);
     let scale = 1.0f32;
-    let g = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0 };
+    let g = |name: &str| -> Vec<f32> {
+        if std::env::var("NEMOTRON_MARLIN_CKPT").is_ok() {
+            if let Ok(b) = std::fs::read(format!("/home/pidtom/ckpt-f32/{name}.bin")) {
+                return b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            }
+        }
+        st.tensor_f32(name).unwrap().0
+    };
     let up = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
     let dl = |t: &Tensor, n: usize| -> Vec<f32> { let mut b = vec![0u8; n*4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
     let token = 5usize;
@@ -293,7 +950,14 @@ pub fn verify_gemma2(d: &dyn Device, plat: &str) {
     let Ok(st) = SafeTensors::open_dir(&dir) else { eprintln!("no model at {dir} — skipping"); return; };
     let (hid, nq, nkv, hd, inter, n_layers, vocab, eps) = (2304usize, 8usize, 4usize, 256usize, 9216usize, 26usize, 256000usize, 1e-6f32);
     let (qdim, kvdim) = (nq*hd, nkv*hd); let scale = 1.0/(256.0f32).sqrt(); let embed_scale = (hid as f32).sqrt();
-    let g = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0 };
+    let g = |name: &str| -> Vec<f32> {
+        if std::env::var("NEMOTRON_MARLIN_CKPT").is_ok() {
+            if let Ok(b) = std::fs::read(format!("/home/pidtom/ckpt-f32/{name}.bin")) {
+                return b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            }
+        }
+        st.tensor_f32(name).unwrap().0
+    };
     let g1 = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0.iter().map(|w| w+1.0).collect() };
     let up = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
     let dl = |t: &Tensor, n: usize| -> Vec<f32> { let mut b = vec![0u8; n*4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
@@ -333,7 +997,14 @@ pub fn verify_phi(d: &dyn Device, plat: &str) {
     let Ok(st) = SafeTensors::open_dir(&dir) else { eprintln!("no model at {dir} — skipping"); return; };
     let (hid, nh, hd, inter, n_layers, vocab, eps) = (2048usize, 32usize, 64usize, 8192usize, 24usize, 51200usize, 1e-5f32);
     let scale = 1.0/(hd as f32).sqrt();
-    let g = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0 };
+    let g = |name: &str| -> Vec<f32> {
+        if std::env::var("NEMOTRON_MARLIN_CKPT").is_ok() {
+            if let Ok(b) = std::fs::read(format!("/home/pidtom/ckpt-f32/{name}.bin")) {
+                return b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            }
+        }
+        st.tensor_f32(name).unwrap().0
+    };
     let up = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
     let dl = |t: &Tensor, n: usize| -> Vec<f32> { let mut b = vec![0u8; n*4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
     let proj = |w: &str, b: &str, x: &Tensor, m: usize, inn: usize| -> Tensor {
@@ -370,7 +1041,14 @@ pub fn verify_stablelm2(d: &dyn Device, plat: &str) {
     let Ok(st) = SafeTensors::open_dir(&dir) else { eprintln!("no model at {dir} — skipping"); return; };
     let (hid, nh, hd, inter, n_layers, vocab, eps) = (2048usize, 32usize, 64usize, 5632usize, 24usize, 100352usize, 1e-5f32);
     let scale = 1.0/(hd as f32).sqrt();
-    let g = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0 };
+    let g = |name: &str| -> Vec<f32> {
+        if std::env::var("NEMOTRON_MARLIN_CKPT").is_ok() {
+            if let Ok(b) = std::fs::read(format!("/home/pidtom/ckpt-f32/{name}.bin")) {
+                return b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            }
+        }
+        st.tensor_f32(name).unwrap().0
+    };
     let up = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
     let dl = |t: &Tensor, n: usize| -> Vec<f32> { let mut b = vec![0u8; n*4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
     let bproj = |w: &str, b: &str, x: &Tensor, m: usize| -> Tensor { add(d, &gemv(d, &up(&g(w), vec![m, hid]), x).unwrap(), &up(&g(b), vec![m])).unwrap() };
@@ -409,7 +1087,14 @@ pub fn verify_olmoe(d: &dyn Device, plat: &str) {
     let Ok(st) = SafeTensors::open_dir(&dir) else { eprintln!("no model at {dir} — skipping"); return; };
     let (hid, nh, hd, inter, n_exp, top_k, n_layers, vocab, eps) = (2048usize, 16usize, 128usize, 1024usize, 64usize, 8usize, 16usize, 50304usize, 1e-5f32);
     let scale = 1.0/(hd as f32).sqrt();
-    let g = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0 };
+    let g = |name: &str| -> Vec<f32> {
+        if std::env::var("NEMOTRON_MARLIN_CKPT").is_ok() {
+            if let Ok(b) = std::fs::read(format!("/home/pidtom/ckpt-f32/{name}.bin")) {
+                return b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            }
+        }
+        st.tensor_f32(name).unwrap().0
+    };
     let up = |v: &[f32]| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), vec![v.len()], DType::F32) };
     let upm = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
     let dl = |t: &Tensor, n: usize| -> Vec<f32> { let mut b = vec![0u8; n*4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
@@ -466,7 +1151,14 @@ pub fn verify_falcon_h1(d: &dyn Device, plat: &str) {
     let (ssm_in, ssm_out, attn_out) = (1.25f32, 0.23570226039551587f32, 0.9375f32);
     let (gate_mult, down_mult, embed_mult) = (0.8838834764831844f32, 0.5859375f32, 5.656854249492381f32);
     let ssm_m = [0.3535533905932738f32, 0.25, 0.3535533905932738, 0.5, 0.3535533905932738];
-    let g = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0 };
+    let g = |name: &str| -> Vec<f32> {
+        if std::env::var("NEMOTRON_MARLIN_CKPT").is_ok() {
+            if let Ok(b) = std::fs::read(format!("/home/pidtom/ckpt-f32/{name}.bin")) {
+                return b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            }
+        }
+        st.tensor_f32(name).unwrap().0
+    };
     let up = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
     let dl = |t: &Tensor, n: usize| -> Vec<f32> { let mut b = vec![0u8; n*4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
     let softplus = |x: f32| if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
@@ -685,7 +1377,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_expert_ids_from_offsets, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_grouped_gemm_cutlass, moe_q4_grouped_mma, moe_q4_grouped_mma_dev, moe_router_device, moe_scatter_add_det_dev, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, nvfp4_roundtrip, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_prefill_split, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gated_group_rmsnorm_batched_f16out, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_expert_ids_from_offsets, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_grouped_gemm_cutlass, moe_q4_grouped_mma, moe_q4_grouped_mma_dev, moe_router_device, moe_scatter_add_det_dev, moe_scatter_add_topk_det_f16, moe_scatter_add_topk_det_f16_x2, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, nvfp4_roundtrip, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -716,7 +1408,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         sign | ((v + round) as u16)
     }
     let tb_f16 = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|&f| f32_to_f16(f).to_le_bytes()).collect() };
-    let g = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0 };
+    let g = |name: &str| -> Vec<f32> {
+        if std::env::var("NEMOTRON_MARLIN_CKPT").is_ok() {
+            if let Ok(b) = std::fs::read(format!("/home/pidtom/ckpt-f32/{name}.bin")) {
+                return b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            }
+        }
+        st.tensor_f32(name).unwrap().0
+    };
     let up = |v: &[f32]| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), vec![v.len()], DType::F32) };
     let upm = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
     let dl = |t: &Tensor, n: usize| -> Vec<f32> { let owned; let src = if t.dtype == DType::F16 { owned = cast_f16_f32(d, t).unwrap(); &owned } else { t }; let mut b = vec![0u8; n * 4]; d.download(src.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
@@ -804,6 +1503,8 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     let use_w4a8_env = std::env::var("NEMOTRON_W4A8_MOE").is_ok();
     let mut w8a8w: HashMap<String, (Tensor, Tensor, i64)> = HashMap::new();
     let use_w8a8_env = std::env::var("NEMOTRON_W8A8_MOE").is_ok();
+    let use_marlin_moe = std::env::var("NEMOTRON_MARLIN_MOE").is_ok();
+    let mut marlinw: std::collections::HashMap<String,(Tensor,Tensor,Tensor)> = std::collections::HashMap::new();
     // Persistent CUTLASS grouped-FP4 handles per layer: (up_handle, dn_handle,
     // alpha_up, alpha_dn). Prepared lazily on first use; alpha buffers are
     // fixed addresses the prepared blob points at (values rewritten per call).
@@ -1119,6 +1820,80 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         };
                         buildw8("up_proj", inter, hid);
                         buildw8("down_proj", hid, inter);
+                    }
+                    // NVFP4 marlin MoE weights (NEMOTRON_MARLIN_MOE). RTN via
+                    // quantize_nvfp4, OR (NEMOTRON_MARLIN_CKPT) calibrated codes
+                    // from NVIDIA's NVFP4 checkpoint blobs. repack + S0E5M3 + global.
+                    if use_marlin_moe {
+                        let sms_i = 48i32; let max_sh = 232448i32; // GB10 sm_121a
+                        let ckpt = std::env::var("NEMOTRON_MARLIN_CKPT").is_ok();
+                        let mut buildm = |which: &str, n: usize, k: usize| {
+                            let ng = k / 16; let kp = k / 8;
+                            let key = format!("{p}.moe_{which}_marlin.{}", if ckpt { "ckpt" } else { "v1" });
+                            let bm_bytes = n_exp * (k / 16) * (n * 2) * 4;
+                            let bs_bytes = n_exp * ng * n;
+                            let gl_bytes = n_exp * 4;
+                            let cpath = cache_path(&key);
+                            if let Ok(b) = std::fs::read(&cpath) {
+                                if b.len() == bm_bytes + bs_bytes + gl_bytes {
+                                    let bt = Tensor::new(d.upload(&b[..bm_bytes]).unwrap(), vec![bm_bytes / 4], DType::U32);
+                                    let bst = Tensor::new(d.upload(&b[bm_bytes..bm_bytes + bs_bytes]).unwrap(), vec![bs_bytes / 4], DType::U32);
+                                    let glt = Tensor::new(d.upload(&b[bm_bytes + bs_bytes..]).unwrap(), vec![n_exp], DType::F32);
+                                    marlinw.insert(key, (bt, bst, glt));
+                                    return;
+                                }
+                            }
+                            // source calibrated codes/scales from the checkpoint blob, if enabled
+                            let (ck_codes, ck_sv, ck_gl): (Vec<u32>, Vec<f32>, Vec<f32>) = if ckpt {
+                                let lnum: usize = p.rsplit('.').next().unwrap().parse().unwrap();
+                                let blob = std::fs::read(format!("/home/pidtom/marlin-ckpt-blobs/L{lnum}_{which}.bin"))
+                                    .unwrap_or_else(|_| panic!("missing ckpt blob L{lnum}_{which}"));
+                                let nc = n_exp * n * kp; let nsv = n_exp * n * ng;
+                                let codes: Vec<u32> = blob[..nc * 4].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                let sv: Vec<f32> = blob[nc * 4..(nc + nsv) * 4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                let gl: Vec<f32> = blob[(nc + nsv) * 4..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                (codes, sv, gl)
+                            } else { (Vec::new(), Vec::new(), Vec::new()) };
+                            let mut bm_host: Vec<u32> = Vec::with_capacity(n_exp * (k / 16) * (n * 2));
+                            let mut bs_host: Vec<u8> = vec![0u8; n_exp * ng * n];
+                            let mut gl: Vec<f32> = vec![0f32; n_exp];
+                            for e in 0..n_exp {
+                                let (codes_e, sv_e, global_e): (Vec<u32>, Vec<f32>, f32) = if ckpt {
+                                    (ck_codes[e * n * kp..(e + 1) * n * kp].to_vec(),
+                                     ck_sv[e * n * ng..(e + 1) * n * ng].to_vec(),
+                                     ck_gl[e])
+                                } else {
+                                    let w = g(&format!("{p}.mixer.experts.{e}.{which}.weight"));
+                                    let (codes, uesc, global) = ffai_ops::quantize_nvfp4(&w, n, k);
+                                    let sv: Vec<f32> = (0..n * ng).map(|i| ffai_ops::dec_ue4m3(uesc[i])).collect();
+                                    (codes, sv, global)
+                                };
+                                let mut qt = vec![0u32; kp * n];
+                                for r in 0..n { for c in 0..kp { qt[c * n + r] = codes_e[r * kp + c]; } }
+                                let qtt = Tensor::new(d.upload(&tbu(&qt)).unwrap(), vec![kp * n], DType::U32);
+                                let bm = ffai_ops::marlin_repack(d, &qtt, k, n, sms_i, max_sh).unwrap();
+                                let mut bmh = vec![0u8; (k / 16) * (n * 2) * 4];
+                                d.download(bm.buffer.as_ref(), &mut bmh).unwrap();
+                                bm_host.extend(bmh.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+                                let mut svm = vec![0f32; ng * n];
+                                for r in 0..n { for gi in 0..ng { svm[gi * n + r] = sv_e[r * ng + gi]; } }
+                                let s0 = ffai_ops::marlin_s0e5m3_scales(&svm, ng, n);
+                                bs_host[e * ng * n..(e + 1) * ng * n].copy_from_slice(&s0);
+                                gl[e] = global_e * 128.0;
+                            }
+                            let mut blob2: Vec<u8> = Vec::with_capacity(bm_bytes + bs_bytes + gl_bytes);
+                            blob2.extend(tbu(&bm_host));
+                            blob2.extend(&bs_host);
+                            blob2.extend(gl.iter().flat_map(|x| x.to_le_bytes()));
+                            let _ = std::fs::write(&cpath, &blob2);
+                            let bt = Tensor::new(d.upload(&tbu(&bm_host)).unwrap(), vec![bm_host.len()], DType::U32);
+                            let bst = Tensor::new(d.upload(&bs_host).unwrap(), vec![bs_host.len() / 4], DType::U32);
+                            let glb: Vec<u8> = gl.iter().flat_map(|x| x.to_le_bytes()).collect();
+                            let glt = Tensor::new(d.upload(&glb).unwrap(), vec![n_exp], DType::F32);
+                            marlinw.insert(key, (bt, bst, glt));
+                        };
+                        buildm("up_proj", inter, hid);
+                        buildm("down_proj", hid, inter);
                     }
                     // NEMOTRON_FP4_SHARED_FOLD=1: shared expert folded into the routed
                     // grouped GEMM as 2 extra always-selected groups. Up: shared up
@@ -1799,6 +2574,23 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             // stack-local host Vec, so a CUDA-graph capture recorded a memcpy node
             // from a pointer that's dangling by replay time. Cached, the pre-warm
             // forwards fill it and the captured forward does NO embed H2D at all.
+            let bf16_stream = is_cuda && std::env::var("NEMOTRON_BF16_STREAM").is_ok();
+            let f16_stream = is_cuda && std::env::var("NEMOTRON_F16_STREAM").is_ok();
+            let stream16 = bf16_stream || f16_stream;
+            // NEMOTRON_TOPK_SCATTER=1: fixed-top_k deterministic scatter reuses
+            // router rowpos/weights and skips the per-token CSR rebuild.
+            let topk_scatter = is_cuda && std::env::var("NEMOTRON_TOPK_SCATTER").is_ok();
+            let stream_dt = if bf16_stream { DType::BF16 } else if f16_stream { DType::F16 } else { DType::F32 };
+            let cast_stream = |d: &dyn Device, t: &ffai_core::Tensor| -> ffai_core::Tensor {
+                if bf16_stream { ffai_ops::cast_f32_bf16(d, t).unwrap() } else { ffai_ops::cast_f32_f16(d, t).unwrap() }
+            };
+            // 16-bit stream -> f32 (for ops without a 16-bit kernel: conv/SSD/gated-norm/attn).
+            let to_f32 = |d: &dyn Device, t: &ffai_core::Tensor| -> ffai_core::Tensor {
+                match t.dtype { DType::F16 => ffai_ops::cast_f16_f32(d, t).unwrap(),
+                                DType::BF16 => ffai_ops::cast_bf16_f32(d, t).unwrap(),
+                                _ => t.clone() }
+            };
+            let act_dt = stream_dt; let _ = (act_dt, stream16);
             let mut xt = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1810,6 +2602,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     upm(&xh, vec![s, hid])
                 })
             };
+            if stream16 { xt = cast_stream(d, &xt); }
             // Tensor-core projection GEMM (Path A): dequant Q4 weight → f16 once,
             // cast x → f16, cuBLAS GemmEx (real tensor cores, f32 accumulate),
             // cast result → f32. Replaces the software-emulated coop_tile MMA
@@ -1817,6 +2610,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             // NEMOTRON_PREFILL_F32GEMM=1 = f32 scalar matmul (A/B).
             let use_f32_gemm = std::env::var("NEMOTRON_PREFILL_F32GEMM").is_ok();
             let use_mpp_gemm = std::env::var("NEMOTRON_PREFILL_MPPGEMM").is_ok();
+            // NEMOTRON_BF16_STREAM: run residual/hidden stream in bf16 (vLLM-style)
+            // instead of f32 — halves elementwise/residual HBM traffic + native model
+            // precision. GEMMs/norms/adds bf16; conv/SSD/MoE-quant cast at f32 boundary.
             // ── Metal per-expert MoE GEMM compute dtype (Apple/Metal only) ──
             // The per-forward Q4→dtype dequant of the routed experts × 23 MoE layers is a
             // top prefill cost at small S. On Metal we dequant→f16 and run the per-expert
@@ -1849,6 +2645,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             };
             let deq16 = |key: &str, qs: &Tensor, sc: &Tensor, m: usize, k: usize, blk_off: usize| -> Tensor {
                 deq16c(key, qs, sc, m, k, blk_off, true)
+            };
+            // BF16 weight dequant (cached) for the BF16-coherent FFN under stream16.
+            let deq16bf = |key: &str, qs: &Tensor, sc: &Tensor, m: usize, k: usize| -> Tensor {
+                let ck = format!("{key}.bf16w");
+                if let Some(w) = w16.borrow().get(&ck) { return w.clone(); }
+                let w = pf!(3, (m * k) as f64, dequant_q4_off(d, qs, sc, m, k, DType::BF16, 0).unwrap());
+                w16.borrow_mut().insert(ck, w.clone());
+                w
             };
             // FP4 dense projections (NEMOTRON_FP4_DENSE=1): quantize the f16
             // activation per call, weight pack cached cross-forward; cublasLt
@@ -1928,6 +2732,36 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             };
             let qmm_fp8d = |xh: &Tensor, name: &str, rows: usize, m: usize, k: usize,
                             qs: &Tensor, sc: &Tensor| -> Tensor {
+                // NEMOTRON_FP8_PT: per-TENSOR fp8 (fast gemm_fp8, scales folded in alpha) —
+                // FFAI proved 1.81x @ argmax near-tie; A/B vs the per-channel default.
+                if std::env::var("NEMOTRON_FP8_PT").is_ok() {
+                    // NEMOTRON_FP8_HAD: block-Hadamard rotate (128) along K before the
+                    // per-tensor fp8 quant — spreads activation outliers so per-tensor
+                    // holds quality. Rotate weight offline (cached) + act at runtime;
+                    // orthonormal so the GEMM result is unchanged.
+                    let had = std::env::var("NEMOTRON_FP8_HAD").is_ok() && k % 128 == 0;
+                    let wkey = if had { format!("{name}.fp8pth") } else { format!("{name}.fp8pt") };
+                    let (wq, wsc) = {
+                        if let Some(t) = w4lt.borrow().get(&wkey) { t.clone() } else {
+                            let wf = dequant_q4_off(d, qs, sc, m, k, DType::F16, 0).unwrap();
+                            let wf = if had { ffai_ops::fwht128(d, &wf, m, k).unwrap() } else { wf };
+                            let t = ffai_ops::fp8_quant(d, &wf, m*k, 1.0).unwrap();
+                            w4lt.borrow_mut().insert(wkey.clone(), t.clone());
+                            t
+                        }
+                    };
+                    let clipv = std::env::var("NEMOTRON_FP8_CLIP").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0f32);
+                    let (xq, xsc) = if had {
+                        // Fused: amax-only rotate (no y write) + rotate-and-quant reading
+                        // xh directly. Kills the [rows,k] f16 rotated-tensor round-trip.
+                        let amx = pf!(15, 0.0, ffai_ops::fwht128_amaxonly(d, xh, rows, k).unwrap());
+                        pf!(15, 0.0, ffai_ops::fwht128_quant_pre(d, xh, rows, k, &amx, clipv).unwrap())
+                    } else {
+                        pf!(15, 0.0, ffai_ops::fp8_quant(d, xh, rows*k, clipv).unwrap())
+                    };
+                    return pf!(2, 2.0*rows as f64*m as f64*k as f64,
+                        ffai_ops::gemm_fp8(d, &xq, &xsc, &wq, &wsc, rows, m, k, true).unwrap());
+                }
                 // PER-CHANNEL weight (rows=m) + PER-TOKEN act (rows) FP8, scales
                 // folded post-GEMM (D[r,c]*=xsc[r]·wsc[c]) — the quality-
                 // preserving granularity (per-tensor was cosine ~0.94).
@@ -1947,6 +2781,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 let (qs, sc, m, k) = &qw[name];
                 let rows = x.elem_count() / *k;
                 let flops = 2.0 * rows as f64 * *m as f64 * *k as f64;
+                // BF16-STREAM: dequant Q4->bf16 (cached) + native bf16 GEMM, no f16 cast.
+                if stream16 && rows > 1 {
+                    let wkey = format!("{name}.s16w");
+                    let wb = if let Some(w) = w16.borrow().get(&wkey) { w.clone() }
+                        else { let w = pf!(3, (*m * *k) as f64, dequant_q4_off(d, qs, sc, *m, *k, stream_dt, 0).unwrap()); w16.borrow_mut().insert(wkey.clone(), w.clone()); w };
+                    let xb = if x.dtype == stream_dt { x.clone() } else { pf!(15, 0.0, cast_stream(d, x)) };
+                    return pf!(2, flops, gemm_cublas(d, &xb, &wb, rows, *m, *k).unwrap());
+                }
                 if fp8_dense && rows > 1 && fp8_name_ok(name) {
                     let xh = pf!(15, 0.0, cast_f32_f16(d, x).unwrap());
                     return qmm_fp8d(&xh, name, rows, *m, *k, qs, sc);
@@ -2019,11 +2861,21 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             // xn carried from the previous layer's fused add+rms_norm (None on layer 0
             // or after a non-fusable tail).
             let mut xn_carry: Option<Tensor> = None;
+            let stream_dbg = std::env::var("NEMOTRON_STREAM_DBG").is_ok();
             for (l, mix) in PATTERN.chars().enumerate() {
                 let p = format!("language_model.backbone.layers.{l}");
+                if stream_dbg {
+                    let xf32 = if xt.dtype == DType::F32 { xt.clone() } else { to_f32(d, &xt) };
+                    let mut hb = vec![0u8; xf32.elem_count()*4]; d.download(xf32.buffer.as_ref(), &mut hb).unwrap();
+                    let vals: Vec<f32> = hb.chunks(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+                    let nnan = vals.iter().filter(|x| x.is_nan()).count();
+                    let amax = vals.iter().filter(|x| x.is_finite()).fold(0f32, |a,&b| a.max(b.abs()));
+                    eprintln!("DBG layer {l} ({mix}) xt.dtype={:?} nan={nnan} amax={amax:.3}", xt.dtype);
+                }
                 let xn = match xn_carry.take() {
                     Some(t) => t,
-                    None => pf!(1, 0.0, rms_norm(d, &xt, &fwd[&format!("{p}.norm.weight")], eps).unwrap()), // [s, hid]
+                    None => { if stream16 { let xtf = to_f32(d, &xt); pf!(1, 0.0, rms_norm(d, &xtf, &fwd[&format!("{p}.norm.weight")], eps).unwrap()) }
+                        else { pf!(1, 0.0, rms_norm(d, &xt, &fwd[&format!("{p}.norm.weight")], eps).unwrap()) } },
                 };
                 match mix {
                     'M' => {
@@ -2043,14 +2895,12 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 qmm(&xn, &format!("{p}.mixer.in_proj.weight"))); // [s, in_proj_out] on device
                             // PART B: fused split — 1 dispatch replaces 3 strided_col_copy calls.
                             // proj layout: [z(di) | xbc(conv_dim) | dt_raw(m_nh)] per row.
+                            let proj_t = if stream16 { pf!(15, 0.0, to_f32(d, &proj_t)) } else { proj_t };
                             let (z_t, xbc_t, dt_raw_t) = pf!(15, 0.0,
                                 mamba_split_proj(d, &proj_t, s, in_proj_out, di, conv_dim, m_nh).unwrap());
-                            // On-device causal depthwise conv1d + silu over all S tokens.
-                            // Result: yc_silu [s * conv_dim] flat.
-                            let yc_silu = pf!(4, 0.0, conv1d_causal_prefill(d, &xbc_t,
-                                &fwd[&format!("{p}.mixer.conv1d.weight")],
-                                &fwd[&format!("{p}.mixer.conv1d.bias")],
-                                s, conv_dim, kc).unwrap());
+                            // conv1d+silu+x/B/C split FUSED into one raw-float4 kernel
+                            // (conv1d_causal_prefill_split) below — deletes the temp
+                            // [s,conv_dim] conv output + the separate split launch.
                             // Persist conv ring state for decode continuity: last (kc-1) rows of xbc.
                             let ring_len = (kc - 1) * conv_dim;
                             let ring_off = (s.saturating_sub(kc - 1)) * conv_dim;
@@ -2082,9 +2932,13 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // cost more than the split's streaming write+read. Machinery kept in
                             // ssm_prefill_scan_ssd_strided; compact split path stays.
                             {
-                                // PART B: fused split — 1 dispatch replaces 3 strided_col_copy calls.
-                                let (x_dev, b_dev, c_dev) = pf!(15, 0.0,
-                                    mamba_split_conv(d, &yc_silu, s, conv_dim, di, ng * ds).unwrap());
+                                // Fused conv1d+silu+split (raw float4): 1 launch, no temp conv buffer.
+                                // Escape NEMOTRON_CONV_PREFILL_SPLIT_OFF=1 -> conv+split fallback.
+                                let (x_dev, b_dev, c_dev) = pf!(4, 0.0,
+                                    conv1d_causal_prefill_split(d, &xbc_t,
+                                        &fwd[&format!("{p}.mixer.conv1d.weight")],
+                                        &fwd[&format!("{p}.mixer.conv1d.bias")],
+                                        s, conv_dim, di, ng * ds, kc).unwrap());
                                 if use_ssd {
                                     ssd_split_out = Some(pf!(5, ssm_flops, ssm_prefill_scan_ssd(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l, seg_reset_dev.as_ref()).unwrap()));
                                 } else if use_ssd_port {
@@ -2099,9 +2953,18 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             ssm_state[l] = Some(so);
                             // PART B: on-device batched gated group RMSNorm — eliminates the
                             // dl(y)+dl(z)+host loop+up(yn) round-trip (2 × s×di = ~42MB per layer).
-                            let ynt = pf!(6, 0.0, gated_group_rmsnorm_batched(d, &y_dev, &z_t,
-                                &up(&fw[&format!("{p}.mixer.norm.weight")]), eps, s, di, gs).unwrap());
-                            let out = qmm(&ynt.reshaped(vec![s, di]), &format!("{p}.mixer.out_proj.weight"));
+                            // cast-fusion: write gated-norm directly as f16 + consume via qmm_h
+                            // (skips a cast_f32_f16 per Mamba layer). Bit-identical f16. Escape:
+                            // NEMOTRON_GATED_NORM_F16OUT_OFF=1 → original f32 gated-norm + qmm.
+                            let out = if is_cuda && std::env::var("NEMOTRON_GATED_NORM_F16OUT_OFF").is_err() {
+                                let ynt = pf!(6, 0.0, gated_group_rmsnorm_batched_f16out(d, &y_dev, &z_t,
+                                    &up(&fw[&format!("{p}.mixer.norm.weight")]), eps, s, di, gs).unwrap());
+                                qmm_h(&ynt.reshaped(vec![s, di]), &format!("{p}.mixer.out_proj.weight"))
+                            } else {
+                                let ynt = pf!(6, 0.0, gated_group_rmsnorm_batched(d, &y_dev, &z_t,
+                                    &up(&fw[&format!("{p}.mixer.norm.weight")]), eps, s, di, gs).unwrap());
+                                qmm(&ynt.reshaped(vec![s, di]), &format!("{p}.mixer.out_proj.weight"))
+                            };
                             {
                                 // fused residual add + NEXT layer's rms_norm (one pass, llama.cpp-style)
                                 let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
@@ -2242,6 +3105,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // scatter) with NO host sync — the prerequisite for CUDA-graphing
                         // the forward (kill the host-launch GPU idle, the real 3-5× lever).
                         let mut moe_dev: Option<(Tensor, Tensor, Tensor)> = None; // (offsets, sorted_tok, sorted_wt)
+                        let mut moe_tok: Option<(Tensor, Tensor)> = None; // (rowpos, token-major router weights)
+                        // 16-bit stream: MoE router/gather/fp4-quant/shared-expert all assume
+                        // f32 xn; cast once at arm entry so the whole MoE path stays f32.
+                        let xn = if stream16 { to_f32(d, &xn) } else { xn };
                         let mut xn_f16_router: Option<Tensor> = None; // f16 xn from the router, reused by the gather
                         // Fully-on-device MoE (descriptors+gather+scatter all device) → SKIP
                         // the host triples reconstruction entirely. mt = s*top_k is
@@ -2264,7 +3131,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let rl_dev = pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64,
                                 gemm_cublas_f32out(d, &xn_f16_e, gate_w16, s, n_exp, hid).unwrap());
                             xn_f16_router = Some(xn_f16_e);
-                            let (st_dev, sw_dev, off_dev) = ffai_ops::moe_route_sort_device(d, &rl_dev, &bias_dev, n_exp, top_k, scale_f).unwrap();
+                            let (st_dev, sw_dev, off_dev) = if topk_scatter {
+                                let (st_dev, sw_dev, off_dev, rowpos_dev, wt_tok_dev) =
+                                    ffai_ops::moe_route_sort_device_rowpos(d, &rl_dev, &bias_dev, n_exp, top_k, scale_f).unwrap();
+                                moe_tok = Some((rowpos_dev, wt_tok_dev));
+                                (st_dev, sw_dev, off_dev)
+                            } else {
+                                ffai_ops::moe_route_sort_device(d, &rl_dev, &bias_dev, n_exp, top_k, scale_f).unwrap()
+                            };
                             let m = s * top_k;
                             let tr: Vec<(u32, usize, f32)> = if devdesc_skip {
                                 Vec::new() // host-free: descriptors/gather/scatter consume device tensors
@@ -2422,7 +3296,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let fp4_skip_gather = is_cuda && moe_dev.is_some() && xn_f16_router.is_some()
                             && std::env::var("NEMOTRON_FP4_DIRECT_OFF").is_err()
                             && std::env::var("NEMOTRON_FP4_SIM").is_err()
-                            && fp4w.contains_key(&format!("{p}.moe_up_proj_fp4")) && !use_w4a16;
+                            && fp4w.contains_key(&format!("{p}.moe_up_proj_fp4")) && !use_w4a16 && !use_fp4_cutlass_env;
                         let (xs, xs_dev_f16_opt) = if fp4_skip_gather {
                             (Vec::new(), None)
                         } else if use_w4a16_marlin && moe_dev.is_some() {
@@ -2707,7 +3581,25 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // same det-scatter. Quality-holding (256 act levels). ──
                             let w8a8_moe = use_w8a8_env && w8a8w.contains_key(&format!("{p}.moe_up_proj_w8a8"));
                             let w4a8_moe = use_w4a8_env && w4a8w.contains_key(&format!("{p}.moe_up_proj_w4a8"));
-                            if w8a8_moe {
+                            let marlin_moe = use_marlin_moe && marlinw.contains_key(&format!("{p}.moe_up_proj_marlin"));
+                            if marlin_moe {
+                                let (off_dev, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
+                                let xn2d = xn_f16_router.as_ref().unwrap().reshaped(vec![s, hid]);
+                                let xs_g = pf!(12, 0.0, gather(d, &xn2d, st_dev).unwrap());
+                                let blk = 16usize;
+                                let (stid_t, eids_t, ntpp_t) = ffai_ops::marlin_build_routing(d, off_dev, n_exp, blk, mt).unwrap();
+                                let topk1 = Tensor::new(d.upload(&vec![1.0f32; mt.max(1)].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap(), vec![mt.max(1)], DType::F32);
+                                let (bu, bsu, gu) = &marlinw[&format!("{p}.moe_up_proj_marlin")];
+                                let (bd, bsd, gd) = &marlinw[&format!("{p}.moe_down_proj_marlin")];
+                                let up_out = pf!(11, 2.0 * mt as f64 * inter as f64 * hid as f64,
+                                    ffai_ops::moe_marlin_gemm(d, &xs_g, bu, bsu, gu, &topk1, &stid_t, &eids_t, &ntpp_t, mt, inter, hid, n_exp, 1, 16, blk, 48).unwrap());
+                                let a2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                                let dn_out = pf!(11, 2.0 * mt as f64 * hid as f64 * inter as f64,
+                                    ffai_ops::moe_marlin_gemm(d, &a2, bd, bsd, gd, &topk1, &stid_t, &eids_t, &ntpp_t, mt, hid, inter, n_exp, 1, 16, blk, 48).unwrap());
+                                let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
+                                moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
+                            } else if w8a8_moe {
                                 let off_dev = off_dev_ref.unwrap();
                                 let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
                                 let xn2d = xn_f16_router.as_ref().unwrap().reshaped(vec![s, hid]);
@@ -2826,7 +3718,12 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 drop(hb);
                                 let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
                                 let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
-                                moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                if topk_scatter && moe_tok.is_some() {
+                                    let (rowpos_dev, wt_tok_dev) = moe_tok.as_ref().unwrap();
+                                    if std::env::var("NEMOTRON_TOPK_SCATTER_X2_OFF").is_err() { moe_scatter_add_topk_det_f16_x2(d, &dn_out, rowpos_dev, wt_tok_dev, &acc_dev, s, top_k, hid, 256.0f32).unwrap(); } else { moe_scatter_add_topk_det_f16(d, &dn_out, rowpos_dev, wt_tok_dev, &acc_dev, s, top_k, hid, 256.0f32).unwrap(); }
+                                } else {
+                                    moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                }
                                 if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
                             } else if fp4_cutlass {
                                 // ── CUTLASS grouped NVFP4 GEMM (NEMOTRON_CUTLASS_MOE=1
@@ -2860,7 +3757,12 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     ffai_ops::moe_grouped_gemm_cutlass_fp4(d, &bp, &bsf, &boff, &bgs, dwp, dwsf, dgw, &g_starts_c, &eids_c, hid, inter).unwrap());
                                 let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
                                 let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
-                                moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                if topk_scatter && moe_tok.is_some() {
+                                    let (rowpos_dev, wt_tok_dev) = moe_tok.as_ref().unwrap();
+                                    if std::env::var("NEMOTRON_TOPK_SCATTER_X2_OFF").is_err() { moe_scatter_add_topk_det_f16_x2(d, &dn_out, rowpos_dev, wt_tok_dev, &acc_dev, s, top_k, hid, 256.0f32).unwrap(); } else { moe_scatter_add_topk_det_f16(d, &dn_out, rowpos_dev, wt_tok_dev, &acc_dev, s, top_k, hid, 256.0f32).unwrap(); }
+                                } else {
+                                    moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                }
                                 if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
                             } else if fold_keys {
                                 let (uwp, uwsc, ugw) = &fp4w[&format!("{p}.moe_up_proj_fp4_fold")];
@@ -2894,7 +3796,12 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 // with a device-side memset instead of uploading 22MB of zeros.
                                 let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
                                 let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
-                                moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                if topk_scatter && moe_tok.is_some() {
+                                    let (rowpos_dev, wt_tok_dev) = moe_tok.as_ref().unwrap();
+                                    if std::env::var("NEMOTRON_TOPK_SCATTER_X2_OFF").is_err() { moe_scatter_add_topk_det_f16_x2(d, &dn_out, rowpos_dev, wt_tok_dev, &acc_dev, s, top_k, hid, 256.0f32).unwrap(); } else { moe_scatter_add_topk_det_f16(d, &dn_out, rowpos_dev, wt_tok_dev, &acc_dev, s, top_k, hid, 256.0f32).unwrap(); }
+                                } else {
+                                    moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                }
                                 if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
                             } else {
                             // UP: [mt,inter] = xs[mt,hid] · Wup_q4[eid; inter,hid]  (n=inter,k=hid)
@@ -2922,9 +3829,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 // device token-idx + weight tensors → atomic scatter, NO host
                                 // tidx_h/wts_h (host-sync-free, toward graph capture).
                                 let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
-                                // DETERMINISTIC device scatter (device CSR build) → host-sync-
-                                // free AND argmax-stable (the atomic scatter flipped 1104/1776).
-                                moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                // DETERMINISTIC scatter: top-k rowpos path skips the token CSR
+                                // rebuild; fallback preserves the existing device CSR path.
+                                if topk_scatter && moe_tok.is_some() {
+                                    let (rowpos_dev, wt_tok_dev) = moe_tok.as_ref().unwrap();
+                                    if std::env::var("NEMOTRON_TOPK_SCATTER_X2_OFF").is_err() { moe_scatter_add_topk_det_f16_x2(d, &dn_out, rowpos_dev, wt_tok_dev, &acc_dev, s, top_k, hid, 256.0f32).unwrap(); } else { moe_scatter_add_topk_det_f16(d, &dn_out, rowpos_dev, wt_tok_dev, &acc_dev, s, top_k, hid, 256.0f32).unwrap(); }
+                                } else {
+                                    moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
+                                }
                             } else {
                                 let wts_h: Vec<f32> = triples.iter().map(|(_,_,w)| *w).collect();
                                 let tidx_h: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
@@ -3324,6 +4236,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 Some(t) => t.clone(),
                                 None => pf!(15, 0.0, cast_f32_f16(d, &xn).unwrap()),
                             };
+                            if std::env::var("NEMOTRON_STREAM_DBG").is_ok() && l <= 2 {
+                                let amx = |t: &Tensor| { let tf = if t.dtype==DType::F32 { t.clone() } else { to_f32(d,t) }; let mut hb=vec![0u8;tf.elem_count()*4]; d.download(tf.buffer.as_ref(),&mut hb).unwrap(); hb.chunks(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]]).abs()).filter(|x| x.is_finite()).fold(0f32,f32::max) };
+                                eprintln!("  DBG-SHARED l={l} xn.dt={:?} amax={:.3}  xnh.dt={:?} amax={:.3} shared_inter={shared_inter}", xn.dtype, amx(&xn), xnh.dtype, amx(&xnh));
+                            }
                             let fp4_shared = fp4w.contains_key(&format!("{p}.sh_up_proj_fp4"));
                             let sd = if fp4_shared {
                                 // NVFP4 W4A4 shared expert: same grouped kernel, n_exp=1
@@ -3369,6 +4285,18 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let sd_lt = pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
                                     ffai_ops::gemm_fp4(d, &aq, &asf, &dwq, &dwsf, s, *sm_dn, *sk_dn, true, Some(&ds_d)).unwrap());
                                 cast_f32_f16(d, &sd_lt).unwrap()
+                            } else if stream16 {
+                            // BF16-coherent shared FFN: up bf16, relu2 FP32-compute/BF16-store
+                            // (no f16 clamp/saturation), down FP32-accum/BF16-out. Matches the
+                            // bf16 residual stream so ReLU2 amplification stays representable.
+                            let wsu = deq16bf(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up);
+                            let xnb = pf!(15, 0.0, ffai_ops::cast_f32_bf16(d, &xn).unwrap());
+                            let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
+                                gemm_cublas(d, &xnb, &wsu, s, *sm_up, *sk_up).unwrap()); // bf16
+                            let sa2 = pf!(3, 0.0, ffai_ops::relu2_scale_bf16(d, &sa, 1.0f32).unwrap()); // bf16
+                            let wsd = deq16bf(&format!("{p}.shdn"), sdqs, sdsc, *sm_dn, *sk_dn);
+                            pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
+                                gemm_cublas(d, &sa2, &wsd, s, *sm_dn, *sk_dn).unwrap()) // [s,hid] bf16
                             } else {
                             let wsu = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
                             let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
@@ -3378,7 +4306,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
                                 gemm_cublas(d, &sa2, &wsd, s, *sm_dn, *sk_dn).unwrap()) // [s,hid] f16
                             };
-                            sd_dev_opt = Some(pf!(15, 0.0, cast_f16_f32(d, &sd).unwrap())); // device f32, full scale
+                            sd_dev_opt = Some(if sd.dtype == DType::BF16 { pf!(15, 0.0, ffai_ops::cast_bf16_f32(d, &sd).unwrap()) } else { pf!(15, 0.0, cast_f16_f32(d, &sd).unwrap()) });
                             Vec::new()
                         } else if metal_mma_shared {
                             // ── Portable Metal shared-expert MMA: gemm_q4_mpp up/down, host relu2 ──
@@ -3454,9 +4382,15 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
                                 if shared_folded {
                                     // shared already accumulated into acc by the grouped scatter
+                                    let acc_dev = if stream16 { cast_stream(d, &acc_dev) } else { acc_dev };
                                     xt = add(d, &xt, &acc_dev).unwrap();
                                 } else {
                                     let sd_dev = sd_dev_opt.take().unwrap_or_else(|| upm(&sd_h, vec![s, hid]));
+                                    if stream_dbg {
+                                        let amx = |t: &Tensor| { let tf = if t.dtype==DType::F32 { t.clone() } else { to_f32(d,t) }; let mut hb=vec![0u8;tf.elem_count()*4]; d.download(tf.buffer.as_ref(),&mut hb).unwrap(); hb.chunks(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]]).abs()).filter(|x| x.is_finite()).fold(0f32,f32::max) };
+                                        eprintln!("  DBG-MERGE l={l} acc_dev.dt={:?} amax={:.3}  sd_dev.dt={:?} amax={:.3}", acc_dev.dtype, amx(&acc_dev), sd_dev.dtype, amx(&sd_dev));
+                                    }
+                                    let (acc_dev, sd_dev) = if stream16 { (cast_stream(d, &acc_dev), cast_stream(d, &sd_dev)) } else { (acc_dev, sd_dev) };
                                     match nw {
                                         Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let merged = add(d, &acc_dev, &sd_dev).unwrap(); let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &merged, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
                                         // one launch, no intermediate: residual + routed acc + shared out
@@ -3468,6 +4402,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         } else {
                             for i in 0..s*hid { acc_h[i] += sd_h[i]; }
                             let acc_up = upm(&acc_h, vec![s, hid]);
+                            let acc_up = if stream16 { cast_stream(d, &acc_up) } else { acc_up };
                             {
                                 // fused residual add + NEXT layer's rms_norm (one pass, llama.cpp-style)
                                 let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
@@ -3490,16 +4425,25 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                              qmm(&xn, &format!("{p}.mixer.k_proj.weight")),
                              qmm(&xn, &format!("{p}.mixer.v_proj.weight")))
                         };
+                        // 16-bit stream: attention runs f32 (kvcache + rope + sdpa f32).
+                        let (q_all, k_all, v_all) = if stream16 {
+                            (to_f32(d, &q_all), to_f32(d, &k_all), to_f32(d, &v_all))
+                        } else { (q_all, k_all, v_all) };
                         // [s, qdim]=[s,nq*hd]; k/v [s, kvdim]=[s,nkv*hd]
                         // PART C: eliminate dl(q)/dl(k)/dl(v) + per-token rope dispatches.
                         // Build positions [s] once, use batched rope_llama_many + kv_append_many.
                         if kvcache[l].is_none() {
                             kvcache[l] = Some((Tensor::new(d.alloc_zeroed(nkv*cap*hd*4).unwrap(), vec![nkv*cap*hd], DType::F32), Tensor::new(d.alloc_zeroed(nkv*cap*hd*4).unwrap(), vec![nkv*cap*hd], DType::F32)));
                         }
-                        let positions_h: Vec<u32> = (0..s).map(|ti| (base + ti) as u32).collect();
-                        let positions_dev = Tensor::new(
-                            d.upload(unsafe { std::slice::from_raw_parts(positions_h.as_ptr() as *const u8, positions_h.len() * 4) }).unwrap(),
-                            vec![s], DType::U32);
+                        // Cache the [s] position ids by (base,s): deterministic, so upload
+                        // ONCE and reuse across all attention layers + forwards (removes the
+                        // per-attention-layer H2D copy).
+                        let positions_dev = cdev(format!("__positions.{base}.{s}"), &|| {
+                            let positions_h: Vec<u32> = (0..s).map(|ti| (base + ti) as u32).collect();
+                            Tensor::new(
+                                d.upload(unsafe { std::slice::from_raw_parts(positions_h.as_ptr() as *const u8, positions_h.len() * 4) }).unwrap(),
+                                vec![s], DType::U32)
+                        });
                         // Batched rope: [s, n_heads, hd] each → rotated in one dispatch.
                         let qr = pf!(8, 0.0, rope_llama_many(d, &q_all.reshaped(vec![s, nq, hd]), &positions_dev, nq, hd, rope_theta, 1.0, 1.0, 1.0, 8192.0).unwrap());
                         let kr = pf!(8, 0.0, rope_llama_many(d, &k_all.reshaped(vec![s, nkv, hd]), &positions_dev, nkv, hd, rope_theta, 1.0, 1.0, 1.0, 8192.0).unwrap());
@@ -3591,8 +4535,11 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             // ONLY when not capturing (a dl aborts cuda-graph stream capture).
             let xf = match xn_carry.take() {
                 Some(t) => t,
-                None => rms_norm(d, &xt, &fwd["norm_f"], eps).unwrap(), // [s, hid]
+                None => { if stream16 { let xtf = to_f32(d, &xt); rms_norm(d, &xtf, &fwd["norm_f"], eps).unwrap() }
+                    else { rms_norm(d, &xt, &fwd["norm_f"], eps).unwrap() } }, // [s, hid]
             };
+            // tail (slice + logits) runs f32: cast the 16-bit stream back once.
+            let xf = if stream16 { to_f32(d, &xf) } else { xf };
             let last_dev = slice(d, &xf, (s-1)*hid, hid).unwrap();   // [hid] device
             let logits_dev = pf!(14, 2.0 * vocab as f64 * hid as f64, qmv(&last_dev, "language_model.lm_head.weight"));
             LAST_BATCHED_LOGITS_DEV.with(|c| *c.borrow_mut() = Some(logits_dev.clone()));

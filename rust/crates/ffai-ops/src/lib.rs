@@ -180,7 +180,51 @@ fn elementwise(
 }
 
 /// Elementwise sum `a + b` (e.g. residual connections).
+const ADD16_SRC: &str = r#"
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+extern "C" __global__ void ffai_add_f16(const __half* __restrict__ a, const __half* __restrict__ b, __half* __restrict__ out, long n){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; long stride=(long)gridDim.x*blockDim.x;
+    for(;i<n;i+=stride) out[i]=__hadd(a[i],b[i]);
+}
+extern "C" __global__ void ffai_add_bf16(const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, long n){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; long stride=(long)gridDim.x*blockDim.x;
+    for(;i<n;i+=stride) out[i]=__float2bfloat16(__bfloat162float(a[i])+__bfloat162float(b[i]));
+}
+"#;
+
+const MULSCALAR16_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void ffai_mul_scalar_f16(const __half* __restrict__ a, __half* __restrict__ out, float sc, long n){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; long stride=(long)gridDim.x*blockDim.x;
+    for(;i<n;i+=stride) out[i]=__float2half(__half2float(a[i])*sc);
+}
+"#;
+
+/// Elementwise `out = a * scale` for an f16 tensor (raw CUDA). Used to undo a
+/// /256 pre-scale that keeps an f16 intermediate inside the f16 range.
+pub fn mul_scalar_f16(dev: &dyn Device, a: &Tensor, scale: f32) -> Result<Tensor> {
+    let out = Tensor::empty(dev, a.shape.clone(), DType::F16)?;
+    let n = a.elem_count();
+    dev.dispatch_raw_cuda(MULSCALAR16_SRC, "mul_scalar_f16.cu", "ffai_mul_scalar_f16",
+        &[(a.buffer.as_ref(), a.offset), (out.buffer.as_ref(), 0)],
+        &[scale.to_le_bytes().to_vec(), (n as i64).to_le_bytes().to_vec()],
+        [(n as u32).div_ceil(256).max(1), 1, 1], [256, 1, 1], 0, false)?;
+    Ok(out)
+}
+
 pub fn add(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    // 16-bit DSL elementwise vec4 codegen IMAs; route f16/bf16 through a raw kernel.
+    if a.dtype == DType::F16 || a.dtype == DType::BF16 {
+        let out = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
+        let n = a.elem_count();
+        let fname = if a.dtype == DType::F16 { "ffai_add_f16" } else { "ffai_add_bf16" };
+        dev.dispatch_raw_cuda(ADD16_SRC, "add16.cu", fname,
+            &[(a.buffer.as_ref(), a.offset), (b.buffer.as_ref(), b.offset), (out.buffer.as_ref(), 0)],
+            &[(n as i64).to_le_bytes().to_vec()],
+            [(n as u32).div_ceil(256).max(1), 1, 1], [256, 1, 1], 0, false)?;
+        return Ok(out);
+    }
     elementwise(dev, a, b, BinOpKind::Add, "ffai_add")
 }
 
@@ -200,6 +244,14 @@ extern "C" __global__ void ffai_add3(
     // left-assoc a+b+c flipped the d32768 argmax via last-ulp drift.
     for(;i<n;i+=stride) out[i]=a[i]+(b[i]+c[i]);
 }
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+extern "C" __global__ void ffai_add3_f16(const __half* __restrict__ a, const __half* __restrict__ b, const __half* __restrict__ c, __half* __restrict__ out, long n){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; long stride=(long)gridDim.x*blockDim.x;
+    for(;i<n;i+=stride){ float r=__half2float(a[i])+(__half2float(b[i])+__half2float(c[i])); out[i]=__float2half(r);} }
+extern "C" __global__ void ffai_add3_bf16(const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b, const __nv_bfloat16* __restrict__ c, __nv_bfloat16* __restrict__ out, long n){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; long stride=(long)gridDim.x*blockDim.x;
+    for(;i<n;i+=stride){ float r=__bfloat162float(a[i])+(__bfloat162float(b[i])+__bfloat162float(c[i])); out[i]=__float2bfloat16(r);} }
 "#;
 
 /// Fused three-way elementwise sum `a + b + c` (f32, CUDA raw path) — one
@@ -209,11 +261,13 @@ pub fn add3(dev: &dyn Device, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<Tens
     let out = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
     let n = a.elem_count();
     let l = |v: i64| v.to_le_bytes().to_vec();
-    dev.dispatch_raw_cuda(ADD3_SRC, "add3.cu", "ffai_add3",
+    let fname = match a.dtype { DType::F16 => "ffai_add3_f16", DType::BF16 => "ffai_add3_bf16", _ => "ffai_add3" };
+    let per = if a.dtype == DType::F32 { 256 * 4 } else { 256 };
+    dev.dispatch_raw_cuda(ADD3_SRC, "add3.cu", fname,
         &[(a.buffer.as_ref(), a.offset), (b.buffer.as_ref(), b.offset),
           (c.buffer.as_ref(), c.offset), (out.buffer.as_ref(), 0)],
         &[l(n as i64)],
-        [(n as u32).div_ceil(256 * 4).max(1), 1, 1], [256, 1, 1], 0, false)?;
+        [(n as u32).div_ceil(per).max(1), 1, 1], [256, 1, 1], 0, false)?;
     Ok(out)
 }
 
@@ -481,7 +535,9 @@ pub fn rms_norm(dev: &dyn Device, x: &Tensor, weight: &Tensor, eps: f32) -> Resu
 
     // Fast path: 4 elems/thread, needs n a multiple of 128 and ≤ 4096.
     // Otherwise the strided wide variant handles any row width.
-    let (kname, block) = if n % 128 == 0 && n <= 4096 {
+    // 16-bit (f16/bf16) DSL vec4 fast-path codegen is broken (IMAs); route them
+    // through the scalar wide variant. f32 keeps the fast path.
+    let (kname, block) = if x.dtype == DType::F32 && n % 128 == 0 && n <= 4096 {
         ("mt_rms_norm", (n / 4) as u32)
     } else {
         ("mt_rms_norm_wide", 256u32)
@@ -930,6 +986,152 @@ pub fn conv1d_causal_prefill(
     Ok(y)
 }
 
+const CONV1D_PREFILL_V4_SRC: &str = r#"
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float silu_f32(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+extern "C" __global__ void conv1d_causal_prefill_v4(
+    const float* __restrict__ xbc,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    float* __restrict__ y,
+    int conv_dim4, int kc, int total4)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total4) return;
+    int ti = idx / conv_dim4;
+    int ci4 = idx - ti * conv_dim4;
+    const float4* __restrict__ x4 = reinterpret_cast<const float4*>(xbc);
+    const float4* __restrict__ w4 = reinterpret_cast<const float4*>(w);
+    const float4* __restrict__ b4 = reinterpret_cast<const float4*>(bias);
+    float4 acc = b4[ci4];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= kc) break;
+        int src_t = ti - (kc - 1 - k);
+        if (src_t >= 0) {
+            float4 xv = x4[(size_t)src_t * conv_dim4 + ci4];
+            float4 wv = w4[(size_t)k * conv_dim4 + ci4];
+            acc.x += xv.x * wv.x;
+            acc.y += xv.y * wv.y;
+            acc.z += xv.z * wv.z;
+            acc.w += xv.w * wv.w;
+        }
+    }
+    acc.x = silu_f32(acc.x);
+    acc.y = silu_f32(acc.y);
+    acc.z = silu_f32(acc.z);
+    acc.w = silu_f32(acc.w);
+    reinterpret_cast<float4*>(y)[idx] = acc;
+}
+
+extern "C" __global__ void conv1d_causal_prefill_split_v4(
+    const float* __restrict__ xbc,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    float* __restrict__ x_out,
+    float* __restrict__ b_out,
+    float* __restrict__ c_out,
+    int conv_dim4, int di4, int ng_ds4, int kc, int total4)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total4) return;
+    int ti = idx / conv_dim4;
+    int ci4 = idx - ti * conv_dim4;
+    const float4* __restrict__ x4 = reinterpret_cast<const float4*>(xbc);
+    const float4* __restrict__ w4 = reinterpret_cast<const float4*>(w);
+    const float4* __restrict__ b4 = reinterpret_cast<const float4*>(bias);
+    float4 acc = b4[ci4];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= kc) break;
+        int src_t = ti - (kc - 1 - k);
+        if (src_t >= 0) {
+            float4 xv = x4[(size_t)src_t * conv_dim4 + ci4];
+            float4 wv = w4[(size_t)k * conv_dim4 + ci4];
+            acc.x += xv.x * wv.x;
+            acc.y += xv.y * wv.y;
+            acc.z += xv.z * wv.z;
+            acc.w += xv.w * wv.w;
+        }
+    }
+    acc.x = silu_f32(acc.x);
+    acc.y = silu_f32(acc.y);
+    acc.z = silu_f32(acc.z);
+    acc.w = silu_f32(acc.w);
+    if (ci4 < di4) {
+        reinterpret_cast<float4*>(x_out)[(size_t)ti * di4 + ci4] = acc;
+    } else if (ci4 < di4 + ng_ds4) {
+        int j = ci4 - di4;
+        reinterpret_cast<float4*>(b_out)[(size_t)ti * ng_ds4 + j] = acc;
+    } else {
+        int j = ci4 - di4 - ng_ds4;
+        reinterpret_cast<float4*>(c_out)[(size_t)ti * ng_ds4 + j] = acc;
+    }
+}
+"#;
+
+/// Fused raw-float4 causal conv1d+SiLU that writes the post-conv x/B/C split
+/// surfaces directly, deleting the temp [s,conv_dim] conv output + the split
+/// launch. Equivalent to conv1d_causal_prefill + mamba_split_conv. Escape with
+/// NEMOTRON_CONV_PREFILL_SPLIT_OFF=1 (falls back to that pair).
+pub fn conv1d_causal_prefill_split(
+    dev: &dyn Device,
+    xbc_in: &Tensor,
+    w: &Tensor,
+    bias: &Tensor,
+    s: usize,
+    conv_dim: usize,
+    di: usize,
+    ng_ds: usize,
+    kc: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let raw_ok = std::env::var("NEMOTRON_CONV_PREFILL_RAW_OFF").is_err()
+        && std::env::var("NEMOTRON_CONV_PREFILL_SPLIT_OFF").is_err()
+        && xbc_in.dtype == DType::F32 && w.dtype == DType::F32 && bias.dtype == DType::F32
+        && xbc_in.offset % 16 == 0 && w.offset % 16 == 0 && bias.offset % 16 == 0
+        && di + 2 * ng_ds == conv_dim
+        && di % 4 == 0 && ng_ds % 4 == 0 && conv_dim % 4 == 0;
+    if raw_ok {
+        let x_out = Tensor::empty(dev, vec![s * di], DType::F32)?;
+        let b_out = Tensor::empty(dev, vec![s * ng_ds], DType::F32)?;
+        let c_out = Tensor::empty(dev, vec![s * ng_ds], DType::F32)?;
+        let i = |v: i32| v.to_le_bytes().to_vec();
+        let total4 = (s * conv_dim / 4) as u32;
+        if dev.dispatch_raw_cuda(
+            CONV1D_PREFILL_V4_SRC,
+            "conv1d_prefill_v4.cu",
+            "conv1d_causal_prefill_split_v4",
+            &[
+                (xbc_in.buffer.as_ref(), xbc_in.offset),
+                (w.buffer.as_ref(), w.offset),
+                (bias.buffer.as_ref(), bias.offset),
+                (x_out.buffer.as_ref(), 0),
+                (b_out.buffer.as_ref(), 0),
+                (c_out.buffer.as_ref(), 0),
+            ],
+            &[
+                i((conv_dim / 4) as i32),
+                i((di / 4) as i32),
+                i((ng_ds / 4) as i32),
+                i(kc as i32),
+                i(total4 as i32),
+            ],
+            [total4.div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+            false,
+        ).is_ok() {
+            return Ok((x_out, b_out, c_out));
+        }
+    }
+    let y = conv1d_causal_prefill(dev, xbc_in, w, bias, s, conv_dim, kc)?;
+    mamba_split_conv(dev, &y, s, conv_dim, di, ng_ds)
+}
+
 /// Extract `[s, width]` columns from row-major `src [s, stride]` at column offset `col_off`.
 /// Returns `dst [s * width]` — a contiguous slab. Used to carve z, xbc, dt_raw out of
 /// the [s, in_proj_out] projection matrix on device (NEMOTRON_CONV_DEVICE path).
@@ -1021,6 +1223,92 @@ pub fn moe_gather_up_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &T
     dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(hid as u32), u(inter as u32), u(rpt)], Grid { grid: [(inter as u32).div_ceil(rpt), top_k as u32, 1], block: [32 * rpt, 1, 1] })?;
     Ok(out)
 }
+// Single-block strided argmax over an f32 vector (the 100K-vocab logit row).
+// Ties resolve to the LOWEST index, matching the host-side scan. One block of
+// 1024 threads striding n, then a shared-memory tree reduce: microseconds at
+// vocab scale, and it shrinks the per-step D2H from the full logit row to 4
+// bytes for greedy decode.
+const ARGMAX_F32_SRC: &str = r#"
+extern "C" __global__ void ffai_argmax_f32(
+    const float* __restrict__ x, unsigned* __restrict__ out, int n)
+{
+    __shared__ float sv[1024];
+    __shared__ unsigned si[1024];
+    int tid = threadIdx.x;
+    float best = -3.4028235e38f;
+    unsigned bi = 0u;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float v = x[i];
+        if (v > best || (v == best && (unsigned)i < bi)) { best = v; bi = (unsigned)i; }
+    }
+    sv[tid] = best; si[tid] = bi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sv[tid + s] > sv[tid] || (sv[tid + s] == sv[tid] && si[tid + s] < si[tid])) {
+                sv[tid] = sv[tid + s]; si[tid] = si[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out[0] = si[0];
+}
+"#;
+
+/// Device argmax of an f32 vector: returns a 1-element u32 tensor holding the
+/// index of the maximum (ties: lowest index). Greedy decode downloads these 4
+/// bytes instead of the whole logit row.
+pub fn argmax_f32_device(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
+    let n = x.elem_count();
+    let out = Tensor::empty(dev, vec![1], DType::U32)?;
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        ARGMAX_F32_SRC, "argmax_f32.cu", "ffai_argmax_f32",
+        &[(x.buffer.as_ref(), x.offset), (out.buffer.as_ref(), 0)],
+        &[i(n as i32)],
+        [1, 1, 1], [1024, 1, 1], 0, false,
+    )?;
+    Ok(out)
+}
+
+/// Batched MoE expert gather GEMV, plain (no fused activation): one
+/// `[top_k*inter]` output from the contiguous `[n_exp*inter, hid]` Q4 stack.
+/// The SwiGLU MoE path calls this for the gate and up stacks, then applies
+/// the activation elementwise before the down gather. F16 per-block scales.
+pub fn moe_gather_q4(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, idx: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<Tensor> {
+    let k = cached_ir("ffai_moe_gather_q4", x.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_moe_gather_q4::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let out = Tensor::empty(dev, vec![top_k * inter], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let rpt: u32 = std::env::var("MT_MOE_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(2);
+    dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(hid as u32), u(inter as u32), u(rpt)], Grid { grid: [(inter as u32).div_ceil(rpt), top_k as u32, 1], block: [32 * rpt, 1, 1] })?;
+    Ok(out)
+}
+
+/// Batched MoE GATE+UP gather with FUSED inline SwiGLU: reads the SAME
+/// activation `x` once and computes both the gate and up dot products for
+/// each (slot, inter-row), writing `silu(gate)·up` straight to a single
+/// `[top_k*inter]` output. Replaces two `moe_gather_q4` calls (gate stack,
+/// up stack) plus a host-side elementwise SwiGLU pass with one dispatch.
+/// F16 per-block scales on both `gate_scales` and `up_scales`.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gather_q4_swiglu(dev: &dyn Device, gate_qs: &Tensor, gate_scales: &Tensor, up_qs: &Tensor, up_scales: &Tensor, x: &Tensor, idx: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<Tensor> {
+    let k = cached_ir("ffai_moe_gather_q4_swiglu", x.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_moe_gather_q4_swiglu::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let out = Tensor::empty(dev, vec![top_k * inter], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let rpt: u32 = std::env::var("MT_MOE_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(2);
+    dev.dispatch(&k, &[
+        Binding::Buffer(gate_qs.buffer.clone()),
+        Binding::Buffer(gate_scales.buffer.clone()),
+        Binding::Buffer(up_qs.buffer.clone()),
+        Binding::Buffer(up_scales.buffer.clone()),
+        Binding::Buffer(x.buffer.clone()),
+        Binding::Buffer(idx.buffer.clone()),
+        Binding::Buffer(out.buffer.clone()),
+        u(hid as u32), u(inter as u32), u(rpt),
+    ], Grid { grid: [(inter as u32).div_ceil(rpt), top_k as u32, 1], block: [32 * rpt, 1, 1] })?;
+    Ok(out)
+}
+
 /// Batched MoE down + router-weighted accumulate into `acc[hid]`. `qs` is the
 /// contiguous `[n_exp*hid, inter]` Q4 weight; `x` is the `[top_k*inter]` up output.
 #[allow(clippy::too_many_arguments)]
@@ -1336,6 +1624,32 @@ extern "C" __global__ void moe_scatter_sort(
         base += __popc(mask);
     }
 }
+
+extern "C" __global__ void moe_scatter_sort_rowpos(
+    const unsigned* __restrict__ idx, const float* __restrict__ wt,
+    const unsigned* __restrict__ offsets, unsigned* __restrict__ sorted_tok,
+    float* __restrict__ sorted_wt, unsigned* __restrict__ rowpos,
+    int mt, int top_k, int n_exp)
+{
+    // Same stable expert-major ordering as moe_scatter_sort, plus a token-major
+    // slot -> sorted-row map for deterministic fixed-top_k output scatter.
+    int e = (blockIdx.x*blockDim.x + threadIdx.x) >> 5; if (e >= n_exp) return;
+    int lane = threadIdx.x & 31;
+    unsigned base = offsets[e];
+    for (int w = 0; w < mt; w += 32) {
+        int i = w + lane;
+        bool match = (i < mt) && (idx[i] == (unsigned)e);
+        unsigned mask = __ballot_sync(0xffffffffu, match);
+        if (match) {
+            unsigned rank = __popc(mask & ((1u << lane) - 1u));
+            unsigned pos = base + rank;
+            sorted_tok[pos] = (unsigned)(i / top_k);
+            sorted_wt[pos] = wt[i];
+            rowpos[i] = pos;
+        }
+        base += __popc(mask);
+    }
+}
 "#;
 
 #[allow(clippy::type_complexity)]
@@ -1375,6 +1689,42 @@ pub fn moe_route_sort_device(
           (sorted_tok.buffer.as_ref(), 0), (sorted_wt.buffer.as_ref(), 0)],
         &[i(mt as i32), i(top_k as i32), i(n_exp as i32)], [((n_exp * 32) as u32).div_ceil(128), 1, 1], [128, 1, 1], 0, false)?;
     Ok((sorted_tok, sorted_wt, offsets))
+}
+
+#[allow(clippy::type_complexity)]
+pub fn moe_route_sort_device_rowpos(
+    dev: &dyn Device, gate_logits: &Tensor, bias: &Tensor, n_exp: usize, top_k: usize, scale: f32,
+) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    let s = gate_logits.elem_count() / n_exp;
+    let mt = s * top_k;
+    let idx = Tensor::empty(dev, vec![mt], DType::U32)?;
+    let wt = Tensor::empty(dev, vec![mt], DType::F32)?;
+    let counts = Tensor::new(dev.alloc_zeroed(n_exp * 4).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![n_exp], DType::U32);
+    let offsets = Tensor::empty(dev, vec![n_exp + 1], DType::U32)?;
+    let cursor = Tensor::empty(dev, vec![n_exp], DType::U32)?;
+    let sorted_tok = Tensor::empty(dev, vec![mt], DType::U32)?;
+    let sorted_wt = Tensor::empty(dev, vec![mt], DType::F32)?;
+    let rowpos = Tensor::empty(dev, vec![mt], DType::U32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    let blk = if n_exp >= 256 { 256 } else { n_exp.max(32) } as u32;
+    dev.dispatch_raw_cuda(MOE_BATCHED_ROUTER_SRC, "moe_route_sort.cu", "moe_batched_router",
+        &[(gate_logits.buffer.as_ref(), gate_logits.offset), (bias.buffer.as_ref(), bias.offset),
+          (idx.buffer.as_ref(), 0), (wt.buffer.as_ref(), 0)],
+        &[i(s as i32), i(n_exp as i32), i(top_k as i32), f(scale)],
+        [s as u32, 1, 1], [blk, 1, 1], 0, false)?;
+    dev.dispatch_raw_cuda(MOE_HIST_SRC, "moe_hist.cu", "moe_hist",
+        &[(idx.buffer.as_ref(), 0), (counts.buffer.as_ref(), 0)],
+        &[i(mt as i32)], [(mt as u32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+    dev.dispatch_raw_cuda(MOE_PREFIX_SRC, "moe_prefix.cu", "moe_prefix",
+        &[(counts.buffer.as_ref(), 0), (offsets.buffer.as_ref(), 0), (cursor.buffer.as_ref(), 0)],
+        &[i(n_exp as i32)], [1, 1, 1], [32, 1, 1], 0, false)?;
+    let _ = &cursor;
+    dev.dispatch_raw_cuda(MOE_SCATTER_SORT_SRC, "moe_scatter_sort.cu", "moe_scatter_sort_rowpos",
+        &[(idx.buffer.as_ref(), 0), (wt.buffer.as_ref(), 0), (offsets.buffer.as_ref(), 0),
+          (sorted_tok.buffer.as_ref(), 0), (sorted_wt.buffer.as_ref(), 0), (rowpos.buffer.as_ref(), 0)],
+        &[i(mt as i32), i(top_k as i32), i(n_exp as i32)], [((n_exp * 32) as u32).div_ceil(128), 1, 1], [128, 1, 1], 0, false)?;
+    Ok((sorted_tok, sorted_wt, offsets, rowpos, wt))
 }
 
 pub fn moe_weighted_sum(dev: &dyn Device, downs: &Tensor, wts: &Tensor, acc: &Tensor, hid: usize, top_k: usize) -> Result<()> {
@@ -1433,7 +1783,10 @@ fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor
     dev.dispatch(&k, &b, grid)?;
     Ok(out)
 }
-/// Q4 matvec `out = Wq4·x`. (block 32, int4 [-7,7], f32 scale/block.)
+/// Q4 matvec `out = Wq4·x`. Block 32, int4 [-7,7], ONE F16 SCALE PER BLOCK:
+/// the coalesced/relu2/accum kernels read `scales` as f16, so convert the f32
+/// scales from [`quantize_q4`] with an f32-to-f16 pass before upload (raw f32
+/// bytes get silently reinterpreted as garbage f16 and inflate every output).
 pub fn gemv_q4(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rpg: usize) -> Result<Tensor> {
     gemv_q4_dispatch(dev, "plain", qs, scales, x, None, None, m_out, k_in, rpg)
 }
@@ -1450,6 +1803,9 @@ pub fn gemv_q4_accum(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor,
 /// Quantize a row-major `[m,k]` F32 weight to Q4 blocks (block 32, symmetric int4
 /// in [-7,7], f32 scale `amax/7`). Returns `(qs_u32, scales)`: qs `[m·k/32·4]`
 /// (8 nibbles/u32, 4 u32/block), scales `[m·k/32]`. `k` must be a multiple of 32.
+/// NOTE: the returned scales are host f32; the `gemv_q4`/`gemv_q4_relu2`/
+/// `gemv_q4_accum` device kernels expect them uploaded as F16 (see the
+/// `gemv_q4` doc). Only `MT_GEMV_VEC`'s vectorized kernel takes f32 scales.
 pub fn quantize_q4(w: &[f32], m: usize, k: usize) -> (Vec<u32>, Vec<f32>) {
     assert_eq!(k % 32, 0, "quantize_q4: k must be a multiple of 32");
     let bpr = k / 32;
@@ -1561,6 +1917,54 @@ pub fn dec_ue4m3(b: u8) -> f32 {
 ///   Chosen so each block's `amax/6` lands in UE4M3's representable range.
 ///
 /// Example: `let (codes, scales, g) = quantize_nvfp4(&w, n_rows, k_in);`
+#[inline]
+fn marlin_f32_to_f16(f: f32) -> u16 {
+    let x = f.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let e = ((x >> 23) & 0xff) as i32 - 112; // 127 - 15
+    if e <= 0 { return sign; }
+    if e >= 0x1f { return sign | 0x7c00; }
+    let m = (x >> 13) & 0x3ff;
+    let round = (x >> 12) & 1;
+    let v = ((e as u32) << 10) | m;
+    sign | ((v + round) as u16)
+}
+
+/// Convert per-16 NVFP4 block-scale VALUES `[ngroup, n]` (row-major; value =
+/// dec_ue4m3(byte)*global) into the marlin S0E5M3 fp8 byte layout the GEMM reads.
+/// Mirrors marlin_permute_scales(group<K) + nvfp4_marlin_process_scales (f16,
+/// scale_factor=1): scale_perm 64-permute, [0,2,1,3] 4-interleave, x2^7, zero-if<2,
+/// reinterpret f16 bits `<<1`, take the high byte (= S0E5M3). Returns `[ngroup*n]` u8.
+pub fn marlin_s0e5m3_scales(vals: &[f32], ngroup: usize, n: usize) -> Vec<u8> {
+    let total = ngroup * n;
+    assert_eq!(vals.len(), total);
+    assert_eq!(total % 64, 0, "marlin_s0e5m3_scales: ngroup*n must be a multiple of 64");
+    // scale_perm (64): [i + 8*j for i in 0..8 for j in 0..8]
+    let mut sp = [0usize; 64];
+    let mut idx = 0;
+    for i in 0..8 { for j in 0..8 { sp[idx] = i + 8 * j; idx += 1; } }
+    // A: 64-chunk column permute (marlin_permute_scales)
+    let mut s1 = vec![0f32; total];
+    for r in 0..(total / 64) {
+        for j in 0..64 { s1[r * 64 + j] = vals[r * 64 + sp[j]]; }
+    }
+    // B: 4-chunk interleave [0,2,1,3]
+    let il = [0usize, 2, 1, 3];
+    let mut s2 = vec![0f32; total];
+    for r in 0..(total / 4) {
+        for j in 0..4 { s2[r * 4 + j] = s1[r * 4 + il[j]]; }
+    }
+    // C: x2^7, zero-if<2, f16 bits <<1, high byte = S0E5M3
+    let mut out = vec![0u8; total];
+    for p in 0..total {
+        let mut v = s2[p] * 128.0;
+        if v < 2.0 { v = 0.0; }
+        let shifted = marlin_f32_to_f16(v) << 1;
+        out[p] = (shifted >> 8) as u8;
+    }
+    out
+}
+
 pub fn quantize_nvfp4(w: &[f32], m: usize, k: usize) -> (Vec<u32>, Vec<u8>, f32) {
     assert_eq!(k % 16, 0, "quantize_nvfp4: k must be a multiple of 16");
     let nblk = k / 16;
@@ -1976,6 +2380,7 @@ const MOE_GROUPED_GEMM_MMA_SRC: &str = r#"
 __device__ __forceinline__ unsigned pk2(__half a, __half b){
     return (unsigned)__half_as_ushort(a) | ((unsigned)__half_as_ushort(b) << 16);
 }
+__device__ __forceinline__ unsigned ld32(const __half* p){ return *reinterpret_cast<const unsigned*>(p); }
 #define CPA(SD, SP, V) asm volatile("cp.async.cg.shared.global [%0],[%1],16,%2;\n" \
     :: "r"(SD), "l"(SP), "r"((V)?16:0))
 // BM=64, BN=128: each block computes 128 N-cols so the loaded A tile is reused
@@ -2020,14 +2425,14 @@ extern "C" __global__ void moe_grouped_gemm_mma(
         __syncthreads();
         int buf = c&1;
         for (int ks=0; ks<NKS; ks++){ int ko=ks*16;
-            unsigned a0=pk2(As[buf][wrow+gid][ko+2*tid4],   As[buf][wrow+gid][ko+2*tid4+1]);
-            unsigned a1=pk2(As[buf][wrow+gid+8][ko+2*tid4], As[buf][wrow+gid+8][ko+2*tid4+1]);
-            unsigned a2=pk2(As[buf][wrow+gid][ko+2*tid4+8], As[buf][wrow+gid][ko+2*tid4+9]);
-            unsigned a3=pk2(As[buf][wrow+gid+8][ko+2*tid4+8],As[buf][wrow+gid+8][ko+2*tid4+9]);
+            unsigned a0=ld32(&As[buf][wrow+gid][ko+2*tid4]);
+            unsigned a1=ld32(&As[buf][wrow+gid+8][ko+2*tid4]);
+            unsigned a2=ld32(&As[buf][wrow+gid][ko+2*tid4+8]);
+            unsigned a3=ld32(&As[buf][wrow+gid+8][ko+2*tid4+8]);
             #pragma unroll
             for (int s=0;s<NS;s++){ int nb=s*8;
-                unsigned b0=pk2(Ws[buf][nb+gid][ko+2*tid4],   Ws[buf][nb+gid][ko+2*tid4+1]);
-                unsigned b1=pk2(Ws[buf][nb+gid][ko+2*tid4+8], Ws[buf][nb+gid][ko+2*tid4+9]);
+                unsigned b0=ld32(&Ws[buf][nb+gid][ko+2*tid4]);
+                unsigned b1=ld32(&Ws[buf][nb+gid][ko+2*tid4+8]);
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                     "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
                     :"+f"(oc[s][0]),"+f"(oc[s][1]),"+f"(oc[s][2]),"+f"(oc[s][3])
@@ -2128,6 +2533,15 @@ __device__ __forceinline__ __half dqn(unsigned w, int nib, __half sc){
     unsigned short t = (unsigned short)((((w>>(nib*4))&0xf) ^ 0x8) | 0x6400u);
     return __hmul(__hsub(__ushort_as_half(t), __float2half(1032.f)), sc);
 }
+// Vectorized dequant: two adjacent nibbles (low,high of the byte at bit-offset sh)
+// -> packed f16x2, SIMD affine. Bit-exact to pk2(dqn(n0),dqn(n1)). sh=(nib_even)*4.
+__device__ __forceinline__ unsigned dq2(unsigned w, int sh, __half sc){
+    unsigned two = (w >> sh) & 0xFFu;
+    unsigned packed = ((((two & 0xf0u) << 12) | (two & 0xfu)) ^ 0x00080008u) | 0x64006400u;
+    __half2 h = *reinterpret_cast<__half2*>(&packed);
+    h = __hmul2(__hsub2(h, __float2half2_rn(1032.0f)), __half2half2(sc));
+    return *reinterpret_cast<unsigned*>(&h);
+}
 #define CPA(SD,SP) asm volatile("cp.async.cg.shared.global [%0],[%1],16,16;\n" :: "r"(SD), "l"(SP))
 // BN=128 (NS=16): each block does 128 N-cols → the loaded A tile is reused over
 // 2x the weights, halving redundant A reads (the bottleneck). Weight/scale loads
@@ -2140,7 +2554,7 @@ extern "C" __global__ void moe_q4_grouped_mma(
     __half* __restrict__ Out,
     int N, int K)
 {
-    const int BM=64,BN=128,BK=64,NS=16,NKS=4,GS=32,WPR=BK/8,GPR=BK/GS;
+    const int BM=64,BN=128,BK=32,NS=16,NKS=2,GS=32,WPR=BK/8,GPR=BK/GS; // BK32 occ-tune (smem 25->12.5KB)
     int bx=blockIdx.x, by=blockIdx.y;
     int tok0=tok0_arr[bx], gend=gend_arr[bx], eid=eid_arr[bx], n0=by*BN;
     int tid=threadIdx.x,warp=tid>>5,lane=tid&31,gid=lane>>2,tid4=lane&3,wrow=warp*16;
@@ -2151,7 +2565,7 @@ extern "C" __global__ void moe_q4_grouped_mma(
     int nchunk=K/BK, WPB=K/32;
     long ebase=(long)eid*N;
 #define LOADC(C,BUF) do{ int kc=(C)*BK; \
-    for(int e=tid;e<BM*8;e+=128){ int r=e/8,k8=(e%8)*8; int t=tok0+r; int v=(t<gend); \
+    for(int e=tid;e<BM*(BK/8);e+=128){ int r=e/(BK/8),k8=(e%(BK/8))*8; int t=tok0+r; int v=(t<gend); \
         unsigned sd=(unsigned)__cvta_generic_to_shared(&As[BUF][r][k8]); \
         const __half* sp=&A[(long)(v?t:tok0)*K + kc + k8]; CPA(sd,sp); } \
     for(int e=tid;e<BN*WPR/4;e+=128){ int f=e*4,r=f/WPR,w0=f%WPR; long wr=ebase+((n0+r<N)?(n0+r):0); \
@@ -2177,8 +2591,8 @@ extern "C" __global__ void moe_q4_grouped_mma(
             for(int s=0;s<NS;s++){ int nrow=s*8+gid;
                 unsigned wA=Wqs[buf][nrow][c0/8], wB=Wqs[buf][nrow][(c0+8)/8];
                 __half sA=Scs[buf][nrow][c0/GS], sB=Scs[buf][nrow][(c0+8)/GS];
-                unsigned b0=pk2(dqn(wA,c0&7,sA),     dqn(wA,(c0+1)&7,sA));
-                unsigned b1=pk2(dqn(wB,(c0+8)&7,sB), dqn(wB,(c0+9)&7,sB));
+                unsigned b0=dq2(wA,(c0&7)*4,sA);
+                unsigned b1=dq2(wB,(c0&7)*4,sB);
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                     "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
                     :"+f"(oc[s][0]),"+f"(oc[s][1]),"+f"(oc[s][2]),"+f"(oc[s][3])
@@ -4239,6 +4653,153 @@ pub fn sdpa_decode(
     Ok(out)
 }
 
+// ── CUDA-graph-capturable dense decode SDPA (raw CUDA, head_dim 128) ────
+//
+// The registry `ffai_sdpa_decode` kernel above takes `n_kv` as a launch-time
+// constexpr — fine for eager decode (a fresh launch every token) but wrong
+// for a captured graph, which replays the exact same recorded launch (same
+// baked `n_kv`) every token. Rather than plumb a buffer-read `n_kv` through
+// the metaltile registry kernel (invasive: `n_kv` there is a `#[constexpr]`
+// used to size the unroll-friendly loop bound), this is a hand-written raw
+// CUDA fallback that reads `n_kv` from a 1-element `u32` device buffer at
+// kernel runtime instead. Same single-pass online-softmax algorithm as the
+// registry kernel's dense path (`ffai_sdpa_decode` with `sink_end=0,
+// window_start=0, has_sink=0`): block per Q-head, 1024 threads (32 warps x
+// 32 lanes), each lane owns 4 of the 128 head dims, `__shfl_xor_sync`
+// butterfly reduction (broadcasts to every lane, matching MSL's
+// all-to-all `simd_sum`/`simd_max`), f32 accumulation throughout. Verified
+// against `sdpa_decode`'s output in `crates/backends/ffai-cuda/tests/laguna.rs`.
+const SDPA_DECODE_NBUF_SRC: &str = r#"
+extern "C" __global__ void ffai_sdpa_decode_nbuf(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ out, const unsigned int* __restrict__ n_kv_buf,
+    int head_dim, int kv_stride, int heads_per_group, float scale)
+{
+    int q_head = blockIdx.x;
+    int kv_head = q_head / heads_per_group;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int sg = tid >> 5;
+    int ns = blockDim.x >> 5;
+    unsigned int n_kv = n_kv_buf[0];
+
+    __shared__ float tg_max[32];
+    __shared__ float tg_sum[32];
+    __shared__ float tg_out0[1056];
+    __shared__ float tg_out1[1056];
+    __shared__ float tg_out2[1056];
+    __shared__ float tg_out3[1056];
+
+    int q_off = q_head * head_dim;
+    long kv_head_base = (long)kv_head * kv_stride * head_dim;
+    int d0 = lane * 4;
+
+    float qs[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) qs[i] = q[q_off + d0 + i] * scale;
+
+    float run_max = -3.4028235e38f;
+    float run_sum = 0.0f;
+    float os[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (unsigned int t = sg; t < n_kv; t += ns) {
+        long base = kv_head_base + (long)t * head_dim;
+        long kv0 = base + d0;
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) partial += qs[i] * k[kv0 + i];
+        for (int mask = 16; mask > 0; mask >>= 1) partial += __shfl_xor_sync(0xffffffffu, partial, mask);
+        float score = partial;
+        float new_max = fmaxf(score, run_max);
+        float factor = expf(run_max - new_max);
+        float weight = expf(score - new_max);
+        run_sum = run_sum * factor + weight;
+        run_max = new_max;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) os[i] = os[i] * factor + weight * v[kv0 + i];
+    }
+
+    if (lane == 0) { tg_max[sg] = run_max; tg_sum[sg] = run_sum; }
+    __syncthreads();
+    if (sg == 0) {
+        float g_max_raw = (lane < ns) ? tg_max[lane] : -3.4028235e38f;
+        float g_max = g_max_raw;
+        for (int mask = 16; mask > 0; mask >>= 1) g_max = fmaxf(g_max, __shfl_xor_sync(0xffffffffu, g_max, mask));
+        float g_sum_in = (lane < ns) ? tg_sum[lane] * expf(g_max_raw - g_max) : 0.0f;
+        float g_sum = g_sum_in;
+        for (int mask = 16; mask > 0; mask >>= 1) g_sum += __shfl_xor_sync(0xffffffffu, g_sum, mask);
+        if (lane == 0) { tg_max[0] = g_max; tg_sum[0] = g_sum; }
+    }
+    __syncthreads();
+    float g_max = tg_max[0];
+    float g_sum = tg_sum[0];
+    float rescale = (g_sum > 0.0f) ? expf(run_max - g_max) / g_sum : 0.0f;
+    int stride = ns + 1;
+    int idx = lane * stride + sg;
+    tg_out0[idx] = os[0] * rescale;
+    tg_out1[idx] = os[1] * rescale;
+    tg_out2[idx] = os[2] * rescale;
+    tg_out3[idx] = os[3] * rescale;
+    __syncthreads();
+    if (sg == 0) {
+        float so0 = 0.0f, so1 = 0.0f, so2 = 0.0f, so3 = 0.0f;
+        for (int g = 0; g < ns; g++) {
+            int ri = lane * stride + g;
+            so0 += tg_out0[ri];
+            so1 += tg_out1[ri];
+            so2 += tg_out2[ri];
+            so3 += tg_out3[ri];
+        }
+        int out_off = q_off + d0;
+        out[out_off]     = so0;
+        out[out_off + 1] = so1;
+        out[out_off + 2] = so2;
+        out[out_off + 3] = so3;
+    }
+}
+"#;
+
+/// CUDA-graph-capturable fallback of [`sdpa_decode`] for `head_dim == 128`
+/// (Laguna's only head_dim): reads the filled KV length `n_kv` from a
+/// 1-element `u32` device buffer instead of a baked-in launch scalar. Dense
+/// causal only (no sink / sliding-window mask) — Laguna's sliding layers
+/// bound the KV walk via the buffer's VALUE (the ring's current filled
+/// length), so a separate window mask isn't needed. f32 only. See the
+/// kernel-source doc above for the algorithm.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_nbuf(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    n_kv_buf: &Tensor,
+    kv_stride: u32,
+    heads_per_group: u32,
+    scale: f32,
+) -> Result<Tensor> {
+    if head_dim != 128 {
+        return Err(Error::Msg(format!("sdpa_decode_nbuf: only head_dim 128 is implemented, got {head_dim}")));
+    }
+    let n_q_heads = q.elem_count() / head_dim;
+    let out = Tensor::empty(dev, vec![n_q_heads, head_dim], DType::F32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        SDPA_DECODE_NBUF_SRC, "sdpa_decode_nbuf.cu", "ffai_sdpa_decode_nbuf",
+        &[
+            (q.buffer.as_ref(), q.offset),
+            (k.buffer.as_ref(), k.offset),
+            (v.buffer.as_ref(), v.offset),
+            (out.buffer.as_ref(), 0),
+            (n_kv_buf.buffer.as_ref(), n_kv_buf.offset),
+        ],
+        &[i(head_dim as i32), i(kv_stride as i32), i(heads_per_group as i32), f(scale)],
+        [n_q_heads as u32, 1, 1], [1024, 1, 1], 0, false,
+    )?;
+    Ok(out)
+}
+
 /// GQA-aware split-K flash-decode SDPA (MLX `sdpa_vector_2pass` port, head_dim
 /// 128). Pass 1: grid `(n_kv_heads, blocks)`, block `(32, gqa_factor)` — one
 /// simdgroup per Q-head of the group, so the `gqa_factor` heads SHARE each K/V
@@ -4579,6 +5140,59 @@ extern "C" __global__ void moe_scatter_add_det_f16(
         acc[t * hid + h] = sum;
     }
 }
+
+// f16-input fixed-top_k variant: rowpos maps token-major router slots
+// (t*top_k+j) to expert-major sorted rows. This skips the token CSR rebuild.
+extern "C" __global__ void moe_scatter_add_topk_det_f16(
+    const __half*   __restrict__ dn,
+    const unsigned* __restrict__ rowpos,
+    const float*    __restrict__ wt_token_major,
+    float*                       acc,
+    int s, int top_k, int hid, float unscale)
+{
+    int t = (int)blockIdx.x;
+    int h = (int)(blockIdx.y * BLOCK_H + threadIdx.x);
+    if (t < s && h < hid) {
+        float sum = 0.f;
+        int base = t * top_k;
+        for (int j = 0; j < top_k; ++j) {
+            unsigned r = rowpos[base + j];
+            sum += __half2float(dn[(int)r * hid + h]) * (wt_token_major[base + j] * unscale);
+        }
+        acc[t * hid + h] = sum;
+    }
+}
+
+extern "C" __global__ void moe_scatter_add_topk_det_f16_x2(
+    const __half*   __restrict__ dn,
+    const unsigned* __restrict__ rowpos,
+    const float*    __restrict__ wts_tok,
+    float*                       acc,
+    int s, int top_k, int hid, float unscale)
+{
+    int t = (int)blockIdx.x;
+    int h = ((int)blockIdx.y * BLOCK_H + threadIdx.x) * 2;
+    if (t < s && h < hid) {
+        float sum0 = 0.f;
+        float sum1 = 0.f;
+        int base = t * top_k;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j < top_k) {
+                int r = (int)rowpos[base + j];
+                float w = wts_tok[base + j] * unscale;
+                long idx = (long)r * hid + h;
+                __half2 hv = *reinterpret_cast<const __half2*>(dn + idx);
+                float2 fv = __half22float2(hv);
+                sum0 += fv.x * w;
+                sum1 += fv.y * w;
+            }
+        }
+        long out = (long)t * hid + h;
+        acc[out] = sum0;
+        acc[out + 1] = sum1;
+    }
+}
 "#;
 
 /// Deterministic MoE scatter-add (drop-in for [`moe_scatter_add`] on the prefill
@@ -4662,6 +5276,34 @@ extern "C" __global__ void moe_token_csr(
 /// runs the deterministic moe_scatter_add_det kernel. Same result as the host
 /// `moe_scatter_add_det` but host-sync-free → graph-capturable.
 #[allow(clippy::too_many_arguments)]
+/// x2 variant of moe_scatter_add_topk_det_f16: 2 hidden-dims/thread via __half2
+/// vectorized loads. Exact; falls back to the x1 kernel on odd hid.
+pub fn moe_scatter_add_topk_det_f16_x2(
+    dev: &dyn Device,
+    dn: &Tensor,
+    rowpos: &Tensor,
+    wts_tok: &Tensor,
+    acc: &Tensor,
+    s: usize,
+    top_k: usize,
+    hid: usize,
+    unscale: f32,
+) -> Result<()> {
+    if hid % 2 != 0 {
+        return moe_scatter_add_topk_det_f16(dev, dn, rowpos, wts_tok, acc, s, top_k, hid, unscale);
+    }
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let pairs = (hid as u32).div_ceil(2);
+    dev.dispatch_raw_cuda(
+        MOE_SCATTER_ADD_DET_SRC,
+        "moe_scatter_add_det.cu",
+        "moe_scatter_add_topk_det_f16_x2",
+        &[(dn.buffer.as_ref(), 0), (rowpos.buffer.as_ref(), rowpos.offset),
+          (wts_tok.buffer.as_ref(), wts_tok.offset), (acc.buffer.as_ref(), 0)],
+        &[i(s as i32), i(top_k as i32), i(hid as i32), unscale.to_le_bytes().to_vec()],
+        [s as u32, pairs.div_ceil(128), 1], [128, 1, 1], 0, false)
+}
+
 pub fn moe_scatter_add_det_dev(
     dev: &dyn Device,
     dn: &Tensor,
@@ -4701,6 +5343,39 @@ pub fn moe_scatter_add_det_dev(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn moe_scatter_add_topk_det_f16(
+    dev: &dyn Device,
+    dn: &Tensor,
+    rowpos: &Tensor,
+    wt_token_major: &Tensor,
+    acc: &Tensor,
+    s: usize,
+    top_k: usize,
+    hid: usize,
+    unscale: f32,
+) -> Result<()> {
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        MOE_SCATTER_ADD_DET_SRC,
+        "moe_scatter_add_det.cu",
+        "moe_scatter_add_topk_det_f16",
+        &[
+            (dn.buffer.as_ref(), 0),
+            (rowpos.buffer.as_ref(), rowpos.offset),
+            (wt_token_major.buffer.as_ref(), wt_token_major.offset),
+            (acc.buffer.as_ref(), 0),
+        ],
+        &[i(s as i32), i(top_k as i32), i(hid as i32), f(unscale)],
+        [s as u32, (hid as u32).div_ceil(128), 1],
+        [128, 1, 1],
+        0,
+        false,
+    )?;
+    Ok(())
+}
+
 /// Expand per-expert CSR offsets `[n_exp+1]` into a per-row expert-id vector
 /// `[mt]` on device: `idx[r] = e` for every `r` in `[off[e], off[e+1])`.
 /// Graph-safe replacement for the host `triples.map(|(e,_,_)| e)` build -- lets
@@ -4736,6 +5411,38 @@ pub fn moe_expert_ids_from_offsets(dev: &dyn Device, off: &Tensor, n_exp: usize,
 /// scale, and cast-back-to-f16 that the MoE prefill loop previously did by
 /// downloading to host, computing on CPU, and re-uploading. One kernel replaces
 /// the full host-round-trip between the up and down GEMMs.
+const RELU2_SCALE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__ void relu2_scale_bf16(
+    const __nv_bfloat16* __restrict__ inp,
+    __nv_bfloat16*       __restrict__ out,
+    int n, float scale)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        float v = __bfloat162float(inp[i]);
+        if (v < 0.f) v = 0.f;
+        // bf16 range (~3e38) holds relu^2 for this model; no f16-style clamp needed.
+        out[i] = __float2bfloat16(v * v * scale);
+    }
+}
+"#;
+
+/// relu(x)^2 * scale for a BF16 tensor: reads BF16, squares in FP32, writes BF16.
+/// Unlike the f16 variant there is no square-safe clamp (bf16 exponent range holds
+/// the squared activations), so the FFN intermediate is not range-distorted.
+pub fn relu2_scale_bf16(dev: &dyn Device, x: &Tensor, scale: f32) -> Result<Tensor> {
+    let n = x.elem_count();
+    let out = Tensor::empty(dev, x.shape.clone(), DType::BF16)?;
+    let block = 256u32;
+    let grid = (n as u32).div_ceil(block);
+    dev.dispatch_raw_cuda(RELU2_SCALE_BF16_SRC, "relu2_scale_bf16.cu", "relu2_scale_bf16",
+        &[(x.buffer.as_ref(), x.offset), (out.buffer.as_ref(), 0)],
+        &[(n as i32).to_le_bytes().to_vec(), scale.to_le_bytes().to_vec()],
+        [grid, 1, 1], [block, 1, 1], 0, false)?;
+    Ok(out)
+}
+
 const RELU2_SCALE_F16_SRC: &str = r#"
 #include <cuda_fp16.h>
 extern "C" __global__ void relu2_scale_f16(
@@ -4958,6 +5665,315 @@ pub fn dsv4_partial_rope(
     let grid = Grid { grid: [n_heads, 1, 1], block: [1, half_rot, 1] };
     dev.dispatch(&k, &bindings, grid)?;
     Ok(Tensor::new(qk.buffer.clone(), qk.shape.clone(), qk.dtype))
+}
+
+// ── Laguna YaRN partial-rotary RoPE (raw CUDA) ───────────────────────────
+//
+// Laguna's full-attention layers rotate only the first `n_rot` (partial-
+// rotary) dims of each head with NEOX pairing (`j`, `j+n_rot/2`) and a YaRN
+// frequency/magnitude correction; the tail dims pass through unrotated. The
+// sliding-window layers reuse the same kernel with `n_rot == head_dim`,
+// `freq_scale = 1.0`, `ext_factor = 0.0`, `attn_factor = 1.0` (plain RoPE,
+// no passthrough, no magnitude scaling).
+//
+// Ports the corr_dims + ramp + mscale math from the reference C++ engine's
+// YaRN rope kernel (`ggml_rope_yarn_corr_dims` + `rope_yarn` in that
+// engine's CUDA rope source) bit-for-bit:
+//   corr_dim(n_rotations) = n_rot * ln(n_orig_ctx / (n_rotations * 2π)) / (2 * ln(theta_base))
+//   corr_low  = max(0, floor(corr_dim(beta_fast)))
+//   corr_high = min(n_rot - 1, ceil(corr_dim(beta_slow)))
+//   ramp(j)   = 1 - clamp((j - corr_low) / max(0.001, corr_high - corr_low), 0, 1)
+//   theta     = lerp(freq_scale * theta_extrap, theta_extrap, ramp(j) * ext_factor)
+//   mscale    = attn_factor * (ext_factor != 0 ? 1 + 0.1 * ln(1 / freq_scale) : 1)
+//
+// IMPORTANT: `attn_factor` here is the model's stored `attention_factor`
+// (e.g. 1.4852030263919618 for Laguna-S-2.1's factor-128 YaRN), passed
+// straight through — this kernel re-applies the `1 + 0.1*ln(1/freq_scale)`
+// correction internally exactly as the reference engine does (the engine's
+// llama-context.cpp pre-cancels its OWN internally-derived default mscale
+// against this same term before folding in the config's `attn_factor`; the
+// net effect is that `attn_factor` reaches the rope kernel unmodified and
+// gets this multiplier applied once, INSIDE the kernel). Do not pre-apply
+// the correction a second time in caller code.
+const ROPE_YARN_PARTIAL_SRC: &str = r#"
+extern "C" __global__ void ffai_rope_yarn_partial(
+    const float* __restrict__ qk, float* __restrict__ out,
+    int head_dim, int n_rot, int position,
+    float theta_base, float freq_scale, float ext_factor, float attn_factor,
+    float corr_low, float corr_high)
+{
+    int h = blockIdx.x;
+    int tid = threadIdx.y;
+    int half_rot = n_rot / 2;
+    const float* row_in  = qk  + (long)h * head_dim;
+    float*       row_out = out + (long)h * head_dim;
+
+    if (tid < half_rot) {
+        int j = tid;
+        float theta_scale  = powf(theta_base, -2.0f / (float)n_rot);
+        float theta_extrap = (float)position * powf(theta_scale, (float)j);
+        float theta_interp = freq_scale * theta_extrap;
+        float theta        = theta_interp;
+        // attn_factor IS the final magnitude scale (mscale). The reference
+        // stack cancels its kernel's internal 1 + 0.1*ln(1/freq_scale)
+        // re-multiply by pre-dividing on the host, so the net scale equals the
+        // model's stored attention_factor; we just apply it directly.
+        float mscale       = attn_factor;
+        if (ext_factor != 0.0f) {
+            float y        = ((float)j - corr_low) / fmaxf(0.001f, corr_high - corr_low);
+            float ramp     = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+            float ramp_mix = ramp * ext_factor;
+            theta  = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        }
+        float cos_t = cosf(theta) * mscale;
+        float sin_t = sinf(theta) * mscale;
+        float x0 = row_in[j];
+        float x1 = row_in[j + half_rot];
+        row_out[j]            = x0 * cos_t - x1 * sin_t;
+        row_out[j + half_rot] = x0 * sin_t + x1 * cos_t;
+    } else {
+        // Passthrough tail: copy the two contiguous elements at [n_rot + 2p,
+        // n_rot + 2p + 1) unrotated (matches the reference NEOX kernel's
+        // untouched-tail convention).
+        int p   = tid - half_rot;
+        int idx = n_rot + 2 * p;
+        if (idx < head_dim) {
+            row_out[idx]     = row_in[idx];
+            row_out[idx + 1] = row_in[idx + 1];
+        }
+    }
+}
+"#;
+
+/// YaRN-scaled partial-rotary RoPE (NEOX pairing) for a `[n_heads, head_dim]`
+/// Q or K tensor at sequence `position`. `n_rot` is the number of rotated
+/// dims (`<= head_dim`; the rest pass through unrotated). Pass `n_rot ==
+/// head_dim`, `freq_scale = 1.0`, `ext_factor = 0.0`, `attn_factor = 1.0` for
+/// plain (non-YaRN) RoPE — `beta_fast`/`beta_slow`/`n_orig_ctx` are then
+/// unused (the ramp contributes zero once `ext_factor` is zero). f32 only.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_yarn_partial(
+    dev: &dyn Device,
+    qk: &Tensor,
+    position: u32,
+    n_rot: u32,
+    theta_base: f32,
+    freq_scale: f32,
+    ext_factor: f32,
+    attn_factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    n_orig_ctx: u32,
+) -> Result<Tensor> {
+    let head_dim = *qk.shape.last().ok_or_else(|| Error::Msg("rope_yarn_partial: scalar input".into()))?;
+    let n_heads = qk.elem_count() / head_dim;
+    if n_rot == 0 || n_rot as usize > head_dim || n_rot % 2 != 0 {
+        return Err(Error::Msg(format!(
+            "rope_yarn_partial: n_rot {n_rot} invalid for head_dim {head_dim}"
+        )));
+    }
+    // ggml_rope_yarn_corr_dims: the [low, high] band (in rotated-pair-index
+    // units) where the rotary frequency ramps from interpolated (YaRN-scaled)
+    // to extrapolated (raw). Degenerate but harmless when ext_factor == 0.
+    let corr_dim = |n_rotations: f32| -> f32 {
+        n_rot as f32 * (n_orig_ctx as f32 / (n_rotations * 2.0 * std::f32::consts::PI)).ln()
+            / (2.0 * theta_base.ln())
+    };
+    let corr_low = corr_dim(beta_fast).floor().max(0.0);
+    let corr_high = corr_dim(beta_slow).ceil().min(n_rot as f32 - 1.0);
+
+    let out = Tensor::empty(dev, qk.shape.clone(), DType::F32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    let half = (head_dim / 2) as u32;
+    dev.dispatch_raw_cuda(
+        ROPE_YARN_PARTIAL_SRC, "rope_yarn_partial.cu", "ffai_rope_yarn_partial",
+        &[(qk.buffer.as_ref(), qk.offset), (out.buffer.as_ref(), 0)],
+        &[
+            i(head_dim as i32), i(n_rot as i32), i(position as i32),
+            f(theta_base), f(freq_scale), f(ext_factor), f(attn_factor),
+            f(corr_low), f(corr_high),
+        ],
+        [n_heads as u32, 1, 1], [1, half, 1], 0, false,
+    )?;
+    Ok(out)
+}
+
+const ROPE_YARN_PARTIAL_POSBUF_SRC: &str = r#"
+extern "C" __global__ void ffai_rope_yarn_partial_posbuf(
+    const float* __restrict__ qk, float* __restrict__ out,
+    const unsigned int* __restrict__ pos_buf,
+    int head_dim, int n_rot,
+    float theta_base, float freq_scale, float ext_factor, float attn_factor,
+    float corr_low, float corr_high)
+{
+    int position = (int)pos_buf[0];
+    int h = blockIdx.x;
+    int tid = threadIdx.y;
+    int half_rot = n_rot / 2;
+    const float* row_in  = qk  + (long)h * head_dim;
+    float*       row_out = out + (long)h * head_dim;
+
+    if (tid < half_rot) {
+        int j = tid;
+        float theta_scale  = powf(theta_base, -2.0f / (float)n_rot);
+        float theta_extrap = (float)position * powf(theta_scale, (float)j);
+        float theta_interp = freq_scale * theta_extrap;
+        float theta        = theta_interp;
+        float mscale       = attn_factor;
+        if (ext_factor != 0.0f) {
+            float y        = ((float)j - corr_low) / fmaxf(0.001f, corr_high - corr_low);
+            float ramp     = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+            float ramp_mix = ramp * ext_factor;
+            theta  = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        }
+        float cos_t = cosf(theta) * mscale;
+        float sin_t = sinf(theta) * mscale;
+        float x0 = row_in[j];
+        float x1 = row_in[j + half_rot];
+        row_out[j]            = x0 * cos_t - x1 * sin_t;
+        row_out[j + half_rot] = x0 * sin_t + x1 * cos_t;
+    } else {
+        int p   = tid - half_rot;
+        int idx = n_rot + 2 * p;
+        if (idx < head_dim) {
+            row_out[idx]     = row_in[idx];
+            row_out[idx + 1] = row_in[idx + 1];
+        }
+    }
+}
+"#;
+
+/// CUDA-graph-capturable variant of [`rope_yarn_partial`]: identical math,
+/// but `position` is read from a 1-element `u32` device buffer at kernel
+/// runtime instead of being baked in as a launch-time scalar. A captured
+/// graph replays the exact same recorded launch every token, so any value
+/// that changes per token (the sequence position) has to live behind a
+/// stable pointer whose CONTENTS the caller updates before each replay,
+/// rather than as an argument frozen at capture time. `corr_low`/`corr_high`
+/// depend only on the (per-layer-type, capture-time-constant) RoPE constants,
+/// so those stay ordinary scalars. Used by Laguna's decode path under
+/// `FFAI_LAGUNA_GRAPH=1`; the plain scalar-position `rope_yarn_partial` above
+/// remains the default (eager, non-graph) path.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_yarn_partial_posbuf(
+    dev: &dyn Device,
+    qk: &Tensor,
+    pos_buf: &Tensor,
+    n_rot: u32,
+    theta_base: f32,
+    freq_scale: f32,
+    ext_factor: f32,
+    attn_factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    n_orig_ctx: u32,
+) -> Result<Tensor> {
+    let head_dim = *qk.shape.last().ok_or_else(|| Error::Msg("rope_yarn_partial_posbuf: scalar input".into()))?;
+    let n_heads = qk.elem_count() / head_dim;
+    if n_rot == 0 || n_rot as usize > head_dim || n_rot % 2 != 0 {
+        return Err(Error::Msg(format!(
+            "rope_yarn_partial_posbuf: n_rot {n_rot} invalid for head_dim {head_dim}"
+        )));
+    }
+    // Same YaRN corr-dims derivation as `rope_yarn_partial` — a function of
+    // the RoPE constants only, never the runtime position.
+    let corr_dim = |n_rotations: f32| -> f32 {
+        n_rot as f32 * (n_orig_ctx as f32 / (n_rotations * 2.0 * std::f32::consts::PI)).ln()
+            / (2.0 * theta_base.ln())
+    };
+    let corr_low = corr_dim(beta_fast).floor().max(0.0);
+    let corr_high = corr_dim(beta_slow).ceil().min(n_rot as f32 - 1.0);
+
+    let out = Tensor::empty(dev, qk.shape.clone(), DType::F32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    let half = (head_dim / 2) as u32;
+    dev.dispatch_raw_cuda(
+        ROPE_YARN_PARTIAL_POSBUF_SRC, "rope_yarn_partial_posbuf.cu", "ffai_rope_yarn_partial_posbuf",
+        &[
+            (qk.buffer.as_ref(), qk.offset),
+            (out.buffer.as_ref(), 0),
+            (pos_buf.buffer.as_ref(), pos_buf.offset),
+        ],
+        &[
+            i(head_dim as i32), i(n_rot as i32),
+            f(theta_base), f(freq_scale), f(ext_factor), f(attn_factor),
+            f(corr_low), f(corr_high),
+        ],
+        [n_heads as u32, 1, 1], [1, half, 1], 0, false,
+    )?;
+    Ok(out)
+}
+
+/// Write a single `u32` scalar into an existing 1-element device buffer, in
+/// place, without reallocating. Laguna's CUDA-graph decode path
+/// (`FFAI_LAGUNA_GRAPH=1`) keeps a small persistent "workspace" of such
+/// buffers (token id, RoPE position, KV length) whose device POINTERS get
+/// captured into the graph and must never move; only their contents change
+/// from token to token. Call this OUTSIDE any graph-capture region — it must
+/// run eagerly every step, right before the (captured or replayed) decode
+/// work that reads the buffer.
+pub fn write_u32(dev: &dyn Device, buf: &Tensor, val: u32) -> Result<()> {
+    dev.dispatch_raw_cuda(
+        WRITE_U32_SRC, "write_u32.cu", "ffai_write_u32",
+        &[(buf.buffer.as_ref(), buf.offset)],
+        &[val.to_le_bytes().to_vec()],
+        [1, 1, 1], [1, 1, 1], 0, false,
+    )
+}
+
+const WRITE_U32_SRC: &str = r#"
+extern "C" __global__ void ffai_write_u32(unsigned int* __restrict__ buf, unsigned int val)
+{
+    buf[0] = val;
+}
+"#;
+
+// ── Laguna per-head softplus attention gate (raw CUDA) ───────────────────
+//
+// `g` holds one raw (pre-activation) gate scalar per head, projected from
+// the same normed hidden state that feeds Q/K/V (`g_proj(attn_norm(x))`,
+// NOT the attention output). This multiplies `softplus(g[h])` into every
+// element of head `h`'s attention output, broadcasting the scalar across
+// `head_dim` — applied BEFORE `o_proj`.
+const GATE_SOFTPLUS_MUL_PERHEAD_SRC: &str = r#"
+extern "C" __global__ void ffai_gate_softplus_mul_perhead(
+    const float* __restrict__ attn, const float* __restrict__ g,
+    float* __restrict__ out, int head_dim, int n_heads)
+{
+    int h = blockIdx.x;
+    int i = threadIdx.x;
+    if (h >= n_heads || i >= head_dim) return;
+    float gv = g[h];
+    // softplus(x) = log1p(exp(x)); linear for large x where exp(x) overflows.
+    float sp = gv > 20.0f ? gv : log1pf(expf(gv));
+    out[h * head_dim + i] = attn[h * head_dim + i] * sp;
+}
+"#;
+
+/// Per-head softplus attention gate: `out[h, i] = attn[h, i] * softplus(g[h])`
+/// for `attn` `[n_heads, head_dim]` and `g` `[n_heads]` (one raw gate scalar
+/// per head, broadcast over `head_dim`). Laguna's XS.2/S.2 attention-output
+/// gate, applied before `o_proj`. f32 only.
+pub fn gate_softplus_mul_perhead(dev: &dyn Device, attn: &Tensor, g: &Tensor) -> Result<Tensor> {
+    let head_dim = *attn.shape.last().ok_or_else(|| Error::Msg("gate_softplus_mul_perhead: scalar attn".into()))?;
+    let n_heads = attn.elem_count() / head_dim;
+    if g.elem_count() != n_heads {
+        return Err(Error::Msg(format!(
+            "gate_softplus_mul_perhead: g has {} elems, expected {n_heads} (one per head)",
+            g.elem_count()
+        )));
+    }
+    let out = Tensor::empty(dev, attn.shape.clone(), DType::F32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        GATE_SOFTPLUS_MUL_PERHEAD_SRC, "gate_softplus_mul_perhead.cu", "ffai_gate_softplus_mul_perhead",
+        &[(attn.buffer.as_ref(), attn.offset), (g.buffer.as_ref(), g.offset), (out.buffer.as_ref(), 0)],
+        &[i(head_dim as i32), i(n_heads as i32)],
+        [n_heads as u32, 1, 1], [head_dim as u32, 1, 1], 0, false,
+    )?;
+    Ok(out)
 }
 
 /// Softmax over the last dim, row-wise. Dispatches `mt_softmax`. Row width
@@ -5287,12 +6303,125 @@ pub fn mamba_split_proj(
         // = 64*161) is a multiple of 64 → s*in_proj_out always divisible by 64.
         {
             let nt = (s * in_proj_out) as u32;
-            let b = if nt % 64 == 0 { 64u32 } else if nt % 32 == 0 { 32u32 } else { 1u32 };
+            let b = if nt % 512 == 0 { 512u32 } else if nt % 256 == 0 { 256u32 } else if nt % 64 == 0 { 64u32 } else if nt % 32 == 0 { 32u32 } else { 1u32 };
             Grid { grid: [nt / b, 1, 1], block: [b, 1, 1] }
         },
     )?;
     Ok((z_out, xbc_out, dt_out))
 }
+const MAMBA_SPLIT_V4_SRC: &str = r#"
+#include <cuda_runtime.h>
+
+extern "C" __global__ void mamba_split_proj_v4(
+    const float* __restrict__ proj,
+    float* __restrict__ z_out,
+    float* __restrict__ xbc_out,
+    float* __restrict__ dt_out,
+    int in_proj_out4, int di4, int conv_dim4, int m_nh4, int total4)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total4) return;
+    int row4 = di4 + conv_dim4 + m_nh4;
+    int ti = idx / row4;
+    int ci4 = idx - ti * row4;
+    const float4* __restrict__ src4 = reinterpret_cast<const float4*>(proj);
+    float4 v = src4[(size_t)ti * in_proj_out4 + ci4];
+    if (ci4 < di4) {
+        reinterpret_cast<float4*>(z_out)[(size_t)ti * di4 + ci4] = v;
+    } else if (ci4 < di4 + conv_dim4) {
+        int j = ci4 - di4;
+        reinterpret_cast<float4*>(xbc_out)[(size_t)ti * conv_dim4 + j] = v;
+    } else {
+        int j = ci4 - di4 - conv_dim4;
+        reinterpret_cast<float4*>(dt_out)[(size_t)ti * m_nh4 + j] = v;
+    }
+}
+
+__device__ __forceinline__ float mamba_softplus(float x) {
+    return x > 20.0f ? x : logf(1.0f + expf(x));
+}
+
+extern "C" __global__ void mamba_split_proj_softplus_v4(
+    const float* __restrict__ proj,
+    const float* __restrict__ bias,
+    float* __restrict__ z_out,
+    float* __restrict__ xbc_out,
+    float* __restrict__ dt_out,
+    int in_proj_out4, int di4, int conv_dim4, int m_nh4, int total4)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total4) return;
+    int row4 = di4 + conv_dim4 + m_nh4;
+    int ti = idx / row4;
+    int ci4 = idx - ti * row4;
+    const float4* __restrict__ src4 = reinterpret_cast<const float4*>(proj);
+    float4 v = src4[(size_t)ti * in_proj_out4 + ci4];
+    if (ci4 < di4) {
+        reinterpret_cast<float4*>(z_out)[(size_t)ti * di4 + ci4] = v;
+    } else if (ci4 < di4 + conv_dim4) {
+        int j = ci4 - di4;
+        reinterpret_cast<float4*>(xbc_out)[(size_t)ti * conv_dim4 + j] = v;
+    } else {
+        int j = ci4 - di4 - conv_dim4;
+        int b = j << 2;
+        v.x = mamba_softplus(v.x + bias[b + 0]);
+        v.y = mamba_softplus(v.y + bias[b + 1]);
+        v.z = mamba_softplus(v.z + bias[b + 2]);
+        v.w = mamba_softplus(v.w + bias[b + 3]);
+        reinterpret_cast<float4*>(dt_out)[(size_t)ti * m_nh4 + j] = v;
+    }
+}
+"#;
+
+/// Fused raw-float4 in_proj split (z/xbc/dt) WITH dt-bias+softplus folded into
+/// the dt band. Replaces mamba_split_proj + softplus_add_rows. Escape with
+/// NEMOTRON_MAMBA_SPLIT_RAW_OFF=1 or NEMOTRON_MAMBA_SPLIT_SOFTPLUS_OFF=1.
+pub fn mamba_split_proj_softplus(
+    dev: &dyn Device,
+    proj: &Tensor,
+    bias: &Tensor,
+    s: usize,
+    in_proj_out: usize,
+    di: usize,
+    conv_dim: usize,
+    m_nh: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let raw_ok = std::env::var("NEMOTRON_MAMBA_SPLIT_RAW_OFF").is_err()
+        && std::env::var("NEMOTRON_MAMBA_SPLIT_SOFTPLUS_OFF").is_err()
+        && proj.dtype == DType::F32 && bias.dtype == DType::F32
+        && proj.offset % 16 == 0 && bias.offset % 4 == 0
+        && di % 4 == 0 && conv_dim % 4 == 0 && m_nh % 4 == 0 && in_proj_out % 4 == 0;
+    if raw_ok {
+        let z_out  = Tensor::empty(dev, vec![s * di], DType::F32)?;
+        let xbc_out = Tensor::empty(dev, vec![s * conv_dim], DType::F32)?;
+        let dt_out  = Tensor::empty(dev, vec![s * m_nh], DType::F32)?;
+        let i = |v: i32| v.to_le_bytes().to_vec();
+        let total4 = (s * (di + conv_dim + m_nh) / 4) as u32;
+        if dev.dispatch_raw_cuda(
+            MAMBA_SPLIT_V4_SRC,
+            "mamba_split_v4.cu",
+            "mamba_split_proj_softplus_v4",
+            &[
+                (proj.buffer.as_ref(), proj.offset),
+                (bias.buffer.as_ref(), bias.offset),
+                (z_out.buffer.as_ref(), 0),
+                (xbc_out.buffer.as_ref(), 0),
+                (dt_out.buffer.as_ref(), 0),
+            ],
+            &[i((in_proj_out / 4) as i32), i((di / 4) as i32), i((conv_dim / 4) as i32), i((m_nh / 4) as i32), i(total4 as i32)],
+            [total4.div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+            false,
+        ).is_ok() {
+            return Ok((z_out, xbc_out, dt_out));
+        }
+    }
+    let (z, xbc, dt_raw) = mamba_split_proj(dev, proj, s, in_proj_out, di, conv_dim, m_nh)?;
+    let dt = softplus_add_rows(dev, &dt_raw, bias, s, m_nh)?;
+    Ok((z, xbc, dt))
+}
+
 
 // ── Fused Mamba conv-output split (Part-B: 3 strided_col_copy → 1 dispatch) ─
 //
@@ -5339,6 +6468,82 @@ pub fn mamba_split_conv(
 // Processes S tokens in one dispatch.  Each thread-group handles one (token,
 // norm-group) pair.  Replaces the host dl+compute+upload loop in the
 // CONV_DEVICE prefill path (TODO comment at line ~1543 of modeltests/lib.rs).
+/// RMSNorm with f16 output only. Equivalent to `cast_f32_f16(rms_norm(...))`,
+/// but avoids the intermediate f32 norm tensor and the separate cast launch.
+pub fn rms_norm_f16out(dev: &dyn Device, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+    let n = *x.shape.last().ok_or_else(|| Error::Msg("rms_norm_f16out: scalar input".into()))?;
+    if std::env::var("NEMOTRON_RMS_NORM_F16OUT_OFF").is_ok()
+        || x.dtype != DType::F32
+        || weight.dtype != DType::F32
+        || n % 128 != 0
+        || n > 4096
+    {
+        let out = rms_norm(dev, x, weight, eps)?;
+        return cast_f32_f16(dev, &out);
+    }
+    let rows = x.elem_count() / n;
+    let out = Tensor::empty(dev, x.shape.clone(), DType::F16)?;
+    let eps_buf = scalar_buf(dev, eps.to_bits())?;
+    let k = cached_ir("mt_rms_norm_f16out", DType::F32, || {
+        let mut k = metaltile_std::mlx::rms_norm::mt_rms_norm_f16out::kernel_ir_for(DType::F32);
+        k.mode = metaltile_core::ir::KernelMode::Reduction;
+        k
+    });
+    let grid = Grid { grid: [rows as u32, 1, 1], block: [(n / 4) as u32, 1, 1] };
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(weight.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            Binding::Buffer(eps_buf),
+            Binding::Scalar((n as u32).to_le_bytes().to_vec()),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+pub fn gated_group_rmsnorm_batched_f16out(
+    dev: &dyn Device,
+    y: &Tensor,
+    z: &Tensor,
+    w: &Tensor,
+    eps: f32,
+    s: usize,
+    di: usize,
+    gs: usize,
+) -> Result<Tensor> {
+    if std::env::var("NEMOTRON_GATED_NORM_F16OUT_OFF").is_ok() {
+        let out = gated_group_rmsnorm_batched(dev, y, z, w, eps, s, di, gs)?;
+        return cast_f32_f16(dev, &out);
+    }
+    let ng = di / gs;
+    let kernel = cached_ir("gated_group_rmsnorm_batched_f16out", DType::F32, || {
+        use metaltile_core::ir::KernelMode;
+        let mut k = metaltile_std::ffai::ssm::gated_group_rmsnorm_batched_f16out::kernel_ir_for();
+        k.mode = KernelMode::Reduction;
+        k
+    });
+    let out = Tensor::empty(dev, vec![s * di], DType::F16)?;
+    let eps_buf = Tensor::new(scalar_buf(dev, eps.to_bits())?, vec![1], DType::F32);
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(y.buffer.clone()),
+            Binding::Buffer(z.buffer.clone()),
+            Binding::Buffer(w.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            Binding::Buffer(eps_buf.buffer.clone()),
+            u(gs as u32),
+            u(ng as u32),
+        ],
+        Grid { grid: [(s * ng) as u32, 1, 1], block: [(gs / 4) as u32, 1, 1] },
+    )?;
+    Ok(out)
+}
+
 pub fn gated_group_rmsnorm_batched(
     dev: &dyn Device,
     y: &Tensor,
@@ -6926,9 +8131,9 @@ extern "C" __global__ void moe_extend_groups(
 // FP8 e4m3 per-tensor quant. Pass 1 = nvfp4_amax_slab (reused, mode 0).
 // fp8_scale: amax bits -> scale = amax/448 and inv (one thread).
 extern "C" __global__ void fp8_scale(
-    const unsigned* __restrict__ amax_bits, float* __restrict__ sc)
+    const unsigned* __restrict__ amax_bits, float* __restrict__ sc, float clip)
 {
-    float am=__uint_as_float(*amax_bits);
+    float am=__uint_as_float(*amax_bits)*((clip>0.f)?clip:1.f);
     float s=(am>0.f)?(am/448.f):1.f;
     sc[0]=s;        // dequant scale (consumed by the GEMM)
     sc[1]=1.f/s;    // quant scale (consumed by fp8_quant)
@@ -6993,6 +8198,61 @@ extern "C" __global__ void fp8_rowcol_scale_f32(
     for(;e<n;e+=st){ int r=(int)(e/N), c=(int)(e%N); o[e]*=xsc[r]*wsc[c]; }
 }
 
+// Fused block-Hadamard(128) along K + global amax of |rotated| (atomicMax on
+// the float bit-pattern, monotonic for positives). Collapses the separate
+// fwht + amax passes for the per-tensor fp8 proj path. K % 128 == 0.
+extern "C" __global__ void fwht128_amax(
+    const __half* __restrict__ x, __half* __restrict__ y,
+    unsigned* __restrict__ amax, long rows, int K)
+{
+    int nb = K / 128;
+    long bid = (long)blockIdx.x;
+    if (bid >= rows * (long)nb) return;
+    int t = threadIdx.x;
+    __shared__ float s[128];
+    long base = bid * 128;
+    s[t] = __half2float(x[base + t]);
+    __syncthreads();
+    for (int len = 1; len < 128; len <<= 1) {
+        float a = s[t]; float b = s[t ^ len];
+        __syncthreads();
+        s[t] = (t & len) ? (b - a) : (a + b);
+        __syncthreads();
+    }
+    float r = s[t] * 0.08838834764831845f;
+    y[base + t] = __float2half(r);
+    // block-reduce |r| then one atomicMax to the global amax
+    s[t] = fabsf(r);
+    __syncthreads();
+    for (int o = 64; o > 0; o >>= 1) { if (t < o) s[t] = fmaxf(s[t], s[t + o]); __syncthreads(); }
+    if (t == 0) atomicMax(amax, __float_as_uint(s[0]));
+}
+
+// Block Walsh-Hadamard transform (size 128) along the K dim, normalized by
+// 1/sqrt(128). Each CUDA block handles one (row, kblock) of 128 contiguous
+// elems. Orthonormal: rotating both activation and weight along K leaves the
+// GEMM x.Wt unchanged, but spreads per-channel activation outliers so a
+// per-tensor fp8 quant holds quality (QuaRot/Hadamard recipe). K % 128 == 0.
+extern "C" __global__ void fwht128(
+    const __half* __restrict__ x, __half* __restrict__ y, long rows, int K)
+{
+    int nb = K / 128;
+    long bid = (long)blockIdx.x;
+    if (bid >= rows * (long)nb) return;
+    int t = threadIdx.x; // 0..127
+    __shared__ float s[128];
+    long base = bid * 128;
+    s[t] = __half2float(x[base + t]);
+    __syncthreads();
+    for (int len = 1; len < 128; len <<= 1) {
+        float a = s[t]; float b = s[t ^ len];
+        __syncthreads();
+        s[t] = (t & len) ? (b - a) : (a + b);
+        __syncthreads();
+    }
+    y[base + t] = __float2half(s[t] * 0.08838834764831845f); // 1/sqrt(128)
+}
+
 extern "C" __global__ void fp8_quant(
     const __half* __restrict__ x, unsigned char* __restrict__ q,
     const float* __restrict__ sc, long n)
@@ -7019,6 +8279,51 @@ extern "C" __global__ void fp8_quant(
         }
         q[i]=(unsigned char)(s|c);
     }
+}
+
+// Pass-1 of the fused fp8 act path: block-Hadamard(128) along K + global amax,
+// WITHOUT materializing the rotated tensor (no y write). Halves the HBM of the
+// old fwht128_amax (which wrote a full [rows,K] f16 that fp8_quant then re-read).
+extern "C" __global__ void fwht128_amaxonly(
+    const __half* __restrict__ x, unsigned* __restrict__ amax, long rows, int K)
+{
+    int nb = K / 128; long bid = (long)blockIdx.x;
+    if (bid >= rows * (long)nb) return;
+    int t = threadIdx.x; __shared__ float s[128]; long base = bid * 128;
+    s[t] = __half2float(x[base + t]); __syncthreads();
+    for (int len = 1; len < 128; len <<= 1) {
+        float a = s[t]; float b = s[t ^ len]; __syncthreads();
+        s[t] = (t & len) ? (b - a) : (a + b); __syncthreads();
+    }
+    float r = s[t] * 0.08838834764831845f;
+    s[t] = fabsf(r); __syncthreads();
+    for (int o = 64; o > 0; o >>= 1) { if (t < o) s[t] = fmaxf(s[t], s[t + o]); __syncthreads(); }
+    if (t == 0) atomicMax(amax, __float_as_uint(s[0]));
+}
+
+// Pass-2 of the fused fp8 act path: re-rotate x (Hadamard 128) AND quant to e4m3
+// in one kernel reading x directly (no rotated-tensor round-trip). Uses the
+// precomputed scale sc[1]. Same e4m3 encoding as fp8_quant.
+extern "C" __global__ void fwht128_quant(
+    const __half* __restrict__ x, unsigned char* __restrict__ q,
+    const float* __restrict__ sc, long rows, int K)
+{
+    int nb = K / 128; long bid = (long)blockIdx.x;
+    if (bid >= rows * (long)nb) return;
+    int t = threadIdx.x; __shared__ float s[128]; long base = bid * 128;
+    s[t] = __half2float(x[base + t]); __syncthreads();
+    for (int len = 1; len < 128; len <<= 1) {
+        float a = s[t]; float b = s[t ^ len]; __syncthreads();
+        s[t] = (t & len) ? (b - a) : (a + b); __syncthreads();
+    }
+    float v = s[t] * 0.08838834764831845f * sc[1];
+    v = fminf(fmaxf(v, -448.f), 448.f);
+    unsigned sgn=(v<0.f)?0x80u:0u; float a=fabsf(v); unsigned c;
+    if(a<0.0009765625f){ int m=(int)rintf(a*512.f); if(m>7)m=7; c=(unsigned)m; }
+    else { int e; float fr=frexpf(a,&e); int E=e+6; int m=(int)rintf((2.f*fr-1.f)*8.f);
+        if(m>7){m=0;E+=1;} if(E<1){ int ms=(int)rintf(a*512.f); if(ms>7)ms=7; c=(unsigned)ms; }
+        else { if(E>15)E=15; if(E==15&&m>6)m=6; c=(unsigned)((E<<3)|m); } }
+    q[base + t]=(unsigned char)(sgn|c);
 }
 
 // f32-input variant of lt_fp4_quant — reads the residual-stream f32 tensor
@@ -7690,6 +8995,54 @@ pub fn w4a8_packw(
 
 /// `sfb_exp_bytes` = per-expert SFB stride in bytes (from `w8a8_packw`).
 #[allow(clippy::too_many_arguments)]
+/// Validated NVFP4 (f16-act) grouped-MoE GEMM (marlin). `a` f16 `[m,K]`, `b` fp4
+/// marlin-tile u32 `[n_exp,K/16,N*2]`, `b_scales` S0E5M3 fp8 (u32-viewed),
+/// `global_scale` f32 `[n_exp]`, `topk_weights` f32 `[m*top_k]`; routing
+/// (`sorted_token_ids`/`expert_ids`/`num_tokens_past_padded`) device i32.
+/// Returns f16 `[m*top_k, N]`. mul_topk_weights + fp32 reduce on.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_marlin_gemm(
+    dev: &dyn Device,
+    a: &Tensor, b: &Tensor, b_scales: &Tensor, global_scale: &Tensor, topk_weights: &Tensor,
+    sorted_token_ids: &Tensor, expert_ids: &Tensor, num_tokens_past_padded: &Tensor,
+    prob_m: usize, prob_n: usize, prob_k: usize, num_experts: usize, top_k: usize,
+    group_size: usize, moe_block: usize, sms: i32,
+) -> Result<Tensor> {
+    let mt = (prob_m * top_k).max(1);
+    let out = Tensor::empty(dev, vec![mt, prob_n.max(1)], DType::F16)?;
+    let num_groups = prob_k / group_size;
+    let ctmp = ((sms as usize) * 4 * moe_block * 256).max(1);
+    let c_tmp = Tensor::new(dev.alloc_zeroed(ctmp * 4)?, vec![ctmp], DType::F32);
+    let wsn = ((sms as usize) * 4).max(1);
+    let ws = Tensor::new(dev.alloc_zeroed(wsn * 4)?, vec![wsn], DType::U32);
+    dev.moe_marlin_gemm(
+        a.buffer.as_ref(), b.buffer.as_ref(), out.buffer.as_ref(), c_tmp.buffer.as_ref(),
+        b_scales.buffer.as_ref(), global_scale.buffer.as_ref(), topk_weights.buffer.as_ref(),
+        sorted_token_ids.buffer.as_ref(), expert_ids.buffer.as_ref(), num_tokens_past_padded.buffer.as_ref(),
+        ws.buffer.as_ref(),
+        moe_block, num_experts, top_k, true, prob_m, prob_n, prob_k, num_groups, group_size, sms, true,
+    )?;
+    Ok(out)
+}
+
+/// Repack one expert's GPTQ-packed `[K/8,N]` u32 weights -> marlin tile `[K/16,N*2]` u32 (device).
+pub fn marlin_repack(dev: &dyn Device, b_q: &Tensor, size_k: usize, size_n: usize, sms: i32, max_shared_mem: i32) -> Result<Tensor> {
+    let out_elems = ((size_k / 16) * (size_n * 2)).max(1);
+    let out = Tensor::new(dev.alloc(out_elems * 4)?, vec![out_elems], DType::U32);
+    dev.marlin_repack(b_q.buffer.as_ref(), out.buffer.as_ref(), size_k, size_n, sms, max_shared_mem)?;
+    Ok(out)
+}
+
+/// On-device marlin routing build from per-expert offsets `off` [n_exp+1] (device i32).
+pub fn marlin_build_routing(dev:&dyn Device, off:&Tensor, n_exp:usize, blk:usize, mt:usize)->Result<(Tensor,Tensor,Tensor)>{
+    let max_blocks = mt/blk + n_exp + 1;
+    let stid=Tensor::new(dev.alloc((max_blocks*blk).max(1)*4)?, vec![(max_blocks*blk).max(1)], DType::U32);
+    let eid=Tensor::new(dev.alloc(max_blocks.max(1)*4)?, vec![max_blocks.max(1)], DType::U32);
+    let ntpp=Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
+    dev.marlin_build_routing(off.buffer.as_ref(), n_exp, blk, mt, stid.buffer.as_ref(), eid.buffer.as_ref(), ntpp.buffer.as_ref())?;
+    Ok((stid,eid,ntpp))
+}
+
 pub fn moe_grouped_gemm_w8a8(
     dev: &dyn Device,
     a_pack: &Tensor, a_sf: &Tensor, sfa_off: &[i64],
@@ -7747,7 +9100,7 @@ pub fn w8a8_packw(
 /// Quantize an f16 tensor to e4m3 with a dynamic per-tensor scale.
 /// Returns `(q, sc)` — e4m3 bytes `[n]` + a 2-f32 scale buffer
 /// `[dequant_scale, quant_scale]` (the GEMM consumes word 0).
-pub fn fp8_quant(dev: &dyn Device, x: &Tensor, n: usize) -> Result<(Tensor, Tensor)> {
+pub fn fp8_quant(dev: &dyn Device, x: &Tensor, n: usize, clip: f32) -> Result<(Tensor, Tensor)> {
     let i = |v: i32| v.to_le_bytes().to_vec();
     let l = |v: i64| v.to_le_bytes().to_vec();
     let amax = Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
@@ -7760,7 +9113,7 @@ pub fn fp8_quant(dev: &dyn Device, x: &Tensor, n: usize) -> Result<(Tensor, Tens
     dev.dispatch_raw_cuda(
         MOE_FP4_SRC, "moe_fp4.cu", "fp8_scale",
         &[(amax.buffer.as_ref(), 0), (sc.buffer.as_ref(), 0)],
-        &[], [1, 1, 1], [1, 1, 1], 0, false)?;
+        &[clip.to_le_bytes().to_vec()], [1, 1, 1], [1, 1, 1], 0, false)?;
     let q = Tensor::new(dev.alloc(n)?, vec![n], DType::U32);
     dev.dispatch_raw_cuda(
         MOE_FP4_SRC, "moe_fp4.cu", "fp8_quant",
@@ -7768,6 +9121,87 @@ pub fn fp8_quant(dev: &dyn Device, x: &Tensor, n: usize) -> Result<(Tensor, Tens
         &[l(n as i64)],
         [(n as u32).div_ceil(256 * 4).max(1), 1, 1], [256, 1, 1], 0, false)?;
     Ok((q, sc))
+}
+
+/// Fused block-Hadamard(128) along K + global amax. Returns `(rotated [rows,k]
+/// f16, amax [1] u32 bits)` for a subsequent fp8 quant that skips its own amax.
+pub fn fwht128_amax(dev: &dyn Device, x: &Tensor, rows: usize, k: usize) -> Result<(Tensor, Tensor)> {
+    if k % 128 != 0 { return Err(Error::Msg(format!("fwht128_amax: k {k} %128 != 0"))); }
+    let y = Tensor::new(dev.alloc(rows * k * 2)?, vec![rows * k], DType::F16);
+    let amax = Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
+    let nb = (rows * (k / 128)) as u32;
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let l = |v: i64| v.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fwht128_amax",
+        &[(x.buffer.as_ref(), x.offset), (y.buffer.as_ref(), 0), (amax.buffer.as_ref(), 0)],
+        &[l(rows as i64), i(k as i32)],
+        [nb, 1, 1], [128, 1, 1], 0, false)?;
+    Ok((y.reshaped(vec![rows, k]), amax))
+}
+
+/// Per-tensor fp8 quant using a PRECOMPUTED amax (from `fwht128_amax`), with
+/// optional clip. Returns `(q bytes, sc [2] f32)`. Skips the amax pass.
+pub fn fp8_quant_pre(dev: &dyn Device, x: &Tensor, n: usize, amax: &Tensor, clip: f32) -> Result<(Tensor, Tensor)> {
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let l = |v: i64| v.to_le_bytes().to_vec();
+    let sc = Tensor::new(dev.alloc(8)?, vec![2], DType::F32);
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fp8_scale",
+        &[(amax.buffer.as_ref(), 0), (sc.buffer.as_ref(), 0)],
+        &[clip.to_le_bytes().to_vec()], [1, 1, 1], [1, 1, 1], 0, false)?;
+    let q = Tensor::new(dev.alloc(n)?, vec![n], DType::U32);
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fp8_quant",
+        &[(x.buffer.as_ref(), x.offset), (q.buffer.as_ref(), 0), (sc.buffer.as_ref(), 0)],
+        &[l(n as i64)],
+        [(n as u32).div_ceil(256 * 4).max(1), 1, 1], [256, 1, 1], 0, false)?;
+    Ok((q, sc))
+}
+
+/// Fused-path pass 1: block-Hadamard(128) along K + global amax, NO rotated
+/// output (saves the [rows,k] f16 write+read vs `fwht128_amax`). Returns amax bits.
+pub fn fwht128_amaxonly(dev: &dyn Device, x: &Tensor, rows: usize, k: usize) -> Result<Tensor> {
+    if k % 128 != 0 { return Err(Error::Msg(format!("fwht128_amaxonly: k {k} %128 != 0"))); }
+    let amax = Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
+    let nb = (rows * (k / 128)) as u32;
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fwht128_amaxonly",
+        &[(x.buffer.as_ref(), x.offset), (amax.buffer.as_ref(), 0)],
+        &[(rows as i64).to_le_bytes().to_vec(), (k as i32).to_le_bytes().to_vec()],
+        [nb, 1, 1], [128, 1, 1], 0, false)?;
+    Ok(amax)
+}
+
+/// Fused-path pass 2: re-rotate `x` (Hadamard 128 along K) AND quant to e4m3 in
+/// one kernel reading `x` directly (no rotated-tensor round-trip), using a
+/// precomputed amax. Returns `(q bytes, sc [2] f32)`.
+pub fn fwht128_quant_pre(dev: &dyn Device, x: &Tensor, rows: usize, k: usize, amax: &Tensor, clip: f32) -> Result<(Tensor, Tensor)> {
+    if k % 128 != 0 { return Err(Error::Msg(format!("fwht128_quant_pre: k {k} %128 != 0"))); }
+    let sc = Tensor::new(dev.alloc(8)?, vec![2], DType::F32);
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fp8_scale",
+        &[(amax.buffer.as_ref(), 0), (sc.buffer.as_ref(), 0)],
+        &[clip.to_le_bytes().to_vec()], [1, 1, 1], [1, 1, 1], 0, false)?;
+    let n = rows * k;
+    let q = Tensor::new(dev.alloc(n)?, vec![n], DType::U32);
+    let nb = (rows * (k / 128)) as u32;
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fwht128_quant",
+        &[(x.buffer.as_ref(), x.offset), (q.buffer.as_ref(), 0), (sc.buffer.as_ref(), 0)],
+        &[(rows as i64).to_le_bytes().to_vec(), (k as i32).to_le_bytes().to_vec()],
+        [nb, 1, 1], [128, 1, 1], 0, false)?;
+    Ok((q, sc))
+}
+
+/// Block Walsh-Hadamard transform (128) along K of an f16 `[rows, k]` tensor.
+/// k must be a multiple of 128. Orthonormal; used to spread activation outliers
+/// before a per-tensor fp8 quant (and applied identically to the weight offline).
+pub fn fwht128(dev: &dyn Device, x: &Tensor, rows: usize, k: usize) -> Result<Tensor> {
+    if k % 128 != 0 { return Err(Error::Msg(format!("fwht128: k {k} %128 != 0"))); }
+    let y = Tensor::new(dev.alloc(rows * k * 2)?, vec![rows * k], DType::F16);
+    let nb = (rows * (k / 128)) as u32;
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let l = |v: i64| v.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fwht128",
+        &[(x.buffer.as_ref(), x.offset), (y.buffer.as_ref(), 0)],
+        &[l(rows as i64), i(k as i32)],
+        [nb, 1, 1], [128, 1, 1], 0, false)?;
+    Ok(y.reshaped(vec![rows, k]))
 }
 
 /// FP8 e4m3 dense GEMM with per-tensor scales (vendor-recipe precision for
@@ -8101,4 +9535,35 @@ pub fn add_rms_norm(
         grid,
     )?;
     Ok((residual, normed))
+}
+
+#[cfg(test)]
+mod marlin_prep_validate {
+    use super::*;
+    use std::fs;
+    fn rf32(p:&str)->Vec<f32>{let b=fs::read(p).unwrap(); b.chunks(4).map(|c|f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect()}
+    #[test]
+    fn marlin_weight_prep_matches_python(){
+        let (n,k)=(1856usize,2688usize); let ng=k/16; let kp=k/8;
+        let w0=rf32("/tmp/mdata/W0.bin"); assert_eq!(w0.len(), n*k);
+        let (codes,uesc,global)=quantize_nvfp4(&w0,n,k);
+        // codes[N,kp] -> transpose [kp,N]
+        let mut qw=vec![0u32; kp*n];
+        for r in 0..n { for c in 0..kp { qw[c*n+r]=codes[r*kp+c]; } }
+        let qref=fs::read("/tmp/mdata/qweight.bin").unwrap();
+        let qref0:Vec<u32>=qref[..kp*n*4].chunks(4).map(|c|u32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+        let qm=qw.iter().zip(&qref0).filter(|(a,b)|a==b).count();
+        // scales: dec_ue4m3[N,ng] -> values, transpose [ng,N], s0e5m3
+        let mut sv=vec![0f32; ng*n];
+        for r in 0..n { for g in 0..ng { sv[g*n+r]=dec_ue4m3(uesc[r*ng+g]); } }
+        let s0=marlin_s0e5m3_scales(&sv,ng,n);
+        let bref=fs::read("/tmp/mdata/bscales.bin").unwrap();
+        let bm=s0.iter().zip(&bref[..ng*n]).filter(|(a,b)|a==b).count();
+        let gref=rf32("/tmp/mdata/global.bin");
+        let grust=global*128.0;
+        eprintln!("QW match {}/{}  BSCALE match {}/{}  global rust {} py {} (ratio {})", qm, kp*n, bm, ng*n, grust, gref[0], grust/gref[0]);
+        assert!(qm==kp*n, "qweight mismatch");
+        assert!(bm>=(ng*n*999/1000), "bscale mismatch");
+        assert!((grust/gref[0]-1.0).abs()<0.02, "global mismatch");
+    }
 }

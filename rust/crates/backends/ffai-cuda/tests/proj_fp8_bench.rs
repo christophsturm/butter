@@ -55,8 +55,8 @@ fn bench_shape(dev: &dyn Device, label: &str, m: usize, n: usize, k: usize, n_wa
     // ---- W8A8 per-TENSOR e4m3 (gemm_fp8) — GEMM-only timing (quant excluded) ----
     // Pre-quantize once (weights fixed; per-tensor act scale recomputed per call
     // in the real engine, but here we time the GEMM core in isolation).
-    let (wq_pt, wsc_pt) = fp8_quant(dev, &wh, n * k).unwrap();
-    let (xq_pt, xsc_pt) = fp8_quant(dev, &xh, m * k).unwrap();
+    let (wq_pt, wsc_pt) = fp8_quant(dev, &wh, n * k, 1.0).unwrap();
+    let (xq_pt, xsc_pt) = fp8_quant(dev, &xh, m * k, 1.0).unwrap();
     let pt_ref = gemm_fp8(dev, &xq_pt, &xsc_pt, &wq_pt, &wsc_pt, m, n, k, true).unwrap();
     for _ in 0..n_warm { let _ = gemm_fp8(dev, &xq_pt, &xsc_pt, &wq_pt, &wsc_pt, m, n, k, true).unwrap(); }
     dev.synchronize().ok();
