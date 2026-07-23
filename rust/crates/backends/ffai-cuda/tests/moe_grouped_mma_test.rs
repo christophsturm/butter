@@ -6,7 +6,7 @@
 
 use ffai_cuda::CudaDevice;
 use ffai_core::{DType, Device, Tensor};
-use ffai_ops::{gemm_cublas_f32out, fwht128, gemm_fp8, fp8_quant, moe_q4_grouped_mma_dev, quantize_q4, moe_grouped_gemm_mma, moe_grouped_gemm_cutlass, cast_f32_f16, cast_f16_f32, lt_fp4_quant_g, lt_fp4_quant_g_46, dec_ue4m3,
+use ffai_ops::{gemm_cublas_f32out, fwht128, gemm_fp8, fp8_quant, moe_q4_grouped_mma, moe_q4_grouped_mma_dev, quantize_q4, moe_grouped_gemm_mma, moe_grouped_gemm_cutlass, cast_f32_f16, cast_f16_f32, lt_fp4_quant_g, lt_fp4_quant_g_46, dec_ue4m3,
     moe_grouped_gemm_w4a8, w4a8_actquant_grouped, w4a8_packw, w4a8_sfa_offsets,
     moe_grouped_gemm_w8a8, w8a8_actquant_grouped, w8a8_packw,
     lt_fp4_quant_slab, lt_fp4_quant_grouped, moe_grouped_gemm_cutlass_fp4, rms_norm, gemm_cublas, cast_f32_bf16, cast_bf16_f32};
@@ -79,7 +79,7 @@ fn run_cutlass(d: &dyn Device, n_exp: usize, k: usize, n: usize, groups: &[(usiz
     let w_dev = cast_f32_f16(d, &up(&w_f, vec![n_exp, n, k])).unwrap().reshaped(vec![n_exp, n, k]);
     let out = match moe_grouped_gemm_cutlass(d, &a_dev, &w_dev, &g_starts, &expert_ids, n, k) {
         Ok(o) => o,
-        Err(e) => { eprintln!("cutlass unavailable ({e:?}) — skip"); return; }
+        Err(e) => { eprintln!("cutlass unavailable ({e:?}), skip"); return; }
     };
     let got = dl(d, &cast_f16_f32(d, &out).unwrap());
     let mut exp = vec![0f32; mt*n];
@@ -112,11 +112,11 @@ fn run_w4a8(d: &dyn Device, n_exp: usize, k: usize, n: usize, groups: &[(usize, 
     // W4A8: fp8 e4m3 acts (group-aware per-32 SFA) x mxfp4 weights (per-32 SFB).
     let (sfa_off, sfa_bytes) = w4a8_sfa_offsets(&g_starts, k);
     let (a_q, a_sf) = match w4a8_actquant_grouped(d, &a_dev, &g_starts.iter().zip(g_starts.iter().skip(1)).map(|(s,e)|(e-s) as i32).collect::<Vec<_>>(), &sfa_off, sfa_bytes, mt, k) {
-        Ok(o) => o, Err(e) => { eprintln!("w4a8 actquant unavailable ({e:?}) — skip"); return; } };
+        Ok(o) => o, Err(e) => { eprintln!("w4a8 actquant unavailable ({e:?}): skip"); return; } };
     let (w_pack, w_sf, sfb_eb) = match w4a8_packw(d, &w_dev, n_exp, n, k) {
-        Ok(o) => o, Err(e) => { eprintln!("w4a8 packw unavailable ({e:?}) — skip"); return; } };
+        Ok(o) => o, Err(e) => { eprintln!("w4a8 packw unavailable ({e:?}): skip"); return; } };
     let out = match moe_grouped_gemm_w4a8(d, &a_q, &a_sf, &sfa_off, &w_pack, &w_sf, sfb_eb, &g_starts, &expert_ids, n, k) {
-        Ok(o) => o, Err(e) => { eprintln!("w4a8 gemm unavailable ({e:?}) — skip"); return; } };
+        Ok(o) => o, Err(e) => { eprintln!("w4a8 gemm unavailable ({e:?}): skip"); return; } };
     let got = dl(d, &cast_f16_f32(d, &out).unwrap());
 
     // host f32 reference + cosine
@@ -156,11 +156,11 @@ fn run_w8a8(d: &dyn Device, n_exp: usize, k: usize, n: usize, groups: &[(usize, 
     // W4A8: fp8 e4m3 acts (group-aware per-32 SFA) x mxfp4 weights (per-32 SFB).
     let (sfa_off, sfa_bytes) = w4a8_sfa_offsets(&g_starts, k);
     let (a_q, a_sf) = match w8a8_actquant_grouped(d, &a_dev, &g_starts.iter().zip(g_starts.iter().skip(1)).map(|(s,e)|(e-s) as i32).collect::<Vec<_>>(), &sfa_off, sfa_bytes, mt, k) {
-        Ok(o) => o, Err(e) => { eprintln!("w8a8 actquant unavailable ({e:?}) — skip"); return; } };
+        Ok(o) => o, Err(e) => { eprintln!("w8a8 actquant unavailable ({e:?}): skip"); return; } };
     let (w_pack, w_sf, sfb_eb) = match w8a8_packw(d, &w_dev, n_exp, n, k) {
-        Ok(o) => o, Err(e) => { eprintln!("w8a8 packw unavailable ({e:?}) — skip"); return; } };
+        Ok(o) => o, Err(e) => { eprintln!("w8a8 packw unavailable ({e:?}): skip"); return; } };
     let out = match moe_grouped_gemm_w8a8(d, &a_q, &a_sf, &sfa_off, &w_pack, &w_sf, sfb_eb, &g_starts, &expert_ids, n, k) {
-        Ok(o) => o, Err(e) => { eprintln!("w8a8 gemm unavailable ({e:?}) — skip"); return; } };
+        Ok(o) => o, Err(e) => { eprintln!("w8a8 gemm unavailable ({e:?}): skip"); return; } };
     let got = dl(d, &cast_f16_f32(d, &out).unwrap());
 
     // host f32 reference + cosine
@@ -261,7 +261,7 @@ fn moe_grouped_w4a8_down() {
 
 #[test]
 fn moe_grouped_w4a8_down_pad() {
-    // DOWN-proj K padded to 1920 (=15*128) — verifies K%128 is the constraint.
+    // DOWN-proj K padded to 1920 (=15*128), verifies K%128 is the constraint.
     let Some(d) = CudaDevice::create().expect("cuda") else { eprintln!("no CUDA"); return; };
     run_w4a8(d.as_ref(), 8, 1920, 2688, &[(0,96),(3,40),(5,128),(7,17)]);
 }
@@ -432,6 +432,107 @@ fn moe_q4_grouped_bench() {
     let ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
     let tf = 2.0 * mt as f64 * n as f64 * k as f64 / (ms * 1e-3) / 1e12;
     eprintln!("moe_q4_grouped_bench: mt={mt} N={n} K={k} -> {ms:.3} ms, {tf:.1} TFLOP/s (f16 ceiling ~85, cutlass-fp4 ref 60)");
+}
+
+// FFAI_LAGUNA_SCHED=1 A/B: descending-group-order tile emission + banded
+// N-block/tile grid transpose (see moe_q4_grouped_mma / _dev in ffai-ops).
+// Deliberately skewed groups (one big 200-row group, several tiny 3-row
+// groups, an empty group) so the reorder + banding actually rearranges tiles
+// relative to the default expert-order/tile-major launch.
+//
+// The real correctness bar here is FFAI_LAGUNA_SCHED=1 vs the default path,
+// NOT vs the host f32 reference: both device paths run the identical Q4
+// dequant + mma math per tile (same tile inputs, same K-reduction order
+// inside a tile), the only thing the flag changes is which CTA runs which
+// (tile, N-block) pair and in what order. Since tile-to-output-element
+// mapping is unchanged (disjoint writes per tile) and per-tile accumulation
+// order is unchanged (task constraint: "float accumulation order within a
+// tile is unchanged"), the two orderings should be near bit-exact: 1e-3
+// relative is generous headroom, not a quantization-noise budget. The
+// host-f32 reference is used only as a loose sanity check (cosine) that the
+// Q4 pipeline itself is producing a real signal, not to gate the A/B.
+#[test]
+fn moe_q4_grouped_laguna_sched_ab() {
+    let Some(d) = CudaDevice::create().expect("cuda") else { eprintln!("no CUDA"); return; };
+    let dev = d.as_ref();
+    let (n_exp, k, n) = (6usize, 128usize, 128usize);
+    // (expert_id, rows): order is deliberately skewed and includes a
+    // genuinely empty group to exercise the padding-tile path.
+    let groups: [(usize, usize); 6] = [(0, 200), (1, 3), (2, 0), (3, 3), (4, 3), (5, 37)];
+    let mut g_starts = vec![0usize];
+    let mut expert_ids = vec![];
+    for &(e, r) in &groups { expert_ids.push(e); g_starts.push(g_starts.last().unwrap() + r); }
+    let mt = *g_starts.last().unwrap();
+
+    let a_f = rng(mt * k, 41);
+    let w_f = rng(n_exp * n * k, 43);
+    let up = |v: &[f32], sh: Vec<usize>| -> Tensor {
+        Tensor::new(dev.upload(&tb(v)).unwrap(), vec![v.len()], DType::F32).reshaped(sh) };
+    let a_dev = cast_f32_f16(dev, &up(&a_f, vec![mt, k])).unwrap().reshaped(vec![mt, k]);
+    let (qs_v, sc_v) = quantize_q4(&w_f, n_exp * n, k);
+    let qs_b: Vec<u8> = qs_v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let qs = Tensor::new(dev.upload(&qs_b).unwrap(), vec![qs_v.len()], DType::U32);
+    let sc = cast_f32_f16(dev, &up(&sc_v, vec![sc_v.len()])).unwrap();
+
+    // host f32 reference (loose sanity check only, see comment above)
+    let mut exp = vec![0f32; mt * n];
+    for g in 0..groups.len() {
+        let (eid, _) = groups[g];
+        for t in g_starts[g]..g_starts[g + 1] {
+            for nn in 0..n {
+                let mut acc = 0f32;
+                for kk in 0..k { acc += a_f[t * k + kk] * w_f[(eid * n + nn) * k + kk]; }
+                exp[t * n + nn] = acc;
+            }
+        }
+    }
+    let sanity_cos = cos(&exp, &dl(dev, &cast_f16_f32(dev, &moe_q4_grouped_mma(
+        dev, &a_dev, &qs, &sc, &g_starts, &expert_ids, n, k).unwrap()).unwrap()));
+    eprintln!("moe_q4_grouped_laguna_sched_ab: sanity cosine (Q4 default vs f32 host ref) = {sanity_cos:.6}");
+    assert!(sanity_cos > 0.99, "moe_q4_grouped_mma default path looks broken, cosine {sanity_cos:.6} vs host ref");
+
+    // the actual A/B: FFAI_LAGUNA_SCHED=1 vs default, max relative diff.
+    let rel_diff = |a: &[f32], b: &[f32]| -> f32 {
+        let mut maxr = 0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let rel = (x - y).abs() / x.abs().max(1e-2);
+            if rel > maxr { maxr = rel; }
+        }
+        maxr
+    };
+
+    // --- host-descriptor path (moe_q4_grouped_mma) ---
+    let out_default = dl(dev, &cast_f16_f32(dev, &moe_q4_grouped_mma(
+        dev, &a_dev, &qs, &sc, &g_starts, &expert_ids, n, k).unwrap()).unwrap());
+    unsafe { std::env::set_var("FFAI_LAGUNA_SCHED", "1"); }
+    let out_sched = dl(dev, &cast_f16_f32(dev, &moe_q4_grouped_mma(
+        dev, &a_dev, &qs, &sc, &g_starts, &expert_ids, n, k).unwrap()).unwrap());
+    unsafe { std::env::remove_var("FFAI_LAGUNA_SCHED"); }
+    let r_host = rel_diff(&out_default, &out_sched);
+    eprintln!("moe_q4_grouped_laguna_sched_ab (host path): sched-vs-default max_rel={r_host:.2e}");
+    assert!(r_host < 1e-3, "host path: FFAI_LAGUNA_SCHED=1 vs default max_rel {r_host:.2e} > 1e-3");
+
+    // --- fully-on-device descriptor path (moe_q4_grouped_mma_dev) ---
+    let offs: Vec<u8> = g_starts.iter().flat_map(|&s| (s as u32).to_le_bytes()).collect();
+    let off = Tensor::new(dev.upload(&offs).unwrap(), vec![g_starts.len()], DType::U32);
+    let out_dev_default = dl(dev, &cast_f16_f32(dev, &moe_q4_grouped_mma_dev(
+        dev, &a_dev, &qs, &sc, &off, n_exp, mt, n, k).unwrap()).unwrap());
+    unsafe { std::env::set_var("FFAI_LAGUNA_SCHED", "1"); }
+    let out_dev_sched = dl(dev, &cast_f16_f32(dev, &moe_q4_grouped_mma_dev(
+        dev, &a_dev, &qs, &sc, &off, n_exp, mt, n, k).unwrap()).unwrap());
+    unsafe { std::env::remove_var("FFAI_LAGUNA_SCHED"); }
+    let r_dev = rel_diff(&out_dev_default, &out_dev_sched);
+    eprintln!("moe_q4_grouped_laguna_sched_ab (dev path): sched-vs-default max_rel={r_dev:.2e}");
+    assert!(r_dev < 1e-3, "dev path: FFAI_LAGUNA_SCHED=1 vs default max_rel {r_dev:.2e} > 1e-3");
+
+    // the dev-path descriptor builder (on-device, offsets-only) must also
+    // agree with the host-descriptor builder for both orderings.
+    let r_cross_default = rel_diff(&out_default, &out_dev_default);
+    let r_cross_sched = rel_diff(&out_sched, &out_dev_sched);
+    eprintln!("moe_q4_grouped_laguna_sched_ab: host-vs-dev max_rel default={r_cross_default:.2e} sched={r_cross_sched:.2e}");
+    assert!(r_cross_default < 1e-3 && r_cross_sched < 1e-3, "host vs dev descriptor builders disagree");
+
+    eprintln!("moe_q4_grouped_laguna_sched_ab: PASS (default vs FFAI_LAGUNA_SCHED=1 agree within 1e-3 on skewed groups)");
 }
 
 #[test]
