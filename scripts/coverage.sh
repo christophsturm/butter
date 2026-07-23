@@ -19,7 +19,7 @@
 # Excludes generated code, .build, and Tests themselves from the report.
 #
 # Scope is intentionally limited to the unit suite (FFAITests +
-# FFAIKernelsSwiftTests). ModelIntegrationTests download multi-GB HuggingFace
+# IronSwiftTests). ModelIntegrationTests download multi-GB HuggingFace
 # snapshots + do real end-to-end inference, which:
 #   (a) takes tens of minutes per run
 #   (b) hits memory contention if multiple suites parallelize
@@ -36,7 +36,7 @@ echo "Running unit tests with coverage enabled..."
 # correctness tests flake under concurrent command-buffer submission, so
 # serialize the Swift Testing run (`--num-workers 1` is an XCTest no-op
 # for Swift Testing).
-swift test --no-parallel --enable-code-coverage --filter "FFAITests|FFAIKernelsSwiftTests"
+swift test --no-parallel --enable-code-coverage --filter "FFAITests|IronSwiftTests"
 
 BIN_PATH=$(swift build --show-bin-path)
 PROF_DATA="$BIN_PATH/codecov/default.profdata"

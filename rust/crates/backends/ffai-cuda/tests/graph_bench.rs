@@ -9,13 +9,13 @@
 
 #![cfg(feature = "cuda")]
 
-use ffai_core::{DType, Tensor};
-use ffai_ops::add;
+use iron_core::{DType, Tensor};
+use iron_ops::add;
 use std::time::Instant;
 
 #[test]
 fn graph_vs_sequential_overhead() {
-    let dev = match ffai_cuda::CudaDevice::create().unwrap() {
+    let dev = match iron_cuda::CudaDevice::create().unwrap() {
         Some(d) => d,
         None => {
             eprintln!("no CUDA device; skipping");

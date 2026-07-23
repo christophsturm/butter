@@ -3,7 +3,7 @@
 //! End-to-end GGUF small-model load + generate on the **Vulkan** GPU (RDNA4).
 //! Mirror of `ffai-metal/tests/qwen25_gguf_metal.rs` — the only difference is
 //! the device constructor (`VulkanDevice::create()` instead of Metal). Proves
-//! the backend-agnostic GGUF path (GgufModel::open + ffai_runtime::generate
+//! the backend-agnostic GGUF path (GgufModel::open + iron_runtime::generate
 //! over GgufModel::step) runs on the portable Vulkan backend.
 //!
 //! Loads Qwen2.5-1.5B-Instruct Q8_0 GGUF (geometry + Q8_0 weights + BPE
@@ -12,11 +12,11 @@
 //!
 //! Requires `--features vulkan`. Skips if no Vulkan device or model is absent.
 
-use ffai_loader::gguf::Gguf;
-use ffai_models::gguf_tokenizer::GgufTokenizer;
-use ffai_models::llama::GgufModel;
-use ffai_runtime::{generate, Sampling, StopOn};
-use ffai_vulkan::VulkanDevice;
+use iron_loader::gguf::Gguf;
+use iron_models::gguf_tokenizer::GgufTokenizer;
+use iron_models::llama::GgufModel;
+use iron_runtime::{generate, Sampling, StopOn};
+use iron_vulkan::VulkanDevice;
 use std::time::Instant;
 
 #[test]

@@ -135,7 +135,7 @@ struct AuraKLDIntegrationTests {
         // Compressed flash should track dequant-mirror quality closely
         // (same codec, just different decode dispatch). Gate is set
         // wide enough to absorb the bf16-Π precision cost from
-        // metaltile #226 (rotation + boundaries moved to Tensor<T>
+        // iron #226 (rotation + boundaries moved to Tensor<T>
         // storage — halves the encoder's dominant read but rounds the
         // Π matrix and Lloyd-Max thresholds at ~1e-3, which shifts a
         // small fraction of borderline 4-bit bin assignments at encode

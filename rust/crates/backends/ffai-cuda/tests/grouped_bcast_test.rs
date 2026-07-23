@@ -2,8 +2,8 @@
 //! Isolate gemm_batched (device-ptr-array, broadcast offsets) vs
 //! gemm_strided_batched on the SSD G1 shape: CB = C·Bᵀ, [L,L]=C[L,ds]·B[L,ds]ᵀ,
 //! plus a multi-chunk fused-vs-strided regression for the null-stream race.
-use ffai_core::{DType, Tensor};
-use ffai_cuda::CudaDevice;
+use iron_core::{DType, Tensor};
+use iron_cuda::CudaDevice;
 
 fn tb_f16(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|&f| half_bits(f).to_le_bytes()).collect()
@@ -105,7 +105,7 @@ fn grouped_broadcast_matches_strided() {
 /// The fix issues that H2D on self.stream; this asserts every chunk matches.
 #[test]
 fn fused_vs_nonfused_multichunk() {
-    use ffai_ops::ssm_prefill_scan_ssd;
+    use iron_ops::ssm_prefill_scan_ssd;
     let Some(dev) = CudaDevice::create().expect("cuda") else { eprintln!("no CUDA — skip"); return; };
     let d = dev.as_ref();
     let (t, h, dh, ds, ng, l) = (512usize, 64usize, 64usize, 128usize, 8usize, 128u32);

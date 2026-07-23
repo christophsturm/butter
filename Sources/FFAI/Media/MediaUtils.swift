@@ -30,7 +30,7 @@ public enum MediaUtils {
     // ─── Resize + normalize (GPU) ────────────────────────────────────
 
     /// GPU resize + per-channel normalize → planar NCHW
-    /// `[1, 3, targetH, targetW]`, via the fused `ffai_resize_normalize{,_bicubic}`
+    /// `[1, 3, targetH, targetW]`, via the fused `iron_resize_normalize{,_bicubic}`
     /// kernel (`Ops.resizeNormalize`). Replaces the CPU triple-loop in
     /// `MediaUtils.resize` + `preprocess`. `align_corners = false`
     /// half-pixel sampling (the HF / transformers convention). `mode` selects

@@ -162,7 +162,7 @@ struct AuraDecodeBenchIntegrationTests {
 
     /// Side-by-side bench at one KV length, prints both numbers + the
     /// ratio. **Informational + catastrophic-regression gate only** —
-    /// the metaltile flash kernel is currently
+    /// the iron flash kernel is currently
     /// single-simdgroup-per-query (see `aura_flash_sdpa.rs` header:
     /// "token-parallelism is a perf follow-up"), so `.compressed` is
     /// a known perf regression at all KV lengths vs `.dequantMirror`.

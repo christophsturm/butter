@@ -7,9 +7,9 @@
 //!
 //! Runs on macOS with a Metal GPU; skips elsewhere.
 
-use ffai_core::{DType, Device, Tensor};
-use ffai_metal::MetalDevice;
-use ffai_models::llama::{LayerWeights, LlamaConfig, decode_layer_self};
+use iron_core::{DType, Device, Tensor};
+use iron_metal::MetalDevice;
+use iron_models::llama::{LayerWeights, LlamaConfig, decode_layer_self};
 
 fn to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()

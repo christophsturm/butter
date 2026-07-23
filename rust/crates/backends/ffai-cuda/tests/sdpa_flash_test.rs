@@ -4,9 +4,9 @@
 //! vs the scalar `sdpa_multi` ground truth (GQA: nq=32, nkv=2, hd=128, causal).
 //! Threshold: max |rel_err| ≤ 1e-2 (f16-input vs f32 tolerance).
 
-use ffai_cuda::CudaDevice;
-use ffai_core::{DType, Device, Tensor};
-use ffai_ops::{sdpa_multi, sdpa_flash_fused, sdpa_flash_wmma, sdpa_flash_mma};
+use iron_cuda::CudaDevice;
+use iron_core::{DType, Device, Tensor};
+use iron_ops::{sdpa_multi, sdpa_flash_fused, sdpa_flash_wmma, sdpa_flash_mma};
 
 fn rng(n: usize, seed: u64) -> Vec<f32> {
     let mut v = vec![0f32; n];
@@ -48,15 +48,15 @@ fn run(dev: &dyn Device, s: usize, in_f16: bool) {
                              s as u32, n_kv as u32, hpg as u32, true, scale).unwrap();
     // Optionally cast inputs to f16 to exercise the f16 path.
     let (qf, kf, vf) = if in_f16 {
-        (ffai_ops::cast_f32_f16(dev, &q).unwrap().reshaped(vec![s, nq, hd]),
-         ffai_ops::cast_f32_f16(dev, &k).unwrap().reshaped(vec![nkv, n_kv, hd]),
-         ffai_ops::cast_f32_f16(dev, &v).unwrap().reshaped(vec![nkv, n_kv, hd]))
+        (iron_ops::cast_f32_f16(dev, &q).unwrap().reshaped(vec![s, nq, hd]),
+         iron_ops::cast_f32_f16(dev, &k).unwrap().reshaped(vec![nkv, n_kv, hd]),
+         iron_ops::cast_f32_f16(dev, &v).unwrap().reshaped(vec![nkv, n_kv, hd]))
     } else { (q.clone(), k.clone(), v.clone()) };
 
     let fused = sdpa_flash_fused(dev, &qf, &kf, &vf, hd, nq as u32, base_kv as u32,
                                  s as u32, n_kv as u32, hpg as u32, true, scale).unwrap();
     // fused output matches input dtype; widen f16 → f32 for comparison/download.
-    let fused = if in_f16 { ffai_ops::cast_f16_f32(dev, &fused).unwrap() } else { fused };
+    let fused = if in_f16 { iron_ops::cast_f16_f32(dev, &fused).unwrap() } else { fused };
 
     let a = dl_f32(dev, &ref_out);
     let b = dl_f32(dev, &fused);
@@ -91,12 +91,12 @@ fn run_wmma(dev: &dyn Device, s: usize) {
     let ref_out = sdpa_multi(dev, &q, &k, &v, hd, nq as u32, base_kv as u32,
                              s as u32, n_kv as u32, hpg as u32, true, scale).unwrap();
     // f16 inputs (wmma needs tensor cores).
-    let qf = ffai_ops::cast_f32_f16(dev, &q).unwrap().reshaped(vec![s, nq, hd]);
-    let kf = ffai_ops::cast_f32_f16(dev, &k).unwrap().reshaped(vec![nkv, n_kv, hd]);
-    let vf = ffai_ops::cast_f32_f16(dev, &v).unwrap().reshaped(vec![nkv, n_kv, hd]);
+    let qf = iron_ops::cast_f32_f16(dev, &q).unwrap().reshaped(vec![s, nq, hd]);
+    let kf = iron_ops::cast_f32_f16(dev, &k).unwrap().reshaped(vec![nkv, n_kv, hd]);
+    let vf = iron_ops::cast_f32_f16(dev, &v).unwrap().reshaped(vec![nkv, n_kv, hd]);
     let w = sdpa_flash_wmma(dev, &qf, &kf, &vf, hd, nq as u32, base_kv as u32,
                             s as u32, n_kv as u32, hpg as u32, true, scale).unwrap();
-    let w = ffai_ops::cast_f16_f32(dev, &w).unwrap();
+    let w = iron_ops::cast_f16_f32(dev, &w).unwrap();
     let a = dl_f32(dev, &ref_out);
     let b = dl_f32(dev, &w);
     let (mut max_abs, mut max_rel) = (0f32, 0f32);
@@ -126,12 +126,12 @@ fn run_mma(dev: &dyn Device, s: usize) {
     let v = up(&v_vals).reshaped(vec![nkv, n_kv, hd]);
     let ref_out = sdpa_multi(dev, &q, &k, &v, hd, nq as u32, base_kv as u32,
                              s as u32, n_kv as u32, hpg as u32, true, scale).unwrap();
-    let qf = ffai_ops::cast_f32_f16(dev, &q).unwrap().reshaped(vec![s, nq, hd]);
-    let kf = ffai_ops::cast_f32_f16(dev, &k).unwrap().reshaped(vec![nkv, n_kv, hd]);
-    let vf = ffai_ops::cast_f32_f16(dev, &v).unwrap().reshaped(vec![nkv, n_kv, hd]);
+    let qf = iron_ops::cast_f32_f16(dev, &q).unwrap().reshaped(vec![s, nq, hd]);
+    let kf = iron_ops::cast_f32_f16(dev, &k).unwrap().reshaped(vec![nkv, n_kv, hd]);
+    let vf = iron_ops::cast_f32_f16(dev, &v).unwrap().reshaped(vec![nkv, n_kv, hd]);
     let w = sdpa_flash_mma(dev, &qf, &kf, &vf, hd, nq as u32, base_kv as u32,
                            s as u32, n_kv as u32, hpg as u32, true, scale).unwrap();
-    let w = ffai_ops::cast_f16_f32(dev, &w).unwrap();
+    let w = iron_ops::cast_f16_f32(dev, &w).unwrap();
     let a = dl_f32(dev, &ref_out);
     let b = dl_f32(dev, &w);
     let (mut max_abs, mut max_rel) = (0f32, 0f32);

@@ -4,9 +4,9 @@
 // Isolates: does the W8A8 path realize the ~1.8x GB10 roofline at the GEMM
 // level, and does it stay numerically close (cosine vs f16) per-tensor vs
 // per-channel? Seconds per run — no 30B reload.
-use ffai_cuda::CudaDevice;
-use ffai_core::{DType, Device, Tensor};
-use ffai_ops::{cast_f32_f16, fp8_quant, fp8_quant_perrow, gemm_cublas_f32out, gemm_fp8, gemm_fp8_perchan};
+use iron_cuda::CudaDevice;
+use iron_core::{DType, Device, Tensor};
+use iron_ops::{cast_f32_f16, fp8_quant, fp8_quant_perrow, gemm_cublas_f32out, gemm_fp8, gemm_fp8_perchan};
 use std::time::Instant;
 
 fn rng(n: usize, seed: u64) -> Vec<f32> {

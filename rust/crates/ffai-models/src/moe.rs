@@ -4,15 +4,15 @@
 //! Mixture-of-Experts MLP builder (DeepSeek-V4, GPT-OSS, Granite4, Qwen-MoE).
 //! The attention half is the dense transformer (see [`super::llama`]); only
 //! the feed-forward is replaced by a routed expert mixture. Built on the
-//! shared [`ffai_ops`], so it runs on any backend.
+//! shared [`iron_ops`], so it runs on any backend.
 //!
 //! Single-token routing is done host-side (download the `n_experts` router
 //! logits, pick top-k, softmax) — exact and cheap for one token; a fused
 //! GPU router/top-k is a later optimization. The per-expert gate/up/down and
 //! SwiGLU run on the device through the same ops the dense MLP uses.
 
-use ffai_core::{DType, Device, Error, Result, Tensor};
-use ffai_ops as ops;
+use iron_core::{DType, Device, Error, Result, Tensor};
+use iron_ops as ops;
 
 /// One expert's SwiGLU MLP weights.
 pub struct ExpertWeights {

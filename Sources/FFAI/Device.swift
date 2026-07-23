@@ -18,7 +18,7 @@
 
 import Foundation
 import Metal
-import FFAIKernelsSwift
+import IronSwift
 
 public final class Device: @unchecked Sendable {
     public let mtlDevice: MTLDevice
@@ -42,9 +42,9 @@ public final class Device: @unchecked Sendable {
     private let residencyLock = NSLock()
 
     public static let shared: Device = {
-        // Reuse the same MTLDevice + queue FFAIKernelsSwift uses, so PSOs
+        // Reuse the same MTLDevice + queue IronSwift uses, so PSOs
         // and buffers are guaranteed compatible.
-        let lib = FFAIKernelsLibrary.shared
+        let lib = IronLibrary.shared
         return Device(mtlDevice: lib.device, commandQueue: lib.commandQueue)
     }()
 
@@ -53,7 +53,7 @@ public final class Device: @unchecked Sendable {
         self.commandQueue = commandQueue
         // Sibling queue for parallel dispatches (shared device/PSO cache).
         guard let qB = mtlDevice.makeCommandQueue(
-            maxCommandBufferCount: MetalTileLibrary.defaultMaxCommandBufferCount)
+            maxCommandBufferCount: IronLibrary.defaultMaxCommandBufferCount)
         else {
             fatalError("Device: failed to create secondary command queue")
         }

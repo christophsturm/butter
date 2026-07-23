@@ -1,17 +1,17 @@
 // Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 // SPDX-License-Identifier: Apache-2.0
-//! Q8_0 resident-weight matvec (`ffai_ops::gemv_q8`) vs a CPU dequant-dot
+//! Q8_0 resident-weight matvec (`iron_ops::gemv_q8`) vs a CPU dequant-dot
 //! reference. Same kernel IR codegens to CUDA — this is the cheap local proof
 //! of the quantized-GEMV path that the resident NemotronH decode loop rides on.
-use ffai_core::{DType, Tensor};
-use ffai_ops::{gemv_q8, quantize_q8};
-use ffai_metal::MetalDevice;
+use iron_core::{DType, Tensor};
+use iron_ops::{gemv_q8, quantize_q8};
+use iron_metal::MetalDevice;
 
 fn tb_f32(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn tb_u32(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn fb(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() }
-// f32<->f16 for the q4 coalesced kernel, whose scales are f16 (see ffai-kernels
-// gemv_quantized: ffai_gemv_q4_coalesced reads f16 scales). Feed f16 + reference
+// f32<->f16 for the q4 coalesced kernel, whose scales are f16 (see iron
+// gemv_quantized: iron_gemv_q4_coalesced reads f16 scales). Feed f16 + reference
 // against the f16-rounded scale so kernel and CPU oracle agree exactly.
 fn f32_to_f16(f: f32) -> u16 {
     let x = f.to_bits();
@@ -87,7 +87,7 @@ fn relu2_matches_host() {
     let d = dev.as_ref();
     let x: Vec<f32> = (-16..16).map(|i| i as f32 * 0.3).collect();
     let xt = Tensor::new(d.upload(&tb_f32(&x)).unwrap(), vec![x.len()], DType::F32);
-    let ot = ffai_ops::relu2(d, &xt).unwrap();
+    let ot = iron_ops::relu2(d, &xt).unwrap();
     let mut ob = vec![0u8; x.len() * 4];
     d.download(ot.buffer.as_ref(), &mut ob).unwrap();
     let got = fb(&ob);
@@ -108,7 +108,7 @@ fn fma_inplace_matches_host() {
     let acc = Tensor::new(d.upload(&tb_f32(&acc0)).unwrap(), vec![n], DType::F32);
     let xt = Tensor::new(d.upload(&tb_f32(&x)).unwrap(), vec![n], DType::F32);
     let st = Tensor::new(d.upload(&tb_f32(&s)).unwrap(), vec![n], DType::F32);
-    ffai_ops::fma_inplace(d, &acc, &xt, &st).unwrap();
+    iron_ops::fma_inplace(d, &acc, &xt, &st).unwrap();
     let mut ob = vec![0u8; n * 4]; d.download(acc.buffer.as_ref(), &mut ob).unwrap();
     let got = fb(&ob);
     let e = (0..n).fold(0f32, |a, i| a.max((got[i] - (acc0[i] + x[i] * s[i])).abs()));
@@ -125,7 +125,7 @@ fn gemv_q4_matches_cpu_dequant() {
     let mut rng = || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; (s as f32 / u32::MAX as f32) - 0.5 };
     let w: Vec<f32> = (0..m * k).map(|_| rng()).collect();
     let x: Vec<f32> = (0..k).map(|_| rng()).collect();
-    let (qs, sc) = ffai_ops::quantize_q4(&w, m, k);
+    let (qs, sc) = iron_ops::quantize_q4(&w, m, k);
     // kernel uses f16 scales -> reference against the f16-rounded value
     let sc: Vec<f32> = sc.iter().map(|&v| f16_to_f32(f32_to_f16(v))).collect();
     let bpr = k / 32;
@@ -138,7 +138,7 @@ fn gemv_q4_matches_cpu_dequant() {
     let qt = Tensor::new(d.upload(&tb_u32(&qs)).unwrap(), vec![qs.len()], DType::U32);
     let st = Tensor::new(d.upload(&tb_f16(&sc)).unwrap(), vec![sc.len()], DType::F16);
     let xt = Tensor::new(d.upload(&tb_f32(&x)).unwrap(), vec![k], DType::F32);
-    let ot = ffai_ops::gemv_q4(d, &qt, &st, &xt, m, k, m).unwrap();
+    let ot = iron_ops::gemv_q4(d, &qt, &st, &xt, m, k, m).unwrap();
     let mut ob = vec![0u8; m*4]; d.download(ot.buffer.as_ref(), &mut ob).unwrap();
     let got = fb(&ob);
     let e = (0..m).fold(0f32, |a, r| a.max((got[r]-want[r]).abs()));
@@ -152,13 +152,13 @@ fn slice_and_conv_roll() {
     let d = dev.as_ref();
     let src: Vec<f32> = (0..100).map(|i| i as f32).collect();
     let st = Tensor::new(d.upload(&tb_f32(&src)).unwrap(), vec![100], DType::F32);
-    let sl = ffai_ops::slice(d, &st, 10, 5).unwrap();
+    let sl = iron_ops::slice(d, &st, 10, 5).unwrap();
     let mut ob = vec![0u8; 5*4]; d.download(sl.buffer.as_ref(), &mut ob).unwrap();
     assert_eq!(fb(&ob), vec![10.,11.,12.,13.,14.], "slice");
     // conv_roll: conv_dim=2, kc=3 → state=4 (2 blocks), keep=2; new=[old[2..4], xbc[0..2]]
     let old = Tensor::new(d.upload(&tb_f32(&[1.,2.,3.,4.])).unwrap(), vec![4], DType::F32);
     let xbc = Tensor::new(d.upload(&tb_f32(&[9.,8.])).unwrap(), vec![2], DType::F32);
-    let nr = ffai_ops::conv_roll(d, &old, &xbc, 2, 3).unwrap();
+    let nr = iron_ops::conv_roll(d, &old, &xbc, 2, 3).unwrap();
     let mut ob = vec![0u8; 4*4]; d.download(nr.buffer.as_ref(), &mut ob).unwrap();
     assert_eq!(fb(&ob), vec![3.,4.,9.,8.], "conv_roll");
     eprintln!("✅ slice + conv_roll correct");

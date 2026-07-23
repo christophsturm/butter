@@ -1,8 +1,8 @@
 #![cfg(feature = "cuda")]
 //! Isolate slice() on f16 with a large element offset (the lm_head last-token slice).
-use ffai_core::{DType, Device, Tensor};
-use ffai_cuda::CudaDevice;
-use ffai_ops::{slice, cast_f32_f16, cast_f16_f32};
+use iron_core::{DType, Device, Tensor};
+use iron_cuda::CudaDevice;
+use iron_ops::{slice, cast_f32_f16, cast_f16_f32};
 
 fn tb(v:&[f32])->Vec<u8>{v.iter().flat_map(|x|x.to_le_bytes()).collect()}
 fn fb32(b:&[u8])->Vec<f32>{b.chunks_exact(4).map(|c|f32::from_le_bytes(c.try_into().unwrap())).collect()}

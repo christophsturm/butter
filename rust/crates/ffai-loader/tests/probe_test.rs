@@ -1,7 +1,7 @@
 // Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 // SPDX-License-Identifier: Apache-2.0
 //! Capability probe demo — what a checkpoint can ACTUALLY do, from its tensors.
-use ffai_loader::probe;
+use iron_loader::probe;
 
 fn snap(repo: &str) -> Option<String> {
     let base = format!("{}/.cache/huggingface/hub/models--{repo}/snapshots", std::env::var("HOME").ok()?);

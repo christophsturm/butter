@@ -200,7 +200,7 @@ in log-space with the right direction (`klAtPosition`). The work to make these
 ## 7. Release-only benches (separate but related gap)
 
 Quality benches forced-decode an entire corpus; in **debug** this is painfully
-slow. metaltile already runs its bench tooling in release (`cargo run --release`).
+slow. iron already runs its bench tooling in release (`cargo run --release`).
 FFAI's bench path is not pinned today. Proposed:
 
 - `ffai bench` (and any bench CI step) builds/runs with `swift run -c release` /

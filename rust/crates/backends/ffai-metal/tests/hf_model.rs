@@ -8,9 +8,9 @@
 //!   MODEL_DIR=/path/to/model TOK=9707 EXPECT=21806 \
 //!     cargo test -p ffai-metal --test hf_model -- --nocapture
 
-use ffai_core::DType;
-use ffai_metal::MetalDevice;
-use ffai_models::llama::{forward_single, load_hf};
+use iron_core::DType;
+use iron_metal::MetalDevice;
+use iron_models::llama::{forward_single, load_hf};
 
 fn decode(b: &[u8], dt: DType) -> Vec<f32> {
     match dt {

@@ -16,7 +16,7 @@
 // conv-heavy tail that dominates synthesis cost (the CPU generator runs
 // ~40 G MAC over ~7800 frames; on one debug CPU core that is ~18 minutes,
 // the bulk of a full utterance). Everything here is channels-first
-// `[C, T]` in `MTLBuffer`-backed `Tensor`s so the ffai-kernels conv / adain /
+// `[C, T]` in `MTLBuffer`-backed `Tensor`s so the iron conv / adain /
 // snake / leaky-relu kernels chain without per-op readback.
 //
 // Numerically validated against the CPU reference (`KokoroWeights.generate`,

@@ -302,7 +302,7 @@ public final class NemotronDiffusionLayer: Module {
         }
         let oOut = oProj(attnReady, on: cmd)
 
-        // Fused residual add + post-attn RMSNorm via ffai_add_rms_norm
+        // Fused residual add + post-attn RMSNorm via iron_add_rms_norm
         // (NemotronDiffusion hidden=3072 fits the ≤ 4096 cap).
         // Validator gate keeps the unfused path for any future wider
         // variant.
@@ -417,7 +417,7 @@ public final class NemotronDiffusionLayer: Module {
             let loraDelta = Ops.gemm(weight: lb, input: aOut, nRows: n, on: cmd)
             oBlock = Ops.add(oBlock, loraDelta, on: cmd)
         }
-        // Fused residual add + post-attn RMSNorm via ffai_add_rms_norm
+        // Fused residual add + post-attn RMSNorm via iron_add_rms_norm
         // over [n, hidden] rows (hidden=3072 fits the ≤ 4096 cap).
         let postAttn: Tensor
         let mlpNorm: Tensor
@@ -446,7 +446,7 @@ public final class NemotronDiffusionLayer: Module {
 /// Project a `[nRows, inDim]` activation block through a linear layer in
 /// one batched GEMM. Routes through `AnyLinear.callMany`, which picks the
 /// right kernel per weight kind: dense `Ops.gemm` for raw weights, or
-/// `Ops.dequantGemmDynamicM` (the `ffai_qmm_mma` batched dequant-GEMM, with
+/// `Ops.dequantGemmDynamicM` (the `iron_qmm_mma` batched dequant-GEMM, with
 /// a per-row `dequantGemv` fallback) for affine-quantized weights. This
 /// lets diffusion / self-speculation run on quantized checkpoints, not
 /// just raw ones.

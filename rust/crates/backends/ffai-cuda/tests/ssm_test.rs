@@ -1,11 +1,11 @@
 #![cfg(feature = "cuda")]
 // Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 // SPDX-License-Identifier: Apache-2.0
-//! Mamba2 SSD selective-scan decode step (ffai_ssm_step) on CUDA vs CPU —
+//! Mamba2 SSD selective-scan decode step (iron_ssm_step) on CUDA vs CPU —
 //! the core SSM-family op (Mamba2/Jamba/FalconH1/LFM2).
-use ffai_core::{DType, Device, Tensor};
-use ffai_cuda::CudaDevice;
-use ffai_ops::ssm_step;
+use iron_core::{DType, Device, Tensor};
+use iron_cuda::CudaDevice;
+use iron_ops::ssm_step;
 
 fn tb(v:&[f32])->Vec<u8>{v.iter().flat_map(|x|x.to_le_bytes()).collect()}
 fn fb(b:&[u8])->Vec<f32>{b.chunks_exact(4).map(|c|f32::from_le_bytes(c.try_into().unwrap())).collect()}
@@ -13,7 +13,7 @@ fn fill(n:usize,s:usize)->Vec<f32>{(0..n).map(|i|(((i*7+s*131)%89) as f32-44.0)*
 fn tn(d:&dyn Device,v:&[f32],sh:Vec<usize>)->Tensor{Tensor::new(d.upload(&tb(v)).unwrap(),sh,DType::F32)}
 
 #[test]
-fn ffai_ssm_step_on_cuda_matches_cpu(){
+fn iron_ssm_step_on_cuda_matches_cpu(){
     let Some(dev)=CudaDevice::create().expect("metal") else { eprintln!("no CUDA — skip"); return; };
     let (nh, dh, ds, hpg) = (4usize, 8usize, 32usize, 2usize);
     let ng = nh/hpg;
@@ -43,7 +43,7 @@ fn ffai_ssm_step_on_cuda_matches_cpu(){
     }
     let mut es=0.0f32; for i in 0..nh*dh*ds { es=es.max((so[i]-so_ref[i]).abs()); }
     let mut eo=0.0f32; for i in 0..nh*dh { eo=eo.max((out[i]-out_ref[i]).abs()); }
-    eprintln!("ffai_ssm_step on CUDA vs CPU: state max|Δ|={es:.3e}  out max|Δ|={eo:.3e}");
+    eprintln!("iron_ssm_step on CUDA vs CPU: state max|Δ|={es:.3e}  out max|Δ|={eo:.3e}");
     assert!(es<=1e-4 && eo<=1e-4, "ssm mismatch state={es:.3e} out={eo:.3e}");
     eprintln!("✅ Mamba2 SSD selective-scan step runs on CUDA through the shared op layer, matches CPU.");
 }

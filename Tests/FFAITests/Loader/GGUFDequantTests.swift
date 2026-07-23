@@ -15,7 +15,7 @@
 // Unit tests for GGUFDequant — block-format constants + a deterministic
 // Q8_0 round-trip (build a known block → dequant → verify d * qs). The
 // Q2_K / IQ2_XXS bit-layout dequant is exercised exhaustively against a
-// canonical oracle in metaltile's kernel correctness tests; here we
+// canonical oracle in iron's kernel correctness tests; here we
 // verify the FFAI-side block constants and the Q8_0 CPU-split → GPU
 // pipeline end to end.
 

@@ -6,10 +6,10 @@
 //! token and attends over the cache (n_kv = current length) — O(seq)/step, not
 //! O(seq²). Only tiny per-step activations + the growing cache cross the bus.
 //! Asserts generated tokens still match HF and prints prefill/decode tok/s.
-use ffai_core::{DType, Tensor};
-use ffai_cuda::CudaDevice;
-use ffai_loader::SafeTensors;
-use ffai_ops::{add, gelu, gemv, layer_norm, matmul, sdpa_decode};
+use iron_core::{DType, Tensor};
+use iron_cuda::CudaDevice;
+use iron_loader::SafeTensors;
+use iron_ops::{add, gelu, gemv, layer_norm, matmul, sdpa_decode};
 use std::time::Instant;
 
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }

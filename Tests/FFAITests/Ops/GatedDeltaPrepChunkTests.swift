@@ -19,7 +19,7 @@
 // grid math and the kernel's numerics against a sequential CPU reference.
 //
 // The oracle mirrors the Rust kernel-side oracle in
-// `ffai-kernels-std/src/kernels/ssm/gated_delta_prep_chunk.rs`
+// `wh-iron-std/src/kernels/ssm/gated_delta_prep_chunk.rs`
 // (`kernel_tests::oracle`): per token t —
 //   dt    = softplus(aRaw + dtBias)          (un-clamped: ln(e^x + 1))
 //   g     = exp(-exp(aLog) · dt)
@@ -304,7 +304,7 @@ struct GatedDeltaPrepChunkTests {
     // guard requires before dispatching this kernel. T kept small (3
     // tokens) for a fast correctness check; isolated/end-to-end perf are
     // covered by the Rust kernel benches, not this suite. Tol matches the
-    // Rust `test_ffai_gated_delta_prep_chunk_fast_d128_128_32_16` cell.
+    // Rust `test_iron_gated_delta_prep_chunk_fast_d128_128_32_16` cell.
     @Test("fast path production shape, Dk=Dv=128, Hv=32, Hk=16, T=3: y + stateOut match CPU oracle")
     func fastPathProductionShapeMatchesOracle() {
         Self.runCaseFast(t: 3, tol: 1e-2)

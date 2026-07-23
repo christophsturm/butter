@@ -375,7 +375,7 @@ public final class Llama3Layer: Module {
         }
         let oOut = oProj(attnReadyForOProj, on: cmd)
 
-        // Fused residual add + post-attn RMSNorm via ffai_add_rms_norm
+        // Fused residual add + post-attn RMSNorm via iron_add_rms_norm
         // (hidden ≤ 4096). Validator gate handles Llama 3 70B (8192).
         // Returns (postAttn residual stream, normed input for MLP).
         let postAttn: Tensor
@@ -488,7 +488,7 @@ public final class Llama3Layer: Module {
         let attnFlat = attnOut.reshaped(to: [nRows, nHeads * headDim])
         let oOut = oProj.callMany(attnFlat, t: nRows, on: cmd, device: device)
 
-        // Fused residual add + post-attn RMSNorm via ffai_add_rms_norm
+        // Fused residual add + post-attn RMSNorm via iron_add_rms_norm
         // (hidden ≤ 4096). Validator gate handles Llama 3 70B (8192).
         let postAttn: Tensor
         let mlpNorm: Tensor
@@ -703,7 +703,7 @@ public final class Llama3Model: TextGenerating {
     ///
     ///   - **AURA caches** use a π-rotated K/V layout that the chunked
     ///     path doesn't implement.
-    ///   - **`headDim != 128`** — `ffai_sdpa_multi` (the kernel
+    ///   - **`headDim != 128`** — `iron_sdpa_multi` (the kernel
     ///     `Llama3Layer.forwardMulti` dispatches) is head_dim-128 only.
     ///     Llama 3.2 1B / 3B use head_dim=64; Qwen 2 uses head_dim=128
     ///     when wide and head_dim=64 when narrow. The single-token
@@ -803,7 +803,7 @@ public final class Llama3Model: TextGenerating {
     /// `pleTokenIds` is ignored — Llama / Qwen 2 have no Per-Layer
     /// Embeddings. Falls back to the per-position embedding loop on the
     /// same shapes the token-id `forwardMulti` does (AURA caches' π-rotated
-    /// layout, or `headDim != 128` where `ffai_sdpa_multi` has no kernel).
+    /// layout, or `headDim != 128` where `iron_sdpa_multi` has no kernel).
     public func forwardMulti(
         inputEmbeddings: Tensor, startingAt position: Int,
         pleTokenIds: [Int]?,
@@ -818,7 +818,7 @@ public final class Llama3Model: TextGenerating {
 
         // Same fast-path gating as the token-id `forwardMulti`: the chunked
         // SDPA path doesn't implement AURA's π-rotated K/V, and
-        // `ffai_sdpa_multi` is head_dim-128 only. Fall back to the
+        // `iron_sdpa_multi` is head_dim-128 only. Fall back to the
         // per-position embedding forward (queued on `cmd`, single commit).
         let hasAura = caches.contains { $0 is AURAQuantizedKVCache }
         if hasAura || headDim != 128 {

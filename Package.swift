@@ -3,7 +3,7 @@
 // FFAI — F*cking Fast AI
 //
 // Apple Silicon LLM inference library built on pre-compiled Metal kernels
-// generated from the ffai-kernels Rust DSL.
+// generated from the iron Rust DSL.
 // See planning/plan.md and planning/architecture.md.
 
 import PackageDescription
@@ -21,8 +21,8 @@ let package = Package(
             targets: ["FFAI"]
         ),
         .library(
-            name: "FFAIKernelsSwift",
-            targets: ["FFAIKernelsSwift"]
+            name: "IronSwift",
+            targets: ["IronSwift"]
         ),
         .executable(
             name: "ffai",
@@ -39,13 +39,13 @@ let package = Package(
     ],
     targets: [
         // Pre-compiled Metal kernels + Swift dispatch wrappers.
-        // Resources are produced at build time by `ffaik build --emit all`
-        // (the ffai-kernels-cli binary in the sibling ffai-kernels workspace)
+        // Resources are produced at build time by `iron build --emit all`
+        // (the wh-iron-cli binary in the sibling iron workspace)
         // and live under Resources/. Generated/ contains the typed Swift
-        // wrappers, also produced by `ffaik build`.
+        // wrappers, also produced by `iron build`.
         .target(
-            name: "FFAIKernelsSwift",
-            path: "Sources/FFAIKernelsSwift",
+            name: "IronSwift",
+            path: "Sources/IronSwift",
             resources: [
                 .copy("Resources")
             ]
@@ -56,7 +56,7 @@ let package = Package(
         .target(
             name: "FFAI",
             dependencies: [
-                "FFAIKernelsSwift",
+                "IronSwift",
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
@@ -108,9 +108,9 @@ let package = Package(
 
         // Tests
         .testTarget(
-            name: "FFAIKernelsSwiftTests",
-            dependencies: ["FFAIKernelsSwift"],
-            path: "Tests/FFAIKernelsSwiftTests"
+            name: "IronSwiftTests",
+            dependencies: ["IronSwift"],
+            path: "Tests/IronSwiftTests"
         ),
         .testTarget(
             name: "FFAITests",

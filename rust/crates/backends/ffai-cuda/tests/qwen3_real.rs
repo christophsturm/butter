@@ -10,9 +10,9 @@
 //!       cargo test -p ffai-cuda --features cuda --test qwen3_real -- --nocapture
 #![cfg(feature = "cuda")]
 
-use ffai_cuda::CudaDevice;
-use ffai_loader::SafeTensors;
-use ffai_models::llama::{LlamaConfig, forward_single, load_qwen3};
+use iron_cuda::CudaDevice;
+use iron_loader::SafeTensors;
+use iron_models::llama::{LlamaConfig, forward_single, load_qwen3};
 
 /// BF16 little-endian bytes → f32.
 fn bf16_to_f32(b: &[u8]) -> Vec<f32> {

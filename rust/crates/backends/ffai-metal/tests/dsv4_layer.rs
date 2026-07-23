@@ -4,10 +4,10 @@
 //! collapse → MLA → expand → new 4-channel state. On Metal vs CPU. This is
 //! the complete DSv4 attention layer unit. pos=0 → RoPE identity (validates
 //! the layer wiring; RoPE verified separately).
-use ffai_core::{DType, Device, Tensor};
-use ffai_metal::MetalDevice;
-use ffai_models::dsv4::{dsv4_attn_subblock, MhcWeights, MlaConfig, MlaWeights};
-use ffai_ops::dsv4_mhc_sinkhorn_split;
+use iron_core::{DType, Device, Tensor};
+use iron_metal::MetalDevice;
+use iron_models::dsv4::{dsv4_attn_subblock, MhcWeights, MlaConfig, MlaWeights};
+use iron_ops::dsv4_mhc_sinkhorn_split;
 
 fn tb(v:&[f32])->Vec<u8>{v.iter().flat_map(|x|x.to_le_bytes()).collect()}
 fn fb(b:&[u8])->Vec<f32>{b.chunks_exact(4).map(|c|f32::from_le_bytes(c.try_into().unwrap())).collect()}

@@ -36,7 +36,7 @@
 // identified end-to-end via the standard `Model.load` dispatch; the
 // forward path is stubbed and raises
 // `DeepSeekV4Error.notYetImplemented` on load. The MLA / CSA / HCA /
-// Lightning-Indexer kernel work lands in follow-ups (metaltile-side
+// Lightning-Indexer kernel work lands in follow-ups (iron-side
 // scope spans 4-5 distinct PRs).
 //
 // The GGUF path is SEPARATE: `GGUFTensorBundle` (in `Loader/GGUF/`) is

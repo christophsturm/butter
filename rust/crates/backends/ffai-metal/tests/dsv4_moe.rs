@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! DSv4 MoE feed-forward (sqrtsoftplus route + clamped-SwiGLU experts +
 //! shared expert) on Metal vs CPU.
-use ffai_core::{DType, Device, Tensor};
-use ffai_metal::MetalDevice;
-use ffai_models::dsv4::{dsv4_moe, Dsv4Expert, Dsv4Moe};
+use iron_core::{DType, Device, Tensor};
+use iron_metal::MetalDevice;
+use iron_models::dsv4::{dsv4_moe, Dsv4Expert, Dsv4Moe};
 
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn fb(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() }

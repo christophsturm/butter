@@ -3,7 +3,7 @@
 //! Batched-prefill correctness + throughput on the Vulkan/RDNA4 backend.
 //!
 //! Drives `GgufModel::prefill` (the multi-token path that routes every
-//! projection + FFN matmul through `ffai_ops::gemm_q8_mpp` — the SimdGroup
+//! projection + FFN matmul through `iron_ops::gemm_q8_mpp` — the SimdGroup
 //! CoopTile GEMM) and:
 //!   1. validates the next-token logits' argmax matches the sequential `step`
 //!      path AND that a short greedy continuation still says "Paris", and
@@ -18,10 +18,10 @@
 //!
 //! Requires `--features vulkan`. Skips if no Vulkan device or model is absent.
 
-use ffai_loader::gguf::Gguf;
-use ffai_models::gguf_tokenizer::GgufTokenizer;
-use ffai_models::llama::GgufModel;
-use ffai_vulkan::VulkanDevice;
+use iron_loader::gguf::Gguf;
+use iron_models::gguf_tokenizer::GgufTokenizer;
+use iron_models::llama::GgufModel;
+use iron_vulkan::VulkanDevice;
 use std::time::Instant;
 
 #[test]

@@ -90,7 +90,7 @@
 
 import Foundation
 import Metal
-import FFAIKernelsSwift
+import IronSwift
 
 // MARK: - Config helpers
 
@@ -1158,7 +1158,7 @@ public final class Gemma4Layer: Module {
         let oOut = oProj(attnOut.reshaped(to: [nHeads * headDim]), on: cmd)
         let normedAttn = postAttnNorm(oOut, on: cmd)
 
-        // Fused (h + normedAttn) → preFFNorm via ffai_add_rms_norm
+        // Fused (h + normedAttn) → preFFNorm via iron_add_rms_norm
         // (hidden ≤ 4096). Gemma 4 27B (hidden 5376) falls through the
         // validator gate to the unfused path.
         var hOut: Tensor
@@ -1215,7 +1215,7 @@ public final class Gemma4Layer: Module {
         let oOut = oProj(attnOut.reshaped(to: [nHeads * headDim]), on: postCmd)
         let normedAttn = postAttnNorm(oOut, on: postCmd)
 
-        // Fused (h + normedAttn) → preFFNorm via ffai_add_rms_norm
+        // Fused (h + normedAttn) → preFFNorm via iron_add_rms_norm
         // (hidden ≤ 4096). Gemma 4 27B (hidden 5376) falls through
         // the validator gate to the unfused path.
         var hOut: Tensor
@@ -1484,7 +1484,7 @@ public final class Gemma4Layer: Module {
 // MARK: - Gemma4Ops — ProportionalRoPE wrapper
 
 /// Gemma 4-specific Ops extensions. `ropeProportional` drives the
-/// shared `ffai_rope_banded` RoPE kernel for Gemma 4's ProportionalRoPE.
+/// shared `iron_rope_banded` RoPE kernel for Gemma 4's ProportionalRoPE.
 enum Gemma4Ops {
     /// ProportionalRoPE: rotate the first `rotatedDim` dims of each
     /// `headDim`-strided head, pairing `(i, i + headDim/2)` for
@@ -1493,7 +1493,7 @@ enum Gemma4Ops {
     /// untouched, so this MUST run in-place — the buffer already holds
     /// the correct identity values for the unrotated dims.
     ///
-    /// The shared `ffai_rope_banded` kernel computes
+    /// The shared `iron_rope_banded` kernel computes
     /// `inv_freq = theta^(-i/half_dim)` and rotates `(base+i, base+i+half_dim)`.
     /// Driving it with `head_dim = headDim`, `half_dim = headDim/2`
     /// (true rotate-half offset + freq denominator) and a grid height of
@@ -1514,7 +1514,7 @@ enum Gemma4Ops {
         let rotatedPairs = rotatedDim / 2  // grid height — only these rotate
         let grid = MTLSize(width: 1, height: nHeads, depth: rotatedPairs)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
-        // ffai_rope_banded reads position from a per-row `positions: [T]` u32
+        // iron_rope_banded reads position from a per-row `positions: [T]` u32
         // buffer (decode = the T=1 case: a 1-element buffer); `row_stride` is
         // the per-token stride in qk (`n_heads * head_dim`). Single-token decode
         // here so a 1-element positions buffer + grid depth 1.
@@ -1524,7 +1524,7 @@ enum Gemma4Ops {
         let rowStride = UInt32(nHeads * headDim)
         switch qk.dtype {
         case .f32:
-            FFAIKernels.ffai_rope_banded_f32(
+            IronKernels.iron_rope_banded_f32(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
@@ -1534,7 +1534,7 @@ enum Gemma4Ops {
                 high_freq_factor: 1.0, original_max_position: 1.0,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_rope_banded_f16(
+            IronKernels.iron_rope_banded_f16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
@@ -1544,7 +1544,7 @@ enum Gemma4Ops {
                 high_freq_factor: 1.0, original_max_position: 1.0,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_rope_banded_bf16(
+            IronKernels.iron_rope_banded_bf16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,

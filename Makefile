@@ -8,8 +8,8 @@
 # ─── Paths ────────────────────────────────────────────────────────────
 PROJECT_ROOT := $(shell pwd)
 # Sibling kernels DSL.
-FFAI_KERNELS_DIR := $(PROJECT_ROOT)/../ffai-kernels
-KERNEL_OUT := $(PROJECT_ROOT)/Sources/FFAIKernelsSwift
+IRON_DIR := $(PROJECT_ROOT)/../iron
+KERNEL_OUT := $(PROJECT_ROOT)/Sources/IronSwift
 
 # ─── Help ─────────────────────────────────────────────────────────────
 .PHONY: help
@@ -48,41 +48,41 @@ build-release: regenerate-kernels ## swift build (release)
 	swift build -c release
 
 .PHONY: regenerate-kernels
-regenerate-kernels: ## run `ffaik build --emit` to regenerate metallib + Swift wrappers
-	@if [ ! -d "$(FFAI_KERNELS_DIR)" ]; then \
-	  echo "Error: ffai-kernels not found at $(FFAI_KERNELS_DIR)"; \
-	  echo "Clone the sibling ffai-kernels repo at ../ffai-kernels."; \
+regenerate-kernels: ## run `iron build --emit` to regenerate metallib + Swift wrappers
+	@if [ ! -d "$(IRON_DIR)" ]; then \
+	  echo "Error: iron not found at $(IRON_DIR)"; \
+	  echo "Clone the sibling iron repo at ../iron."; \
 	  exit 1; \
 	fi
-	@# Run cargo from the ffai-kernels dir so its rust-toolchain.toml (nightly,
+	@# Run cargo from the iron dir so its rust-toolchain.toml (nightly,
 	@# 2024 edition) is honored. Running cargo from FFAI/ would use the
 	@# system default toolchain, which lacks edition=2024 support.
 	@#
-	@# `ffaik build --emit` writes:
+	@# `iron build --emit` writes:
 	@#   $(KERNEL_OUT)/Resources/kernels/<name>.metal     per-kernel MSL
 	@#   $(KERNEL_OUT)/Resources/kernels.metallib         compiled metallib
 	@#   $(KERNEL_OUT)/Resources/manifest.json            IR descriptor
-	@#   $(KERNEL_OUT)/Generated/FFAIKernels.swift   dispatch wrappers
+	@#   $(KERNEL_OUT)/Generated/IronKernels.swift   dispatch wrappers
 	@#
-	@# `ffaik build` spawns `__ffai_runner` by bare name via PATH, so build
-	@# it alongside `ffaik` — building only `ffaik` never builds the sibling
+	@# `iron build` spawns `__iron_runner` by bare name via PATH, so build
+	@# it alongside `iron` — building only `iron` never builds the sibling
 	@# runner. Reuse both binaries when they are already present.
-	@if [ -x "$(FFAI_KERNELS_DIR)/target/release/ffaik" ] && \
-	   [ -x "$(FFAI_KERNELS_DIR)/target/release/__ffai_runner" ]; then \
-	  (cd $(FFAI_KERNELS_DIR) && PATH="$$PWD/target/release:$$PATH" \
-	    ffaik build --emit all --out $(KERNEL_OUT)); \
+	@if [ -x "$(IRON_DIR)/target/release/iron" ] && \
+	   [ -x "$(IRON_DIR)/target/release/__iron_runner" ]; then \
+	  (cd $(IRON_DIR) && PATH="$$PWD/target/release:$$PATH" \
+	    iron build --emit all --out $(KERNEL_OUT)); \
 	else \
-	  (cd $(FFAI_KERNELS_DIR) && \
-	    cargo build --release --bin ffaik --bin __ffai_runner && \
+	  (cd $(IRON_DIR) && \
+	    cargo build --release --bin iron --bin __iron_runner && \
 	    PATH="$$PWD/target/release:$$PATH" \
-	      ffaik build --emit all --out $(KERNEL_OUT)); \
+	      iron build --emit all --out $(KERNEL_OUT)); \
 	fi
 	@# Prepend the `// swift-format-ignore-file` directive so swift-format
 	@# skips the generated wrappers. The directive needs to live on line 1
-	@# for swift-format to honor it. Until ffai-kernels' codegen emits it
+	@# for swift-format to honor it. Until iron's codegen emits it
 	@# directly (see planning/session-plan.md), prepend it post-emit so
 	@# `make format-check` stays clean across regenerations.
-	@gen=$(KERNEL_OUT)/Generated/FFAIKernels.swift; \
+	@gen=$(KERNEL_OUT)/Generated/IronKernels.swift; \
 	  if [ -f "$$gen" ] && ! head -1 "$$gen" | grep -q swift-format-ignore-file; then \
 	    tmp="$$gen.tmp"; \
 	    { printf '// swift-format-ignore-file\n//\n'; cat "$$gen"; } > "$$tmp" && mv "$$tmp" "$$gen"; \
@@ -106,7 +106,7 @@ bench: regenerate-kernels ## run `ffai bench` in release (quality benches requir
 # wrong-dispatch-shape Ops wrappers — is fixed at the source (see the
 # post-mortem in papers/ and OpsValidation in Sources/FFAI/). Test
 # runs use the same in-flight command-buffer cap as production — the
-# code default in FFAIKernelsLibrary.defaultMaxCommandBufferCount — so
+# code default in IronLibrary.defaultMaxCommandBufferCount — so
 # anything that passes in CI is proven safe under production load. To
 # set a custom command buffer count use FFAI_MAX_COMMAND_BUFFERS=16.
 #
@@ -129,7 +129,7 @@ bench: regenerate-kernels ## run `ffai bench` in release (quality benches requir
 #     loading at a time.
 #
 # Targets:
-# - `make test-unit`         — FFAITests + FFAIKernelsSwiftTests at the
+# - `make test-unit`         — FFAITests + IronSwiftTests at the
 #                              production cap (the code default), serialized
 #                              (`--no-parallel`, the Swift Testing
 #                              global serializer) so concurrent GPU
@@ -163,7 +163,7 @@ test-unit: regenerate-kernels ## unit + Metal tests, serialized (--no-parallel) 
 	@# isolation. --no-parallel makes the gate reliable (verified 6/6 green vs
 	@# ~50% flake parallel; ~8s vs ~3s). The uncapped-parallel canary that
 	@# surfaces the dispatch-race class lives in `make test-stress`.
-	swift test --no-parallel --filter "FFAITests|FFAIKernelsSwiftTests"
+	swift test --no-parallel --filter "FFAITests|IronSwiftTests"
 
 .PHONY: test-integration
 test-integration: regenerate-kernels ## end-to-end model tests; production cap + ModelLoadLock; matches release.yml
@@ -180,7 +180,7 @@ test-stress: regenerate-kernels ## canary; production cap with uncapped parallel
 	@echo "wrapper-precondition / PSOCache / ModelLoadLock defenses, this is"
 	@echo "where it surfaces."
 	@echo ""
-	swift test --filter "FFAITests|FFAIKernelsSwiftTests"
+	swift test --filter "FFAITests|IronSwiftTests"
 	swift test --filter "ModelIntegrationTests"
 
 .PHONY: coverage
@@ -212,9 +212,9 @@ integration-bisect: regenerate-kernels ## run each ModelIntegrationTests/*Integr
 #
 # Files that should be skipped opt out at the source-file level via
 # `// swift-format-ignore-file` on line 1. See
-# Sources/FFAIKernelsSwift/Generated/FFAIKernels.swift for the
-# canonical example (the file is auto-regenerated by ffai-kernels'
-# `ffaik build --emit swift`; the directive needs to be re-emitted at
+# Sources/IronSwift/Generated/IronKernels.swift for the
+# canonical example (the file is auto-regenerated by iron'
+# `iron build --emit swift`; the directive needs to be re-emitted at
 # the top by the codegen — see planning/session-plan.md).
 .PHONY: format
 format: ## run swift-format on all .swift files
@@ -258,7 +258,7 @@ docs-verify: ## swift-docc target-by-target verification only (no website previe
 .PHONY: clean
 clean: ## remove .build and generated kernel artifacts
 	rm -rf .build
-	rm -f Sources/FFAIKernelsSwift/Resources/kernels.metallib
-	rm -f Sources/FFAIKernelsSwift/Resources/manifest.json
-	rm -rf Sources/FFAIKernelsSwift/Resources/kernels
-	rm -rf Sources/FFAIKernelsSwift/Generated/FFAIKernels.swift
+	rm -f Sources/IronSwift/Resources/kernels.metallib
+	rm -f Sources/IronSwift/Resources/manifest.json
+	rm -rf Sources/IronSwift/Resources/kernels
+	rm -rf Sources/IronSwift/Generated/IronKernels.swift

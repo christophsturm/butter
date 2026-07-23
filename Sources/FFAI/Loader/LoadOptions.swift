@@ -68,7 +68,7 @@ public enum AURADecodePath: Sendable, Equatable {
     /// realising AURA's memory savings (~1.88× at aura4v4, ~3.7× at
     /// aura4v2 on Qwen3 d=128).
     ///
-    /// AURA-dtype unification (metaltile + FFAI joint change) put the
+    /// AURA-dtype unification (iron + FFAI joint change) put the
     /// per-token norms and per-scheme codebook into the activation
     /// dtype, so encode + both decode kernel paths consume the cache
     /// buffers directly — no per-call f32 cast on the decode hot path

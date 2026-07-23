@@ -23,8 +23,8 @@
 // + `dequantizeAffine` recover the input to within the quantization
 // step.
 //
-// Wraps `ffai_affine_quantize_int{2,4,8}_*` + `ffai_affine_dequantize_int{2,4,8}_*`
-// from `ffai-kernels-std/src/mlx/quantized.rs`. Bits ∈ {3, 5, 6} use a
+// Wraps `iron_affine_quantize_int{2,4,8}_*` + `iron_affine_dequantize_int{2,4,8}_*`
+// from `crates/wh-iron-std/src/kernels/gemm/quantized.rs`. Bits ∈ {3, 5, 6} use a
 // bit-stream packing path and are documented in
 // `OpsCoverageNotes.swift` — not yet wrapped (no production caller
 // needs them at this layer; embedding / weight quant already routes
@@ -46,7 +46,7 @@
 
 import Foundation
 import Metal
-import FFAIKernelsSwift
+import IronSwift
 
 public enum QuantizedOps {
 
@@ -88,126 +88,126 @@ public enum QuantizedOps {
         let gs = UInt32(groupSize)
         switch (bits, out.dtype) {
         case (4, .f32):
-            FFAIKernels.ffai_affine_dequantize_int4_f32(
+            IronKernels.iron_affine_dequantize_int4_f32(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, .f16):
-            FFAIKernels.ffai_affine_dequantize_int4_f16(
+            IronKernels.iron_affine_dequantize_int4_f16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, .bf16):
-            FFAIKernels.ffai_affine_dequantize_int4_bf16(
+            IronKernels.iron_affine_dequantize_int4_bf16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .f32):
-            FFAIKernels.ffai_affine_dequantize_int8_f32(
+            IronKernels.iron_affine_dequantize_int8_f32(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .f16):
-            FFAIKernels.ffai_affine_dequantize_int8_f16(
+            IronKernels.iron_affine_dequantize_int8_f16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .bf16):
-            FFAIKernels.ffai_affine_dequantize_int8_bf16(
+            IronKernels.iron_affine_dequantize_int8_bf16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .f32):
-            FFAIKernels.ffai_affine_dequantize_int2_f32(
+            IronKernels.iron_affine_dequantize_int2_f32(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .f16):
-            FFAIKernels.ffai_affine_dequantize_int2_f16(
+            IronKernels.iron_affine_dequantize_int2_f16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .bf16):
-            FFAIKernels.ffai_affine_dequantize_int2_bf16(
+            IronKernels.iron_affine_dequantize_int2_bf16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .f32):
-            FFAIKernels.ffai_affine_dequantize_int3_f32(
+            IronKernels.iron_affine_dequantize_int3_f32(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .f16):
-            FFAIKernels.ffai_affine_dequantize_int3_f16(
+            IronKernels.iron_affine_dequantize_int3_f16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .bf16):
-            FFAIKernels.ffai_affine_dequantize_int3_bf16(
+            IronKernels.iron_affine_dequantize_int3_bf16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (5, .f32):
-            FFAIKernels.ffai_affine_dequantize_int5_f32(
+            IronKernels.iron_affine_dequantize_int5_f32(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (5, .f16):
-            FFAIKernels.ffai_affine_dequantize_int5_f16(
+            IronKernels.iron_affine_dequantize_int5_f16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (5, .bf16):
-            FFAIKernels.ffai_affine_dequantize_int5_bf16(
+            IronKernels.iron_affine_dequantize_int5_bf16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (6, .f32):
-            FFAIKernels.ffai_affine_dequantize_int6_f32(
+            IronKernels.iron_affine_dequantize_int6_f32(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (6, .f16):
-            FFAIKernels.ffai_affine_dequantize_int6_f16(
+            IronKernels.iron_affine_dequantize_int6_f16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 out: out.buffer, outOffset: out.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (6, .bf16):
-            FFAIKernels.ffai_affine_dequantize_int6_bf16(
+            IronKernels.iron_affine_dequantize_int6_bf16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -255,126 +255,126 @@ public enum QuantizedOps {
         let gs = UInt32(groupSize)
         switch (bits, weight.dtype) {
         case (4, .f32):
-            FFAIKernels.ffai_affine_quantize_int4_f32(
+            IronKernels.iron_affine_quantize_int4_f32(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, .f16):
-            FFAIKernels.ffai_affine_quantize_int4_f16(
+            IronKernels.iron_affine_quantize_int4_f16(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, .bf16):
-            FFAIKernels.ffai_affine_quantize_int4_bf16(
+            IronKernels.iron_affine_quantize_int4_bf16(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .f32):
-            FFAIKernels.ffai_affine_quantize_int8_f32(
+            IronKernels.iron_affine_quantize_int8_f32(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .f16):
-            FFAIKernels.ffai_affine_quantize_int8_f16(
+            IronKernels.iron_affine_quantize_int8_f16(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .bf16):
-            FFAIKernels.ffai_affine_quantize_int8_bf16(
+            IronKernels.iron_affine_quantize_int8_bf16(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .f32):
-            FFAIKernels.ffai_affine_quantize_int2_f32(
+            IronKernels.iron_affine_quantize_int2_f32(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .f16):
-            FFAIKernels.ffai_affine_quantize_int2_f16(
+            IronKernels.iron_affine_quantize_int2_f16(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .bf16):
-            FFAIKernels.ffai_affine_quantize_int2_bf16(
+            IronKernels.iron_affine_quantize_int2_bf16(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .f32):
-            FFAIKernels.ffai_affine_quantize_int3_f32(
+            IronKernels.iron_affine_quantize_int3_f32(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .f16):
-            FFAIKernels.ffai_affine_quantize_int3_f16(
+            IronKernels.iron_affine_quantize_int3_f16(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .bf16):
-            FFAIKernels.ffai_affine_quantize_int3_bf16(
+            IronKernels.iron_affine_quantize_int3_bf16(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (5, .f32):
-            FFAIKernels.ffai_affine_quantize_int5_f32(
+            IronKernels.iron_affine_quantize_int5_f32(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (5, .f16):
-            FFAIKernels.ffai_affine_quantize_int5_f16(
+            IronKernels.iron_affine_quantize_int5_f16(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (5, .bf16):
-            FFAIKernels.ffai_affine_quantize_int5_bf16(
+            IronKernels.iron_affine_quantize_int5_bf16(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (6, .f32):
-            FFAIKernels.ffai_affine_quantize_int6_f32(
+            IronKernels.iron_affine_quantize_int6_f32(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (6, .f16):
-            FFAIKernels.ffai_affine_quantize_int6_f16(
+            IronKernels.iron_affine_quantize_int6_f16(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
                 group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         case (6, .bf16):
-            FFAIKernels.ffai_affine_quantize_int6_bf16(
+            IronKernels.iron_affine_quantize_int6_bf16(
                 w: weight.buffer, wOffset: weight.offset,
                 out: packed.buffer, outOffset: packed.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,

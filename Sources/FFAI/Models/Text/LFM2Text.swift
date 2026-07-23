@@ -297,7 +297,7 @@ func lfm2LoadModel(
                     Linear(
                         weight: try weights.tensor(named: "\(p).conv.out_proj.weight")))
             }
-            // HF Conv1d weight ships [hidden, 1, kernel]; the ffai-kernels
+            // HF Conv1d weight ships [hidden, 1, kernel]; the iron
             // conv1d kernel wants [kernel, hidden].
             let convWSrc = try weights.tensor(named: "\(p).conv.conv.weight")
             precondition(
@@ -875,7 +875,7 @@ public final class LFM2Layer: Module, DecoderLayer {
 
         // ── Mixer half ────────────────────────────────────────────────
         // The attention-mixer branch fuses (h + mixerOut) → ffnNorm via
-        // ffai_add_rms_norm (hidden ≤ 4096). The conv-mixer branch is the
+        // iron_add_rms_norm (hidden ≤ 4096). The conv-mixer branch is the
         // SSM recurrence path and per the task carve-out keeps the
         // separate add + norm sequence.
         var workCmd = cmd
@@ -1224,7 +1224,7 @@ private func lfm2WriteFloats(
 }
 
 /// Transpose an HF Conv1d weight `[channels, 1, kernel]` → `[kernel,
-/// channels]` for the ffai-kernels `conv1d_causal_step` kernel.
+/// channels]` for the iron `conv1d_causal_step` kernel.
 private func lfm2TransposeConvWeight(
     _ src: Tensor, kernel K: Int,
     channels C: Int,

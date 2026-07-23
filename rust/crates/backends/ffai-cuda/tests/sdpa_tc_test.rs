@@ -5,9 +5,9 @@
 //! at S=128, S=512, S=2048 (GQA: nq=32, nkv=2, hd=128, causal=true).
 //! Threshold: max |rel_err| ≤ 1e-2 (1% — typical f16 vs f32 tolerance).
 
-use ffai_cuda::CudaDevice;
-use ffai_core::{DType, Device, Tensor};
-use ffai_ops::{sdpa_multi, sdpa_multi_tc};
+use iron_cuda::CudaDevice;
+use iron_core::{DType, Device, Tensor};
+use iron_ops::{sdpa_multi, sdpa_multi_tc};
 
 fn rng(n: usize, seed: u64) -> Vec<f32> {
     let mut v = vec![0f32; n];

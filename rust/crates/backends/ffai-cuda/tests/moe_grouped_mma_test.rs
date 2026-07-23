@@ -4,9 +4,9 @@
 //! out[t,n] = Σ_k A[t,k]·W[eid(t)][n,k], sorted tokens, contiguous expert slab.
 //! Reference computed on host (f32 accumulate of the same f16 inputs).
 
-use ffai_cuda::CudaDevice;
-use ffai_core::{DType, Device, Tensor};
-use ffai_ops::{moe_grouped_gemm_mma, moe_grouped_gemm_cutlass, cast_f32_f16, cast_f16_f32, lt_fp4_quant_g, lt_fp4_quant_g_46, dec_ue4m3,
+use iron_cuda::CudaDevice;
+use iron_core::{DType, Device, Tensor};
+use iron_ops::{moe_grouped_gemm_mma, moe_grouped_gemm_cutlass, cast_f32_f16, cast_f16_f32, lt_fp4_quant_g, lt_fp4_quant_g_46, dec_ue4m3,
     moe_grouped_gemm_w4a8, w4a8_actquant_grouped, w4a8_packw, w4a8_sfa_offsets,
     moe_grouped_gemm_w8a8, w8a8_actquant_grouped, w8a8_packw,
     lt_fp4_quant_slab, lt_fp4_quant_grouped, moe_grouped_gemm_cutlass_fp4};

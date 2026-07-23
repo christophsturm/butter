@@ -5,10 +5,10 @@
 //! shared expert) on the shared op layer, comparing to HF transformers'
 //! Qwen2MoeSparseMoeBlock output for the same input. Turns MoE from
 //! "compute-verified-vs-CPU" into "real-weights-verified-vs-HF".
-use ffai_core::{DType, Tensor};
-use ffai_metal::MetalDevice;
-use ffai_loader::SafeTensors;
-use ffai_ops::{gemv, swiglu};
+use iron_core::{DType, Tensor};
+use iron_metal::MetalDevice;
+use iron_loader::SafeTensors;
+use iron_ops::{gemv, swiglu};
 
 fn fb(b:&[u8])->Vec<f32>{b.chunks_exact(4).map(|c|f32::from_le_bytes(c.try_into().unwrap())).collect()}
 fn tb(v:&[f32])->Vec<u8>{v.iter().flat_map(|x|x.to_le_bytes()).collect()}

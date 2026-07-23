@@ -5,9 +5,9 @@
 //! L∈{64,128,256,512}, plus the sequential reference, to find the optimal
 //! chunk length and quantify the O(S·L) intra-chunk vs O(nc) inter-chunk
 //! tradeoff. Run with:  cargo test --release -p ffai-metal --test ssd_profile -- --nocapture --test-threads=1
-use ffai_core::{DType, Device, Tensor};
-use ffai_metal::MetalDevice;
-use ffai_ops::{ssm_prefill_scan, ssm_prefill_scan_ssd_portable};
+use iron_core::{DType, Device, Tensor};
+use iron_metal::MetalDevice;
+use iron_ops::{ssm_prefill_scan, ssm_prefill_scan_ssd_portable};
 use std::time::Instant;
 
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }

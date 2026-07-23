@@ -10,15 +10,15 @@
 //!
 //! ## How code is shared
 //!
-//! Kernels are shared via the **metaltile IR** ([`Kernel`], re-exported
-//! from `metaltile-core`). A model op builds or looks up a `Kernel` and
+//! Kernels are shared via the **iron IR** ([`Kernel`], re-exported
+//! from `iron-core`). A model op builds or looks up a `Kernel` and
 //! hands it to [`Device::dispatch`]; the backend lowers that IR to its
 //! target language (MSL / CUDA C++ / SPIR-V) and launches it. So:
 //!
 //! - **Above** this trait (models, ops, loaders, KV cache, sampler) is
 //!   plain Rust that never names a GPU API — written once, runs everywhere.
 //! - **Below** it, each backend is a thin [`Device`] impl.
-//! - The kernels themselves are generated once by metaltile.
+//! - The kernels themselves are generated once by iron.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -27,9 +27,9 @@ mod error;
 pub use error::{Error, Result};
 
 // Re-export the shared kernel IR + dtype so the whole engine speaks one
-// vocabulary and nothing downstream depends on metaltile-core directly.
-pub use ffai_kernels_core::dtype::DType;
-pub use ffai_kernels_core::ir::Kernel;
+// vocabulary and nothing downstream depends on iron-core directly.
+pub use iron_kernels_core::dtype::DType;
+pub use iron_kernels_core::ir::Kernel;
 
 /// Which accelerator family a [`Device`] targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -113,7 +113,7 @@ pub trait Device: Send + Sync {
     /// Copy device memory back into a host slice.
     fn download(&self, buf: &dyn DeviceBuffer, out: &mut [u8]) -> Result<()>;
 
-    /// Lower `kernel` (shared metaltile IR) for this backend and launch it
+    /// Lower `kernel` (shared iron IR) for this backend and launch it
     /// over `grid` with `bindings` in signature order.
     fn dispatch(&self, kernel: &Kernel, bindings: &[Binding], grid: Grid) -> Result<()>;
 

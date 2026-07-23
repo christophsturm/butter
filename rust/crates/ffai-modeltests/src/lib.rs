@@ -6,9 +6,9 @@
 //! ONCE. The per-backend test files (`ffai-metal/tests/*`, `ffai-cuda/tests/*`)
 //! are thin wrappers that build their device and call these — so a model's
 //! logic lives in exactly one place, not a Metal test + a sed'd CUDA twin.
-use ffai_core::{Backend, DType, Device, Tensor};
-use ffai_loader::SafeTensors;
-use ffai_ops::{add, gelu, gemv, layer_norm, sdpa_decode};
+use iron_core::{Backend, DType, Device, Tensor};
+use iron_loader::SafeTensors;
+use iron_ops::{add, gelu, gemv, layer_norm, sdpa_decode};
 
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn fb(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() }
@@ -77,7 +77,7 @@ pub fn verify_gpt2(d: &dyn Device, plat: &str) {
     let xf = layer_norm(d, &up(&x, vec![hid]),
         &up(&g("ln_f.weight"), vec![hid]), &up(&g("ln_f.bias"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&wte, vec![vocab, hid]), &xf).unwrap(), vocab);
-    let argmax = ffai_runtime::argmax(&logits);
+    let argmax = iron_runtime::argmax(&logits);
     eprintln!("GPT-2-124M full forward on {plat}: argmax = {argmax} (HF = 198)");
     assert_eq!(argmax, 198, "GPT-2 argmax != HF 198");
     eprintln!("✅ Full real GPT-2 forward matches HF on the shared engine ({plat}) — one shared forward, both backends.");
@@ -86,7 +86,7 @@ pub fn verify_gpt2(d: &dyn Device, plat: &str) {
 /// Mamba2-130m single-token forward (SSM: conv1d + SSD scan + gated RMSNorm)
 /// vs HF argmax 310. Same shared op layer, any `Device`.
 pub fn verify_mamba2(d: &dyn Device, plat: &str) {
-    use ffai_ops::{conv1d_causal_step, rms_norm, silu, ssm_step};
+    use iron_ops::{conv1d_causal_step, rms_norm, silu, ssm_step};
     let dir = model_dir("MAMBA2_DIR", "models--AntonV--mamba2-130m-hf").unwrap_or_default();
     let path = format!("{dir}/model.safetensors");
     let Ok(st) = SafeTensors::open(&path) else { eprintln!("no model at {path} — skipping"); return; };
@@ -140,7 +140,7 @@ pub fn verify_mamba2(d: &dyn Device, plat: &str) {
     let xf = rms_norm(d, &up(&x), &up(&g("backbone.norm_f.weight")), eps).unwrap();
     let lm = upm(&embed, vec![vocab, hid]);
     let logits = dl(&gemv(d, &lm, &xf).unwrap(), vocab);
-    let argmax = ffai_runtime::argmax(&logits);
+    let argmax = iron_runtime::argmax(&logits);
     eprintln!("Mamba2-130m full forward on {plat}: argmax = {argmax} (HF = 310)");
     assert_eq!(argmax, 310, "Mamba2 argmax != HF 310");
     eprintln!("✅ Full real Mamba2-130m forward matches HF on the shared engine ({plat}).");
@@ -201,7 +201,7 @@ pub fn verify_pythia(d: &dyn Device, plat: &str) {
     }
     let xf = layer_norm(d, &up(&x, vec![hid]), &up(&g("gpt_neox.final_layer_norm.weight"), vec![hid]), &up(&g("gpt_neox.final_layer_norm.bias"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&g("embed_out.weight"), vec![vocab, hid]), &xf).unwrap(), vocab);
-    let argmax = ffai_runtime::argmax(&logits);
+    let argmax = iron_runtime::argmax(&logits);
     eprintln!("Pythia-160m on {plat}: argmax = {argmax} (HF = 285)");
     assert_eq!(argmax, 285, "Pythia argmax != HF 285");
     eprintln!("✅ Pythia-160m matches HF ({plat}).");
@@ -209,7 +209,7 @@ pub fn verify_pythia(d: &dyn Device, plat: &str) {
 
 /// OLMo-2-1B: post-norm placement + qk-norm over full proj, SwiGLU. vs HF top-3 [198,8,13].
 pub fn verify_olmo2(d: &dyn Device, plat: &str) {
-    use ffai_ops::{rms_norm, swiglu};
+    use iron_ops::{rms_norm, swiglu};
     let dir = model_dir("OLMO2_DIR", "models--allenai--OLMo-2-0425-1B").unwrap_or_default();
     let Ok(st) = SafeTensors::open_dir(&dir) else { eprintln!("no model at {dir} — skipping"); return; };
     let (hid, nq, nkv, hd, inter, n_layers, vocab, eps) = (2048usize, 16usize, 16usize, 128usize, 8192usize, 16usize, 100352usize, 1e-6f32);
@@ -242,7 +242,7 @@ pub fn verify_olmo2(d: &dyn Device, plat: &str) {
     }
     let xf = rms_norm(d, &up(&x, vec![hid]), &up(&g("model.norm.weight"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&g("lm_head.weight"), vec![vocab, hid]), &xf).unwrap(), vocab);
-    let idx = ffai_runtime::topk(&logits, 3);
+    let idx = iron_runtime::topk(&logits, 3);
     eprintln!("OLMo-2-1B on {plat}: top3 = {:?} (HF = [198,8,13])", &idx[..3]);
     assert_eq!(&idx[..3], &[198usize, 8, 13], "OLMo-2 top-3 != HF");
     eprintln!("✅ OLMo-2-1B matches HF ({plat}).");
@@ -279,7 +279,7 @@ pub fn verify_gptneo(d: &dyn Device, plat: &str) {
     }
     let xf = layer_norm(d, &up(&x, vec![hid]), &up(&g("transformer.ln_f.weight"), vec![hid]), &up(&g("transformer.ln_f.bias"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&wte, vec![vocab, hid]), &xf).unwrap(), vocab);
-    let idx = ffai_runtime::topk(&logits, 3);
+    let idx = iron_runtime::topk(&logits, 3);
     eprintln!("GPT-Neo-125M on {plat}: top3 = {:?} (HF = [28,59,91])", &idx[..3]);
     assert_eq!(&idx[..3], &[28usize, 59, 91], "GPT-Neo top-3 != HF");
     eprintln!("✅ GPT-Neo-125M matches HF ({plat}).");
@@ -288,7 +288,7 @@ pub fn verify_gptneo(d: &dyn Device, plat: &str) {
 /// Gemma-2-2b: √hidden embed-scale, RMSNorm(1+w), 4 norms/layer, geGLU, GQA
 /// hd256, softcaps (argmax-invariant at 1 pos). vs HF top-3 [9707,235265,110].
 pub fn verify_gemma2(d: &dyn Device, plat: &str) {
-    use ffai_ops::{mul, rms_norm};
+    use iron_ops::{mul, rms_norm};
     let dir = model_dir("GEMMA2_DIR", "models--unsloth--gemma-2-2b-it").unwrap_or_default();
     let Ok(st) = SafeTensors::open_dir(&dir) else { eprintln!("no model at {dir} — skipping"); return; };
     let (hid, nq, nkv, hd, inter, n_layers, vocab, eps) = (2304usize, 8usize, 4usize, 256usize, 9216usize, 26usize, 256000usize, 1e-6f32);
@@ -320,7 +320,7 @@ pub fn verify_gemma2(d: &dyn Device, plat: &str) {
     }
     let xf = rms_norm(d, &up(&x, vec![hid]), &up(&g1("model.norm.weight"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&embed, vec![vocab, hid]), &xf).unwrap(), vocab);
-    let idx = ffai_runtime::topk(&logits, 3);
+    let idx = iron_runtime::topk(&logits, 3);
     eprintln!("Gemma-2-2b on {plat}: top3 = {:?} (HF = [9707,235265,110])", &idx[..3]);
     assert_eq!(&idx[..3], &[9707usize, 235265, 110], "Gemma top-3 != HF");
     eprintln!("✅ Gemma-2-2b matches HF ({plat}).");
@@ -356,7 +356,7 @@ pub fn verify_phi(d: &dyn Device, plat: &str) {
     }
     let xf = layer_norm(d, &up(&x, vec![hid]), &up(&g("model.final_layernorm.weight"), vec![hid]), &up(&g("model.final_layernorm.bias"), vec![hid]), eps).unwrap();
     let logits = dl(&add(d, &gemv(d, &up(&g("lm_head.weight"), vec![vocab, hid]), &xf).unwrap(), &up(&g("lm_head.bias"), vec![vocab])).unwrap(), vocab);
-    let idx = ffai_runtime::topk(&logits, 3);
+    let idx = iron_runtime::topk(&logits, 3);
     eprintln!("Phi-1.5 on {plat}: top3 = {:?} (HF = [11,13,546])", &idx[..3]);
     assert_eq!(&idx[..3], &[11usize, 13, 546], "Phi top-3 != HF");
     eprintln!("✅ Phi-1.5 matches HF ({plat}).");
@@ -365,7 +365,7 @@ pub fn verify_phi(d: &dyn Device, plat: &str) {
 /// StableLM-2-1.6B: LayerNorm(+bias), q/k/v bias, partial rotary, SwiGLU.
 /// vs HF top-3 [341,11,280].
 pub fn verify_stablelm2(d: &dyn Device, plat: &str) {
-    use ffai_ops::swiglu;
+    use iron_ops::swiglu;
     let dir = model_dir("STABLELM2_DIR", "models--stabilityai--stablelm-2-1_6b").unwrap_or_default();
     let Ok(st) = SafeTensors::open_dir(&dir) else { eprintln!("no model at {dir} — skipping"); return; };
     let (hid, nh, hd, inter, n_layers, vocab, eps) = (2048usize, 32usize, 64usize, 5632usize, 24usize, 100352usize, 1e-5f32);
@@ -395,7 +395,7 @@ pub fn verify_stablelm2(d: &dyn Device, plat: &str) {
     }
     let xf = layer_norm(d, &up(&x, vec![hid]), &up(&g("model.norm.weight"), vec![hid]), &up(&g("model.norm.bias"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&g("lm_head.weight"), vec![vocab, hid]), &xf).unwrap(), vocab);
-    let idx = ffai_runtime::topk(&logits, 3);
+    let idx = iron_runtime::topk(&logits, 3);
     eprintln!("StableLM-2-1.6B on {plat}: top3 = {:?} (HF = [341,11,280])", &idx[..3]);
     assert_eq!(&idx[..3], &[341usize, 11, 280], "StableLM-2 top-3 != HF");
     eprintln!("✅ StableLM-2-1.6B matches HF ({plat}).");
@@ -404,7 +404,7 @@ pub fn verify_stablelm2(d: &dyn Device, plat: &str) {
 /// OLMoE-1B-7B: 64-expert MoE, top-8 no-renorm, no shared expert, qk-norm over
 /// full proj, MHA hd128. vs HF argmax 310.
 pub fn verify_olmoe(d: &dyn Device, plat: &str) {
-    use ffai_ops::{rms_norm, swiglu};
+    use iron_ops::{rms_norm, swiglu};
     let dir = model_dir("OLMOE_DIR", "models--allenai--OLMoE-1B-7B-0924").unwrap_or_default();
     let Ok(st) = SafeTensors::open_dir(&dir) else { eprintln!("no model at {dir} — skipping"); return; };
     let (hid, nh, hd, inter, n_exp, top_k, n_layers, vocab, eps) = (2048usize, 16usize, 128usize, 1024usize, 64usize, 8usize, 16usize, 50304usize, 1e-5f32);
@@ -433,7 +433,7 @@ pub fn verify_olmoe(d: &dyn Device, plat: &str) {
         let exps: Vec<f32> = rl.iter().map(|&z| (z-mx).exp()).collect();
         let sum: f32 = exps.iter().sum();
         let probs: Vec<f32> = exps.iter().map(|&e| e/sum).collect();
-        let eidx = ffai_runtime::topk(&probs, top_k);
+        let eidx = iron_runtime::topk(&probs, top_k);
         let mut acc = vec![0.0f32; hid];
         for &e in &eidx {
             let w = probs[e]; let ep = format!("{p}.mlp.experts.{e}");
@@ -447,7 +447,7 @@ pub fn verify_olmoe(d: &dyn Device, plat: &str) {
     }
     let xf = rms_norm(d, &up(&x), &up(&g("model.norm.weight")), eps).unwrap();
     let logits = dl(&gemv(d, &upm(&g("lm_head.weight"), vec![vocab, hid]), &xf).unwrap(), vocab);
-    let argmax = ffai_runtime::argmax(&logits);
+    let argmax = iron_runtime::argmax(&logits);
     eprintln!("OLMoE-1B-7B on {plat}: argmax = {argmax} (HF = 310)");
     assert_eq!(argmax, 310, "OLMoE argmax != HF 310");
     eprintln!("✅ OLMoE-1B-7B (64-expert MoE) matches HF ({plat}).");
@@ -456,7 +456,7 @@ pub fn verify_olmoe(d: &dyn Device, plat: &str) {
 /// Falcon-H1-0.5B: hybrid Mamba2 mixer ∥ GQA attention per layer + µP. vs HF
 /// top-3 [593,531,587]. (token 5 is a reserved zero-embedding slot — use 9707.)
 pub fn verify_falcon_h1(d: &dyn Device, plat: &str) {
-    use ffai_ops::{conv1d_causal_step, rms_norm, silu, ssm_step};
+    use iron_ops::{conv1d_causal_step, rms_norm, silu, ssm_step};
     let dir = model_dir("FALCON_H1_DIR", "models--tiiuae--Falcon-H1-0.5B-Base").unwrap_or_default();
     let Ok(st) = SafeTensors::open_dir(&dir) else { eprintln!("no model at {dir} — skipping"); return; };
     let (hid, nq, nkv, ahd, inter, n_layers, vocab, eps) = (1024usize, 8usize, 2usize, 64usize, 2048usize, 36usize, 32784usize, 1e-5f32);
@@ -519,7 +519,7 @@ pub fn verify_falcon_h1(d: &dyn Device, plat: &str) {
     }
     let xf = rms_norm(d, &up(&x, vec![hid]), &up(&g("model.final_layernorm.weight"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&g("lm_head.weight"), vec![vocab, hid]), &xf).unwrap(), vocab);
-    let idx = ffai_runtime::topk(&logits, 3);
+    let idx = iron_runtime::topk(&logits, 3);
     eprintln!("Falcon-H1-0.5B on {plat}: top3 = {:?} (HF = [593,531,587])", &idx[..3]);
     assert_eq!(&idx[..3], &[593usize, 531, 587], "Falcon-H1 top-3 != HF");
     eprintln!("✅ Falcon-H1-0.5B (hybrid Mamba2+attn) matches HF ({plat}).");
@@ -530,7 +530,7 @@ pub fn verify_falcon_h1(d: &dyn Device, plat: &str) {
 /// Single mixer per layer, pre-norm residual. BF16 weights → F32 on-device.
 /// Verified against an HF-transformers CPU oracle (set NEMOTRON_ARGMAX).
 pub fn verify_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{conv1d_causal_step, rms_norm, rope_llama, silu, ssm_step};
+    use iron_ops::{conv1d_causal_step, rms_norm, rope_llama, silu, ssm_step};
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
     let dir = std::env::var("NEMOTRON_DIR")
         .unwrap_or_else(|_| "/home/pidtom/models/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16".into());
@@ -621,7 +621,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
                 let sig: Vec<f32> = rl.iter().map(|&z| 1.0 / (1.0 + (-z).exp())).collect();
                 let bias = g(&format!("{p}.mixer.gate.e_score_correction_bias"));
                 let choice: Vec<f32> = (0..n_exp).map(|i| sig[i] + bias[i]).collect();
-                let eidx = ffai_runtime::topk(&choice, top_k);
+                let eidx = iron_runtime::topk(&choice, top_k);
                 let mut w: Vec<f32> = eidx.iter().map(|&e| sig[e]).collect();
                 let wsum: f32 = w.iter().sum::<f32>() + 1e-20;
                 for v in w.iter_mut() { *v = *v / wsum * scale_f; }
@@ -655,8 +655,8 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
     }
     let xf = rms_norm(d, &up(&x), &up(&g("language_model.backbone.norm_f.weight")), eps).unwrap();
     let logits = dl(&gemv(d, &upm(&g("language_model.lm_head.weight"), vec![vocab, hid]), &xf).unwrap(), vocab);
-    let argmax = ffai_runtime::argmax(&logits);
-    let idx = ffai_runtime::topk(&logits, 5);
+    let argmax = iron_runtime::argmax(&logits);
+    let idx = iron_runtime::topk(&logits, 5);
     let total = t_total.elapsed().as_secs_f64();
     let (deq, xfer) = (t_deq.get(), t_xfer.get());
     let compute = (total - deq - xfer).max(0.0);
@@ -685,7 +685,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_expert_ids_from_offsets, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_grouped_gemm_cutlass, moe_q4_grouped_mma, moe_q4_grouped_mma_dev, moe_router_device, moe_scatter_add_det_dev, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, nvfp4_roundtrip, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
+    use iron_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_cublas_f32out, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_expert_ids_from_offsets, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_grouped_gemm_cutlass, moe_q4_grouped_mma, moe_q4_grouped_mma_dev, moe_router_device, moe_scatter_add_det_dev, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, nvfp4_roundtrip, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -1029,7 +1029,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         drop(wh);
                         let wt = Tensor::new(d.upload(&bytes).unwrap(), vec![n_exp * n, k], DType::F16);
                         drop(bytes);
-                        let (wp, wsc, gw) = ffai_ops::moe_fp4_pack_weights(d, &wt, n_exp, n, k).unwrap();
+                        let (wp, wsc, gw) = iron_ops::moe_fp4_pack_weights(d, &wt, n_exp, n, k).unwrap();
                         // fill the cache (raw blob: wp ++ wsc ++ gw)
                         let mut blob = vec![0u8; (wp_len + wsc_len + n_exp) * 4];
                         d.download(wp.buffer.as_ref(), &mut blob[..wp_len * 4]).unwrap();
@@ -1069,7 +1069,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             drop(wh);
                             let wt = Tensor::new(d.upload(&bytes).unwrap(), vec![n_exp * n, k], DType::F16);
                             drop(bytes);
-                            let (wp, wsf, gw) = ffai_ops::lt_fp4_quant_slab(d, &wt, n_exp, n, k).unwrap();
+                            let (wp, wsf, gw) = iron_ops::lt_fp4_quant_slab(d, &wt, n_exp, n, k).unwrap();
                             // fill the cache (raw blob: pack ++ sf ++ gw)
                             let mut blob = vec![0u8; pack_len + sf_len + gw_len];
                             d.download(wp.buffer.as_ref(), &mut blob[..pack_len]).unwrap();
@@ -1097,8 +1097,8 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             drop(bytes);
                             // mxf8f6f4 SF atom-K = 128 → pad K (down-proj K=1856 -> 1920).
                             let kpad = k.div_ceil(128) * 128;
-                            let wt = ffai_ops::pad_rows_f16(d, &wt, n_exp * n, k, kpad).unwrap();
-                            let (wp, wsf, eb) = ffai_ops::w4a8_packw(d, &wt, n_exp, n, kpad).unwrap();
+                            let wt = iron_ops::pad_rows_f16(d, &wt, n_exp * n, k, kpad).unwrap();
+                            let (wp, wsf, eb) = iron_ops::w4a8_packw(d, &wt, n_exp, n, kpad).unwrap();
                             w4a8w.insert(key, (wp, wsf, eb));
                         };
                         buildw("up_proj", inter, hid);
@@ -1114,7 +1114,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let bytes = tb_f16(&wh); drop(wh);
                             let wt = Tensor::new(d.upload(&bytes).unwrap(), vec![n_exp * n, k], DType::F16);
                             drop(bytes);
-                            let (wp, wsf, eb) = ffai_ops::w8a8_packw(d, &wt, n_exp, n, k).unwrap();
+                            let (wp, wsf, eb) = iron_ops::w8a8_packw(d, &wt, n_exp, n, k).unwrap();
                             w8a8w.insert(key, (wp, wsf, eb));
                         };
                         buildw8("up_proj", inter, hid);
@@ -1162,7 +1162,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             drop(wh);
                             let wt = Tensor::new(d.upload(&bytes).unwrap(), vec![ne * n, k], DType::F16);
                             drop(bytes);
-                            let (wp, wsc, gw) = ffai_ops::moe_fp4_pack_weights(d, &wt, ne, n, k).unwrap();
+                            let (wp, wsc, gw) = iron_ops::moe_fp4_pack_weights(d, &wt, ne, n, k).unwrap();
                             let mut blob = vec![0u8; (wp_len + wsc_len + ne) * 4];
                             d.download(wp.buffer.as_ref(), &mut blob[..wp_len * 4]).unwrap();
                             d.download(wsc.buffer.as_ref(), &mut blob[wp_len * 4..(wp_len + wsc_len) * 4]).unwrap();
@@ -1181,7 +1181,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             drop(wh);
                             let wt = Tensor::new(d.upload(&bytes).unwrap(), vec![n, k], DType::F16);
                             drop(bytes);
-                            let (wp, wsc, gw) = ffai_ops::moe_fp4_pack_weights(d, &wt, 1, n, k).unwrap();
+                            let (wp, wsc, gw) = iron_ops::moe_fp4_pack_weights(d, &wt, 1, n, k).unwrap();
                             fp4w.insert(format!("{p}.sh_{which}_fp4"), (wp, wsc, gw));
                         };
                         build1("up_proj", shared_inter, hid);
@@ -1496,7 +1496,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let sig: Vec<f32> = rl.iter().map(|&z| 1.0 / (1.0 + (-z).exp())).collect();
                         let bias = &fw[&format!("{p}.mixer.gate.e_score_correction_bias")];
                         let choice: Vec<f32> = (0..n_exp).map(|i| sig[i] + bias[i]).collect();
-                        let eidx = ffai_runtime::topk(&choice, top_k);
+                        let eidx = iron_runtime::topk(&choice, top_k);
                         let mut w: Vec<f32> = eidx.iter().map(|&e| sig[e]).collect();
                         let wsum: f32 = w.iter().sum::<f32>() + 1e-20;
                         for v in w.iter_mut() { *v = *v / wsum * scale_f; }
@@ -1646,7 +1646,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             step_count.set(step_count.get() + 1);
         }
         LAST_STEP_LOGITS.with(|c| *c.borrow_mut() = logits.clone()); // INSTRUMENTATION: revert
-        ffai_runtime::argmax(&logits)
+        iron_runtime::argmax(&logits)
     };
 
     let mut tok = 1234usize;
@@ -1664,7 +1664,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     // ── BATCHED PREFILL (NEMOTRON_PREFILL_BATCHED=1) ─────────────────────────
     // Process all S=prefill prompt tokens in ONE forward instead of S sequential
     // decode steps. Compute-bound path: dequant Q4 projection weights → f32 and
-    // run the tensor-tiled `ffai_gemm` (matmul) over [S, *]; causal prefill
+    // run the tensor-tiled `iron_gemm` (matmul) over [S, *]; causal prefill
     // flash-attn (sdpa_multi) over S; SSD scan (ssm_prefill_scan) over S; per-
     // token MoE gather loop (correctness-first). Writes the SAME conv_dev /
     // ssm_state / kvcache the sequential `step()` uses, so a following decode
@@ -1878,7 +1878,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 let (wp, wsf, wg) = {
                     if let (Some(t), Some(g)) = (w4lt.borrow().get(name).cloned(), w4g.borrow().get(name).cloned()) { (t.0, t.1, g) } else {
                         let wf = pf!(3, (m * k) as f64, dequant_q4_off(d, qs, sc, m, k, DType::F16, 0).unwrap());
-                        let (wp, wsf, wg) = ffai_ops::lt_fp4_quant_g(d, &wf, m, k).unwrap();
+                        let (wp, wsf, wg) = iron_ops::lt_fp4_quant_g(d, &wf, m, k).unwrap();
                         w4lt.borrow_mut().insert(name.to_string(), (wp.clone(), wsf.clone()));
                         w4g.borrow_mut().insert(name.to_string(), wg.clone());
                         (wp, wsf, wg)
@@ -1892,14 +1892,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let (_, _, _, p, f, g) = s0.as_ref().unwrap();
                         (p.clone(), f.clone(), g.clone())
                     } else {
-                        let t = pf!(15, 0.0, ffai_ops::lt_fp4_quant_g(d, xh, rows, k).unwrap());
+                        let t = pf!(15, 0.0, iron_ops::lt_fp4_quant_g(d, xh, rows, k).unwrap());
                         *actq_slot.borrow_mut() = Some((xh.clone(), rows, k, t.0.clone(), t.1.clone(), t.2.clone()));
                         t
                     }
                 };
-                let dscale = ffai_ops::fp4_dscale(d, &xg, &wg).unwrap();
+                let dscale = iron_ops::fp4_dscale(d, &xg, &wg).unwrap();
                 let o = pf!(2, 2.0 * rows as f64 * m as f64 * k as f64,
-                    ffai_ops::gemm_fp4(d, &xp, &xsf, &wp, &wsf, rows, m, k, true, Some(&dscale)).unwrap()); // [rows, m] f32
+                    iron_ops::gemm_fp4(d, &xp, &xsf, &wp, &wsf, rows, m, k, true, Some(&dscale)).unwrap()); // [rows, m] f32
                 if std::env::var("NEMOTRON_FP4_DENSE_DEBUG").is_ok() {
                     // numeric audit vs the f16 path (bench-only; huge max|d| = layout bug,
                     // few-percent rel = expected FP4 quantization noise)
@@ -1934,14 +1934,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 let (wq, wsc) = {
                     if let Some(t) = w4lt.borrow().get(&format!("{name}.fp8c")) { t.clone() } else {
                         let wf = pf!(3, (m * k) as f64, dequant_q4_off(d, qs, sc, m, k, DType::F16, 0).unwrap());
-                        let t = ffai_ops::fp8_quant_perrow(d, &wf, m, k).unwrap();
+                        let t = iron_ops::fp8_quant_perrow(d, &wf, m, k).unwrap();
                         w4lt.borrow_mut().insert(format!("{name}.fp8c"), t.clone());
                         t
                     }
                 };
-                let (xq, xsc) = pf!(15, 0.0, ffai_ops::fp8_quant_perrow(d, xh, rows, k).unwrap());
+                let (xq, xsc) = pf!(15, 0.0, iron_ops::fp8_quant_perrow(d, xh, rows, k).unwrap());
                 pf!(2, 2.0 * rows as f64 * m as f64 * k as f64,
-                    ffai_ops::gemm_fp8_perchan(d, &xq, &xsc, &wq, &wsc, rows, m, k).unwrap()) // [rows, m] f32
+                    iron_ops::gemm_fp8_perchan(d, &xq, &xsc, &wq, &wsc, rows, m, k).unwrap()) // [rows, m] f32
             };
             let qmm = |x: &Tensor, name: &str| -> Tensor {
                 let (qs, sc, m, k) = &qw[name];
@@ -2106,7 +2106,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 // fused residual add + NEXT layer's rms_norm (one pass, llama.cpp-style)
                                 let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
                                 match nw {
-                                    Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &out, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
+                                    Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = iron_ops::add_rms_norm(d, &xt, &out, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
                                     _ => { xt = add(d, &xt, &out).unwrap(); }
                                 }
                             }
@@ -2218,7 +2218,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // fused residual add + NEXT layer's rms_norm (one pass, llama.cpp-style)
                             let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
                             match nw {
-                                Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &out, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
+                                Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = iron_ops::add_rms_norm(d, &xt, &out, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
                                 _ => { xt = add(d, &xt, &out).unwrap(); }
                             }
                         }
@@ -2257,14 +2257,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let (triples, mt): (Vec<(u32, usize, f32)>, usize) = if devsort {
                             let bias_dev = cdev(format!("{p}.mixer.gate.e_score_correction_bias"), &|| up(&bias[..]));
                             // xn cast once to f16: feeds BOTH the cuBLAS router GEMM
-                            // (was software-MMA ffai_gemm, ~28x slower at this shape)
+                            // (was software-MMA iron_gemm, ~28x slower at this shape)
                             // and the f16 token gather below.
                             let xn_f16_e = pf!(15, 0.0, cast_f32_f16(d, &xn).unwrap());
                             let gate_w16 = &fwd[&format!("{p}.mixer.gate.weight.f16")];
                             let rl_dev = pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64,
                                 gemm_cublas_f32out(d, &xn_f16_e, gate_w16, s, n_exp, hid).unwrap());
                             xn_f16_router = Some(xn_f16_e);
-                            let (st_dev, sw_dev, off_dev) = ffai_ops::moe_route_sort_device(d, &rl_dev, &bias_dev, n_exp, top_k, scale_f).unwrap();
+                            let (st_dev, sw_dev, off_dev) = iron_ops::moe_route_sort_device(d, &rl_dev, &bias_dev, n_exp, top_k, scale_f).unwrap();
                             let m = s * top_k;
                             let tr: Vec<(u32, usize, f32)> = if devdesc_skip {
                                 Vec::new() // host-free: descriptors/gather/scatter consume device tensors
@@ -2286,7 +2286,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let rl = &rl_all[ti*n_exp..(ti+1)*n_exp];
                                 let sig: Vec<f32> = rl.iter().map(|&z| 1.0/(1.0+(-z).exp())).collect();
                                 let choice: Vec<f32> = (0..n_exp).map(|i| sig[i]+bias[i]).collect();
-                                let eidx = ffai_runtime::topk(&choice, top_k);
+                                let eidx = iron_runtime::topk(&choice, top_k);
                                 let mut w: Vec<f32> = eidx.iter().map(|&e| sig[e]).collect();
                                 let wsum: f32 = w.iter().sum::<f32>()+1e-20; for v in w.iter_mut() { *v = *v/wsum*scale_f; }
                                 for (j,&e) in eidx.iter().enumerate() { tr.push((e as u32, ti, w[j])); }
@@ -2386,7 +2386,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // ON-DEVICE MoE gather/scatter (DEFAULT-ON for CUDA): keep the
                         // validated fewer_syncs per-expert cuBLAS GEMM + on-device
                         // relu²/scatter, but ALSO gather the sorted expert activation ON
-                        // DEVICE (ffai_gather over xn rows → [mt,hid] f16) instead of the
+                        // DEVICE (iron_gather over xn rows → [mt,hid] f16) instead of the
                         // dl(&xn)+host-scatter+per-expert re-upload, and keep the routed
                         // accumulator on device through the shared-expert + residual merge.
                         // Kills the ~22MB D2H × 23 host gather + host scatter + the
@@ -2721,17 +2721,17 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let grows: Vec<i32> = g_starts_c.windows(2).map(|w| (w[1]-w[0]) as i32).collect();
                                 let (uwp, uwsf, ueb) = &w8a8w[&format!("{p}.moe_up_proj_w8a8")];
                                 let (dwp, dwsf, deb) = &w8a8w[&format!("{p}.moe_down_proj_w8a8")];
-                                let (uoff, ubytes) = ffai_ops::w4a8_sfa_offsets(&g_starts_c, hid);
+                                let (uoff, ubytes) = iron_ops::w4a8_sfa_offsets(&g_starts_c, hid);
                                 let (ap, asf) = pf!(15, 0.0,
-                                    ffai_ops::w8a8_actquant_grouped(d, &xs_g, &grows, &uoff, ubytes, mt, hid).unwrap());
+                                    iron_ops::w8a8_actquant_grouped(d, &xs_g, &grows, &uoff, ubytes, mt, hid).unwrap());
                                 let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
-                                    ffai_ops::moe_grouped_gemm_w8a8(d, &ap, &asf, &uoff, uwp, uwsf, *ueb, &g_starts_c, &eids_c, inter, hid).unwrap());
+                                    iron_ops::moe_grouped_gemm_w8a8(d, &ap, &asf, &uoff, uwp, uwsf, *ueb, &g_starts_c, &eids_c, inter, hid).unwrap());
                                 let a2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
-                                let (boff, bbytes) = ffai_ops::w4a8_sfa_offsets(&g_starts_c, inter);
+                                let (boff, bbytes) = iron_ops::w4a8_sfa_offsets(&g_starts_c, inter);
                                 let (bp, bsf) = pf!(15, 0.0,
-                                    ffai_ops::w8a8_actquant_grouped(d, &a2, &grows, &boff, bbytes, mt, inter).unwrap());
+                                    iron_ops::w8a8_actquant_grouped(d, &a2, &grows, &boff, bbytes, mt, inter).unwrap());
                                 let dn_out = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
-                                    ffai_ops::moe_grouped_gemm_w8a8(d, &bp, &bsf, &boff, dwp, dwsf, *deb, &g_starts_c, &eids_c, hid, inter).unwrap());
+                                    iron_ops::moe_grouped_gemm_w8a8(d, &bp, &bsf, &boff, dwp, dwsf, *deb, &g_starts_c, &eids_c, hid, inter).unwrap());
                                 let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
                                 moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
                                 if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
@@ -2752,19 +2752,19 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let (dwp, dwsf, deb) = &w4a8w[&format!("{p}.moe_down_proj_w4a8")];
                                 let hid_pad = hid.div_ceil(128) * 128;
                                 let inter_pad = inter.div_ceil(128) * 128;
-                                let xs_p = ffai_ops::pad_rows_f16(d, &xs_g, mt, hid, hid_pad).unwrap();
-                                let (uoff, ubytes) = ffai_ops::w4a8_sfa_offsets(&g_starts_c, hid_pad);
+                                let xs_p = iron_ops::pad_rows_f16(d, &xs_g, mt, hid, hid_pad).unwrap();
+                                let (uoff, ubytes) = iron_ops::w4a8_sfa_offsets(&g_starts_c, hid_pad);
                                 let (ap, asf) = pf!(15, 0.0,
-                                    ffai_ops::w4a8_actquant_grouped(d, &xs_p, &grows, &uoff, ubytes, mt, hid_pad).unwrap());
+                                    iron_ops::w4a8_actquant_grouped(d, &xs_p, &grows, &uoff, ubytes, mt, hid_pad).unwrap());
                                 let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
-                                    ffai_ops::moe_grouped_gemm_w4a8(d, &ap, &asf, &uoff, uwp, uwsf, *ueb, &g_starts_c, &eids_c, inter, hid_pad).unwrap());
+                                    iron_ops::moe_grouped_gemm_w4a8(d, &ap, &asf, &uoff, uwp, uwsf, *ueb, &g_starts_c, &eids_c, inter, hid_pad).unwrap());
                                 let a2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
-                                let a2p = ffai_ops::pad_rows_f16(d, &a2, mt, inter, inter_pad).unwrap();
-                                let (boff, bbytes) = ffai_ops::w4a8_sfa_offsets(&g_starts_c, inter_pad);
+                                let a2p = iron_ops::pad_rows_f16(d, &a2, mt, inter, inter_pad).unwrap();
+                                let (boff, bbytes) = iron_ops::w4a8_sfa_offsets(&g_starts_c, inter_pad);
                                 let (bp, bsf) = pf!(15, 0.0,
-                                    ffai_ops::w4a8_actquant_grouped(d, &a2p, &grows, &boff, bbytes, mt, inter_pad).unwrap());
+                                    iron_ops::w4a8_actquant_grouped(d, &a2p, &grows, &boff, bbytes, mt, inter_pad).unwrap());
                                 let dn_out = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
-                                    ffai_ops::moe_grouped_gemm_w4a8(d, &bp, &bsf, &boff, dwp, dwsf, *deb, &g_starts_c, &eids_c, hid, inter_pad).unwrap());
+                                    iron_ops::moe_grouped_gemm_w4a8(d, &bp, &bsf, &boff, dwp, dwsf, *deb, &g_starts_c, &eids_c, hid, inter_pad).unwrap());
                                 {
                                     use std::sync::atomic::{AtomicUsize, Ordering};
                                     static DBG: AtomicUsize = AtomicUsize::new(0);
@@ -2808,18 +2808,18 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 // explicit xs gather pass; amax scans s rows instead of mt.
                                 let (_, st_dev0, _) = moe_dev.as_ref().unwrap();
                                 let (ap, asf, ags) = if let Some(xnr) = xn_f16_router.as_ref() {
-                                    pf!(15, 0.0, ffai_ops::lt_fp4_quant_grouped_dev(d, xnr, mt, hid, off_dev, n_exp, 0, 0.0, Some((st_dev0, s))).unwrap())
+                                    pf!(15, 0.0, iron_ops::lt_fp4_quant_grouped_dev(d, xnr, mt, hid, off_dev, n_exp, 0, 0.0, Some((st_dev0, s))).unwrap())
                                 } else {
-                                    pf!(15, 0.0, ffai_ops::lt_fp4_quant_grouped_dev(d, &xs_in, mt, hid, off_dev, n_exp, 0, 0.0, None).unwrap())
+                                    pf!(15, 0.0, iron_ops::lt_fp4_quant_grouped_dev(d, &xs_in, mt, hid, off_dev, n_exp, 0, 0.0, None).unwrap())
                                 };
-                                ffai_ops::fp4_group_alpha_id(d, &ags, ugw, alpha_u, n_exp).unwrap();
+                                iron_ops::fp4_group_alpha_id(d, &ags, ugw, alpha_u, n_exp).unwrap();
                                 let up_out = Tensor::empty(d, vec![mt, inter], DType::F16).unwrap();
                                 pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
                                     d.moe_grouped_cutlass_fp4_run(*hu, ap.buffer.as_ref(), asf.buffer.as_ref(), up_out.buffer.as_ref(), off_dev.buffer.as_ref()).unwrap());
                                 // relu²·(1/256) fused into the down-quant (no standalone pass)
                                 let (bp, bsf, bgs) = pf!(15, 0.0,
-                                    ffai_ops::lt_fp4_quant_grouped_dev(d, &up_out, mt, inter, off_dev, n_exp, 1, inv, None).unwrap());
-                                ffai_ops::fp4_group_alpha_id(d, &bgs, dgw, alpha_d, n_exp).unwrap();
+                                    iron_ops::lt_fp4_quant_grouped_dev(d, &up_out, mt, inter, off_dev, n_exp, 1, inv, None).unwrap());
+                                iron_ops::fp4_group_alpha_id(d, &bgs, dgw, alpha_d, n_exp).unwrap();
                                 let dn_out = Tensor::empty(d, vec![mt, hid], DType::F16).unwrap();
                                 pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
                                     d.moe_grouped_cutlass_fp4_run(*hd, bp.buffer.as_ref(), bsf.buffer.as_ref(), dn_out.buffer.as_ref(), off_dev.buffer.as_ref()).unwrap());
@@ -2850,14 +2850,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let (uwp, uwsf, ugw) = &fp4w_cutlass[&format!("{p}.moe_up_proj_fp4_cutlass")];
                                 let (dwp, dwsf, dgw) = &fp4w_cutlass[&format!("{p}.moe_down_proj_fp4_cutlass")];
                                 let (ap, asf, aoff, ags) = pf!(15, 0.0,
-                                    ffai_ops::lt_fp4_quant_grouped(d, &xs_in, mt, hid, &g_starts_c).unwrap());
+                                    iron_ops::lt_fp4_quant_grouped(d, &xs_in, mt, hid, &g_starts_c).unwrap());
                                 let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
-                                    ffai_ops::moe_grouped_gemm_cutlass_fp4(d, &ap, &asf, &aoff, &ags, uwp, uwsf, ugw, &g_starts_c, &eids_c, inter, hid).unwrap());
+                                    iron_ops::moe_grouped_gemm_cutlass_fp4(d, &ap, &asf, &aoff, &ags, uwp, uwsf, ugw, &g_starts_c, &eids_c, inter, hid).unwrap());
                                 let a2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
                                 let (bp, bsf, boff, bgs) = pf!(15, 0.0,
-                                    ffai_ops::lt_fp4_quant_grouped(d, &a2, mt, inter, &g_starts_c).unwrap());
+                                    iron_ops::lt_fp4_quant_grouped(d, &a2, mt, inter, &g_starts_c).unwrap());
                                 let dn_out = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
-                                    ffai_ops::moe_grouped_gemm_cutlass_fp4(d, &bp, &bsf, &boff, &bgs, dwp, dwsf, dgw, &g_starts_c, &eids_c, hid, inter).unwrap());
+                                    iron_ops::moe_grouped_gemm_cutlass_fp4(d, &bp, &bsf, &boff, &bgs, dwp, dwsf, dgw, &g_starts_c, &eids_c, hid, inter).unwrap());
                                 let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
                                 let (_, st_dev, sw_dev) = moe_dev.as_ref().unwrap();
                                 moe_scatter_add_det_dev(d, &dn_out, st_dev, sw_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
@@ -2867,14 +2867,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let (dwp, dwsc, dgw) = &fp4w[&format!("{p}.moe_down_proj_fp4_fold")];
                                 let amax_dn = Tensor::new(d.alloc_zeroed(4).unwrap(), vec![1], DType::U32);
                                 let (off0, st0, sw0) = moe_dev.as_ref().unwrap();
-                                let (st_e, sw_e, off_e) = ffai_ops::moe_extend_groups(d, st0, sw0, off0, mt, s, n_exp).unwrap();
-                                let ffai_e = mt + 2 * s;
-                                let up_out = pf!(11, 2.0*ffai_e as f64*inter as f64*hid as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xs_in, uwp, uwsc, ugw, &off_e, n_exp + 2, ffai_e, inter, hid, 0, 0.0, None, Some((&amax_dn, 1, inv)), Some(&st_e)).unwrap());
-                                let dn_out = pf!(11, 2.0*ffai_e as f64*hid as f64*inter as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &up_out, dwp, dwsc, dgw, &off_e, n_exp + 2, ffai_e, hid, inter, 1, inv, Some(&amax_dn), None, None).unwrap());
+                                let (st_e, sw_e, off_e) = iron_ops::moe_extend_groups(d, st0, sw0, off0, mt, s, n_exp).unwrap();
+                                let iron_e = mt + 2 * s;
+                                let up_out = pf!(11, 2.0*iron_e as f64*inter as f64*hid as f64,
+                                    iron_ops::moe_fp4_grouped_mma_dev(d, &xs_in, uwp, uwsc, ugw, &off_e, n_exp + 2, iron_e, inter, hid, 0, 0.0, None, Some((&amax_dn, 1, inv)), Some(&st_e)).unwrap());
+                                let dn_out = pf!(11, 2.0*iron_e as f64*hid as f64*inter as f64,
+                                    iron_ops::moe_fp4_grouped_mma_dev(d, &up_out, dwp, dwsc, dgw, &off_e, n_exp + 2, iron_e, hid, inter, 1, inv, Some(&amax_dn), None, None).unwrap());
                                 let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
-                                moe_scatter_add_det_dev(d, &dn_out, &st_e, &sw_e, &acc_dev, s, ffai_e, hid, 256.0f32, true).unwrap();
+                                moe_scatter_add_det_dev(d, &dn_out, &st_e, &sw_e, &acc_dev, s, iron_e, hid, 256.0f32, true).unwrap();
                                 shared_folded = true;
                                 if ondevice_moe { acc_dev_keep = Some(acc_dev); } else { acc_h = dl(&acc_dev, s * hid); }
                             } else if fp4_moe {
@@ -2886,10 +2886,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let amax_dn = Tensor::new(d.alloc_zeroed(4).unwrap(), vec![1], DType::U32);
                                 let up_gidx = if fp4_direct { moe_dev.as_ref().map(|(_, st, _)| st) } else { None };
                                 let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xs_in, uwp, uwsc, ugw, off_dev_ref.unwrap(), n_exp, mt, inter, hid, 0, 0.0, None, Some((&amax_dn, 1, inv)), up_gidx).unwrap());
+                                    iron_ops::moe_fp4_grouped_mma_dev(d, &xs_in, uwp, uwsc, ugw, off_dev_ref.unwrap(), n_exp, mt, inter, hid, 0, 0.0, None, Some((&amax_dn, 1, inv)), up_gidx).unwrap());
                                 // relu²·(1/256) fused into the down act-quant (no standalone pass)
                                 let dn_out = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &up_out, dwp, dwsc, dgw, off_dev_ref.unwrap(), n_exp, mt, hid, inter, 1, inv, Some(&amax_dn), None, None).unwrap());
+                                    iron_ops::moe_fp4_grouped_mma_dev(d, &up_out, dwp, dwsc, dgw, off_dev_ref.unwrap(), n_exp, mt, hid, inter, 1, inv, Some(&amax_dn), None, None).unwrap());
                                 // acc_h is still all-zero on this path — seed the accumulator
                                 // with a device-side memset instead of uploading 22MB of zeros.
                                 let acc_dev = Tensor::new(d.alloc_zeroed(s * hid * 4).unwrap(), vec![s, hid], DType::F32);
@@ -3034,7 +3034,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // dl(acc_dev) at the end of the layer replaces the ~2×128
                             // per-expert dl()/cuStreamSynchronize pairs. Implies dev relu².
                             // DEFAULT-ON for CUDA: FEWER_SYNCS is now deterministic (the htod
-                            // null-stream race was fixed in metaltile) and +26% at zero cost.
+                            // null-stream race was fixed in iron) and +26% at zero cost.
                             // NEMOTRON_FEWER_SYNCS_OFF=1 reverts to the per-expert dl()/sync path.
                             let fewer_syncs = is_cuda && !two_pass && std::env::var("NEMOTRON_FEWER_SYNCS_OFF").is_err();
                             let dev_relu2 = is_cuda && !two_pass && (fewer_syncs || std::env::var("NEMOTRON_DEV_RELU2").is_ok());
@@ -3232,7 +3232,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                         // ── Metal per-expert GEMM, f16 compute (default) ────────
                                         // dequant_q4_off → f16 expert weight slab (block offset into
                                         // the shared up/down qs/sc), cast activation → f16, run the
-                                        // matmul in f16 (ffai_gemm[F16]). relu2 in host f32 (squares
+                                        // matmul in f16 (iron_gemm[F16]). relu2 in host f32 (squares
                                         // can exceed f16 max → overflow). EXACT MATCH vs the f32 path
                                         // (argmax unchanged). No resident cache — re-dequant each
                                         // forward (the f16 cache is a bandwidth loss on Metal).
@@ -3333,9 +3333,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let (dwp, dwsc, dgw) = &fp4w[&format!("{p}.sh_down_proj_fp4")];
                                 let amax_sd = Tensor::new(d.alloc_zeroed(4).unwrap(), vec![1], DType::U32);
                                 let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &xnh, uwp, uwsc, ugw, &off1, 1, s, shared_inter, hid, 0, 0.0, None, Some((&amax_sd, 1, 1.0)), None).unwrap());
+                                    iron_ops::moe_fp4_grouped_mma_dev(d, &xnh, uwp, uwsc, ugw, &off1, 1, s, shared_inter, hid, 0, 0.0, None, Some((&amax_sd, 1, 1.0)), None).unwrap());
                                 pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
-                                    ffai_ops::moe_fp4_grouped_mma_dev(d, &sa, dwp, dwsc, dgw, &off1, 1, s, hid, shared_inter, 1, 1.0, Some(&amax_sd), None, None).unwrap())
+                                    iron_ops::moe_fp4_grouped_mma_dev(d, &sa, dwp, dwsc, dgw, &off1, 1, s, hid, shared_inter, 1, 1.0, Some(&amax_sd), None, None).unwrap())
                             } else if std::env::var("NEMOTRON_FP4_SHARED_LT").is_ok() {
                                 let q46 = std::env::var("NEMOTRON_FP4_46").is_ok();
                                 let q46w = q46 || std::env::var("NEMOTRON_FP4_46W").is_ok();
@@ -3347,7 +3347,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     let key = format!("{p}.shup.lt4");
                                     if let (Some(t), Some(g)) = (w4lt.borrow().get(&key).cloned(), w4g.borrow().get(&key).cloned()) { (t.0, t.1, g) } else {
                                         let wf = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
-                                        let (wp, wsf, wg) = if q46w { ffai_ops::lt_fp4_quant_g_46(d, &wf, *sm_up, *sk_up).unwrap() } else { ffai_ops::lt_fp4_quant_g(d, &wf, *sm_up, *sk_up).unwrap() };
+                                        let (wp, wsf, wg) = if q46w { iron_ops::lt_fp4_quant_g_46(d, &wf, *sm_up, *sk_up).unwrap() } else { iron_ops::lt_fp4_quant_g(d, &wf, *sm_up, *sk_up).unwrap() };
                                         w4lt.borrow_mut().insert(key.clone(), (wp.clone(), wsf.clone())); w4g.borrow_mut().insert(key, wg.clone()); (wp, wsf, wg)
                                     }
                                 };
@@ -3355,19 +3355,19 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     let key = format!("{p}.shdn.lt4");
                                     if let (Some(t), Some(g)) = (w4lt.borrow().get(&key).cloned(), w4g.borrow().get(&key).cloned()) { (t.0, t.1, g) } else {
                                         let wf = deq16(&format!("{p}.shdn"), sdqs, sdsc, *sm_dn, *sk_dn, 0);
-                                        let (wp, wsf, wg) = if q46w { ffai_ops::lt_fp4_quant_g_46(d, &wf, *sm_dn, *sk_dn).unwrap() } else { ffai_ops::lt_fp4_quant_g(d, &wf, *sm_dn, *sk_dn).unwrap() };
+                                        let (wp, wsf, wg) = if q46w { iron_ops::lt_fp4_quant_g_46(d, &wf, *sm_dn, *sk_dn).unwrap() } else { iron_ops::lt_fp4_quant_g(d, &wf, *sm_dn, *sk_dn).unwrap() };
                                         w4lt.borrow_mut().insert(key.clone(), (wp.clone(), wsf.clone())); w4g.borrow_mut().insert(key, wg.clone()); (wp, wsf, wg)
                                     }
                                 };
-                                let (xq, xsf, xg) = pf!(15, 0.0, if q46a { ffai_ops::lt_fp4_quant_g_46(d, &xnh, s, hid).unwrap() } else { ffai_ops::lt_fp4_quant_g(d, &xnh, s, hid).unwrap() });
-                                let ds_u = ffai_ops::fp4_dscale(d, &xg, &uwg).unwrap();
+                                let (xq, xsf, xg) = pf!(15, 0.0, if q46a { iron_ops::lt_fp4_quant_g_46(d, &xnh, s, hid).unwrap() } else { iron_ops::lt_fp4_quant_g(d, &xnh, s, hid).unwrap() });
+                                let ds_u = iron_ops::fp4_dscale(d, &xg, &uwg).unwrap();
                                 let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
-                                    ffai_ops::gemm_fp4(d, &xq, &xsf, &uwq, &uwsf, s, *sm_up, *sk_up, true, Some(&ds_u)).unwrap());
+                                    iron_ops::gemm_fp4(d, &xq, &xsf, &uwq, &uwsf, s, *sm_up, *sk_up, true, Some(&ds_u)).unwrap());
                                 let sa2 = pf!(3, 0.0, relu2_scale_f16(d, &cast_f32_f16(d,&sa).unwrap(), 1.0f32).unwrap());
-                                let (aq, asf, ag) = pf!(15, 0.0, if q46a { ffai_ops::lt_fp4_quant_g_46(d, &sa2, s, shared_inter).unwrap() } else { ffai_ops::lt_fp4_quant_g(d, &sa2, s, shared_inter).unwrap() });
-                                let ds_d = ffai_ops::fp4_dscale(d, &ag, &dwg).unwrap();
+                                let (aq, asf, ag) = pf!(15, 0.0, if q46a { iron_ops::lt_fp4_quant_g_46(d, &sa2, s, shared_inter).unwrap() } else { iron_ops::lt_fp4_quant_g(d, &sa2, s, shared_inter).unwrap() });
+                                let ds_d = iron_ops::fp4_dscale(d, &ag, &dwg).unwrap();
                                 let sd_lt = pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
-                                    ffai_ops::gemm_fp4(d, &aq, &asf, &dwq, &dwsf, s, *sm_dn, *sk_dn, true, Some(&ds_d)).unwrap());
+                                    iron_ops::gemm_fp4(d, &aq, &asf, &dwq, &dwsf, s, *sm_dn, *sk_dn, true, Some(&ds_d)).unwrap());
                                 cast_f32_f16(d, &sd_lt).unwrap()
                             } else {
                             let wsu = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
@@ -3458,9 +3458,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 } else {
                                     let sd_dev = sd_dev_opt.take().unwrap_or_else(|| upm(&sd_h, vec![s, hid]));
                                     match nw {
-                                        Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let merged = add(d, &acc_dev, &sd_dev).unwrap(); let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &merged, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
+                                        Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let merged = add(d, &acc_dev, &sd_dev).unwrap(); let (r, nx) = iron_ops::add_rms_norm(d, &xt, &merged, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
                                         // one launch, no intermediate: residual + routed acc + shared out
-                                        _ if is_cuda => { xt = ffai_ops::add3(d, &xt, &acc_dev, &sd_dev).unwrap(); }
+                                        _ if is_cuda => { xt = iron_ops::add3(d, &xt, &acc_dev, &sd_dev).unwrap(); }
                                         _ => { let merged = add(d, &acc_dev, &sd_dev).unwrap(); xt = add(d, &xt, &merged).unwrap(); }
                                     }
                                 }
@@ -3472,7 +3472,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 // fused residual add + NEXT layer's rms_norm (one pass, llama.cpp-style)
                                 let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
                                 match nw {
-                                    Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &acc_up, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
+                                    Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = iron_ops::add_rms_norm(d, &xt, &acc_up, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
                                     _ => { xt = add(d, &xt, &acc_up).unwrap(); }
                                 }
                             }
@@ -3533,9 +3533,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 // varlen path. Single-segment prefill = plain causal [base,base+s).
                                 match std::env::var("NEMOTRON_PACKED_ATTN").ok().as_deref() {
                                     Some("fused") if hd==128 => { let _=(seg_lo,pk_seg_len);
-                                        pf!(7, attn_flops, ffai_ops::sdpa_flash_fused(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap()) }
+                                        pf!(7, attn_flops, iron_ops::sdpa_flash_fused(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap()) }
                                     Some("wmma") if hd==128 => { let _=(seg_lo,pk_seg_len);
-                                        pf!(7, attn_flops, ffai_ops::sdpa_flash_wmma(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap()) }
+                                        pf!(7, attn_flops, iron_ops::sdpa_flash_wmma(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap()) }
                                     _ => {
                                 // Packed: block-diagonal varlen flash-attn (each query stays in its segment).
                                 pf!(7, attn_flops, sdpa_multi_tc_varlen(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), seg_lo, pk_seg_len, hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
@@ -3548,15 +3548,15 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 // register-resident O (mma.sync) — beats cuBLAS-TC attention
                                 // 1.5-3.3× (no HBM score materialization, causal-skipped, high
                                 // occupancy). Argmax-exact. NEMOTRON_FLASH_MMA_OFF=1 → cuBLAS-TC.
-                                pf!(7, attn_flops, ffai_ops::sdpa_flash_mma(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
+                                pf!(7, attn_flops, iron_ops::sdpa_flash_mma(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
                             } else if std::env::var("NEMOTRON_FLASH_WMMA").is_ok() {
                                 // Fused tensor-core (wmma) causal FlashAttention: scores
                                 // stay in shared (no HBM round-trip), causal skipped.
-                                pf!(7, attn_flops, ffai_ops::sdpa_flash_wmma(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
+                                pf!(7, attn_flops, iron_ops::sdpa_flash_wmma(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
                             } else if std::env::var("NEMOTRON_FLASH_FUSED").is_ok() {
                                 // Fused single-kernel causal FlashAttention: no HBM
                                 // score/prep round-trip, causal triangle skipped.
-                                pf!(7, attn_flops, ffai_ops::sdpa_flash_fused(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
+                                pf!(7, attn_flops, iron_ops::sdpa_flash_fused(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
                             } else {
                             pf!(7, attn_flops, sdpa_multi_tc(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
                             }
@@ -3569,7 +3569,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // fused residual add + NEXT layer's rms_norm (one pass, llama.cpp-style)
                             let nw = if l + 1 < PATTERN.len() { fwd.get(&format!("language_model.backbone.layers.{}.norm.weight", l + 1)) } else { fwd.get("norm_f") };
                             match nw {
-                                Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = ffai_ops::add_rms_norm(d, &xt, &o, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
+                                Some(w) if is_cuda && std::env::var("NEMOTRON_FUSED_ADDNORM").is_ok() => { let (r, nx) = iron_ops::add_rms_norm(d, &xt, &o, w, eps).unwrap(); xt = r; xn_carry = Some(nx); }
                                 _ => { xt = add(d, &xt, &o).unwrap(); }
                             }
                         }
@@ -3599,7 +3599,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             if CAPTURING.with(|c| c.get()) { 0usize }
             else {
                 let logits = dl(&logits_dev, vocab);
-                let am = ffai_runtime::argmax(&logits);
+                let am = iron_runtime::argmax(&logits);
                 LAST_BATCHED_LOGITS.with(|c| *c.borrow_mut() = logits);
                 am
             }
@@ -3837,7 +3837,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             d.synchronize().ok();
             let rep = t.elapsed().as_secs_f64();
             let logits = LAST_BATCHED_LOGITS_DEV.with(|c| c.borrow().clone()).map(|t| dl(&t, vocab)).unwrap_or_default();
-            let am = ffai_runtime::argmax(&logits);
+            let am = iron_runtime::argmax(&logits);
             LAST_BATCHED_LOGITS.with(|c| *c.borrow_mut() = logits);
             eprintln!("  ── CUDA-GRAPH replay: {rep:.3}s = {:.2} tok/s (captured forward, argmax {am}) ──", ids.len() as f64 / rep);
             // I1: BF16/W4A16-oracle metric. NEMOTRON_DUMP_LOGITS=<f> writes last-token
@@ -3859,7 +3859,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let (mut dot,mut na,mut nb)=(0f64,0f64,0f64);
                             for (a,b) in bl.iter().zip(rl.iter()){ dot+=(*a as f64)*(*b as f64); na+=(*a as f64).powi(2); nb+=(*b as f64).powi(2); }
                             let cos=dot/(na.sqrt()*nb.sqrt()+1e-30);
-                            let amb=ffai_runtime::argmax(&bl); let amr=ffai_runtime::argmax(&rl);
+                            let amb=iron_runtime::argmax(&bl); let amr=iron_runtime::argmax(&rl);
                             let t5=|v:&[f32]|{let mut ix:Vec<usize>=(0..v.len()).collect(); ix.sort_by(|&a,&b| v[b].partial_cmp(&v[a]).unwrap()); ix.truncate(5); ix};
                             let (tb,tr)=(t5(&bl),t5(&rl)); let ov=tr.iter().filter(|x| tb.contains(x)).count();
                             eprintln!("  [BF16-REF vs {p}] cosine={cos:.6}  argmax={amb} (oracle {amr}){}  top5-overlap={ov}/5", if amb==amr {" EXACT*"} else {" MISMATCH"});

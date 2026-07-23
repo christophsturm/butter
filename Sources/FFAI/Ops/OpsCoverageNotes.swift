@@ -12,29 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// OpsCoverageNotes — documentation of ffai-kernels kernels intentionally
+// OpsCoverageNotes — documentation of iron kernels intentionally
 // **not** exposed as standalone `Ops.*` wrappers.
 //
 // FFAI's `Ops` surface is the production-callable API. Not every
-// `#[kernel]` in `ffai-kernels-std` belongs there:
+// `#[kernel]` in `wh-iron-std` belongs there:
 //
 //   1. Some kernels are internal building blocks composed by a
 //      higher-level wrapper (e.g. `aura_flash_p1_*` is used inside
 //      `Ops.auraFlashAttention`-style composites, not directly).
 //   2. Some are bit-width / tile-shape variants that the existing
-//      wrapper switches over by parameter (e.g. `ffai_qmv_b3` … `ffai_qmv_b8`
+//      wrapper switches over by parameter (e.g. `iron_qmv_b3` … `iron_qmv_b8`
 //      are auto-routed inside `Ops.dequantGemv(bits:)`).
 //   3. Some are `_record` / `state_replay_*` infrastructure for the
 //      `dispatch_chain` indirect-command-buffer mode — those aren't
 //      standalone-callable kernels, they're recorded into an ICB.
 //   4. Some are bench-only / probe-only kernels with no production
-//      caller (`ffai_sgload_smoke`, `mma_layout_probe`, `mpp_matmul_smoke`).
+//      caller (`iron_sgload_smoke`, `mma_layout_probe`, `mpp_matmul_smoke`).
 //   5. Some require dtypes (fp4 / fp8 / mxfp) that FFAI's `DType` enum
 //      doesn't yet expose; wrapping them would require a DType
 //      expansion first (tracked separately).
 //
 // This file is a manifest of those choices so the next sweep over
-// `Sources/FFAIKernelsSwift/Generated/FFAIKernels.swift` can quickly
+// `Sources/IronSwift/Generated/IronKernels.swift` can quickly
 // distinguish "intentionally skipped" from "missing wrapper, please add".
 //
 // Format: each `KernelKind` case captures the *family* (not every
@@ -45,9 +45,9 @@ import Foundation
 
 public enum OpsCoverageNotes {
 
-    /// One entry per intentionally-unwrapped ffai-kernels kernel family.
+    /// One entry per intentionally-unwrapped iron kernel family.
     /// Pure data — no Metal symbols referenced, so this builds even if
-    /// a kernel is later removed from ffai-kernels.
+    /// a kernel is later removed from iron.
     public struct UncoveredKernel: Sendable, Equatable {
         public let familyName: String
         public let rationale: String
@@ -82,29 +82,29 @@ public enum OpsCoverageNotes {
 
         // ── Bit-width / tile-shape variants of an already-wrapped op ─
         UncoveredKernel(
-            familyName: "ffai_qmm_b{3,4,5,6,8} / ffai_qmv_b{3,4,5,6,8} / ffai_qvm_b{3,4,5,6,8}",
+            familyName: "iron_qmm_b{3,4,5,6,8} / iron_qmv_b{3,4,5,6,8} / iron_qvm_b{3,4,5,6,8}",
             rationale:
-                "MLX-style quantized matmul variants. FFAI's production path uses ffai_* / dequant_gemv_* kernels (different geometry); these MLX-style siblings are kept for `ffaik bench` side-by-side comparisons only."
+                "MLX-style quantized matmul variants. FFAI's production path uses iron_* / dequant_gemv_* kernels (different geometry); these MLX-style siblings are kept for `iron bench` side-by-side comparisons only."
         ),
         UncoveredKernel(
             familyName:
-                "ffai_qmm_bm2_int8_fast / ffai_qmm_bm4_int8_fast / ffai_qmm_int8_fast / ffai_qmv_int8_fast / ffai_qvm_int4_fast / ffai_qmm_mma_int8 / ffai_qmm_mma_m16_int8 / ffai_qmm_mma_mpp_int8 / ffai_qmm_nax_int8 / ffai_qmm_nax",
+                "iron_qmm_bm2_int8_fast / iron_qmm_bm4_int8_fast / iron_qmm_int8_fast / iron_qmv_int8_fast / iron_qvm_int4_fast / iron_qmm_mma_int8 / iron_qmm_mma_m16_int8 / iron_qmm_mma_mpp_int8 / iron_qmm_nax_int8 / iron_qmm_nax",
             rationale:
-                "MLX-style int8/int4 GEMM variants. Not on the FFAI hot path (which uses ffai_gemm + dequant_gemv_int*)."
+                "MLX-style int8/int4 GEMM variants. Not on the FFAI hot path (which uses iron_gemm + dequant_gemv_int*)."
         ),
         UncoveredKernel(
             familyName:
-                "ffai_moe_gather_qmm_b{3,5,6,8} / *_mma_b{3,5,6,8} / *_int8 / *_int8_bm{8,16,64}_mpp / *_int4_m{8,16,32}",
+                "iron_moe_gather_qmm_b{3,5,6,8} / *_mma_b{3,5,6,8} / *_int8 / *_int8_bm{8,16,64}_mpp / *_int4_m{8,16,32}",
             rationale:
                 "MoE gather quantized matmul bit-width / tile-shape variants. Routed inside Ops.moeGatherDequantGemm* by bits + BM."
         ),
         UncoveredKernel(
-            familyName: "ffai_steel_gemm_{32x32,64x64,…}_{1x2,2x2,4x2,…}",
+            familyName: "iron_steel_gemm_{32x32,64x64,…}_{1x2,2x2,4x2,…}",
             rationale:
                 "Tile-shape variants of the base steel GEMM. Internal to Ops.gemm dispatch; user-facing wrapper picks the right tile."
         ),
         UncoveredKernel(
-            familyName: "ffai_steel_gemm_{gather,masked,segmented,splitk,splitk_accum,fused,nax}*",
+            familyName: "iron_steel_gemm_{gather,masked,segmented,splitk,splitk_accum,fused,nax}*",
             rationale:
                 "Specialized steel GEMM variants (gather / masked / split-K / NAX). Not yet on the production hot path; reserved for future Ops.gemm specializations."
         ),
@@ -123,7 +123,7 @@ public enum OpsCoverageNotes {
         UncoveredKernel(
             familyName: "*_record",
             rationale:
-                "dispatch_chain indirect-command-buffer recording variants. Not standalone-callable; encoded into MTLIndirectComputeCommand by ffai-kernels' chain replay system."
+                "dispatch_chain indirect-command-buffer recording variants. Not standalone-callable; encoded into MTLIndirectComputeCommand by iron's chain replay system."
         ),
         UncoveredKernel(
             familyName: "state_replay_d* / ssm_step_record_d* / gated_delta_step_record_d*",
@@ -138,7 +138,7 @@ public enum OpsCoverageNotes {
 
         // ── Bit-stream affine quant variants (bits 3 / 5 / 6) ───────
         UncoveredKernel(
-            familyName: "ffai_affine_{quantize,dequantize}_int{3,5,6}",
+            familyName: "iron_affine_{quantize,dequantize}_int{3,5,6}",
             rationale:
                 "Bit-stream packed affine quant for odd bit-widths. Not yet exposed at the QuantizedOps layer — caller-side production callers either use Ops.dequantGemv (which has int{3,5,6} arms via the dequant_gemv_int* kernels) or QuantizedOps.{quantize,dequantize}Affine for bits ∈ {2,4,8}. Promotion path: add the bit-stream packing arm to QuantizedOps if a per-buffer int{3,5,6} need arises."
         ),
@@ -169,7 +169,7 @@ public enum OpsCoverageNotes {
         // ── FP4 / FP8 / MXFP ───────────────────────────────────────
         UncoveredKernel(
             familyName:
-                "ffai_fp4_{quant_dequant,qmm_mma} / ffai_fp8_{e4m3,e5m2}_{quant_dequant,qmm_mma} / ffai_fp_qmm_nax",
+                "iron_fp4_{quant_dequant,qmm_mma} / iron_fp8_{e4m3,e5m2}_{quant_dequant,qmm_mma} / iron_fp_qmm_nax",
             rationale:
                 "FP4 / FP8 / MXFP quantization. FFAI's DType enum does not yet expose fp4/fp8 cases — wrapping these would require a DType expansion first. Tracked as a follow-up; the existing GPT-OSS MXFP4 transcode goes through a model-specific Loader path."
         ),
@@ -181,53 +181,53 @@ public enum OpsCoverageNotes {
 
         // ── FFT / Hadamard / scan / sort / strided ─────────────────
         UncoveredKernel(
-            familyName: "ffai_fft_n{32,64,…,1024} / ffai_fft_bluestein_*",
+            familyName: "iron_fft_n{32,64,…,1024} / iron_fft_bluestein_*",
             rationale:
                 "FFT building blocks composed inside mel_spectrogram / vocoder_istft. Not exposed standalone — the audio pipeline is the only caller."
         ),
         UncoveredKernel(
-            familyName: "ffai_hadamard_n{64,128,…,1024}",
+            familyName: "iron_hadamard_n{64,128,…,1024}",
             rationale:
                 "Walsh-Hadamard transform — composed inside AURA encode (the SRHT rotation step). Direct standalone use is uncommon enough we route through auraEncode."
         ),
         UncoveredKernel(
-            familyName: "ffai_scan / ffai_scan_exclusive / ffai_scan_{max,min,prod}*",
+            familyName: "iron_scan / iron_scan_exclusive / iron_scan_{max,min,prod}*",
             rationale:
                 "Inclusive / exclusive prefix-scan family. No production caller at the Ops layer yet."
         ),
         UncoveredKernel(
-            familyName: "ffai_sort / ffai_sort_segmented",
+            familyName: "iron_sort / iron_sort_segmented",
             rationale:
                 "Sort kernels. No on-GPU sort production caller; logits sampling uses GPU mask + CPU-side argmax."
         ),
         UncoveredKernel(
-            familyName: "ffai_strided_copy / ffai_strided_copy_nd",
+            familyName: "iron_strided_copy / iron_strided_copy_nd",
             rationale:
-                "Strided / N-D copy. Production data movement uses MTLBlit (Ops.copy) or contiguous ffai_copy (Ops.copyKernel). Strided variant is reserved for the future when slicing semantics land."
+                "Strided / N-D copy. Production data movement uses MTLBlit (Ops.copy) or contiguous iron_copy (Ops.copyKernel). Strided variant is reserved for the future when slicing semantics land."
         ),
         UncoveredKernel(
-            familyName: "ffai_masked_scatter / ffai_scatter / ffai_scatter_axis",
+            familyName: "iron_masked_scatter / iron_scatter / iron_scatter_axis",
             rationale:
                 "Scatter / masked-scatter primitives. No production caller; the embedding write path uses kv_cache_update for KV and direct buffer-row writes for embeddings."
         ),
         UncoveredKernel(
-            familyName: "ffai_gather_axis / ffai_gather_front",
+            familyName: "iron_gather_axis / iron_gather_front",
             rationale:
                 "Gather primitives. Embedding gather uses Ops.gather / Ops.dequantGather; axis-gather has no production caller."
         ),
         UncoveredKernel(
-            familyName: "ffai_merge / ffai_select / ffai_binary_two",
+            familyName: "iron_merge / iron_select / iron_binary_two",
             rationale:
                 "Element-wise primitives — merge (two-input ternary), select, binary_two. No production caller at the Ops layer."
         ),
         UncoveredKernel(
             familyName:
-                "ffai_seg_reduce / ffai_seg_reduce_{max,min,prod} / ffai_col_reduce* / ffai_all_reduce*",
+                "iron_seg_reduce / iron_seg_reduce_{max,min,prod} / iron_col_reduce* / iron_all_reduce*",
             rationale:
-                "Segmented + column + cross-row reduction primitives. ffai_row_reduce variants are also unwrapped — Ops exposes the higher-level argmax / softmax / logsumexp instead, which cover the production decoder needs."
+                "Segmented + column + cross-row reduction primitives. iron_row_reduce variants are also unwrapped — Ops exposes the higher-level argmax / softmax / logsumexp instead, which cover the production decoder needs."
         ),
         UncoveredKernel(
-            familyName: "ffai_row_reduce / ffai_row_reduce_{max,min,prod}",
+            familyName: "iron_row_reduce / iron_row_reduce_{max,min,prod}",
             rationale:
                 "Per-row sum/max/min/prod. Sampling pipeline uses argmax / argmin / softmax instead; raw row-reductions have no production caller yet."
         ),
@@ -238,32 +238,32 @@ public enum OpsCoverageNotes {
         // ── Scalar math primitives ─────────────────────────────────
         UncoveredKernel(
             familyName:
-                "ffai_acos / ffai_acosh / ffai_asin / ffai_asinh / ffai_atan / ffai_atan2 / ffai_atanh / ffai_cos / ffai_cosh / ffai_sin / ffai_sinh / ffai_tan / ffai_tanh_op / ffai_erf / ffai_erfinv / ffai_exp2 / ffai_expm1 / ffai_log10 / ffai_log1p / ffai_log2 / ffai_logaddexp / ffai_remainder / ffai_sign / ffai_trunc / ffai_random_hash",
+                "iron_acos / iron_acosh / iron_asin / iron_asinh / iron_atan / iron_atan2 / iron_atanh / iron_cos / iron_cosh / iron_sin / iron_sinh / iron_tan / iron_tanh_op / iron_erf / iron_erfinv / iron_exp2 / iron_expm1 / iron_log10 / iron_log1p / iron_log2 / iron_logaddexp / iron_remainder / iron_sign / iron_trunc / iron_random_hash",
             rationale:
                 "Trig / hyperbolic / specialised log / random scalar primitives. No production caller; covered by torch's CPU-side preprocessing for the rare callers that need them. Wrappers can be added incrementally if a model family adopts one."
         ),
         UncoveredKernel(
-            familyName: "ffai_fft_bluestein_chirp_filter",
+            familyName: "iron_fft_bluestein_chirp_filter",
             rationale:
                 "Bluestein-FFT chirp-filter helper. Composed inside mel_spectrogram; not a standalone caller."
         ),
         UncoveredKernel(
-            familyName: "ffai_scalar_fma_chain8",
+            familyName: "iron_scalar_fma_chain8",
             rationale:
                 "Chain-of-8 scalar FMA used by AURA encode rotation. Internal building block."),
 
         // ── Probe / bench / test kernels ───────────────────────────
         UncoveredKernel(
-            familyName: "ffai_sgload_smoke",
-            rationale: "Subgroup-load smoke test kernel — used only by ffai-kernels' own GPU probe."),
+            familyName: "iron_sgload_smoke",
+            rationale: "Subgroup-load smoke test kernel — used only by iron's own GPU probe."),
         UncoveredKernel(
-            familyName: "ffai_rms_inv_scalar",
+            familyName: "iron_rms_inv_scalar",
             rationale:
-                "Bench-only helper used by RMSNorm correctness tests on the ffai-kernels side."),
+                "Bench-only helper used by RMSNorm correctness tests on the iron side."),
 
         // ── Other ──────────────────────────────────────────────────
         UncoveredKernel(
-            familyName: "ffai_gemv_masked",
+            familyName: "iron_gemv_masked",
             rationale:
                 "Masked GEMV for sparse attention. No production caller yet — sparse attention variants use sdpa_multi/decode instead."
         ),
@@ -281,9 +281,9 @@ public enum OpsCoverageNotes {
 
         // ── Future per-headDim sdpa specializations ────────────────
         UncoveredKernel(
-            familyName: "ffai_sdpa / ffai_sdpa_prefill / ffai_sdpa_vector / ffai_sdpa_prefill_mma_bf16",
+            familyName: "iron_sdpa / iron_sdpa_prefill / iron_sdpa_vector / iron_sdpa_prefill_mma_bf16",
             rationale:
-                "MLX-side base SDPA kernels — FFAI routes through ffai_sdpa_decode / ffai_sdpa_multi / ffai_sdpa_bidirectional which carry the dispatch-shape contracts and DISPATCH-INVARIANTS docs that prevent the 2026-05-19 GPU-pin class of bug. The MLX siblings are kept for bench comparisons."
+                "MLX-side base SDPA kernels — FFAI routes through iron_sdpa_decode / iron_sdpa_multi / iron_sdpa_bidirectional which carry the dispatch-shape contracts and DISPATCH-INVARIANTS docs that prevent the 2026-05-19 GPU-pin class of bug. The MLX siblings are kept for bench comparisons."
         ),
     ]
 

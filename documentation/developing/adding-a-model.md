@@ -86,7 +86,7 @@ Open `Sources/FFAI/Ops.swift` and verify every op the forward pass needs exists.
 - `kv_cache_update`
 - `argmax`
 
-If your model needs something new (attention sinks, fused MoE, sliding-window mask, GDN step, SSM scan), that's a ffai-kernels-side addition first — see [developing.md § Writing a new kernel](developing.md#writing-a-new-kernel).
+If your model needs something new (attention sinks, fused MoE, sliding-window mask, GDN step, SSM scan), that's a iron-side addition first — see [developing.md § Writing a new kernel](developing.md#writing-a-new-kernel).
 
 ## Step 3 — write the family file
 
@@ -246,7 +246,7 @@ refine); `Model.transcribe` / `synthesize` / `detect` then work for free.
 
 FFAI does **not** pin correctness with golden fixtures. There is no Python dependency in the test loop. Correctness comes from two layers:
 
-- **Per-kernel GPU correctness** — every non-trivial kernel lands with a ffai-kernels-side `<kernel>_gpu_correctness` test comparing the GPU result against a naive CPU oracle in fp32 (see ffai-kernels' `docs/testing.md`). This is the tight numerical signal. If your family needed a new kernel, that test ships in the same commit on the ffai-kernels side.
+- **Per-kernel GPU correctness** — every non-trivial kernel lands with a iron-side `<kernel>_gpu_correctness` test comparing the GPU result against a naive CPU oracle in fp32 (see iron's `docs/testing.md`). This is the tight numerical signal. If your family needed a new kernel, that test ships in the same commit on the iron side.
 - **Per-family coherence** — the FFAI integration test (Step 8) loads a real checkpoint, greedy-decodes, and asserts the model produces coherent text. The contract is "the pipeline produces coherent output", not bit-parity with mlx-lm / mlx-vlm — cross-implementation token parity proved to be a measure of rounding-mode alignment, not correctness, and was dropped.
 
 ## Step 7 — wire inspect hooks

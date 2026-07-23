@@ -3,7 +3,7 @@
 //! Metal-validation cross-check for the CUDA `dequant_q4_off` MMU-fault.
 //!
 //! The Nemotron batched-prefill CUDA path deterministically MMU-faults (Xid 31,
-//! VIRT_READ out-of-bounds) and the prime suspect is `ffai_ops::dequant_q4_off`
+//! VIRT_READ out-of-bounds) and the prime suspect is `iron_ops::dequant_q4_off`
 //! — the 1-thread-per-u32-word Q4 dequant used for the dense projections
 //! (blk_off=0) and the per-MoE-expert sub-slabs (blk_off != 0). This test calls
 //! that op directly at both shapes, under Metal's GPU/shader validation layer
@@ -18,9 +18,9 @@
 //!
 //! Nemotron-Cascade-2-30B-A3B dims: hid=2688, inter=1856, n_exp=128.
 
-use ffai_core::{DType, Device, Tensor};
-use ffai_metal::MetalDevice;
-use ffai_ops::{dequant_q4_off, quantize_q4};
+use iron_core::{DType, Device, Tensor};
+use iron_metal::MetalDevice;
+use iron_ops::{dequant_q4_off, quantize_q4};
 
 // ── f16 round-trip (mirrors the loader's tb_f16 + the kernel's f16 read) ──────
 fn f32_to_f16(f: f32) -> u16 {

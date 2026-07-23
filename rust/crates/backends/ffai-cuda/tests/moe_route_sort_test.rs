@@ -4,9 +4,9 @@
 //! Validates: per-expert group counts (offsets) + the (token,weight) multiset per
 //! expert match the host sigmoid+bias+topk+stable-sort.
 
-use ffai_cuda::CudaDevice;
-use ffai_core::{DType, Device, Tensor};
-use ffai_ops::moe_route_sort_device;
+use iron_cuda::CudaDevice;
+use iron_core::{DType, Device, Tensor};
+use iron_ops::moe_route_sort_device;
 
 fn rng(n: usize, seed: u64) -> Vec<f32> {
     let mut v = vec![0f32; n]; let mut s = seed;

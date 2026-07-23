@@ -103,7 +103,7 @@ struct GGUFLoaderTests {
     }
 
     /// Dequant a tensor to f32 and assert shape match + finite, bounded
-    /// values over a sample (exact numerical checks live in the metaltile
+    /// values over a sample (exact numerical checks live in the iron
     /// kernel correctness tests; this is the loader-pipeline sanity).
     private func assertDequantSane(
         _ bundle: GGUFTensorBundle, _ info: GGUFTensorInfo, requireNonZero: Bool = false

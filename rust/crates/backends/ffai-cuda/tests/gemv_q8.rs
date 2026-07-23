@@ -1,11 +1,11 @@
 // Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 // SPDX-License-Identifier: Apache-2.0
-//! Q8_0 resident-weight matvec (`ffai_ops::gemv_q8`) vs a CPU dequant-dot
+//! Q8_0 resident-weight matvec (`iron_ops::gemv_q8`) vs a CPU dequant-dot
 //! reference. Same kernel IR codegens to CUDA — this is the cheap local proof
 //! of the quantized-GEMV path that the resident NemotronH decode loop rides on.
-use ffai_core::{DType, Tensor};
-use ffai_ops::{gemv_q8, quantize_q8};
-use ffai_cuda::CudaDevice;
+use iron_core::{DType, Tensor};
+use iron_ops::{gemv_q8, quantize_q8};
+use iron_cuda::CudaDevice;
 
 fn tb_f32(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn tb_u32(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }

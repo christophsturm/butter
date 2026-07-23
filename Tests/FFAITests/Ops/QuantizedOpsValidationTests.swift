@@ -17,7 +17,7 @@
 // dequant + per-head rotation) reject bad inputs and accept good ones,
 // without producing a process trap.
 //
-// Background: each `Ops.*` wrapper around a quantized ffai-kernels kernel
+// Background: each `Ops.*` wrapper around a quantized iron kernel
 // calls `preconditionFailure` when its dispatch contract is violated.
 // Those traps halt the whole test process, so the pure-function
 // `OpsValidation.validate*` shape (returning `String?`) lets us

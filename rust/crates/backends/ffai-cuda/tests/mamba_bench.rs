@@ -1,7 +1,7 @@
 // Mamba2 kernel microbench — ssm_step + conv1d at NemotronH dims.
-use ffai_core::{DType, Tensor};
-use ffai_ops::{conv1d_causal_step, silu, ssm_step};
-use ffai_cuda::CudaDevice;
+use iron_core::{DType, Tensor};
+use iron_ops::{conv1d_causal_step, silu, ssm_step};
+use iron_cuda::CudaDevice;
 use std::time::Instant;
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 #[test]

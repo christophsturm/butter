@@ -21,7 +21,7 @@ wrong model — Qwen3-VL-30B-A3B). Likely also affects
 integration bisect will confirm. Debug via an mlx-vlm video-feature parity
 dump (same method that fixed LFM2-VL). NOT a placeholder/count bug.
 
-## GPU LSTM (`ffai_lstm`) — context-dependent NaN in the full Kokoro chain
+## GPU LSTM (`iron_lstm`) — context-dependent NaN in the full Kokoro chain
 
 **Symptom.** With the Kokoro front-end wired to run its LSTMs on the GPU
 (`KokoroFrontEndGPU.biLstmGPU` → `Ops.lstm`), the full `synthesize`
@@ -45,7 +45,7 @@ both pass — `lstmLongSeqHidden256` (plain) and
 dispatches, finite + bit-deterministic + matching the CPU oracle. The
 NaN only appears **after the full chain's many prior GPU dispatches**
 (PLBERT 12 layers + bert/text encoders + per-block decoder/generator
-work) — a context/state interaction, possibly ffai-kernels buffer-pool
+work) — a context/state interaction, possibly iron buffer-pool
 aliasing or a Metal threadgroup-memory hazard that needs that much prior
 GPU traffic to surface. Not reproducible standalone, so not yet bisectable.
 
@@ -65,8 +65,8 @@ pool. Re-point `biLstmGPU` back to `Ops.lstm` once fixed.
 ## GPU pin — broad vision SDPA pin ELIMINATED; residual d32 + watch item
 
 **Status (updated 2026-06-05).** The broad GPU pin is **gone.** The
-2026-05-30 ffai-kernels production-shape work added `(nQuery=576, nQHeads=16)`
-GPU-correctness cells for `ffai_sdpa_bidirectional` at d{64,72,80,96} and
+2026-05-30 iron production-shape work added `(nQuery=576, nQHeads=16)`
+GPU-correctness cells for `iron_sdpa_bidirectional` at d{64,72,80,96} and
 fixed the dispatch-geometry bug, so those dims are now **GPU
 production-safe** (`OpsValidation.sdpaBidirectionalProductionSafeHeadDims
 = {64,72,80,96}`; `sdpaBidirectionalIsProductionSafe(_:)` gates the choice).
@@ -80,7 +80,7 @@ GPU. (`defaultMaxCommandBufferCount` is 64 since PR #14 / J.7.)
   (`sdpaBidirectionalIsProductionSafe(32) == false`), so `VisionEncoderLayer`
   falls back to the CPU `cpuAttention` path for d32. To close: add an
   `sdpa_bidirectional_d32_*` production-shape correctness cell in
-  ffai-kernels-std, then add 32 to `sdpaBidirectionalProductionSafeHeadDims`.
+  wh-iron-std, then add 32 to `sdpaBidirectionalProductionSafeHeadDims`.
 - **d128** (Pixtral / Mistral3 / GlmOcr full-attention) routes through
   `Ops.sdpaMulti(causal:false)`, not the bidirectional kernel — unaffected.
 
@@ -164,7 +164,7 @@ now has) before assuming a kernel bug.
 `Quantized3bitIntegrationTests` fails coherence (19 unique tokens / 200,
 real-but-repetitive). **Confirmed not a kernel bug:** the only int3
 kernels on the path (`dequant_gather_int3`, `dequant_gemv_int3`) pass new
-production-shape GPU-correctness cells (ffai-kernels `5cca5ac`), and the
+production-shape GPU-correctness cells (iron `5cca5ac`), and the
 emitted MSL is behaviorally identical before/after the `1522fbd` codegen
 change. Pure 3-bit on a 1.7B model just sits at its greedy quality floor
 — same class as Qwen3.5-0.8B (which relaxed its floor to 0.05) and the
@@ -192,7 +192,7 @@ Brief — full per-item diagnoses are in `plan.md` / conversation history:
 - **GLMASR** — audio adapter feeds quantized weights into `Ops.gemm`
   without dequant.
 - **FishSpeech** — codec Conv1d (dilated/transposed) still CPU until
-  ffai-kernels kernels land.
+  iron kernels land.
 
 ## Quantization — mixed-precision + format gaps
 
@@ -214,14 +214,14 @@ shape. Remaining gaps:
   path.
 - **GGUF** — no parser (Phase 10).
 
-## ffai-kernels `test_mel_spectrogram` / `test_mel_spectrogram_magnitude` [f16] — flaky GPU correctness cell
+## iron `test_mel_spectrogram` / `test_mel_spectrogram_magnitude` [f16] — flaky GPU correctness cell
 
-**Symptom.** The ffai-kernels `kernel_tests_harness` umbrella intermittently
+**Symptom.** The iron `kernel_tests_harness` umbrella intermittently
 fails one of the two f16 Mel `#[test_kernel]`s (which one, and the delta,
 vary run-to-run — e.g. `max|Δ|≈16` then `≈8`), so `make test` is
 flaky-red. Reproduces on **clean `dev`** with none of our kernels present —
 **pre-existing, not ours**, and macOS-gated so it does not run on
-ffai-kernels' Linux CI.
+iron's Linux CI.
 
 **Why.** The Mel kernels accumulate the DFT in f32, but the **f16 inputs**
 of a near-tonal test sine leave most bins at the log-floor, where `log`
@@ -231,7 +231,7 @@ past the buffer on the last frames → nondeterministic). It does **not**
 affect FFAI: the Gemma4 audio front-end uses the **f32** Mel path (validated
 to 4.4e-4 vs the feature-extractor oracle + a coherent audio→text decode).
 
-**Next step (upstream ffai-kernels):** loosen the f16 Mel tolerance to the
+**Next step (upstream iron):** loosen the f16 Mel tolerance to the
 log-floor regime, switch the test signal to broadband noise, or pad the test
 audio to `(n_frames-1)*hop + n_fft`.
 
@@ -251,9 +251,9 @@ text config.)
 
 ## Orphaned GPU kernels still awaiting a consumer
 
-`Ops.frameDiffLuma` (video luma frame-diff motion gate) has a ffai-kernels
+`Ops.frameDiffLuma` (video luma frame-diff motion gate) has a iron
 kernel + FFAI Ops wrapper + unit test but **no model call site**: it is
-infrastructure for the planned real-time video loop (ffai-kernels
+infrastructure for the planned real-time video loop (iron
 `multi-modal-support.md` §7c / K7) — a cheap motion gate that skips
 near-static frames before the vision tower. No model currently decodes
 multi-frame video through such a gate, so wiring it is net-new feature work

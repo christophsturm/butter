@@ -568,7 +568,7 @@ public final class Gemma3Layer: Module {
             on: cmd)
         let normedAttn = postAttnNorm(oOut, on: cmd)
 
-        // Fused residual add + pre-FFN RMSNorm via ffai_add_rms_norm
+        // Fused residual add + pre-FFN RMSNorm via iron_add_rms_norm
         // (hidden ≤ 4096). Gemma 3 27B (hidden 5376) falls through the
         // validator gate to the unfused path.
         let postAttn: Tensor

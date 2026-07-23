@@ -8,7 +8,7 @@ build time by cargo feature.
 > ships to iPhone/iPad/Mac, fast. It is *maintained as a first-class engine*,
 > not replaced. This Rust engine is the path to everything Swift can't reach:
 > NVIDIA (CUDA), AMD (ROCm), and portable GPUs (Vulkan). Both share the same
-> kernels via the **metaltile** IR, so a kernel is written once and lowered to
+> kernels via the **iron** IR, so a kernel is written once and lowered to
 > MSL *and* CUDA/SPIR-V.
 
 ## Layout
@@ -24,9 +24,9 @@ rust/
     ffai/             umbrella: backend selection + device enumeration
     ffai-cli/         `ffai` binary
     backends/
-      ffai-cuda/      wraps metaltile-runtime CudaDevice (NVRTC → PTX → driver)
+      ffai-cuda/      wraps iron-runtime CudaDevice (NVRTC → PTX → driver)
       ffai-metal/     metal-rs (cross-validation on Mac; Swift is primary on Apple)
-      ffai-vulkan/    SPIR-V (portable; pending metaltile SPIR-V target)
+      ffai-vulkan/    SPIR-V (portable; pending iron SPIR-V target)
 ```
 
 ## Build
@@ -45,16 +45,16 @@ The boundary is exactly two things: the **`Device` trait** (`ffai-core`) and
 the **op→kernel dispatch** (`ffai-ops`). Everything above them — models,
 loaders, KV cache, sampler — is plain Rust that never names a GPU API, so it
 runs on every backend unchanged. Everything below is a thin `Device` impl.
-Kernels are already shared by metaltile.
+Kernels are already shared by iron.
 
 Adding a backend (e.g. Vulkan) is **one crate**, not a fork — that's the
 whole point of the seam.
 
-## metaltile dependency
+## iron dependency
 
-Canonical pointer is the `feature/cuda-backend` branch of the metaltile repo
+Canonical pointer is the `feature/cuda-backend` branch of the iron repo
 (the cuda+metal toolchain), so a fresh clone is self-contained. Local
-co-development overrides it to a sibling `../../metaltile-cuda` checkout via
+co-development overrides it to a sibling `../../iron-cuda` checkout via
 the `[patch]` in `Cargo.toml` — instant, no fetch.
 
 ## Status
@@ -62,5 +62,5 @@ the `[patch]` in `Cargo.toml` — instant, no fetch.
 Skeleton: the `Device` trait + Tensor + modular backend crates compile and the
 CLI enumerates compiled backends. Backend `Device` impls and the model port
 land next. The CUDA kernel corpus already passes 100% (4164/4164) bit-accurate
-on GB10 in the metaltile repo — this engine wires those kernels into real
+on GB10 in the iron repo — this engine wires those kernels into real
 inference.

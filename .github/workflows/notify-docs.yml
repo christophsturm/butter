@@ -87,9 +87,9 @@ jobs:
           gh workflow run deploy.yml \
             --repo thewafflehaus/ffai-website \
             --ref main \
-            --field ffai_tag="$TAG" \
-            --field ffai_release_name="$NAME" \
-            --field ffai_release_url="$URL" \
-            --field ffai_release_published_at="$PUBLISHED_AT" \
-            --field ffai_release_body="$BODY"
+            --field iron_tag="$TAG" \
+            --field iron_release_name="$NAME" \
+            --field iron_release_url="$URL" \
+            --field iron_release_published_at="$PUBLISHED_AT" \
+            --field iron_release_body="$BODY"
           echo "dispatched ffai-website/deploy.yml for $TAG"

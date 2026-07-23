@@ -28,7 +28,7 @@
 //   correctness signal. Neither implementation has a bug — they made
 //   different reasonable choices.
 //
-//   Per-kernel correctness now comes from ffai-kernels' GPU
+//   Per-kernel correctness now comes from iron's GPU
 //   correctness tests (compared against a naive CPU oracle, much
 //   tighter than cross-impl comparison). The job of these
 //   integration tests is just to verify that the pipeline — load,

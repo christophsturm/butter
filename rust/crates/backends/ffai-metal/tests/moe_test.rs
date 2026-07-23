@@ -6,9 +6,9 @@
 //! the shared op layer. (Real MoE-model-vs-HF verification follows once the
 //! large expert weights are staged.)
 
-use ffai_core::{DType, Device, Tensor};
-use ffai_metal::MetalDevice;
-use ffai_models::moe::{ExpertWeights, MoeMlp, moe_mlp};
+use iron_core::{DType, Device, Tensor};
+use iron_metal::MetalDevice;
+use iron_models::moe::{ExpertWeights, MoeMlp, moe_mlp};
 
 fn tb(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()

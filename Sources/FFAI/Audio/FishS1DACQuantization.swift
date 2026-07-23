@@ -23,9 +23,9 @@
 // `FishS1DACDownsampleRVQ.decode(indices:config:weights:)`.
 //
 // CPU fallback note: the transformer and ConvNeXt blocks run on CPU via
-// `AudioMath` helpers. A ffai-kernels kernel port for the dilated depthwise
+// `AudioMath` helpers. A iron kernel port for the dilated depthwise
 // convolutions would be the natural next step (see TODO below).
-// TODO(ffai-kernels): port FishS1ConvNeXt depthwise dilated Conv1d kernel.
+// TODO(iron): port FishS1ConvNeXt depthwise dilated Conv1d kernel.
 
 import Foundation
 
@@ -137,8 +137,8 @@ enum FishS1RoPE {
 ///
 /// CPU implementation. All inner loops run on the calling thread because
 /// these blocks are part of a one-shot decode, not an autoregressive loop.
-/// TODO(ffai-kernels): replace with a GPU kernel once the depthwise dilated
-/// Conv1d kernel is available in ffai-kernels-std.
+/// TODO(iron): replace with a GPU kernel once the depthwise dilated
+/// Conv1d kernel is available in wh-iron-std.
 struct FishS1DACConvNeXtBlock {
     let dwConvW: [Float]  // [dim, 1, kernelSize] (depthwise, groups=dim)
     let dwConvWShape: [Int]

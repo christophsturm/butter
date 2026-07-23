@@ -9,10 +9,10 @@
 //! projection runs on the verified `matmul`. A full SmolVLM forward then =
 //! [verified SigLIP tower] → [this connector] → splice into text → [verified
 //! causal Llama], all on the shared op layer.
-use ffai_core::{DType, Tensor};
-use ffai_cuda::CudaDevice;
-use ffai_loader::SafeTensors;
-use ffai_ops::matmul;
+use iron_core::{DType, Tensor};
+use iron_cuda::CudaDevice;
+use iron_loader::SafeTensors;
+use iron_ops::matmul;
 
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn fb(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() }

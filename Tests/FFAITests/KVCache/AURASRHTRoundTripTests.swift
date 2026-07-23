@@ -25,7 +25,7 @@
 //
 //   2. The AURA codec (encode + dequant) with a non-identity SRHT
 //      rotation produces output that approximates `Π · input`. The
-//      ffai-kernels-side GPU correctness test for `aura_encode` only
+//      iron-side GPU correctness test for `aura_encode` only
 //      exercises identity rotation; this fills the gap so a future
 //      regression in the encode kernel's rotation-matmul stage is
 //      caught at the Swift layer.

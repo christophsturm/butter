@@ -9,12 +9,12 @@ Package.resolved
 
 # Generated kernel artifacts (regenerated on every build by SPM plugin).
 # Ignore everything in Generated/ except .gitkeep so the directory
-# survives a fresh clone before ffai-kernels-emit runs.
-Sources/FFAIKernelsSwift/Resources/kernels.metallib
-Sources/FFAIKernelsSwift/Resources/manifest.json
-Sources/FFAIKernelsSwift/Resources/kernels/
-Sources/FFAIKernelsSwift/Generated/*
-!Sources/FFAIKernelsSwift/Generated/.gitkeep
+# survives a fresh clone before iron-emit runs.
+Sources/IronSwift/Resources/kernels.metallib
+Sources/IronSwift/Resources/manifest.json
+Sources/IronSwift/Resources/kernels/
+Sources/IronSwift/Generated/*
+!Sources/IronSwift/Generated/.gitkeep
 
 # Local model files (downloaded checkpoints land in /Models at the repo
 # root; Sources/FFAI/Models/ is the family-file source directory and IS

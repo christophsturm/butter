@@ -7,9 +7,9 @@
 //!
 //! Runs on macOS with a Metal GPU; skips elsewhere.
 
-use ffai_metal::MetalDevice;
-use ffai_loader::SafeTensors;
-use ffai_models::llama::{LlamaConfig, forward_single, load_qwen3};
+use iron_metal::MetalDevice;
+use iron_loader::SafeTensors;
+use iron_models::llama::{LlamaConfig, forward_single, load_qwen3};
 
 fn bf16_to_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(2)

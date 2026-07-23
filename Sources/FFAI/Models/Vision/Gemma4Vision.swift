@@ -240,7 +240,7 @@ final class Gemma4VLVisionBlock {
     ///      scale 1.0 (the q_norm folds the 1/√d), baseKV 0, kvStride ==
     ///      nTokens.
     ///
-    /// The `ffai_sdpa_bidirectional_d{64,72,80,96}` kernels are GPU-correct
+    /// The `iron_sdpa_bidirectional_d{64,72,80,96}` kernels are GPU-correct
     /// at this production geometry — see `sdpa_bidirectional_gpu_correctness
     /// .rs` (incl. the 576×16×64 case) — with TPG 1024 / n_simd 32, so the
     /// machine-freeze the earlier CPU `concurrentPerform` fallback worked

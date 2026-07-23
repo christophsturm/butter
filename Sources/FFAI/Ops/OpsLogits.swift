@@ -14,7 +14,7 @@
 //
 // OpsLogits — sampling-pipeline logits processors.
 //
-// Wraps the `logits_*` kernels from `ffai-kernels-std/src/ffai/`:
+// Wraps the `logits_*` kernels from `wh-iron-std/src/ffai/`:
 //   * `logits_temperature_*` — `out[i] = inp[i] / temperature` (Grid3D)
 //   * `logits_repetition_penalty_*` — in-place division/multiplication
 //     of the logits at the supplied token IDs (Grid3D, one thread per
@@ -34,7 +34,7 @@
 
 import Foundation
 import Metal
-import FFAIKernelsSwift
+import IronSwift
 
 extension Ops {
 
@@ -61,19 +61,19 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(inp.elementCount)
         switch inp.dtype {
         case .f32:
-            FFAIKernels.ffai_logits_temperature_f32(
+            IronKernels.iron_logits_temperature_f32(
                 inp: inp.buffer, inpOffset: inp.offset,
                 out: result.buffer, outOffset: result.offset,
                 temperature: temperature,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_logits_temperature_f16(
+            IronKernels.iron_logits_temperature_f16(
                 inp: inp.buffer, inpOffset: inp.offset,
                 out: result.buffer, outOffset: result.offset,
                 temperature: temperature,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_logits_temperature_bf16(
+            IronKernels.iron_logits_temperature_bf16(
                 inp: inp.buffer, inpOffset: inp.offset,
                 out: result.buffer, outOffset: result.offset,
                 temperature: temperature,
@@ -110,19 +110,19 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(tokenIds.elementCount)
         switch logits.dtype {
         case .f32:
-            FFAIKernels.ffai_logits_repetition_penalty_f32(
+            IronKernels.iron_logits_repetition_penalty_f32(
                 logits: logits.buffer, logitsOffset: logits.offset,
                 token_ids: tokenIds.buffer, token_idsOffset: tokenIds.offset,
                 penalty: penalty,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_logits_repetition_penalty_f16(
+            IronKernels.iron_logits_repetition_penalty_f16(
                 logits: logits.buffer, logitsOffset: logits.offset,
                 token_ids: tokenIds.buffer, token_idsOffset: tokenIds.offset,
                 penalty: penalty,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_logits_repetition_penalty_bf16(
+            IronKernels.iron_logits_repetition_penalty_bf16(
                 logits: logits.buffer, logitsOffset: logits.offset,
                 token_ids: tokenIds.buffer, token_idsOffset: tokenIds.offset,
                 penalty: penalty,
@@ -154,19 +154,19 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(inp.elementCount)
         switch inp.dtype {
         case .f32:
-            FFAIKernels.ffai_logits_topk_mask_f32(
+            IronKernels.iron_logits_topk_mask_f32(
                 inp: inp.buffer, inpOffset: inp.offset,
                 out: result.buffer, outOffset: result.offset,
                 threshold: threshold,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_logits_topk_mask_f16(
+            IronKernels.iron_logits_topk_mask_f16(
                 inp: inp.buffer, inpOffset: inp.offset,
                 out: result.buffer, outOffset: result.offset,
                 threshold: threshold,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_logits_topk_mask_bf16(
+            IronKernels.iron_logits_topk_mask_bf16(
                 inp: inp.buffer, inpOffset: inp.offset,
                 out: result.buffer, outOffset: result.offset,
                 threshold: threshold,
@@ -201,19 +201,19 @@ extension Ops {
         let tg = MTLSize(width: tgSize, height: 1, depth: 1)
         switch inp.dtype {
         case .f32:
-            FFAIKernels.ffai_logits_min_p_mask_f32(
+            IronKernels.iron_logits_min_p_mask_f32(
                 inp: inp.buffer, inpOffset: inp.offset,
                 out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), min_p: minP,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_logits_min_p_mask_f16(
+            IronKernels.iron_logits_min_p_mask_f16(
                 inp: inp.buffer, inpOffset: inp.offset,
                 out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), min_p: minP,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_logits_min_p_mask_bf16(
+            IronKernels.iron_logits_min_p_mask_bf16(
                 inp: inp.buffer, inpOffset: inp.offset,
                 out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), min_p: minP,
@@ -247,19 +247,19 @@ extension Ops {
         let tg = MTLSize(width: tgSize, height: 1, depth: 1)
         switch inp.dtype {
         case .f32:
-            FFAIKernels.ffai_logits_top_p_mask_f32(
+            IronKernels.iron_logits_top_p_mask_f32(
                 inp: inp.buffer, inpOffset: inp.offset,
                 out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), top_p: topP,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_logits_top_p_mask_f16(
+            IronKernels.iron_logits_top_p_mask_f16(
                 inp: inp.buffer, inpOffset: inp.offset,
                 out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), top_p: topP,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_logits_top_p_mask_bf16(
+            IronKernels.iron_logits_top_p_mask_bf16(
                 inp: inp.buffer, inpOffset: inp.offset,
                 out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), top_p: topP,

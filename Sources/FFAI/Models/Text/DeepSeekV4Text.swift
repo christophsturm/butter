@@ -20,7 +20,7 @@
 // `DeepSeekV4Pro`), and the `DeepSeekV4Model` placeholder — so the
 // loader can identify a DSv4 checkpoint (safetensors or GGUF) and
 // dispatch into the family. The forward path land in follow-up PRs
-// per the multi-week metaltile kernel sequence (MLA decode, CSA
+// per the multi-week iron kernel sequence (MLA decode, CSA
 // sparse-gather SDPA, HCA compressed-stream SDPA, Lightning Indexer,
 // FP4 / block-FP8 dequant).
 //
@@ -48,7 +48,7 @@
 //   intermediate=2048, 1 always-on shared expert at dim=2048).
 //   `noaux_tc` aux-loss-free + per-expert bias routing.
 // • **`sqrtsoftplus` routing scoring** — replaces DSv3's sigmoid+bias
-//   gate (companion `ffai_moe_router_sigmoid_bias` kernel from
+//   gate (companion `iron_moe_router_sigmoid_bias` kernel from
 //   the Step-3 series is the closest cousin; sqrtsoftplus is its
 //   own small variant kernel).
 // • **mHC (Manifold-Constrained Hyper-Connections)** — residual
@@ -66,7 +66,7 @@
 //
 // • MoE expert weights stored as **fp4** (FP4 e2m1, block 32, with
 //   per-block fp8 e4m3 scales). New kernel family — not in
-//   metaltile-std today.
+//   wh-iron-std today.
 // • Attention / router weights stored as **block-FP8** (FP8 e4m3,
 //   block 128×128). Distinct from per-channel int4 affine; another
 //   net-new dequant kernel.
@@ -74,7 +74,7 @@
 
 import Foundation
 import Metal
-import MetalTileSwift
+import IronSwift
 import QuartzCore
 
 // ─── DeepSeekV4TextConfig ────────────────────────────────────────────

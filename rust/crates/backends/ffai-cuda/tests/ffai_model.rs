@@ -3,13 +3,13 @@
 //! A full transformer decode layer (Qwen2-0.5B geometry) assembled from the
 //! shared ffai-ops, run on CUDA through the Device trait, and checked against
 //! an independent CPU reference. This is the proof that a model — not just an
-//! op — runs on the shared layer: one builder (ffai_models::llama) + the op
+//! op — runs on the shared layer: one builder (iron_models::llama) + the op
 //! seam produce a correct forward on real GB10 hardware.
 #![cfg(feature = "cuda")]
 
-use ffai_core::{DType, Device, Tensor};
-use ffai_cuda::CudaDevice;
-use ffai_models::llama::{LayerWeights, LlamaConfig, ModelWeights, decode_layer_self, forward_single};
+use iron_core::{DType, Device, Tensor};
+use iron_cuda::CudaDevice;
+use iron_models::llama::{LayerWeights, LlamaConfig, ModelWeights, decode_layer_self, forward_single};
 
 fn to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()

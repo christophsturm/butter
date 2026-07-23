@@ -1,8 +1,8 @@
 // Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 // SPDX-License-Identifier: Apache-2.0
 //! Prove the shared engine seam runs a kernel end-to-end on real CUDA
-//! hardware: build a metaltile `Kernel` IR, then drive it entirely through
-//! the backend-neutral `ffai_core::Device` trait (alloc / upload / dispatch
+//! hardware: build a iron `Kernel` IR, then drive it entirely through
+//! the backend-neutral `iron_core::Device` trait (alloc / upload / dispatch
 //! / download / synchronize) — no CUDA-specific code in sight. This is the
 //! concrete proof that CUDA consumes the shared layer.
 //!
@@ -10,9 +10,9 @@
 //! no device is present.
 #![cfg(feature = "cuda")]
 
-use ffai_core::{Binding, DType, Grid, Tensor};
-use ffai_cuda::CudaDevice;
-use ffai_kernels_core::{
+use iron_core::{Binding, DType, Grid, Tensor};
+use iron_cuda::CudaDevice;
+use iron_kernels_core::{
     ir::{BinOpKind, IndexExpr, Kernel, Op, Param, ParamKind, ValueId},
     shape::Shape,
 };
@@ -104,13 +104,13 @@ fn vector_add_through_shared_device_trait() {
         max_err = max_err.max((c[i] - (a[i] + b[i])).abs());
     }
     assert!(max_err <= 1e-6, "vector_add via ffai Device mismatch: max|Δ|={max_err:.3e}");
-    eprintln!("vector_add through ffai_core::Device on CUDA: OK (max|Δ|={max_err:.1e})");
+    eprintln!("vector_add through iron_core::Device on CUDA: OK (max|Δ|={max_err:.1e})");
 }
 
-/// Drive the real op layer (`ffai_ops::add` / `mul`) on CUDA — the same
+/// Drive the real op layer (`iron_ops::add` / `mul`) on CUDA — the same
 /// calls model code makes, executed through the shared Device trait.
 #[test]
-fn ffai_ops_elementwise_on_cuda() {
+fn iron_ops_elementwise_on_cuda() {
     let Some(dev) = CudaDevice::create().expect("cuda init") else {
         eprintln!("no CUDA device — skipping");
         return;
@@ -123,8 +123,8 @@ fn ffai_ops_elementwise_on_cuda() {
     let ta = Tensor::new(dev.upload(&to_bytes(&a)).unwrap(), vec![N], DType::F32);
     let tb = Tensor::new(dev.upload(&to_bytes(&b)).unwrap(), vec![N], DType::F32);
 
-    let sum = ffai_ops::add(dev.as_ref(), &ta, &tb).unwrap();
-    let prod = ffai_ops::mul(dev.as_ref(), &ta, &tb).unwrap();
+    let sum = iron_ops::add(dev.as_ref(), &ta, &tb).unwrap();
+    let prod = iron_ops::mul(dev.as_ref(), &ta, &tb).unwrap();
     dev.synchronize().unwrap();
 
     let mut sbytes = vec![0u8; N * 4];
@@ -139,16 +139,16 @@ fn ffai_ops_elementwise_on_cuda() {
         err = err.max((s[i] - (a[i] + b[i])).abs());
         err = err.max((p[i] - (a[i] * b[i])).abs());
     }
-    assert!(err <= 1e-6, "ffai_ops add/mul on CUDA mismatch: max|Δ|={err:.3e}");
-    eprintln!("ffai_ops::add + ffai_ops::mul on CUDA: OK (max|Δ|={err:.1e})");
+    assert!(err <= 1e-6, "iron_ops add/mul on CUDA mismatch: max|Δ|={err:.3e}");
+    eprintln!("iron_ops::add + iron_ops::mul on CUDA: OK (max|Δ|={err:.1e})");
 }
 
-/// Heavier ops via the registered-kernel lookup: rms_norm (ffai_rms_norm) and
-/// gemv (ffai_gemv), driven through the shared Device trait on CUDA and
+/// Heavier ops via the registered-kernel lookup: rms_norm (iron_rms_norm) and
+/// gemv (iron_gemv), driven through the shared Device trait on CUDA and
 /// checked against a CPU reference. This is the mechanism every transformer
 /// op rides on.
 #[test]
-fn ffai_ops_rms_norm_and_gemv_on_cuda() {
+fn iron_ops_rms_norm_and_gemv_on_cuda() {
     let Some(dev) = CudaDevice::create().expect("cuda init") else {
         eprintln!("no CUDA device — skipping");
         return;
@@ -163,7 +163,7 @@ fn ffai_ops_rms_norm_and_gemv_on_cuda() {
 
     let tx = Tensor::new(dev.upload(&to_bytes(&x)).unwrap(), vec![ROWS, N], DType::F32);
     let tw = Tensor::new(dev.upload(&to_bytes(&w)).unwrap(), vec![N], DType::F32);
-    let ty = ffai_ops::rms_norm(dev.as_ref(), &tx, &tw, eps).unwrap();
+    let ty = iron_ops::rms_norm(dev.as_ref(), &tx, &tw, eps).unwrap();
     dev.synchronize().unwrap();
     let mut yb = vec![0u8; ROWS * N * 4];
     dev.download(ty.buffer.as_ref(), &mut yb).unwrap();
@@ -180,7 +180,7 @@ fn ffai_ops_rms_norm_and_gemv_on_cuda() {
         }
     }
     assert!(rms_err <= 1e-4, "rms_norm on CUDA mismatch: max|Δ|={rms_err:.3e}");
-    eprintln!("ffai_ops::rms_norm (ffai_rms_norm) on CUDA: OK (max|Δ|={rms_err:.1e})");
+    eprintln!("iron_ops::rms_norm (iron_rms_norm) on CUDA: OK (max|Δ|={rms_err:.1e})");
 
     // ── gemv: [M,K] @ [K] ────────────────────────────────────────────
     const M: usize = 64;
@@ -190,7 +190,7 @@ fn ffai_ops_rms_norm_and_gemv_on_cuda() {
 
     let tmat = Tensor::new(dev.upload(&to_bytes(&mat)).unwrap(), vec![M, K], DType::F32);
     let tvec = Tensor::new(dev.upload(&to_bytes(&vecd)).unwrap(), vec![K], DType::F32);
-    let tout = ffai_ops::gemv(dev.as_ref(), &tmat, &tvec).unwrap();
+    let tout = iron_ops::gemv(dev.as_ref(), &tmat, &tvec).unwrap();
     dev.synchronize().unwrap();
     let mut ob = vec![0u8; M * 4];
     dev.download(tout.buffer.as_ref(), &mut ob).unwrap();
@@ -202,7 +202,7 @@ fn ffai_ops_rms_norm_and_gemv_on_cuda() {
         gemv_err = gemv_err.max((got[r] - want).abs());
     }
     assert!(gemv_err <= 1e-3, "gemv on CUDA mismatch: max|Δ|={gemv_err:.3e}");
-    eprintln!("ffai_ops::gemv (ffai_gemv) on CUDA: OK (max|Δ|={gemv_err:.1e})");
+    eprintln!("iron_ops::gemv (iron_gemv) on CUDA: OK (max|Δ|={gemv_err:.1e})");
 }
 
 fn sigmoid(x: f32) -> f32 {
@@ -212,7 +212,7 @@ fn sigmoid(x: f32) -> f32 {
 /// The remaining transformer ops via registered kernels: silu, swiglu,
 /// gather (embedding), softmax — all through the shared Device trait on CUDA.
 #[test]
-fn ffai_ops_transformer_ops_on_cuda() {
+fn iron_ops_transformer_ops_on_cuda() {
     let Some(dev) = CudaDevice::create().expect("cuda init") else {
         eprintln!("no CUDA device — skipping");
         return;
@@ -221,7 +221,7 @@ fn ffai_ops_transformer_ops_on_cuda() {
     // ── silu ─────────────────────────────────────────────────────────
     let g: Vec<f32> = (0..1024).map(|i| (i % 21) as f32 * 0.1 - 1.0).collect();
     let tg = Tensor::new(dev.upload(&to_bytes(&g)).unwrap(), vec![1024], DType::F32);
-    let ts = ffai_ops::silu(dev.as_ref(), &tg).unwrap();
+    let ts = iron_ops::silu(dev.as_ref(), &tg).unwrap();
     dev.synchronize().unwrap();
     let mut sb = vec![0u8; 1024 * 4];
     dev.download(ts.buffer.as_ref(), &mut sb).unwrap();
@@ -231,12 +231,12 @@ fn ffai_ops_transformer_ops_on_cuda() {
         e = e.max((s[i] - g[i] * sigmoid(g[i])).abs());
     }
     assert!(e <= 1e-5, "silu mismatch: {e:.2e}");
-    eprintln!("ffai_ops::silu (ffai_silu) on CUDA: OK (max|Δ|={e:.1e})");
+    eprintln!("iron_ops::silu (iron_silu) on CUDA: OK (max|Δ|={e:.1e})");
 
     // ── swiglu ───────────────────────────────────────────────────────
     let up: Vec<f32> = (0..1024).map(|i| (i % 13) as f32 * 0.05).collect();
     let tu = Tensor::new(dev.upload(&to_bytes(&up)).unwrap(), vec![1024], DType::F32);
-    let tw = ffai_ops::swiglu(dev.as_ref(), &tg, &tu).unwrap();
+    let tw = iron_ops::swiglu(dev.as_ref(), &tg, &tu).unwrap();
     dev.synchronize().unwrap();
     let mut wb = vec![0u8; 1024 * 4];
     dev.download(tw.buffer.as_ref(), &mut wb).unwrap();
@@ -246,7 +246,7 @@ fn ffai_ops_transformer_ops_on_cuda() {
         e = e.max((w[i] - g[i] * sigmoid(g[i]) * up[i]).abs());
     }
     assert!(e <= 1e-5, "swiglu mismatch: {e:.2e}");
-    eprintln!("ffai_ops::swiglu (ffai_swiglu) on CUDA: OK (max|Δ|={e:.1e})");
+    eprintln!("iron_ops::swiglu (iron_swiglu) on CUDA: OK (max|Δ|={e:.1e})");
 
     // ── gather (embedding) ───────────────────────────────────────────
     const VOCAB: usize = 8;
@@ -256,7 +256,7 @@ fn ffai_ops_transformer_ops_on_cuda() {
     let id_bytes: Vec<u8> = ids.iter().flat_map(|v| v.to_le_bytes()).collect();
     let tt = Tensor::new(dev.upload(&to_bytes(&table)).unwrap(), vec![VOCAB, DIM], DType::F32);
     let ti = Tensor::new(dev.upload(&id_bytes).unwrap(), vec![4], DType::U32);
-    let tge = ffai_ops::gather(dev.as_ref(), &tt, &ti).unwrap();
+    let tge = iron_ops::gather(dev.as_ref(), &tt, &ti).unwrap();
     dev.synchronize().unwrap();
     let mut gb = vec![0u8; 4 * DIM * 4];
     dev.download(tge.buffer.as_ref(), &mut gb).unwrap();
@@ -268,14 +268,14 @@ fn ffai_ops_transformer_ops_on_cuda() {
         }
     }
     assert!(e == 0.0, "gather mismatch: {e:.2e}");
-    eprintln!("ffai_ops::gather (ffai_gather) on CUDA: OK (exact)");
+    eprintln!("iron_ops::gather (iron_gather) on CUDA: OK (exact)");
 
     // ── softmax ──────────────────────────────────────────────────────
     const ROWS: usize = 2;
     const NW: usize = 1024;
     let xs: Vec<f32> = (0..ROWS * NW).map(|i| ((i % 37) as f32 - 18.0) * 0.1).collect();
     let txs = Tensor::new(dev.upload(&to_bytes(&xs)).unwrap(), vec![ROWS, NW], DType::F32);
-    let tsm = ffai_ops::softmax(dev.as_ref(), &txs).unwrap();
+    let tsm = iron_ops::softmax(dev.as_ref(), &txs).unwrap();
     dev.synchronize().unwrap();
     let mut smb = vec![0u8; ROWS * NW * 4];
     dev.download(tsm.buffer.as_ref(), &mut smb).unwrap();
@@ -291,14 +291,14 @@ fn ffai_ops_transformer_ops_on_cuda() {
         }
     }
     assert!(e <= 1e-5, "softmax mismatch: {e:.2e}");
-    eprintln!("ffai_ops::softmax (ffai_softmax) on CUDA: OK (max|Δ|={e:.1e})");
+    eprintln!("iron_ops::softmax (iron_softmax) on CUDA: OK (max|Δ|={e:.1e})");
 }
 
 /// Decode-time attention (sdpa_decode) on CUDA vs a CPU reference, single
 /// q-head / single kv-head, head_dim=64. The gatekeeper op for a real
 /// transformer forward.
 #[test]
-fn ffai_ops_sdpa_decode_on_cuda() {
+fn iron_ops_sdpa_decode_on_cuda() {
     let Some(dev) = CudaDevice::create().expect("cuda init") else {
         eprintln!("no CUDA device — skipping");
         return;
@@ -318,7 +318,7 @@ fn ffai_ops_sdpa_decode_on_cuda() {
 
     // n_kv=128, kv_stride=128 (cache exactly filled), heads_per_group=1.
     let tout =
-        ffai_ops::sdpa_decode(dev.as_ref(), &tq, &tk, &tv, HD, NKV as u32, NKV as u32, 1, scale)
+        iron_ops::sdpa_decode(dev.as_ref(), &tq, &tk, &tv, HD, NKV as u32, NKV as u32, 1, scale)
             .unwrap();
     dev.synchronize().unwrap();
     let mut ob = vec![0u8; HD * 4];
@@ -347,5 +347,5 @@ fn ffai_ops_sdpa_decode_on_cuda() {
         err = err.max((got[d] - want[d]).abs());
     }
     assert!(err <= 1e-4, "sdpa_decode on CUDA mismatch: max|Δ|={err:.3e}");
-    eprintln!("ffai_ops::sdpa_decode (ffai_sdpa_decode_d64) on CUDA: OK (max|Δ|={err:.1e})");
+    eprintln!("iron_ops::sdpa_decode (iron_sdpa_decode_d64) on CUDA: OK (max|Δ|={err:.1e})");
 }

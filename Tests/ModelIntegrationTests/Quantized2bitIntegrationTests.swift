@@ -15,7 +15,7 @@
 // End-to-end test: download FFAI's own 2-bit Qwen3.5-0.8B conversion
 // (`ekryski/Qwen3.5-0.8B-2bit`, produced via `ffai convert --bits 2
 // --quantize-embeddings`) and exercise the dequant_gemv_int2 +
-// dequant_gather_int2 + ffai_qmm_mma_int2 kernels end-to-end through the
+// dequant_gather_int2 + iron_qmm_mma_int2 kernels end-to-end through the
 // Qwen3.5-VL loader and centered-RMSNorm fold path.
 //
 // ── No coherence assertion ──

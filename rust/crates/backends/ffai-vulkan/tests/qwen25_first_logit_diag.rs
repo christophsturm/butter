@@ -4,10 +4,10 @@
 //! decode step, to tell a precision near-tie apart from a real kernel bug on
 //! the Vulkan/RDNA4 path. Not a CI test — gated on QWEN25_GGUF + vulkan.
 
-use ffai_loader::gguf::Gguf;
-use ffai_models::gguf_tokenizer::GgufTokenizer;
-use ffai_models::llama::GgufModel;
-use ffai_vulkan::VulkanDevice;
+use iron_loader::gguf::Gguf;
+use iron_models::gguf_tokenizer::GgufTokenizer;
+use iron_models::llama::GgufModel;
+use iron_vulkan::VulkanDevice;
 
 #[test]
 fn qwen25_first_logit_diag_vulkan() {

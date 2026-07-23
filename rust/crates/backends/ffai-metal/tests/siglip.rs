@@ -10,10 +10,10 @@
 //! per query); LayerNorm + GELU(tanh) on device. Bias/residual/head-reorg are
 //! trivial host elementwise. Input is a deterministic synthetic pixel tensor
 //! (same `sin(0.01·i)` formula as the HF reference).
-use ffai_core::{DType, Tensor};
-use ffai_metal::MetalDevice;
-use ffai_loader::SafeTensors;
-use ffai_ops::{gelu, layer_norm, matmul, sdpa_decode};
+use iron_core::{DType, Tensor};
+use iron_metal::MetalDevice;
+use iron_loader::SafeTensors;
+use iron_ops::{gelu, layer_norm, matmul, sdpa_decode};
 
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn fb(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() }

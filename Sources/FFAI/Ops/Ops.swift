@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Ops — ergonomic Tensor-based dispatch over FFAIKernels.
+// Ops — ergonomic Tensor-based dispatch over IronKernels.
 //
 // Each op picks the right kernel for the input dtype, fills in default
 // grid/threadgroup sizing, encodes on the supplied command buffer, and
@@ -22,7 +22,7 @@
 
 import Foundation
 import Metal
-import FFAIKernelsSwift
+import IronSwift
 
 public enum Ops {
     public static let device: Device = .shared
@@ -86,19 +86,19 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(n)
         switch accum.dtype {
         case .f32:
-            FFAIKernels.ffai_axpy_scalar_inplace_f32(
+            IronKernels.iron_axpy_scalar_inplace_f32(
                 src: src.buffer, srcOffset: src.offset,
                 accum: accum.buffer, accumOffset: accum.offset,
                 scalar: scalar,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_axpy_scalar_inplace_f16(
+            IronKernels.iron_axpy_scalar_inplace_f16(
                 src: src.buffer, srcOffset: src.offset,
                 accum: accum.buffer, accumOffset: accum.offset,
                 scalar: scalar,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_axpy_scalar_inplace_bf16(
+            IronKernels.iron_axpy_scalar_inplace_bf16(
                 src: src.buffer, srcOffset: src.offset,
                 accum: accum.buffer, accumOffset: accum.offset,
                 scalar: scalar,
@@ -128,7 +128,7 @@ public enum Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch dt {
         case .f16:
-            FFAIKernels.ffai_moe_down_weighted_sum_6_f16(
+            IronKernels.iron_moe_down_weighted_sum_6_f16(
                 down_0: downs[0].buffer, down_0Offset: downs[0].offset,
                 inner_0: inners[0].buffer, inner_0Offset: inners[0].offset,
                 down_1: downs[1].buffer, down_1Offset: downs[1].offset,
@@ -146,7 +146,7 @@ public enum Ops {
                 k: UInt32(k),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f32:
-            FFAIKernels.ffai_moe_down_weighted_sum_6_f32(
+            IronKernels.iron_moe_down_weighted_sum_6_f32(
                 down_0: downs[0].buffer, down_0Offset: downs[0].offset,
                 inner_0: inners[0].buffer, inner_0Offset: inners[0].offset,
                 down_1: downs[1].buffer, down_1Offset: downs[1].offset,
@@ -164,7 +164,7 @@ public enum Ops {
                 k: UInt32(k),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_moe_down_weighted_sum_6_bf16(
+            IronKernels.iron_moe_down_weighted_sum_6_bf16(
                 down_0: downs[0].buffer, down_0Offset: downs[0].offset,
                 inner_0: inners[0].buffer, inner_0Offset: inners[0].offset,
                 down_1: downs[1].buffer, down_1Offset: downs[1].offset,
@@ -204,7 +204,7 @@ public enum Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch gateW.dtype {
         case .f32:
-            FFAIKernels.ffai_gate_up_swiglu_fused_f32(
+            IronKernels.iron_gate_up_swiglu_fused_f32(
                 gate_w: gateW.buffer, gate_wOffset: gateW.offset,
                 up_w: upW.buffer, up_wOffset: upW.offset,
                 x: x.buffer, xOffset: x.offset,
@@ -212,7 +212,7 @@ public enum Ops {
                 k: UInt32(k),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gate_up_swiglu_fused_f16(
+            IronKernels.iron_gate_up_swiglu_fused_f16(
                 gate_w: gateW.buffer, gate_wOffset: gateW.offset,
                 up_w: upW.buffer, up_wOffset: upW.offset,
                 x: x.buffer, xOffset: x.offset,
@@ -220,7 +220,7 @@ public enum Ops {
                 k: UInt32(k),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gate_up_swiglu_fused_bf16(
+            IronKernels.iron_gate_up_swiglu_fused_bf16(
                 gate_w: gateW.buffer, gate_wOffset: gateW.offset,
                 up_w: upW.buffer, up_wOffset: upW.offset,
                 x: x.buffer, xOffset: x.offset,
@@ -252,21 +252,21 @@ public enum Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch mat.dtype {
         case .f32:
-            FFAIKernels.ffai_gemv_axpy_inplace_f32(
+            IronKernels.iron_gemv_axpy_inplace_f32(
                 mat: mat.buffer, matOffset: mat.offset,
                 vec: vec.buffer, vecOffset: vec.offset,
                 accum: accum.buffer, accumOffset: accum.offset,
                 k: UInt32(k), weight: weight,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gemv_axpy_inplace_f16(
+            IronKernels.iron_gemv_axpy_inplace_f16(
                 mat: mat.buffer, matOffset: mat.offset,
                 vec: vec.buffer, vecOffset: vec.offset,
                 accum: accum.buffer, accumOffset: accum.offset,
                 k: UInt32(k), weight: weight,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gemv_axpy_inplace_bf16(
+            IronKernels.iron_gemv_axpy_inplace_bf16(
                 mat: mat.buffer, matOffset: mat.offset,
                 vec: vec.buffer, vecOffset: vec.offset,
                 accum: accum.buffer, accumOffset: accum.offset,
@@ -288,19 +288,19 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(n)
         switch a.dtype {
         case .f32:
-            FFAIKernels.vector_add_f32(
+            IronKernels.vector_add_f32(
                 a: a.buffer, aOffset: a.offset,
                 b: b.buffer, bOffset: b.offset,
                 c: result.buffer, cOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.vector_add_f16(
+            IronKernels.vector_add_f16(
                 a: a.buffer, aOffset: a.offset,
                 b: b.buffer, bOffset: b.offset,
                 c: result.buffer, cOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.vector_add_bf16(
+            IronKernels.vector_add_bf16(
                 a: a.buffer, aOffset: a.offset,
                 b: b.buffer, bOffset: b.offset,
                 c: result.buffer, cOffset: result.offset,
@@ -322,19 +322,19 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(n)
         switch a.dtype {
         case .f32:
-            FFAIKernels.ffai_mul_f32(
+            IronKernels.iron_mul_f32(
                 a: a.buffer, aOffset: a.offset,
                 b: b.buffer, bOffset: b.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_mul_f16(
+            IronKernels.iron_mul_f16(
                 a: a.buffer, aOffset: a.offset,
                 b: b.buffer, bOffset: b.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_mul_bf16(
+            IronKernels.iron_mul_bf16(
                 a: a.buffer, aOffset: a.offset,
                 b: b.buffer, bOffset: b.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -354,17 +354,17 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(n)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_silu_f32(
+            IronKernels.iron_silu_f32(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_silu_f16(
+            IronKernels.iron_silu_f16(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_silu_bf16(
+            IronKernels.iron_silu_bf16(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
@@ -374,8 +374,8 @@ public enum Ops {
         return result
     }
 
-    /// Sigmoid: out[i] = 1 / (1 + exp(-x[i])). Wraps ffai-kernels'
-    /// `ffai_sigmoid_*` element-wise kernel. Qwen3.5's gated attention
+    /// Sigmoid: out[i] = 1 / (1 + exp(-x[i])). Wraps iron'
+    /// `iron_sigmoid_*` element-wise kernel. Qwen3.5's gated attention
     /// output (`attn_output_gate`) multiplies the SDPA result by
     /// `sigmoid(gate)` before `o_proj`.
     public static func sigmoid(
@@ -387,17 +387,17 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(n)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_sigmoid_f32(
+            IronKernels.iron_sigmoid_f32(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_sigmoid_f16(
+            IronKernels.iron_sigmoid_f16(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_sigmoid_bf16(
+            IronKernels.iron_sigmoid_bf16(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
@@ -407,7 +407,7 @@ public enum Ops {
         return result
     }
 
-    /// ReLU: out[i] = max(x[i], 0). Wraps ffai-kernels' `ffai_relu_*`
+    /// ReLU: out[i] = max(x[i], 0). Wraps iron's `iron_relu_*`
     /// element-wise kernel. NemotronH's MLP / MoE feed-forward blocks
     /// use squared-ReLU (`relu(x)^2`) as their activation; the squaring
     /// is a follow-up `Ops.mul(relu, relu)` on the caller side.
@@ -420,17 +420,17 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(n)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_relu_f32(
+            IronKernels.iron_relu_f32(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_relu_f16(
+            IronKernels.iron_relu_f16(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_relu_bf16(
+            IronKernels.iron_relu_bf16(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
@@ -442,7 +442,7 @@ public enum Ops {
 
     /// GELU (tanh-approximate, matching the math used by Gemma 3 / GPT-2
     /// / etc.). out[i] = 0.5 * x[i] * (1 + tanh(sqrt(2/π) * (x[i] + 0.044715 * x[i]³))).
-    /// Wraps ffai-kernels' `ffai_gelu_*` element-wise kernel.
+    /// Wraps iron's `iron_gelu_*` element-wise kernel.
     public static func gelu(
         _ x: Tensor, on cmd: MTLCommandBuffer,
         into out: Tensor? = nil
@@ -452,17 +452,17 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(n)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_gelu_f32(
+            IronKernels.iron_gelu_f32(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gelu_f16(
+            IronKernels.iron_gelu_f16(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gelu_bf16(
+            IronKernels.iron_gelu_bf16(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
@@ -475,7 +475,7 @@ public enum Ops {
     /// Exact (erf-based) GELU `0.5·x·(1 + erf(x/√2))` — PyTorch `nn.GELU()`
     /// default. Distinct from ``gelu`` (the tanh approximation): the Kokoro
     /// PLBERT needs the exact form so its 12 shared FFNs don't drift the
-    /// prosody predictor's rounding-sensitive durations. Wraps `ffai_gelu_erf`.
+    /// prosody predictor's rounding-sensitive durations. Wraps `iron_gelu_erf`.
     public static func geluErf(
         _ x: Tensor, on cmd: MTLCommandBuffer, into out: Tensor? = nil
     ) -> Tensor {
@@ -483,15 +483,15 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(x.elementCount)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_gelu_erf_f32(
+            IronKernels.iron_gelu_erf_f32(
                 input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gelu_erf_f16(
+            IronKernels.iron_gelu_erf_f16(
                 input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gelu_erf_bf16(
+            IronKernels.iron_gelu_erf_bf16(
                 input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
@@ -512,17 +512,17 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(n)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_softplus_f32(
+            IronKernels.iron_softplus_f32(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_softplus_f16(
+            IronKernels.iron_softplus_f16(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_softplus_bf16(
+            IronKernels.iron_softplus_bf16(
                 a: x.buffer, aOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
@@ -537,10 +537,10 @@ public enum Ops {
     /// The sigmoid-with-bias gate used by NemotronH / DeepSeek-V3 expert
     /// routing: the bias steers SELECTION only — the final expert weight
     /// is the raw `sigmoid(logits)`, recoverable as `scores - bias`.
-    /// Elementwise over `[nExperts]`, **f32-only** (the ffai-kernels
-    /// `ffai_moe_router_sigmoid_bias` kernel is a non-generic all-`f32`
+    /// Elementwise over `[nExperts]`, **f32-only** (the iron
+    /// `iron_moe_router_sigmoid_bias` kernel is a non-generic all-`f32`
     /// `#[kernel]` — see
-    /// `crates/ffai-kernels-std/src/ffai/moe_router_sigmoid_bias.rs`).
+    /// `crates/crates/wh-iron-std/src/kernels/moe/moe_router_sigmoid_bias.rs`).
     public static func moeRouterSigmoidBias(
         logits: Tensor, bias: Tensor, on cmd: MTLCommandBuffer,
         into out: Tensor? = nil
@@ -556,7 +556,7 @@ public enum Ops {
         let result = out ?? Tensor.empty(shape: logits.shape, dtype: .f32)
         let n = logits.elementCount
         let (grid, tg) = elementwiseGrid(n)
-        FFAIKernels.ffai_moe_router_sigmoid_bias_f32(
+        IronKernels.iron_moe_router_sigmoid_bias_f32(
             logits: logits.buffer, logitsOffset: logits.offset,
             bias: bias.buffer, biasOffset: bias.offset,
             scores: result.buffer, scoresOffset: result.offset,
@@ -580,21 +580,21 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(totalThreads)
         switch table.dtype {
         case .f32:
-            FFAIKernels.ffai_gather_f32(
+            IronKernels.iron_gather_f32(
                 table: table.buffer, tableOffset: table.offset,
                 indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
                 out: result.buffer, outOffset: result.offset,
                 dim: UInt32(dim),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gather_f16(
+            IronKernels.iron_gather_f16(
                 table: table.buffer, tableOffset: table.offset,
                 indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
                 out: result.buffer, outOffset: result.offset,
                 dim: UInt32(dim),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gather_bf16(
+            IronKernels.iron_gather_bf16(
                 table: table.buffer, tableOffset: table.offset,
                 indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -629,9 +629,9 @@ public enum Ops {
         let dim = table.shape[1]
         let psoName: String
         switch table.dtype {
-        case .f32: psoName = "ffai_gather_f32"
-        case .f16: psoName = "ffai_gather_f16"
-        case .bf16: psoName = "ffai_gather_bf16"
+        case .f32: psoName = "iron_gather_f32"
+        case .f16: psoName = "iron_gather_f16"
+        case .bf16: psoName = "iron_gather_bf16"
         default: fatalError("Ops.gatherTwo: unsupported dtype \(table.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -657,7 +657,7 @@ public enum Ops {
     /// Cooperative-thread matrix-vector multiply. weight: [out_dim, in_dim],
     /// input: [in_dim], output: [out_dim]. One threadgroup per output row;
     /// threads cooperate on the dot-product reduction.
-    /// Device-side MoE dispatch plan (ffai_moe_sort_plan). From the router's
+    /// Device-side MoE dispatch plan (iron_moe_sort_plan). From the router's
     /// top-k expert ids [mTotal] produces sortedExperts/sourceTokens/invPerm
     /// in one dispatch — no readback / wait / host sort.
     public static func moeSortPlan(
@@ -667,7 +667,7 @@ public enum Ops {
         let tgWidth = min(mTotal, 256)
         let grid = MTLSize(width: mTotal, height: 1, depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
-        FFAIKernels.ffai_moe_sort_plan_f32(
+        IronKernels.iron_moe_sort_plan_f32(
             topk_ids: topkIds.buffer, topk_idsOffset: topkIds.offset,
             sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
             source_tokens: sourceTokens.buffer, source_tokensOffset: sourceTokens.offset,
@@ -680,10 +680,10 @@ public enum Ops {
     /// gate). Same stable-order output contract, three dispatches on the
     /// caller's command buffer instead of one, no readback between them,
     /// same no-sync DEVPLAN2 property as the kernel it replaces:
-    ///   1. `ffai_moe_sort_plan_hist`    computes per-(block, expert) row counts.
-    ///   2. `ffai_moe_sort_plan_offsets` turns counts into each block's per-expert
+    ///   1. `iron_moe_sort_plan_hist`    computes per-(block, expert) row counts.
+    ///   2. `iron_moe_sort_plan_offsets` turns counts into each block's per-expert
     ///      write offset.
-    ///   3. `ffai_moe_sort_plan_scatter` has each row write itself using its
+    ///   3. `iron_moe_sort_plan_scatter` has each row write itself using its
     ///      block's offset plus an in-block stable rank.
     /// `blockCounts`/`blockOffsets` are fresh scratch each call (sized off
     /// `mTotal`, which varies per prefill chunk), not cached, matching how
@@ -703,7 +703,7 @@ public enum Ops {
 
         // Pass 1: per-block histogram. grid = nBlocks threadgroups, one
         // lane per expert.
-        FFAIKernels.ffai_moe_sort_plan_hist_f32_threadgroups(
+        IronKernels.iron_moe_sort_plan_hist_f32_threadgroups(
             topk_ids: topkIds.buffer, topk_idsOffset: topkIds.offset,
             block_counts: blockCountsBuf, block_countsOffset: 0,
             m_total: UInt32(mTotal), n_experts: UInt32(nExperts), block_size: UInt32(blockSize),
@@ -713,7 +713,7 @@ public enum Ops {
 
         // Pass 2: counts -> per-block per-expert write offsets. One
         // threadgroup, one lane per expert.
-        FFAIKernels.ffai_moe_sort_plan_offsets_f32_threadgroups(
+        IronKernels.iron_moe_sort_plan_offsets_f32_threadgroups(
             block_counts: blockCountsBuf, block_countsOffset: 0,
             block_offsets: blockOffsetsBuf, block_offsetsOffset: 0,
             n_blocks: UInt32(nBlocks), n_experts: UInt32(nExperts),
@@ -722,9 +722,9 @@ public enum Ops {
             on: cmd)
 
         // Pass 3: scatter. Same dispatchThreads convention as the
-        // original `ffai_moe_sort_plan` (grid in threads, data-sized).
+        // original `iron_moe_sort_plan` (grid in threads, data-sized).
         let tgWidth = min(mTotal, 256)
-        FFAIKernels.ffai_moe_sort_plan_scatter_f32(
+        IronKernels.iron_moe_sort_plan_scatter_f32(
             topk_ids: topkIds.buffer, topk_idsOffset: topkIds.offset,
             block_offsets: blockOffsetsBuf, block_offsetsOffset: 0,
             sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
@@ -757,12 +757,12 @@ public enum Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         let gs = UInt32(groupSize)
         switch (bits, out.dtype) {
-        case (4, .f32): FFAIKernels.ffai_affine_dequantize_int4_f32(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
-        case (4, .f16): FFAIKernels.ffai_affine_dequantize_int4_f16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
-        case (4, .bf16): FFAIKernels.ffai_affine_dequantize_int4_bf16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
-        case (8, .f32): FFAIKernels.ffai_affine_dequantize_int8_f32(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
-        case (8, .f16): FFAIKernels.ffai_affine_dequantize_int8_f16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
-        case (8, .bf16): FFAIKernels.ffai_affine_dequantize_int8_bf16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, .f32): IronKernels.iron_affine_dequantize_int4_f32(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, .f16): IronKernels.iron_affine_dequantize_int4_f16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, .bf16): IronKernels.iron_affine_dequantize_int4_bf16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (8, .f32): IronKernels.iron_affine_dequantize_int8_f32(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (8, .f16): IronKernels.iron_affine_dequantize_int8_f16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (8, .bf16): IronKernels.iron_affine_dequantize_int8_bf16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("affineDequantize: unsupported bits/dtype \(bits)/\(out.dtype)")
         }
     }
@@ -793,21 +793,21 @@ public enum Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch weight.dtype {
         case .f32:
-            FFAIKernels.ffai_gemv_f32(
+            IronKernels.iron_gemv_f32(
                 mat: weight.buffer, matOffset: weight.offset,
                 vec: input.buffer, vecOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
                 k: UInt32(inDim),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gemv_f16(
+            IronKernels.iron_gemv_f16(
                 mat: weight.buffer, matOffset: weight.offset,
                 vec: input.buffer, vecOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
                 k: UInt32(inDim),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gemv_bf16(
+            IronKernels.iron_gemv_bf16(
                 mat: weight.buffer, matOffset: weight.offset,
                 vec: input.buffer, vecOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -823,7 +823,7 @@ public enum Ops {
     /// of `nRows` rows in one dispatch. `weight` is `[outDim, inDim]`,
     /// `input` is `[nRows, inDim]`, output is `[nRows, outDim]`.
     ///
-    /// `ffai_gemm` tiles the output 32×32 and stages weight + input
+    /// `iron_gemm` tiles the output 32×32 and stages weight + input
     /// tiles in threadgroup memory, so the weight is read once and
     /// reused across the block's rows — the projection-bandwidth win
     /// the diffusion / self-speculation block forward depends on.
@@ -854,21 +854,21 @@ public enum Ops {
         let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
         switch weight.dtype {
         case .f32:
-            FFAIKernels.ffai_gemm_f32(
+            IronKernels.iron_gemm_f32(
                 weight: weight.buffer, weightOffset: weight.offset,
                 input: input.buffer, inputOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
                 in_dim: UInt32(inDim), out_dim: UInt32(outDim), n_rows: UInt32(nRows),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gemm_f16(
+            IronKernels.iron_gemm_f16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 input: input.buffer, inputOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
                 in_dim: UInt32(inDim), out_dim: UInt32(outDim), n_rows: UInt32(nRows),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gemm_bf16(
+            IronKernels.iron_gemm_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 input: input.buffer, inputOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -935,7 +935,7 @@ public enum Ops {
 
     /// Two `rmsNormRows` dispatches in ONE compute encoder. Used by
     /// the Qwen3 attention mixer's pre-RoPE Q-norm + K-norm pair: both
-    /// run the fast `ffai_rms_norm_*` kernel (TPG = rowSize / 4), share
+    /// run the fast `iron_rms_norm_*` kernel (TPG = rowSize / 4), share
     /// the same eps when set from the same model config, and there's
     /// no data dependency between them.
     ///
@@ -981,9 +981,9 @@ public enum Ops {
         }
         let psoName: String
         switch x1.dtype {
-        case .f32: psoName = "ffai_rms_norm_f32"
-        case .f16: psoName = "ffai_rms_norm_f16"
-        case .bf16: psoName = "ffai_rms_norm_bf16"
+        case .f32: psoName = "iron_rms_norm_f32"
+        case .f16: psoName = "iron_rms_norm_f16"
+        case .bf16: psoName = "iron_rms_norm_bf16"
         default: fatalError("Ops.rmsNormRowsTwo: unsupported dtype \(x1.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -1074,7 +1074,7 @@ public enum Ops {
         let nU = UInt32(rowSize)
         switch a.dtype {
         case .f32:
-            FFAIKernels.ffai_add_rms_norm_f32(
+            IronKernels.iron_add_rms_norm_f32(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0,
@@ -1082,7 +1082,7 @@ public enum Ops {
                 normed_out: normed.buffer, normed_outOffset: normed.offset,
                 n: nU, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_add_rms_norm_f16(
+            IronKernels.iron_add_rms_norm_f16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0,
@@ -1090,7 +1090,7 @@ public enum Ops {
                 normed_out: normed.buffer, normed_outOffset: normed.offset,
                 n: nU, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_add_rms_norm_bf16(
+            IronKernels.iron_add_rms_norm_bf16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0,
@@ -1105,10 +1105,10 @@ public enum Ops {
 
     /// Shared RMSNorm dispatch for `rmsNorm` (nRows = 1) and
     /// `rmsNormRows`. Routes by row width:
-    ///   • `n ≤ 4096` AND `n` is a multiple of 128 → `ffai_rms_norm`,
+    ///   • `n ≤ 4096` AND `n` is a multiple of 128 → `iron_rms_norm`,
     ///     4 elements per thread, TPG = n / 4 (the fast straight-line
     ///     kernel — every standard transformer hidden size).
-    ///   • Anything else → `ffai_rms_norm_wide`, whose strided loop covers
+    ///   • Anything else → `iron_rms_norm_wide`, whose strided loop covers
     ///     any width at a fixed TPG of 1024. Used by large-hidden text
     ///     models (Gemma 4 27B+ hidden 5376) AND by vision/audio towers
     ///     whose hidden dim isn't a 128-multiple (SmolVLM2 d=960 etc).
@@ -1122,14 +1122,14 @@ public enum Ops {
 
         // Kernel selection by row width `n` (each kernel owns a different
         // elements-per-thread ratio, so the wrong one corrupts the row):
-        //   • fast  (`ffai_rms_norm`, TPG = n/4): n a multiple of 128, ≤ 4096
+        //   • fast  (`iron_rms_norm`, TPG = n/4): n a multiple of 128, ≤ 4096
         //     — hidden-width norms (the common case).
-        //   • small (`ffai_rms_norm_small`, TPG = n/2): n a multiple of 64,
+        //   • small (`iron_rms_norm_small`, TPG = n/2): n a multiple of 64,
         //     64 ≤ n ≤ 2048 — PER-HEAD norms (head_dim ∈ {64,128,192,256}).
         //     This is the ONLY correct path when n isn't a multiple of 128
         //     (e.g. head_dim 64): the wide kernel fixes TPG = 1024 / N =
         //     4096 and reads 4096 slots per row, trashing a 64-wide row.
-        //   • wide  (`ffai_rms_norm_wide`, TPG = 1024): everything else
+        //   • wide  (`iron_rms_norm_wide`, TPG = 1024): everything else
         //     (rows wider than 4096, or odd widths).
         // `n` a multiple of 64 ⇒ n/2 a multiple of 32 (one full simdgroup),
         // and n ≤ 2048 ⇒ TPG ≤ 1024 — both small-kernel invariants hold.
@@ -1150,63 +1150,63 @@ public enum Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch (kernel, x.dtype) {
         case (.fast, .f32):
-            FFAIKernels.ffai_rms_norm_f32(
+            IronKernels.iron_rms_norm_f32(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.fast, .f16):
-            FFAIKernels.ffai_rms_norm_f16(
+            IronKernels.iron_rms_norm_f16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.fast, .bf16):
-            FFAIKernels.ffai_rms_norm_bf16(
+            IronKernels.iron_rms_norm_bf16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.small, .f32):
-            FFAIKernels.ffai_rms_norm_small_f32(
+            IronKernels.iron_rms_norm_small_f32(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.small, .f16):
-            FFAIKernels.ffai_rms_norm_small_f16(
+            IronKernels.iron_rms_norm_small_f16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.small, .bf16):
-            FFAIKernels.ffai_rms_norm_small_bf16(
+            IronKernels.iron_rms_norm_small_bf16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.wide, .f32):
-            FFAIKernels.ffai_rms_norm_wide_f32(
+            IronKernels.iron_rms_norm_wide_f32(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.wide, .f16):
-            FFAIKernels.ffai_rms_norm_wide_f16(
+            IronKernels.iron_rms_norm_wide_f16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(n),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.wide, .bf16):
-            FFAIKernels.ffai_rms_norm_wide_bf16(
+            IronKernels.iron_rms_norm_wide_bf16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -1253,14 +1253,14 @@ public enum Ops {
         let grid = MTLSize(width: 1, height: nHeads, depth: halfDim)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         // Single-token decode: 1-element positions buffer, row_stride = per-token
-        // qk stride (n_heads * head_dim). See ffai_rope_banded contract.
+        // qk stride (n_heads * head_dim). See iron_rope_banded contract.
         let posBuf = Device.shared.makeBuffer(length: 4)
         var posVal = UInt32(position)
         memcpy(posBuf.contents(), &posVal, 4)
         let rowStride = UInt32(nHeads * headDim)
         switch qk.dtype {
         case .f32:
-            FFAIKernels.ffai_rope_banded_f32(
+            IronKernels.iron_rope_banded_f32(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: posBuf, positionsOffset: 0,
                 out: result.buffer, outOffset: result.offset,
@@ -1274,7 +1274,7 @@ public enum Ops {
                 original_max_position: scaling.originalMaxPosition,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_rope_banded_f16(
+            IronKernels.iron_rope_banded_f16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: posBuf, positionsOffset: 0,
                 out: result.buffer, outOffset: result.offset,
@@ -1288,7 +1288,7 @@ public enum Ops {
                 original_max_position: scaling.originalMaxPosition,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_rope_banded_bf16(
+            IronKernels.iron_rope_banded_bf16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: posBuf, positionsOffset: 0,
                 out: result.buffer, outOffset: result.offset,
@@ -1313,7 +1313,7 @@ public enum Ops {
     /// `partial_rotary_factor = 0.25` so a 256-dim head rotates only its
     /// first 64 dims.
     ///
-    /// The `ffai_rope_banded_*` kernel takes the per-head stride
+    /// The `iron_rope_banded_*` kernel takes the per-head stride
     /// (`head_dim`) and the rotate-half pairing offset / grid depth
     /// (`half_dim`) as independent constants. Driving it with
     /// `head_dim = headDim` (true stride) but `half_dim = rotaryDim / 2`
@@ -1347,14 +1347,14 @@ public enum Ops {
         let grid = MTLSize(width: 1, height: nHeads, depth: halfRotary)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         // Single-token decode: 1-element positions buffer, row_stride = per-token
-        // qk stride (n_heads * head_dim). See ffai_rope_banded contract.
+        // qk stride (n_heads * head_dim). See iron_rope_banded contract.
         let posBuf = Device.shared.makeBuffer(length: 4)
         var posVal = UInt32(position)
         memcpy(posBuf.contents(), &posVal, 4)
         let rowStride = UInt32(nHeads * headDim)
         switch qk.dtype {
         case .f32:
-            FFAIKernels.ffai_rope_banded_f32(
+            IronKernels.iron_rope_banded_f32(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
@@ -1368,7 +1368,7 @@ public enum Ops {
                 original_max_position: scaling.originalMaxPosition,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_rope_banded_f16(
+            IronKernels.iron_rope_banded_f16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
@@ -1382,7 +1382,7 @@ public enum Ops {
                 original_max_position: scaling.originalMaxPosition,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_rope_banded_bf16(
+            IronKernels.iron_rope_banded_bf16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
@@ -1423,19 +1423,19 @@ public enum Ops {
             "Ops.ropePartialTwo: rotaryDim (\(rotaryDim)) must be even and in 1...headDim")
         let psoName: String
         switch q.dtype {
-        case .f32: psoName = "ffai_rope_banded_f32"
-        case .f16: psoName = "ffai_rope_banded_f16"
-        case .bf16: psoName = "ffai_rope_banded_bf16"
+        case .f32: psoName = "iron_rope_banded_f32"
+        case .f16: psoName = "iron_rope_banded_f16"
+        case .bf16: psoName = "iron_rope_banded_bf16"
         default: fatalError("Ops.ropePartialTwo: unsupported dtype \(q.dtype)")
         }
         let halfRotary = rotaryDim / 2
-        // ffai_rope_banded takes a [T]=1 u32 positions buffer for decode.
+        // iron_rope_banded takes a [T]=1 u32 positions buffer for decode.
         let positions = Tensor.empty(shape: [1], dtype: .u32)
         positions.copyIn(from: [UInt32(position)])
         let pso = PSOCache.shared.pipelineState(for: psoName)
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
-        // Shared bindings set ONCE. Layout matches ffai_rope_banded:
+        // Shared bindings set ONCE. Layout matches iron_rope_banded:
         // qk(0) positions(1) out(2) head_dim(3) half_dim(4) row_stride(5)
         // theta(6) scale(7) low(8) high(9) orig(10). row_stride + the qk/out
         // buffers differ per tensor, so they're set inside `dispatch`.
@@ -1500,9 +1500,9 @@ public enum Ops {
         let halfRotary = rotaryDim / 2
         let psoName: String
         switch qk.dtype {
-        case .f32: psoName = "ffai_rope_banded_f32"
-        case .f16: psoName = "ffai_rope_banded_f16"
-        case .bf16: psoName = "ffai_rope_banded_bf16"
+        case .f32: psoName = "iron_rope_banded_f32"
+        case .f16: psoName = "iron_rope_banded_f16"
+        case .bf16: psoName = "iron_rope_banded_bf16"
         default: fatalError("Ops.ropePartialMany: unsupported dtype \(qk.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -1559,9 +1559,9 @@ public enum Ops {
         let halfRotary = rotaryDim / 2
         let psoName: String
         switch q.dtype {
-        case .f32: psoName = "ffai_rope_banded_f32"
-        case .f16: psoName = "ffai_rope_banded_f16"
-        case .bf16: psoName = "ffai_rope_banded_bf16"
+        case .f32: psoName = "iron_rope_banded_f32"
+        case .f16: psoName = "iron_rope_banded_f16"
+        case .bf16: psoName = "iron_rope_banded_bf16"
         default: fatalError("Ops.ropePartialManyTwo: unsupported dtype \(q.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -1670,7 +1670,7 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         switch qk.dtype {
         case .f32:
-            FFAIKernels.ffai_rope_yarn_f32(
+            IronKernels.iron_rope_yarn_f32(
                 qk: qk.buffer, qkOffset: qk.offset,
                 out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
@@ -1679,7 +1679,7 @@ public enum Ops {
                 attn_factor: yarn.attnFactor,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_rope_yarn_f16(
+            IronKernels.iron_rope_yarn_f16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
@@ -1688,7 +1688,7 @@ public enum Ops {
                 attn_factor: yarn.attnFactor,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_rope_yarn_bf16(
+            IronKernels.iron_rope_yarn_bf16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
@@ -1727,7 +1727,7 @@ public enum Ops {
         let groupSizeU = UInt32(groupSize)
         switch (bits, scales.dtype) {
         case (4, .f32):
-            FFAIKernels.ffai_dequant_gather_int4_f32(
+            IronKernels.iron_dequant_gather_int4_f32(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1736,7 +1736,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, .f16):
-            FFAIKernels.ffai_dequant_gather_int4_f16(
+            IronKernels.iron_dequant_gather_int4_f16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1745,7 +1745,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, .bf16):
-            FFAIKernels.ffai_dequant_gather_int4_bf16(
+            IronKernels.iron_dequant_gather_int4_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1754,7 +1754,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .f32):
-            FFAIKernels.ffai_dequant_gather_int8_f32(
+            IronKernels.iron_dequant_gather_int8_f32(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1763,7 +1763,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .f16):
-            FFAIKernels.ffai_dequant_gather_int8_f16(
+            IronKernels.iron_dequant_gather_int8_f16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1772,7 +1772,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .bf16):
-            FFAIKernels.ffai_dequant_gather_int8_bf16(
+            IronKernels.iron_dequant_gather_int8_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1781,7 +1781,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (6, .f32):
-            FFAIKernels.ffai_dequant_gather_int6_f32(
+            IronKernels.iron_dequant_gather_int6_f32(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1790,7 +1790,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (6, .f16):
-            FFAIKernels.ffai_dequant_gather_int6_f16(
+            IronKernels.iron_dequant_gather_int6_f16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1799,7 +1799,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (6, .bf16):
-            FFAIKernels.ffai_dequant_gather_int6_bf16(
+            IronKernels.iron_dequant_gather_int6_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1808,7 +1808,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .f32):
-            FFAIKernels.ffai_dequant_gather_int3_f32(
+            IronKernels.iron_dequant_gather_int3_f32(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1817,7 +1817,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .f16):
-            FFAIKernels.ffai_dequant_gather_int3_f16(
+            IronKernels.iron_dequant_gather_int3_f16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1826,7 +1826,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .bf16):
-            FFAIKernels.ffai_dequant_gather_int3_bf16(
+            IronKernels.iron_dequant_gather_int3_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1835,7 +1835,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (5, .f32):
-            FFAIKernels.ffai_dequant_gather_int5_f32(
+            IronKernels.iron_dequant_gather_int5_f32(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1844,7 +1844,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (5, .f16):
-            FFAIKernels.ffai_dequant_gather_int5_f16(
+            IronKernels.iron_dequant_gather_int5_f16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1853,7 +1853,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (5, .bf16):
-            FFAIKernels.ffai_dequant_gather_int5_bf16(
+            IronKernels.iron_dequant_gather_int5_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1862,7 +1862,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .f32):
-            FFAIKernels.ffai_dequant_gather_int2_f32(
+            IronKernels.iron_dequant_gather_int2_f32(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1871,7 +1871,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .f16):
-            FFAIKernels.ffai_dequant_gather_int2_f16(
+            IronKernels.iron_dequant_gather_int2_f16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1880,7 +1880,7 @@ public enum Ops {
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .bf16):
-            FFAIKernels.ffai_dequant_gather_int2_bf16(
+            IronKernels.iron_dequant_gather_int2_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1951,7 +1951,7 @@ public enum Ops {
 
         switch (bits, input.dtype) {
         case (4, .f32):
-            FFAIKernels.ffai_dequant_gemv_int4_f32(
+            IronKernels.iron_dequant_gemv_int4_f32(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1960,7 +1960,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, .f16):
-            FFAIKernels.ffai_dequant_gemv_int4_f16(
+            IronKernels.iron_dequant_gemv_int4_f16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1969,7 +1969,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, .bf16):
-            FFAIKernels.ffai_dequant_gemv_int4_bf16(
+            IronKernels.iron_dequant_gemv_int4_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1978,7 +1978,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .f32):
-            FFAIKernels.ffai_dequant_gemv_int8_f32(
+            IronKernels.iron_dequant_gemv_int8_f32(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1987,7 +1987,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .f16):
-            FFAIKernels.ffai_dequant_gemv_int8_f16(
+            IronKernels.iron_dequant_gemv_int8_f16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -1996,7 +1996,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .bf16):
-            FFAIKernels.ffai_dequant_gemv_int8_bf16(
+            IronKernels.iron_dequant_gemv_int8_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -2005,7 +2005,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (6, .f32):
-            FFAIKernels.ffai_dequant_gemv_int6_f32(
+            IronKernels.iron_dequant_gemv_int6_f32(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -2014,7 +2014,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (6, .f16):
-            FFAIKernels.ffai_dequant_gemv_int6_f16(
+            IronKernels.iron_dequant_gemv_int6_f16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -2023,7 +2023,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (6, .bf16):
-            FFAIKernels.ffai_dequant_gemv_int6_bf16(
+            IronKernels.iron_dequant_gemv_int6_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -2032,7 +2032,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .f32):
-            FFAIKernels.ffai_dequant_gemv_int3_f32(
+            IronKernels.iron_dequant_gemv_int3_f32(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -2041,7 +2041,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .f16):
-            FFAIKernels.ffai_dequant_gemv_int3_f16(
+            IronKernels.iron_dequant_gemv_int3_f16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -2050,7 +2050,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .bf16):
-            FFAIKernels.ffai_dequant_gemv_int3_bf16(
+            IronKernels.iron_dequant_gemv_int3_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -2059,7 +2059,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (5, .f32):
-            FFAIKernels.ffai_dequant_gemv_int5_f32(
+            IronKernels.iron_dequant_gemv_int5_f32(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -2068,7 +2068,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (5, .f16):
-            FFAIKernels.ffai_dequant_gemv_int5_f16(
+            IronKernels.iron_dequant_gemv_int5_f16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -2077,7 +2077,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (5, .bf16):
-            FFAIKernels.ffai_dequant_gemv_int5_bf16(
+            IronKernels.iron_dequant_gemv_int5_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -2086,7 +2086,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .f32):
-            FFAIKernels.ffai_dequant_gemv_int2_f32(
+            IronKernels.iron_dequant_gemv_int2_f32(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -2095,7 +2095,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .f16):
-            FFAIKernels.ffai_dequant_gemv_int2_f16(
+            IronKernels.iron_dequant_gemv_int2_f16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -2104,7 +2104,7 @@ public enum Ops {
                 in_dim: inDimU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .bf16):
-            FFAIKernels.ffai_dequant_gemv_int2_bf16(
+            IronKernels.iron_dequant_gemv_int2_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -2152,9 +2152,9 @@ public enum Ops {
             "Ops.dequantGemvInt4Two: dtype mismatch")
         let psoName: String
         switch input.dtype {
-        case .f32: psoName = "ffai_dequant_gemv_int4_f32"
-        case .f16: psoName = "ffai_dequant_gemv_int4_f16"
-        case .bf16: psoName = "ffai_dequant_gemv_int4_bf16"
+        case .f32: psoName = "iron_dequant_gemv_int4_f32"
+        case .f16: psoName = "iron_dequant_gemv_int4_f16"
+        case .bf16: psoName = "iron_dequant_gemv_int4_bf16"
         default: fatalError("Ops.dequantGemvInt4Two: unsupported dtype \(input.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -2202,9 +2202,9 @@ public enum Ops {
             "Ops.dequantGemvInt4Three: dtype mismatch")
         let psoName: String
         switch input.dtype {
-        case .f32: psoName = "ffai_dequant_gemv_int4_f32"
-        case .f16: psoName = "ffai_dequant_gemv_int4_f16"
-        case .bf16: psoName = "ffai_dequant_gemv_int4_bf16"
+        case .f32: psoName = "iron_dequant_gemv_int4_f32"
+        case .f16: psoName = "iron_dequant_gemv_int4_f16"
+        case .bf16: psoName = "iron_dequant_gemv_int4_bf16"
         default: fatalError("Ops.dequantGemvInt4Three: unsupported dtype \(input.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -2253,9 +2253,9 @@ public enum Ops {
             "Ops.dequantGemvInt4Four: dtype mismatch")
         let psoName: String
         switch input.dtype {
-        case .f32: psoName = "ffai_dequant_gemv_int4_f32"
-        case .f16: psoName = "ffai_dequant_gemv_int4_f16"
-        case .bf16: psoName = "ffai_dequant_gemv_int4_bf16"
+        case .f32: psoName = "iron_dequant_gemv_int4_f32"
+        case .f16: psoName = "iron_dequant_gemv_int4_f16"
+        case .bf16: psoName = "iron_dequant_gemv_int4_bf16"
         default: fatalError("Ops.dequantGemvInt4Four: unsupported dtype \(input.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -2326,24 +2326,24 @@ public enum Ops {
         let dtype = inputs[0].dtype
         let psoName: String
         switch (bits, dtype) {
-        case (2, .f32): psoName = "ffai_dequant_gemv_int2_f32"
-        case (2, .f16): psoName = "ffai_dequant_gemv_int2_f16"
-        case (2, .bf16): psoName = "ffai_dequant_gemv_int2_bf16"
-        case (3, .f32): psoName = "ffai_dequant_gemv_int3_f32"
-        case (3, .f16): psoName = "ffai_dequant_gemv_int3_f16"
-        case (3, .bf16): psoName = "ffai_dequant_gemv_int3_bf16"
-        case (4, .f32): psoName = "ffai_dequant_gemv_int4_f32"
-        case (4, .f16): psoName = "ffai_dequant_gemv_int4_f16"
-        case (4, .bf16): psoName = "ffai_dequant_gemv_int4_bf16"
-        case (5, .f32): psoName = "ffai_dequant_gemv_int5_f32"
-        case (5, .f16): psoName = "ffai_dequant_gemv_int5_f16"
-        case (5, .bf16): psoName = "ffai_dequant_gemv_int5_bf16"
-        case (6, .f32): psoName = "ffai_dequant_gemv_int6_f32"
-        case (6, .f16): psoName = "ffai_dequant_gemv_int6_f16"
-        case (6, .bf16): psoName = "ffai_dequant_gemv_int6_bf16"
-        case (8, .f32): psoName = "ffai_dequant_gemv_int8_f32"
-        case (8, .f16): psoName = "ffai_dequant_gemv_int8_f16"
-        case (8, .bf16): psoName = "ffai_dequant_gemv_int8_bf16"
+        case (2, .f32): psoName = "iron_dequant_gemv_int2_f32"
+        case (2, .f16): psoName = "iron_dequant_gemv_int2_f16"
+        case (2, .bf16): psoName = "iron_dequant_gemv_int2_bf16"
+        case (3, .f32): psoName = "iron_dequant_gemv_int3_f32"
+        case (3, .f16): psoName = "iron_dequant_gemv_int3_f16"
+        case (3, .bf16): psoName = "iron_dequant_gemv_int3_bf16"
+        case (4, .f32): psoName = "iron_dequant_gemv_int4_f32"
+        case (4, .f16): psoName = "iron_dequant_gemv_int4_f16"
+        case (4, .bf16): psoName = "iron_dequant_gemv_int4_bf16"
+        case (5, .f32): psoName = "iron_dequant_gemv_int5_f32"
+        case (5, .f16): psoName = "iron_dequant_gemv_int5_f16"
+        case (5, .bf16): psoName = "iron_dequant_gemv_int5_bf16"
+        case (6, .f32): psoName = "iron_dequant_gemv_int6_f32"
+        case (6, .f16): psoName = "iron_dequant_gemv_int6_f16"
+        case (6, .bf16): psoName = "iron_dequant_gemv_int6_bf16"
+        case (8, .f32): psoName = "iron_dequant_gemv_int8_f32"
+        case (8, .f16): psoName = "iron_dequant_gemv_int8_f16"
+        case (8, .bf16): psoName = "iron_dequant_gemv_int8_bf16"
         default:
             fatalError("Ops.dequantGemvMany: unsupported (bits=\(bits), dtype=\(dtype))")
         }
@@ -2378,7 +2378,7 @@ public enum Ops {
     }
 
     /// Fused Q/K/V int4 dequant-GEMV in ONE dispatch via
-    /// `ffai_batched_qkv_qgemv_fast`. Replaces the 3-dispatch
+    /// `iron_batched_qkv_qgemv_fast`. Replaces the 3-dispatch
     /// `dequantGemvInt4Three` shared-encoder form: the matrix is
     /// selected by `program_id<2>()` across a `[ceil(maxOut/8), 1, 3]`
     /// threadgroup grid, so all 3 projections share a single kernel
@@ -2389,7 +2389,7 @@ public enum Ops {
     /// Output layout: q, k, v concatenated in that order in `out`;
     /// caller slices into the three regions.
     ///
-    /// Kernel constraints (mirror `ffai_rms_norm_qgemv_fast`):
+    /// Kernel constraints (mirror `iron_rms_norm_qgemv_fast`):
     /// - `in_dim` MUST be a multiple of 512.
     /// - Each of `out_q`, `out_k`, `out_v` MUST be a multiple of 8.
     /// - `group_size` MUST be 64.
@@ -2437,7 +2437,7 @@ public enum Ops {
         let tg = MTLSize(width: tpg, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_batched_qkv_qgemv_fast_f32(
+            IronKernels.iron_batched_qkv_qgemv_fast_f32(
                 x: x.buffer, xOffset: x.offset,
                 w_q: wQ.buffer, w_qOffset: wQ.offset,
                 scales_q: scalesQ.buffer, scales_qOffset: scalesQ.offset,
@@ -2453,7 +2453,7 @@ public enum Ops {
                 in_dim: UInt32(inDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_batched_qkv_qgemv_fast_f16(
+            IronKernels.iron_batched_qkv_qgemv_fast_f16(
                 x: x.buffer, xOffset: x.offset,
                 w_q: wQ.buffer, w_qOffset: wQ.offset,
                 scales_q: scalesQ.buffer, scales_qOffset: scalesQ.offset,
@@ -2469,7 +2469,7 @@ public enum Ops {
                 in_dim: UInt32(inDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_batched_qkv_qgemv_fast_bf16(
+            IronKernels.iron_batched_qkv_qgemv_fast_bf16(
                 x: x.buffer, xOffset: x.offset,
                 w_q: wQ.buffer, w_qOffset: wQ.offset,
                 scales_q: scalesQ.buffer, scales_qOffset: scalesQ.offset,
@@ -2499,7 +2499,7 @@ public enum Ops {
     /// dispatches; the `xNorm` DRAM roundtrip is paid once instead of
     /// three times.
     ///
-    /// Constraints (mirror `ffai_batched_qkv_qmm_fast`):
+    /// Constraints (mirror `iron_batched_qkv_qmm_fast`):
     /// - `in_dim` MUST be a multiple of 512.
     /// - Each of `out_q`, `out_k`, `out_v` MUST be a multiple of 8.
     /// - `group_size` MUST be 64. TPG = 64.
@@ -2561,7 +2561,7 @@ public enum Ops {
         let tg = MTLSize(width: tpg, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_batched_qkv_qmm_fast_f32(
+            IronKernels.iron_batched_qkv_qmm_fast_f32(
                 x: x.buffer, xOffset: x.offset,
                 w_q: wQ.buffer, w_qOffset: wQ.offset,
                 scales_q: scalesQ.buffer, scales_qOffset: scalesQ.offset,
@@ -2579,7 +2579,7 @@ public enum Ops {
                 in_dim: UInt32(inDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_batched_qkv_qmm_fast_f16(
+            IronKernels.iron_batched_qkv_qmm_fast_f16(
                 x: x.buffer, xOffset: x.offset,
                 w_q: wQ.buffer, w_qOffset: wQ.offset,
                 scales_q: scalesQ.buffer, scales_qOffset: scalesQ.offset,
@@ -2597,7 +2597,7 @@ public enum Ops {
                 in_dim: UInt32(inDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_batched_qkv_qmm_fast_bf16(
+            IronKernels.iron_batched_qkv_qmm_fast_bf16(
                 x: x.buffer, xOffset: x.offset,
                 w_q: wQ.buffer, w_qOffset: wQ.offset,
                 scales_q: scalesQ.buffer, scales_qOffset: scalesQ.offset,
@@ -2620,7 +2620,7 @@ public enum Ops {
     }
 
     /// Fused 4-output int4 dequant-GEMV in ONE dispatch via
-    /// `ffai_batched_4_qgemv_fast`. Extends the QKV (3-output) pattern
+    /// `iron_batched_4_qgemv_fast`. Extends the QKV (3-output) pattern
     /// to 4 projections sharing the same input. Used by the Qwen3.5
     /// GDN mixer where the four input projections (qkv, z, b, a) all
     /// read the same `xNorm` and can be fused into a single kernel
@@ -2628,7 +2628,7 @@ public enum Ops {
     /// (`Ops.dequantGemvInt4Four`) with one launch, paying the input
     /// DRAM roundtrip once instead of four times.
     ///
-    /// Constraints (mirror `ffai_batched_qkv_qgemv_fast`):
+    /// Constraints (mirror `iron_batched_qkv_qgemv_fast`):
     /// - `in_dim` MUST be a multiple of 512.
     /// - Each of `out_a / out_b / out_c / out_d` MUST be a multiple
     ///   of 8.
@@ -2676,7 +2676,7 @@ public enum Ops {
         let tg = MTLSize(width: tpg, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_batched_4_qgemv_fast_f32(
+            IronKernels.iron_batched_4_qgemv_fast_f32(
                 x: x.buffer, xOffset: x.offset,
                 w_a: wA.buffer, w_aOffset: wA.offset,
                 scales_a: scalesA.buffer, scales_aOffset: scalesA.offset,
@@ -2699,7 +2699,7 @@ public enum Ops {
                 in_dim: UInt32(inDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_batched_4_qgemv_fast_f16(
+            IronKernels.iron_batched_4_qgemv_fast_f16(
                 x: x.buffer, xOffset: x.offset,
                 w_a: wA.buffer, w_aOffset: wA.offset,
                 scales_a: scalesA.buffer, scales_aOffset: scalesA.offset,
@@ -2722,7 +2722,7 @@ public enum Ops {
                 in_dim: UInt32(inDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_batched_4_qgemv_fast_bf16(
+            IronKernels.iron_batched_4_qgemv_fast_bf16(
                 x: x.buffer, xOffset: x.offset,
                 w_a: wA.buffer, w_aOffset: wA.offset,
                 scales_a: scalesA.buffer, scales_aOffset: scalesA.offset,
@@ -2759,7 +2759,7 @@ public enum Ops {
     /// Output tensors are caller-allocated and indexed independently
     /// (`outA / outB / outC / outD`, each `[M, out_*]`).
     ///
-    /// Constraints (mirror `ffai_batched_4_qgemv_fast`):
+    /// Constraints (mirror `iron_batched_4_qgemv_fast`):
     /// - `in_dim` MUST be a multiple of 512.
     /// - Each of `out_a / out_b / out_c / out_d` MUST be a multiple
     ///   of 8.
@@ -2818,7 +2818,7 @@ public enum Ops {
         let tg = MTLSize(width: tpg, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_batched_4_qmm_fast_f32(
+            IronKernels.iron_batched_4_qmm_fast_f32(
                 x: x.buffer, xOffset: x.offset,
                 w_a: wA.buffer, w_aOffset: wA.offset,
                 scales_a: scalesA.buffer, scales_aOffset: scalesA.offset,
@@ -2841,7 +2841,7 @@ public enum Ops {
                 in_dim: UInt32(inDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_batched_4_qmm_fast_f16(
+            IronKernels.iron_batched_4_qmm_fast_f16(
                 x: x.buffer, xOffset: x.offset,
                 w_a: wA.buffer, w_aOffset: wA.offset,
                 scales_a: scalesA.buffer, scales_aOffset: scalesA.offset,
@@ -2864,7 +2864,7 @@ public enum Ops {
                 in_dim: UInt32(inDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_batched_4_qmm_fast_bf16(
+            IronKernels.iron_batched_4_qmm_fast_bf16(
                 x: x.buffer, xOffset: x.offset,
                 w_a: wA.buffer, w_aOffset: wA.offset,
                 scales_a: scalesA.buffer, scales_aOffset: scalesA.offset,
@@ -2934,7 +2934,7 @@ public enum Ops {
         // output row). `dispatchThreads` counts THREADS not threadgroups
         // — total threads = outDim · 32 gives outDim threadgroups, one
         // per output row.
-        // Dispatch via PSOCache + encoder (Generated FFAIKernels may omit
+        // Dispatch via PSOCache + encoder (Generated IronKernels may omit
         // the affine int4 expert-indexed wrappers after a partial emit).
         dequantGemvInt4ExpertIndexedMany(
             weightsStacked: [weightsStacked], scalesStacked: [scalesStacked],
@@ -2967,9 +2967,9 @@ public enum Ops {
         let dtype = inputs[0].dtype
         let psoName: String
         switch dtype {
-        case .f32: psoName = "ffai_dequant_gemv_int4_expert_indexed_f32"
-        case .f16: psoName = "ffai_dequant_gemv_int4_expert_indexed_f16"
-        case .bf16: psoName = "ffai_dequant_gemv_int4_expert_indexed_bf16"
+        case .f32: psoName = "iron_dequant_gemv_int4_expert_indexed_f32"
+        case .f16: psoName = "iron_dequant_gemv_int4_expert_indexed_f16"
+        case .bf16: psoName = "iron_dequant_gemv_int4_expert_indexed_bf16"
         default:
             fatalError(
                 "Ops.dequantGemvInt4ExpertIndexedMany: unsupported dtype \(dtype)")
@@ -3013,7 +3013,7 @@ public enum Ops {
 
     /// Encoder-batched int2 affine expert-indexed dequant-GEMV (MLX oQ2
     /// pack: 16 vals/u32, scales+biases per group). Kernel name
-    /// `ffai_dequant_gemv_int2_expert_indexed_*` — may live in
+    /// `iron_dequant_gemv_int2_expert_indexed_*` — may live in
     /// `hy3_extra.metallib` or be live-compiled from
     /// `Resources/kernels/`. Same buffer layout as the int4 affine form.
     public static func dequantGemvInt2ExpertIndexedMany(
@@ -3033,9 +3033,9 @@ public enum Ops {
         let dtype = inputs[0].dtype
         let psoName: String
         switch dtype {
-        case .f32: psoName = "ffai_dequant_gemv_int2_expert_indexed_f32"
-        case .f16: psoName = "ffai_dequant_gemv_int2_expert_indexed_f16"
-        case .bf16: psoName = "ffai_dequant_gemv_int2_expert_indexed_bf16"
+        case .f32: psoName = "iron_dequant_gemv_int2_expert_indexed_f32"
+        case .f16: psoName = "iron_dequant_gemv_int2_expert_indexed_f16"
+        case .bf16: psoName = "iron_dequant_gemv_int2_expert_indexed_bf16"
         default:
             fatalError(
                 "Ops.dequantGemvInt2ExpertIndexedMany: unsupported dtype \(dtype)")
@@ -3114,9 +3114,9 @@ public enum Ops {
             "moeSigmoidBiasRows: dtype mismatch")
         let psoName: String
         switch logits.dtype {
-        case .f32: psoName = "ffai_moe_sigmoid_bias_rows_f32"
-        case .f16: psoName = "ffai_moe_sigmoid_bias_rows_f16"
-        case .bf16: psoName = "ffai_moe_sigmoid_bias_rows_bf16"
+        case .f32: psoName = "iron_moe_sigmoid_bias_rows_f32"
+        case .f16: psoName = "iron_moe_sigmoid_bias_rows_f16"
+        case .bf16: psoName = "iron_moe_sigmoid_bias_rows_bf16"
         default:
             fatalError("Ops.moeSigmoidBiasRows: unsupported dtype \(logits.dtype)")
         }
@@ -3178,7 +3178,7 @@ public enum Ops {
         let tg = MTLSize(width: 32, height: 1, depth: 1)
         switch scoreBiased.dtype {
         case .f32:
-            FFAIKernels.ffai_moe_router_topk_biased_f32(
+            IronKernels.iron_moe_router_topk_biased_f32(
                 score_biased: scoreBiased.buffer, score_biasedOffset: scoreBiased.offset,
                 score_unbiased: scoreUnbiased.buffer, score_unbiasedOffset: scoreUnbiased.offset,
                 indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
@@ -3186,7 +3186,7 @@ public enum Ops {
                 n_experts: UInt32(nExperts), k: UInt32(k),
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_moe_router_topk_biased_f16(
+            IronKernels.iron_moe_router_topk_biased_f16(
                 score_biased: scoreBiased.buffer, score_biasedOffset: scoreBiased.offset,
                 score_unbiased: scoreUnbiased.buffer, score_unbiasedOffset: scoreUnbiased.offset,
                 indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
@@ -3194,7 +3194,7 @@ public enum Ops {
                 n_experts: UInt32(nExperts), k: UInt32(k),
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_moe_router_topk_biased_bf16(
+            IronKernels.iron_moe_router_topk_biased_bf16(
                 score_biased: scoreBiased.buffer, score_biasedOffset: scoreBiased.offset,
                 score_unbiased: scoreUnbiased.buffer, score_unbiasedOffset: scoreUnbiased.offset,
                 indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
@@ -3255,21 +3255,21 @@ public enum Ops {
         let normFlag: UInt32 = normTopkProb ? 1 : 0
         switch logits.dtype {
         case .f32:
-            FFAIKernels.ffai_moe_router_topk_f32(
+            IronKernels.iron_moe_router_topk_f32(
                 router_logits: logits.buffer, router_logitsOffset: logits.offset,
                 indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
                 weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
                 n_experts: UInt32(nExperts), k: UInt32(k), norm_topk_prob: normFlag,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_moe_router_topk_f16(
+            IronKernels.iron_moe_router_topk_f16(
                 router_logits: logits.buffer, router_logitsOffset: logits.offset,
                 indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
                 weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
                 n_experts: UInt32(nExperts), k: UInt32(k), norm_topk_prob: normFlag,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_moe_router_topk_bf16(
+            IronKernels.iron_moe_router_topk_bf16(
                 router_logits: logits.buffer, router_logitsOffset: logits.offset,
                 indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
                 weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
@@ -3304,7 +3304,7 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_conv1d_causal_step_f32(
+            IronKernels.iron_conv1d_causal_step_f32(
                 x: x.buffer, xOffset: x.offset,
                 w: w.buffer, wOffset: w.offset,
                 b: b.buffer, bOffset: b.offset,
@@ -3313,7 +3313,7 @@ public enum Ops {
                 n_channels: UInt32(nChannels), kernel_size: UInt32(kernelSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_conv1d_causal_step_f16(
+            IronKernels.iron_conv1d_causal_step_f16(
                 x: x.buffer, xOffset: x.offset,
                 w: w.buffer, wOffset: w.offset,
                 b: b.buffer, bOffset: b.offset,
@@ -3322,7 +3322,7 @@ public enum Ops {
                 n_channels: UInt32(nChannels), kernel_size: UInt32(kernelSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_conv1d_causal_step_bf16(
+            IronKernels.iron_conv1d_causal_step_bf16(
                 x: x.buffer, xOffset: x.offset,
                 w: w.buffer, wOffset: w.offset,
                 b: b.buffer, bOffset: b.offset,
@@ -3373,7 +3373,7 @@ public enum Ops {
         let ckU = UInt32(convKernel)
         switch src.dtype {
         case .f32:
-            FFAIKernels.ffai_conv1d_causal_step_silu_cast_many_f32(
+            IronKernels.iron_conv1d_causal_step_silu_cast_many_f32(
                 src: src.buffer, srcOffset: src.offset,
                 w: w.buffer, wOffset: w.offset,
                 b: b.buffer, bOffset: b.offset,
@@ -3383,7 +3383,7 @@ public enum Ops {
                 t_len: tLenU, conv_dim: cdU, conv_kernel: ckU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_conv1d_causal_step_silu_cast_many_f16(
+            IronKernels.iron_conv1d_causal_step_silu_cast_many_f16(
                 src: src.buffer, srcOffset: src.offset,
                 w: w.buffer, wOffset: w.offset,
                 b: b.buffer, bOffset: b.offset,
@@ -3393,7 +3393,7 @@ public enum Ops {
                 t_len: tLenU, conv_dim: cdU, conv_kernel: ckU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_conv1d_causal_step_silu_cast_many_bf16(
+            IronKernels.iron_conv1d_causal_step_silu_cast_many_bf16(
                 src: src.buffer, srcOffset: src.offset,
                 w: w.buffer, wOffset: w.offset,
                 b: b.buffer, bOffset: b.offset,
@@ -3433,7 +3433,7 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_ssm_step_f32(
+            IronKernels.iron_ssm_step_f32(
                 x: x.buffer, xOffset: x.offset,
                 a: a.buffer, aOffset: a.offset,
                 b: b.buffer, bOffset: b.offset,
@@ -3444,7 +3444,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), state_dim: UInt32(stateDim),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_ssm_step_f16(
+            IronKernels.iron_ssm_step_f16(
                 x: x.buffer, xOffset: x.offset,
                 a: a.buffer, aOffset: a.offset,
                 b: b.buffer, bOffset: b.offset,
@@ -3455,7 +3455,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), state_dim: UInt32(stateDim),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_ssm_step_bf16(
+            IronKernels.iron_ssm_step_bf16(
                 x: x.buffer, xOffset: x.offset,
                 a: a.buffer, aOffset: a.offset,
                 b: b.buffer, bOffset: b.offset,
@@ -3508,7 +3508,7 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_ssm_step_a2d_f32(
+            IronKernels.iron_ssm_step_a2d_f32(
                 x: x.buffer, xOffset: x.offset,
                 a_log: aLog.buffer, a_logOffset: aLog.offset,
                 b: b.buffer, bOffset: b.offset,
@@ -3519,7 +3519,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), state_dim: UInt32(stateDim),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_ssm_step_a2d_f16(
+            IronKernels.iron_ssm_step_a2d_f16(
                 x: x.buffer, xOffset: x.offset,
                 a_log: aLog.buffer, a_logOffset: aLog.offset,
                 b: b.buffer, bOffset: b.offset,
@@ -3530,7 +3530,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), state_dim: UInt32(stateDim),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_ssm_step_a2d_bf16(
+            IronKernels.iron_ssm_step_a2d_bf16(
                 x: x.buffer, xOffset: x.offset,
                 a_log: aLog.buffer, a_logOffset: aLog.offset,
                 b: b.buffer, bOffset: b.offset,
@@ -3555,7 +3555,7 @@ public enum Ops {
     ///
     /// The underlying kernel is **reduction-mode** with strict
     /// dispatch-shape invariants (see
-    /// `crates/ffai-kernels-std/src/ffai/gated_delta.rs`
+    /// `crates/crates/wh-iron-std/src/kernels/ssm/gated_delta.rs`
     /// §"DISPATCH INVARIANTS" and `OpsValidation.validateGatedDeltaStep`):
     /// TPG = 32 (one simdgroup), one threadgroup per `(dv, n)` pair,
     /// `Dk % 32 == 0`, `Hv % Hk == 0`. The `(Dk, Dv, Hk, Hv)` dimensions
@@ -3568,7 +3568,7 @@ public enum Ops {
     /// `stateOut`; callers double-buffer via `GDNStateCache.swap()`.
     ///
     /// All tensors are f32 — the kernel runs the recurrence state in f32
-    /// regardless of activation dtype. This wraps `ffai_gated_delta_step`,
+    /// regardless of activation dtype. This wraps `iron_gated_delta_step`,
     /// which performs exactly one recurrence step; multi-step prefill
     /// loops this call per token at the caller.
     public static func gatedDeltaStep(
@@ -3608,11 +3608,11 @@ public enum Ops {
             height: numValueHeads, depth: 1)
         let tg = MTLSize(width: lanesPerGroup, height: 1, depth: 1)
 
-        // `ffai_gated_delta_step` is a single PSO: the (Dk, Dv, Hv, Hk)
+        // `iron_gated_delta_step` is a single PSO: the (Dk, Dv, Hv, Hk)
         // dimensions are runtime `#[constexpr]` scalars rather than
         // baked compile-time constants, so one dispatch serves every
         // model config.
-        FFAIKernels.ffai_gated_delta_step_f32(
+        IronKernels.iron_gated_delta_step_f32(
             q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
             v: v.buffer, vOffset: v.offset, g: g.buffer, gOffset: g.offset,
             beta: beta.buffer, betaOffset: beta.offset,
@@ -3636,17 +3636,17 @@ public enum Ops {
         let grid = MTLSize(width: 256, height: 1, depth: 1)
         switch logits.dtype {
         case .f32:
-            FFAIKernels.ffai_argmax_f32(
+            IronKernels.iron_argmax_f32(
                 inp: logits.buffer, inpOffset: logits.offset,
                 out: out.buffer, outOffset: out.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_argmax_f16(
+            IronKernels.iron_argmax_f16(
                 inp: logits.buffer, inpOffset: logits.offset,
                 out: out.buffer, outOffset: out.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_argmax_bf16(
+            IronKernels.iron_argmax_bf16(
                 inp: logits.buffer, inpOffset: logits.offset,
                 out: out.buffer, outOffset: out.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
@@ -3689,21 +3689,21 @@ public enum Ops {
         let grid = MTLSize(width: 256, height: 1, depth: 1)
         switch logits.dtype {
         case .f32:
-            FFAIKernels.ffai_softmax_categorical_sample_f32(
+            IronKernels.iron_softmax_categorical_sample_f32(
                 inp: logits.buffer, inpOffset: logits.offset,
                 out: out.buffer, outOffset: out.offset,
                 temperature_in: temperature.buffer, temperature_inOffset: temperature.offset,
                 uniform_in: uniform.buffer, uniform_inOffset: uniform.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_softmax_categorical_sample_f16(
+            IronKernels.iron_softmax_categorical_sample_f16(
                 inp: logits.buffer, inpOffset: logits.offset,
                 out: out.buffer, outOffset: out.offset,
                 temperature_in: temperature.buffer, temperature_inOffset: temperature.offset,
                 uniform_in: uniform.buffer, uniform_inOffset: uniform.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_softmax_categorical_sample_bf16(
+            IronKernels.iron_softmax_categorical_sample_bf16(
                 inp: logits.buffer, inpOffset: logits.offset,
                 out: out.buffer, outOffset: out.offset,
                 temperature_in: temperature.buffer, temperature_inOffset: temperature.offset,
@@ -3793,7 +3793,7 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         switch src.dtype {
         case .f32:
-            FFAIKernels.ffai_quantize_kv_int4_f32(
+            IronKernels.iron_quantize_kv_int4_f32(
                 src: src.buffer, srcOffset: src.offset,
                 out_w: weights.buffer, out_wOffset: weights.offset,
                 out_s: scales.buffer, out_sOffset: scales.offset,
@@ -3802,7 +3802,7 @@ public enum Ops {
                 group_size: UInt32(groupSize), position: UInt32(position),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_quantize_kv_int4_f16(
+            IronKernels.iron_quantize_kv_int4_f16(
                 src: src.buffer, srcOffset: src.offset,
                 out_w: weights.buffer, out_wOffset: weights.offset,
                 out_s: scales.buffer, out_sOffset: scales.offset,
@@ -3811,7 +3811,7 @@ public enum Ops {
                 group_size: UInt32(groupSize), position: UInt32(position),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_quantize_kv_int4_bf16(
+            IronKernels.iron_quantize_kv_int4_bf16(
                 src: src.buffer, srcOffset: src.offset,
                 out_w: weights.buffer, out_wOffset: weights.offset,
                 out_s: scales.buffer, out_sOffset: scales.offset,
@@ -3850,7 +3850,7 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         switch out.dtype {
         case .f32:
-            FFAIKernels.ffai_bulk_dequant_kv_int4_f32(
+            IronKernels.iron_bulk_dequant_kv_int4_f32(
                 in_w: weights.buffer, in_wOffset: weights.offset,
                 in_s: scales.buffer, in_sOffset: scales.offset,
                 in_b: biases.buffer, in_bOffset: biases.offset,
@@ -3859,7 +3859,7 @@ public enum Ops {
                 group_size: UInt32(groupSize), n_positions: UInt32(nPositions),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_bulk_dequant_kv_int4_f16(
+            IronKernels.iron_bulk_dequant_kv_int4_f16(
                 in_w: weights.buffer, in_wOffset: weights.offset,
                 in_s: scales.buffer, in_sOffset: scales.offset,
                 in_b: biases.buffer, in_bOffset: biases.offset,
@@ -3868,7 +3868,7 @@ public enum Ops {
                 group_size: UInt32(groupSize), n_positions: UInt32(nPositions),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_bulk_dequant_kv_int4_bf16(
+            IronKernels.iron_bulk_dequant_kv_int4_bf16(
                 in_w: weights.buffer, in_wOffset: weights.offset,
                 in_s: scales.buffer, in_sOffset: scales.offset,
                 in_b: biases.buffer, in_bOffset: biases.offset,
@@ -3909,7 +3909,7 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         switch src.dtype {
         case .f32:
-            FFAIKernels.ffai_quantize_kv_int8_f32(
+            IronKernels.iron_quantize_kv_int8_f32(
                 src: src.buffer, srcOffset: src.offset,
                 out_w: weights.buffer, out_wOffset: weights.offset,
                 out_s: scales.buffer, out_sOffset: scales.offset,
@@ -3918,7 +3918,7 @@ public enum Ops {
                 group_size: UInt32(groupSize), position: UInt32(position),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_quantize_kv_int8_f16(
+            IronKernels.iron_quantize_kv_int8_f16(
                 src: src.buffer, srcOffset: src.offset,
                 out_w: weights.buffer, out_wOffset: weights.offset,
                 out_s: scales.buffer, out_sOffset: scales.offset,
@@ -3927,7 +3927,7 @@ public enum Ops {
                 group_size: UInt32(groupSize), position: UInt32(position),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_quantize_kv_int8_bf16(
+            IronKernels.iron_quantize_kv_int8_bf16(
                 src: src.buffer, srcOffset: src.offset,
                 out_w: weights.buffer, out_wOffset: weights.offset,
                 out_s: scales.buffer, out_sOffset: scales.offset,
@@ -3968,7 +3968,7 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         switch out.dtype {
         case .f32:
-            FFAIKernels.ffai_bulk_dequant_kv_int8_f32(
+            IronKernels.iron_bulk_dequant_kv_int8_f32(
                 in_w: weights.buffer, in_wOffset: weights.offset,
                 in_s: scales.buffer, in_sOffset: scales.offset,
                 in_b: biases.buffer, in_bOffset: biases.offset,
@@ -3977,7 +3977,7 @@ public enum Ops {
                 group_size: UInt32(groupSize), n_positions: UInt32(nPositions),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_bulk_dequant_kv_int8_f16(
+            IronKernels.iron_bulk_dequant_kv_int8_f16(
                 in_w: weights.buffer, in_wOffset: weights.offset,
                 in_s: scales.buffer, in_sOffset: scales.offset,
                 in_b: biases.buffer, in_bOffset: biases.offset,
@@ -3986,7 +3986,7 @@ public enum Ops {
                 group_size: UInt32(groupSize), n_positions: UInt32(nPositions),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_bulk_dequant_kv_int8_bf16(
+            IronKernels.iron_bulk_dequant_kv_int8_bf16(
                 in_w: weights.buffer, in_wOffset: weights.offset,
                 in_s: scales.buffer, in_sOffset: scales.offset,
                 in_b: biases.buffer, in_bOffset: biases.offset,
@@ -4017,19 +4017,19 @@ public enum Ops {
         let pos = UInt32(position)
         switch src.dtype {
         case .f32:
-            FFAIKernels.ffai_kv_cache_update_f32(
+            IronKernels.iron_kv_cache_update_f32(
                 src: src.buffer, srcOffset: src.offset,
                 out: cache.buffer, outOffset: cache.offset,
                 head_dim: hd, max_seq: ms, position: pos,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_kv_cache_update_f16(
+            IronKernels.iron_kv_cache_update_f16(
                 src: src.buffer, srcOffset: src.offset,
                 out: cache.buffer, outOffset: cache.offset,
                 head_dim: hd, max_seq: ms, position: pos,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_kv_cache_update_bf16(
+            IronKernels.iron_kv_cache_update_bf16(
                 src: src.buffer, srcOffset: src.offset,
                 out: cache.buffer, outOffset: cache.offset,
                 head_dim: hd, max_seq: ms, position: pos,
@@ -4061,9 +4061,9 @@ public enum Ops {
         let pos = UInt32(position)
         let psoName: String
         switch kSrc.dtype {
-        case .f32: psoName = "ffai_kv_cache_update_f32"
-        case .f16: psoName = "ffai_kv_cache_update_f16"
-        case .bf16: psoName = "ffai_kv_cache_update_bf16"
+        case .f32: psoName = "iron_kv_cache_update_f32"
+        case .f16: psoName = "iron_kv_cache_update_f16"
+        case .bf16: psoName = "iron_kv_cache_update_bf16"
         default: fatalError("Ops.kvCacheUpdateKV: unsupported dtype \(kSrc.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -4119,9 +4119,9 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(total)
         let psoName: String
         switch kSrc.dtype {
-        case .f32: psoName = "ffai_kv_cache_update_many_f32"
-        case .f16: psoName = "ffai_kv_cache_update_many_f16"
-        case .bf16: psoName = "ffai_kv_cache_update_many_bf16"
+        case .f32: psoName = "iron_kv_cache_update_many_f32"
+        case .f16: psoName = "iron_kv_cache_update_many_f16"
+        case .bf16: psoName = "iron_kv_cache_update_many_bf16"
         default: fatalError("Ops.kvCacheUpdateKVMany: unsupported dtype \(kSrc.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -4151,7 +4151,7 @@ public enum Ops {
     /// capacity (maxSeq) and nKV is how many positions to attend to.
     /// Output: [n_q_heads, head_dim].
     ///
-    /// Dispatch invariants (see `crates/ffai-kernels-std/src/ffai/sdpa_decode.rs`
+    /// Dispatch invariants (see `crates/crates/wh-iron-std/src/kernels/sdpa/sdpa_decode.rs`
     /// + `sdpa_decode_d64.rs`):
     ///   * `head_dim ∈ {64, 128}` — one threadgroup is 32 simdgroups ×
     ///     32 lanes; each lane owns `head_dim / 32` consecutive Q/K/V
@@ -4163,7 +4163,7 @@ public enum Ops {
     ///     (32 simdgroups × 32 lanes). `tgid_x = q_head`.
     ///
     /// Sliding-window / attention-sink fast path (`head_dim = 128`
-    /// variants only — ffai-kernels PR #50): when `sinkEnd` and/or
+    /// variants only — iron PR #50): when `sinkEnd` and/or
     /// `windowStart` are non-zero the kernel attends `[0, sinkEnd)`
     /// (the pinned attention sinks) plus `[windowStart, nKV)` (the
     /// sliding window) and skips the masked range
@@ -4218,7 +4218,7 @@ public enum Ops {
         // vectorize pass; per-head-dim variants keep both kernels fast.
         switch (headDim, q.dtype) {
         case (128, .f32):
-            FFAIKernels.ffai_sdpa_decode_f32(
+            IronKernels.iron_sdpa_decode_f32(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4239,7 +4239,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (128, .f16):
-            FFAIKernels.ffai_sdpa_decode_f16(
+            IronKernels.iron_sdpa_decode_f16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4254,7 +4254,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (128, .bf16):
-            FFAIKernels.ffai_sdpa_decode_bf16(
+            IronKernels.iron_sdpa_decode_bf16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4268,16 +4268,16 @@ public enum Ops {
                 has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
-        // NOTE: the d64/d256 specialized kernels in ffai-kernels-std
+        // NOTE: the d64/d256 specialized kernels in wh-iron-std
         // don't accept `sink_end` / `window_start` parameters — they're
         // perf-tuned for dense full attention. Callers needing sliding-
         // window / attention-sink at these head_dims must precondition
         // `sinkEnd == 0 && windowStart == 0` (validated upstream by
         // OpsValidation.validateSdpaDecode). The d128 / d512 cases use
-        // the generic `ffai_sdpa_decode_*` kernel with constexpr
+        // the generic `iron_sdpa_decode_*` kernel with constexpr
         // head_dim which DOES carry both params.
         case (64, .f32):
-            FFAIKernels.ffai_sdpa_decode_d64_f32(
+            IronKernels.iron_sdpa_decode_d64_f32(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4289,7 +4289,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .f16):
-            FFAIKernels.ffai_sdpa_decode_d64_f16(
+            IronKernels.iron_sdpa_decode_d64_f16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4301,7 +4301,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .bf16):
-            FFAIKernels.ffai_sdpa_decode_d64_bf16(
+            IronKernels.iron_sdpa_decode_d64_bf16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4315,7 +4315,7 @@ public enum Ops {
         // d96 — Phi-3-mini (3072 / 32). Dense-only like d64/d256/d512;
         // OpsValidation preconditions sinkEnd == 0 && windowStart == 0.
         case (96, .f32):
-            FFAIKernels.ffai_sdpa_decode_d96_f32(
+            IronKernels.iron_sdpa_decode_d96_f32(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4327,7 +4327,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (96, .f16):
-            FFAIKernels.ffai_sdpa_decode_d96_f16(
+            IronKernels.iron_sdpa_decode_d96_f16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4338,7 +4338,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (96, .bf16):
-            FFAIKernels.ffai_sdpa_decode_d96_bf16(
+            IronKernels.iron_sdpa_decode_d96_bf16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4350,7 +4350,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .f32):
-            FFAIKernels.ffai_sdpa_decode_d256_f32(
+            IronKernels.iron_sdpa_decode_d256_f32(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4362,7 +4362,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .f16):
-            FFAIKernels.ffai_sdpa_decode_d256_f16(
+            IronKernels.iron_sdpa_decode_d256_f16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4374,7 +4374,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .bf16):
-            FFAIKernels.ffai_sdpa_decode_d256_bf16(
+            IronKernels.iron_sdpa_decode_d256_bf16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4385,8 +4385,8 @@ public enum Ops {
                 has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
-        // d512 routes to the dedicated `ffai_sdpa_decode_d512_*` kernel.
-        // ffai-kernels #145 auto-discovers `sdpa_decode_d512.rs`, so the
+        // d512 routes to the dedicated `iron_sdpa_decode_d512_*` kernel.
+        // iron #145 auto-discovers `sdpa_decode_d512.rs`, so the
         // per-head-dim kernel is emitted again — the generic-kernel
         // reroute used while it was missing produced all-zero output
         // past offset 128 (the generic body's per-lane width assumes
@@ -4394,7 +4394,7 @@ public enum Ops {
         // for dense full attention and does not accept sink params;
         // OpsValidation preconditions `sinkEnd == 0 && windowStart == 0`.
         case (512, .f32):
-            FFAIKernels.ffai_sdpa_decode_d512_f32(
+            IronKernels.iron_sdpa_decode_d512_f32(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4405,7 +4405,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (512, .f16):
-            FFAIKernels.ffai_sdpa_decode_d512_f16(
+            IronKernels.iron_sdpa_decode_d512_f16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4416,7 +4416,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (512, .bf16):
-            FFAIKernels.ffai_sdpa_decode_d512_bf16(
+            IronKernels.iron_sdpa_decode_d512_bf16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4441,7 +4441,7 @@ public enum Ops {
     /// to the output, so a confidently-attending head can down-weight every
     /// real key. Mathematically identical to the old host-side online-softmax
     /// rescale, but folded into one GPU dispatch — no readback, no second
-    /// command buffer. Wraps `ffai_sdpa_decode_sink_buf`
+    /// command buffer. Wraps `iron_sdpa_decode_sink_buf`
     /// (`sdpa_decode_sink_buf.rs` §"DISPATCH INVARIANTS"): Reduction, TPG =
     /// 1024, one threadgroup per q-head, bounds-masked for any
     /// `head_dim % 4 == 0, ≤ 128` (covers d64 + d128 in one kernel).
@@ -4490,7 +4490,7 @@ public enum Ops {
         let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
         switch q.dtype {
         case .f32:
-            FFAIKernels.ffai_sdpa_decode_sink_buf_f32(
+            IronKernels.iron_sdpa_decode_sink_buf_f32(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4503,7 +4503,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_sdpa_decode_sink_buf_f16(
+            IronKernels.iron_sdpa_decode_sink_buf_f16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4516,7 +4516,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_sdpa_decode_sink_buf_bf16(
+            IronKernels.iron_sdpa_decode_sink_buf_bf16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4602,7 +4602,7 @@ public enum Ops {
 
         switch q.dtype {
         case .f32:
-            FFAIKernels.ffai_sdpa_decode_2pass_pass1_f32(
+            IronKernels.iron_sdpa_decode_2pass_pass1_f32(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4614,7 +4614,7 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
                 scale: scale,
                 gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
-            FFAIKernels.ffai_sdpa_decode_2pass_pass2_f32(
+            IronKernels.iron_sdpa_decode_2pass_pass2_f32(
                 partial_o: partialO.buffer, partial_oOffset: partialO.offset,
                 partial_m: partialM.buffer, partial_mOffset: partialM.offset,
                 partial_l: partialL.buffer, partial_lOffset: partialL.offset,
@@ -4622,7 +4622,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), blocks: UInt32(blocks),
                 gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_sdpa_decode_2pass_pass1_f16(
+            IronKernels.iron_sdpa_decode_2pass_pass1_f16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4634,7 +4634,7 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
                 scale: scale,
                 gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
-            FFAIKernels.ffai_sdpa_decode_2pass_pass2_f16(
+            IronKernels.iron_sdpa_decode_2pass_pass2_f16(
                 partial_o: partialO.buffer, partial_oOffset: partialO.offset,
                 partial_m: partialM.buffer, partial_mOffset: partialM.offset,
                 partial_l: partialL.buffer, partial_lOffset: partialL.offset,
@@ -4642,7 +4642,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), blocks: UInt32(blocks),
                 gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_sdpa_decode_2pass_pass1_bf16(
+            IronKernels.iron_sdpa_decode_2pass_pass1_bf16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -4654,7 +4654,7 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
                 scale: scale,
                 gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
-            FFAIKernels.ffai_sdpa_decode_2pass_pass2_bf16(
+            IronKernels.iron_sdpa_decode_2pass_pass2_bf16(
                 partial_o: partialO.buffer, partial_oOffset: partialO.offset,
                 partial_m: partialM.buffer, partial_mOffset: partialM.offset,
                 partial_l: partialL.buffer, partial_lOffset: partialL.offset,
@@ -4673,9 +4673,9 @@ public enum Ops {
     /// `[0, baseKV + nQuery)` (bidirectional); `causal == true` → query
     /// `r` attends `[0, baseKV + r + 1)`.
     ///
-    /// `ffai_sdpa_multi` is a reduction kernel — its threadgroup
+    /// `iron_sdpa_multi` is a reduction kernel — its threadgroup
     /// geometry is part of the contract. Each invariant below is
-    /// `precondition`-checked, citing `crates/ffai-kernels-std/src/ffai/
+    /// `precondition`-checked, citing `crates/wh-iron-std/src/ffai/
     /// sdpa_multi.rs`. The 1024-thread dispatch is hard: a smaller TPG
     /// makes the kernel's `n_simd` zero and the K walk an infinite GPU
     /// loop (the documented machine-freeze hazard).
@@ -4706,8 +4706,8 @@ public enum Ops {
         let grid = MTLSize(width: nQHeads * nQuery * threadsPerGroup, height: 1, depth: 1)
         let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
         let causalFlag = UInt32(causal ? 1 : 0)
-        // Route by (dtype, headDim). d=128 → `ffai_sdpa_multi_*`; d=256
-        // → `ffai_sdpa_multi_d256_*`, the variant added for Qwen3.6-A3B
+        // Route by (dtype, headDim). d=128 → `iron_sdpa_multi_*`; d=256
+        // → `iron_sdpa_multi_d256_*`, the variant added for Qwen3.6-A3B
         // full-attention layers (head_dim=256). Both kernels share the
         // same Swift wrapper shape; the dispatch grid / TPG / online
         // softmax / causal mask / GQA fan-out semantics are identical.
@@ -4715,7 +4715,7 @@ public enum Ops {
         // to stay under Apple's 32 KB threadgroup-memory cap.
         switch (q.dtype, headDim) {
         case (.f32, 128):
-            FFAIKernels.ffai_sdpa_multi_f32(
+            IronKernels.iron_sdpa_multi_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -4724,7 +4724,7 @@ public enum Ops {
                 causal: causalFlag, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.f16, 128):
-            FFAIKernels.ffai_sdpa_multi_f16(
+            IronKernels.iron_sdpa_multi_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -4733,7 +4733,7 @@ public enum Ops {
                 causal: causalFlag, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.bf16, 128):
-            FFAIKernels.ffai_sdpa_multi_bf16(
+            IronKernels.iron_sdpa_multi_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -4742,7 +4742,7 @@ public enum Ops {
                 causal: causalFlag, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.f32, 256):
-            FFAIKernels.ffai_sdpa_multi_d256_f32(
+            IronKernels.iron_sdpa_multi_d256_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -4751,7 +4751,7 @@ public enum Ops {
                 causal: causalFlag, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.f16, 256):
-            FFAIKernels.ffai_sdpa_multi_d256_f16(
+            IronKernels.iron_sdpa_multi_d256_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -4760,7 +4760,7 @@ public enum Ops {
                 causal: causalFlag, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.bf16, 256):
-            FFAIKernels.ffai_sdpa_multi_d256_bf16(
+            IronKernels.iron_sdpa_multi_d256_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -4783,8 +4783,8 @@ public enum Ops {
     /// loaded K/V block across all 16 rows before advancing, vs
     /// `sdpaMulti`'s one-threadgroup-per-query-row (no K/V reuse across
     /// rows, the mechanism behind the F-85 prefill-attention gap).
-    /// Wraps `ffai_sdpa_prefill_qtiled_d256`; see
-    /// `crates/ffai-kernels-std/src/kernels/sdpa/
+    /// Wraps `iron_sdpa_prefill_qtiled_d256`; see
+    /// `crates/wh-iron-std/src/kernels/sdpa/
     /// sdpa_prefill_qtiled_d256.rs` for the tiling / masking contract.
     /// TPG = 128 (4 simdgroups × 32 lanes); grid = `(ceil(nQuery/16),
     /// nQHeads, 1)`. Ragged tiles (`nQuery` not a multiple of 16) are
@@ -4825,7 +4825,7 @@ public enum Ops {
         let causalFlag = UInt32(causal ? 1 : 0)
         switch q.dtype {
         case .f32:
-            FFAIKernels.ffai_sdpa_prefill_qtiled_d256_f32(
+            IronKernels.iron_sdpa_prefill_qtiled_d256_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -4834,7 +4834,7 @@ public enum Ops {
                 causal: causalFlag, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_sdpa_prefill_qtiled_d256_f16(
+            IronKernels.iron_sdpa_prefill_qtiled_d256_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -4843,7 +4843,7 @@ public enum Ops {
                 causal: causalFlag, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_sdpa_prefill_qtiled_d256_bf16(
+            IronKernels.iron_sdpa_prefill_qtiled_d256_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -4867,7 +4867,7 @@ public enum Ops {
     /// `BQ = 32` query rows for a single q_head, computed via
     /// multi-simdgroup `simdgroup_matrix` MMA fragments rather than
     /// `sdpaPrefillQtiledD256`'s scalar simd_sum dot products. Wraps
-    /// `ffai_sdpa_prefill_mma_d256`; see `crates/ffai-kernels-std/src/
+    /// `iron_sdpa_prefill_mma_d256`; see `crates/wh-iron-std/src/
     /// kernels/sdpa/sdpa_prefill_mma_d256.rs`.
     /// TPG = 128 (4 simdgroups x 32 lanes); grid = `(ceil(nQuery/32),
     /// nQHeads, 1)` THREADGROUPS -- this is a coop-matrix MMA kernel,
@@ -4878,7 +4878,7 @@ public enum Ops {
     /// kernels, not just a perf one).
     ///
     /// f16/bf16 default to the BK=16 follow-up kernel
-    /// (`ffai_sdpa_prefill_mma_d256_bk16`, see `crates/ffai-kernels-std/
+    /// (`iron_sdpa_prefill_mma_d256_bk16`, see `crates/wh-iron-std/
     /// src/kernels/sdpa/sdpa_prefill_mma_d256_bk16.rs`): it halves the
     /// K-block loop's iteration count by reusing each cooperative K/V
     /// load across twice as many query rows, at a threadgroup-memory
@@ -4924,7 +4924,7 @@ public enum Ops {
         let useBK16 = Self.sdpaBK16Enabled
         switch q.dtype {
         case .f32:
-            FFAIKernels.ffai_sdpa_prefill_mma_d256_f32_threadgroups(
+            IronKernels.iron_sdpa_prefill_mma_d256_f32_threadgroups(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -4934,7 +4934,7 @@ public enum Ops {
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         case .f16:
             if useBK16 {
-                FFAIKernels.ffai_sdpa_prefill_mma_d256_bk16_f16_threadgroups(
+                IronKernels.iron_sdpa_prefill_mma_d256_bk16_f16_threadgroups(
                     q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                     v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                     head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -4943,7 +4943,7 @@ public enum Ops {
                     causal: causalFlag, scale: scale,
                     gridSize: tgGrid, threadgroupSize: tg, on: cmd)
             } else {
-                FFAIKernels.ffai_sdpa_prefill_mma_d256_f16_threadgroups(
+                IronKernels.iron_sdpa_prefill_mma_d256_f16_threadgroups(
                     q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                     v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                     head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -4954,7 +4954,7 @@ public enum Ops {
             }
         case .bf16:
             if useBK16 {
-                FFAIKernels.ffai_sdpa_prefill_mma_d256_bk16_bf16_threadgroups(
+                IronKernels.iron_sdpa_prefill_mma_d256_bk16_bf16_threadgroups(
                     q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                     v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                     head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -4963,7 +4963,7 @@ public enum Ops {
                     causal: causalFlag, scale: scale,
                     gridSize: tgGrid, threadgroupSize: tg, on: cmd)
             } else {
-                FFAIKernels.ffai_sdpa_prefill_mma_d256_bf16_threadgroups(
+                IronKernels.iron_sdpa_prefill_mma_d256_bf16_threadgroups(
                     q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                     v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                     head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
@@ -5028,7 +5028,7 @@ public enum Ops {
         let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
         switch q.dtype {
         case .f32:
-            FFAIKernels.ffai_sdpa_multi_tree_mask_f32(
+            IronKernels.iron_sdpa_multi_tree_mask_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
                 mask: mask.buffer, maskOffset: mask.offset,
@@ -5039,7 +5039,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_sdpa_multi_tree_mask_f16(
+            IronKernels.iron_sdpa_multi_tree_mask_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
                 mask: mask.buffer, maskOffset: mask.offset,
@@ -5050,7 +5050,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_sdpa_multi_tree_mask_bf16(
+            IronKernels.iron_sdpa_multi_tree_mask_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
                 mask: mask.buffer, maskOffset: mask.offset,
@@ -5078,9 +5078,9 @@ public enum Ops {
     /// layout with bounds masking — lanes 24..31 are idle (25% lane
     /// occupancy loss, kernel-internal, transparent to the wrapper).
     ///
-    /// `ffai_sdpa_bidirectional_dN` is a reduction kernel — TPG=1024
+    /// `iron_sdpa_bidirectional_dN` is a reduction kernel — TPG=1024
     /// is hard. See `OpsValidation.validateSdpaBidirectional` for the
-    /// invariant list and `ffai-kernels/crates/ffai-kernels-std/src/ffai/
+    /// invariant list and `iron/crates/wh-iron-std/src/ffai/
     /// sdpa_bidirectional.rs` for the dispatch contract.
     public static func sdpaBidirectional(
         q: Tensor, k: Tensor, v: Tensor,
@@ -5112,105 +5112,105 @@ public enum Ops {
         let hpg = UInt32(headsPerGroup)
         switch (headDim, q.dtype) {
         case (32, .f32):
-            FFAIKernels.ffai_sdpa_bidirectional_d32_f32(
+            IronKernels.iron_sdpa_bidirectional_d32_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (32, .f16):
-            FFAIKernels.ffai_sdpa_bidirectional_d32_f16(
+            IronKernels.iron_sdpa_bidirectional_d32_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (32, .bf16):
-            FFAIKernels.ffai_sdpa_bidirectional_d32_bf16(
+            IronKernels.iron_sdpa_bidirectional_d32_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .f32):
-            FFAIKernels.ffai_sdpa_bidirectional_d64_f32(
+            IronKernels.iron_sdpa_bidirectional_d64_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .f16):
-            FFAIKernels.ffai_sdpa_bidirectional_d64_f16(
+            IronKernels.iron_sdpa_bidirectional_d64_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .bf16):
-            FFAIKernels.ffai_sdpa_bidirectional_d64_bf16(
+            IronKernels.iron_sdpa_bidirectional_d64_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (72, .f32):
-            FFAIKernels.ffai_sdpa_bidirectional_d72_f32(
+            IronKernels.iron_sdpa_bidirectional_d72_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (72, .f16):
-            FFAIKernels.ffai_sdpa_bidirectional_d72_f16(
+            IronKernels.iron_sdpa_bidirectional_d72_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (72, .bf16):
-            FFAIKernels.ffai_sdpa_bidirectional_d72_bf16(
+            IronKernels.iron_sdpa_bidirectional_d72_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (80, .f32):
-            FFAIKernels.ffai_sdpa_bidirectional_d80_f32(
+            IronKernels.iron_sdpa_bidirectional_d80_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (80, .f16):
-            FFAIKernels.ffai_sdpa_bidirectional_d80_f16(
+            IronKernels.iron_sdpa_bidirectional_d80_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (80, .bf16):
-            FFAIKernels.ffai_sdpa_bidirectional_d80_bf16(
+            IronKernels.iron_sdpa_bidirectional_d80_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (96, .f32):
-            FFAIKernels.ffai_sdpa_bidirectional_d96_f32(
+            IronKernels.iron_sdpa_bidirectional_d96_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (96, .f16):
-            FFAIKernels.ffai_sdpa_bidirectional_d96_f16(
+            IronKernels.iron_sdpa_bidirectional_d96_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
                 kv_stride: kvs, heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (96, .bf16):
-            FFAIKernels.ffai_sdpa_bidirectional_d96_bf16(
+            IronKernels.iron_sdpa_bidirectional_d96_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
                 head_dim: hd, n_q_heads: nqh, base_kv: bkv, n_query: nq,
@@ -5273,7 +5273,7 @@ public enum Ops {
         let rl = UInt32(relLen)
         switch q.dtype {
         case .f32:
-            FFAIKernels.ffai_sdpa_bidirectional_d128_relpos_f32(
+            IronKernels.iron_sdpa_bidirectional_d128_relpos_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, bias: bias.buffer, biasOffset: bias.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -5281,7 +5281,7 @@ public enum Ops {
                 kv_stride: kvs, heads_per_group: hpg, rel_zero: rz, rel_len: rl,
                 scale: scale, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_sdpa_bidirectional_d128_relpos_f16(
+            IronKernels.iron_sdpa_bidirectional_d128_relpos_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, bias: bias.buffer, biasOffset: bias.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -5289,7 +5289,7 @@ public enum Ops {
                 kv_stride: kvs, heads_per_group: hpg, rel_zero: rz, rel_len: rl,
                 scale: scale, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_sdpa_bidirectional_d128_relpos_bf16(
+            IronKernels.iron_sdpa_bidirectional_d128_relpos_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, bias: bias.buffer, biasOffset: bias.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -5368,7 +5368,7 @@ public enum Ops {
         let rl = UInt32(relLen)
         switch q.dtype {
         case .f32:
-            FFAIKernels.ffai_sdpa_rel_pos_conformer_d128_f32(
+            IronKernels.iron_sdpa_rel_pos_conformer_d128_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
                 rel_emb: relEmb.buffer, rel_embOffset: relEmb.offset,
@@ -5379,7 +5379,7 @@ public enum Ops {
                 kv_stride: kvs, heads_per_group: hpg, rel_zero: rz, rel_len: rl,
                 scale: scale, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_sdpa_rel_pos_conformer_d128_f16(
+            IronKernels.iron_sdpa_rel_pos_conformer_d128_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
                 rel_emb: relEmb.buffer, rel_embOffset: relEmb.offset,
@@ -5390,7 +5390,7 @@ public enum Ops {
                 kv_stride: kvs, heads_per_group: hpg, rel_zero: rz, rel_len: rl,
                 scale: scale, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_sdpa_rel_pos_conformer_d128_bf16(
+            IronKernels.iron_sdpa_rel_pos_conformer_d128_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
                 rel_emb: relEmb.buffer, rel_embOffset: relEmb.offset,
@@ -5449,7 +5449,7 @@ public enum Ops {
         let hpg = UInt32(headsPerGroup)
         switch q.dtype {
         case .f32:
-            FFAIKernels.ffai_sdpa_bidirectional_windowed_d80_f32(
+            IronKernels.iron_sdpa_bidirectional_windowed_d80_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
                 seg_start: segStart.buffer, seg_startOffset: segStart.offset,
@@ -5459,7 +5459,7 @@ public enum Ops {
                 heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_sdpa_bidirectional_windowed_d80_f16(
+            IronKernels.iron_sdpa_bidirectional_windowed_d80_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
                 seg_start: segStart.buffer, seg_startOffset: segStart.offset,
@@ -5469,7 +5469,7 @@ public enum Ops {
                 heads_per_group: hpg, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_sdpa_bidirectional_windowed_d80_bf16(
+            IronKernels.iron_sdpa_bidirectional_windowed_d80_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
                 seg_start: segStart.buffer, seg_startOffset: segStart.offset,
@@ -5511,7 +5511,7 @@ public enum Ops {
             "Ops.auraEncode: rotation/boundaries dtype must match input "
                 + "dtype (got rotation=\(rotation.dtype), "
                 + "boundaries=\(boundaries.dtype) vs input=\(input.dtype)) "
-                + "— metaltile #226 unified to Tensor<T>; the Π matrix "
+                + "— iron #226 unified to Tensor<T>; the Π matrix "
                 + "dominates encoder bandwidth so narrowing it at f16/bf16 "
                 + "halves the dominant read")
         precondition(
@@ -5569,7 +5569,7 @@ public enum Ops {
         switch (bits, input.dtype) {
         case (2, .f32):
             dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
-                FFAIKernels.ffai_aura_encode_int2_f32(
+                IronKernels.iron_aura_encode_int2_f32(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
@@ -5577,7 +5577,7 @@ public enum Ops {
             }
         case (2, .f16):
             dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
-                FFAIKernels.ffai_aura_encode_int2_f16(
+                IronKernels.iron_aura_encode_int2_f16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
@@ -5585,7 +5585,7 @@ public enum Ops {
             }
         case (2, .bf16):
             dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
-                FFAIKernels.ffai_aura_encode_int2_bf16(
+                IronKernels.iron_aura_encode_int2_bf16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
@@ -5593,7 +5593,7 @@ public enum Ops {
             }
         case (3, .f32):
             dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
-                FFAIKernels.ffai_aura_encode_int3_f32(
+                IronKernels.iron_aura_encode_int3_f32(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
@@ -5601,7 +5601,7 @@ public enum Ops {
             }
         case (3, .f16):
             dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
-                FFAIKernels.ffai_aura_encode_int3_f16(
+                IronKernels.iron_aura_encode_int3_f16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
@@ -5609,7 +5609,7 @@ public enum Ops {
             }
         case (3, .bf16):
             dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
-                FFAIKernels.ffai_aura_encode_int3_bf16(
+                IronKernels.iron_aura_encode_int3_bf16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
@@ -5617,7 +5617,7 @@ public enum Ops {
             }
         case (4, .f32):
             dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
-                FFAIKernels.ffai_aura_encode_int4_f32(
+                IronKernels.iron_aura_encode_int4_f32(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
@@ -5625,7 +5625,7 @@ public enum Ops {
             }
         case (4, .f16):
             dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
-                FFAIKernels.ffai_aura_encode_int4_f16(
+                IronKernels.iron_aura_encode_int4_f16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
@@ -5633,7 +5633,7 @@ public enum Ops {
             }
         case (4, .bf16):
             dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
-                FFAIKernels.ffai_aura_encode_int4_bf16(
+                IronKernels.iron_aura_encode_int4_bf16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
@@ -5641,7 +5641,7 @@ public enum Ops {
             }
         case (8, .f32):
             dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
-                FFAIKernels.ffai_aura_encode_int8_f32(
+                IronKernels.iron_aura_encode_int8_f32(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
@@ -5649,7 +5649,7 @@ public enum Ops {
             }
         case (8, .f16):
             dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
-                FFAIKernels.ffai_aura_encode_int8_f16(
+                IronKernels.iron_aura_encode_int8_f16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
@@ -5657,7 +5657,7 @@ public enum Ops {
             }
         case (8, .bf16):
             dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
-                FFAIKernels.ffai_aura_encode_int8_bf16(
+                IronKernels.iron_aura_encode_int8_bf16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
@@ -5717,7 +5717,7 @@ public enum Ops {
         let tg = MTLSize(width: packedWidth, height: 1, depth: 1)
         switch (bits, out.dtype) {
         case (2, .f32):
-            FFAIKernels.ffai_aura_dequant_rotated_int2_f32(
+            IronKernels.iron_aura_dequant_rotated_int2_f32(
                 packed: packed.buffer, packedOffset: packed.offset,
                 norms: norms.buffer, normsOffset: norms.offset,
                 codebook: codebook.buffer, codebookOffset: codebook.offset,
@@ -5725,7 +5725,7 @@ public enum Ops {
                 dim: UInt32(dim), packed_width: UInt32(packedWidth), tokens: UInt32(stride),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .f16):
-            FFAIKernels.ffai_aura_dequant_rotated_int2_f16(
+            IronKernels.iron_aura_dequant_rotated_int2_f16(
                 packed: packed.buffer, packedOffset: packed.offset,
                 norms: norms.buffer, normsOffset: norms.offset,
                 codebook: codebook.buffer, codebookOffset: codebook.offset,
@@ -5733,7 +5733,7 @@ public enum Ops {
                 dim: UInt32(dim), packed_width: UInt32(packedWidth), tokens: UInt32(stride),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .bf16):
-            FFAIKernels.ffai_aura_dequant_rotated_int2_bf16(
+            IronKernels.iron_aura_dequant_rotated_int2_bf16(
                 packed: packed.buffer, packedOffset: packed.offset,
                 norms: norms.buffer, normsOffset: norms.offset,
                 codebook: codebook.buffer, codebookOffset: codebook.offset,
@@ -5741,7 +5741,7 @@ public enum Ops {
                 dim: UInt32(dim), packed_width: UInt32(packedWidth), tokens: UInt32(stride),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .f32):
-            FFAIKernels.ffai_aura_dequant_rotated_int3_f32(
+            IronKernels.iron_aura_dequant_rotated_int3_f32(
                 packed: packed.buffer, packedOffset: packed.offset,
                 norms: norms.buffer, normsOffset: norms.offset,
                 codebook: codebook.buffer, codebookOffset: codebook.offset,
@@ -5749,7 +5749,7 @@ public enum Ops {
                 dim: UInt32(dim), packed_width: UInt32(packedWidth), tokens: UInt32(stride),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .f16):
-            FFAIKernels.ffai_aura_dequant_rotated_int3_f16(
+            IronKernels.iron_aura_dequant_rotated_int3_f16(
                 packed: packed.buffer, packedOffset: packed.offset,
                 norms: norms.buffer, normsOffset: norms.offset,
                 codebook: codebook.buffer, codebookOffset: codebook.offset,
@@ -5757,7 +5757,7 @@ public enum Ops {
                 dim: UInt32(dim), packed_width: UInt32(packedWidth), tokens: UInt32(stride),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (3, .bf16):
-            FFAIKernels.ffai_aura_dequant_rotated_int3_bf16(
+            IronKernels.iron_aura_dequant_rotated_int3_bf16(
                 packed: packed.buffer, packedOffset: packed.offset,
                 norms: norms.buffer, normsOffset: norms.offset,
                 codebook: codebook.buffer, codebookOffset: codebook.offset,
@@ -5765,7 +5765,7 @@ public enum Ops {
                 dim: UInt32(dim), packed_width: UInt32(packedWidth), tokens: UInt32(stride),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, .f32):
-            FFAIKernels.ffai_aura_dequant_rotated_int4_f32(
+            IronKernels.iron_aura_dequant_rotated_int4_f32(
                 packed: packed.buffer, packedOffset: packed.offset,
                 norms: norms.buffer, normsOffset: norms.offset,
                 codebook: codebook.buffer, codebookOffset: codebook.offset,
@@ -5773,7 +5773,7 @@ public enum Ops {
                 dim: UInt32(dim), packed_width: UInt32(packedWidth), tokens: UInt32(stride),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, .f16):
-            FFAIKernels.ffai_aura_dequant_rotated_int4_f16(
+            IronKernels.iron_aura_dequant_rotated_int4_f16(
                 packed: packed.buffer, packedOffset: packed.offset,
                 norms: norms.buffer, normsOffset: norms.offset,
                 codebook: codebook.buffer, codebookOffset: codebook.offset,
@@ -5781,7 +5781,7 @@ public enum Ops {
                 dim: UInt32(dim), packed_width: UInt32(packedWidth), tokens: UInt32(stride),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, .bf16):
-            FFAIKernels.ffai_aura_dequant_rotated_int4_bf16(
+            IronKernels.iron_aura_dequant_rotated_int4_bf16(
                 packed: packed.buffer, packedOffset: packed.offset,
                 norms: norms.buffer, normsOffset: norms.offset,
                 codebook: codebook.buffer, codebookOffset: codebook.offset,
@@ -5789,7 +5789,7 @@ public enum Ops {
                 dim: UInt32(dim), packed_width: UInt32(packedWidth), tokens: UInt32(stride),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .f32):
-            FFAIKernels.ffai_aura_dequant_rotated_int8_f32(
+            IronKernels.iron_aura_dequant_rotated_int8_f32(
                 packed: packed.buffer, packedOffset: packed.offset,
                 norms: norms.buffer, normsOffset: norms.offset,
                 codebook: codebook.buffer, codebookOffset: codebook.offset,
@@ -5797,7 +5797,7 @@ public enum Ops {
                 dim: UInt32(dim), packed_width: UInt32(packedWidth), tokens: UInt32(stride),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .f16):
-            FFAIKernels.ffai_aura_dequant_rotated_int8_f16(
+            IronKernels.iron_aura_dequant_rotated_int8_f16(
                 packed: packed.buffer, packedOffset: packed.offset,
                 norms: norms.buffer, normsOffset: norms.offset,
                 codebook: codebook.buffer, codebookOffset: codebook.offset,
@@ -5805,7 +5805,7 @@ public enum Ops {
                 dim: UInt32(dim), packed_width: UInt32(packedWidth), tokens: UInt32(stride),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .bf16):
-            FFAIKernels.ffai_aura_dequant_rotated_int8_bf16(
+            IronKernels.iron_aura_dequant_rotated_int8_bf16(
                 packed: packed.buffer, packedOffset: packed.offset,
                 norms: norms.buffer, normsOffset: norms.offset,
                 codebook: codebook.buffer, codebookOffset: codebook.offset,
@@ -5848,7 +5848,7 @@ public enum Ops {
     ///     `dequantMirror` decode path — Π applied to Q before SDPA so
     ///     scores cancel; Π^T applied to the output before oProj).
     ///   - confirm `supportsFlashSdpa(scheme:headDim:)` is true; this
-    ///     wrapper only covers the metaltile flash variants currently
+    ///     wrapper only covers the iron flash variants currently
     ///     emitted: (kb=4, vb=2) and (kb=4, vb=4) × d ∈ {64, 128}.
     ///   - own + pass a `sinks` tensor of shape `[nQHeads]` (zeroed +
     ///     `hasSinks=false` gives a no-op attention-sink path).
@@ -5934,7 +5934,7 @@ public enum Ops {
 
         switch (keyBits, valueBits, headDim, out.dtype) {
         case (4, 2, 128, .f32):
-            FFAIKernels.ffai_aura_flash_sdpa_kb4_vb2_d128_f32(
+            IronKernels.iron_aura_flash_sdpa_kb4_vb2_d128_f32(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -5950,7 +5950,7 @@ public enum Ops {
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 2, 128, .f16):
-            FFAIKernels.ffai_aura_flash_sdpa_kb4_vb2_d128_f16(
+            IronKernels.iron_aura_flash_sdpa_kb4_vb2_d128_f16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -5966,7 +5966,7 @@ public enum Ops {
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 2, 128, .bf16):
-            FFAIKernels.ffai_aura_flash_sdpa_kb4_vb2_d128_bf16(
+            IronKernels.iron_aura_flash_sdpa_kb4_vb2_d128_bf16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -5982,7 +5982,7 @@ public enum Ops {
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 4, 128, .f32):
-            FFAIKernels.ffai_aura_flash_sdpa_kb4_vb4_d128_f32(
+            IronKernels.iron_aura_flash_sdpa_kb4_vb4_d128_f32(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -5998,7 +5998,7 @@ public enum Ops {
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 4, 128, .f16):
-            FFAIKernels.ffai_aura_flash_sdpa_kb4_vb4_d128_f16(
+            IronKernels.iron_aura_flash_sdpa_kb4_vb4_d128_f16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -6014,7 +6014,7 @@ public enum Ops {
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 4, 128, .bf16):
-            FFAIKernels.ffai_aura_flash_sdpa_kb4_vb4_d128_bf16(
+            IronKernels.iron_aura_flash_sdpa_kb4_vb4_d128_bf16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -6039,12 +6039,12 @@ public enum Ops {
     }
 
     /// Predicate for the `auraFlashSdpa` supported-scheme set. Returns
-    /// true when the metaltile flash kernel exists for this combo.
+    /// true when the iron flash kernel exists for this combo.
     public static func supportsAuraFlashSdpa(
         keyBits: Int, valueBits: Int, headDim: Int, dtype: DType
     ) -> Bool {
         guard [DType.f32, .f16, .bf16].contains(dtype) else { return false }
-        // d=64 metaltile kernels exist but FFAI side hasn't wired their
+        // d=64 iron kernels exist but FFAI side hasn't wired their
         // Ops dispatch yet — gate to d=128 (Qwen3 / Llama-3 family).
         guard headDim == 128 else { return false }
         if keyBits == 4 && (valueBits == 2 || valueBits == 4) { return true }
@@ -6153,7 +6153,7 @@ public enum Ops {
 
         switch (keyBits, valueBits, headDim, out.dtype) {
         case (4, 2, 128, .f32):
-            FFAIKernels.ffai_aura_flash_p1_kb4_vb2_d128_f32(
+            IronKernels.iron_aura_flash_p1_kb4_vb2_d128_f32(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -6170,7 +6170,7 @@ public enum Ops {
                 num_blocks: numBlocksU, block_size: blockSizeU,
                 q_position: qPosition,
                 gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
-            FFAIKernels.ffai_aura_flash_pass2_d128_f32(
+            IronKernels.iron_aura_flash_pass2_d128_f32(
                 o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
                 m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
                 l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
@@ -6178,7 +6178,7 @@ public enum Ops {
                 dim: dim, num_blocks: numBlocksU,
                 gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
         case (4, 2, 128, .f16):
-            FFAIKernels.ffai_aura_flash_p1_kb4_vb2_d128_f16(
+            IronKernels.iron_aura_flash_p1_kb4_vb2_d128_f16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -6195,7 +6195,7 @@ public enum Ops {
                 num_blocks: numBlocksU, block_size: blockSizeU,
                 q_position: qPosition,
                 gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
-            FFAIKernels.ffai_aura_flash_pass2_d128_f16(
+            IronKernels.iron_aura_flash_pass2_d128_f16(
                 o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
                 m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
                 l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
@@ -6203,7 +6203,7 @@ public enum Ops {
                 dim: dim, num_blocks: numBlocksU,
                 gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
         case (4, 2, 128, .bf16):
-            FFAIKernels.ffai_aura_flash_p1_kb4_vb2_d128_bf16(
+            IronKernels.iron_aura_flash_p1_kb4_vb2_d128_bf16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -6220,7 +6220,7 @@ public enum Ops {
                 num_blocks: numBlocksU, block_size: blockSizeU,
                 q_position: qPosition,
                 gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
-            FFAIKernels.ffai_aura_flash_pass2_d128_bf16(
+            IronKernels.iron_aura_flash_pass2_d128_bf16(
                 o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
                 m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
                 l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
@@ -6228,7 +6228,7 @@ public enum Ops {
                 dim: dim, num_blocks: numBlocksU,
                 gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
         case (4, 4, 128, .f32):
-            FFAIKernels.ffai_aura_flash_p1_kb4_vb4_d128_f32(
+            IronKernels.iron_aura_flash_p1_kb4_vb4_d128_f32(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -6245,7 +6245,7 @@ public enum Ops {
                 num_blocks: numBlocksU, block_size: blockSizeU,
                 q_position: qPosition,
                 gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
-            FFAIKernels.ffai_aura_flash_pass2_d128_f32(
+            IronKernels.iron_aura_flash_pass2_d128_f32(
                 o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
                 m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
                 l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
@@ -6253,7 +6253,7 @@ public enum Ops {
                 dim: dim, num_blocks: numBlocksU,
                 gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
         case (4, 4, 128, .f16):
-            FFAIKernels.ffai_aura_flash_p1_kb4_vb4_d128_f16(
+            IronKernels.iron_aura_flash_p1_kb4_vb4_d128_f16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -6270,7 +6270,7 @@ public enum Ops {
                 num_blocks: numBlocksU, block_size: blockSizeU,
                 q_position: qPosition,
                 gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
-            FFAIKernels.ffai_aura_flash_pass2_d128_f16(
+            IronKernels.iron_aura_flash_pass2_d128_f16(
                 o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
                 m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
                 l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
@@ -6278,7 +6278,7 @@ public enum Ops {
                 dim: dim, num_blocks: numBlocksU,
                 gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
         case (4, 4, 128, .bf16):
-            FFAIKernels.ffai_aura_flash_p1_kb4_vb4_d128_bf16(
+            IronKernels.iron_aura_flash_p1_kb4_vb4_d128_bf16(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
                 key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
                 key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
@@ -6295,7 +6295,7 @@ public enum Ops {
                 num_blocks: numBlocksU, block_size: blockSizeU,
                 q_position: qPosition,
                 gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
-            FFAIKernels.ffai_aura_flash_pass2_d128_bf16(
+            IronKernels.iron_aura_flash_pass2_d128_bf16(
                 o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
                 m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
                 l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
@@ -6313,7 +6313,7 @@ public enum Ops {
 
     /// Predicate for the `auraFlashSdpa2Pass` supported-scheme set.
     /// Matches `supportsAuraFlashSdpa` today — both wrappers cover the
-    /// same metaltile-emitted (kb=4, vb∈{2,4}) × d=128 cells.
+    /// same iron-emitted (kb=4, vb∈{2,4}) × d=128 cells.
     public static func supportsAuraFlashSdpa2Pass(
         keyBits: Int, valueBits: Int, headDim: Int, dtype: DType
     ) -> Bool {
@@ -6357,7 +6357,7 @@ public enum Ops {
 
     // ─── MoE batched gather GEMM (int4) ──────────────────────────────
     //
-    // Wraps `ffai_moe_gather_qmm_mma_int4_bm16_*` — one kernel launch that
+    // Wraps `iron_moe_gather_qmm_mma_int4_bm16_*` — one kernel launch that
     // processes `mTotal` rows of activations, each row tagged with the
     // expert id it routes to via `indices[mTotal]`. Replaces a Python-
     // style serial-expert loop (`topK` dispatches × 3 projections = 3K
@@ -6403,7 +6403,7 @@ public enum Ops {
     ///
     /// Module-visible (not `private`) rather than duplicated: `MoELayer`'s
     /// F-85 coop-core MoE gather gate (`coopEnabled`) also wraps a
-    /// `matmul2d`/cooperative-tensor kernel (`ffai_moe_gather_qmm_coop`)
+    /// `matmul2d`/cooperative-tensor kernel (`iron_moe_gather_qmm_coop`)
     /// with the same Family-9/macOS-26 requirement, and unlike
     /// `dispatchQmmMma`'s coop tier below (which falls back to a cheaper
     /// tier on incapable hardware), that kernel has no lower-level
@@ -6460,7 +6460,7 @@ public enum Ops {
 
         // BM=16, BN=32. The simdgroup-matrix variant uses 64 threads
         // (2 SGs); the MPP / NAX cooperative-tensor variant uses 32
-        // threads (1 SG). Canonical ffai-kernels dispatch
+        // threads (1 SG). Canonical iron dispatch
         //   dispatch_with_grid(grid=[N/32, ceil(T/16), 1], tg=[TG_W, 1, 1])
         // calls `dispatchThreadgroups` (grid counted in TGs); the
         // generated Swift wrapper calls `dispatchThreads` (grid counted
@@ -6502,7 +6502,7 @@ public enum Ops {
             let idRows = Self.identityRowsBuffer(minCount: mTotal, device: Device.shared)
             switch input.dtype {
             case .f32:
-                FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_f32(
+                IronKernels.iron_moe_gather_qmm_mma_int4_bm16_mpp_f32(
                     x: input.buffer, xOffset: input.offset,
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -6514,7 +6514,7 @@ public enum Ops {
                     group_size: groupSizeU,
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             case .f16:
-                FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_f16(
+                IronKernels.iron_moe_gather_qmm_mma_int4_bm16_mpp_f16(
                     x: input.buffer, xOffset: input.offset,
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -6527,7 +6527,7 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             case .bf16:
                 // Qwen3.x activations are often bf16; kernel is already emitted.
-                FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_bf16(
+                IronKernels.iron_moe_gather_qmm_mma_int4_bm16_mpp_bf16(
                     x: input.buffer, xOffset: input.offset,
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -6548,7 +6548,7 @@ public enum Ops {
 
         switch input.dtype {
         case .f32:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_f32(
+            IronKernels.iron_moe_gather_qmm_mma_int4_bm16_f32(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -6559,7 +6559,7 @@ public enum Ops {
                 group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_f16(
+            IronKernels.iron_moe_gather_qmm_mma_int4_bm16_f16(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -6570,7 +6570,7 @@ public enum Ops {
                 group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_bf16(
+            IronKernels.iron_moe_gather_qmm_mma_int4_bm16_bf16(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -6595,7 +6595,7 @@ public enum Ops {
     /// host before routing runs - so callers can size and dispatch the
     /// plan-builder AND the tileplan GEMM with a fully static grid, no
     /// GPU→CPU sync to read back the real tile count. See
-    /// `ffai_moe_build_tile_plan`'s dispatch-invariants doc (kernels repo,
+    /// `iron_moe_build_tile_plan`'s dispatch-invariants doc (kernels repo,
     /// `moe_tile_plan_builder.rs`) for the proof sketch and the zero-fill
     /// contract that makes the padding entries this bound reserves safe to
     /// dispatch as inert tiles.
@@ -6603,7 +6603,7 @@ public enum Ops {
         (mTotal + 15) / 16 + nExperts
     }
 
-    /// Device-side tile-plan builder (`ffai_moe_build_tile_plan`). Reads the
+    /// Device-side tile-plan builder (`iron_moe_build_tile_plan`). Reads the
     /// already expert-sorted `sortedExperts [mTotal]` device buffer (the
     /// routing step's own sort output - no host readback) and writes
     /// `tileExpert`/`tileRowStart`/`tileRowCount`, one entry per expert-
@@ -6633,7 +6633,7 @@ public enum Ops {
         )
         let grid = MTLSize(width: nExperts, height: 1, depth: 1)
         let tg = MTLSize(width: nExperts, height: 1, depth: 1)
-        FFAIKernels.ffai_moe_build_tile_plan_f32(
+        IronKernels.iron_moe_build_tile_plan_f32(
             sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
             tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
             tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
@@ -6643,7 +6643,7 @@ public enum Ops {
     }
 
     /// Expert-aligned tile-plan MoE gather GEMM
-    /// (`ffai_moe_gather_qmm_mma_int4_bm16_mpp_tileplan`, F-85). Same
+    /// (`iron_moe_gather_qmm_mma_int4_bm16_mpp_tileplan`, F-85). Same
     /// dequant math, same BM=16/BN=32/BK=16 MPP geometry as
     /// `moeGatherDequantGemmInt4`'s MPP path - the only difference is tile
     /// boundaries come from a host-dispatched, device-built plan
@@ -6698,7 +6698,7 @@ public enum Ops {
 
         switch input.dtype {
         case .f32:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_tileplan_f32(
+            IronKernels.iron_moe_gather_qmm_mma_int4_bm16_mpp_tileplan_f32(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -6711,7 +6711,7 @@ public enum Ops {
                 n_out: nOutU, k_in: kInU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_tileplan_f16(
+            IronKernels.iron_moe_gather_qmm_mma_int4_bm16_mpp_tileplan_f16(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -6724,7 +6724,7 @@ public enum Ops {
                 n_out: nOutU, k_in: kInU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_tileplan_bf16(
+            IronKernels.iron_moe_gather_qmm_mma_int4_bm16_mpp_tileplan_bf16(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -6752,7 +6752,7 @@ public enum Ops {
         (mTotal + 31) / 32 + nExperts
     }
 
-    /// Device-side BM=32 tile-plan builder (`ffai_moe_build_tile_plan_bm32`).
+    /// Device-side BM=32 tile-plan builder (`iron_moe_build_tile_plan_bm32`).
     /// Same contract as `moeBuildTilePlan` - reads the already expert-sorted
     /// `sortedExperts` buffer, writes `tileExpert`/`tileRowStart`/
     /// `tileRowCount` for BM=32 tiles - just the tile-height constant
@@ -6786,7 +6786,7 @@ public enum Ops {
         )
         let grid = MTLSize(width: nExperts, height: 1, depth: 1)
         let tg = MTLSize(width: nExperts, height: 1, depth: 1)
-        FFAIKernels.ffai_moe_build_tile_plan_bm32_f32(
+        IronKernels.iron_moe_build_tile_plan_bm32_f32(
             sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
             tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
             tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
@@ -6797,8 +6797,8 @@ public enum Ops {
             gridSize: grid, threadgroupSize: tg, on: cmd)
     }
 
-    /// Coop-core MoE gather GEMM (`ffai_moe_gather_qmm_coop`, F-85 gather
-    /// variant). Reuses `ffai_qmm_coop`'s inner loop/staging (TPG=128, 4 SG
+    /// Coop-core MoE gather GEMM (`iron_moe_gather_qmm_coop`, F-85 gather
+    /// variant). Reuses `iron_qmm_coop`'s inner loop/staging (TPG=128, 4 SG
     /// 2x2 warp grid, BN=64) against a BM=32 tile plan - the tile height
     /// matches this core's native M-tile exactly, so a plan tile maps to
     /// one threadgroup with no pairing logic, mirroring
@@ -6852,7 +6852,7 @@ public enum Ops {
 
         switch input.dtype {
         case .f32:
-            FFAIKernels.ffai_moe_gather_qmm_coop_f32_threadgroups(
+            IronKernels.iron_moe_gather_qmm_coop_f32_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -6865,7 +6865,7 @@ public enum Ops {
                 n_out: nOutU, k_in: kInU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_moe_gather_qmm_coop_f16_threadgroups(
+            IronKernels.iron_moe_gather_qmm_coop_f16_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -6878,7 +6878,7 @@ public enum Ops {
                 n_out: nOutU, k_in: kInU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_moe_gather_qmm_coop_bf16_threadgroups(
+            IronKernels.iron_moe_gather_qmm_coop_bf16_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -6915,14 +6915,14 @@ public enum Ops {
     /// Hand-encoded rather than routed through a generated `_threadgroups`
     /// wrapper: the generated Swift bindings only emit a fixed
     /// `dispatchThreadgroups(_:threadsPerThreadgroup:)` call taking a
-    /// host-computed `MTLSize`, with no indirect-buffer variant (metaltile
+    /// host-computed `MTLSize`, with no indirect-buffer variant (iron
     /// codegen limitation - out of scope to change for this fix). The PSO
     /// itself is unchanged (same pipeline the generated wrapper uses,
     /// fetched by the same name from the shared `PSOCache`), and every
     /// `setBuffer`/`setBytes` call below mirrors the generated
     /// `..._threadgroups` wrapper's binding order index-for-index - see
-    /// `ffai_moe_gather_qmm_coop_<dtype>_threadgroups` in
-    /// `FFAIKernels.swift` for the reference this must stay in sync with
+    /// `iron_moe_gather_qmm_coop_<dtype>_threadgroups` in
+    /// `IronKernels.swift` for the reference this must stay in sync with
     /// if that kernel's signature ever changes.
     public static func moeGatherDequantGemmInt4CoopTilePlanIndirect(
         input: Tensor,
@@ -6961,9 +6961,9 @@ public enum Ops {
 
         let kernelName: String
         switch input.dtype {
-        case .f32: kernelName = "ffai_moe_gather_qmm_coop_f32"
-        case .f16: kernelName = "ffai_moe_gather_qmm_coop_f16"
-        case .bf16: kernelName = "ffai_moe_gather_qmm_coop_bf16"
+        case .f32: kernelName = "iron_moe_gather_qmm_coop_f32"
+        case .f16: kernelName = "iron_moe_gather_qmm_coop_f16"
+        case .bf16: kernelName = "iron_moe_gather_qmm_coop_bf16"
         default:
             fatalError("Ops.moeGatherDequantGemmInt4CoopTilePlanIndirect: unsupported dtype \(input.dtype)")
         }
@@ -7001,7 +7001,7 @@ public enum Ops {
     }
 
     /// Device-side "own" BM=32 tile-plan builder for the F-85 tile-pairing
-    /// lever (`ffai_moe_build_tile_plan_bm32_own`). Same contract and same
+    /// lever (`iron_moe_build_tile_plan_bm32_own`). Same contract and same
     /// worst-case capacity as `moeBuildTilePlanBm32` - the only difference
     /// is that an expert's `1..=16`-row remainder does not get a tile here
     /// (those rows are pairing candidates, handled by the separate
@@ -7036,7 +7036,7 @@ public enum Ops {
         )
         let grid = MTLSize(width: nExperts, height: 1, depth: 1)
         let tg = MTLSize(width: nExperts, height: 1, depth: 1)
-        FFAIKernels.ffai_moe_build_tile_plan_bm32_own_f32(
+        IronKernels.iron_moe_build_tile_plan_bm32_own_f32(
             sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
             tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
             tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
@@ -7048,7 +7048,7 @@ public enum Ops {
     }
 
     /// Phase 1 of the parallelized tile-plan builders (F-85 small-M
-    /// follow-up, `ffai_moe_tile_plan_expert_counts`). Dispatches ONE
+    /// follow-up, `iron_moe_tile_plan_expert_counts`). Dispatches ONE
     /// THREADGROUP PER EXPERT (`nExperts` groups, one thread each) so every
     /// expert's binary search over `sortedExperts` runs concurrently across
     /// the GPU's cores instead of serially on the single core the original
@@ -7081,7 +7081,7 @@ public enum Ops {
         )
         let grid = MTLSize(width: nExperts, height: 1, depth: 1)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
-        FFAIKernels.ffai_moe_tile_plan_expert_counts_f32_threadgroups(
+        IronKernels.iron_moe_tile_plan_expert_counts_f32_threadgroups(
             sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
             expert_row_base: expertRowBase.buffer, expert_row_baseOffset: expertRowBase.offset,
             expert_count: expertCount.buffer, expert_countOffset: expertCount.offset,
@@ -7091,7 +7091,7 @@ public enum Ops {
 
     /// Parallelized sibling of `moeBuildTilePlan` (F-85 small-M follow-up):
     /// dispatches `moeTilePlanExpertCounts` (phase 1, per-expert parallel)
-    /// then `ffai_moe_build_tile_plan_parallel` (phase 2 - prefix sum +
+    /// then `iron_moe_build_tile_plan_parallel` (phase 2 - prefix sum +
     /// tile emission only, no per-lane binary search left). Identical
     /// output format/contract to `moeBuildTilePlan` - same
     /// `tileExpert`/`tileRowStart`/`tileRowCount`, same worst-case capacity
@@ -7122,7 +7122,7 @@ public enum Ops {
 
         let grid = MTLSize(width: 1, height: 1, depth: 1)
         let tg = MTLSize(width: nExperts, height: 1, depth: 1)
-        FFAIKernels.ffai_moe_build_tile_plan_parallel_f32_threadgroups(
+        IronKernels.iron_moe_build_tile_plan_parallel_f32_threadgroups(
             expert_row_base: expertRowBase.buffer, expert_row_baseOffset: expertRowBase.offset,
             expert_count: expertCount.buffer, expert_countOffset: expertCount.offset,
             tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
@@ -7166,7 +7166,7 @@ public enum Ops {
 
         let grid = MTLSize(width: 1, height: 1, depth: 1)
         let tg = MTLSize(width: nExperts, height: 1, depth: 1)
-        FFAIKernels.ffai_moe_build_tile_plan_bm32_parallel_f32_threadgroups(
+        IronKernels.iron_moe_build_tile_plan_bm32_parallel_f32_threadgroups(
             expert_row_base: expertRowBase.buffer, expert_row_baseOffset: expertRowBase.offset,
             expert_count: expertCount.buffer, expert_countOffset: expertCount.offset,
             tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
@@ -7213,7 +7213,7 @@ public enum Ops {
 
         let grid = MTLSize(width: 1, height: 1, depth: 1)
         let tg = MTLSize(width: nExperts, height: 1, depth: 1)
-        FFAIKernels.ffai_moe_build_tile_plan_bm32_own_parallel_f32_threadgroups(
+        IronKernels.iron_moe_build_tile_plan_bm32_own_parallel_f32_threadgroups(
             expert_row_base: expertRowBase.buffer, expert_row_baseOffset: expertRowBase.offset,
             expert_count: expertCount.buffer, expert_countOffset: expertCount.offset,
             tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
@@ -7226,7 +7226,7 @@ public enum Ops {
     }
 
     /// Device-side PAIR-ONLY BM=32 tile-plan builder for the F-85
-    /// tile-pairing lever (`ffai_moe_build_tile_plan_bm32_paired`). Reads
+    /// tile-pairing lever (`iron_moe_build_tile_plan_bm32_paired`). Reads
     /// the SAME `sortedExperts` array as `moeBuildTilePlanBm32Own` and
     /// produces the complementary `1..=16`-row remainder tiles those rows
     /// were excluded from, packed two experts to a tile (`_a`/`_b` halves,
@@ -7266,7 +7266,7 @@ public enum Ops {
         )
         let grid = MTLSize(width: nExperts, height: 1, depth: 1)
         let tg = MTLSize(width: nExperts, height: 1, depth: 1)
-        FFAIKernels.ffai_moe_build_tile_plan_bm32_paired_f32(
+        IronKernels.iron_moe_build_tile_plan_bm32_paired_f32(
             sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
             tile_expert_a: tileExpertA.buffer, tile_expert_aOffset: tileExpertA.offset,
             tile_row_start_a: tileRowStartA.buffer, tile_row_start_aOffset: tileRowStartA.offset,
@@ -7280,7 +7280,7 @@ public enum Ops {
             gridSize: grid, threadgroupSize: tg, on: cmd)
     }
 
-    /// Two-expert PAIRED-tile MoE gather GEMM (`ffai_moe_gather_qmm_coop_paired`,
+    /// Two-expert PAIRED-tile MoE gather GEMM (`iron_moe_gather_qmm_coop_paired`,
     /// F-85 tile-pairing lever). Separate dispatch from
     /// `moeGatherDequantGemmInt4CoopTilePlan` - fed the `moeBuildTilePlanBm32Paired`
     /// plan instead of the regular tile plan, over the SAME sorted-row
@@ -7335,7 +7335,7 @@ public enum Ops {
 
         switch input.dtype {
         case .f32:
-            FFAIKernels.ffai_moe_gather_qmm_coop_paired_f32_threadgroups(
+            IronKernels.iron_moe_gather_qmm_coop_paired_f32_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -7351,7 +7351,7 @@ public enum Ops {
                 n_out: nOutU, k_in: kInU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_moe_gather_qmm_coop_paired_f16_threadgroups(
+            IronKernels.iron_moe_gather_qmm_coop_paired_f16_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -7367,7 +7367,7 @@ public enum Ops {
                 n_out: nOutU, k_in: kInU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_moe_gather_qmm_coop_paired_bf16_threadgroups(
+            IronKernels.iron_moe_gather_qmm_coop_paired_bf16_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -7401,14 +7401,14 @@ public enum Ops {
     /// Hand-encoded rather than routed through a generated `_threadgroups`
     /// wrapper: the generated Swift bindings only emit a fixed
     /// `dispatchThreadgroups(_:threadsPerThreadgroup:)` call taking a
-    /// host-computed `MTLSize`, with no indirect-buffer variant (metaltile
+    /// host-computed `MTLSize`, with no indirect-buffer variant (iron
     /// codegen limitation - out of scope to change for this fix). The PSO
     /// itself is unchanged (same pipeline the generated wrapper uses,
     /// fetched by the same name from the shared `PSOCache`), and every
     /// `setBuffer`/`setBytes` call below mirrors the generated
     /// `..._threadgroups` wrapper's binding order index-for-index - see
-    /// `ffai_moe_gather_qmm_coop_paired_<dtype>_threadgroups` in
-    /// `FFAIKernels.swift` for the reference this must stay in sync with
+    /// `iron_moe_gather_qmm_coop_paired_<dtype>_threadgroups` in
+    /// `IronKernels.swift` for the reference this must stay in sync with
     /// if that kernel's signature ever changes.
     public static func moeGatherDequantGemmInt4CoopTilePlanPairedIndirect(
         input: Tensor,
@@ -7456,9 +7456,9 @@ public enum Ops {
 
         let kernelName: String
         switch input.dtype {
-        case .f32: kernelName = "ffai_moe_gather_qmm_coop_paired_f32"
-        case .f16: kernelName = "ffai_moe_gather_qmm_coop_paired_f16"
-        case .bf16: kernelName = "ffai_moe_gather_qmm_coop_paired_bf16"
+        case .f32: kernelName = "iron_moe_gather_qmm_coop_paired_f32"
+        case .f16: kernelName = "iron_moe_gather_qmm_coop_paired_f16"
+        case .bf16: kernelName = "iron_moe_gather_qmm_coop_paired_bf16"
         default:
             fatalError(
                 "Ops.moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: unsupported dtype \(input.dtype)"
@@ -7496,7 +7496,7 @@ public enum Ops {
 
     /// Multi-token Gated Delta Net recurrence over a chunk of `T` tokens.
     ///
-    /// Wraps `ffai_gated_delta_chunk` — same recurrence math as
+    /// Wraps `iron_gated_delta_chunk` — same recurrence math as
     /// `gatedDeltaStep` but runs the per-token loop *inside* the kernel
     /// with the recurrent state kept in per-lane registers across the
     /// entire `T` sweep. A single dispatch replaces `T` independent
@@ -7504,7 +7504,7 @@ public enum Ops {
     /// and written once at exit.
     ///
     /// Layout (matches the MLX-LM `_make_gated_delta_kernel` convention
-    /// the ffai-kernels-ffai kernel implements):
+    /// the iron-ffai kernel implements):
     ///   * `q, k`  : `[T, Hk, Dk]`   row-major  (B=1)
     ///   * `v, y`  : `[T, Hv, Dv]`   row-major
     ///   * `g, beta` : `[T, Hv]`     row-major
@@ -7519,7 +7519,7 @@ public enum Ops {
     /// tensors as well.
     ///
     /// Dispatch: grid `(Dv, Hv)` threadgroups, 32 threads (one simdgroup)
-    /// per group — identical to `ffai_gated_delta_step` apart from the
+    /// per group — identical to `iron_gated_delta_step` apart from the
     /// runtime `tLen`. `Dk % 32 == 0` invariant applies (max Dk = 256, so
     /// `n_per_t = Dk/32 ≤ 8` register entries per lane).
     public static func gatedDeltaChunk(
@@ -7554,7 +7554,7 @@ public enum Ops {
 
         switch q.dtype {
         case .f32:
-            FFAIKernels.ffai_gated_delta_chunk_f32(
+            IronKernels.iron_gated_delta_chunk_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, g: g.buffer, gOffset: g.offset,
                 beta: beta.buffer, betaOffset: beta.offset,
@@ -7566,7 +7566,7 @@ public enum Ops {
                 hv: UInt32(numValueHeads), hk: UInt32(numKeyHeads),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gated_delta_chunk_f16(
+            IronKernels.iron_gated_delta_chunk_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, g: g.buffer, gOffset: g.offset,
                 beta: beta.buffer, betaOffset: beta.offset,
@@ -7578,7 +7578,7 @@ public enum Ops {
                 hv: UInt32(numValueHeads), hk: UInt32(numKeyHeads),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gated_delta_chunk_bf16(
+            IronKernels.iron_gated_delta_chunk_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, g: g.buffer, gOffset: g.offset,
                 beta: beta.buffer, betaOffset: beta.offset,
@@ -7602,7 +7602,7 @@ public enum Ops {
         precondition(input.dtype == .f16)
         let result = out ?? Tensor.empty(shape: [h, t, d], dtype: .f16)
         var tU = UInt32(t), hU = UInt32(h), dU = UInt32(d)
-        let pso = PSOCache.shared.pipelineState(for: "ffai_transpose_thd_f16")
+        let pso = PSOCache.shared.pipelineState(for: "iron_transpose_thd_f16")
         guard let enc = cmd.makeComputeCommandEncoder() else { return result }
         enc.setComputePipelineState(pso)
         enc.setBuffer(input.buffer, offset: input.offset, index: 0)
@@ -7627,7 +7627,7 @@ public enum Ops {
         precondition(input.dtype == .f16)
         let result = out ?? Tensor.empty(shape: [t, h, d], dtype: .f16)
         var tU = UInt32(t), hU = UInt32(h), dU = UInt32(d)
-        let pso = PSOCache.shared.pipelineState(for: "ffai_transpose_htd_f16")
+        let pso = PSOCache.shared.pipelineState(for: "iron_transpose_htd_f16")
         guard let enc = cmd.makeComputeCommandEncoder() else { return result }
         enc.setComputePipelineState(pso)
         enc.setBuffer(input.buffer, offset: input.offset, index: 0)
@@ -7652,7 +7652,7 @@ public enum Ops {
         precondition(src.dtype == .f16 && kLen > 0 && kLen <= maxSeq)
         let result = out ?? Tensor.empty(shape: [nKV, kLen, headDim], dtype: .f16)
         var nKVU = UInt32(nKV), maxU = UInt32(maxSeq), kU = UInt32(kLen), dU = UInt32(headDim)
-        let pso = PSOCache.shared.pipelineState(for: "ffai_compact_kv_f16")
+        let pso = PSOCache.shared.pipelineState(for: "iron_compact_kv_f16")
         let ownsEnc = encoder == nil
         guard let enc = encoder ?? cmd.makeComputeCommandEncoder() else { return result }
         enc.setComputePipelineState(pso)
@@ -7675,7 +7675,7 @@ public enum Ops {
     /// q-head, T separate dispatches) with one dispatch that tiles the
     /// `T × K` attention matrix 32×16 with simdgroup_matrix MMAs.
     ///
-    /// Layout (per `ffai_sdpa_prefill_mma` in ffai-kernels-ffai):
+    /// Layout (per `iron_sdpa_prefill_mma` in iron-ffai):
     ///   * `q`   : `[n_q_heads, q_len, head_dim]`   row-major (B=1)
     ///   * `k,v` : `[n_kv_heads, k_len, head_dim]`  row-major
     ///   * `out` : `[n_q_heads, q_len, head_dim]`
@@ -7721,7 +7721,7 @@ public enum Ops {
 
         switch q.dtype {
         case .f32:
-            FFAIKernels.ffai_sdpa_prefill_mma_f32_threadgroups(
+            IronKernels.iron_sdpa_prefill_mma_f32_threadgroups(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -7732,7 +7732,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_sdpa_prefill_mma_f16_threadgroups(
+            IronKernels.iron_sdpa_prefill_mma_f16_threadgroups(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -7743,7 +7743,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_sdpa_prefill_mma_bf16_threadgroups(
+            IronKernels.iron_sdpa_prefill_mma_bf16_threadgroups(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -7776,18 +7776,18 @@ public enum Ops {
     ///
     /// Requires macOS 26.2+ on Apple10+ GPU (M5 Max) — the MPP path
     /// uses the cooperative-tensor `mpp::tensor_ops::matmul2d` per the
-    /// ffai-kernels MPP NAX primitive landing.
+    /// iron MPP NAX primitive landing.
     ///
     /// FIXED (2026-07-18, round-3 MoE tile lever). The 2026-05-21 note
     /// below described a real bug, now root-caused: this call used the
     /// plain `dispatchThreads`-based wrapper with `gridSize` scaled to
-    /// TOTAL THREADS (`(nOut/64)*128`), but `ffai_moe_gather_qmm_mma_
+    /// TOTAL THREADS (`(nOut/64)*128`), but `iron_moe_gather_qmm_mma_
     /// int4_bm64_mpp` is a coop_tile / cooperative-tensor kernel, and the
     /// codegen itself documents that `dispatchThreads` puts Metal in
     /// non-uniform-threadgroup mode. That silently produces wrong
     /// results for `matmul2d`, even when the grid divides evenly by the
     /// threadgroup size (see `emit_swift_wrapper_threadgroups` in
-    /// ffai-kernels-codegen/src/emit.rs). The already-shipped Hy3 int2
+    /// wh-iron-codegen/src/emit.rs). The already-shipped Hy3 int2
     /// BM64 / expert-grid path (`moeGatherDequantGemmInt2` above) never
     /// hit this because it hand-encodes `dispatchThreadgroups` directly
     /// instead of going through the generated wrapper. That is the
@@ -7800,7 +7800,7 @@ public enum Ops {
     /// was Swift-side dispatch, not the tile logic.
     ///
     /// Old warning (2026-05-21, root cause now known): dispatch shape
-    /// matched the metaltile-std `moe_gather_qmm_mpp_bm64_correctness`
+    /// matched the wh-iron-std `moe_gather_qmm_mpp_bm64_correctness`
     /// test (grid = `[ceil(N/64), ceil(M/64), 1]` threadgroups, tg =
     /// `[128, 1, 1]` for 4 SGs WM=WN=2), but `forwardManyEquivalence` at
     /// T=8 mTotal=64 produced top-1 argmax 279 with logit 12.25 vs
@@ -7849,7 +7849,7 @@ public enum Ops {
             kIn % 32 == 0,
             "moeGatherDequantGemmInt4Bm64Mpp: kIn (\(kIn)) must be multiple of 32 (BK tile)")
 
-        // Per `ffai-kernels-std/src/ffai/moe_mpp_bm64.rs`:
+        // Per `crates/wh-iron-std/src/kernels/moe/moe_mpp_bm64.rs`:
         //   BM = BN = 64, BK = 32. 4 SGs per TG, WM = WN = 2.
         //   Threadgroup size [128, 1, 1]. Grid [N/64, ceil(M/64), 1].
         // This is a coop_tile (cooperative-tensor matmul2d) kernel, so the
@@ -7858,7 +7858,7 @@ public enum Ops {
         // the already-shipped Hy3 int2 BM64 / expert-grid path just above.
         // The plain (thread-count, `dispatchThreads`) wrapper puts Metal
         // in non-uniform-threadgroup mode, which is documented (see
-        // ffai-kernels-codegen/src/emit.rs) to silently corrupt
+        // wh-iron-codegen/src/emit.rs) to silently corrupt
         // cooperative-tensor kernels even on an evenly-divided grid, and
         // was the actual cause of the 2026-05-21 correctness bug this
         // kernel was gated off for.
@@ -7875,7 +7875,7 @@ public enum Ops {
 
         switch input.dtype {
         case .f32:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_f32_threadgroups(
+            IronKernels.iron_moe_gather_qmm_mma_int4_bm64_mpp_f32_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -7886,7 +7886,7 @@ public enum Ops {
                 group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_f16_threadgroups(
+            IronKernels.iron_moe_gather_qmm_mma_int4_bm64_mpp_f16_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -7897,7 +7897,7 @@ public enum Ops {
                 group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_bf16_threadgroups(
+            IronKernels.iron_moe_gather_qmm_mma_int4_bm64_mpp_bf16_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -7918,7 +7918,7 @@ public enum Ops {
     /// MoE path — one dispatch over T·hidden elements vs the
     /// `mTotal × 2` separate dispatches.
     ///
-    /// Layout (per `ffai-kernels-std/src/ffai/moe.rs`):
+    /// Layout (per `wh-iron-std/src/ffai/moe.rs`):
     ///   - `expertOutputs`: `[k·B·T, hidden]` per-expert dense outputs at
     ///     expert-sorted positions
     ///   - `invPerm`: `[B·T, k]` u32 — where (token, slot) was placed in
@@ -7966,7 +7966,7 @@ public enum Ops {
         let kU = UInt32(k)
         switch out.dtype {
         case .f32:
-            FFAIKernels.ffai_moe_unpermute_f32(
+            IronKernels.iron_moe_unpermute_f32(
                 expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
                 inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
                 top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
@@ -7974,7 +7974,7 @@ public enum Ops {
                 hidden: hiddenU, k: kU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_moe_unpermute_f16(
+            IronKernels.iron_moe_unpermute_f16(
                 expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
                 inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
                 top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
@@ -7982,7 +7982,7 @@ public enum Ops {
                 hidden: hiddenU, k: kU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_moe_unpermute_bf16(
+            IronKernels.iron_moe_unpermute_bf16(
                 expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
                 inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
                 top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
@@ -8048,7 +8048,7 @@ public enum Ops {
 
         switch input.dtype {
         case .f32:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm8_mpp_f32(
+            IronKernels.iron_moe_gather_qmm_mma_int4_bm8_mpp_f32(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -8059,7 +8059,7 @@ public enum Ops {
                 group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm8_mpp_f16(
+            IronKernels.iron_moe_gather_qmm_mma_int4_bm8_mpp_f16(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -8070,7 +8070,7 @@ public enum Ops {
                 group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm8_mpp_bf16(
+            IronKernels.iron_moe_gather_qmm_mma_int4_bm8_mpp_bf16(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -8090,7 +8090,7 @@ public enum Ops {
     // One dispatch absorbs the per-head q/k RMSNorm + g/beta math +
     // the existing GDN recurrence step, collapsing the 3 host
     // commit+wait pairs in Qwen35GDNMixer.forward down to 1. Same
-    // dispatch geometry as `ffai_gated_delta_step`:
+    // dispatch geometry as `iron_gated_delta_step`:
     //   grid = [dv, B·hv, 1]
     //   tg   = [32, 1, 1]
     // `convOut` layout: `[B, 2·Hk·Dk + Hv·Dv]` — q | k | v slabs.
@@ -8140,7 +8140,7 @@ public enum Ops {
 
         switch convOut.dtype {
         case .f32:
-            FFAIKernels.ffai_gated_delta_prep_step_f32(
+            IronKernels.iron_gated_delta_prep_step_f32(
                 conv_out: convOut.buffer, conv_outOffset: convOut.offset,
                 a_log: aLog.buffer, a_logOffset: aLog.offset,
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
@@ -8154,7 +8154,7 @@ public enum Ops {
                 dk: dkU, dv: dvU, hv: hvU, hk: hkU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gated_delta_prep_step_f16(
+            IronKernels.iron_gated_delta_prep_step_f16(
                 conv_out: convOut.buffer, conv_outOffset: convOut.offset,
                 a_log: aLog.buffer, a_logOffset: aLog.offset,
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
@@ -8168,7 +8168,7 @@ public enum Ops {
                 dk: dkU, dv: dvU, hv: hvU, hk: hkU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gated_delta_prep_step_bf16(
+            IronKernels.iron_gated_delta_prep_step_bf16(
                 conv_out: convOut.buffer, conv_outOffset: convOut.offset,
                 a_log: aLog.buffer, a_logOffset: aLog.offset,
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
@@ -8234,7 +8234,7 @@ public enum Ops {
         let hkU = UInt32(hk)
         switch convOut.dtype {
         case .f32:
-            FFAIKernels.ffai_gated_delta_qknorm_prepass_f32(
+            IronKernels.iron_gated_delta_qknorm_prepass_f32(
                 conv_out: convOut.buffer, conv_outOffset: convOut.offset,
                 q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
                 k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
@@ -8244,7 +8244,7 @@ public enum Ops {
                 dk: dkU, dv: dvU, hv: hvU, hk: hkU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gated_delta_qknorm_prepass_f16(
+            IronKernels.iron_gated_delta_qknorm_prepass_f16(
                 conv_out: convOut.buffer, conv_outOffset: convOut.offset,
                 q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
                 k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
@@ -8254,7 +8254,7 @@ public enum Ops {
                 dk: dkU, dv: dvU, hv: hvU, hk: hkU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gated_delta_qknorm_prepass_bf16(
+            IronKernels.iron_gated_delta_qknorm_prepass_bf16(
                 conv_out: convOut.buffer, conv_outOffset: convOut.offset,
                 q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
                 k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
@@ -8332,7 +8332,7 @@ public enum Ops {
         let hkU = UInt32(hk)
         switch convOut.dtype {
         case .f32:
-            FFAIKernels.ffai_gated_delta_prep_chunk_f32(
+            IronKernels.iron_gated_delta_prep_chunk_f32(
                 conv_out: convOut.buffer, conv_outOffset: convOut.offset,
                 a_log: aLog.buffer, a_logOffset: aLog.offset,
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
@@ -8347,7 +8347,7 @@ public enum Ops {
                 dk: dkU, dv: dvU, hv: hvU, hk: hkU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gated_delta_prep_chunk_f16(
+            IronKernels.iron_gated_delta_prep_chunk_f16(
                 conv_out: convOut.buffer, conv_outOffset: convOut.offset,
                 a_log: aLog.buffer, a_logOffset: aLog.offset,
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
@@ -8362,7 +8362,7 @@ public enum Ops {
                 dk: dkU, dv: dvU, hv: hvU, hk: hkU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gated_delta_prep_chunk_bf16(
+            IronKernels.iron_gated_delta_prep_chunk_bf16(
                 conv_out: convOut.buffer, conv_outOffset: convOut.offset,
                 a_log: aLog.buffer, a_logOffset: aLog.offset,
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
@@ -8393,10 +8393,10 @@ public enum Ops {
     /// shader compiler, and the per-lane `state_reg`/`k_cache` arrays can't
     /// be unrolled into registers; every iteration of the T-token recurrence
     /// pays a real indexed-memory round trip instead. This dispatches a
-    /// sibling kernel (`ffai_gated_delta_prep_chunk_fast_d128_128_32_16`)
+    /// sibling kernel (`iron_gated_delta_prep_chunk_fast_d128_128_32_16`)
     /// that bakes `Dk`/`Dv`/`Hv`/`Hk` as true Rust-level compile-time
     /// constants (`#[kernel(variants(...))]`, the same mechanism already
-    /// used by `ffai_gated_delta_step_record`'s shape specialization), so
+    /// used by `iron_gated_delta_step_record`'s shape specialization), so
     /// the Metal compiler can fully unroll and register-promote. Measured
     /// ~3.7-4.2x faster than the generic kernel at this exact shape (see
     /// `bench_gated_delta_prep_chunk_fast_t1024` / `_t4096` vs
@@ -8441,7 +8441,7 @@ public enum Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch convOut.dtype {
         case .f32:
-            FFAIKernels.ffai_gated_delta_prep_chunk_fast_d128_128_32_16_f32(
+            IronKernels.iron_gated_delta_prep_chunk_fast_d128_128_32_16_f32(
                 conv_out: convOut.buffer, conv_outOffset: convOut.offset,
                 a_log: aLog.buffer, a_logOffset: aLog.offset,
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
@@ -8455,7 +8455,7 @@ public enum Ops {
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gated_delta_prep_chunk_fast_d128_128_32_16_f16(
+            IronKernels.iron_gated_delta_prep_chunk_fast_d128_128_32_16_f16(
                 conv_out: convOut.buffer, conv_outOffset: convOut.offset,
                 a_log: aLog.buffer, a_logOffset: aLog.offset,
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
@@ -8469,7 +8469,7 @@ public enum Ops {
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gated_delta_prep_chunk_fast_d128_128_32_16_bf16(
+            IronKernels.iron_gated_delta_prep_chunk_fast_d128_128_32_16_bf16(
                 conv_out: convOut.buffer, conv_outOffset: convOut.offset,
                 a_log: aLog.buffer, a_logOffset: aLog.offset,
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
@@ -8487,7 +8487,7 @@ public enum Ops {
         }
     }
 
-    // ─── Chunked-WY GDN prefill (`ffai_gdn_wy_plan` + `ffai_gdn_wy_scan`) ──
+    // ─── Chunked-WY GDN prefill (`iron_gdn_wy_plan` + `iron_gdn_wy_scan`) ──
     //
     // Opt-in alternative to `gatedDeltaPrepChunk` — see
     // `Qwen35GDNMixer.forwardManyChunked` for the `FFAI_GDN_WY=1` gate and
@@ -8507,7 +8507,7 @@ public enum Ops {
         return Tensor(buffer: buf, offset: 0, shape: shape, dtype: dtype)
     }
 
-    /// General N-D strided copy/broadcast, wrapping `ffai_strided_copy_nd`
+    /// General N-D strided copy/broadcast, wrapping `iron_strided_copy_nd`
     /// (module doc: handles padded copies, transposes, broadcasts via a
     /// zero stride, and arbitrary slices). `shape`/`strides` are **element**
     /// counts, not bytes; `rank = shape.count`. `srcBuffer`/`srcByteOffset`
@@ -8544,7 +8544,7 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(nOut)
         switch dtype {
         case .f32:
-            FFAIKernels.ffai_strided_copy_nd_f32(
+            IronKernels.iron_strided_copy_nd_f32(
                 src: srcBuffer, srcOffset: srcByteOffset,
                 shape: shapeBuf, shapeOffset: 0,
                 strides: stridesBuf, stridesOffset: 0,
@@ -8552,7 +8552,7 @@ public enum Ops {
                 rank: UInt32(rank),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_strided_copy_nd_f16(
+            IronKernels.iron_strided_copy_nd_f16(
                 src: srcBuffer, srcOffset: srcByteOffset,
                 shape: shapeBuf, shapeOffset: 0,
                 strides: stridesBuf, stridesOffset: 0,
@@ -8560,7 +8560,7 @@ public enum Ops {
                 rank: UInt32(rank),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_strided_copy_nd_bf16(
+            IronKernels.iron_strided_copy_nd_bf16(
                 src: srcBuffer, srcOffset: srcByteOffset,
                 shape: shapeBuf, shapeOffset: 0,
                 strides: stridesBuf, stridesOffset: 0,
@@ -8573,21 +8573,21 @@ public enum Ops {
     }
 
     /// Per-token GDN gate/beta for the chunked-WY prefill pipeline
-    /// (`ffai_gdn_wy_plan`/`ffai_gdn_wy_scan`), which — unlike
+    /// (`iron_gdn_wy_plan`/`iron_gdn_wy_scan`), which — unlike
     /// `gatedDeltaPrepChunk` — consume precomputed `g`/`beta` tensors
     /// instead of computing them internally from raw `a_raw`/`b_raw` +
     /// `a_log`/`dt_bias`.
     ///
-    /// Dispatches the fused `ffai_gdn_gate_beta` kernel (one dispatch),
+    /// Dispatches the fused `iron_gdn_gate_beta` kernel (one dispatch),
     /// replacing what used to be a ~6-dispatch elementwise chain (sigmoid,
     /// two broadcasts, add, softplus, mul, exp — see git history for the
     /// old implementation).
     ///
     /// Math (identical to `gatedDeltaPrepChunk`'s internal per-token g/beta
-    /// — same un-clamped softplus `ffai_gated_delta_prep_chunk` bakes in,
+    /// — same un-clamped softplus `iron_gated_delta_prep_chunk` bakes in,
     /// `log(exp(x)+1)`; the fused kernel now matches that production
     /// oracle's formula exactly, superseding the old chain's use of the
-    /// numerically-stable `ffai_softplus` kernel — the same real value
+    /// numerically-stable `iron_softplus` kernel — the same real value
     /// away from overflow, which the learned `a_raw`/`dt_bias` activations
     /// never approach):
     ///   - `dt   = log(exp(a_raw + dt_bias) + 1)`
@@ -8625,7 +8625,7 @@ public enum Ops {
         let tgWidth = min(n, 256)
         let grid = MTLSize(width: n, height: 1, depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
-        FFAIKernels.ffai_gdn_gate_beta_f32(
+        IronKernels.iron_gdn_gate_beta_f32(
             a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
             b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
             dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
@@ -8636,8 +8636,8 @@ public enum Ops {
             gridSize: grid, threadgroupSize: tg, on: cmd)
     }
 
-    /// Chunked-WY GDN prefill — two-kernel (`ffai_gdn_wy_plan` +
-    /// `ffai_gdn_wy_scan`) alternative to `gatedDeltaPrepChunk`. Opt-in via
+    /// Chunked-WY GDN prefill — two-kernel (`iron_gdn_wy_plan` +
+    /// `iron_gdn_wy_scan`) alternative to `gatedDeltaPrepChunk`. Opt-in via
     /// `FFAI_GDN_WY=1`, default OFF (see `Qwen35GDNMixer.forwardManyChunked`).
     ///
     /// `_plan`/`_scan`'s v1 require `t_len` to be an exact multiple of
@@ -8656,12 +8656,12 @@ public enum Ops {
     ///
     /// Shape contract (B=1, matching the mixer's batching):
     ///   - `convOut`         : `[T, 2·Hk·Dk + Hv·Dv]` fp32 — the `v` slab is
-    ///     sliced out of its packed row here (`ffai_gdn_wy_plan` wants a
+    ///     sliced out of its packed row here (`iron_gdn_wy_plan` wants a
     ///     dense `[T,Hv,Dv]`, unlike `gatedDeltaPrepChunk`, which reads the
     ///     packed layout directly).
     ///   - `qNormed`/`kNormed` : `[T, Hk, Dk]` fp32, from
     ///     `gatedDeltaQKNormPrepass` (reused as-is — already the dense
-    ///     layout `ffai_gdn_wy_plan` wants).
+    ///     layout `iron_gdn_wy_plan` wants).
     ///   - `aRaw`/`bRaw`     : `[T, Hv]` fp32, from `castToF32Two`.
     ///   - `stateIn`/`stateOut` : `[Hv, Dv, Dk]` fp32 recurrent state.
     ///   - `y`               : `[T, Hv, Dv]` fp32 (matches `gatedDeltaPrepChunk`'s `y`) —
@@ -8683,10 +8683,10 @@ public enum Ops {
                 + "caller must fall back to gatedDeltaPrepChunk when there's no full chunk")
         precondition(
             dk % 16 == 0 && dv % 16 == 0,
-            "Ops.gatedDeltaWYPrefill: dk/dv (\(dk)/\(dv)) must be multiples of 16 (ffai_gdn_wy_plan MMA tiling)")
+            "Ops.gatedDeltaWYPrefill: dk/dv (\(dk)/\(dv)) must be multiples of 16 (iron_gdn_wy_plan MMA tiling)")
         precondition(
             dv % 32 == 0,
-            "Ops.gatedDeltaWYPrefill: dv (\(dv)) must be a multiple of 32 (ffai_gdn_wy_scan v1 requirement)")
+            "Ops.gatedDeltaWYPrefill: dv (\(dv)) must be a multiple of 32 (iron_gdn_wy_scan v1 requirement)")
         precondition(
             hv % hk == 0,
             "Ops.gatedDeltaWYPrefill: hv (\(hv)) must be a multiple of hk (\(hk)) (GQA)")
@@ -8834,11 +8834,11 @@ public enum Ops {
         let uS = wyScratchTensor(
             shape: [n * nc * dv * dk], dtype: .f32, tag: "gdn_wy_us_\(n)x\(nc)x\(dv)x\(dk)", device: device)
 
-        // ── K1: ffai_gdn_wy_plan — chunk-parallel, dispatchThreadgroups
+        // ── K1: iron_gdn_wy_plan — chunk-parallel, dispatchThreadgroups
         // (coop_tile/MMA kernel). Grid (TGs): [Tpadded/C, B·Hv, 1], TG [512,1,1].
         let gridK1 = MTLSize(width: nc, height: n, depth: 1)
         let tgK1 = MTLSize(width: 512, height: 1, depth: 1)
-        FFAIKernels.ffai_gdn_wy_plan_f32_threadgroups(
+        IronKernels.iron_gdn_wy_plan_f32_threadgroups(
             q: qForKernel.buffer, qOffset: qForKernel.offset,
             k: kForKernel.buffer, kOffset: kForKernel.offset,
             v: vAll.buffer, vOffset: vAll.offset,
@@ -8853,11 +8853,11 @@ public enum Ops {
             dk: UInt32(dk), dv: UInt32(dv), hv: UInt32(hv), hk: UInt32(hk), c: UInt32(c),
             gridSize: gridK1, threadgroupSize: tgK1, on: cmd)
 
-        // ── K2: ffai_gdn_wy_scan — chunk-sequential, dispatchThreadgroups.
+        // ── K2: iron_gdn_wy_scan — chunk-sequential, dispatchThreadgroups.
         // Grid (TGs): [Dv/32, B·Hv, 1], TG [128,1,1].
         let gridK2 = MTLSize(width: dv / 32, height: n, depth: 1)
         let tgK2 = MTLSize(width: 128, height: 1, depth: 1)
-        FFAIKernels.ffai_gdn_wy_scan_f32_threadgroups(
+        IronKernels.iron_gdn_wy_scan_f32_threadgroups(
             q_eff: qEff.buffer, q_effOffset: qEff.offset,
             y_local: yLocal.buffer, y_localOffset: yLocal.offset,
             p_s: pS.buffer, p_sOffset: pS.offset,
@@ -8883,8 +8883,8 @@ public enum Ops {
 
     // ─── Dynamic-M batched-prefill int4 qmm ───────────────────────────
     //
-    // Host-side driver around `ffai_qmm_mma` (and, at bits=4 on eligible
-    // shapes/hardware, the faster `ffai_qmm_coop` / `ffai_qmm_mma_mpp`
+    // Host-side driver around `iron_qmm_mma` (and, at bits=4 on eligible
+    // shapes/hardware, the faster `iron_qmm_coop` / `iron_qmm_mma_mpp`
     // cooperative-tensor tiers; see `dispatchQmmMma`'s doc for the
     // priority order). The BN=32 kernels' dispatch grid is
     // `[N/32, ceil(M/32), 1]` × tg `[128, 1, 1]` — M is purely grid-Y
@@ -8894,12 +8894,12 @@ public enum Ops {
     // collapse to `0` at every valid output column (`s · Σ q·x + b · Σ x`
     // with `x ≡ 0`).
     //
-    // The Rust-side ffai-kernels-ffai counterpart lives in
-    // `crates/ffai-kernels-std/src/mlx/quantized_mma_dynamic_m.rs` and has
+    // The Rust-side iron-ffai counterpart lives in
+    // `crates/crates/wh-iron-std/src/kernels/gemm/quantized_mma_dynamic_m.rs` and has
     // 7/7 GPU correctness cells including the bf16 T=4096 N=K=2048 Qwen3.6
     // production shape (cos 0.999999). This Swift wrapper is the host-side
     // equivalent — same padding contract, same dispatch geometry, dispatched
-    // through the regenerated `FFAIKernels.ffai_qmm_mma_*` bindings.
+    // through the regenerated `IronKernels.iron_qmm_mma_*` bindings.
     //
     // Use this when `T > 1` (the batched-prefill case). For T=1 the regular
     // per-token dequant path is faster (the mma kernel pays full weight-tile
@@ -9028,9 +9028,9 @@ public enum Ops {
         var gsU = UInt32(gsPerRow)
         let psoName: String
         switch input.dtype {
-        case .f32: psoName = "ffai_qmm_mma_mpp_int8_f32"
-        case .f16: psoName = "ffai_qmm_mma_mpp_int8_f16"
-        case .bf16: psoName = "ffai_qmm_mma_mpp_int8_bf16"
+        case .f32: psoName = "iron_qmm_mma_mpp_int8_f32"
+        case .f16: psoName = "iron_qmm_mma_mpp_int8_f16"
+        case .bf16: psoName = "iron_qmm_mma_mpp_int8_bf16"
         default: fatalError("encodeDequantGemmInt8Mpp: dtype \(input.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -9059,7 +9059,7 @@ public enum Ops {
         ProcessInfo.processInfo.environment["FFAI_QMM_COOP"]
 
     /// Inner dispatcher for `dequantGemmDynamicM`. Grid is `[N/32, M/32, 1]`
-    /// × tg `[128, 1, 1]` (4 SGs WM=WN=2 per the canonical `ffai_qmm_mma`).
+    /// × tg `[128, 1, 1]` (4 SGs WM=WN=2 per the canonical `iron_qmm_mma`).
     /// `dispatchThreads` counts total threads per axis, so grid.x = N/32·128.
     /// `bits` selects the int4 (unsuffixed) or int2 variant; the int2 kernel
     /// uses the same geometry but unpacks 16 codes per u32 (vs 8 nibbles).
@@ -9069,7 +9069,7 @@ public enum Ops {
     /// path); the `m/32` grid math below silently truncates otherwise.
     ///
     /// bits=4 additionally prefers, in order:
-    ///  1. `ffai_qmm_coop` (BN=64 wide-N cooperative-tensor kernel, two
+    ///  1. `iron_qmm_coop` (BN=64 wide-N cooperative-tensor kernel, two
     ///     `matmul2d` ops per simdgroup sharing one staged X-tile; see its
     ///     module doc for the isolated-bench case for widening past MPP's
     ///     BN=32). Requires `n % 64 == 0` in addition to the group-size
@@ -9079,14 +9079,14 @@ public enum Ops {
     ///     `=1` (force on); unset auto-detects on `Ops.mppAutoCapable`
     ///     hardware (default ON there; this is the fastest of the three
     ///     tiers on every dense int4 shape measured so far).
-    ///  2. `ffai_qmm_mma_mpp` (MPP/NAX cooperative-tensor kernel,
+    ///  2. `iron_qmm_mma_mpp` (MPP/NAX cooperative-tensor kernel,
     ///     live-compiled via `MetalPerformancePrimitives`) over the manual
     ///     simdgroup ladder, same idea as the existing bits=8 MPP arm
     ///     below. Gate: `Ops.mppAutoCapable` (Apple GPU Family 9+ /
     ///     macOS 26+, the same cached capability check the MoE bgemm work
     ///     added; reused here rather than duplicated), overridable via
     ///     `FFAI_QMM_MPP=0` (force off) / `FFAI_QMM_MPP=1` (force on).
-    ///  3. `ffai_qmm_mma` (manual simdgroup ladder), the fallback for any
+    ///  3. `iron_qmm_mma` (manual simdgroup ladder), the fallback for any
     ///     shape or hardware neither tier above can serve.
     /// Both cooperative-tensor kernels bake `group_size=64` (Qwen3.6-A3B's
     /// default; see their module docs); a caller quantized at a different
@@ -9111,7 +9111,7 @@ public enum Ops {
             width: tgGrid.width * tgWidth,
             height: tgGrid.height,
             depth: 1)
-        // ffai_qmm_coop's BN=64 tile halves the N-tile count vs the BN=32
+        // iron_qmm_coop's BN=64 tile halves the N-tile count vs the BN=32
         // tiers above.
         let coopGrid = MTLSize(width: n / 64, height: m / 32, depth: 1)
         let kU = UInt32(k)
@@ -9136,7 +9136,7 @@ public enum Ops {
         switch (bits, input.dtype) {
         case (4, .f32):
             if useCoop4 {
-                FFAIKernels.ffai_qmm_coop_f32_threadgroups(
+                IronKernels.iron_qmm_coop_f32_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9145,7 +9145,7 @@ public enum Ops {
                     k: kU, n: nU, gs_per_row: gsU,
                     gridSize: coopGrid, threadgroupSize: tg, on: cmd)
             } else if useMpp4 {
-                FFAIKernels.ffai_qmm_mma_mpp_f32_threadgroups(
+                IronKernels.iron_qmm_mma_mpp_f32_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9154,7 +9154,7 @@ public enum Ops {
                     k: kU, n: nU, gs_per_row: gsU,
                     gridSize: tgGrid, threadgroupSize: tg, on: cmd)
             } else {
-                FFAIKernels.ffai_qmm_mma_f32(
+                IronKernels.iron_qmm_mma_f32(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9165,7 +9165,7 @@ public enum Ops {
             }
         case (4, .f16):
             if useCoop4 {
-                FFAIKernels.ffai_qmm_coop_f16_threadgroups(
+                IronKernels.iron_qmm_coop_f16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9174,7 +9174,7 @@ public enum Ops {
                     k: kU, n: nU, gs_per_row: gsU,
                     gridSize: coopGrid, threadgroupSize: tg, on: cmd)
             } else if useMpp4 {
-                FFAIKernels.ffai_qmm_mma_mpp_f16_threadgroups(
+                IronKernels.iron_qmm_mma_mpp_f16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9183,7 +9183,7 @@ public enum Ops {
                     k: kU, n: nU, gs_per_row: gsU,
                     gridSize: tgGrid, threadgroupSize: tg, on: cmd)
             } else {
-                FFAIKernels.ffai_qmm_mma_f16(
+                IronKernels.iron_qmm_mma_f16(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9194,7 +9194,7 @@ public enum Ops {
             }
         case (4, .bf16):
             if useCoop4 {
-                FFAIKernels.ffai_qmm_coop_bf16_threadgroups(
+                IronKernels.iron_qmm_coop_bf16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9203,7 +9203,7 @@ public enum Ops {
                     k: kU, n: nU, gs_per_row: gsU,
                     gridSize: coopGrid, threadgroupSize: tg, on: cmd)
             } else if useMpp4 {
-                FFAIKernels.ffai_qmm_mma_mpp_bf16_threadgroups(
+                IronKernels.iron_qmm_mma_mpp_bf16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9212,7 +9212,7 @@ public enum Ops {
                     k: kU, n: nU, gs_per_row: gsU,
                     gridSize: tgGrid, threadgroupSize: tg, on: cmd)
             } else {
-                FFAIKernels.ffai_qmm_mma_bf16(
+                IronKernels.iron_qmm_mma_bf16(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9222,7 +9222,7 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             }
         case (2, .f32):
-            FFAIKernels.ffai_qmm_mma_int2_f32(
+            IronKernels.iron_qmm_mma_int2_f32(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -9231,7 +9231,7 @@ public enum Ops {
                 k: kU, n: nU, gs_per_row: gsU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .f16):
-            FFAIKernels.ffai_qmm_mma_int2_f16(
+            IronKernels.iron_qmm_mma_int2_f16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -9240,7 +9240,7 @@ public enum Ops {
                 k: kU, n: nU, gs_per_row: gsU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (2, .bf16):
-            FFAIKernels.ffai_qmm_mma_int2_bf16(
+            IronKernels.iron_qmm_mma_int2_bf16(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
@@ -9251,7 +9251,7 @@ public enum Ops {
         case (8, .f32):
             // Prefer MPP/NAX int8 (live-compile) unless FFAI_HY3_QMM_MMA=1.
             if ProcessInfo.processInfo.environment["FFAI_HY3_QMM_MMA"] == nil {
-                FFAIKernels.ffai_qmm_mma_mpp_int8_f32_threadgroups(
+                IronKernels.iron_qmm_mma_mpp_int8_f32_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9260,7 +9260,7 @@ public enum Ops {
                     k: kU, n: nU, gs_per_row: gsU,
                     gridSize: tgGrid, threadgroupSize: tg, on: cmd)
             } else {
-                FFAIKernels.ffai_qmm_mma_int8_f32(
+                IronKernels.iron_qmm_mma_int8_f32(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9271,7 +9271,7 @@ public enum Ops {
             }
         case (8, .f16):
             if ProcessInfo.processInfo.environment["FFAI_HY3_QMM_MMA"] == nil {
-                FFAIKernels.ffai_qmm_mma_mpp_int8_f16_threadgroups(
+                IronKernels.iron_qmm_mma_mpp_int8_f16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9280,7 +9280,7 @@ public enum Ops {
                     k: kU, n: nU, gs_per_row: gsU,
                     gridSize: tgGrid, threadgroupSize: tg, on: cmd)
             } else {
-                FFAIKernels.ffai_qmm_mma_int8_f16(
+                IronKernels.iron_qmm_mma_int8_f16(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9291,7 +9291,7 @@ public enum Ops {
             }
         case (8, .bf16):
             if ProcessInfo.processInfo.environment["FFAI_HY3_QMM_MMA"] == nil {
-                FFAIKernels.ffai_qmm_mma_mpp_int8_bf16_threadgroups(
+                IronKernels.iron_qmm_mma_mpp_int8_bf16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9300,7 +9300,7 @@ public enum Ops {
                     k: kU, n: nU, gs_per_row: gsU,
                     gridSize: tgGrid, threadgroupSize: tg, on: cmd)
             } else {
-                FFAIKernels.ffai_qmm_mma_int8_bf16(
+                IronKernels.iron_qmm_mma_int8_bf16(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
@@ -9316,7 +9316,7 @@ public enum Ops {
 
     // ─── GPU-side cast to fp32 ────────────────────────────────────────
     //
-    // Wraps `ffai_cast_to_f32_{bf16,f16,f32}`. Per-element copy with dtype
+    // Wraps `iron_cast_to_f32_{bf16,f16,f32}`. Per-element copy with dtype
     // promotion. Used to bridge bf16 / f16 model activations into kernels
     // that require fp32 inputs (the fused GDN prep step is the immediate
     // consumer — it runs against the fp32 recurrence state to avoid the
@@ -9344,12 +9344,12 @@ public enum Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch input.dtype {
         case .f16:
-            FFAIKernels.ffai_silu_cast_to_f32_f16(
+            IronKernels.iron_silu_cast_to_f32_f16(
                 input: input.buffer, inputOffset: input.offset,
                 out: output.buffer, outOffset: output.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_silu_cast_to_f32_bf16(
+            IronKernels.iron_silu_cast_to_f32_bf16(
                 input: input.buffer, inputOffset: input.offset,
                 out: output.buffer, outOffset: output.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
@@ -9382,9 +9382,9 @@ public enum Ops {
             "Ops.castToF32Two: b / outB element-count mismatch")
         let psoName: String
         switch a.dtype {
-        case .bf16: psoName = "ffai_cast_to_f32_bf16"
-        case .f16: psoName = "ffai_cast_to_f32_f16"
-        case .f32: psoName = "ffai_cast_to_f32_f32"
+        case .bf16: psoName = "iron_cast_to_f32_bf16"
+        case .f16: psoName = "iron_cast_to_f32_f16"
+        case .f32: psoName = "iron_cast_to_f32_f32"
         default: fatalError("Ops.castToF32Two: unsupported dtype \(a.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -9432,9 +9432,9 @@ public enum Ops {
             "Ops.castToF32Three: c / outC element-count mismatch")
         let psoName: String
         switch a.dtype {
-        case .bf16: psoName = "ffai_cast_to_f32_bf16"
-        case .f16: psoName = "ffai_cast_to_f32_f16"
-        case .f32: psoName = "ffai_cast_to_f32_f32"
+        case .bf16: psoName = "iron_cast_to_f32_bf16"
+        case .f16: psoName = "iron_cast_to_f32_f16"
+        case .f32: psoName = "iron_cast_to_f32_f32"
         default: fatalError("Ops.castToF32Three: unsupported dtype \(a.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -9475,17 +9475,17 @@ public enum Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch input.dtype {
         case .f32:
-            FFAIKernels.ffai_cast_to_f32_f32(
+            IronKernels.iron_cast_to_f32_f32(
                 input: input.buffer, inputOffset: input.offset,
                 out: output.buffer, outOffset: output.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_cast_to_f32_f16(
+            IronKernels.iron_cast_to_f32_f16(
                 input: input.buffer, inputOffset: input.offset,
                 out: output.buffer, outOffset: output.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_cast_to_f32_bf16(
+            IronKernels.iron_cast_to_f32_bf16(
                 input: input.buffer, inputOffset: input.offset,
                 out: output.buffer, outOffset: output.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
@@ -9497,7 +9497,7 @@ public enum Ops {
     /// bf16 → f16 elementwise cast (2-byte → 2-byte). Supports **in-place**
     /// when `input` and `output` share buffer+offset (Hy3 oQ2 load path:
     /// promote checkpoint BF16 scales without doubling resident weight
-    /// storage). Live-compiled from `Resources/kernels/ffai_cast_bf16_to_f16.metal`.
+    /// storage). Live-compiled from `Resources/kernels/iron_cast_bf16_to_f16.metal`.
     /// Returns a Tensor view with `dtype == .f16` over `output`'s storage.
     @discardableResult
     public static func castBf16ToF16(
@@ -9526,7 +9526,7 @@ public enum Ops {
         let tgWidth = min(n, 256)
         let grid = MTLSize(width: n, height: 1, depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
-        let pso = PSOCache.shared.pipelineState(for: "ffai_cast_bf16_to_f16_f32")
+        let pso = PSOCache.shared.pipelineState(for: "iron_cast_bf16_to_f16_f32")
         guard let enc = cmd.makeComputeCommandEncoder() else {
             return Tensor(
                 buffer: out.buffer, offset: out.offset, shape: out.shape, dtype: .f16)
@@ -9573,11 +9573,11 @@ public enum Ops {
         let castPso: String
         switch siluIn.dtype {
         case .f16:
-            siluPso = "ffai_silu_cast_to_f32_f16"
-            castPso = "ffai_cast_to_f32_f16"
+            siluPso = "iron_silu_cast_to_f32_f16"
+            castPso = "iron_cast_to_f32_f16"
         case .bf16:
-            siluPso = "ffai_silu_cast_to_f32_bf16"
-            castPso = "ffai_cast_to_f32_bf16"
+            siluPso = "iron_silu_cast_to_f32_bf16"
+            castPso = "iron_cast_to_f32_bf16"
         default:
             fatalError(
                 "Ops.siluCastF32PlusCastF32Two: unsupported dtype \(siluIn.dtype)")
@@ -9603,7 +9603,7 @@ public enum Ops {
 
     // ─── Fused gated mixer norm ───────────────────────────────────────
     //
-    // Wraps `ffai_gated_mixer_norm_{f32,f16,bf16}`. Computes
+    // Wraps `iron_gated_mixer_norm_{f32,f16,bf16}`. Computes
     // `out = rms_norm(y, w) · silu(z)` per row across `[Hv, Dv]` in a
     // single dispatch. Used by FFAI's Qwen3.5 / Qwen3.6 GDN mixer to
     // eliminate the phase-2 host round-trip the legacy path needed
@@ -9666,7 +9666,7 @@ public enum Ops {
         let nU = UInt32(valueHeadDim)
         switch out.dtype {
         case .f32:
-            FFAIKernels.ffai_gated_mixer_norm_f32(
+            IronKernels.iron_gated_mixer_norm_f32(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -9674,7 +9674,7 @@ public enum Ops {
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: nU, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gated_mixer_norm_f16(
+            IronKernels.iron_gated_mixer_norm_f16(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -9682,7 +9682,7 @@ public enum Ops {
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: nU, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gated_mixer_norm_bf16(
+            IronKernels.iron_gated_mixer_norm_bf16(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -9746,7 +9746,7 @@ public enum Ops {
         let nU = UInt32(valueHeadDim)
         switch out.dtype {
         case .f32:
-            FFAIKernels.ffai_gated_mixer_norm_f32(
+            IronKernels.iron_gated_mixer_norm_f32(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -9754,7 +9754,7 @@ public enum Ops {
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: nU, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gated_mixer_norm_f16(
+            IronKernels.iron_gated_mixer_norm_f16(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -9762,7 +9762,7 @@ public enum Ops {
                 eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
                 n: nU, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gated_mixer_norm_bf16(
+            IronKernels.iron_gated_mixer_norm_bf16(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 w: weight.buffer, wOffset: weight.offset,
@@ -9776,8 +9776,8 @@ public enum Ops {
 
     // ─── Fused RMSNorm + int4 dequant-GEMV ────────────────────────────
     //
-    // Wraps `ffai_rms_norm_qgemv_fast` (RMSNorm-fused) and
-    // `ffai_gated_rms_norm_qgemv_int4_fast` (Mamba2-gated-RMSNorm-
+    // Wraps `iron_rms_norm_qgemv_fast` (RMSNorm-fused) and
+    // `iron_gated_rms_norm_qgemv_int4_fast` (Mamba2-gated-RMSNorm-
     // fused). Both keep the normalised activation in registers and
     // feed it straight into the int4 dequant-GEMV, replacing a
     // 2-dispatch chain (`Ops.rmsNorm` / `Ops.gatedRmsNorm` + `Ops.
@@ -9790,13 +9790,13 @@ public enum Ops {
     // post-recurrence gatedRmsNorm + outProj pair.
 
     /// Fused RMSNorm + int4 dequant-GEMV in ONE dispatch via
-    /// `ffai_rms_norm_qgemv_fast`. Computes
+    /// `iron_rms_norm_qgemv_fast`. Computes
     ///   `y[row] = Σ_i (q[row,i]·scale + bias) ·
     ///            (x[i] · norm_weight[i] · inv_rms)`
     /// with `inv_rms = rsqrt(mean(x²) + eps)` and the normalised
     /// activation never leaving registers.
     ///
-    /// Kernel constraints (`ffai_rms_norm_qgemv_fast`):
+    /// Kernel constraints (`iron_rms_norm_qgemv_fast`):
     /// - `in_dim` MUST be a multiple of 512 (kernel block size = 512
     ///   K-elements per outer iter).
     /// - `out_dim` MUST be a multiple of 8 (kernel processes 8 output
@@ -9851,7 +9851,7 @@ public enum Ops {
         let grid = MTLSize(width: nTiles * 64, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_rms_norm_qgemv_fast_f32(
+            IronKernels.iron_rms_norm_qgemv_fast_f32(
                 x: x.buffer, xOffset: x.offset,
                 norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
                 weight: qWeight.buffer, weightOffset: qWeight.offset,
@@ -9862,7 +9862,7 @@ public enum Ops {
                 in_dim: UInt32(inDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_rms_norm_qgemv_fast_f16(
+            IronKernels.iron_rms_norm_qgemv_fast_f16(
                 x: x.buffer, xOffset: x.offset,
                 norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
                 weight: qWeight.buffer, weightOffset: qWeight.offset,
@@ -9873,7 +9873,7 @@ public enum Ops {
                 in_dim: UInt32(inDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_rms_norm_qgemv_fast_bf16(
+            IronKernels.iron_rms_norm_qgemv_fast_bf16(
                 x: x.buffer, xOffset: x.offset,
                 norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
                 weight: qWeight.buffer, weightOffset: qWeight.offset,
@@ -9889,7 +9889,7 @@ public enum Ops {
     }
 
     /// Fused Mamba2-style gated RMSNorm + int4 dequant-GEMV in ONE
-    /// dispatch via `ffai_gated_rms_norm_qgemv_int4_fast`. Computes
+    /// dispatch via `iron_gated_rms_norm_qgemv_int4_fast`. Computes
     /// the GDN mixer's `silu(z) · w · rmsnorm(y)` and feeds the result
     /// straight into the int4 outProj — replaces the 2-dispatch
     /// chain (`Ops.gatedRmsNorm` + `Ops.dequantGemvInt4`) with a
@@ -9950,7 +9950,7 @@ public enum Ops {
         let epsBuf = device.scalarBuffer(eps)
         switch out.dtype {
         case .f32:
-            FFAIKernels.ffai_gated_rms_norm_qgemv_int4_fast_f32(
+            IronKernels.iron_gated_rms_norm_qgemv_int4_fast_f32(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
@@ -9963,7 +9963,7 @@ public enum Ops {
                 out_dim: UInt32(outDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gated_rms_norm_qgemv_int4_fast_f16(
+            IronKernels.iron_gated_rms_norm_qgemv_int4_fast_f16(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
@@ -9976,7 +9976,7 @@ public enum Ops {
                 out_dim: UInt32(outDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gated_rms_norm_qgemv_int4_fast_bf16(
+            IronKernels.iron_gated_rms_norm_qgemv_int4_fast_bf16(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
@@ -9998,8 +9998,8 @@ public enum Ops {
     /// the variance (`inner = rms_norm(y · silu(z)) · w`, variance over the
     /// gated input), matching HF `MambaRMSNormGated` — distinct from the
     /// GDN variant's variance-over-`y`. Wraps
-    /// `ffai_gated_rms_norm_pregate_qgemv_int4_fast` (see
-    /// `crates/ffai-kernels-std/src/ffai/gated_rms_norm_pregate_qgemv.rs`).
+    /// `iron_gated_rms_norm_pregate_qgemv_int4_fast` (see
+    /// `crates/crates/wh-iron-std/src/kernels/norm/gated_rms_norm_pregate_qgemv.rs`).
     ///
     /// Two geometry differences from the GDN wrapper:
     /// - `normWeight` is the FULL `[Hv·Dv]` (`d_inner`) weight, indexed
@@ -10063,7 +10063,7 @@ public enum Ops {
         memcpy(epsBuf.contents(), &epsValue, 4)
         switch out.dtype {
         case .f32:
-            FFAIKernels.ffai_gated_rms_norm_pregate_qgemv_int4_fast_f32(
+            IronKernels.iron_gated_rms_norm_pregate_qgemv_int4_fast_f32(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
@@ -10076,7 +10076,7 @@ public enum Ops {
                 out_dim: UInt32(outDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_gated_rms_norm_pregate_qgemv_int4_fast_f16(
+            IronKernels.iron_gated_rms_norm_pregate_qgemv_int4_fast_f16(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
@@ -10089,7 +10089,7 @@ public enum Ops {
                 out_dim: UInt32(outDim), group_size: UInt32(groupSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_gated_rms_norm_pregate_qgemv_int4_fast_bf16(
+            IronKernels.iron_gated_rms_norm_pregate_qgemv_int4_fast_bf16(
                 y: y.buffer, yOffset: y.offset,
                 z: z.buffer, zOffset: z.offset,
                 norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
@@ -10108,7 +10108,7 @@ public enum Ops {
 
     // ─── Fused scalar-sigmoid fan-out + FMA ───────────────────────────
     //
-    // Wraps `ffai_sigmoid_scalar_fma_{f32,f16,bf16}`. Computes
+    // Wraps `iron_sigmoid_scalar_fma_{f32,f16,bf16}`. Computes
     //   `out[i] = base[i] + sigmoid(gate[0]) * value[i]`
     // for `i in 0..hidden`, broadcasting the scalar `gate` across the
     // `[hidden]` vectors. Used by `Qwen35MoEFFN.forward` to fuse the
@@ -10144,21 +10144,21 @@ public enum Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch out.dtype {
         case .f32:
-            FFAIKernels.ffai_sigmoid_scalar_fma_f32(
+            IronKernels.iron_sigmoid_scalar_fma_f32(
                 gate: gate.buffer, gateOffset: gate.offset,
                 value: value.buffer, valueOffset: value.offset,
                 base: base.buffer, baseOffset: base.offset,
                 out: out.buffer, outOffset: out.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_sigmoid_scalar_fma_f16(
+            IronKernels.iron_sigmoid_scalar_fma_f16(
                 gate: gate.buffer, gateOffset: gate.offset,
                 value: value.buffer, valueOffset: value.offset,
                 base: base.buffer, baseOffset: base.offset,
                 out: out.buffer, outOffset: out.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_sigmoid_scalar_fma_bf16(
+            IronKernels.iron_sigmoid_scalar_fma_bf16(
                 gate: gate.buffer, gateOffset: gate.offset,
                 value: value.buffer, valueOffset: value.offset,
                 base: base.buffer, baseOffset: base.offset,
@@ -10195,7 +10195,7 @@ public enum Ops {
         let hiddenU = UInt32(hidden)
         switch out.dtype {
         case .f32:
-            FFAIKernels.ffai_sigmoid_row_fma_f32(
+            IronKernels.iron_sigmoid_row_fma_f32(
                 gate: gate.buffer, gateOffset: gate.offset,
                 value: value.buffer, valueOffset: value.offset,
                 base: base.buffer, baseOffset: base.offset,
@@ -10203,7 +10203,7 @@ public enum Ops {
                 hidden: hiddenU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_sigmoid_row_fma_f16(
+            IronKernels.iron_sigmoid_row_fma_f16(
                 gate: gate.buffer, gateOffset: gate.offset,
                 value: value.buffer, valueOffset: value.offset,
                 base: base.buffer, baseOffset: base.offset,
@@ -10211,7 +10211,7 @@ public enum Ops {
                 hidden: hiddenU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_sigmoid_row_fma_bf16(
+            IronKernels.iron_sigmoid_row_fma_bf16(
                 gate: gate.buffer, gateOffset: gate.offset,
                 value: value.buffer, valueOffset: value.offset,
                 base: base.buffer, baseOffset: base.offset,
@@ -10225,7 +10225,7 @@ public enum Ops {
 
     // ─── Fused SwiGLU ─────────────────────────────────────────────────
     //
-    // Wraps `ffai_swiglu_{f32,f16,bf16}`. Computes `out[i] = silu(gate[i]) * up[i]`
+    // Wraps `iron_swiglu_{f32,f16,bf16}`. Computes `out[i] = silu(gate[i]) * up[i]`
     // in one element-wise dispatch — replaces the two-launch `silu` +
     // `mul` chain (`Ops.silu(gate) → Ops.mul(_, up)`). Half the bandwidth
     // on the activation tensor (the intermediate `silu(gate)` stays in
@@ -10254,19 +10254,19 @@ public enum Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch gate.dtype {
         case .f32:
-            FFAIKernels.ffai_swiglu_f32(
+            IronKernels.iron_swiglu_f32(
                 gate: gate.buffer, gateOffset: gate.offset,
                 up: up.buffer, upOffset: up.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_swiglu_f16(
+            IronKernels.iron_swiglu_f16(
                 gate: gate.buffer, gateOffset: gate.offset,
                 up: up.buffer, upOffset: up.offset,
                 out: result.buffer, outOffset: result.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_swiglu_bf16(
+            IronKernels.iron_swiglu_bf16(
                 gate: gate.buffer, gateOffset: gate.offset,
                 up: up.buffer, upOffset: up.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -10279,7 +10279,7 @@ public enum Ops {
 
     /// N independent SwiGLU dispatches sharing ONE compute encoder.
     /// Each `(gate, up, out)` triple is dispatched in sequence after
-    /// setting the same `ffai_swiglu_*` PSO once. Used by the MoE
+    /// setting the same `iron_swiglu_*` PSO once. Used by the MoE
     /// per-expert SwiGLU phase at decode (one dispatch per chosen
     /// expert × topK experts × MoE layers) where the encoder
     /// begin/end pairs dominated CPU side.
@@ -10295,9 +10295,9 @@ public enum Ops {
         let dtype = gates[0].dtype
         let psoName: String
         switch dtype {
-        case .f32: psoName = "ffai_swiglu_f32"
-        case .f16: psoName = "ffai_swiglu_f16"
-        case .bf16: psoName = "ffai_swiglu_bf16"
+        case .f32: psoName = "iron_swiglu_f32"
+        case .f16: psoName = "iron_swiglu_f16"
+        case .bf16: psoName = "iron_swiglu_bf16"
         default: fatalError("Ops.swigluMany: unsupported dtype \(dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -10348,9 +10348,9 @@ public enum Ops {
         let dtype = gates[0].dtype
         let psoName: String
         switch dtype {
-        case .f32: psoName = "ffai_swiglu_limit_f32"
-        case .f16: psoName = "ffai_swiglu_limit_f16"
-        case .bf16: psoName = "ffai_swiglu_limit_bf16"
+        case .f32: psoName = "iron_swiglu_limit_f32"
+        case .f16: psoName = "iron_swiglu_limit_f16"
+        case .bf16: psoName = "iron_swiglu_limit_bf16"
         default: fatalError("Ops.swigluLimitMany: unsupported dtype \(dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -10377,7 +10377,7 @@ public enum Ops {
 
     // ─── MoE gather quantised matmul, scalar m1 ────────────────────────
     //
-    // Wraps `ffai_moe_gather_qmm_int4_{f32,f16,bf16}`. One TG per
+    // Wraps `iron_moe_gather_qmm_int4_{f32,f16,bf16}`. One TG per
     // (output column m, input row t). Each TG resolves the row's
     // expert via the CSR `expert_offsets` and computes one scalar
     // dot-product with `simd_sum` reduction. No cooperative-tensor
@@ -10385,7 +10385,7 @@ public enum Ops {
     // (bm8 / bm16 / bm64) regress because the descriptor + tensor
     // setup dominates the tiny compute. This kernel skips that
     // overhead and walks K with the same per-lane stride pattern as
-    // `ffai_dequant_gemv_int4`.
+    // `iron_dequant_gemv_int4`.
     //
     // Inputs:
     //   x              [T_rows, k_in]                 T  — sorted by expert (caller responsibility)
@@ -10429,7 +10429,7 @@ public enum Ops {
         let groupSizeU = UInt32(groupSize)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_moe_gather_qmm_int4_f32(
+            IronKernels.iron_moe_gather_qmm_int4_f32(
                 x: x.buffer, xOffset: x.offset,
                 weight_packed: weight.buffer, weight_packedOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -10439,7 +10439,7 @@ public enum Ops {
                 k_in: kInU, m_out: mOutU, n_experts: nExpertsU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_moe_gather_qmm_int4_f16(
+            IronKernels.iron_moe_gather_qmm_int4_f16(
                 x: x.buffer, xOffset: x.offset,
                 weight_packed: weight.buffer, weight_packedOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -10449,7 +10449,7 @@ public enum Ops {
                 k_in: kInU, m_out: mOutU, n_experts: nExpertsU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_moe_gather_qmm_int4_bf16(
+            IronKernels.iron_moe_gather_qmm_int4_bf16(
                 x: x.buffer, xOffset: x.offset,
                 weight_packed: weight.buffer, weight_packedOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -10465,7 +10465,7 @@ public enum Ops {
 
     /// Compact sorted expert ids into an active-only list + row spans and
     /// write `MTLDispatchThreadgroupsIndirectArguments` for gate/up and down.
-    /// Single TG, thread 0. Live-compile `ffai_moe_compact_active_experts`.
+    /// Single TG, thread 0. Live-compile `iron_moe_compact_active_experts`.
     public static func moeCompactActiveExperts(
         sortedExperts: Tensor,
         activeExperts: Tensor,
@@ -10489,7 +10489,7 @@ public enum Ops {
         var nOutGUU = UInt32(nOutGU)
         var nOutDownU = UInt32(nOutDown)
         var capU = UInt32(nExpertsCap)
-        let pso = PSOCache.shared.pipelineState(for: "ffai_moe_compact_active_experts_f32")
+        let pso = PSOCache.shared.pipelineState(for: "iron_moe_compact_active_experts_f32")
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
         enc.setBuffer(sortedExperts.buffer, offset: sortedExperts.offset, index: 0)
@@ -10528,7 +10528,7 @@ public enum Ops {
         var packsU = UInt32(packsPerRow)
         var groupsU = UInt32(groupsPerRow)
         var nActiveU = UInt32(nActive)
-        let pso = PSOCache.shared.pipelineState(for: "ffai_moe_densify_int2_experts_f16")
+        let pso = PSOCache.shared.pipelineState(for: "iron_moe_densify_int2_experts_f16")
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
         enc.setBuffer(weightSrc.buffer, offset: weightSrc.offset, index: 0)
@@ -10560,7 +10560,7 @@ public enum Ops {
         precondition(denseIndices.dtype == .u32 && denseIndices.elementCount >= mTotal)
         var mTotalU = UInt32(mTotal)
         var nActiveU = UInt32(nActive)
-        let pso = PSOCache.shared.pipelineState(for: "ffai_moe_remap_experts_dense_f32")
+        let pso = PSOCache.shared.pipelineState(for: "iron_moe_remap_experts_dense_f32")
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
         enc.setBuffer(sortedExperts.buffer, offset: sortedExperts.offset, index: 0)
@@ -10597,8 +10597,8 @@ public enum Ops {
         precondition(kIn.isMultiple(of: groupSize))
         let psoName: String
         switch input.dtype {
-        case .f16: psoName = "ffai_moe_gather_qmm_mma_eg_int2_active_mpp_f16"
-        case .bf16: psoName = "ffai_moe_gather_qmm_mma_eg_int2_active_mpp_bf16"
+        case .f16: psoName = "iron_moe_gather_qmm_mma_eg_int2_active_mpp_f16"
+        case .bf16: psoName = "iron_moe_gather_qmm_mma_eg_int2_active_mpp_bf16"
         default: fatalError("moeGatherDequantGemmInt2Active: \(input.dtype)")
         }
         // bf16 active kernel may be missing — fall back to f16 name only.
@@ -10647,7 +10647,7 @@ public enum Ops {
     /// or expert-outer grid. Prefer expert-sorted `indices` so contiguous
     /// runs share weight loads.
     ///
-    /// Default: MPP `ffai_moe_gather_qmm_mma_int2_bm16_mpp_*` (1 SG, tpg=32,
+    /// Default: MPP `iron_moe_gather_qmm_mma_int2_bm16_mpp_*` (1 SG, tpg=32,
     /// live-compile from Resources/kernels).
     /// - `FFAI_HY3_MOE_BM64=1` (+ `nOut%64==0`, `kIn%32==0`): BM64 MPP
     ///   (4 SG, tpg=128) — better for fat experts / long runs.
@@ -10720,41 +10720,41 @@ public enum Ops {
         let psoName: String
         if useExpertGrid {
             switch input.dtype {
-            case .f32: psoName = "ffai_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_f32"
-            case .f16: psoName = "ffai_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_f16"
-            case .bf16: psoName = "ffai_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_bf16"
+            case .f32: psoName = "iron_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_f32"
+            case .f16: psoName = "iron_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_f16"
+            case .bf16: psoName = "iron_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_bf16"
             default:
                 fatalError("Ops.moeGatherDequantGemmInt2: unsupported dtype \(input.dtype)")
             }
         } else if useBm64 {
             switch input.dtype {
-            case .f32: psoName = "ffai_moe_gather_qmm_mma_int2_bm64_mpp_f32"
-            case .f16: psoName = "ffai_moe_gather_qmm_mma_int2_bm64_mpp_f16"
-            case .bf16: psoName = "ffai_moe_gather_qmm_mma_int2_bm64_mpp_bf16"
+            case .f32: psoName = "iron_moe_gather_qmm_mma_int2_bm64_mpp_f32"
+            case .f16: psoName = "iron_moe_gather_qmm_mma_int2_bm64_mpp_f16"
+            case .bf16: psoName = "iron_moe_gather_qmm_mma_int2_bm64_mpp_bf16"
             default:
                 fatalError("Ops.moeGatherDequantGemmInt2: unsupported dtype \(input.dtype)")
             }
         } else if useBm8 {
             switch input.dtype {
-            case .f32: psoName = "ffai_moe_gather_qmm_mma_int2_bm8_mpp_f32"
-            case .f16: psoName = "ffai_moe_gather_qmm_mma_int2_bm8_mpp_f16"
-            case .bf16: psoName = "ffai_moe_gather_qmm_mma_int2_bm8_mpp_bf16"
+            case .f32: psoName = "iron_moe_gather_qmm_mma_int2_bm8_mpp_f32"
+            case .f16: psoName = "iron_moe_gather_qmm_mma_int2_bm8_mpp_f16"
+            case .bf16: psoName = "iron_moe_gather_qmm_mma_int2_bm8_mpp_bf16"
             default:
                 fatalError("Ops.moeGatherDequantGemmInt2: unsupported dtype \(input.dtype)")
             }
         } else if useMma {
             switch input.dtype {
-            case .f32: psoName = "ffai_moe_gather_qmm_mma_int2_bm16_f32"
-            case .f16: psoName = "ffai_moe_gather_qmm_mma_int2_bm16_f16"
-            case .bf16: psoName = "ffai_moe_gather_qmm_mma_int2_bm16_bf16"
+            case .f32: psoName = "iron_moe_gather_qmm_mma_int2_bm16_f32"
+            case .f16: psoName = "iron_moe_gather_qmm_mma_int2_bm16_f16"
+            case .bf16: psoName = "iron_moe_gather_qmm_mma_int2_bm16_bf16"
             default:
                 fatalError("Ops.moeGatherDequantGemmInt2: unsupported dtype \(input.dtype)")
             }
         } else {
             switch input.dtype {
-            case .f32: psoName = "ffai_moe_gather_qmm_mma_int2_bm16_mpp_f32"
-            case .f16: psoName = "ffai_moe_gather_qmm_mma_int2_bm16_mpp_f16"
-            case .bf16: psoName = "ffai_moe_gather_qmm_mma_int2_bm16_mpp_bf16"
+            case .f32: psoName = "iron_moe_gather_qmm_mma_int2_bm16_mpp_f32"
+            case .f16: psoName = "iron_moe_gather_qmm_mma_int2_bm16_mpp_f16"
+            case .bf16: psoName = "iron_moe_gather_qmm_mma_int2_bm16_mpp_bf16"
             default:
                 fatalError("Ops.moeGatherDequantGemmInt2: unsupported dtype \(input.dtype)")
             }
@@ -10846,9 +10846,9 @@ public enum Ops {
         var groupSizeV = UInt32(groupSize)
         let psoName: String
         switch x.dtype {
-        case .f32: psoName = "ffai_moe_gather_qmm_int2_f32"
-        case .f16: psoName = "ffai_moe_gather_qmm_int2_f16"
-        case .bf16: psoName = "ffai_moe_gather_qmm_int2_bf16"
+        case .f32: psoName = "iron_moe_gather_qmm_int2_f32"
+        case .f16: psoName = "iron_moe_gather_qmm_int2_f16"
+        case .bf16: psoName = "iron_moe_gather_qmm_int2_bf16"
         default:
             fatalError("Ops.moeGatherDequantGemmInt2M1: unsupported dtype \(x.dtype)")
         }
@@ -10870,7 +10870,7 @@ public enum Ops {
     }
 
     /// LayerNorm: `out = (x − mean) / sqrt(var + eps) · weight + bias`.
-    /// Backed by `ffai_layer_norm_*` (one TG per row, TPG=1024). Used by
+    /// Backed by `iron_layer_norm_*` (one TG per row, TPG=1024). Used by
     /// vision-transformer encoders (SigLIP / CLIP) and audio frontends —
     /// not on the Qwen3.5/3.6 hot path, but kept here so VLM/audio
     /// models in this package compile against `Ops`.
@@ -10900,7 +10900,7 @@ public enum Ops {
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_layer_norm_f32(
+            IronKernels.iron_layer_norm_f32(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 b: bias.buffer, bOffset: bias.offset,
@@ -10908,7 +10908,7 @@ public enum Ops {
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(rowSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_layer_norm_f16(
+            IronKernels.iron_layer_norm_f16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 b: bias.buffer, bOffset: bias.offset,
@@ -10916,7 +10916,7 @@ public enum Ops {
                 eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(rowSize),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_layer_norm_bf16(
+            IronKernels.iron_layer_norm_bf16(
                 x: x.buffer, xOffset: x.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 b: bias.buffer, bOffset: bias.offset,
@@ -10933,7 +10933,7 @@ public enum Ops {
 
     /// 2D convolution for vision-transformer patch embedding.
     ///
-    /// Backed by `ffai-kernels-std/src/ffai/conv2d.rs` (`conv2d_generic`).
+    /// Backed by `crates/wh-iron-std/src/kernels/convolution/conv2d.rs` (`conv2d_generic`).
     /// One thread per output element `(n, oc, oh, ow)` — a genuine
     /// Grid3D / one-thread-per-output kernel, dispatched flat over the
     /// `batch * out_ch * out_h * out_w` output count, exactly like
@@ -11028,7 +11028,7 @@ public enum Ops {
         switch input.dtype {
         case .f32:
             dispatch {
-                FFAIKernels.conv2d_generic_f32(
+                IronKernels.conv2d_generic_f32(
                     input: $0, inputOffset: $1, weight: $2, weightOffset: $3,
                     bias: $4, biasOffset: $5, out: $6, outOffset: $7,
                     batch: $8, in_ch: $9, in_h: $10, in_w: $11,
@@ -11039,7 +11039,7 @@ public enum Ops {
             }
         case .f16:
             dispatch {
-                FFAIKernels.conv2d_generic_f16(
+                IronKernels.conv2d_generic_f16(
                     input: $0, inputOffset: $1, weight: $2, weightOffset: $3,
                     bias: $4, biasOffset: $5, out: $6, outOffset: $7,
                     batch: $8, in_ch: $9, in_h: $10, in_w: $11,
@@ -11050,7 +11050,7 @@ public enum Ops {
             }
         case .bf16:
             dispatch {
-                FFAIKernels.conv2d_generic_bf16(
+                IronKernels.conv2d_generic_bf16(
                     input: $0, inputOffset: $1, weight: $2, weightOffset: $3,
                     bias: $4, biasOffset: $5, out: $6, outOffset: $7,
                     batch: $8, in_ch: $9, in_h: $10, in_w: $11,
@@ -11074,7 +11074,7 @@ public enum Ops {
     /// depthwise `[channels, kH, kW]` (in-ch-per-group 1, squeezed);
     /// `bias` `[channels]`; `out` NHWC `[batch, outH, outW, channels]`.
     /// Same-padding when `padding = (k − 1) / 2`. Backed by
-    /// `ffai-kernels-std/src/ffai/depthwise_conv2d_nhwc.rs` — Grid3D, one
+    /// `crates/wh-iron-std/src/kernels/convolution/depthwise_conv2d_nhwc.rs` — Grid3D, one
     /// thread per output element, dispatched flat.
     public static func depthwiseConv2dNHWC(
         input: Tensor, weight: Tensor, bias: Tensor,
@@ -11112,7 +11112,7 @@ public enum Ops {
         let st = UInt32(stride), pd = UInt32(padding), dl = UInt32(dilation)
         switch input.dtype {
         case .f32:
-            FFAIKernels.depthwise_conv2d_nhwc_f32(
+            IronKernels.depthwise_conv2d_nhwc_f32(
                 input: input.buffer, inputOffset: input.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -11121,7 +11121,7 @@ public enum Ops {
                 k_h: kh, k_w: kw, stride: st, pad: pd, dilation: dl,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.depthwise_conv2d_nhwc_f16(
+            IronKernels.depthwise_conv2d_nhwc_f16(
                 input: input.buffer, inputOffset: input.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -11130,7 +11130,7 @@ public enum Ops {
                 k_h: kh, k_w: kw, stride: st, pad: pd, dilation: dl,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.depthwise_conv2d_nhwc_bf16(
+            IronKernels.depthwise_conv2d_nhwc_bf16(
                 input: input.buffer, inputOffset: input.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -11149,7 +11149,7 @@ public enum Ops {
     /// Fused image-unfold + linear-projection patch embedding for vision
     /// transformers — the ViT stem in one dispatch.
     ///
-    /// Backed by `ffai-kernels-std/src/ffai/patch_embed.rs`. One thread per
+    /// Backed by `crates/wh-iron-std/src/kernels/gemm/patch_embed.rs`. One thread per
     /// output element `(patch, h)` — Grid3D / one-thread-per-output,
     /// dispatched flat over `num_patches * hidden`.
     ///
@@ -11215,7 +11215,7 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(totalThreads)
         switch image.dtype {
         case .f32:
-            FFAIKernels.ffai_patch_embed_f32(
+            IronKernels.iron_patch_embed_f32(
                 image: image.buffer, imageOffset: image.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -11225,7 +11225,7 @@ public enum Ops {
                 hidden: UInt32(hidden),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_patch_embed_f16(
+            IronKernels.iron_patch_embed_f16(
                 image: image.buffer, imageOffset: image.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -11235,7 +11235,7 @@ public enum Ops {
                 hidden: UInt32(hidden),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_patch_embed_bf16(
+            IronKernels.iron_patch_embed_bf16(
                 image: image.buffer, imageOffset: image.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -11256,7 +11256,7 @@ public enum Ops {
     /// component. Splits each head's `head_dim` into two halves: the
     /// first rotated by the token's row index, the second by its column.
     ///
-    /// Backed by `ffai-kernels-std/src/ffai/rope_2d.rs`. Grid3D — one thread
+    /// Backed by `crates/wh-iron-std/src/kernels/rope/rope_2d.rs`. Grid3D — one thread
     /// per `(token, head, j)` with `j ∈ [0, quarter_dim)`; each thread
     /// emits four output values.
     ///
@@ -11300,7 +11300,7 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         switch qk.dtype {
         case .f32:
-            FFAIKernels.ffai_rope_2d_f32(
+            IronKernels.iron_rope_2d_f32(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: positions.buffer, positionsOffset: positions.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -11309,7 +11309,7 @@ public enum Ops {
                 theta_base: thetaBase,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_rope_2d_f16(
+            IronKernels.iron_rope_2d_f16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: positions.buffer, positionsOffset: positions.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -11318,7 +11318,7 @@ public enum Ops {
                 theta_base: thetaBase,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_rope_2d_bf16(
+            IronKernels.iron_rope_2d_bf16(
                 qk: qk.buffer, qkOffset: qk.offset,
                 positions: positions.buffer, positionsOffset: positions.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -11339,7 +11339,7 @@ public enum Ops {
     /// head_dim`). Lets the whole attention pipeline stay GPU-resident
     /// instead of bouncing K/V to the CPU for a re-pack.
     ///
-    /// Wraps `ffai_transpose_th` (`transpose_th.rs` §"DISPATCH
+    /// Wraps `iron_transpose_th` (`transpose_th.rs` §"DISPATCH
     /// INVARIANTS"): Grid3D, one thread per output element, grid
     /// `[nTokens, nHeads, headDim]`. A pure element copy — no reduction
     /// TPG, no freeze hazard.
@@ -11368,19 +11368,19 @@ public enum Ops {
         let hd = UInt32(headDim)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_transpose_th_f32(
+            IronKernels.iron_transpose_th_f32(
                 input: x.buffer, inputOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 n_tokens: nt, n_heads: nh, head_dim: hd,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_transpose_th_f16(
+            IronKernels.iron_transpose_th_f16(
                 input: x.buffer, inputOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 n_tokens: nt, n_heads: nh, head_dim: hd,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_transpose_th_bf16(
+            IronKernels.iron_transpose_th_bf16(
                 input: x.buffer, inputOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 n_tokens: nt, n_heads: nh, head_dim: hd,
@@ -11397,7 +11397,7 @@ public enum Ops {
     /// applies (`use_clipped_linears=True`; bounds are scalars baked into
     /// the checkpoint). Keeps the vision/audio attention GPU-resident
     /// instead of bouncing each projection to the CPU for the clamp. Wraps
-    /// `ffai_clamp_scalar` (`clamp_scalar.rs` §"DISPATCH INVARIANTS"):
+    /// `iron_clamp_scalar` (`clamp_scalar.rs` §"DISPATCH INVARIANTS"):
     /// Grid3D, one thread per element. `lo <= hi` (caller-enforced).
     public static func clampScalar(
         _ x: Tensor, lo: Float, hi: Float,
@@ -11415,19 +11415,19 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_clamp_scalar_f32(
+            IronKernels.iron_clamp_scalar_f32(
                 input: x.buffer, inputOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 lo: loBuf, hi: hiBuf,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_clamp_scalar_f16(
+            IronKernels.iron_clamp_scalar_f16(
                 input: x.buffer, inputOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 lo: loBuf, hi: hiBuf,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_clamp_scalar_bf16(
+            IronKernels.iron_clamp_scalar_bf16(
                 input: x.buffer, inputOffset: x.offset,
                 out: result.buffer, outOffset: result.offset,
                 lo: loBuf, hi: hiBuf,
@@ -11452,8 +11452,8 @@ public enum Ops {
     /// op a VL image preprocess needs. `src` is an interleaved `[srcH·srcW·3]`
     /// image (RGB, typically `[0,1]`); returns the planar NCHW
     /// `[3, targetH, targetW]` tensor `(v − mean[c]) / std[c]`. `mode` picks
-    /// the interpolation kernel: `.bilinear` wraps `ffai_resize_normalize`,
-    /// `.bicubic` wraps `ffai_resize_normalize_bicubic` (both
+    /// the interpolation kernel: `.bilinear` wraps `iron_resize_normalize`,
+    /// `.bicubic` wraps `iron_resize_normalize_bicubic` (both
     /// `resize_normalize.rs` §"DISPATCH INVARIANTS"): Grid3D, one thread per
     /// output element, align_corners = false half-pixel sampling. Replaces
     /// the CPU triple-loop resize + normalize.
@@ -11491,42 +11491,42 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         switch (mode, src.dtype) {
         case (.bilinear, .f32):
-            FFAIKernels.ffai_resize_normalize_f32(
+            IronKernels.iron_resize_normalize_f32(
                 input: src.buffer, inputOffset: src.offset,
                 mean: meanBuf, std: stdBuf,
                 out: result.buffer, outOffset: result.offset,
                 src_w: swB, src_h: shB, target_w: twB, target_h: thB,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.bilinear, .f16):
-            FFAIKernels.ffai_resize_normalize_f16(
+            IronKernels.iron_resize_normalize_f16(
                 input: src.buffer, inputOffset: src.offset,
                 mean: meanBuf, std: stdBuf,
                 out: result.buffer, outOffset: result.offset,
                 src_w: swB, src_h: shB, target_w: twB, target_h: thB,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.bilinear, .bf16):
-            FFAIKernels.ffai_resize_normalize_bf16(
+            IronKernels.iron_resize_normalize_bf16(
                 input: src.buffer, inputOffset: src.offset,
                 mean: meanBuf, std: stdBuf,
                 out: result.buffer, outOffset: result.offset,
                 src_w: swB, src_h: shB, target_w: twB, target_h: thB,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.bicubic, .f32):
-            FFAIKernels.ffai_resize_normalize_bicubic_f32(
+            IronKernels.iron_resize_normalize_bicubic_f32(
                 input: src.buffer, inputOffset: src.offset,
                 mean: meanBuf, std: stdBuf,
                 out: result.buffer, outOffset: result.offset,
                 src_w: swB, src_h: shB, target_w: twB, target_h: thB,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.bicubic, .f16):
-            FFAIKernels.ffai_resize_normalize_bicubic_f16(
+            IronKernels.iron_resize_normalize_bicubic_f16(
                 input: src.buffer, inputOffset: src.offset,
                 mean: meanBuf, std: stdBuf,
                 out: result.buffer, outOffset: result.offset,
                 src_w: swB, src_h: shB, target_w: twB, target_h: thB,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.bicubic, .bf16):
-            FFAIKernels.ffai_resize_normalize_bicubic_bf16(
+            IronKernels.iron_resize_normalize_bicubic_bf16(
                 input: src.buffer, inputOffset: src.offset,
                 mean: meanBuf, std: stdBuf,
                 out: result.buffer, outOffset: result.offset,
@@ -11565,21 +11565,21 @@ public enum Ops {
         let (kh, kw, st, pd) = (UInt32(kH), UInt32(kW), UInt32(stride), UInt32(pad))
         switch input.dtype {
         case .f32:
-            FFAIKernels.ffai_avg_pool2d_nhwc_f32(
+            IronKernels.iron_avg_pool2d_nhwc_f32(
                 input: input.buffer, inputOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
                 batch: b, ch: c, in_h: ih, in_w: iw, out_h: oh, out_w: ow,
                 k_h: kh, k_w: kw, stride: st, pad: pd,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_avg_pool2d_nhwc_f16(
+            IronKernels.iron_avg_pool2d_nhwc_f16(
                 input: input.buffer, inputOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
                 batch: b, ch: c, in_h: ih, in_w: iw, out_h: oh, out_w: ow,
                 k_h: kh, k_w: kw, stride: st, pad: pd,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_avg_pool2d_nhwc_bf16(
+            IronKernels.iron_avg_pool2d_nhwc_bf16(
                 input: input.buffer, inputOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
                 batch: b, ch: c, in_h: ih, in_w: iw, out_h: oh, out_w: ow,
@@ -11618,19 +11618,19 @@ public enum Ops {
             (UInt32(channels), UInt32(inH), UInt32(inW), UInt32(patch), UInt32(gridW))
         switch input.dtype {
         case .f32:
-            FFAIKernels.ffai_im2col_patch_f32(
+            IronKernels.iron_im2col_patch_f32(
                 input: input.buffer, inputOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
                 channels: c, in_h: ih, in_w: iw, patch: p, grid_w: gw,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_im2col_patch_f16(
+            IronKernels.iron_im2col_patch_f16(
                 input: input.buffer, inputOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
                 channels: c, in_h: ih, in_w: iw, patch: p, grid_w: gw,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_im2col_patch_bf16(
+            IronKernels.iron_im2col_patch_bf16(
                 input: input.buffer, inputOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
                 channels: c, in_h: ih, in_w: iw, patch: p, grid_w: gw,
@@ -11646,7 +11646,7 @@ public enum Ops {
     /// `scale·x + bias` (Gemma 4 normalizes with `2·(x − 0.5)` → `scale = 2`,
     /// `bias = -1`), and the row zero-padded out to `patchDimPadded` (a GEMM
     /// K-tile multiple ≥ `channels·patch·patch`). Wraps
-    /// `ffai_im2col_patch_interleaved` (`im2col_patch_interleaved.rs`):
+    /// `iron_im2col_patch_interleaved` (`im2col_patch_interleaved.rs`):
     /// Grid3D, one thread per output. Input NCHW `[channels, inH, inW]`;
     /// returns `[nPatches, patchDimPadded]` ready for the patch-embed GEMM.
     public static func im2colPatchInterleaved(
@@ -11677,21 +11677,21 @@ public enum Ops {
         )
         switch input.dtype {
         case .f32:
-            FFAIKernels.ffai_im2col_patch_interleaved_f32(
+            IronKernels.iron_im2col_patch_interleaved_f32(
                 input: input.buffer, inputOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
                 channels: c, in_h: ih, in_w: iw, patch: p, grid_w: gw,
                 patch_dim_padded: pdp, scale: scale, bias: bias,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_im2col_patch_interleaved_f16(
+            IronKernels.iron_im2col_patch_interleaved_f16(
                 input: input.buffer, inputOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
                 channels: c, in_h: ih, in_w: iw, patch: p, grid_w: gw,
                 patch_dim_padded: pdp, scale: scale, bias: bias,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_im2col_patch_interleaved_bf16(
+            IronKernels.iron_im2col_patch_interleaved_bf16(
                 input: input.buffer, inputOffset: input.offset,
                 out: result.buffer, outOffset: result.offset,
                 channels: c, in_h: ih, in_w: iw, patch: p, grid_w: gw,
@@ -11708,7 +11708,7 @@ public enum Ops {
     /// `frames` is a contiguous `[nFrames, channels, imgSide, imgSide]` buffer
     /// (`nFrames = isImage ? 1 : gridT·temporalPatch`; a still image reuses
     /// its one frame for every temporal slot). Rows are zero-padded to
-    /// `patchDimPadded`. Wraps `ffai_patch_unfold_qwen` (`patch_unfold_qwen.rs`):
+    /// `patchDimPadded`. Wraps `iron_patch_unfold_qwen` (`patch_unfold_qwen.rs`):
     /// Grid3D, one thread per output. Returns `[nPatches, patchDimPadded]`,
     /// `nPatches = gridT·side·side`, `side = mergeBlocks·merge`.
     public static func patchUnfoldQwen(
@@ -11744,7 +11744,7 @@ public enum Ops {
         )
         switch frames.dtype {
         case .f32:
-            FFAIKernels.ffai_patch_unfold_qwen_f32(
+            IronKernels.iron_patch_unfold_qwen_f32(
                 frames: frames.buffer, framesOffset: frames.offset,
                 out: result.buffer, outOffset: result.offset,
                 channels: c, patch: p, temporal_patch: tp, merge: m,
@@ -11752,7 +11752,7 @@ public enum Ops {
                 patch_dim_padded: pdp, is_image: isImg,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_patch_unfold_qwen_f16(
+            IronKernels.iron_patch_unfold_qwen_f16(
                 frames: frames.buffer, framesOffset: frames.offset,
                 out: result.buffer, outOffset: result.offset,
                 channels: c, patch: p, temporal_patch: tp, merge: m,
@@ -11760,7 +11760,7 @@ public enum Ops {
                 patch_dim_padded: pdp, is_image: isImg,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_patch_unfold_qwen_bf16(
+            IronKernels.iron_patch_unfold_qwen_bf16(
                 frames: frames.buffer, framesOffset: frames.offset,
                 out: result.buffer, outOffset: result.offset,
                 channels: c, patch: p, temporal_patch: tp, merge: m,
@@ -11800,21 +11800,21 @@ public enum Ops {
         let (h, gw) = (UInt32(hidden), UInt32(gridW))
         switch tokens.dtype {
         case .f32:
-            FFAIKernels.ffai_pos_emb_2d_add_f32(
+            IronKernels.iron_pos_emb_2d_add_f32(
                 tokens: tokens.buffer, tokensOffset: tokens.offset,
                 pos_x: posX.buffer, pos_xOffset: posX.offset,
                 pos_y: posY.buffer, pos_yOffset: posY.offset,
                 out: result.buffer, outOffset: result.offset,
                 hidden: h, grid_w: gw, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_pos_emb_2d_add_f16(
+            IronKernels.iron_pos_emb_2d_add_f16(
                 tokens: tokens.buffer, tokensOffset: tokens.offset,
                 pos_x: posX.buffer, pos_xOffset: posX.offset,
                 pos_y: posY.buffer, pos_yOffset: posY.offset,
                 out: result.buffer, outOffset: result.offset,
                 hidden: h, grid_w: gw, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_pos_emb_2d_add_bf16(
+            IronKernels.iron_pos_emb_2d_add_bf16(
                 tokens: tokens.buffer, tokensOffset: tokens.offset,
                 pos_x: posX.buffer, pos_xOffset: posX.offset,
                 pos_y: posY.buffer, pos_yOffset: posY.offset,
@@ -11852,21 +11852,21 @@ public enum Ops {
         let (iw, oh, ow, d) = (UInt32(inW), UInt32(outH), UInt32(outW), UInt32(ds))
         switch frame0.dtype {
         case .f32:
-            FFAIKernels.ffai_frame_diff_luma_f32(
+            IronKernels.iron_frame_diff_luma_f32(
                 frame0: frame0.buffer, frame0Offset: frame0.offset,
                 frame1: frame1.buffer, frame1Offset: frame1.offset,
                 out: result.buffer, outOffset: result.offset,
                 in_w: iw, out_h: oh, out_w: ow, ds: d,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_frame_diff_luma_f16(
+            IronKernels.iron_frame_diff_luma_f16(
                 frame0: frame0.buffer, frame0Offset: frame0.offset,
                 frame1: frame1.buffer, frame1Offset: frame1.offset,
                 out: result.buffer, outOffset: result.offset,
                 in_w: iw, out_h: oh, out_w: ow, ds: d,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_frame_diff_luma_bf16(
+            IronKernels.iron_frame_diff_luma_bf16(
                 frame0: frame0.buffer, frame0Offset: frame0.offset,
                 frame1: frame1.buffer, frame1Offset: frame1.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -11934,7 +11934,7 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(nFrames * nMels)
         switch audio.dtype {
         case .f32:
-            FFAIKernels.ffai_mel_spectrogram_f32(
+            IronKernels.iron_mel_spectrogram_f32(
                 audio: audio.buffer, audioOffset: audio.offset,
                 window: window.buffer, windowOffset: window.offset,
                 mel_weight: melWeight.buffer, mel_weightOffset: melWeight.offset,
@@ -11945,7 +11945,7 @@ public enum Ops {
                 n_out: UInt32(nFrames * nMels),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_mel_spectrogram_f16(
+            IronKernels.iron_mel_spectrogram_f16(
                 audio: audio.buffer, audioOffset: audio.offset,
                 window: window.buffer, windowOffset: window.offset,
                 mel_weight: melWeight.buffer, mel_weightOffset: melWeight.offset,
@@ -12001,7 +12001,7 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(nFrames * nMels)
         switch audio.dtype {
         case .f32:
-            FFAIKernels.ffai_mel_spectrogram_magnitude_f32(
+            IronKernels.iron_mel_spectrogram_magnitude_f32(
                 audio: audio.buffer, audioOffset: audio.offset,
                 window: window.buffer, windowOffset: window.offset,
                 mel_weight: melWeight.buffer, mel_weightOffset: melWeight.offset,
@@ -12012,7 +12012,7 @@ public enum Ops {
                 n_out: UInt32(nFrames * nMels),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_mel_spectrogram_magnitude_f16(
+            IronKernels.iron_mel_spectrogram_magnitude_f16(
                 audio: audio.buffer, audioOffset: audio.offset,
                 window: window.buffer, windowOffset: window.offset,
                 mel_weight: melWeight.buffer, mel_weightOffset: melWeight.offset,
@@ -12063,7 +12063,7 @@ public enum Ops {
         let len = UInt32(length)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_adain1d_f32(
+            IronKernels.iron_adain1d_f32(
                 x: x.buffer, xOffset: x.offset,
                 gamma: gamma.buffer, gammaOffset: gamma.offset,
                 beta: beta.buffer, betaOffset: beta.offset,
@@ -12071,7 +12071,7 @@ public enum Ops {
                 eps_buf: epsT.buffer, eps_bufOffset: epsT.offset,
                 length: len, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_adain1d_f16(
+            IronKernels.iron_adain1d_f16(
                 x: x.buffer, xOffset: x.offset,
                 gamma: gamma.buffer, gammaOffset: gamma.offset,
                 beta: beta.buffer, betaOffset: beta.offset,
@@ -12079,7 +12079,7 @@ public enum Ops {
                 eps_buf: epsT.buffer, eps_bufOffset: epsT.offset,
                 length: len, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_adain1d_bf16(
+            IronKernels.iron_adain1d_bf16(
                 x: x.buffer, xOffset: x.offset,
                 gamma: gamma.buffer, gammaOffset: gamma.offset,
                 beta: beta.buffer, betaOffset: beta.offset,
@@ -12096,7 +12096,7 @@ public enum Ops {
     /// (one threadgroup, thread `j` owns hidden unit `j`, state in
     /// threadgroup memory across timesteps). PyTorch `nn.LSTM` cell, gate
     /// order **i, f, g, o**, `bias = b_ih + b_hh` precombined. Wraps
-    /// `ffai_lstm` (`lstm.rs`): Reduction, ONE threadgroup, TPG =
+    /// `iron_lstm` (`lstm.rs`): Reduction, ONE threadgroup, TPG =
     /// `ceil(hidden/32)·32` (so `hidden ≤ 1024`).
     ///
     /// `reverse` walks `t` backward. A **bidirectional** LSTM is two calls
@@ -12138,21 +12138,21 @@ public enum Ops {
             UInt32(reverse ? 1 : 0), UInt32(stride), UInt32(outOffset))
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_lstm_f32(
+            IronKernels.iron_lstm_f32(
                 x: x.buffer, xOffset: x.offset, w_ih: wIH.buffer, w_ihOffset: wIH.offset,
                 w_hh: wHH.buffer, w_hhOffset: wHH.offset, bias: bias.buffer, biasOffset: bias.offset,
                 out: result.buffer, outOffset: result.offset,
                 seq_len: sl, input_dim: idim, hidden: h, reverse: rev,
                 out_stride: os, out_offset: oo, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_lstm_f16(
+            IronKernels.iron_lstm_f16(
                 x: x.buffer, xOffset: x.offset, w_ih: wIH.buffer, w_ihOffset: wIH.offset,
                 w_hh: wHH.buffer, w_hhOffset: wHH.offset, bias: bias.buffer, biasOffset: bias.offset,
                 out: result.buffer, outOffset: result.offset,
                 seq_len: sl, input_dim: idim, hidden: h, reverse: rev,
                 out_stride: os, out_offset: oo, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_lstm_bf16(
+            IronKernels.iron_lstm_bf16(
                 x: x.buffer, xOffset: x.offset, w_ih: wIH.buffer, w_ihOffset: wIH.offset,
                 w_hh: wHH.buffer, w_hhOffset: wHH.offset, bias: bias.buffer, biasOffset: bias.offset,
                 out: result.buffer, outOffset: result.offset,
@@ -12221,7 +12221,7 @@ public enum Ops {
     /// Element-wise Leaky ReLU `out[i] = x[i] > 0 ? x[i] : slope·x[i]` — the
     /// StyleTTS2 / Kokoro decoder + generator activation (slope varies per
     /// call site: 0.2 in AdaIN res-blocks, 0.1 / 0.01 in the generator).
-    /// Wraps `ffai_leaky_relu` (Grid3D, one thread per element). `slope` is a
+    /// Wraps `iron_leaky_relu` (Grid3D, one thread per element). `slope` is a
     /// runtime scalar so one PSO serves every slope.
     public static func leakyReLU(
         _ x: Tensor, slope: Float,
@@ -12236,17 +12236,17 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(x.elementCount)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_leaky_relu_f32(
+            IronKernels.iron_leaky_relu_f32(
                 input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 slope: slopeT.buffer, slopeOffset: slopeT.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_leaky_relu_f16(
+            IronKernels.iron_leaky_relu_f16(
                 input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 slope: slopeT.buffer, slopeOffset: slopeT.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_leaky_relu_bf16(
+            IronKernels.iron_leaky_relu_bf16(
                 input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 slope: slopeT.buffer, slopeOffset: slopeT.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
@@ -12259,7 +12259,7 @@ public enum Ops {
     /// Snake activation `out[c,t] = x[c,t] + (1/α_c)·sin²(α_c·x[c,t])` over a
     /// channels-first `[channels, length]` map with a learnable per-channel
     /// `alpha` `[channels]` — the iSTFTNet / BigVGAN periodic activation.
-    /// Wraps `ffai_snake1d` (Grid3D, one thread per element).
+    /// Wraps `iron_snake1d` (Grid3D, one thread per element).
     public static func snake(
         _ x: Tensor, alpha: Tensor, channels: Int, length: Int,
         on cmd: MTLCommandBuffer, into out: Tensor? = nil
@@ -12275,17 +12275,17 @@ public enum Ops {
         let len = UInt32(length)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_snake1d_f32(
+            IronKernels.iron_snake1d_f32(
                 input: x.buffer, inputOffset: x.offset, alpha: alpha.buffer, alphaOffset: alpha.offset,
                 out: result.buffer, outOffset: result.offset, length: len,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_snake1d_f16(
+            IronKernels.iron_snake1d_f16(
                 input: x.buffer, inputOffset: x.offset, alpha: alpha.buffer, alphaOffset: alpha.offset,
                 out: result.buffer, outOffset: result.offset, length: len,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_snake1d_bf16(
+            IronKernels.iron_snake1d_bf16(
                 input: x.buffer, inputOffset: x.offset, alpha: alpha.buffer, alphaOffset: alpha.offset,
                 out: result.buffer, outOffset: result.offset, length: len,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
@@ -12297,7 +12297,7 @@ public enum Ops {
 
     /// Nearest-neighbour 1-D up-sample `[channels, inLen] → [channels,
     /// factor·inLen]` (channels-first) — the StyleTTS2 `AdainResBlk1d`
-    /// shortcut + F0/N predictor up-sampler. Wraps `ffai_upsample_nearest1d`
+    /// shortcut + F0/N predictor up-sampler. Wraps `iron_upsample_nearest1d`
     /// (Grid3D, one thread per OUTPUT element, pure gather).
     public static func upsampleNearest1d(
         _ x: Tensor, channels: Int, inLen: Int, factor: Int,
@@ -12313,15 +12313,15 @@ public enum Ops {
         let (il, f) = (UInt32(inLen), UInt32(factor))
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_upsample_nearest1d_f32(
+            IronKernels.iron_upsample_nearest1d_f32(
                 input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 in_len: il, factor: f, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_upsample_nearest1d_f16(
+            IronKernels.iron_upsample_nearest1d_f16(
                 input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 in_len: il, factor: f, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_upsample_nearest1d_bf16(
+            IronKernels.iron_upsample_nearest1d_bf16(
                 input: x.buffer, inputOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 in_len: il, factor: f, gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
@@ -12335,7 +12335,7 @@ public enum Ops {
     /// (`ConvTranspose1d(C, C, k, stride, pad, groups=C)`). `weight` is
     /// per-channel `[channels, k]` (the depthwise `[C,1,k]` flattened),
     /// `bias` `[channels]`. `outLen = (inLen−1)·stride − 2·pad +
-    /// dilation·(k−1) + 1`. Wraps `ffai_conv1d_transpose_depthwise`.
+    /// dilation·(k−1) + 1`. Wraps `iron_conv1d_transpose_depthwise`.
     public static func conv1dTransposeDepthwise(
         _ input: Tensor, weight: Tensor, bias: Tensor,
         channels: Int, inLen: Int, k: Int, stride: Int, pad: Int, dilation: Int = 1,
@@ -12355,21 +12355,21 @@ public enum Ops {
         let (kk, st, pd, dl) = (UInt32(k), UInt32(stride), UInt32(pad), UInt32(dilation))
         switch input.dtype {
         case .f32:
-            FFAIKernels.ffai_conv1d_dense_depthwise_f32(
+            IronKernels.iron_conv1d_dense_depthwise_f32(
                 input: input.buffer, inputOffset: input.offset, weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset, out: result.buffer, outOffset: result.offset,
                 batch: 1, in_ch: c, channels: c, in_len: il, out_ch: c, out_len: ol,
                 k: kk, stride: st, pad: pd, dilation: dl,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_conv1d_dense_depthwise_f16(
+            IronKernels.iron_conv1d_dense_depthwise_f16(
                 input: input.buffer, inputOffset: input.offset, weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset, out: result.buffer, outOffset: result.offset,
                 batch: 1, in_ch: c, channels: c, in_len: il, out_ch: c, out_len: ol,
                 k: kk, stride: st, pad: pd, dilation: dl,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_conv1d_dense_depthwise_bf16(
+            IronKernels.iron_conv1d_dense_depthwise_bf16(
                 input: input.buffer, inputOffset: input.offset, weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset, out: result.buffer, outOffset: result.offset,
                 batch: 1, in_ch: c, channels: c, in_len: il, out_ch: c, out_len: ol,
@@ -12394,7 +12394,7 @@ public enum Ops {
         let (kk, st, pd, dl) = (UInt32(k), UInt32(stride), UInt32(pad), UInt32(dilation))
         switch (transposed, input.dtype) {
         case (false, .f32):
-            FFAIKernels.ffai_conv1d_dense_dilated_f32(
+            IronKernels.iron_conv1d_dense_dilated_f32(
                 input: input.buffer, inputOffset: input.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -12403,7 +12403,7 @@ public enum Ops {
                 k: kk, stride: st, pad: pd, dilation: dl,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (false, .f16):
-            FFAIKernels.ffai_conv1d_dense_dilated_f16(
+            IronKernels.iron_conv1d_dense_dilated_f16(
                 input: input.buffer, inputOffset: input.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -12412,7 +12412,7 @@ public enum Ops {
                 k: kk, stride: st, pad: pd, dilation: dl,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (false, .bf16):
-            FFAIKernels.ffai_conv1d_dense_dilated_bf16(
+            IronKernels.iron_conv1d_dense_dilated_bf16(
                 input: input.buffer, inputOffset: input.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -12421,7 +12421,7 @@ public enum Ops {
                 k: kk, stride: st, pad: pd, dilation: dl,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (true, .f32):
-            FFAIKernels.ffai_conv1d_dense_transpose_f32(
+            IronKernels.iron_conv1d_dense_transpose_f32(
                 input: input.buffer, inputOffset: input.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -12430,7 +12430,7 @@ public enum Ops {
                 k: kk, stride: st, pad: pd, dilation: dl,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (true, .f16):
-            FFAIKernels.ffai_conv1d_dense_transpose_f16(
+            IronKernels.iron_conv1d_dense_transpose_f16(
                 input: input.buffer, inputOffset: input.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -12439,7 +12439,7 @@ public enum Ops {
                 k: kk, stride: st, pad: pd, dilation: dl,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (true, .bf16):
-            FFAIKernels.ffai_conv1d_dense_transpose_bf16(
+            IronKernels.iron_conv1d_dense_transpose_bf16(
                 input: input.buffer, inputOffset: input.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -12506,7 +12506,7 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(batch * outCh * outLen)
         switch input.dtype {
         case .f32:
-            FFAIKernels.ffai_conv1d_dense_direct_f32(
+            IronKernels.iron_conv1d_dense_direct_f32(
                 input: input.buffer, inputOffset: input.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -12516,7 +12516,7 @@ public enum Ops {
                 k: UInt32(k), stride: UInt32(stride), pad: UInt32(pad),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_conv1d_dense_direct_f16(
+            IronKernels.iron_conv1d_dense_direct_f16(
                 input: input.buffer, inputOffset: input.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -12526,7 +12526,7 @@ public enum Ops {
                 k: UInt32(k), stride: UInt32(stride), pad: UInt32(pad),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_conv1d_dense_direct_bf16(
+            IronKernels.iron_conv1d_dense_direct_bf16(
                 input: input.buffer, inputOffset: input.offset,
                 weight: weight.buffer, weightOffset: weight.offset,
                 bias: bias.buffer, biasOffset: bias.offset,
@@ -12587,7 +12587,7 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(outLen)
         switch specRe.dtype {
         case .f32:
-            FFAIKernels.ffai_vocoder_istft_f32(
+            IronKernels.iron_vocoder_istft_f32(
                 spec_re: specRe.buffer, spec_reOffset: specRe.offset,
                 spec_im: specIm.buffer, spec_imOffset: specIm.offset,
                 window: window.buffer, windowOffset: window.offset,
@@ -12596,7 +12596,7 @@ public enum Ops {
                 n_freq: UInt32(nFreq), hop_length: UInt32(hopLength),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_vocoder_istft_f16(
+            IronKernels.iron_vocoder_istft_f16(
                 spec_re: specRe.buffer, spec_reOffset: specRe.offset,
                 spec_im: specIm.buffer, spec_imOffset: specIm.offset,
                 window: window.buffer, windowOffset: window.offset,
@@ -12605,7 +12605,7 @@ public enum Ops {
                 n_freq: UInt32(nFreq), hop_length: UInt32(hopLength),
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_vocoder_istft_bf16(
+            IronKernels.iron_vocoder_istft_bf16(
                 spec_re: specRe.buffer, spec_reOffset: specRe.offset,
                 spec_im: specIm.buffer, spec_imOffset: specIm.offset,
                 window: window.buffer, windowOffset: window.offset,

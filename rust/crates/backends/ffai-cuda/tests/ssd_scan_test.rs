@@ -4,9 +4,9 @@
 //! Mamba2 SSD chunked-MATMUL prefill scan (`ssm_prefill_scan_ssd`) on CUDA vs
 //! the sequential `ssm_prefill_scan` reference, for the NemotronH cell
 //! (dh=64, ds=128, H=64, G=8). Gate: max|Δy| < 1e-3 (fp16 GEMM path).
-use ffai_core::{DType, Device, Tensor};
-use ffai_cuda::CudaDevice;
-use ffai_ops::{ssm_prefill_scan, ssm_prefill_scan_ssd};
+use iron_core::{DType, Device, Tensor};
+use iron_cuda::CudaDevice;
+use iron_ops::{ssm_prefill_scan, ssm_prefill_scan_ssd};
 
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn fb(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() }

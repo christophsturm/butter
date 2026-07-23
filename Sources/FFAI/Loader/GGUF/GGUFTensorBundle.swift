@@ -31,7 +31,7 @@ import QuartzCore
 // **Status:** The reader (header + KV + tensor-info
 // table) is fully implemented in `GGUFReader.swift` and works end-to-
 // end on real DeepSeek-V4-Flash IQ2_XXS GGUFs. `tensor(named:)` decodes
-// the on-disk bytes into the GPU-resident split that metaltile's GGUF
+// the on-disk bytes into the GPU-resident split that iron's GGUF
 // dequant kernels expect (Q8_0 / Q2_K / IQ2_XXS) — for formats whose
 // dequant kernels haven't landed yet (every i-quant other than
 // IQ2_XXS, the FP4 / TQ / MXFP4 variants), it throws
@@ -169,8 +169,8 @@ public final class GGUFTensorBundle: @unchecked Sendable {
 
     /// Materialize a tensor from the GGUF as a host-side `Tensor`.
     /// Supported on-disk formats: F32 / F16 / BF16 (direct copy) and
-    /// Q8_0 / Q2_K / IQ2_XXS (GPU dequant via the metaltile
-    /// `ffai_gguf_dequant_*` kernels). Other quant types raise
+    /// Q8_0 / Q2_K / IQ2_XXS (GPU dequant via the iron
+    /// `iron_gguf_dequant_*` kernels). Other quant types raise
     /// `GGUFError.unsupportedDequant` — they land in follow-ups as
     /// the kernel surface grows.
     ///

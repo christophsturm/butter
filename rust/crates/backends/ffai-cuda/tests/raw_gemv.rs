@@ -8,7 +8,7 @@
 
 #![cfg(feature = "cuda")]
 
-use ffai_kernels_runtime::CudaDevice;
+use iron_kernels_runtime::CudaDevice;
 use std::os::raw::c_void;
 use std::time::Instant;
 

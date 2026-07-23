@@ -3,9 +3,9 @@
 
 //! # ffai-metal
 //!
-//! Metal backend for the FFAI engine. Wraps `ffai_kernels_runtime::Context`
+//! Metal backend for the FFAI engine. Wraps `iron_kernels_runtime::Context`
 //! (the public Metal face — MSL JIT, PSO cache, dispatch) behind the shared
-//! [`ffai_core::Device`] trait, so the **same Rust models run on Apple GPUs
+//! [`iron_core::Device`] trait, so the **same Rust models run on Apple GPUs
 //! (and iOS)** as on CUDA. This is the half that makes "models shared across
 //! CUDA *and* Metal" real.
 //!
@@ -15,8 +15,8 @@
 //! being re-staged from host bytes each call. Outputs flow through host bytes
 //! (preserves in-place reads + readback) and invalidate the stale resident copy.
 
-use ffai_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
-use ffai_kernels_runtime::{Context, DispatchSpec, FFAIError, ResidentBuffer};
+use iron_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
+use iron_kernels_runtime::{Context, DispatchSpec, FFAIError, ResidentBuffer};
 use parking_lot::{Mutex, RwLock};
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -49,7 +49,7 @@ impl DeviceBuffer for MetalBuffer {
     }
 }
 
-/// Metal device: a metaltile `Context` behind the shared `Device` trait.
+/// Metal device: a iron `Context` behind the shared `Device` trait.
 pub struct MetalDevice {
     ctx: Mutex<Context>,
     name: String,

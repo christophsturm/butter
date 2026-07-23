@@ -3,14 +3,14 @@
 
 //! # ffai-models
 //!
-//! Model forward passes as plain Rust over [`ffai_ops`]. This is the big
+//! Model forward passes as plain Rust over [`iron_ops`]. This is the big
 //! surface ported from FFAI-Swift `Models/` (~35 families) — written ONCE
-//! and run on every backend via the shared [`ffai_core::Device`] trait. The
+//! and run on every backend via the shared [`iron_core::Device`] trait. The
 //! 35 families collapse to a handful of *builders* parameterized by config;
 //! this module starts with the transformer-LLM builder (Llama / Qwen /
 //! Gemma / Mistral / Yi / Phi / SmolLM / …).
 
-use ffai_core::{Device, Result, Tensor};
+use iron_core::{Device, Result, Tensor};
 
 /// A loaded model: weights resident on some [`Device`], able to run a
 /// forward pass. Backend-neutral — the same impl runs on Metal/CUDA/Vulkan.

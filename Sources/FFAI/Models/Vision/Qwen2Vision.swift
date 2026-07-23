@@ -235,7 +235,7 @@ final class Qwen2VLVisionBlock {
     ///      token-major → head-major (`Ops.transposeTokensToHeads`), then
     ///      `Ops.sdpaBidirectional` (MHA, `nKVHeads == nQHeads`), scale
     ///      `1/√headDim`, baseKV 0, `kvStride == nTokens`. The
-    ///      `ffai_sdpa_bidirectional_d80_*` kernel is GPU-correct at this
+    ///      `iron_sdpa_bidirectional_d80_*` kernel is GPU-correct at this
     ///      production geometry (`sdpa_bidirectional_gpu_correctness.rs`),
     ///      so the native-resolution grid (thousands of patches) no longer
     ///      pins the cores.

@@ -1,7 +1,7 @@
 // MoE gather bandwidth: contiguous vs scattered expert indices (isolate scatter cost).
-use ffai_core::{DType, Tensor};
-use ffai_ops::{moe_gather_up_relu2, quantize_q4};
-use ffai_cuda::CudaDevice;
+use iron_core::{DType, Tensor};
+use iron_ops::{moe_gather_up_relu2, quantize_q4};
+use iron_cuda::CudaDevice;
 use std::time::Instant;
 fn tbf(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn tbu(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }

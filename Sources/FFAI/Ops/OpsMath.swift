@@ -14,7 +14,7 @@
 //
 // OpsMath — element-wise math primitives + per-row reductions.
 //
-// Wraps the `ffai_*` math kernels from `ffai-kernels-std/src/mlx/unary.rs`,
+// Wraps the `iron_*` math kernels from `crates/wh-iron-std/src/kernels/ops/unary.rs`,
 // `binary.rs`, `reduce.rs`, `softmax.rs`, `logsumexp.rs`, `arg_reduce.rs`,
 // `copy.rs`, `arange.rs`, and `strided.rs`.
 //
@@ -27,13 +27,13 @@
 
 import Foundation
 import Metal
-import FFAIKernelsSwift
+import IronSwift
 
 extension Ops {
 
     // ─── Binary elementwise: sub, div, pow, maxElem, minElem ─────────
 
-    /// Element-wise `out[i] = a[i] - b[i]`. Wraps `ffai_sub_*`.
+    /// Element-wise `out[i] = a[i] - b[i]`. Wraps `iron_sub_*`.
     public static func sub(
         _ a: Tensor, _ b: Tensor, on cmd: MTLCommandBuffer,
         into out: Tensor? = nil
@@ -44,15 +44,15 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(a.elementCount)
         switch a.dtype {
         case .f32:
-            FFAIKernels.ffai_sub_f32(
+            IronKernels.iron_sub_f32(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_sub_f16(
+            IronKernels.iron_sub_f16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_sub_bf16(
+            IronKernels.iron_sub_bf16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.sub: unsupported dtype \(a.dtype)")
@@ -60,7 +60,7 @@ extension Ops {
         return result
     }
 
-    /// Element-wise `out[i] = a[i] / b[i]`. Wraps `ffai_div_*`.
+    /// Element-wise `out[i] = a[i] / b[i]`. Wraps `iron_div_*`.
     public static func div(
         _ a: Tensor, _ b: Tensor, on cmd: MTLCommandBuffer,
         into out: Tensor? = nil
@@ -71,15 +71,15 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(a.elementCount)
         switch a.dtype {
         case .f32:
-            FFAIKernels.ffai_div_f32(
+            IronKernels.iron_div_f32(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_div_f16(
+            IronKernels.iron_div_f16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_div_bf16(
+            IronKernels.iron_div_bf16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.div: unsupported dtype \(a.dtype)")
@@ -87,7 +87,7 @@ extension Ops {
         return result
     }
 
-    /// Element-wise `out[i] = a[i] ^ b[i]`. Wraps `ffai_pow_*`.
+    /// Element-wise `out[i] = a[i] ^ b[i]`. Wraps `iron_pow_*`.
     public static func pow(
         _ a: Tensor, _ b: Tensor, on cmd: MTLCommandBuffer,
         into out: Tensor? = nil
@@ -98,15 +98,15 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(a.elementCount)
         switch a.dtype {
         case .f32:
-            FFAIKernels.ffai_pow_f32(
+            IronKernels.iron_pow_f32(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_pow_f16(
+            IronKernels.iron_pow_f16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_pow_bf16(
+            IronKernels.iron_pow_bf16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.pow: unsupported dtype \(a.dtype)")
@@ -114,8 +114,8 @@ extension Ops {
         return result
     }
 
-    /// Element-wise `out[i] = max(a[i], b[i])`. Wraps `ffai_max_elem_*`.
-    /// Distinct from `Ops.argmax` / `ffai_max_elem` per-tensor; this is
+    /// Element-wise `out[i] = max(a[i], b[i])`. Wraps `iron_max_elem_*`.
+    /// Distinct from `Ops.argmax` / `iron_max_elem` per-tensor; this is
     /// per-element maximum across two tensors.
     public static func maxElem(
         _ a: Tensor, _ b: Tensor, on cmd: MTLCommandBuffer,
@@ -127,15 +127,15 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(a.elementCount)
         switch a.dtype {
         case .f32:
-            FFAIKernels.ffai_max_elem_f32(
+            IronKernels.iron_max_elem_f32(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_max_elem_f16(
+            IronKernels.iron_max_elem_f16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_max_elem_bf16(
+            IronKernels.iron_max_elem_bf16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.maxElem: unsupported dtype \(a.dtype)")
@@ -143,7 +143,7 @@ extension Ops {
         return result
     }
 
-    /// Element-wise `out[i] = min(a[i], b[i])`. Wraps `ffai_min_elem_*`.
+    /// Element-wise `out[i] = min(a[i], b[i])`. Wraps `iron_min_elem_*`.
     public static func minElem(
         _ a: Tensor, _ b: Tensor, on cmd: MTLCommandBuffer,
         into out: Tensor? = nil
@@ -154,15 +154,15 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(a.elementCount)
         switch a.dtype {
         case .f32:
-            FFAIKernels.ffai_min_elem_f32(
+            IronKernels.iron_min_elem_f32(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_min_elem_f16(
+            IronKernels.iron_min_elem_f16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_min_elem_bf16(
+            IronKernels.iron_min_elem_bf16(
                 a: a.buffer, aOffset: a.offset, b: b.buffer, bOffset: b.offset, out: result.buffer,
                 outOffset: result.offset, gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.minElem: unsupported dtype \(a.dtype)")
@@ -199,17 +199,17 @@ extension Ops {
         runUnary(
             x, out, "neg",
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_neg_f32(
+                IronKernels.iron_neg_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_neg_f16(
+                IronKernels.iron_neg_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_neg_bf16(
+                IronKernels.iron_neg_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -221,17 +221,17 @@ extension Ops {
         runUnary(
             x, out, "abs",
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_abs_f32(
+                IronKernels.iron_abs_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_abs_f16(
+                IronKernels.iron_abs_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_abs_bf16(
+                IronKernels.iron_abs_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -243,17 +243,17 @@ extension Ops {
         runUnary(
             x, out, "exp",
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_exp_f32(
+                IronKernels.iron_exp_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_exp_f16(
+                IronKernels.iron_exp_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_exp_bf16(
+                IronKernels.iron_exp_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -265,17 +265,17 @@ extension Ops {
         runUnary(
             x, out, "log",
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_log_f32(
+                IronKernels.iron_log_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_log_f16(
+                IronKernels.iron_log_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_log_bf16(
+                IronKernels.iron_log_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -289,17 +289,17 @@ extension Ops {
         runUnary(
             x, out, "sqrt",
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_sqrt_f32(
+                IronKernels.iron_sqrt_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_sqrt_f16(
+                IronKernels.iron_sqrt_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_sqrt_bf16(
+                IronKernels.iron_sqrt_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -313,17 +313,17 @@ extension Ops {
         runUnary(
             x, out, "square",
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_square_f32(
+                IronKernels.iron_square_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_square_f16(
+                IronKernels.iron_square_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_square_bf16(
+                IronKernels.iron_square_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -337,17 +337,17 @@ extension Ops {
         runUnary(
             x, out, "recip",
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_recip_f32(
+                IronKernels.iron_recip_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_recip_f16(
+                IronKernels.iron_recip_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_recip_bf16(
+                IronKernels.iron_recip_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -361,17 +361,17 @@ extension Ops {
         runUnary(
             x, out, "floor",
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_floor_f32(
+                IronKernels.iron_floor_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_floor_f16(
+                IronKernels.iron_floor_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_floor_bf16(
+                IronKernels.iron_floor_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -385,17 +385,17 @@ extension Ops {
         runUnary(
             x, out, "ceil",
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_ceil_f32(
+                IronKernels.iron_ceil_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_ceil_f16(
+                IronKernels.iron_ceil_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_ceil_bf16(
+                IronKernels.iron_ceil_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -410,17 +410,17 @@ extension Ops {
         runUnary(
             x, out, "round",
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_round_f32(
+                IronKernels.iron_round_f32(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_round_f16(
+                IronKernels.iron_round_f16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
             { a, ao, o, oo, g, t, c in
-                FFAIKernels.ffai_round_bf16(
+                IronKernels.iron_round_bf16(
                     a: a, aOffset: ao, out: o, outOffset: oo, gridSize: g, threadgroupSize: t, on: c
                 )
             },
@@ -430,7 +430,7 @@ extension Ops {
     // ─── GPU copy (kernel) ───────────────────────────────────────────
     //
     // `Ops.copy` (in Ops.swift) is a blit copy. `copyKernel` exposes the
-    // ffai-kernels `ffai_copy_*` kernel — same semantics, but it runs as a
+    // iron `iron_copy_*` kernel — same semantics, but it runs as a
     // compute kernel rather than a blit, which is occasionally useful
     // for kernel-fusion / command-encoder ordering reasons (a blit forces
     // an encoder boundary; a compute dispatch chains with neighbouring
@@ -447,15 +447,15 @@ extension Ops {
         let (grid, tg) = elementwiseGrid(src.elementCount)
         switch src.dtype {
         case .f32:
-            FFAIKernels.ffai_copy_f32(
+            IronKernels.iron_copy_f32(
                 a: src.buffer, aOffset: src.offset, out: dst.buffer, outOffset: dst.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_copy_f16(
+            IronKernels.iron_copy_f16(
                 a: src.buffer, aOffset: src.offset, out: dst.buffer, outOffset: dst.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_copy_bf16(
+            IronKernels.iron_copy_bf16(
                 a: src.buffer, aOffset: src.offset, out: dst.buffer, outOffset: dst.offset,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.copyKernel: unsupported dtype \(src.dtype)")
@@ -464,10 +464,10 @@ extension Ops {
 
     // ─── arange ──────────────────────────────────────────────────────
     //
-    // `ffai_arange_*` fills `out[i] = start + i * step` for `i ∈ [0, n)`.
+    // `iron_arange_*` fills `out[i] = start + i * step` for `i ∈ [0, n)`.
     // The kernel takes `start` and `step` as 1-element scalar buffers
     // (not constexpr scalars) so the same PSO works across calls — see
-    // `ffai-kernels-std/src/mlx/arange.rs`.
+    // `crates/wh-iron-std/src/kernels/ops/arange.rs`.
 
     /// Fill `out` with the linspace `[start, start + step, …,
     /// start + (n-1)*step]`. `out.elementCount` is treated as `n`.
@@ -489,7 +489,7 @@ extension Ops {
             let startBuf = dev.scalarBuffer(start)
             let stepBuf = dev.scalarBuffer(step)
             let (grid, tg) = elementwiseGrid(n)
-            FFAIKernels.ffai_arange_f32(
+            IronKernels.iron_arange_f32(
                 out: out.buffer, outOffset: out.offset,
                 start: startBuf, startOffset: 0,
                 step: stepBuf, stepOffset: 0,
@@ -503,7 +503,7 @@ extension Ops {
 
     /// Numerically-stable softmax over the last dim of a row-major
     /// 2D `[rows, n]` tensor (or a 1D `[n]` tensor treated as `rows=1`).
-    /// Wraps `ffai_softmax_*`: one threadgroup per row, online max + sum
+    /// Wraps `iron_softmax_*`: one threadgroup per row, online max + sum
     /// reduction, then a second pass writes the normalised output. The
     /// vocab length `n` is a runtime constexpr — no per-vocab PSO churn.
     public static func softmax(
@@ -523,15 +523,15 @@ extension Ops {
         let tg = MTLSize(width: tgSize, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_softmax_f32(
+            IronKernels.iron_softmax_f32(
                 inp: x.buffer, inpOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_softmax_f16(
+            IronKernels.iron_softmax_f16(
                 inp: x.buffer, inpOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_softmax_bf16(
+            IronKernels.iron_softmax_bf16(
                 inp: x.buffer, inpOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.softmax: unsupported dtype \(x.dtype)")
@@ -560,15 +560,15 @@ extension Ops {
         let tg = MTLSize(width: tgSize, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_logsumexp_f32(
+            IronKernels.iron_logsumexp_f32(
                 inp: x.buffer, inpOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_logsumexp_f16(
+            IronKernels.iron_logsumexp_f16(
                 inp: x.buffer, inpOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_logsumexp_bf16(
+            IronKernels.iron_logsumexp_bf16(
                 inp: x.buffer, inpOffset: x.offset, out: result.buffer, outOffset: result.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.logsumexp: unsupported dtype \(x.dtype)")
@@ -594,15 +594,15 @@ extension Ops {
         let tg = MTLSize(width: tgSize, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
-            FFAIKernels.ffai_argmin_f32(
+            IronKernels.iron_argmin_f32(
                 inp: x.buffer, inpOffset: x.offset, out: out.buffer, outOffset: out.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_argmin_f16(
+            IronKernels.iron_argmin_f16(
                 inp: x.buffer, inpOffset: x.offset, out: out.buffer, outOffset: out.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_argmin_bf16(
+            IronKernels.iron_argmin_bf16(
                 inp: x.buffer, inpOffset: x.offset, out: out.buffer, outOffset: out.offset,
                 n: UInt32(n), gridSize: grid, threadgroupSize: tg, on: cmd)
         default: fatalError("Ops.argmin: unsupported dtype \(x.dtype)")

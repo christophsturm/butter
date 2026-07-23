@@ -75,7 +75,7 @@ struct QuantizedOpsAffineTests {
     @Test("int8 round-trip — 64 elements / group=64 recovers within ~0.01")
     func int8RoundTrip64() {
         autoreleasepool {
-            // The ffai-kernels int8 quantize kernel reads 2 elements per lane
+            // The iron int8 quantize kernel reads 2 elements per lane
             // (`lane * 2`, `lane * 2 + 1`) across a 32-lane simdgroup, so
             // group_size MUST be 64. Earlier this test passed groupSize=32
             // and silently spilled the upper 16 lanes into the next group's
@@ -221,7 +221,7 @@ struct QuantizedOpsAffineTests {
 
     @Test("validateAffineQuantize rejects group_size != 64")
     func rejectGroupNotEqual64() {
-        // The ffai-kernels quantize kernels (`ffai_affine_quantize_int{2,4,8}`)
+        // The iron quantize kernels (`iron_affine_quantize_int{2,4,8}`)
         // bake in one simdgroup × 2 elements/lane = 64 elements/group via
         // the `lane * 2` / `lane * 2 + 1` loads + `simd_min` / `simd_max`
         // reduction. Only group_size=64 is emitted; anything else either

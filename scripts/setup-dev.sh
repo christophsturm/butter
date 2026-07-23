@@ -24,7 +24,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-FFAI_KERNELS_DIR="$PROJECT_ROOT/../ffai-kernels"
+IRON_DIR="$PROJECT_ROOT/../iron"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -91,19 +91,19 @@ else
 fi
 
 # ─────────────────────────────────────────────
-# Sibling ffai-kernels checkout
+# Sibling iron checkout
 # ─────────────────────────────────────────────
 echo ""
-echo "Checking sibling ffai-kernels repo..."
-if [ ! -d "$FFAI_KERNELS_DIR" ]; then
-    warn "ffai-kernels not found at $FFAI_KERNELS_DIR"
+echo "Checking sibling iron repo..."
+if [ ! -d "$IRON_DIR" ]; then
+    warn "iron not found at $IRON_DIR"
     echo ""
     echo "Clone it with:"
-    echo "  cd $(dirname "$PROJECT_ROOT") && git clone https://github.com/thewafflehaus/ffai-kernels"
+    echo "  cd $(dirname "$PROJECT_ROOT") && git clone https://github.com/thewafflehaus/iron"
     echo ""
-    fail "ffai-kernels checkout required for kernel generation"
+    fail "iron checkout required for kernel generation"
 fi
-ok "ffai-kernels: $FFAI_KERNELS_DIR"
+ok "iron: $IRON_DIR"
 
 # ─────────────────────────────────────────────
 # Resolve packages

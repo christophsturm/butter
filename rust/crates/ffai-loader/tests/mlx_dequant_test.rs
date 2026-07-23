@@ -3,7 +3,7 @@
 //! Validate the MLX 4-bit affine dequant + name-remap path against MLX ground
 //! truth captured from `mx.dequantize(...)` on the Nemotron-Cascade checkpoint.
 //! Needs the local MLX dir (skips if absent).
-use ffai_loader::SafeTensors;
+use iron_loader::SafeTensors;
 
 const DIR: &str = "/Users/tom/models/Nemotron-Cascade-2-30B-A3B-4bit";
 

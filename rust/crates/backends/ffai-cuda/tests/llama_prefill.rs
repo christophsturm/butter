@@ -7,10 +7,10 @@
 //! Llama: hidden 576, GQA 9q/3kv, head_dim 64, rope θ=1e5, 30 layers), run
 //! text-only. This is exactly the text-half prefill a full VLM forward runs
 //! after splicing image embeds — every piece now on the shared op layer.
-use ffai_core::{DType, Tensor};
-use ffai_cuda::CudaDevice;
-use ffai_loader::SafeTensors;
-use ffai_ops::{matmul, rms_norm, rope_llama, sdpa_decode, swiglu};
+use iron_core::{DType, Tensor};
+use iron_cuda::CudaDevice;
+use iron_loader::SafeTensors;
+use iron_ops::{matmul, rms_norm, rope_llama, sdpa_decode, swiglu};
 
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn fb(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() }

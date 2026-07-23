@@ -5,9 +5,9 @@
 //! identity, so this validates the COMPOSITION wiring (q low-rank →
 //! per-head q-norm → sink-SDPA → grouped O-LoRA); RoPE itself is verified
 //! separately in dsv4_test.
-use ffai_core::{DType, Device, Tensor};
-use ffai_cuda::CudaDevice;
-use ffai_models::dsv4::{mla_attention, MlaConfig, MlaWeights};
+use iron_core::{DType, Device, Tensor};
+use iron_cuda::CudaDevice;
+use iron_models::dsv4::{mla_attention, MlaConfig, MlaWeights};
 
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn fb(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() }

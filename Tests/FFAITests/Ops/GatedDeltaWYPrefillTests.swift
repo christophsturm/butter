@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Equivalence tests for `Ops.gatedDeltaWYPrefill` — the chunked-WY GDN
-// prefill pipeline (`ffai_gdn_wy_plan` + `ffai_gdn_wy_scan` + the
+// prefill pipeline (`iron_gdn_wy_plan` + `iron_gdn_wy_scan` + the
 // `Ops.gdnGateBeta` gate pre-pass) — against `Ops.gatedDeltaPrepChunk`,
 // the production recurrence it opts in as a replacement for
 // (`FFAI_GDN_WY=1`). Both paths consume identical raw inputs

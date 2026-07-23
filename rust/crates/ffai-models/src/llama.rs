@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Transformer-LLM builder (Llama / Qwen / Mistral / Yi / Phi / SmolLM …).
-//! One decode layer assembled entirely from [`ffai_ops`] — so it runs on any
-//! backend that implements [`ffai_core::Device`]. Config-parameterized: the
+//! One decode layer assembled entirely from [`iron_ops`] — so it runs on any
+//! backend that implements [`iron_core::Device`]. Config-parameterized: the
 //! same code serves every model in this family by varying [`LlamaConfig`].
 
-use ffai_core::{Device, Error, Result, Tensor};
-use ffai_ops as ops;
+use iron_core::{Device, Error, Result, Tensor};
+use iron_ops as ops;
 
 /// Architecture config shared by the transformer-LLM family.
 #[derive(Debug, Clone, Copy)]
@@ -148,7 +148,7 @@ pub fn forward_single(
     let ids = Tensor::new(
         dev.upload(&token_id.to_le_bytes())?,
         vec![1],
-        ffai_core::DType::U32,
+        iron_core::DType::U32,
     );
     let mut x = ops::gather(dev, &w.embed, &ids)?.reshaped(vec![cfg.hidden]);
     for layer in &w.layers {
@@ -164,7 +164,7 @@ pub fn forward_single(
 /// back to tied embeddings when `lm_head.weight` is absent.
 pub fn load_qwen3(
     dev: &dyn Device,
-    st: &ffai_loader::SafeTensors,
+    st: &iron_loader::SafeTensors,
     cfg: &LlamaConfig,
     n_layers: usize,
 ) -> Result<ModelWeights> {
@@ -241,7 +241,7 @@ pub fn load_hf(dev: &dyn Device, dir: &str) -> Result<LoadedModel> {
     let rope_theta = j["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
     let eps = j["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
 
-    let st = ffai_loader::SafeTensors::open(&format!("{dir}/model.safetensors"))?;
+    let st = iron_loader::SafeTensors::open(&format!("{dir}/model.safetensors"))?;
     let qk_norm = st.info("model.layers.0.self_attn.q_norm.weight").is_some();
     let attn_bias = st.info("model.layers.0.self_attn.q_proj.bias").is_some();
 
@@ -276,7 +276,7 @@ pub fn load_hf(dev: &dyn Device, dir: &str) -> Result<LoadedModel> {
 /// Read geometry from a GGUF's metadata and derive the [`LlamaConfig`].
 /// Probes for the `qwen2`/`llama` arch prefix and detects the QKV-bias flag
 /// from the presence of `blk.0.attn_q.bias`.
-pub fn gguf_config(g: &ffai_loader::gguf::Gguf) -> Result<(LlamaConfig, usize, usize)> {
+pub fn gguf_config(g: &iron_loader::gguf::Gguf) -> Result<(LlamaConfig, usize, usize)> {
     // Architecture prefix for the geometry keys (e.g. "qwen2", "llama").
     let arch = g.meta_str("general.architecture").unwrap_or("qwen2").to_string();
     let mu = |suffix: &str| -> Option<u32> { g.meta_u32(&format!("{arch}.{suffix}")) };
@@ -325,7 +325,7 @@ pub fn gguf_config(g: &ffai_loader::gguf::Gguf) -> Result<(LlamaConfig, usize, u
 /// the Qwen2.5 QKV biases when `cfg.attn_bias`. Parallel to [`load_qwen3`].
 pub fn load_qwen_gguf(
     dev: &dyn Device,
-    g: &ffai_loader::gguf::Gguf,
+    g: &iron_loader::gguf::Gguf,
     cfg: &LlamaConfig,
     n_layers: usize,
 ) -> Result<ModelWeights> {
@@ -340,7 +340,7 @@ pub fn load_qwen_gguf(
         // [out, in] (block r·in .. (r+1)·in), so report shape [out, in].
         let shape: Vec<usize> = t.dims.iter().rev().map(|&d| d as usize).collect();
         let bytes: &[u8] = bytemuck_cast(&data);
-        Ok(Tensor::new(dev.upload(bytes)?, shape, ffai_core::DType::F32))
+        Ok(Tensor::new(dev.upload(bytes)?, shape, iron_core::DType::F32))
     };
 
     let embed = up("token_embd.weight")?;
@@ -391,7 +391,7 @@ pub fn load_qwen_gguf(
 // re-quant, backend-agnostic (host-side slice → f32 upload → registry ops).
 
 /// True when the GGUF declares the Phi-3 architecture (fused qkv/ffn_up).
-pub fn gguf_is_phi3(g: &ffai_loader::gguf::Gguf) -> bool {
+pub fn gguf_is_phi3(g: &iron_loader::gguf::Gguf) -> bool {
     g.meta_str("general.architecture") == Some("phi3")
         || g.tensor("blk.0.attn_qkv.weight").is_some()
 }
@@ -400,7 +400,7 @@ pub fn gguf_is_phi3(g: &ffai_loader::gguf::Gguf) -> bool {
 /// `(out, in)` dims. GGUF stores dims fastest-first, so a logical `[out, in]`
 /// matrix is listed as `dims=[in, out]`; the dequantized buffer is row-major
 /// `[out, in]`. Shared by the fused-tensor split below.
-fn dequant_2d(g: &ffai_loader::gguf::Gguf, name: &str) -> Result<(Vec<f32>, usize, usize)> {
+fn dequant_2d(g: &iron_loader::gguf::Gguf, name: &str) -> Result<(Vec<f32>, usize, usize)> {
     let t = g
         .tensor(name)
         .ok_or_else(|| Error::Msg(format!("gguf: tensor '{name}' not found")))?;
@@ -425,7 +425,7 @@ fn upload_rows(
 ) -> Result<Tensor> {
     let slab = &data[r0 * in_dim..r1 * in_dim];
     let bytes: &[u8] = bytemuck_cast(slab);
-    Ok(Tensor::new(dev.upload(bytes)?, vec![r1 - r0, in_dim], ffai_core::DType::F32))
+    Ok(Tensor::new(dev.upload(bytes)?, vec![r1 - r0, in_dim], iron_core::DType::F32))
 }
 
 /// Build [`ModelWeights`] from a **Phi-3** GGUF (f32 dequant-to-upload),
@@ -434,7 +434,7 @@ fn upload_rows(
 /// no QKV bias, no q/k-norm).
 pub fn load_phi3_gguf(
     dev: &dyn Device,
-    g: &ffai_loader::gguf::Gguf,
+    g: &iron_loader::gguf::Gguf,
     cfg: &LlamaConfig,
     n_layers: usize,
 ) -> Result<ModelWeights> {
@@ -447,7 +447,7 @@ pub fn load_phi3_gguf(
         let data = g.dequant_f32(name)?;
         let shape: Vec<usize> = t.dims.iter().rev().map(|&d| d as usize).collect();
         let bytes: &[u8] = bytemuck_cast(&data);
-        Ok(Tensor::new(dev.upload(bytes)?, shape, ffai_core::DType::F32))
+        Ok(Tensor::new(dev.upload(bytes)?, shape, iron_core::DType::F32))
     };
 
     let embed = up("token_embd.weight")?;
@@ -509,7 +509,7 @@ pub fn load_phi3_gguf(
 
 // ════════════════════════════════════════════════════════════════════════
 // Resident-Q8 GGUF path: keep the big matmul weights QUANTIZED (Q8_0) on the
-// device and decode through `ffai_ops::gemv_q8` instead of dequant-to-f32.
+// device and decode through `iron_ops::gemv_q8` instead of dequant-to-f32.
 // ════════════════════════════════════════════════════════════════════════
 //
 // This roughly halves the weight upload (int8 + f32 scale/32 ≈ 1.03 B/weight vs
@@ -517,7 +517,7 @@ pub fn load_phi3_gguf(
 // per matvec — the resident-decode win). Norms/RoPE/attention stay f32 (small).
 // Backend-agnostic: gemv_q8 is the registry-tested Metal/CUDA/Vulkan kernel.
 
-/// One resident-Q8 weight matrix in the layout `ffai_ops::gemv_q8` consumes:
+/// One resident-Q8 weight matrix in the layout `iron_ops::gemv_q8` consumes:
 /// `qs` = int8 codes packed 4-per-u32 (8 u32 per 32-block), `scales` = one f32
 /// per 32-block (`[m*k/32]`). Dense matvec ⇒ `rows_per_group = m`.
 pub struct Q8Mat {
@@ -555,7 +555,7 @@ impl Q8Mat {
                 rows.extend_from_slice(&yb);
             }
             let buf = dev.upload(&rows)?;
-            return Ok(Tensor::new(buf, vec![n_rows, self.m], ffai_core::DType::F32));
+            return Ok(Tensor::new(buf, vec![n_rows, self.m], iron_core::DType::F32));
         }
         ops::gemm_q8_mpp(dev, &self.qs, &self.scales, x, n_rows, self.m, self.k)
     }
@@ -581,14 +581,14 @@ pub struct Q8Weights {
 
 /// Upload a 2-D GGUF weight as a resident-Q8 [`Q8Mat`] — Q8_0 tensors are
 /// repacked losslessly, F16/F32 are quantized per-32-block (see
-/// [`ffai_loader::gguf::Gguf::q8_repack`]). No f32 weight upload.
-fn up_q8(dev: &dyn Device, g: &ffai_loader::gguf::Gguf, name: &str) -> Result<Q8Mat> {
+/// [`iron_loader::gguf::Gguf::q8_repack`]). No f32 weight upload.
+fn up_q8(dev: &dyn Device, g: &iron_loader::gguf::Gguf, name: &str) -> Result<Q8Mat> {
     let (qs, scales, m, k) = g.q8_repack(name)?;
     let qs_bytes: &[u8] = u32_bytes(&qs);
     let sc_bytes: &[u8] = bytemuck_cast(&scales);
     Ok(Q8Mat {
-        qs: Tensor::new(dev.upload(qs_bytes)?, vec![qs.len()], ffai_core::DType::U32),
-        scales: Tensor::new(dev.upload(sc_bytes)?, vec![scales.len()], ffai_core::DType::F32),
+        qs: Tensor::new(dev.upload(qs_bytes)?, vec![qs.len()], iron_core::DType::U32),
+        scales: Tensor::new(dev.upload(sc_bytes)?, vec![scales.len()], iron_core::DType::F32),
         m,
         k,
     })
@@ -599,7 +599,7 @@ fn up_q8(dev: &dyn Device, g: &ffai_loader::gguf::Gguf, name: &str) -> Result<Q8
 /// `output.weight` falls back to the (tied) `token_embd.weight`.
 pub fn load_qwen_gguf_q8(
     dev: &dyn Device,
-    g: &ffai_loader::gguf::Gguf,
+    g: &iron_loader::gguf::Gguf,
     n_layers: usize,
 ) -> Result<Q8Weights> {
     let lm_head = match up_q8(dev, g, "output.weight") {
@@ -623,7 +623,7 @@ pub fn load_qwen_gguf_q8(
 }
 
 /// Quantize a row-major `[m, k]` f32 slab into a resident-Q8 [`Q8Mat`] using the
-/// identical per-32-block amax/127 scheme as [`ffai_loader::gguf::Gguf::q8_repack`].
+/// identical per-32-block amax/127 scheme as [`iron_loader::gguf::Gguf::q8_repack`].
 /// Used to carve Q8 sub-matrices from Phi-3's fused (already-dequantized) tensors.
 fn q8mat_from_f32(dev: &dyn Device, w: &[f32], m: usize, k: usize) -> Result<Q8Mat> {
     if k % 32 != 0 {
@@ -652,8 +652,8 @@ fn q8mat_from_f32(dev: &dyn Device, w: &[f32], m: usize, k: usize) -> Result<Q8M
     let qs_bytes: &[u8] = u32_bytes(&qs);
     let sc_bytes: &[u8] = bytemuck_cast(&scales);
     Ok(Q8Mat {
-        qs: Tensor::new(dev.upload(qs_bytes)?, vec![qs.len()], ffai_core::DType::U32),
-        scales: Tensor::new(dev.upload(sc_bytes)?, vec![scales.len()], ffai_core::DType::F32),
+        qs: Tensor::new(dev.upload(qs_bytes)?, vec![qs.len()], iron_core::DType::U32),
+        scales: Tensor::new(dev.upload(sc_bytes)?, vec![scales.len()], iron_core::DType::F32),
         m,
         k,
     })
@@ -664,7 +664,7 @@ fn q8mat_from_f32(dev: &dyn Device, w: &[f32], m: usize, k: usize) -> Result<Q8M
 /// (re-quantized per-32-block from the exact f32 slabs).
 pub fn load_phi3_gguf_q8(
     dev: &dyn Device,
-    g: &ffai_loader::gguf::Gguf,
+    g: &iron_loader::gguf::Gguf,
     cfg: &LlamaConfig,
     n_layers: usize,
 ) -> Result<Q8Weights> {
@@ -722,14 +722,14 @@ pub fn load_phi3_gguf_q8(
 /// dummies). Phi-3 has no QKV bias / q-k-norm.
 pub fn load_phi3_gguf_small_f32(
     dev: &dyn Device,
-    g: &ffai_loader::gguf::Gguf,
+    g: &iron_loader::gguf::Gguf,
     _cfg: &LlamaConfig,
     n_layers: usize,
 ) -> Result<ModelWeights> {
     let up = |name: &str| -> Result<Tensor> {
         let (data, out_dim, in_dim) = dequant_2d(g, name)?;
         let bytes: &[u8] = bytemuck_cast(&data);
-        Ok(Tensor::new(dev.upload(bytes)?, vec![out_dim, in_dim], ffai_core::DType::F32))
+        Ok(Tensor::new(dev.upload(bytes)?, vec![out_dim, in_dim], iron_core::DType::F32))
     };
     let up1 = |name: &str| -> Result<Tensor> {
         // 1-D norm vectors (dequant_2d requires 2-D; norms are 1-D).
@@ -737,10 +737,10 @@ pub fn load_phi3_gguf_small_f32(
         let data = g.dequant_f32(name)?;
         let shape: Vec<usize> = t.dims.iter().rev().map(|&d| d as usize).collect();
         let bytes: &[u8] = bytemuck_cast(&data);
-        Ok(Tensor::new(dev.upload(bytes)?, shape, ffai_core::DType::F32))
+        Ok(Tensor::new(dev.upload(bytes)?, shape, iron_core::DType::F32))
     };
     let dummy = |dev: &dyn Device| -> Result<Tensor> {
-        Ok(Tensor::new(dev.upload(&0.0f32.to_le_bytes())?, vec![1, 1], ffai_core::DType::F32))
+        Ok(Tensor::new(dev.upload(&0.0f32.to_le_bytes())?, vec![1, 1], iron_core::DType::F32))
     };
 
     let embed = up("token_embd.weight")?;
@@ -777,7 +777,7 @@ pub fn load_phi3_gguf_small_f32(
 /// for these small tensors only.
 pub fn load_qwen_gguf_small_f32(
     dev: &dyn Device,
-    g: &ffai_loader::gguf::Gguf,
+    g: &iron_loader::gguf::Gguf,
     cfg: &LlamaConfig,
     n_layers: usize,
 ) -> Result<ModelWeights> {
@@ -788,11 +788,11 @@ pub fn load_qwen_gguf_small_f32(
         let data = g.dequant_f32(name)?;
         let shape: Vec<usize> = t.dims.iter().rev().map(|&d| d as usize).collect();
         let bytes: &[u8] = bytemuck_cast(&data);
-        Ok(Tensor::new(dev.upload(bytes)?, shape, ffai_core::DType::F32))
+        Ok(Tensor::new(dev.upload(bytes)?, shape, iron_core::DType::F32))
     };
     // 1-element f32 dummy for the unused big-matmul slots (Q8 path ignores them).
     let dummy = |dev: &dyn Device| -> Result<Tensor> {
-        Ok(Tensor::new(dev.upload(&0.0f32.to_le_bytes())?, vec![1, 1], ffai_core::DType::F32))
+        Ok(Tensor::new(dev.upload(&0.0f32.to_le_bytes())?, vec![1, 1], iron_core::DType::F32))
     };
 
     let embed = up("token_embd.weight")?;
@@ -838,7 +838,7 @@ fn bytemuck_cast(v: &[f32]) -> &[u8] {
 }
 
 /// A GGUF-loaded model with a resident multi-position KV cache, exposing a
-/// `step(token, pos) -> logits` suitable for `ffai_runtime::generate`. The KV
+/// `step(token, pos) -> logits` suitable for `iron_runtime::generate`. The KV
 /// cache is `[n_kv_heads, cap, head_dim]` per layer; each step writes k/v at
 /// `pos` and attends over `[0, pos]`. Everything runs in f32 on `dev`.
 pub struct GgufModel {
@@ -860,7 +860,7 @@ impl GgufModel {
     /// Load from a GGUF path, deriving config from metadata and allocating a
     /// KV cache of `cap` positions. Uses the f32 dequant-to-upload weight path.
     pub fn open(dev: &dyn Device, path: &str, cap: usize) -> Result<Self> {
-        let g = ffai_loader::gguf::Gguf::open(path)?;
+        let g = iron_loader::gguf::Gguf::open(path)?;
         let (cfg, n_layers, vocab) = gguf_config(&g)?;
         // Phi-3 ships FUSED attn_qkv / ffn_up tensors; split them at load. Once
         // split, the Qwen f32 forward path serves Phi-3 unchanged.
@@ -877,7 +877,7 @@ impl GgufModel {
     /// (small), so the weight upload is ~halved and decode reads ~4× less weight
     /// DRAM. Same geometry/KV-cache as [`open`]; backend-agnostic.
     pub fn open_q8(dev: &dyn Device, path: &str, cap: usize) -> Result<Self> {
-        let g = ffai_loader::gguf::Gguf::open(path)?;
+        let g = iron_loader::gguf::Gguf::open(path)?;
         let (cfg, n_layers, vocab) = gguf_config(&g)?;
         let (weights, q8) = if gguf_is_phi3(&g) {
             (
@@ -936,8 +936,8 @@ impl GgufModel {
         let mut kcache = Vec::with_capacity(n_layers);
         let mut vcache = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
-            kcache.push(Tensor::new(dev.upload(zb)?, vec![nkv_hd * cap], ffai_core::DType::F32));
-            vcache.push(Tensor::new(dev.upload(zb)?, vec![nkv_hd * cap], ffai_core::DType::F32));
+            kcache.push(Tensor::new(dev.upload(zb)?, vec![nkv_hd * cap], iron_core::DType::F32));
+            vcache.push(Tensor::new(dev.upload(zb)?, vec![nkv_hd * cap], iron_core::DType::F32));
         }
         Ok(GgufModel { cfg, weights, n_layers, vocab, cap, q8: None, kcache, vcache })
     }
@@ -955,11 +955,11 @@ impl GgufModel {
         let ids = Tensor::new(
             dev.upload(&token.to_le_bytes())?,
             vec![1],
-            ffai_core::DType::U32,
+            iron_core::DType::U32,
         );
         let mut x = ops::gather(dev, &self.weights.embed, &ids)?.reshaped(vec![cfg.hidden]);
 
-        let pb = Tensor::new(dev.upload(&(pos as u32).to_le_bytes())?, vec![1], ffai_core::DType::U32);
+        let pb = Tensor::new(dev.upload(&(pos as u32).to_le_bytes())?, vec![1], iron_core::DType::U32);
 
         for l in 0..self.n_layers {
             let w = &self.weights.layers[l];
@@ -1041,7 +1041,7 @@ impl GgufModel {
     /// logits (the last row's `[vocab]`). This is the prefill counterpart of the
     /// per-token [`step`]: instead of `S` sequential `step()` calls (each doing
     /// `gemv_q8` matvecs), the seven projections + lm_head run as batched
-    /// `[S, k]·Wᵀ` GEMMs through [`ffai_ops::gemm_q8_mpp`] — the SimdGroup CoopTile
+    /// `[S, k]·Wᵀ` GEMMs through [`iron_ops::gemm_q8_mpp`] — the SimdGroup CoopTile
     /// kernel that picks up `VK_KHR_cooperative_matrix` on Vulkan/RDNA4 when
     /// `MT_VK_COOPMAT=1`. Only the resident-Q8 path is GEMM-routed; without Q8
     /// weights it falls back to the per-token loop (f32 dense decode).
@@ -1070,7 +1070,7 @@ impl GgufModel {
         let ids = Tensor::new(
             dev.upload(u32_bytes(tokens))?,
             vec![s],
-            ffai_core::DType::U32,
+            iron_core::DType::U32,
         );
         let mut x = ops::gather(dev, &self.weights.embed, &ids)?.reshaped(vec![s, cfg.hidden]);
 
@@ -1079,7 +1079,7 @@ impl GgufModel {
         let positions = Tensor::new(
             dev.upload(u32_bytes(&pos_vec))?,
             vec![s],
-            ffai_core::DType::U32,
+            iron_core::DType::U32,
         );
 
         for l in 0..self.n_layers {
@@ -1119,7 +1119,7 @@ impl GgufModel {
             // exactly the per-query `sdpa_decode` loop this replaced, but in a
             // single grid (`[n_q_heads*n_query]` workgroups) with no per-row
             // host download/upload round-trip. Validated bit-accurate on the
-            // Vulkan backend by `metaltile-std/tests/vulkan_sdpa_multi.rs`
+            // Vulkan backend by `wh-iron-std/tests/vulkan_sdpa_multi.rs`
             // (prefill + GQA shapes) and the auto corpus.
             ops::kv_append_many(dev, &k, &positions, &self.kcache[l], nkv, hd, cap)?;
             ops::kv_append_many(dev, &v, &positions, &self.vcache[l], nkv, hd, cap)?;

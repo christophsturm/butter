@@ -14,7 +14,7 @@
 //
 // GGUF on-disk → GPU-resident dequant pipeline. For each supported
 // quant format, splits the packed on-disk blocks into the GPU-resident
-// tensor layout the metaltile dequant kernel expects, then dispatches
+// tensor layout the iron dequant kernel expects, then dispatches
 // the kernel and returns a host-readable `Tensor`.
 //
 // The CPU split is a one-pass scan over the raw GGUF bytes — fp16

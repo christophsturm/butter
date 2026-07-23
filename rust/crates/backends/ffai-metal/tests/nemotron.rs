@@ -12,7 +12,7 @@
 //! the loader's MLX-affine path. Set NEMOTRON_DIR to the checkpoint dir.
 //! Not in run_all (large model + needs local weights). NEMOTRON_PREFILL_BATCHED=1
 //! and NEMOTRON_PREFILL_S=<S> drive the batched prefill inside bench_nemotron.
-use ffai_metal::MetalDevice;
+use iron_metal::MetalDevice;
 
 #[test]
 fn nemotron_batched_prefill_metal() {
@@ -20,5 +20,5 @@ fn nemotron_batched_prefill_metal() {
         eprintln!("no Metal device — skipping");
         return;
     };
-    ffai_modeltests::bench_nemotron(dev.as_ref(), "Apple M5 Max (Metal)");
+    iron_modeltests::bench_nemotron(dev.as_ref(), "Apple M5 Max (Metal)");
 }

@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! sdpa_multi vs sdpa_multi_tc throughput benchmark.
 //! S=512/2048/4096/8192, nq=32 nkv=2 hd=128 causal=true (Nemotron dims).
-use ffai_cuda::CudaDevice;
-use ffai_core::{DType, Device, Tensor};
-use ffai_ops::{sdpa_multi, sdpa_multi_tc};
+use iron_cuda::CudaDevice;
+use iron_core::{DType, Device, Tensor};
+use iron_ops::{sdpa_multi, sdpa_multi_tc};
 use std::time::Instant;
 
 fn rng(n: usize, seed: u64) -> Vec<f32> {

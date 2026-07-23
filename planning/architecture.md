@@ -15,7 +15,7 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
                            ──────────
 
   ┌──────────────────────────────────────────────────────────────┐
-  │  ffai-kernels (Rust workspace, sibling repo)                    │
+  │  iron (Rust workspace, sibling repo)                    │
   │                                                              │
   │   #[kernel] fn rms_norm<T>(x, w, out, eps, n) { … }          │
   │   #[kernel] fn rope(q, k, freqs, offset, n) { … }            │
@@ -24,8 +24,8 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
   │              │ proc-macro expansion → IR                     │
   │              ▼                                               │
   │   ┌──────────────────────────┐                               │
-  │   │  ffai-kernels-core          │   SSA IR (Kernel, Op,         │
-  │   │  ffai-kernels-codegen       │   Block, ConstExpr, …)        │
+  │   │  wh-iron-core          │   SSA IR (Kernel, Op,         │
+  │   │  wh-iron-codegen       │   Block, ConstExpr, …)        │
   │   │                          │                               │
   │   │  6-pass pipeline:        │                               │
   │   │  TypeCheck → ConstFold   │                               │
@@ -39,39 +39,39 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
                       │
                       ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │  ffaik build --emit all --out Sources/MetalTileSwift          │
-  │  (ffai-kernels-cli, dev sibling repo)                           │
+  │  iron build --emit all --out Sources/IronSwift          │
+  │  (wh-iron-cli, dev sibling repo)                           │
   │                                                              │
   │  Walks the inventory of `BenchSpec`-registered kernels,      │
   │  for each (kernel × dtype):                                  │
   │   1. Codegen MSL → write Resources/kernels/<name>.metal      │
   │   2. Append to Resources/manifest.json (name, params,        │
   │      dtype, constexprs, mode)                                │
-  │   3. Append to Generated/MetalTileKernels.swift              │
+  │   3. Append to Generated/IronKernels.swift              │
   │      (one strongly-typed Swift func per kernel)              │
   │                                                              │
   │  Then: shell out to                                          │
   │   xcrun -sdk macosx metal -c   *.metal → *.air               │
   │   xcrun -sdk macosx metallib   *.air   → kernels.metallib    │
   │                                                              │
-  │  Emit logic lives in ffai-kernels-codegen::emit so other        │
+  │  Emit logic lives in wh-iron-codegen::emit so other        │
   │  tooling (build scripts, future SPM plugins) can consume     │
   │  it without going through the CLI binary.                    │
   └───────────────────┬──────────────────────────────────────────┘
                       │
                       ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │  Sources/MetalTileSwift/                                     │
+  │  Sources/IronSwift/                                     │
   │   ├─ Resources/                                              │
   │   │   ├─ kernels.metallib       ← compiled Metal binary      │
   │   │   ├─ manifest.json          ← per-kernel metadata        │
   │   │   └─ kernels/*.metal        ← MSL sources (debug aid)    │
   │   └─ Generated/                                              │
-  │       └─ MetalTileKernels.swift ← typed Swift wrappers       │
+  │       └─ IronKernels.swift ← typed Swift wrappers       │
   └──────────────────────────────────────────────────────────────┘
 
            │
-           │  `make regenerate-kernels` runs `ffaik build --emit all` before
+           │  `make regenerate-kernels` runs `iron build --emit all` before
            │  every `make build` / `make test`
            ▼
    swift build / swift test  →  ready Swift package
@@ -82,8 +82,8 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
 - Kernel changes never require Swift source edits — the wrappers and metallib are regenerated.
 - The `.metal` files are checked in (per `.gitignore` policy: optional; default is regenerate). This makes diffs reviewable and lets contributors inspect what got generated without running cargo.
 - All compilation happens at build time. **Zero runtime JIT.**
-- Kernel sources in ffai-kernels-std are split into `crates/ffai-kernels-std/src/mlx/` (each kernel has an MLX side-by-side comparison via `ffaik bench` + `check_equiv`) and `crates/ffai-kernels-std/src/ffai/` (model-specific kernels with no MLX upstream counterpart at the pinned `MLX_COMMIT`; correctness validated by FFAI integration tests against real models). Kernels graduate from `ffai/` to `mlx/` when an MLX counterpart ships upstream or someone wires a hand-written runner. The `ffaik build --emit all` pipeline is agnostic — both folders feed the same `kernels.metallib` + `manifest.json` + `MetalTileKernels.swift` outputs.
-- **No CPU interpreter.** The `ffai-kernels-interp` crate was dropped in upstream PRs #16 / #17. Correctness verification now runs through three layers on the Apple Silicon GPU: (1) per-kernel `<kernel>_gpu_correctness.rs` tests under `crates/ffai-kernels-std/tests/` comparing against a naive CPU reference in fp32 (pattern from PR #35); (2) MLX side-by-side via `ffaik bench` + `check_equiv` for `mlx/` kernels with an upstream counterpart; (3) FFAI integration tests on real models for `ffai/` kernels. Codegen-side text diffs are caught by `insta` MSL golden snapshots under `crates/ffai-kernels-codegen/tests/snapshots/` (PR #25).
+- Kernel sources in wh-iron-std are split into `crates/wh-iron-std/src/mlx/` (each kernel has an MLX side-by-side comparison via `iron bench` + `check_equiv`) and `crates/wh-iron-std/src/ffai/` (model-specific kernels with no MLX upstream counterpart at the pinned `MLX_COMMIT`; correctness validated by FFAI integration tests against real models). Kernels graduate from `ffai/` to `mlx/` when an MLX counterpart ships upstream or someone wires a hand-written runner. The `iron build --emit all` pipeline is agnostic — both folders feed the same `kernels.metallib` + `manifest.json` + `IronKernels.swift` outputs.
+- **No CPU interpreter.** The `iron-interp` crate was dropped in upstream PRs #16 / #17. Correctness verification now runs through three layers on the Apple Silicon GPU: (1) per-kernel `<kernel>_gpu_correctness.rs` tests under `crates/wh-iron-std/tests/` comparing against a naive CPU reference in fp32 (pattern from PR #35); (2) MLX side-by-side via `iron bench` + `check_equiv` for `mlx/` kernels with an upstream counterpart; (3) FFAI integration tests on real models for `ffai/` kernels. Codegen-side text diffs are caught by `insta` MSL golden snapshots under `crates/wh-iron-codegen/tests/snapshots/` (PR #25).
 
 ---
 
@@ -99,7 +99,7 @@ Happens once when the FFAI process launches.
       │
       ▼
   ┌────────────────────────────────────────┐
-  │  MetalTileLibrary.shared (lazy)        │
+  │  IronLibrary.shared (lazy)        │
   │                                        │
   │  1. MTLCreateSystemDefaultDevice()     │
   │  2. device.makeLibrary(URL: bundle     │
@@ -550,7 +550,7 @@ This is the hot loop. For each token to generate, we run one forward pass throug
                            ▼
   ┌─────────────────────────────────────────────────────────┐
   │  embed_tokens(prev_token)                               │
-  │   → MetalTileKernels.gather(                            │
+  │   → IronKernels.gather(                            │
   │       table:  embed_tokens.weight,                      │
   │       index:  prev_token,                               │
   │       out:    h /* [1, hidden] */,                      │
@@ -561,61 +561,61 @@ This is the hot loop. For each token to generate, we run one forward pass throug
    for each TransformerBlock layer:
    ┌─────────────────────────────────────────────────────────┐
    │  // -- attention --                                     │
-   │  MetalTileKernels.rms_norm(                             │
+   │  IronKernels.rms_norm(                             │
    │     x: h, weight: layer.input_layernorm.weight,         │
    │     out: x_norm, eps:, on: cmdBuf)                      │
    │                                                         │
-   │  MetalTileKernels.gemv_fp16(                            │
+   │  IronKernels.gemv_fp16(                            │
    │     x: x_norm, w: layer.self_attn.q_proj.weight,        │
    │     out: q, on: cmdBuf)                                 │
    │  // … same for k, v                                     │
    │                                                         │
-   │  MetalTileKernels.rope(                                 │
+   │  IronKernels.rope(                                 │
    │     q: q, k: k, freqs: rope_freqs,                      │
    │     offset: cache.length, on: cmdBuf)                   │
    │                                                         │
    │  cache.append(k, v)   // writes into pre-alloc'd        │
    │                       // KV MTLBuffer at offset         │
    │                                                         │
-   │  MetalTileKernels.sdpa_decode(                          │
+   │  IronKernels.sdpa_decode(                          │
    │     q: q,                                               │
    │     k_cache: cache.k_buffer,                            │
    │     v_cache: cache.v_buffer,                            │
    │     length: cache.length,                               │
    │     out: attn_out, on: cmdBuf)                          │
    │                                                         │
-   │  MetalTileKernels.gemv_fp16(                            │
+   │  IronKernels.gemv_fp16(                            │
    │     x: attn_out, w: layer.self_attn.o_proj.weight,      │
    │     out: o, on: cmdBuf)                                 │
    │                                                         │
-   │  MetalTileKernels.add(h, o, out: h, on: cmdBuf)         │
+   │  IronKernels.add(h, o, out: h, on: cmdBuf)         │
    │                                                         │
    │  // -- mlp --                                           │
-   │  MetalTileKernels.rms_norm(                             │
+   │  IronKernels.rms_norm(                             │
    │     x: h, weight: layer.post_attention_layernorm.weight,│
    │     out: x_norm, eps:, on: cmdBuf)                      │
    │                                                         │
-   │  MetalTileKernels.gemv_fp16(                            │
+   │  IronKernels.gemv_fp16(                            │
    │     x: x_norm, w: layer.mlp.gate_proj.weight,           │
    │     out: gate, on: cmdBuf)                              │
-   │  MetalTileKernels.gemv_fp16(                            │
+   │  IronKernels.gemv_fp16(                            │
    │     x: x_norm, w: layer.mlp.up_proj.weight,             │
    │     out: up, on: cmdBuf)                                │
    │                                                         │
-   │  MetalTileKernels.silu_mul(                             │
+   │  IronKernels.silu_mul(                             │
    │     a: gate, b: up, out: g, on: cmdBuf)                 │
    │                                                         │
-   │  MetalTileKernels.gemv_fp16(                            │
+   │  IronKernels.gemv_fp16(                            │
    │     x: g, w: layer.mlp.down_proj.weight,                │
    │     out: d, on: cmdBuf)                                 │
    │                                                         │
-   │  MetalTileKernels.add(h, d, out: h, on: cmdBuf)         │
+   │  IronKernels.add(h, d, out: h, on: cmdBuf)         │
    └────────────────────────┬────────────────────────────────┘
                             │
                             ▼
   ┌─────────────────────────────────────────────────────────┐
-  │  MetalTileKernels.rms_norm(h, model.norm.weight, …)     │
-  │  MetalTileKernels.gemv_fp16(h, lm_head.weight, → logits)│
+  │  IronKernels.rms_norm(h, model.norm.weight, …)     │
+  │  IronKernels.gemv_fp16(h, lm_head.weight, → logits)│
   └────────────────────────┬────────────────────────────────┘
                            │
                            ▼
@@ -637,10 +637,10 @@ This is the hot loop. For each token to generate, we run one forward pass throug
                   (feed back to next loop iter)
 ```
 
-**What each `MetalTileKernels.*` call does internally:**
+**What each `IronKernels.*` call does internally:**
 
 ```
-   MetalTileKernels.rms_norm(x:, weight:, out:, eps:, on: cmdBuf)
+   IronKernels.rms_norm(x:, weight:, out:, eps:, on: cmdBuf)
        │
        ▼
    pso = PSOCache.shared.get(
@@ -983,7 +983,7 @@ The throughput win comes from amortising one verifier forward over multiple acce
 | Tensor type | `MLXArray` (lazy graph node, hides MTLBuffer) | `Tensor` (direct MTLBuffer + offset + shape) |
 | Dispatch timing | Lazy: graph traversal + planning + encode + submit on `eval()` | Eager: Swift code is the dispatch order, no graph traversal step |
 | Dispatch modes | One mode (lazy graph) | Three modes (Eager / Argument buffers / ICB) selectable at load time |
-| Op fusion | Automatic via lazy graph compiler | Manual via fused kernels in ffai-kernels (compile-time, profileable) |
+| Op fusion | Automatic via lazy graph compiler | Manual via fused kernels in iron (compile-time, profileable) |
 | Sampling | CPU readback per token (~60-200KB) | On-GPU sampling kernel, 4-byte readback |
 | Custom kernel cost | ~55-95µs per call (Swift→C→C++→Metal marshaling) | ~5-10µs per call eager / sub-µs amortized in ICB mode |
 | Kernel iteration | Edit MLX C++ → mlx-c → mlx-swift → mlx-swift-lm | Edit Rust `#[kernel]` → rebuild Swift package |
@@ -1030,7 +1030,7 @@ The throughput win comes from amortising one verifier forward over multiple acce
            │ kernels             │ HF + tokenizers
            ▼                     ▼
   ┌────────────────────┐   ┌──────────────────────────────┐
-  │  MetalTileSwift    │   │  swift-huggingface           │
+  │  IronSwift    │   │  swift-huggingface           │
   │  (in-repo)         │   │  swift-transformers          │
   │                    │   │  (external SPM dependencies) │
   │  • Library loader  │   └──────────────────────────────┘
@@ -1047,13 +1047,13 @@ The throughput win comes from amortising one verifier forward over multiple acce
 
   Build-time only (not in runtime graph):
   ┌──────────────────────────────────────────────────────────┐
-  │  ffai-kernels (Rust workspace, sibling repo)                │
+  │  iron (Rust workspace, sibling repo)                │
   │  Generates kernels.metallib + manifest + Swift wrappers  │
-  │  via the `ffaik build --emit all --out <dir>` CLI command │
-  │  (ffai-kernels-cli).                                        │
+  │  via the `iron build --emit all --out <dir>` CLI command │
+  │  (wh-iron-cli).                                        │
   └──────────────────────────────────────────────────────────┘
 ```
 
 **Runtime dependencies:** Metal framework, swift-huggingface, swift-transformers. That's it.
 
-**Build-time dependencies:** add Xcode (for `xcrun metal`), a Rust toolchain (for `ffaik`), and the ffai-kernels sibling repo checkout until the `ffaik` binary ships via Homebrew.
+**Build-time dependencies:** add Xcode (for `xcrun metal`), a Rust toolchain (for `iron`), and the iron sibling repo checkout until the `iron` binary ships via Homebrew.

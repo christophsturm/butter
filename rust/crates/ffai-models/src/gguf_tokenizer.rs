@@ -12,8 +12,8 @@
 //! are stored in that same mapped-char space, so a token string is matched
 //! directly against the merged symbols.
 
-use ffai_core::{Error, Result};
-use ffai_loader::gguf::Gguf;
+use iron_core::{Error, Result};
+use iron_loader::gguf::Gguf;
 use std::collections::HashMap;
 
 /// Which on-disk tokenizer the GGUF carries. GPT-2/Qwen ship byte-level BPE

@@ -1,15 +1,15 @@
 // Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 // SPDX-License-Identifier: Apache-2.0
 //! End-to-end smoke for the ffai-vulkan Device: drive a real kernel through
-//! the `ffai_core::Device` seam (upload → alloc → dispatch → download) on a
-//! live Vulkan device and compare to a CPU oracle. Mirrors metaltile's
+//! the `iron_core::Device` seam (upload → alloc → dispatch → download) on a
+//! live Vulkan device and compare to a CPU oracle. Mirrors iron's
 //! `vulkan_smoke.rs` but exercises the ffai-core trait, not run_kernel
 //! directly. Skips cleanly if no Vulkan device is present.
 #![cfg(feature = "vulkan")]
 
-use ffai_core::{Binding, Grid};
-use ffai_vulkan::VulkanDevice;
-use ffai_kernels_core::{
+use iron_core::{Binding, Grid};
+use iron_vulkan::VulkanDevice;
+use iron_kernels_core::{
     dtype::DType,
     ir::{BinOpKind, IndexExpr, Kernel, Op, Param, ParamKind, ValueId},
     shape::Shape,
@@ -57,12 +57,12 @@ fn to_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 #[test]
-fn ffai_vulkan_vector_add_f32_bit_exact() {
+fn iron_vulkan_vector_add_f32_bit_exact() {
     let Some(dev) = VulkanDevice::create().expect("vulkan create") else {
-        eprintln!("ffai_vulkan_smoke: no Vulkan device — skipping");
+        eprintln!("iron_vulkan_smoke: no Vulkan device — skipping");
         return;
     };
-    eprintln!("ffai_vulkan_smoke: device='{}'", dev.name());
+    eprintln!("iron_vulkan_smoke: device='{}'", dev.name());
 
     const N: usize = 8 * 1024;
     let a: Vec<f32> = (0..N).map(|i| (i as f32) * 0.5).collect();
@@ -92,6 +92,6 @@ fn ffai_vulkan_vector_add_f32_bit_exact() {
         .zip(&oracle)
         .map(|(g, w)| (g - w).abs())
         .fold(0.0f32, f32::max);
-    eprintln!("ffai_vulkan_smoke: max|Δ| = {max_abs:e}");
+    eprintln!("iron_vulkan_smoke: max|Δ| = {max_abs:e}");
     assert!(max_abs == 0.0, "vector_add not bit-exact through ffai seam: {max_abs:e}");
 }

@@ -137,7 +137,7 @@ gh workflow run deploy.yml --repo thewafflehaus/ffai-website
 
 # Re-deploy against a specific FFAI release (e.g. roll back the docs).
 gh workflow run deploy.yml --repo thewafflehaus/ffai-website \
-  --field ffai_tag=v0.1.0
+  --field iron_tag=v0.1.0
 
 # Re-run the full notify → dispatch chain (useful to test the token).
 gh workflow run notify-docs.yml --repo thewafflehaus/FFAI \

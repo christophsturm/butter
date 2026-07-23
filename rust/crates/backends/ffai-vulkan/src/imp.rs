@@ -2,16 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Real Vulkan backend (compiled under `--features vulkan`). Wraps
-//! `ffai_kernels_runtime::VulkanDevice` — the GlslGenerator → shaderc → SPIR-V →
+//! `iron_kernels_runtime::VulkanDevice` — the GlslGenerator → shaderc → SPIR-V →
 //! VkPipeline path that runs the kernel corpus bit-accurately on any Vulkan
 //! 1.2+ device (validated on AMD RX 9070 XT / RDNA4) — behind the shared
-//! [`ffai_core::Device`] trait.
+//! [`iron_core::Device`] trait.
 //!
 //! ## Two buffer models: resident (default, fast) + host-shadow (fallback)
 //!
 //! The CUDA backend keeps tensors resident in VRAM: `alloc`/`upload` return a
 //! raw device handle, and `dispatch` binds those pre-uploaded buffers to a
-//! cached pipeline. This backend now mirrors that, using the metaltile Vulkan
+//! cached pipeline. This backend now mirrors that, using the iron Vulkan
 //! resident seam (`alloc_raw` / `htod_raw` / `dtoh_raw` / `compile_kernel` /
 //! `run_pipeline_bound`):
 //!
@@ -39,7 +39,7 @@
 //! pending queue and a single command buffer carries many dispatches (with a
 //! shader-write→read barrier between them) to ONE submit + wait. The queue is
 //! flushed at a size cap (`FFAI_VULKAN_BATCH_CAP`, default 48 — ~two
-//! transformer layers, bounded by the metaltile descriptor pool), at
+//! transformer layers, bounded by the iron descriptor pool), at
 //! `synchronize`/`download` (a read must see the results), and on device drop.
 //! This removes the per-op CPU↔GPU round-trip that dominates decode latency —
 //! the single biggest decode lever once weights are resident. Disable with
@@ -49,9 +49,9 @@ use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-use ffai_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
-use ffai_kernels_core::ir::ParamKind;
-use ffai_kernels_runtime::{
+use iron_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
+use iron_kernels_core::ir::ParamKind;
+use iron_kernels_runtime::{
     BatchDispatch, FFAIError, VulkanDevice as MtVulkanDevice, VulkanPipeline, VulkanRawBuffer,
 };
 
@@ -68,7 +68,7 @@ fn batch_enabled() -> bool {
 }
 
 /// Max dispatches accumulated before an automatic flush. Bounds the live
-/// descriptor sets (the metaltile pool holds 1024) and the transient companion
+/// descriptor sets (the iron pool holds 1024) and the transient companion
 /// VRAM held until submit, so a long forward pass can't exhaust either. A
 /// transformer layer is ~15-25 dispatches, so this batches roughly two layers
 /// per submit while staying well inside the pool. Override with
@@ -103,10 +103,10 @@ fn host_shadow_enabled() -> bool {
 }
 
 /// Synthesize a Strided param's `_shape` / `_strides` companion buffer
-/// (row-major) from the param's static shape — mirrors metaltile's own
+/// (row-major) from the param's static shape — mirrors iron's own
 /// `synth_strided_meta` so the resident binding layout matches the emitter.
-fn synth_strided_meta(shape: &ffai_kernels_core::shape::Shape, strides: bool) -> Vec<u8> {
-    use ffai_kernels_core::shape::Dim;
+fn synth_strided_meta(shape: &iron_kernels_core::shape::Shape, strides: bool) -> Vec<u8> {
+    use iron_kernels_core::shape::Dim;
     let dims: Vec<u32> = (0..shape.rank())
         .map(|i| match shape.dim(i) {
             Some(Dim::Known(n)) => *n as u32,
@@ -125,7 +125,7 @@ fn synth_strided_meta(shape: &ffai_kernels_core::shape::Shape, strides: bool) ->
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-/// Vulkan implementation of the shared [`Device`] trait. Holds the metaltile
+/// Vulkan implementation of the shared [`Device`] trait. Holds the iron
 /// runtime device in an `Arc` so it outlives every buffer/dispatch, plus the
 /// resident pipeline cache.
 pub struct VulkanDevice {
@@ -216,7 +216,7 @@ impl VulkanDevice {
         let mut keepalive: Vec<Arc<dyn DeviceBuffer>> = Vec::new();
 
         // Push-constant payload: constexprs in order, then `_n_elems` if the
-        // plan needs it (Elementwise) — mirrors metaltile's `run_kernel`.
+        // plan needs it (Elementwise) — mirrors iron's `run_kernel`.
         let mut push: Vec<u8> = Vec::new();
 
         let mut param_i = 0usize;
@@ -584,13 +584,13 @@ impl Device for VulkanDevice {
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
         // Flush any dispatches still queued so their submit completes and their
-        // transient buffers are freed before the metaltile device tears down.
+        // transient buffers are freed before the iron device tears down.
         if self.batch {
             let _ = self.flush();
         }
         // Resident buffers (VulkanRawBuffer) are owned by the Tensors/engine
         // above and are not tracked here, so they are not freed on device drop
-        // — the metaltile VulkanDevice's own Drop tears down the VkDevice,
+        // — the iron VulkanDevice's own Drop tears down the VkDevice,
         // which releases all child objects (buffers + cached pipelines).
     }
 }

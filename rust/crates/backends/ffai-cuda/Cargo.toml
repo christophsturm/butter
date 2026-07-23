@@ -1,6 +1,6 @@
 [package]
 name = "ffai-cuda"
-description = "FFAI CUDA backend — wraps ffai-kernels-runtime's CudaDevice (NVRTC -> PTX -> driver) behind the ffai-core Device trait."
+description = "FFAI CUDA backend — wraps wh-iron-runtime's CudaDevice (NVRTC -> PTX -> driver) behind the ffai-core Device trait."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,9 @@ repository.workspace = true
 
 [dependencies]
 ffai-core.workspace = true
-ffai-kernels-core.workspace = true
-ffai-kernels-codegen = { workspace = true, optional = true }
-ffai-kernels-runtime = { workspace = true, optional = true }
+wh-iron-core.workspace = true
+wh-iron-codegen = { workspace = true, optional = true }
+wh-iron-runtime = { workspace = true, optional = true }
 
 [dev-dependencies]
 ffai-modeltests.workspace = true
@@ -18,19 +18,19 @@ ffai-core.workspace = true
 ffai-ops.workspace = true
 ffai-models.workspace = true
 ffai-loader.workspace = true
-ffai-kernels-core.workspace = true
+wh-iron-core.workspace = true
 
 [features]
 # Off by default so macOS / non-CUDA hosts build the crate as a stub.
-# `--features cuda` pulls ffai-kernels-runtime's real CUDA device.
-cuda = ["dep:ffai-kernels-runtime", "dep:ffai-kernels-codegen", "ffai-kernels-runtime/cuda"]
+# `--features cuda` pulls wh-iron-runtime's real CUDA device.
+cuda = ["dep:wh-iron-runtime", "dep:wh-iron-codegen", "wh-iron-runtime/cuda"]
 
 [[test]]
 name = "cuda_smoke"
 required-features = ["cuda"]
 
 [[test]]
-name = "ffai_model"
+name = "iron_model"
 required-features = ["cuda"]
 
 [[test]]

@@ -25,7 +25,7 @@
 //
 // Stage-2: the FishS1DAC codec (CPU fallback, see Audio/FishS1DAC.swift) decodes
 // VQ codes → waveform. When codec weights are present in the snapshot the full
-// path is active. A ffai-kernels kernel port for dilated depthwise Conv1d would
+// path is active. A iron kernel port for dilated depthwise Conv1d would
 // accelerate the decoder blocks; the CPU path is documented in FishS1DACQuantization.swift.
 //
 // Reference:

@@ -381,7 +381,7 @@ public struct JambaHybrid: JambaVariant {
                 weight: try weights.tensor(named: "\(p).dt_proj.weight"),
                 bias: try weights.tensor(named: "\(p).dt_proj.bias")))
 
-        // conv1d.weight ships [d_inner, 1, kernel]; the ffai-kernels kernel
+        // conv1d.weight ships [d_inner, 1, kernel]; the iron kernel
         // wants [kernel, d_inner].
         let convWSrc = try weights.tensor(named: "\(p).conv1d.weight")
         precondition(
@@ -973,7 +973,7 @@ public final class JambaAttentionLayer: Module, DecoderLayer {
         let xNorm = inputNorm(h, on: cmd)
         let mixerOut = mixer.forward(xNorm, cache: kv, cmd: cmd, device: device)
 
-        // Fused residual add + pre-FF RMSNorm via ffai_add_rms_norm
+        // Fused residual add + pre-FF RMSNorm via iron_add_rms_norm
         // (hidden ≤ 4096). Jamba 1.5 Mini is hidden=4096 (fits);
         // wider variants fall through the validator gate.
         let postMix: Tensor
@@ -1038,7 +1038,7 @@ private func jambaApplyFFN(
     preNormed: Tensor? = nil
 ) -> Tensor {
     // `preNormed` lets the attention-layer caller supply the
-    // fused-kernel output of `ffai_add_rms_norm` (postMix already +
+    // fused-kernel output of `iron_add_rms_norm` (postMix already +
     // pre-FF norm in one dispatch). When nil, we run the separate norm.
     let ffnNorm = preNormed ?? preFFNorm(postMix, on: cmd)
     switch ffn {
@@ -1334,7 +1334,7 @@ private func zeroVectorJamba(_ n: Int, dtype: DType, device: Device) -> Tensor {
     return t
 }
 
-/// Transpose HF conv1d.weight `[C, 1, K]` → `[K, C]` for the ffai-kernels
+/// Transpose HF conv1d.weight `[C, 1, K]` → `[K, C]` for the iron
 /// conv kernel.
 private func transposeConv1dWeightJamba(
     src: Tensor, kernel K: Int, channels C: Int,

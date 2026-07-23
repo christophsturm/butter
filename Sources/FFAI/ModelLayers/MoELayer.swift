@@ -390,7 +390,7 @@ public final class MoELayer: Module, DecoderLayer {
     public let hidden: Int
 
     /// Stacked-expert weight handles for the batched gather BGEMM fast
-    /// path. When set, `decode` dispatches `ffai_moe_gather_qmm_mma_int4_bm16`
+    /// path. When set, `decode` dispatches `iron_moe_gather_qmm_mma_int4_bm16`
     /// instead of running `topK` sequential per-expert SwiGLU triplets —
     /// 3 kernel launches per token instead of `3 * topK` (24 → 3 at
     /// `topK=8`). Populated by the host model's MoE builder when (a) the
@@ -464,11 +464,11 @@ public final class MoELayer: Module, DecoderLayer {
     /// cached at init (same reasoning as the other env-flag caches above);
     /// `tilePlanEnabled` below is the single place that interprets it.
     let tilePlanEnvRaw: String?
-    /// F-85 coop-core MoE gather GEMM gate (BM=32 tile plan, `ffai_qmm_coop`'s
+    /// F-85 coop-core MoE gather GEMM gate (BM=32 tile plan, `iron_qmm_coop`'s
     /// inner loop). Raw env string cached at init; `coopEnabled` below is
     /// the single place that interprets it.
     let coopEnvRaw: String?
-    /// F-85 two-expert tile-pairing lever gate (`ffai_moe_gather_qmm_coop_paired`,
+    /// F-85 two-expert tile-pairing lever gate (`iron_moe_gather_qmm_coop_paired`,
     /// only takes effect where `coopEnabled` already holds). Raw env
     /// string cached at init; `pairedEnabled` below is the single place
     /// that interprets it.
@@ -483,11 +483,11 @@ public final class MoELayer: Module, DecoderLayer {
     /// it.
     let pairedIndirectEnvRaw: String?
     /// F-85 idle-tile-cost indirect-dispatch gate for the PRODUCTION coop
-    /// path (`ffai_moe_gather_qmm_coop` itself, both the plain
+    /// path (`iron_moe_gather_qmm_coop` itself, both the plain
     /// `useCoopTilePlan` dispatch and the paired lever's "own" dispatch -
     /// see `coopIndirectEnabled` below). Raw env string cached at init.
     let coopIndirectEnvRaw: String?
-    /// Bucketed counting-sort gate for `ffai_moe_sort_plan` (F-85 prefill
+    /// Bucketed counting-sort gate for `iron_moe_sort_plan` (F-85 prefill
     /// gate). Raw env string cached at init; `sortPlanCountingEnabled`
     /// below is the single place that interprets it.
     let sortPlanCountingEnvRaw: String?
@@ -514,7 +514,7 @@ public final class MoELayer: Module, DecoderLayer {
     private var expertInnerScratches: [Tensor] = []
     private var expertOutScratches: [Tensor] = []
     /// GPU MoE router scratches — written once per layer per token by
-    /// `ffai_moe_router_topk`, then consumed by the per-slot indexed qmms
+    /// `iron_moe_router_topk`, then consumed by the per-slot indexed qmms
     /// and the scalarFMAChain8.
     private var routerIndicesScratch: Tensor?
     private var routerWeightsScratch: Tensor?
@@ -588,7 +588,7 @@ public final class MoELayer: Module, DecoderLayer {
     private var pairedIndirectArgsDownBuf: MTLBuffer?
 
     /// F-85 idle-tile-cost indirect-dispatch args for the PRODUCTION coop
-    /// GEMM (`ffai_moe_gather_qmm_coop` - see
+    /// GEMM (`iron_moe_gather_qmm_coop` - see
     /// `Ops.moeGatherDequantGemmInt4CoopTilePlanIndirect`). Same layout
     /// and same lazy-alloc-once / cross-call GPU-ordering safety argument
     /// as `pairedIndirectArgsGateUpBuf` above: `[n_out_tiles, real_tile_count, 1]`,
@@ -736,7 +736,7 @@ public final class MoELayer: Module, DecoderLayer {
         tilePlanEnvRaw != "0"
     }
 
-    /// F-85 bucketed counting-sort gate for `ffai_moe_sort_plan`
+    /// F-85 bucketed counting-sort gate for `iron_moe_sort_plan`
     /// (`Ops.moeSortPlanCounting`, `moe_sort_plan_counting.rs`). Replaces
     /// the original kernel's O(mTotal^2) per-thread linear scan with a
     /// three-pass O(mTotal * nExperts) histogram -> prefix-sum -> scatter
@@ -749,13 +749,13 @@ public final class MoELayer: Module, DecoderLayer {
     /// ~38x at 32768. Default ON. Escape hatch: `FFAI_MOE_COUNTING_SORT=0`
     /// reverts to the original kernel. Only wired into the DEVPLAN2
     /// device-sorted-plan path (`useDevPlan2`) - the only path that calls
-    /// `ffai_moe_sort_plan` at all.
+    /// `iron_moe_sort_plan` at all.
     public var sortPlanCountingEnabled: Bool {
         sortPlanCountingEnvRaw != "0"
     }
 
     /// F-85 parallelized tile-plan builder gate (small-M follow-up to the
-    /// idle-tile-cost/counting-sort round). `ffai_moe_build_tile_plan` /
+    /// idle-tile-cost/counting-sort round). `iron_moe_build_tile_plan` /
     /// `_bm32` / `_bm32_own` each dispatch ONE threadgroup for the whole
     /// plan build - every expert's binary search, the prefix sum, and
     /// every tile emission all run on a single GPU core, a per-layer fixed
@@ -778,8 +778,8 @@ public final class MoELayer: Module, DecoderLayer {
     }
 
     /// F-85 coop-core MoE gather GEMM gate (BM=32 tile plan over
-    /// `ffai_moe_gather_qmm_coop`, the gather counterpart of the dense
-    /// `ffai_qmm_coop` core). Default ON as of the wiring pass's quality +
+    /// `iron_moe_gather_qmm_coop`, the gather counterpart of the dense
+    /// `iron_qmm_coop` core). Default ON as of the wiring pass's quality +
     /// speed gates, same evidence bar as `tilePlanEnabled` above:
     /// isolated kernel bench vs the BM=16 tileplan incumbent shows +31-98%
     /// GB/s across mTotal 4096/16384/32768, both legs, 3 Zipf-seeded
@@ -799,7 +799,7 @@ public final class MoELayer: Module, DecoderLayer {
     ///
     /// Auto-default gates on `Ops.mppAutoCapable` (Apple GPU Family 9+ /
     /// macOS 26+) - the same hardware requirement `dispatchQmmMma`'s coop
-    /// tier checks for the dense GEMM, since `ffai_moe_gather_qmm_coop`
+    /// tier checks for the dense GEMM, since `iron_moe_gather_qmm_coop`
     /// wraps the identical `matmul2d` cooperative-tensor core. Unlike the
     /// dense path (which falls back to a cheaper simdgroup tier when
     /// incapable), this kernel has no such fallback once dispatched, so
@@ -816,9 +816,9 @@ public final class MoELayer: Module, DecoderLayer {
         }
     }
 
-    /// F-85 two-expert tile-pairing lever gate (`ffai_moe_gather_qmm_coop_paired`,
+    /// F-85 two-expert tile-pairing lever gate (`iron_moe_gather_qmm_coop_paired`,
     /// splits the coop tile plan into an "own" plan for full/17-31-row
-    /// remainders, fed the UNCHANGED `ffai_moe_gather_qmm_coop` dispatch,
+    /// remainders, fed the UNCHANGED `iron_moe_gather_qmm_coop` dispatch,
     /// plus a "paired" plan for `1..=16`-row remainders packed two experts
     /// to a tile, fed the new paired-GEMM dispatch - see
     /// `moe_tile_plan_builder_paired.rs`'s module doc). Isolated kernel
@@ -908,7 +908,7 @@ public final class MoELayer: Module, DecoderLayer {
     }
 
     /// F-85 idle-tile-cost indirect-dispatch gate for the PRODUCTION coop
-    /// GEMM (`ffai_moe_gather_qmm_coop`). An ablation on this kernel's
+    /// GEMM (`iron_moe_gather_qmm_coop`). An ablation on this kernel's
     /// guard structure found no early exit before the K-loop: every
     /// dispatched threadgroup, including worst-case-capacity padding whose
     /// `tileRowCount == 0`, pays the full W dequant and `coop_tile_run`
@@ -1110,7 +1110,7 @@ public final class MoELayer: Module, DecoderLayer {
         // ── 2a. GPU MoE router fast path ──────────────────────────────
         // When `FFAI_MOE_GPU_ROUTER=1` (default ON) AND the layer has
         // stacked int4 expert layout AND routing matches
-        // `ffai_moe_router_topk`'s assumptions (softmax-then-topK + Qwen-
+        // `iron_moe_router_topk`'s assumptions (softmax-then-topK + Qwen-
         // MoE-style renorm, topK=8), skip the CPU sync entirely. The
         // router writes topK indices + weights to a GPU buffer; per-
         // expert qmms read their slot's expert id from that buffer via
@@ -1234,7 +1234,7 @@ public final class MoELayer: Module, DecoderLayer {
     ///      Uses the same `Tensor.filled([hidden])` broadcast pattern as
     ///      the single-token `batchedSwiGLU`, mTotal times. Scatter-sum
     ///      is the dominant residual cost at large `mTotal`; a future
-    ///      `ffai_moe_scatter_scale_add` kernel collapses these mTotal
+    ///      `iron_moe_scatter_scale_add` kernel collapses these mTotal
     ///      dispatches into one.
     ///   9. Shared expert (if any): one per-row SwiGLU call across T
     ///      tokens (also currently a T-loop because the single-token
@@ -1261,7 +1261,7 @@ public final class MoELayer: Module, DecoderLayer {
         // gateLogitsAll shape: [T, nExperts]
 
         // ── 2. Routing — GPU fast path or CPU sync ──────────────────────
-        // When router config matches `ffai_moe_router_topk`'s semantic
+        // When router config matches `iron_moe_router_topk`'s semantic
         // envelope (softmax → topK + Qwen-MoE renorm, no expert bias,
         // k=8), run the T-batched router on GPU via
         // `Ops.moeRouterTopKMany`. Eliminates the T-parallel host
@@ -1387,7 +1387,7 @@ public final class MoELayer: Module, DecoderLayer {
             sortedWeightsHost.append(tuple.3)
         }
         // ── 4b. Build inv_perm + per-token-order weights for the
-        // ffai_moe_unpermute fused scatter-sum kernel. `invPermHost[r·k+s]`
+        // iron_moe_unpermute fused scatter-sum kernel. `invPermHost[r·k+s]`
         // = sortedIdx where (token r, slot s) landed in `downOut`.
         // `weightsTokenOrderHost[r·k+s]` = routings[r].weights[s]
         // (unsorted, matches the kernel's per-token lookup).
@@ -1511,9 +1511,9 @@ public final class MoELayer: Module, DecoderLayer {
         // F-85 expert-aligned tile-plan MoE gather GEMM (default ON, see
         // `tilePlanEnabled`; escape hatch FFAI_MOE_TILEPLAN=0). Only
         // wired into the DEVPLAN2 device-sorted-plan path: `indices` there is already
-        // expert-sorted ascending on device (ffai_moe_sort_plan's own
+        // expert-sorted ascending on device (iron_moe_sort_plan's own
         // output, no host readback) - exactly what
-        // `ffai_moe_build_tile_plan` needs, and preserving that no-sync
+        // `iron_moe_build_tile_plan` needs, and preserving that no-sync
         // property is the whole point of building the plan on-device
         // instead of reading `indices` back to the host. The other
         // routing paths (host GPU-router sync, CPU router) keep bm16
@@ -1524,7 +1524,7 @@ public final class MoELayer: Module, DecoderLayer {
         // priority when set - tileplan only replaces the bm16 default.
         let useTilePlan = useDevPlan2 && !useBm64 && !useBm8 && self.tilePlanEnabled
         // F-85 coop-core MoE gather GEMM (BM=32 tile plan over
-        // `ffai_moe_gather_qmm_coop`, see `coopEnabled`). Only takes over
+        // `iron_moe_gather_qmm_coop`, see `coopEnabled`). Only takes over
         // from the bm16 tileplan default when the coop core's shape
         // requirements hold for BOTH gate/up (nOut=moeIntermediate) and
         // down (nOut=hidden) legs at this layer - `nOut % 64 == 0` (BN=64)
@@ -1875,7 +1875,7 @@ public final class MoELayer: Module, DecoderLayer {
             nOutLeg: hidden, kInLeg: moeIntermediate, into: downOut)
 
         // ── 12. Weighted scatter-sum back to [T, hidden] via fused
-        // `ffai_moe_unpermute` kernel — ONE dispatch over T·hidden
+        // `iron_moe_unpermute` kernel — ONE dispatch over T·hidden
         // elements instead of mTotal·2 small `Tensor.filled([hidden])`
         // + mul + add per row. At Qwen3.6-A3B T=32 topK=8 mTotal=256
         // that's 512 dispatches → 1 per gate/up/down stage.
@@ -1979,7 +1979,7 @@ public final class MoELayer: Module, DecoderLayer {
         let dtype = stacked.dtype
         let useBm8 = topK <= 8 && useBm8Env
         // `FFAI_MOE_M1=1` routes the gather through the scalar m1
-        // kernel `ffai_moe_gather_qmm_int4` — no MPP / cooperative-tensor
+        // kernel `iron_moe_gather_qmm_int4` — no MPP / cooperative-tensor
         // overhead. At decode T=1 the cooperative-tensor variants
         // (bm8 / bm16 / bm64) lose ~15 % to descriptor setup cost; the
         // m1 path does a one-output-cell-per-TG dot-product with
@@ -2115,7 +2115,7 @@ public final class MoELayer: Module, DecoderLayer {
 
     /// One SwiGLU FFN: down(silu(gate(x)) * up(x)).
     ///
-    /// `silu(gate) * up` runs as a single fused `ffai_swiglu` dispatch
+    /// `silu(gate) * up` runs as a single fused `iron_swiglu` dispatch
     /// instead of two launches (silu → mul). Saves one elementwise
     /// kernel + one full-tensor RMW per call. At Qwen3.6-A3B decode T=1
     /// the per-expert intermediate is [moeIntermediate=768] so the win
@@ -2234,7 +2234,7 @@ public final class MoELayer: Module, DecoderLayer {
 
         // Fuse phase 1b (swigluMany), phase 2 (8 down indexed-gemvs),
         // and phase 3 (scalarFMAChain8) into ONE dispatch via
-        // `ffai_moe_down_swiglu_accum_int4_chain8`. Per-slot `inner` is
+        // `iron_moe_down_swiglu_accum_int4_chain8`. Per-slot `inner` is
         // staged in 3 KiB threadgroup memory, never spilling to global
         // memory. Kernel constraint: moeIntermediate ≤ 768 + groupSize
         // == 64. Qwen3.6-A3B has exactly 768 so this matches; fall back

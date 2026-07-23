@@ -8,10 +8,10 @@
 //! whisper-tiny (here d512/6L/8H). Decoder layer = causal self-attn (n_kv=1 at
 //! pos 0) + cross-attn (n_kv=1500) + exact-erf GELU MLP, pre-norm, tied lm_head.
 //! All on the shared op layer; exact-erf GELU host-side.
-use ffai_core::{DType, Tensor};
-use ffai_cuda::CudaDevice;
-use ffai_loader::SafeTensors;
-use ffai_ops::{add, gemv, layer_norm, matmul, sdpa_decode};
+use iron_core::{DType, Tensor};
+use iron_cuda::CudaDevice;
+use iron_loader::SafeTensors;
+use iron_ops::{add, gemv, layer_norm, matmul, sdpa_decode};
 
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn fb(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() }

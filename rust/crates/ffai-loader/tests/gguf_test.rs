@@ -1,7 +1,7 @@
 // Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 // SPDX-License-Identifier: Apache-2.0
 //! GGUF v3 parser + Q8_0 dequant vs gguf-py reference (DSv4-Flash checkpoint).
-use ffai_loader::gguf::Gguf;
+use iron_loader::gguf::Gguf;
 
 #[test]
 fn gguf_parse_and_q8_0_dequant_match_ggufpy() {
@@ -98,7 +98,7 @@ fn build_gguf(name: &str, dims: &[u64], ggml_type: u32, data: &[u8]) -> Vec<u8> 
 }
 
 fn write_temp(bytes: &[u8], stem: &str) -> String {
-    let path = std::env::temp_dir().join(format!("ffai_kquant_{stem}.gguf"));
+    let path = std::env::temp_dir().join(format!("iron_kquant_{stem}.gguf"));
     std::fs::write(&path, bytes).unwrap();
     path.to_string_lossy().into_owned()
 }
@@ -315,8 +315,8 @@ fn split_gguf_reads_tensors_across_parts() {
     let p2 = build_gguf("b", &[4], 0, &b);
 
     let dir = std::env::temp_dir();
-    let path1 = dir.join("ffai_split_test-00001-of-00002.gguf");
-    let path2 = dir.join("ffai_split_test-00002-of-00002.gguf");
+    let path1 = dir.join("iron_split_test-00001-of-00002.gguf");
+    let path2 = dir.join("iron_split_test-00002-of-00002.gguf");
     std::fs::write(&path1, &p1).unwrap();
     std::fs::write(&path2, &p2).unwrap();
 

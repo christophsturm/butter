@@ -1,7 +1,7 @@
 // Q4 gemv profiling target — one big cold GEMV (lm_head shape) for ncu.
-use ffai_core::{DType, Tensor};
-use ffai_ops::{gemv_q4, quantize_q4};
-use ffai_cuda::CudaDevice;
+use iron_core::{DType, Tensor};
+use iron_ops::{gemv_q4, quantize_q4};
+use iron_cuda::CudaDevice;
 use std::time::Instant;
 fn tbf(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn tbu(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
@@ -11,7 +11,7 @@ fn q4_lmhead_prof() {
     let d = dev.as_ref();
     for (m,k,lbl) in [(131072usize,2688usize,"lmhead"),(1856,2688,"exp_up"),(2688,1856,"exp_down"),(10304,2688,"in_proj")] { run(d,m,k,lbl); }
 }
-fn run(d: &dyn ffai_core::Device, m: usize, k: usize, lbl: &str) {
+fn run(d: &dyn iron_core::Device, m: usize, k: usize, lbl: &str) {
     let mut s = 0x1u32; let mut rng = || { s ^= s<<13; s^=s>>17; s^=s<<5; (s as f32/u32::MAX as f32)-0.5 };
     let w: Vec<f32> = (0..m*k).map(|_| rng()).collect();
     let x: Vec<f32> = (0..k).map(|_| rng()).collect();

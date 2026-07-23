@@ -110,7 +110,7 @@ dependencies = [
 name = "ffai-core"
 version = "0.1.0"
 dependencies = [
- "ffai-kernels-core",
+ "wh-iron-core",
  "thiserror",
 ]
 
@@ -119,9 +119,9 @@ name = "ffai-cuda"
 version = "0.1.0"
 dependencies = [
  "ffai-core",
- "ffai-kernels-codegen",
- "ffai-kernels-core",
- "ffai-kernels-runtime",
+ "wh-iron-codegen",
+ "wh-iron-core",
+ "wh-iron-runtime",
  "ffai-loader",
  "ffai-models",
  "ffai-modeltests",
@@ -136,15 +136,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "ffai-kernels"
+name = "iron"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
+source = "git+https://github.com/thewafflehaus/iron?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
 dependencies = [
  "bytemuck",
- "ffai-kernels-codegen",
- "ffai-kernels-core",
- "ffai-kernels-macros",
- "ffai-kernels-runtime",
+ "wh-iron-codegen",
+ "wh-iron-core",
+ "wh-iron-macros",
+ "wh-iron-runtime",
  "inventory",
  "objc2",
  "objc2-foundation",
@@ -155,11 +155,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "ffai-kernels-codegen"
+name = "wh-iron-codegen"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
+source = "git+https://github.com/thewafflehaus/iron?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
 dependencies = [
- "ffai-kernels-core",
+ "wh-iron-core",
  "inventory",
  "rustc-hash",
  "serde",
@@ -170,11 +170,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "ffai-kernels-core"
+name = "wh-iron-core"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
+source = "git+https://github.com/thewafflehaus/iron?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
 dependencies = [
- "ffai-kernels-macros",
+ "wh-iron-macros",
  "inventory",
  "rustc-hash",
  "serde",
@@ -184,9 +184,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "ffai-kernels-macros"
+name = "wh-iron-macros"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
+source = "git+https://github.com/thewafflehaus/iron?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -194,12 +194,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "ffai-kernels-runtime"
+name = "wh-iron-runtime"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
+source = "git+https://github.com/thewafflehaus/iron?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
 dependencies = [
- "ffai-kernels-codegen",
- "ffai-kernels-core",
+ "wh-iron-codegen",
+ "wh-iron-core",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
@@ -211,11 +211,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "ffai-kernels-std"
+name = "wh-iron-std"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/ffai-kernels?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
+source = "git+https://github.com/thewafflehaus/iron?branch=dev#9fe8610439fda6ffee46c9dd60fae3b0c7ecd1ec"
 dependencies = [
- "ffai-kernels",
+ "iron",
  "half",
  "rustc-hash",
 ]
@@ -234,8 +234,8 @@ name = "ffai-metal"
 version = "0.1.0"
 dependencies = [
  "ffai-core",
- "ffai-kernels-core",
- "ffai-kernels-runtime",
+ "wh-iron-core",
+ "wh-iron-runtime",
  "ffai-loader",
  "ffai-models",
  "ffai-modeltests",
@@ -270,9 +270,9 @@ name = "ffai-ops"
 version = "0.1.0"
 dependencies = [
  "ffai-core",
- "ffai-kernels-codegen",
- "ffai-kernels-core",
- "ffai-kernels-std",
+ "wh-iron-codegen",
+ "wh-iron-core",
+ "wh-iron-std",
  "parking_lot",
  "rustc-hash",
 ]
@@ -286,8 +286,8 @@ name = "ffai-vulkan"
 version = "0.1.0"
 dependencies = [
  "ffai-core",
- "ffai-kernels-core",
- "ffai-kernels-runtime",
+ "wh-iron-core",
+ "wh-iron-runtime",
  "ffai-loader",
  "ffai-models",
  "ffai-runtime",

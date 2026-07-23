@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Causal conv1d step (conv1d_causal_step) on Metal vs CPU — the short-conv
 //! used by Mamba2 + audio front-ends.
-use ffai_core::{DType, Device, Tensor};
-use ffai_metal::MetalDevice;
-use ffai_ops::conv1d_causal_step;
+use iron_core::{DType, Device, Tensor};
+use iron_metal::MetalDevice;
+use iron_ops::conv1d_causal_step;
 
 fn tb(v:&[f32])->Vec<u8>{v.iter().flat_map(|x|x.to_le_bytes()).collect()}
 fn fb(b:&[u8])->Vec<f32>{b.chunks_exact(4).map(|c|f32::from_le_bytes(c.try_into().unwrap())).collect()}

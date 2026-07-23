@@ -15,7 +15,7 @@
 // OpsValidation tests — verify every wrapper precondition rejects
 // bad inputs and accepts good ones, without producing a process trap.
 //
-// Background: each `Ops.*` wrapper around a reduction-mode ffai-kernels
+// Background: each `Ops.*` wrapper around a reduction-mode iron
 // kernel calls `preconditionFailure` when dispatch invariants are
 // violated. Those traps halt the entire test process, so the
 // pure-function `OpsValidation.validate*` shape (returning
@@ -40,12 +40,12 @@ struct OpsValidationTests {
     func rmsNormAcceptsLegal() {
         // Smallest legal n: 128 (one full simdgroup × 4 elts/thread).
         #expect(OpsValidation.validateRmsNorm(n: 128) == nil)
-        // Common Llama hidden dims (≤ 4096 → ffai_rms_norm).
+        // Common Llama hidden dims (≤ 4096 → iron_rms_norm).
         #expect(OpsValidation.validateRmsNorm(n: 256) == nil)
         #expect(OpsValidation.validateRmsNorm(n: 1024) == nil)
         #expect(OpsValidation.validateRmsNorm(n: 2048) == nil)
         #expect(OpsValidation.validateRmsNorm(n: 4096) == nil)
-        // Wide rows (> 4096 → ffai_rms_norm_wide): Gemma 4 31B hidden
+        // Wide rows (> 4096 → iron_rms_norm_wide): Gemma 4 31B hidden
         // 5376 and beyond. No upper bound — the strided kernel covers
         // any width.
         #expect(OpsValidation.validateRmsNorm(n: 5376) == nil)
@@ -58,12 +58,12 @@ struct OpsValidationTests {
         #expect(OpsValidation.validateRmsNorm(n: -128) != nil)
     }
 
-    @Test("rmsNorm accepts non-128-multiples (routed to ffai_rms_norm_wide)")
+    @Test("rmsNorm accepts non-128-multiples (routed to iron_rms_norm_wide)")
     func rmsNormAcceptsNonMultipleOf128() {
         // SmolVLM2's vision tower has hidden dim 960 (= 128*7 + 64) —
         // not a multiple of 128. The wrapper routes anything not
         // 128-aligned through the always-correct wide kernel
-        // (`ffai_rms_norm_wide`, TPG=1024 strided, no alignment
+        // (`iron_rms_norm_wide`, TPG=1024 strided, no alignment
         // requirement). Pre-2026-05-25 the validator rejected these
         // widths because only the fast kernel was wired; the wide path
         // makes the rejection obsolete.
@@ -78,10 +78,10 @@ struct OpsValidationTests {
         #expect(OpsValidation.validateRmsNorm(n: 4) == nil)
     }
 
-    @Test("rmsNorm accepts wide rows (routed to ffai_rms_norm_wide)")
+    @Test("rmsNorm accepts wide rows (routed to iron_rms_norm_wide)")
     func rmsNormAcceptsWideRows() {
-        // Rows past the 4096 cap of ffai_rms_norm route to the strided
-        // ffai_rms_norm_wide kernel, which has no upper bound. Before the
+        // Rows past the 4096 cap of iron_rms_norm route to the strided
+        // iron_rms_norm_wide kernel, which has no upper bound. Before the
         // wide kernel these `n / 4 > 1024` widths were rejected.
         #expect(OpsValidation.validateRmsNorm(n: 4224) == nil)  // 4224/4 = 1056
         #expect(OpsValidation.validateRmsNorm(n: 5376) == nil)  // Gemma 4 31B
@@ -136,7 +136,7 @@ struct OpsValidationTests {
 
     @Test("supportedSdpaHeadDims is what wrappers route to")
     func supportedHeadDimsMatchKernels() {
-        // Pin the set so adding a new head_dim variant in ffai-kernels
+        // Pin the set so adding a new head_dim variant in iron
         // requires updating both this set and the dispatch switch in
         // Ops.sdpaDecode in the same commit. Gemma 3 + Gemma 4 added
         // head_dim=256 in the Phase 6 wave; Gemma 4's global layers
@@ -440,7 +440,7 @@ struct OpsValidationTests {
 
     @Test("sdpaBidirectional production-safe gate covers the verified vision/audio dims")
     func sdpaBidirectionalProductionSafeGate() {
-        // d64/d72/d80/d96 each have a passing ffai-kernels production-shape cell
+        // d64/d72/d80/d96 each have a passing iron production-shape cell
         // (576-patch vision tower / 1500-frame audio encoder) → GPU-cleared.
         for hd in [64, 72, 80, 96] {
             #expect(
@@ -655,7 +655,7 @@ struct OpsValidationTests {
 
     @Test("validateGatedDeltaStep accepts representative model configs")
     func gatedDeltaStepAcceptsValidConfigs() {
-        // `ffai_gated_delta_step` takes (Dk, Dv, Hv, Hk) as runtime
+        // `iron_gated_delta_step` takes (Dk, Dv, Hv, Hk) as runtime
         // constexprs — any config satisfying the geometry invariants
         // is dispatchable. These cover the shipped Qwen3.5 GDN variants.
         let configs: [[Int]] = [

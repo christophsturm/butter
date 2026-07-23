@@ -7,10 +7,10 @@
 //! kv_stride = seq_len). Proves causal masking + the prefill path on the shared
 //! op layer. (GPT-2 uses learned position embeddings, isolating causal masking
 //! from RoPE.) argmax of the last position vs HF.
-use ffai_core::{DType, Tensor};
-use ffai_metal::MetalDevice;
-use ffai_loader::SafeTensors;
-use ffai_ops::{gelu, layer_norm, matmul, sdpa_decode};
+use iron_core::{DType, Tensor};
+use iron_metal::MetalDevice;
+use iron_loader::SafeTensors;
+use iron_ops::{gelu, layer_norm, matmul, sdpa_decode};
 
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn fb(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() }

@@ -29,11 +29,11 @@
 //! Q8 path — the recommended decode path — runs the full continuation. The
 //! f32↔Q8 agreement assert compares only the shared (short) prefix.
 
-use ffai_loader::gguf::Gguf;
-use ffai_metal::MetalDevice;
-use ffai_models::gguf_tokenizer::GgufTokenizer;
-use ffai_models::llama::GgufModel;
-use ffai_runtime::{generate, Sampling, StopOn};
+use iron_loader::gguf::Gguf;
+use iron_metal::MetalDevice;
+use iron_models::gguf_tokenizer::GgufTokenizer;
+use iron_models::llama::GgufModel;
+use iron_runtime::{generate, Sampling, StopOn};
 use std::time::Instant;
 
 /// One row of the GGUF regression matrix.
@@ -90,7 +90,7 @@ fn eos_id(tok: &GgufTokenizer) -> Option<u32> {
 
 /// Run `model` greedily for `budget` decode steps and return (tokens, text, decode_tok/s).
 fn run(
-    dev: &dyn ffai_core::Device,
+    dev: &dyn iron_core::Device,
     model: &GgufModel,
     tok: &GgufTokenizer,
     prompt: &[u32],

@@ -6,9 +6,9 @@
 //! `MTLCommandBuffer.commit()` + wait, a Metal/driver cost paid identically
 //! whether the encoder is driven from Swift (MetalKit) or Rust (objc2). The
 //! decode bottleneck is the dispatch COUNT (~120/token), not the host language.
-use ffai_core::{DType, Tensor};
-use ffai_metal::MetalDevice;
-use ffai_ops::{add, gemv};
+use iron_core::{DType, Tensor};
+use iron_metal::MetalDevice;
+use iron_ops::{add, gemv};
 use std::time::Instant;
 
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }

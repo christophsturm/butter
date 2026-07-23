@@ -24,7 +24,7 @@
 // convention so diff tooling produces stable output):
 //
 //   {
-//     "__metadata__": { "format": "pt", "ffai_version": "..." },
+//     "__metadata__": { "format": "pt", "iron_version": "..." },
 //     "tensor_name": {
 //       "data_offsets": [start, end],
 //       "dtype": "BF16" | "F16" | "F32" | "U32" | ...,
@@ -176,7 +176,7 @@ public final class SafeTensorsWriter {
         // __metadata__ sorts to the top ("_" precedes letters in ASCII).
         headerDict["__metadata__"] = [
             "format": "pt",
-            "ffai_version": FFAI.version,
+            "iron_version": FFAI.version,
         ]
         var offset = 0
         for p in tensors {

@@ -4,10 +4,10 @@
 //! # ffai-loader
 //!
 //! Weight loaders. Pure CPU byte-parsing + upload through the
-//! [`Device`](ffai_core::Device) trait — no GPU API, fully shared across
+//! [`Device`](iron_core::Device) trait — no GPU API, fully shared across
 //! backends. SafeTensors is implemented; GGUF / HF follow.
 
-use ffai_core::{DType, Error, Result};
+use iron_core::{DType, Error, Result};
 use std::collections::BTreeMap;
 
 /// One tensor's location + metadata inside a SafeTensors blob.

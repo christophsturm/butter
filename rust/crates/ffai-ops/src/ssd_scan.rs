@@ -33,7 +33,7 @@
 //! Lives in its own module (not `lib.rs`) to avoid edit contention with the
 //! concurrent tensor-core attention work on the same branch.
 
-use ffai_core::{DType, Device, Error, Result, Tensor};
+use iron_core::{DType, Device, Error, Result, Tensor};
 
 /// CUDA: inclusive cumsum of A*dt within each chunk → Lcs (f32), one thread per
 /// (chunk, head). A = -exp(a_log[h]). dt layout [T, H]. Lcs layout [nc*H, L].
@@ -979,14 +979,14 @@ pub fn ssm_prefill_scan_ssd_strided(
     let cs = Tensor::empty(dev, vec![bhc * l * dhu], DType::F16)?;       // [nc*H, L, dh]
 
     let raw = |src: &str, name: &str, fnn: &str,
-               ptrs: &[(&dyn ffai_core::DeviceBuffer, usize)],
+               ptrs: &[(&dyn iron_core::DeviceBuffer, usize)],
                scalars: &[u32], n_threads: usize| -> Result<()> {
         let block = 256u32;
         let grid = [((n_threads as u32) + block - 1) / block, 1, 1];
         let sc: Vec<Vec<u8>> = scalars.iter().map(|v| v.to_le_bytes().to_vec()).collect();
         dev.dispatch_raw_cuda(src, name, fnn, ptrs, &sc, grid, [block, 1, 1], 0, false)
     };
-    fn bb(t: &Tensor) -> &dyn ffai_core::DeviceBuffer { t.buffer.as_ref() }
+    fn bb(t: &Tensor) -> &dyn iron_core::DeviceBuffer { t.buffer.as_ref() }
     let (tt, hh, gg, ll, dsd, dhd, ncn, hpgn) = (
         t_total, n_heads, n_groups, l as u32, ds, dh, nc as u32, hpg as u32,
     );

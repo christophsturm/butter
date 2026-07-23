@@ -31,13 +31,13 @@ import Foundation
 @preconcurrency import Metal
 import Testing
 
-@testable import FFAIKernelsSwift
+@testable import IronSwift
 
 @Suite("PSOCache")
 struct PSOCacheTests {
 
     private func makeCache() throws -> PSOCache {
-        let lib = try FFAIKernelsLibrary()
+        let lib = try IronLibrary()
         return PSOCache(library: lib)
     }
 
@@ -119,7 +119,7 @@ struct PSOCacheTests {
         #expect(freshPso.maxTotalThreadsPerThreadgroup > 0)
         #expect(sharedPso.maxTotalThreadsPerThreadgroup > 0)
         // The two caches are backed by different MTLLibrary instances
-        // (each `FFAIKernelsLibrary()` builds its own MTLLibrary), so the
+        // (each `IronLibrary()` builds its own MTLLibrary), so the
         // PSO instances will differ — but both must be live.
     }
 

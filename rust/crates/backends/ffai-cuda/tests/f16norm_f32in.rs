@@ -1,9 +1,9 @@
 #![cfg(feature = "cuda")]
 //! Isolate add_rms_norm_f16norm with REAL in-model f32 inputs (a/b/w all f32).
 //! Compares residual + normed against a CPU oracle AND the working add_rms_norm.
-use ffai_core::{DType, Device, Tensor};
-use ffai_cuda::CudaDevice;
-use ffai_ops::{add_rms_norm, add_rms_norm_f16norm};
+use iron_core::{DType, Device, Tensor};
+use iron_cuda::CudaDevice;
+use iron_ops::{add_rms_norm, add_rms_norm_f16norm};
 
 fn tb(v:&[f32])->Vec<u8>{v.iter().flat_map(|x|x.to_le_bytes()).collect()}
 fn fb32(b:&[u8])->Vec<f32>{b.chunks_exact(4).map(|c|f32::from_le_bytes(c.try_into().unwrap())).collect()}
@@ -48,7 +48,7 @@ fn f16norm_f32_inputs_matches_oracle(){
     let mut cn=vec![0u8;rows*n*4]; d.download(n32.buffer.as_ref(),&mut cn).unwrap(); let nrm_c=fb32(&cn);
 
     // EXACT-FUSION CHECK: fused f16 normed must equal cast_f32_f16(f32wrap normed) bit-for-bit.
-    let nrm_c_f16 = ffai_ops::cast_f32_f16(d, &n32).unwrap();
+    let nrm_c_f16 = iron_ops::cast_f32_f16(d, &n32).unwrap();
     d.synchronize().unwrap();
     let mut hc=vec![0u8;rows*n*2]; d.download(nrm_c_f16.buffer.as_ref(),&mut hc).unwrap();
     let mut hf=vec![0u8;rows*n*2]; d.download(nf.buffer.as_ref(),&mut hf).unwrap();

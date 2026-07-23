@@ -4,8 +4,8 @@
 //! # ffai-cuda
 //!
 //! CUDA backend for the FFAI engine. Under `--features cuda` it wraps
-//! `ffai_kernels_runtime::CudaDevice` (NVRTC → PTX → driver) behind the shared
-//! [`ffai_core::Device`] trait — the same seam the Metal/Vulkan backends
+//! `iron_kernels_runtime::CudaDevice` (NVRTC → PTX → driver) behind the shared
+//! [`iron_core::Device`] trait — the same seam the Metal/Vulkan backends
 //! implement, so everything above it is backend-agnostic. Without the
 //! feature it is a stub so non-CUDA hosts still build the workspace.
 
@@ -16,7 +16,7 @@ pub use imp::{CudaBuffer, CudaDevice};
 
 #[cfg(not(feature = "cuda"))]
 mod stub {
-    use ffai_core::{Device, Result};
+    use iron_core::{Device, Result};
     use std::sync::Arc;
 
     /// Stub: the crate builds on non-CUDA hosts, but no device is available

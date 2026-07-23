@@ -4,10 +4,10 @@ Table of contents for the FFAI documentation. The top-level [`README`](../README
 
 ## Getting started
 
-- [Installation](installation.md) — SwiftPM / Xcode setup, platform requirements, sibling-ffai-kernels checkout.
+- [Installation](installation.md) — SwiftPM / Xcode setup, platform requirements, sibling-iron checkout.
 - [Quick start](quickstart.md) — generate text in 5 lines.
 - [Using the CLI](using-the-cli.md) — build the `ffai` binary and run it via `swift run`, the built path, or a `PATH` symlink.
-- [Architecture](architecture.md) — the three-layer stack (`ffai-kernels` Rust → `MetalTileSwift` → `FFAI`), build pipeline, and per-token dispatch loop.
+- [Architecture](architecture.md) — the three-layer stack (`iron` Rust → `IronSwift` → `FFAI`), build pipeline, and per-token dispatch loop.
 - [Models](models.md) — the supported architecture families (dense text, SSM / GDN / conv+attention hybrids, MoE, vision-language, audio, neural codecs), per-family known gaps, and adding a new family.
 
 ## Cross-cutting topics
@@ -47,7 +47,7 @@ The user-facing site at **https://thewafflehaus.github.io/ffai-website/** is bui
 |---|---|
 | **A new release is published on this repo** | `.github/workflows/notify-docs.yml` calls `workflow_dispatch` on ffai-website's `deploy.yml`, passing the release tag, name, body, and url as inputs. ffai-website pins its FFAI checkout to that tag, renders the release body as the Changelog page, updates the version label in the site title + hero, then deploys. |
 | Push to `main` on `ffai-website` | Site source changed (CSS, layout, new page). ffai-website rebuilds against FFAI's *latest published release* (via `gh release view`). |
-| Manual dispatch on either repo | Same — `ffai-website` always builds against the latest release (or against a specific tag if you pass `--field ffai_tag=...`). |
+| Manual dispatch on either repo | Same — `ffai-website` always builds against the latest release (or against a specific tag if you pass `--field iron_tag=...`). |
 
 ### The token
 
@@ -73,7 +73,7 @@ gh workflow run notify-docs.yml --repo thewafflehaus/FFAI --field tag=v0.1.0
 # Rebuild ffai-website against an arbitrary FFAI tag directly (skips
 # the FFAI notify hop — handy for debugging the site itself).
 gh workflow run deploy.yml --repo thewafflehaus/ffai-website \
-  --field ffai_tag=v0.1.0
+  --field iron_tag=v0.1.0
 ```
 
 ### Previewing unreleased doc changes locally

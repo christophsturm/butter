@@ -273,7 +273,7 @@ public struct FalconH1Hybrid: FalconH1Variant {
                 outProj = AnyLinear(Linear(weight: outProjW))
             }
 
-            // conv1d.weight ships [conv_dim, 1, kernel]; the ffai-kernels
+            // conv1d.weight ships [conv_dim, 1, kernel]; the iron
             // kernel wants [kernel, conv_dim]. Same transpose Mamba 2 does.
             let convWSrc = try weights.tensor(named: "\(p).mamba.conv1d.weight")
             precondition(
@@ -616,7 +616,7 @@ public final class FalconH1DecoderLayer: Module, DecoderLayer {
 
         // Parallel-hybrid join: residual + mixer + attention.
         // Fuse the final (temp + attnH) → preFfNorm pair into
-        // ffai_add_rms_norm (hidden ≤ 4096). The first inner add stays
+        // iron_add_rms_norm (hidden ≤ 4096). The first inner add stays
         // separate — fused kernel only collapses one add+norm pair.
         let temp = Ops.add(h, mambaH, on: cmd)
         let postMix: Tensor
@@ -1004,7 +1004,7 @@ private func tileDFH1(
 }
 
 /// Transpose HF conv1d.weight `[C, 1, K]` (channel-major) → `[K, C]`
-/// (kernel-tap-major) for the ffai-kernels conv kernel.
+/// (kernel-tap-major) for the iron conv kernel.
 private func transposeConv1dWeightFH1(
     src: Tensor, kernel K: Int, channels C: Int,
     dtype: DType, device: Device

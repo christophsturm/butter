@@ -5,8 +5,8 @@
 //!
 //! The **seam** between model code and kernels — the Rust analog of
 //! FFAI-Swift's `Ops/`. Each function takes Tensors, builds (or looks up)
-//! the corresponding metaltile [`Kernel`](ffai_core::Kernel), and dispatches
-//! it through the [`Device`](ffai_core::Device) trait. Model code calls
+//! the corresponding iron [`Kernel`](iron_core::Kernel), and dispatches
+//! it through the [`Device`](iron_core::Device) trait. Model code calls
 //! these; it never touches a GPU API or a kernel directly. Re-implementing
 //! this layer once is what lets the whole model surface above it run on
 //! every backend.
@@ -14,12 +14,12 @@
 //! Every op here is real and runs on any backend implementing [`Device`]
 //! (verified vs HF on CUDA + Metal). Elementwise ops hand-build their IR;
 //! the heavier ones (matmul / rms_norm / layer_norm / sdpa / rope / conv1d /
-//! ssm …) resolve a registered metaltile kernel via `lookup`, which carries
+//! ssm …) resolve a registered iron kernel via `lookup`, which carries
 //! the correct dispatch mode.
 
-use ffai_core::{Binding, DType, Device, Error, Grid, Kernel, Result, Tensor};
-use ffai_kernels_core::ir::{ActKind, BinOpKind, IndexExpr, Op, Param, ParamKind, ValueId};
-use ffai_kernels_core::shape::Shape;
+use iron_core::{Binding, DType, Device, Error, Grid, Kernel, Result, Tensor};
+use iron_kernels_core::ir::{ActKind, BinOpKind, IndexExpr, Op, Param, ParamKind, ValueId};
+use iron_kernels_core::shape::Shape;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
@@ -28,10 +28,10 @@ use std::sync::OnceLock;
 /// uploaded once per (device, bit-pattern) instead of per call. The norms run
 /// hundreds of times per prefill forward, and each 4-byte upload pays a full
 /// pageable H2D + driver round-trip.
-fn scalar_buf(dev: &dyn Device, bits: u32) -> Result<std::sync::Arc<dyn ffai_core::DeviceBuffer>> {
+fn scalar_buf(dev: &dyn Device, bits: u32) -> Result<std::sync::Arc<dyn iron_core::DeviceBuffer>> {
     use std::cell::RefCell;
     thread_local! {
-        static CACHE: RefCell<FxHashMap<(usize, u32), std::sync::Arc<dyn ffai_core::DeviceBuffer>>> =
+        static CACHE: RefCell<FxHashMap<(usize, u32), std::sync::Arc<dyn iron_core::DeviceBuffer>>> =
             RefCell::new(FxHashMap::default());
     }
     let key = (dev as *const dyn Device as *const () as usize, bits);
@@ -71,9 +71,9 @@ fn cached_ir(name: &str, dtype: DType, build: impl FnOnce() -> Kernel) -> Kernel
     k
 }
 
-/// Look up a registered metaltile kernel by name and instantiate its IR for
+/// Look up a registered iron kernel by name and instantiate its IR for
 /// `dtype`, **with the correct dispatch mode already set**. We pull it from
-/// the test registry (`ffai_kernels_std::all_tests`) rather than the raw kernel
+/// the test registry (`iron_kernels_std::all_tests`) rather than the raw kernel
 /// registry: the test/bench setup is where each kernel's `KernelMode`
 /// (Elementwise / Reduction / Grid3D …) is configured, and that mode drives
 /// codegen (e.g. whether `tid` vs `gid` is defined, the `_n_elems` arg). This
@@ -83,7 +83,7 @@ fn lookup(name: &str, dtype: DType) -> Result<Kernel> {
     if let Some(k) = kernel_cache().lock().get(&key) {
         return Ok(k.clone());
     }
-    for entry in ffai_kernels_std::all_tests() {
+    for entry in iron_kernels_std::all_tests() {
         let t = entry.test();
         if !t.dtypes().contains(&dtype) {
             continue;
@@ -96,7 +96,7 @@ fn lookup(name: &str, dtype: DType) -> Result<Kernel> {
         }
     }
     Err(Error::Msg(format!(
-        "kernel '{name}' [{dtype}] not found in the metaltile test registry"
+        "kernel '{name}' [{dtype}] not found in the iron test registry"
     )))
 }
 
@@ -181,16 +181,16 @@ fn elementwise(
 
 /// Elementwise sum `a + b` (e.g. residual connections).
 pub fn add(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    elementwise(dev, a, b, BinOpKind::Add, "ffai_add")
+    elementwise(dev, a, b, BinOpKind::Add, "iron_add")
 }
 
 /// Elementwise product `a * b` (e.g. gating).
 pub fn mul(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    elementwise(dev, a, b, BinOpKind::Mul, "ffai_mul")
+    elementwise(dev, a, b, BinOpKind::Mul, "iron_mul")
 }
 
 const ADD3_SRC: &str = r#"
-extern "C" __global__ void ffai_add3(
+extern "C" __global__ void iron_add3(
     const float* __restrict__ a, const float* __restrict__ b,
     const float* __restrict__ c, float* __restrict__ out, long n)
 {
@@ -204,12 +204,12 @@ extern "C" __global__ void ffai_add3(
 
 /// Fused three-way elementwise sum `a + b + c` (f32, CUDA raw path) — one
 /// launch + no intermediate tensor for the per-E-layer
-/// `residual + routed_acc + shared_out` merge (was two `ffai_add` launches).
+/// `residual + routed_acc + shared_out` merge (was two `iron_add` launches).
 pub fn add3(dev: &dyn Device, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<Tensor> {
     let out = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
     let n = a.elem_count();
     let l = |v: i64| v.to_le_bytes().to_vec();
-    dev.dispatch_raw_cuda(ADD3_SRC, "add3.cu", "ffai_add3",
+    dev.dispatch_raw_cuda(ADD3_SRC, "add3.cu", "iron_add3",
         &[(a.buffer.as_ref(), a.offset), (b.buffer.as_ref(), b.offset),
           (c.buffer.as_ref(), c.offset), (out.buffer.as_ref(), 0)],
         &[l(n as i64)],
@@ -220,12 +220,12 @@ pub fn add3(dev: &dyn Device, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<Tens
 // ── DeepSeek-V4 MoE ops ─────────────────────────────────────────────────
 
 /// DSv4 clamped SwiGLU: `out = silu(min(gate, limit)) * clip(up, ±limit)`.
-/// Dispatches `ffai_dsv4_swiglu_limit` (limit = 10 for DSv4).
+/// Dispatches `iron_dsv4_swiglu_limit` (limit = 10 for DSv4).
 pub fn swiglu_limit(dev: &dyn Device, gate: &Tensor, up: &Tensor, limit: f32) -> Result<Tensor> {
     if gate.shape != up.shape {
         return Err(Error::Msg("swiglu_limit: gate/up shape mismatch".into()));
     }
-    let k = lookup("ffai_swiglu_limit", gate.dtype)?;
+    let k = lookup("iron_swiglu_limit", gate.dtype)?;
     let out = Tensor::empty(dev, gate.shape.clone(), gate.dtype)?;
     let n = gate.elem_count() as u32;
     let grid = Grid::d1(n.div_ceil(256), 256);
@@ -273,7 +273,7 @@ pub fn conv1d_causal_step(
     n_channels: u32,
     kernel_size: u32,
 ) -> Result<Tensor> {
-    let k = lookup("ffai_conv1d_causal_step", x.dtype)?;
+    let k = lookup("iron_conv1d_causal_step", x.dtype)?;
     let y = Tensor::empty(dev, vec![n_channels as usize], x.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     let bindings = vec![
@@ -310,7 +310,7 @@ fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
 
 /// Mamba2 SSD selective-scan **decode step** (single token, batch=1):
 /// `da = exp(-exp(a_log)·dt)`; `state' = da·state + x·dt·B`;
-/// `out = Σ_s C·state' + x·D`. Dispatches `ffai_ssm_step`. Returns
+/// `out = Σ_s C·state' + x·D`. Dispatches `iron_ssm_step`. Returns
 /// `(state_out [n_heads·dh·ds], out [n_heads·dh])`. `ds` must be a multiple
 /// of 32. Shapes: x `[n_heads·dh]`, a_log/d_skip/dt `[n_heads]`,
 /// b_mat/c_mat `[n_groups·ds]`, state_in `[n_heads·dh·ds]`.
@@ -329,7 +329,7 @@ pub fn ssm_step(
     n_heads: u32,
     heads_per_group: u32,
 ) -> Result<(Tensor, Tensor)> {
-    let k = lookup("ffai_ssm_step_grouped", x.dtype)?;
+    let k = lookup("iron_ssm_step_grouped", x.dtype)?;
     let state_out = Tensor::empty(dev, state_in.shape.clone(), x.dtype)?;
     let out = Tensor::empty(dev, vec![(n_heads * dh) as usize], x.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -357,7 +357,7 @@ pub fn ssm_step(
 
 /// mHC sinkhorn split (single token, host-side): the 24-value `mixes`
 /// vector → `pre[4]`, `post[4]`, `comb[4×4]`. Faithful transcription of
-/// `ffai_dsv4_mhc_sinkhorn_split` (a 3-output kernel; trivial at one token,
+/// `iron_dsv4_mhc_sinkhorn_split` (a 3-output kernel; trivial at one token,
 /// so it runs on the host). `scale` is `[pre, post, comb]`, `base` is `[24]`.
 /// - pre[c]  = sigmoid(mixes[c]·pre_scale + base[c]) + eps
 /// - post[c] = 2·sigmoid(mixes[4+c]·post_scale + base[4+c])
@@ -405,7 +405,7 @@ pub fn dsv4_mhc_sinkhorn_split(
 
 /// mHC collapse: `out[d] = Σ_c pre[c] · state[c, d]` — mix the 4-channel
 /// residual state `[n_hc, hidden]` down to `[hidden]` using the per-channel
-/// `pre` weights. Single token. Dispatches `ffai_dsv4_mhc_collapse`.
+/// `pre` weights. Single token. Dispatches `iron_dsv4_mhc_collapse`.
 pub fn dsv4_mhc_collapse(
     dev: &dyn Device,
     state: &Tensor,
@@ -413,7 +413,7 @@ pub fn dsv4_mhc_collapse(
     hidden_dim: u32,
     n_hc: u32,
 ) -> Result<Tensor> {
-    let k = lookup("ffai_mhc_collapse", state.dtype)?;
+    let k = lookup("iron_mhc_collapse", state.dtype)?;
     let out = Tensor::empty(dev, vec![hidden_dim as usize], state.dtype)?;
     let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
     let grid = Grid::d1((hidden_dim).div_ceil(256), 256);
@@ -434,7 +434,7 @@ pub fn dsv4_mhc_collapse(
 
 /// mHC expand: write the new 4-channel residual state
 /// `state[dst, d] = block_out[d]·post[dst] + Σ_src comb[dst, src]·residual[src, d]`.
-/// Single token. Returns `[n_hc, hidden]`. Dispatches `ffai_dsv4_mhc_expand`.
+/// Single token. Returns `[n_hc, hidden]`. Dispatches `iron_dsv4_mhc_expand`.
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_mhc_expand(
     dev: &dyn Device,
@@ -445,7 +445,7 @@ pub fn dsv4_mhc_expand(
     hidden_dim: u32,
     n_hc: u32,
 ) -> Result<Tensor> {
-    let k = lookup("ffai_mhc_expand", block_out.dtype)?;
+    let k = lookup("iron_mhc_expand", block_out.dtype)?;
     let state = Tensor::empty(dev, vec![(n_hc * hidden_dim) as usize], block_out.dtype)?;
     let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
     let grid = Grid::d1((hidden_dim).div_ceil(256), 256);
@@ -466,13 +466,13 @@ pub fn dsv4_mhc_expand(
     Ok(state)
 }
 
-// ── Heavier ops — dispatch the registered metaltile kernels ─────────────
+// ── Heavier ops — dispatch the registered iron kernels ─────────────
 
 /// Row-wise RMS norm: `out[r] = x[r] * rsqrt(mean(x[r]²) + eps) * weight`.
-/// Dispatches the registered `ffai_rms_norm` reduction kernel — the same one
+/// Dispatches the registered `iron_rms_norm` reduction kernel — the same one
 /// the Swift side runs. The last dim is the row width `n`; the kernel owns 4
 /// elements per thread, so `n` must be a multiple of 128 and ≤ 4096 (the
-/// `ffai_rms_norm_wide` variant lifts this — wired later).
+/// `iron_rms_norm_wide` variant lifts this — wired later).
 pub fn rms_norm(dev: &dyn Device, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     let n = *x.shape.last().ok_or_else(|| Error::Msg("rms_norm: scalar input".into()))?;
     let rows = x.elem_count() / n;
@@ -482,9 +482,9 @@ pub fn rms_norm(dev: &dyn Device, x: &Tensor, weight: &Tensor, eps: f32) -> Resu
     // Fast path: 4 elems/thread, needs n a multiple of 128 and ≤ 4096.
     // Otherwise the strided wide variant handles any row width.
     let (kname, block) = if n % 128 == 0 && n <= 4096 {
-        ("ffai_rms_norm", (n / 4) as u32)
+        ("iron_rms_norm", (n / 4) as u32)
     } else {
-        ("ffai_rms_norm_wide", 256u32)
+        ("iron_rms_norm_wide", 256u32)
     };
     let k = lookup(kname, x.dtype)?;
     let grid = Grid { grid: [rows as u32, 1, 1], block: [block, 1, 1] };
@@ -503,7 +503,7 @@ pub fn rms_norm(dev: &dyn Device, x: &Tensor, weight: &Tensor, eps: f32) -> Resu
 }
 
 /// Matrix-vector product `mat @ vec`: `mat` is `[m, k]` row-major, `vec` is
-/// `[k]`, result is `[m]`. Dispatches the registered `ffai_gemv` kernel (one
+/// `[k]`, result is `[m]`. Dispatches the registered `iron_gemv` kernel (one
 /// threadgroup per output row). This is the decode-time projection path; the
 /// batched/prefill cooperative matmul is a separate kernel, wired later.
 pub fn gemv(dev: &dyn Device, mat: &Tensor, vec: &Tensor) -> Result<Tensor> {
@@ -517,7 +517,7 @@ pub fn gemv(dev: &dyn Device, mat: &Tensor, vec: &Tensor) -> Result<Tensor> {
             vec.elem_count()
         )));
     }
-    let k = lookup("ffai_gemv", mat.dtype)?;
+    let k = lookup("iron_gemv", mat.dtype)?;
     let out = Tensor::empty(dev, vec![m], mat.dtype)?;
 
     let grid = Grid { grid: [m as u32, 1, 1], block: [256, 1, 1] };
@@ -539,7 +539,7 @@ pub fn gemv(dev: &dyn Device, mat: &Tensor, vec: &Tensor) -> Result<Tensor> {
 /// x[(r/rows_per_group)·k_in + k]`. `qs` is u32-packed (4 int8/u32, 8 u32/block),
 /// `scales` is `[m_out · k_in/32]` f32. Dense gemv ⇒ `rows_per_group = m_out`
 /// (n_groups=1, `x = [k_in]`); MoE ⇒ per-expert grouping. Dispatches the
-/// Reduction kernel `ffai_grouped_gemv_q8_rows` (8-bit ⇒ ~4× less weight DRAM
+/// Reduction kernel `iron_grouped_gemv_q8_rows` (8-bit ⇒ ~4× less weight DRAM
 /// than F32, the resident-decode bandwidth win). `k_in` must be a multiple of 32.
 pub fn gemv_q8(
     dev: &dyn Device,
@@ -557,7 +557,7 @@ pub fn gemv_q8(
     // are JIT-specialized by the runtime from the scalar bindings below).
     // Coalesced variant: consecutive lanes read consecutive qs words (~2× the
     // strided original's DRAM bandwidth on GB10).
-    let k = cached_ir("ffai_gemv_q8_coalesced", x.dtype, || { let mut k = ffai_kernels_std::kernels::gemm::gemv_quantized::ffai_gemv_q8_coalesced::kernel_ir_for(x.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("iron_gemv_q8_coalesced", x.dtype, || { let mut k = iron_kernels_std::kernels::gemm::gemv_quantized::iron_gemv_q8_coalesced::kernel_ir_for(x.dtype); k.mode = iron_kernels_core::ir::KernelMode::Reduction; k });
     let out = Tensor::empty(dev, vec![m_out], x.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     let grid = Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] };
@@ -578,7 +578,7 @@ pub fn gemv_q8(
 }
 
 /// Batched Q8 GEMM — the **prefill** projection path. `out[r,o] = Σ_k W[o,k]·x[r,k]`
-/// for `n_rows` tokens at once, dispatching metaltile's `ffai_gemm_q8_mpp`
+/// for `n_rows` tokens at once, dispatching iron's `iron_gemm_q8_mpp`
 /// (SimdGroup-scope CoopTile 64×64×32 tile). On the Vulkan/RDNA4 backend this
 /// kernel picks up the gated `VK_KHR_cooperative_matrix` fragment ops when
 /// `MT_VK_COOPMAT=1` (≈6× the scalar GEMM) — the realized prefill win. With the
@@ -605,11 +605,11 @@ pub fn gemm_q8_mpp(
     // Coopmat fragments stage through fp16 → drive the kernel at f16. Cast the
     // f32 residual-stream activations in, widen the result back out.
     let xf16 = if x.dtype == DType::F16 { x.clone() } else { cast_f32_f16(dev, x)? };
-    // `ffai_gemm_q8_mpp` in Reduction mode (matches the metaltile coopmat test
+    // `iron_gemm_q8_mpp` in Reduction mode (matches the iron coopmat test
     // + bench). Buffer order: x, qs, d_f32, out; constexpr n_rows, out_dim, k_in.
-    let k = cached_ir("ffai_gemm_q8_mpp", DType::F16, || {
-        let mut k = ffai_kernels_std::kernels::gemm::gemm_q8_mpp::ffai_gemm_q8_mpp::kernel_ir_for(DType::F16);
-        k.mode = ffai_kernels_core::ir::KernelMode::Reduction;
+    let k = cached_ir("iron_gemm_q8_mpp", DType::F16, || {
+        let mut k = iron_kernels_std::kernels::gemm::gemm_q8_mpp::iron_gemm_q8_mpp::kernel_ir_for(DType::F16);
+        k.mode = iron_kernels_core::ir::KernelMode::Reduction;
         k
     });
     let out = Tensor::empty(dev, vec![n_rows * m_out], DType::F16)?;
@@ -647,17 +647,17 @@ pub fn add_bias_rows(dev: &dyn Device, x: &Tensor, bias: &Tensor, n_rows: usize,
     // Fully on-device per-feature bias broadcast: `i = ProgramId(0)` (global
     // flat id), row-local column `col = i % n`, `out[i] = x[i] + bias[col]`.
     // `n` is a CONSTEXPR push-constant (bound as a `Binding::Scalar`) — NOT a
-    // baked `Op::Const` literal — so the one cached `ffai_add_bias_rows`
+    // baked `Op::Const` literal — so the one cached `iron_add_bias_rows`
     // pipeline serves every projection width (q: nq*hd, k/v: nkv*hd) instead
     // of silently reusing the first call's `n`. The DSL `%` lowers to
     // `BinOpKind::Mod` → GLSL `uint(i) % uint(n)` (integer modulo), validated
-    // bit-exact on Vulkan by `metaltile-std/tests/vulkan_add_bias_rows.rs`.
+    // bit-exact on Vulkan by `wh-iron-std/tests/vulkan_add_bias_rows.rs`.
     // No host round-trip — runs straight on the device-local weight buffer.
-    use ffai_kernels_core::ir::ConstExprDecl;
-    use ffai_kernels_core::ConstExpr;
+    use iron_kernels_core::ir::ConstExprDecl;
+    use iron_kernels_core::ConstExpr;
     let total = n_rows * n;
     let out = Tensor::empty(dev, vec![total], DType::F32)?;
-    let mut k = Kernel::new("ffai_add_bias_rows");
+    let mut k = Kernel::new("iron_add_bias_rows");
     for (pname, is_out) in [("x", false), ("bias", false), ("out", true)] {
         k.params.push(Param {
             name: pname.into(),
@@ -725,9 +725,9 @@ pub fn add_bias_rows(dev: &dyn Device, x: &Tensor, bias: &Tensor, n_rows: usize,
 }
 
 /// Q8 gemv with fused ReLU²: `out[r] = max(0, (Wq·x)[r])²` — a MoE expert's
-/// `up` projection + activation in one dispatch. Dispatches `ffai_gemv_q8_coalesced_relu2`.
+/// `up` projection + activation in one dispatch. Dispatches `iron_gemv_q8_coalesced_relu2`.
 pub fn gemv_q8_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rows_per_group: usize) -> Result<Tensor> {
-    let k = cached_ir("ffai_gemv_q8_coalesced_relu2", x.dtype, || { let mut k = ffai_kernels_std::kernels::gemm::gemv_quantized::ffai_gemv_q8_coalesced_relu2::kernel_ir_for(x.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("iron_gemv_q8_coalesced_relu2", x.dtype, || { let mut k = iron_kernels_std::kernels::gemm::gemv_quantized::iron_gemv_q8_coalesced_relu2::kernel_ir_for(x.dtype); k.mode = iron_kernels_core::ir::KernelMode::Reduction; k });
     let out = Tensor::empty(dev, vec![m_out], x.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     let grid = Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] };
@@ -738,7 +738,7 @@ pub fn gemv_q8_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor,
 /// Q8 gemv that scales + accumulates in place: `acc[r] += scale · (Wq · x)[r]`.
 /// Fuses an MoE expert's `down` projection with its router-weighted sum into the
 /// layer accumulator — no per-expert scalar-broadcast upload or separate add.
-/// `scale_buf` is a 1-element device buffer. Dispatches `ffai_gemv_q8_coalesced_accum`.
+/// `scale_buf` is a 1-element device buffer. Dispatches `iron_gemv_q8_coalesced_accum`.
 #[allow(clippy::too_many_arguments)]
 pub fn gemv_q8_accum(
     dev: &dyn Device,
@@ -754,7 +754,7 @@ pub fn gemv_q8_accum(
     if k_in % 32 != 0 {
         return Err(Error::Msg(format!("gemv_q8_accum: k_in {k_in} must be a multiple of 32")));
     }
-    let k = cached_ir("ffai_gemv_q8_coalesced_accum", acc.dtype, || { let mut k = ffai_kernels_std::kernels::gemm::gemv_quantized::ffai_gemv_q8_coalesced_accum::kernel_ir_for(acc.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("iron_gemv_q8_coalesced_accum", acc.dtype, || { let mut k = iron_kernels_std::kernels::gemm::gemv_quantized::iron_gemv_q8_coalesced_accum::kernel_ir_for(acc.dtype); k.mode = iron_kernels_core::ir::KernelMode::Reduction; k });
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     let grid = Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] };
     dev.dispatch(
@@ -778,9 +778,9 @@ pub fn gemv_q8_accum(
 /// `dst[h, pos, :] = src[h, :]`, where `dst` is `[nkv, cap, hd]`, `src` is
 /// `[nkv*hd]`, and `posbuf` is a 1-element u32 device buffer. Keeps the growing
 /// context entirely on-device — no host reorg/reupload per step (the 32K-context
-/// fix). Dispatches `ffai_kv_append` (runtime `pos` ⇒ compiled once, not per step).
+/// fix). Dispatches `iron_kv_append` (runtime `pos` ⇒ compiled once, not per step).
 pub fn kv_append(dev: &dyn Device, src: &Tensor, dst: &Tensor, posbuf: &Tensor, hd: usize, cap: usize, n: usize) -> Result<()> {
-    let k = cached_ir("ffai_kv_append", src.dtype, || { let mut k = ffai_kernels_std::kernels::kv_cache::cache::ffai_kv_append::kernel_ir_for(src.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("iron_kv_append", src.dtype, || { let mut k = iron_kernels_std::kernels::kv_cache::cache::iron_kv_append::kernel_ir_for(src.dtype); k.mode = iron_kernels_core::ir::KernelMode::Grid3D; k });
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     let grid = Grid { grid: [(n as u32).div_ceil(64), 1, 1], block: [64, 1, 1] };
     dev.dispatch(&k, &[Binding::Buffer(src.buffer.clone()), Binding::Buffer(dst.buffer.clone()), Binding::Buffer(posbuf.buffer.clone()), u(hd as u32), u(cap as u32)], grid)?;
@@ -789,7 +789,7 @@ pub fn kv_append(dev: &dyn Device, src: &Tensor, dst: &Tensor, posbuf: &Tensor, 
 
 /// Device slice `out[i] = src[off + i]` for `len` elements (no host round-trip).
 pub fn slice(dev: &dyn Device, src: &Tensor, off: usize, len: usize) -> Result<Tensor> {
-    let k = cached_ir("ffai_slice", src.dtype, || { let mut k = ffai_kernels_std::kernels::ops::copy::ffai_slice::kernel_ir_for(src.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("iron_slice", src.dtype, || { let mut k = iron_kernels_std::kernels::ops::copy::iron_slice::kernel_ir_for(src.dtype); k.mode = iron_kernels_core::ir::KernelMode::Grid3D; k });
     // Defensive bounds check. The kernel reads `src[off + i]` for i in [0, len),
     // addressing a sub-slab purely via `off` against the RAW bound buffer (the
     // tensor.offset is ignored by design). A caller binding a buffer that does
@@ -813,7 +813,7 @@ pub fn slice(dev: &dyn Device, src: &Tensor, off: usize, len: usize) -> Result<T
 /// Cast f32 → f16 (KV-cache compaction: store attention K/V at half precision
 /// to halve the 32K-context sdpa read). Returns a fresh F16 tensor.
 pub fn cast_f32_f16(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
-    let k = cached_ir("ffai_cast_f32_f16", DType::F16, || { let mut k = ffai_kernels_std::kernels::ops::unary::ffai_cast_f32_f16::kernel_ir(); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("iron_cast_f32_f16", DType::F16, || { let mut k = iron_kernels_std::kernels::ops::unary::iron_cast_f32_f16::kernel_ir(); k.mode = iron_kernels_core::ir::KernelMode::Grid3D; k });
     let n = src.elem_count();
     let out = Tensor::empty(dev, src.shape.clone(), DType::F16)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -824,7 +824,7 @@ pub fn cast_f32_f16(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
 /// Cast f16 → f32 (reverse: widen the sdpa f16 output back to f32 for the
 /// downstream o_proj Q4 GEMV, which consumes f32 activations). Fresh F32 tensor.
 pub fn cast_f16_f32(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
-    let k = cached_ir("ffai_cast_f16_f32", DType::F32, || { let mut k = ffai_kernels_std::kernels::ops::unary::ffai_cast_f16_f32::kernel_ir(); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("iron_cast_f16_f32", DType::F32, || { let mut k = iron_kernels_std::kernels::ops::unary::iron_cast_f16_f32::kernel_ir(); k.mode = iron_kernels_core::ir::KernelMode::Grid3D; k });
     let n = src.elem_count();
     let out = Tensor::empty(dev, src.shape.clone(), DType::F32)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -836,7 +836,7 @@ pub fn cast_f16_f32(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
 /// (NEMOTRON_BF16_STREAM) doesn't overflow on NemotronH massive-activation
 /// channels the way f16 (max 65504) does.
 pub fn cast_f32_bf16(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
-    let k = cached_ir("ffai_cast_f32_bf16", DType::BF16, || { let mut k = ffai_kernels_std::kernels::ops::unary::ffai_cast_f32_bf16::kernel_ir(); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("iron_cast_f32_bf16", DType::BF16, || { let mut k = iron_kernels_std::kernels::ops::unary::iron_cast_f32_bf16::kernel_ir(); k.mode = iron_kernels_core::ir::KernelMode::Grid3D; k });
     let n = src.elem_count();
     let out = Tensor::empty(dev, src.shape.clone(), DType::BF16)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -846,7 +846,7 @@ pub fn cast_f32_bf16(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
 
 /// Cast bf16 → f32 (widen the residual back for ops that need f32 input).
 pub fn cast_bf16_f32(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
-    let k = cached_ir("ffai_cast_bf16_f32", DType::F32, || { let mut k = ffai_kernels_std::kernels::ops::unary::ffai_cast_to_f32::kernel_ir_for(DType::BF16); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("iron_cast_bf16_f32", DType::F32, || { let mut k = iron_kernels_std::kernels::ops::unary::iron_cast_to_f32::kernel_ir_for(DType::BF16); k.mode = iron_kernels_core::ir::KernelMode::Grid3D; k });
     let n = src.elem_count();
     let out = Tensor::empty(dev, src.shape.clone(), DType::F32)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -856,7 +856,7 @@ pub fn cast_bf16_f32(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
 
 /// Device Mamba dt: `softplus(dt_raw + dt_bias)` — no host round-trip.
 pub fn softplus_add(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let k = cached_ir("ffai_softplus_add", DType::F32, || { let mut k = ffai_kernels_std::kernels::ssm::scan::ffai_softplus_add::kernel_ir(); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("iron_softplus_add", DType::F32, || { let mut k = iron_kernels_std::kernels::ssm::scan::iron_softplus_add::kernel_ir(); k.mode = iron_kernels_core::ir::KernelMode::Grid3D; k });
     let n = a.elem_count();
     let out = Tensor::empty(dev, a.shape.clone(), DType::F32)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -867,7 +867,7 @@ pub fn softplus_add(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> 
 /// NemotronH/Zamba2 gated grouped RMSNorm ON-DEVICE: out = (y·silu(z)) normalized
 /// per `gs`-group, ×w. Removes the per-Mamba-layer dl→host-norm→up sync. `y` is f32.
 pub fn gated_group_rmsnorm(dev: &dyn Device, y: &Tensor, z: &Tensor, w: &Tensor, eps: f32, di: usize, gs: usize) -> Result<Tensor> {
-    let k = cached_ir("ffai_gated_group_rmsnorm", z.dtype, || { let mut k = ffai_kernels_std::kernels::ssm::scan::ffai_gated_group_rmsnorm::kernel_ir_for(z.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("iron_gated_group_rmsnorm", z.dtype, || { let mut k = iron_kernels_std::kernels::ssm::scan::iron_gated_group_rmsnorm::kernel_ir_for(z.dtype); k.mode = iron_kernels_core::ir::KernelMode::Reduction; k });
     let out = Tensor::empty(dev, vec![di], z.dtype)?;
     let eps_buf = Tensor::new(scalar_buf(dev, eps.to_bits())?, vec![1], DType::F32);
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -880,7 +880,7 @@ pub fn gated_group_rmsnorm(dev: &dyn Device, y: &Tensor, z: &Tensor, w: &Tensor,
 pub fn conv_roll(dev: &dyn Device, old: &Tensor, xbc: &Tensor, conv_dim: usize, kc: usize) -> Result<Tensor> {
     let n = (kc - 1) * conv_dim;
     let keep = (kc - 2) * conv_dim;
-    let k = cached_ir("ffai_conv_roll", old.dtype, || { let mut k = ffai_kernels_std::kernels::convolution::conv1d_causal::ffai_conv_roll::kernel_ir_for(old.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("iron_conv_roll", old.dtype, || { let mut k = iron_kernels_std::kernels::convolution::conv1d_causal::iron_conv_roll::kernel_ir_for(old.dtype); k.mode = iron_kernels_core::ir::KernelMode::Grid3D; k });
     let out = Tensor::empty(dev, vec![n], old.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     dev.dispatch(&k, &[Binding::Buffer(old.buffer.clone()), Binding::Buffer(xbc.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(conv_dim as u32), u(keep as u32), u(n as u32)], Grid { grid: [(n as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
@@ -907,7 +907,7 @@ pub fn conv1d_causal_prefill(
     conv_dim: usize,
     kc: usize,
 ) -> Result<Tensor> {
-    let kernel = lookup("ffai_conv1d_causal_prefill", DType::F32)?;
+    let kernel = lookup("iron_conv1d_causal_prefill", DType::F32)?;
     let y = Tensor::empty(dev, vec![s * conv_dim], DType::F32)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     dev.dispatch(
@@ -941,7 +941,7 @@ pub fn strided_col_copy(
     col_off: usize,
     width: usize,
 ) -> Result<Tensor> {
-    let kernel = lookup("ffai_strided_col_copy", DType::F32)?;
+    let kernel = lookup("iron_strided_col_copy", DType::F32)?;
     // Defensive bounds check. The kernel reads `src[ti*stride + col_off + ci]`
     // for ti in [0, s), ci in [0, width) — a sub-slab addressed purely via the
     // host stride/col_off against the RAW bound buffer (tensor.offset ignored by
@@ -986,7 +986,7 @@ pub fn softplus_add_rows(
     s: usize,
     n: usize,
 ) -> Result<Tensor> {
-    let kernel = lookup("ffai_softplus_add_rows", DType::F32)?;
+    let kernel = lookup("iron_softplus_add_rows", DType::F32)?;
     let dst = Tensor::empty(dev, vec![s * n], DType::F32)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     dev.dispatch(
@@ -1012,7 +1012,7 @@ pub fn softplus_add_rows(
 /// Batched MoE up+ReLU²: gather `top_k` experts (indices `idx`) from the
 /// contiguous `[n_exp*inter, hid]` Q4 weight into one `[top_k*inter]` GEMV.
 pub fn moe_gather_up_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, idx: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<Tensor> {
-    let k = cached_ir("ffai_moe_gather_q4_relu2", x.dtype, || { let mut k = ffai_kernels_std::kernels::moe::moe_gather_q4::ffai_moe_gather_q4_relu2::kernel_ir_for(x.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("iron_moe_gather_q4_relu2", x.dtype, || { let mut k = iron_kernels_std::kernels::moe::moe_gather_q4::iron_moe_gather_q4_relu2::kernel_ir_for(x.dtype); k.mode = iron_kernels_core::ir::KernelMode::Reduction; k });
     let out = Tensor::empty(dev, vec![top_k * inter], x.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     // Default rpt=2: MoE-gather kernels are big + latency-bound; 2 warps/row hides
@@ -1025,7 +1025,7 @@ pub fn moe_gather_up_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &T
 /// contiguous `[n_exp*hid, inter]` Q4 weight; `x` is the `[top_k*inter]` up output.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gather_down_accum(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, idx: &Tensor, wts: &Tensor, acc: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<()> {
-    let k = cached_ir("ffai_moe_gather_q4_down_accum", x.dtype, || { let mut k = ffai_kernels_std::kernels::moe::moe_gather_q4::ffai_moe_gather_q4_down_accum::kernel_ir_for(x.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("iron_moe_gather_q4_down_accum", x.dtype, || { let mut k = iron_kernels_std::kernels::moe::moe_gather_q4::iron_moe_gather_q4_down_accum::kernel_ir_for(x.dtype); k.mode = iron_kernels_core::ir::KernelMode::Reduction; k });
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(wts.buffer.clone()), Binding::Buffer(acc.buffer.clone()), u(inter as u32), u(hid as u32), u(top_k as u32)], Grid { grid: [hid as u32, 1, 1], block: [32, 1, 1] })?;
     Ok(())
@@ -1033,7 +1033,7 @@ pub fn moe_gather_down_accum(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: 
 
 /// Batched MoE down gather → `[top_k*hid]` (one big GEMV, no accumulate).
 pub fn moe_gather_down(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, idx: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<Tensor> {
-    let k = cached_ir("ffai_moe_gather_q4_down", x.dtype, || { let mut k = ffai_kernels_std::kernels::moe::moe_gather_q4::ffai_moe_gather_q4_down::kernel_ir_for(x.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Reduction; k });
+    let k = cached_ir("iron_moe_gather_q4_down", x.dtype, || { let mut k = iron_kernels_std::kernels::moe::moe_gather_q4::iron_moe_gather_q4_down::kernel_ir_for(x.dtype); k.mode = iron_kernels_core::ir::KernelMode::Reduction; k });
     let out = Tensor::empty(dev, vec![top_k * hid], x.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     // Default rpt=2: MoE-gather kernels are big + latency-bound; 2 warps/row hides
@@ -1235,18 +1235,18 @@ pub fn moe_fused_ffn(
 /// Returns (idx[top_k] U32, wts[top_k] F32) WITHOUT a host round-trip — replaces the
 /// per-layer dl(gate)+host-topk+up(idx) sync that drains the async pipeline 23×/token.
 pub fn moe_router_device(dev: &dyn Device, gate_logits: &Tensor, bias: &Tensor, n_exp: usize, top_k: usize, scale: f32) -> Result<(Tensor, Tensor)> {
-    use ffai_kernels_core::ir::KernelMode;
+    use iron_kernels_core::ir::KernelMode;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     let f = |v: f32| Binding::Scalar(v.to_le_bytes().to_vec());
     let unbiased = Tensor::empty(dev, vec![n_exp], DType::F32)?;
     let biased = Tensor::empty(dev, vec![n_exp], DType::F32)?;
-    let ks = cached_ir("ffai_moe_sigmoid_bias", DType::F32, || { let mut k = ffai_kernels_std::kernels::moe::moe_sigmoid_bias::ffai_moe_sigmoid_bias::kernel_ir(); k.mode = KernelMode::Grid3D; k });
+    let ks = cached_ir("iron_moe_sigmoid_bias", DType::F32, || { let mut k = iron_kernels_std::kernels::moe::moe_sigmoid_bias::iron_moe_sigmoid_bias::kernel_ir(); k.mode = KernelMode::Grid3D; k });
     dev.dispatch(&ks, &[Binding::Buffer(gate_logits.buffer.clone()), Binding::Buffer(bias.buffer.clone()), Binding::Buffer(unbiased.buffer.clone()), Binding::Buffer(biased.buffer.clone()), u(n_exp as u32)], Grid { grid: [(n_exp as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
     let idx = Tensor::empty(dev, vec![top_k], DType::U32)?;
     let wts = Tensor::empty(dev, vec![top_k], DType::F32)?;
-    let kr = cached_ir("ffai_dsv4_router_topk", DType::F32, || { let mut k = ffai_kernels_std::kernels::moe::moe_router_topk_biased::ffai_moe_router_topk_biased::kernel_ir_for(DType::F32); k.mode = KernelMode::Reduction; k });
+    let kr = cached_ir("iron_dsv4_router_topk", DType::F32, || { let mut k = iron_kernels_std::kernels::moe::moe_router_topk_biased::iron_moe_router_topk_biased::kernel_ir_for(DType::F32); k.mode = KernelMode::Reduction; k });
     dev.dispatch(&kr, &[Binding::Buffer(biased.buffer.clone()), Binding::Buffer(unbiased.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(wts.buffer.clone()), u(n_exp as u32), u(top_k as u32)], Grid { grid: [1, 1, 1], block: [32, 1, 1] })?;
-    let kv = cached_ir("ffai_vscale", DType::F32, || { let mut k = ffai_kernels_std::kernels::ops::unary::ffai_vscale::kernel_ir(); k.mode = KernelMode::Grid3D; k });
+    let kv = cached_ir("iron_vscale", DType::F32, || { let mut k = iron_kernels_std::kernels::ops::unary::iron_vscale::kernel_ir(); k.mode = KernelMode::Grid3D; k });
     dev.dispatch(&kv, &[Binding::Buffer(wts.buffer.clone()), f(scale), u(top_k as u32)], Grid { grid: [(top_k as u32).div_ceil(64), 1, 1], block: [64, 1, 1] })?;
     Ok((idx, wts))
 }
@@ -1378,7 +1378,7 @@ pub fn moe_route_sort_device(
 }
 
 pub fn moe_weighted_sum(dev: &dyn Device, downs: &Tensor, wts: &Tensor, acc: &Tensor, hid: usize, top_k: usize) -> Result<()> {
-    let k = cached_ir("ffai_moe_weighted_sum", acc.dtype, || { let mut k = ffai_kernels_std::kernels::moe::moe_gather_q4::ffai_moe_weighted_sum::kernel_ir_for(acc.dtype); k.mode = ffai_kernels_core::ir::KernelMode::Grid3D; k });
+    let k = cached_ir("iron_moe_weighted_sum", acc.dtype, || { let mut k = iron_kernels_std::kernels::moe::moe_gather_q4::iron_moe_weighted_sum::kernel_ir_for(acc.dtype); k.mode = iron_kernels_core::ir::KernelMode::Grid3D; k });
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     dev.dispatch(&k, &[Binding::Buffer(downs.buffer.clone()), Binding::Buffer(wts.buffer.clone()), Binding::Buffer(acc.buffer.clone()), u(hid as u32), u(top_k as u32)], Grid { grid: [(hid as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
     Ok(())
@@ -1390,18 +1390,18 @@ fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor
     // streams in flight (more memory-level-parallelism on the latency-bound Q4 read).
     let vec = kernel == "plain" && std::env::var("MT_GEMV_VEC").is_ok();
     let two_row = !vec && kernel == "plain" && std::env::var("MT_GEMV_2ROW").is_ok();
-    let name = if vec { "ffai_gemv_q4_vec" } else if two_row { "ffai_gemv_q4_coalesced_2row" } else { match kernel { "plain" => "ffai_gemv_q4_coalesced", "relu2" => "ffai_gemv_q4_coalesced_relu2", _ => "ffai_gemv_q4_coalesced_accum" } };
+    let name = if vec { "iron_gemv_q4_vec" } else if two_row { "iron_gemv_q4_coalesced_2row" } else { match kernel { "plain" => "iron_gemv_q4_coalesced", "relu2" => "iron_gemv_q4_coalesced_relu2", _ => "iron_gemv_q4_coalesced_accum" } };
     let k = cached_ir(name, x.dtype, || {
         let mut k = if vec {
-            ffai_kernels_std::kernels::gemm::gemv_quantized::ffai_gemv_q4_vec::kernel_ir_for(x.dtype)
+            iron_kernels_std::kernels::gemm::gemv_quantized::iron_gemv_q4_vec::kernel_ir_for(x.dtype)
         } else if two_row {
-            ffai_kernels_std::kernels::gemm::gemv_quantized::ffai_gemv_q4_coalesced_2row::kernel_ir_for(x.dtype)
+            iron_kernels_std::kernels::gemm::gemv_quantized::iron_gemv_q4_coalesced_2row::kernel_ir_for(x.dtype)
         } else { match kernel {
-            "plain" => ffai_kernels_std::kernels::gemm::gemv_quantized::ffai_gemv_q4_coalesced::kernel_ir_for(x.dtype),
-            "relu2" => ffai_kernels_std::kernels::gemm::gemv_quantized::ffai_gemv_q4_coalesced_relu2::kernel_ir_for(x.dtype),
-            _ => ffai_kernels_std::kernels::gemm::gemv_quantized::ffai_gemv_q4_coalesced_accum::kernel_ir_for(x.dtype),
+            "plain" => iron_kernels_std::kernels::gemm::gemv_quantized::iron_gemv_q4_coalesced::kernel_ir_for(x.dtype),
+            "relu2" => iron_kernels_std::kernels::gemm::gemv_quantized::iron_gemv_q4_coalesced_relu2::kernel_ir_for(x.dtype),
+            _ => iron_kernels_std::kernels::gemm::gemv_quantized::iron_gemv_q4_coalesced_accum::kernel_ir_for(x.dtype),
         }};
-        k.mode = ffai_kernels_core::ir::KernelMode::Reduction;
+        k.mode = iron_kernels_core::ir::KernelMode::Reduction;
         k
     });
     let out = acc.cloned().unwrap_or(Tensor::empty(dev, vec![m_out], x.dtype)?);
@@ -1623,7 +1623,7 @@ pub fn nvfp4_roundtrip(w: &[f32], m: usize, k: usize) -> Vec<f32> {
 /// Prefill linear: `out[r, :] = weight · input[r, :]` for a block of rows in
 /// one dispatch — `weight` is `[out_dim, in_dim]`, `input` is `[n_rows, in_dim]`,
 /// result `[n_rows, out_dim]`. Dispatches the 32×32-tiled Reduction kernel
-/// `ffai_gemm` (weight read once per tile, reused across the row block — the
+/// `iron_gemm` (weight read once per tile, reused across the row block — the
 /// many-token path that a `gemv`-per-row would re-stream). Requires
 /// `in_dim % 16 == 0` (the K-tile contract); row/out-dim edges are handled
 /// in-kernel. This is the matmul the prefill + VLM/ViT towers run on.
@@ -1639,7 +1639,7 @@ pub fn matmul(dev: &dyn Device, weight: &Tensor, input: &Tensor) -> Result<Tenso
     if in_dim % 16 != 0 {
         return Err(Error::Msg(format!("matmul: in_dim {in_dim} must be a multiple of 16")));
     }
-    let k = lookup("ffai_gemm", weight.dtype)?;
+    let k = lookup("iron_gemm", weight.dtype)?;
     let out = Tensor::empty(dev, vec![rows, out_dim], weight.dtype)?;
     let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
     let grid = Grid {
@@ -1712,7 +1712,7 @@ pub fn gemm_cublas_f32out(
     Ok(out)
 }
 
-/// Dense Q4 GEMM via cooperative-tensor MMA (`ffai_gemm_q4_mpp`). Weight
+/// Dense Q4 GEMM via cooperative-tensor MMA (`iron_gemm_q4_mpp`). Weight
 /// `[out_dim, k_in]` is the bench's Q4 layout (qs u32 4-words/block, scales
 /// f16 amax/7); `x` is `[n_rows, k_in]` of dtype T; out is `[n_rows, out_dim]`
 /// of T. The tensor-core projection GEMM for prefill (replaces the f32 scalar
@@ -1728,13 +1728,13 @@ pub fn gemm_q4_mpp(
     out_dim: usize,
     k_in: usize,
 ) -> Result<Tensor> {
-    use ffai_kernels_core::ir::KernelMode;
+    use iron_kernels_core::ir::KernelMode;
     if k_in % 32 != 0 {
         return Err(Error::Msg(format!("gemm_q4_mpp: k_in {k_in} must be a multiple of 32")));
     }
     let out = Tensor::empty(dev, vec![n_rows, out_dim], x.dtype)?;
-    let kern = cached_ir("ffai_gemm_q4_mpp", x.dtype, || {
-        let mut kk = ffai_kernels_std::kernels::gemm::gemm_q4_mpp::ffai_gemm_q4_mpp::kernel_ir_for(x.dtype);
+    let kern = cached_ir("iron_gemm_q4_mpp", x.dtype, || {
+        let mut kk = iron_kernels_std::kernels::gemm::gemm_q4_mpp::iron_gemm_q4_mpp::kernel_ir_for(x.dtype);
         kk.mode = KernelMode::Reduction;
         kk
     });
@@ -1759,7 +1759,7 @@ pub fn gemm_q4_mpp(
     Ok(out)
 }
 
-/// Routed-expert MoE Q4 grouped BGEMM via MMA (`ffai_moe_bgemm_q4_bm64`). The
+/// Routed-expert MoE Q4 grouped BGEMM via MMA (`iron_moe_bgemm_q4_bm64`). The
 /// token rows of `x` `[m_total, k_in]` MUST be pre-sorted by expert, with
 /// `indices` `[m_total]` giving each row's expert id. Expert weights are the
 /// contiguous Q4 pool `[n_experts*n_out, k_in]` (qs u32 + scales f16). Output
@@ -1777,13 +1777,13 @@ pub fn moe_bgemm_q4_bm64(
     n_out: usize,
     k_in: usize,
 ) -> Result<Tensor> {
-    use ffai_kernels_core::ir::KernelMode;
+    use iron_kernels_core::ir::KernelMode;
     if n_out % 64 != 0 {
         return Err(Error::Msg(format!("moe_bgemm_q4_bm64: n_out {n_out} must be a multiple of 64")));
     }
     let out = Tensor::empty(dev, vec![m_total, n_out], x.dtype)?;
-    let kern = cached_ir("ffai_moe_bgemm_q4_bm64", x.dtype, || {
-        let mut kk = ffai_kernels_std::kernels::moe::moe_bgemm_q4_bm64::ffai_moe_bgemm_q4_bm64::kernel_ir_for(x.dtype);
+    let kern = cached_ir("iron_moe_bgemm_q4_bm64", x.dtype, || {
+        let mut kk = iron_kernels_std::kernels::moe::moe_bgemm_q4_bm64::iron_moe_bgemm_q4_bm64::kernel_ir_for(x.dtype);
         kk.mode = KernelMode::Reduction;
         kk
     });
@@ -1812,7 +1812,7 @@ pub fn moe_bgemm_q4_bm64(
 /// Q4 → dense `[m, k]` dequant. Expands a resident Q4 weight (the bench's
 /// `quantize_q4` layout: `qs [m·(k/32)·4]` u32, signed nibbles; `scales
 /// [m·(k/32)]` f32, amax/7) into a dense slab of `out_dtype` for the
-/// compute-bound prefill GEMM (dequant-once → tensor-core `ffai_gemm`).
+/// compute-bound prefill GEMM (dequant-once → tensor-core `iron_gemm`).
 /// 1-D grid, one thread per output value.
 pub fn dequant_q4(
     dev: &dyn Device,
@@ -1839,7 +1839,7 @@ pub fn dequant_q4_off(
     out_dtype: DType,
     blk_off: usize,
 ) -> Result<Tensor> {
-    use ffai_kernels_core::ir::KernelMode;
+    use iron_kernels_core::ir::KernelMode;
     let n = m * k;
     // Defensive bounds check. The kernel addresses sub-slabs purely via blk_off
     // against the RAW bound buffers, reading up to qs[(blk_off + m*bpr - 1)*4 + 3]
@@ -1859,8 +1859,8 @@ pub fn dequant_q4_off(
         )));
     }
     let out = Tensor::empty(dev, vec![m, k], out_dtype)?;
-    let kern = cached_ir("ffai_dequant_q4", out_dtype, || {
-        let mut kk = ffai_kernels_std::kernels::quant::dequant_q4::ffai_dequant_q4::kernel_ir_for(out_dtype);
+    let kern = cached_ir("iron_dequant_q4", out_dtype, || {
+        let mut kk = iron_kernels_std::kernels::quant::dequant_q4::iron_dequant_q4::kernel_ir_for(out_dtype);
         kk.mode = KernelMode::Grid3D;
         kk
     });
@@ -1890,7 +1890,7 @@ pub fn dequant_q4_off(
 /// (causal within the block, prefix fully visible); `causal=0` → bidirectional
 /// over `[0, base_kv+n_query)`. Q/out `[n_query, n_q_heads, head_dim]`, K/V
 /// `[n_kv_heads, kv_stride, head_dim]`. head_dim hard-128. This is the prefill
-/// flash-attn (`ffai_sdpa_multi`), Reduction-mode, grid `[n_q_heads*n_query]`,
+/// flash-attn (`iron_sdpa_multi`), Reduction-mode, grid `[n_q_heads*n_query]`,
 /// block 1024.
 #[allow(clippy::too_many_arguments)]
 pub fn sdpa_multi(
@@ -1907,13 +1907,13 @@ pub fn sdpa_multi(
     causal: bool,
     scale: f32,
 ) -> Result<Tensor> {
-    use ffai_kernels_core::ir::KernelMode;
+    use iron_kernels_core::ir::KernelMode;
     if head_dim != 128 {
         return Err(Error::Msg(format!("sdpa_multi: head_dim must be 128, got {head_dim}")));
     }
     let out = Tensor::empty(dev, vec![n_query as usize, n_q_heads as usize, head_dim], q.dtype)?;
-    let kern = cached_ir("ffai_sdpa_multi", q.dtype, || {
-        let mut kk = ffai_kernels_std::kernels::sdpa::sdpa_multi::ffai_sdpa_multi::kernel_ir_for(q.dtype);
+    let kern = cached_ir("iron_sdpa_multi", q.dtype, || {
+        let mut kk = iron_kernels_std::kernels::sdpa::sdpa_multi::iron_sdpa_multi::kernel_ir_for(q.dtype);
         kk.mode = KernelMode::Reduction;
         kk
     });
@@ -1945,7 +1945,7 @@ pub fn sdpa_multi(
 //
 // Drop-in replacement for [`sdpa_multi`] that runs the two big matmuls (QKᵀ and
 // P·V) on the GB10 **tensor cores via cuBLAS** instead of the software-MMA
-// `ffai_sdpa_multi` kernel (which sits at ~0.1% of peak and dominated the
+// `iron_sdpa_multi` kernel (which sits at ~0.1% of peak and dominated the
 // long-context prefill). It is a FlashAttention-style online-softmax loop tiled
 // over KV blocks so the score matrix is never materialised in full:
 //
@@ -1961,7 +1961,7 @@ pub fn sdpa_multi(
 // a group all read the same KV slab — no duplicated KV is materialised).
 //
 // Q is pre-scaled by `scale` in the transpose kernel, so the GEMM/softmax run on
-// already-scaled logits (matches `ffai_sdpa_multi`, which folds `scale` into Q).
+// already-scaled logits (matches `iron_sdpa_multi`, which folds `scale` into Q).
 
 /// Grouped MoE GEMM via mma.sync (register-O), ONE launch for ALL experts.
 /// `out[t,n] = Σ_k A[t,k]·W[grp(t)][n,k]` over sorted tokens (each contiguous
@@ -4102,7 +4102,7 @@ pub fn ssm_prefill_scan(
     n_heads: u32,
     n_groups: u32,
 ) -> Result<(Tensor, Tensor)> {
-    use ffai_kernels_core::ir::KernelMode;
+    use iron_kernels_core::ir::KernelMode;
     if (dh, ds, n_heads, n_groups) != (64, 128, 64, 8) {
         return Err(Error::Msg(format!(
             "ssm_prefill_scan: only Nemotron cell (64,128,64,8) wired, got ({dh},{ds},{n_heads},{n_groups})"
@@ -4118,7 +4118,7 @@ pub fn ssm_prefill_scan(
     // mask buffer: has_mask=0 → kernel ignores contents, but the binding must exist.
     let mask = Tensor::new(dev.alloc_zeroed(t * 4).unwrap(), vec![t], DType::U32);
     let kern = cached_ir("ssm_step_record_d64_128_64_8", x.dtype, || {
-        let mut kk = ffai_kernels_std::kernels::ssm::ssm_replay::ffai_ssm_step_record_d64_128_64_8::kernel_ir_for(x.dtype);
+        let mut kk = iron_kernels_std::kernels::ssm::ssm_replay::iron_ssm_step_record_d64_128_64_8::kernel_ir_for(x.dtype);
         kk.mode = KernelMode::Grid3D;
         kk
     });
@@ -4151,7 +4151,7 @@ pub fn ssm_prefill_scan(
 /// **attention sink** (a virtual logit that extends the softmax denominator).
 /// `q` is `[n_q_heads, 512]`; `k`/`v` are the latent KV cache
 /// `[n_kv_heads, kv_stride, 512]`; `sink_logit` is `[n_q_heads]` f32.
-/// Dispatches `ffai_sdpa_decode_d512_sink` (tg 512).
+/// Dispatches `iron_sdpa_decode_d512_sink` (tg 512).
 #[allow(clippy::too_many_arguments)]
 pub fn sdpa_decode_sink(
     dev: &dyn Device,
@@ -4168,7 +4168,7 @@ pub fn sdpa_decode_sink(
     let n_q_heads = q.elem_count() / HD;
     let out = Tensor::empty(dev, vec![n_q_heads, HD], q.dtype)?;
     let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
-    let kern = lookup("ffai_sdpa_decode_d512_sink", q.dtype)?;
+    let kern = lookup("iron_sdpa_decode_d512_sink", q.dtype)?;
     let bindings = vec![
         Binding::Buffer(q.buffer.clone()),
         Binding::Buffer(k.buffer.clone()),
@@ -4214,11 +4214,11 @@ pub fn sdpa_decode(
     // Per-variant trailing constexprs (everything after head_dim, n_kv,
     // kv_stride, heads_per_group). Dense path → sink/window disabled.
     let (name, block, trailing): (&str, u32, Vec<Binding>) = match head_dim {
-        64 => ("ffai_sdpa_decode_d64", 1024, vec![u(0), f(0.0), f(scale)]), // has_sink, sink_logit, scale
-        96 => ("ffai_sdpa_decode_d96", 1024, vec![f(scale)]),
-        128 => ("ffai_sdpa_decode", 1024, vec![u(0), u(0), u(0), f(0.0), f(scale)]), // sink_end, window_start, has_sink, sink_logit, scale
-        256 => ("ffai_sdpa_decode_d256", 1024, vec![u(0), f(0.0), f(scale)]),
-        512 => ("ffai_sdpa_decode_d512", 512, vec![f(scale)]),
+        64 => ("iron_sdpa_decode_d64", 1024, vec![u(0), f(0.0), f(scale)]), // has_sink, sink_logit, scale
+        96 => ("iron_sdpa_decode_d96", 1024, vec![f(scale)]),
+        128 => ("iron_sdpa_decode", 1024, vec![u(0), u(0), u(0), f(0.0), f(scale)]), // sink_end, window_start, has_sink, sink_logit, scale
+        256 => ("iron_sdpa_decode_d256", 1024, vec![u(0), f(0.0), f(scale)]),
+        512 => ("iron_sdpa_decode_d512", 512, vec![f(scale)]),
         _ => return Err(Error::Msg(format!("sdpa_decode: unsupported head_dim {head_dim}"))),
     };
 
@@ -4247,7 +4247,7 @@ pub fn sdpa_decode(
 /// the KV positions, emitting per-block (max, sum, partial_o). Pass 2: grid
 /// `(n_q_heads)`, block 1024 — online-softmax merge of the `blocks` partials.
 /// `blocks` MUST be a multiple of 32 (pass-2 reducer constraint). Kernel math
-/// is registry-validated (`test_ffai_sdpa_decode_2pass_combined`, f32/f16/bf16).
+/// is registry-validated (`test_iron_sdpa_decode_2pass_combined`, f32/f16/bf16).
 #[allow(clippy::too_many_arguments)]
 pub fn sdpa_decode_2pass(
     dev: &dyn Device,
@@ -4261,7 +4261,7 @@ pub fn sdpa_decode_2pass(
     scale: f32,
     blocks: u32,
 ) -> Result<Tensor> {
-    use ffai_kernels_core::ir::KernelMode;
+    use iron_kernels_core::ir::KernelMode;
     let n_q_heads = q.elem_count() / head_dim;
     let n_kv_heads = n_q_heads / gqa_factor as usize;
     let nb = blocks as usize;
@@ -4272,7 +4272,7 @@ pub fn sdpa_decode_2pass(
     let f = |x: f32| Binding::Scalar(x.to_le_bytes().to_vec());
 
     let k1 = cached_ir("sdpa_decode_2pass_pass1", q.dtype, || {
-        let mut k = ffai_kernels_std::kernels::sdpa::sdpa_decode_2pass::ffai_sdpa_decode_2pass_pass1::kernel_ir_for(q.dtype);
+        let mut k = iron_kernels_std::kernels::sdpa::sdpa_decode_2pass::iron_sdpa_decode_2pass_pass1::kernel_ir_for(q.dtype);
         k.mode = KernelMode::Reduction;
         k
     });
@@ -4284,7 +4284,7 @@ pub fn sdpa_decode_2pass(
 
     let out = Tensor::empty(dev, vec![n_q_heads, head_dim], q.dtype)?;
     let k2 = cached_ir("sdpa_decode_2pass_pass2", q.dtype, || {
-        let mut k = ffai_kernels_std::kernels::sdpa::sdpa_decode_2pass::ffai_sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
+        let mut k = iron_kernels_std::kernels::sdpa::sdpa_decode_2pass::iron_sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
         k.mode = KernelMode::Reduction;
         k
     });
@@ -4311,7 +4311,7 @@ pub fn sdpa_decode_2pass_tiled(
     scale: f32,
     blocks: u32,
 ) -> Result<Tensor> {
-    use ffai_kernels_core::ir::KernelMode;
+    use iron_kernels_core::ir::KernelMode;
     let n_q_heads = q.elem_count() / head_dim;
     let n_kv_heads = n_q_heads / gqa_factor as usize;
     let nb = blocks as usize;
@@ -4322,7 +4322,7 @@ pub fn sdpa_decode_2pass_tiled(
     let f = |x: f32| Binding::Scalar(x.to_le_bytes().to_vec());
 
     let k1 = cached_ir("sdpa_decode_2pass_pass1_tiled", q.dtype, || {
-        let mut k = ffai_kernels_std::kernels::sdpa::sdpa_decode_2pass::ffai_sdpa_decode_2pass_pass1_tiled::kernel_ir_for(q.dtype);
+        let mut k = iron_kernels_std::kernels::sdpa::sdpa_decode_2pass::iron_sdpa_decode_2pass_pass1_tiled::kernel_ir_for(q.dtype);
         k.mode = KernelMode::Reduction;
         k
     });
@@ -4334,7 +4334,7 @@ pub fn sdpa_decode_2pass_tiled(
 
     let out = Tensor::empty(dev, vec![n_q_heads, head_dim], q.dtype)?;
     let k2 = cached_ir("sdpa_decode_2pass_pass2", q.dtype, || {
-        let mut k = ffai_kernels_std::kernels::sdpa::sdpa_decode_2pass::ffai_sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
+        let mut k = iron_kernels_std::kernels::sdpa::sdpa_decode_2pass::iron_sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
         k.mode = KernelMode::Reduction;
         k
     });
@@ -4362,7 +4362,7 @@ pub fn sdpa_decode_2pass_bc4(
     scale: f32,
     blocks: u32,
 ) -> Result<Tensor> {
-    use ffai_kernels_core::ir::KernelMode;
+    use iron_kernels_core::ir::KernelMode;
     let n_q_heads = q.elem_count() / head_dim;
     let n_kv_heads = n_q_heads / gqa_factor as usize;
     let nb = blocks as usize;
@@ -4374,7 +4374,7 @@ pub fn sdpa_decode_2pass_bc4(
 
     // BC=4 pass 1: 4 positions per loop iter for MLP / load-latency hiding.
     let k1 = cached_ir("sdpa_decode_2pass_pass1_bc4", q.dtype, || {
-        let mut k = ffai_kernels_std::kernels::sdpa::sdpa_decode_2pass::ffai_sdpa_decode_2pass_pass1_bc4::kernel_ir_for(q.dtype);
+        let mut k = iron_kernels_std::kernels::sdpa::sdpa_decode_2pass::iron_sdpa_decode_2pass_pass1_bc4::kernel_ir_for(q.dtype);
         k.mode = KernelMode::Reduction;
         k
     });
@@ -4387,7 +4387,7 @@ pub fn sdpa_decode_2pass_bc4(
     // Pass 2 unchanged: same partial buffer layout, same reduction.
     let out = Tensor::empty(dev, vec![n_q_heads, head_dim], q.dtype)?;
     let k2 = cached_ir("sdpa_decode_2pass_pass2", q.dtype, || {
-        let mut k = ffai_kernels_std::kernels::sdpa::sdpa_decode_2pass::ffai_sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
+        let mut k = iron_kernels_std::kernels::sdpa::sdpa_decode_2pass::iron_sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
         k.mode = KernelMode::Reduction;
         k
     });
@@ -4418,16 +4418,16 @@ fn elementwise_kernel(
     Ok(out)
 }
 
-/// SiLU activation `out = x * sigmoid(x)`, elementwise. Dispatches `ffai_silu`.
+/// SiLU activation `out = x * sigmoid(x)`, elementwise. Dispatches `iron_silu`.
 pub fn silu(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
-    elementwise_kernel(dev, "ffai_silu", x.dtype, x.shape.clone(), vec![Binding::Buffer(x.buffer.clone())])
+    elementwise_kernel(dev, "iron_silu", x.dtype, x.shape.clone(), vec![Binding::Buffer(x.buffer.clone())])
 }
 
 /// ReLU² activation `out = max(x,0)²`, elementwise — NemotronH MoE expert act.
 /// Built inline (Relu → square) so the expert `up → relu² → down` chain stays
-/// ON-DEVICE (no host round-trip between the two Q8 GEMVs). Dispatches `ffai_relu2`.
+/// ON-DEVICE (no host round-trip between the two Q8 GEMVs). Dispatches `iron_relu2`.
 pub fn relu2(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
-    let mut k = Kernel::new("ffai_relu2");
+    let mut k = Kernel::new("iron_relu2");
     for (pname, is_out) in [("a", false), ("c", true)] {
         k.params.push(Param { name: pname.into(), dtype: x.dtype, shape: Shape::scalar(), is_output: is_out, kind: ParamKind::Tensor });
     }
@@ -4436,7 +4436,7 @@ pub fn relu2(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
     k.body.push_op(Op::Activation { kind: ActKind::Relu, value: ValueId::new(1) }, ValueId::new(2));
     k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: ValueId::new(2), rhs: ValueId::new(2) }, ValueId::new(3));
     k.body.push_op_no_result(Op::Store { dst: "c".into(), indices: vec![IndexExpr::Value(ValueId::new(0))], value: ValueId::new(3), mask: None });
-    k.mode = ffai_kernels_core::ir::KernelMode::Elementwise;
+    k.mode = iron_kernels_core::ir::KernelMode::Elementwise;
     let out = Tensor::empty(dev, x.shape.clone(), x.dtype)?;
     let n = out.elem_count() as u32;
     let grid = Grid::d1(n.div_ceil(256), 256);
@@ -4491,7 +4491,7 @@ pub fn moe_scatter_add(
     hid: usize,
     unscale: f32,
 ) -> Result<()> {
-    let ffai_i = (mt as i32).to_le_bytes().to_vec();
+    let iron_i = (mt as i32).to_le_bytes().to_vec();
     let hid_i = (hid as i32).to_le_bytes().to_vec();
     let uscale_f = unscale.to_le_bytes().to_vec();
     const BLOCK_H: u32 = 128;
@@ -4507,7 +4507,7 @@ pub fn moe_scatter_add(
             (wts.buffer.as_ref(),  0),
             (acc.buffer.as_ref(),  0),
         ],
-        &[ffai_i, hid_i, uscale_f],
+        &[iron_i, hid_i, uscale_f],
         grid,
         block,
         0,
@@ -4780,8 +4780,8 @@ pub fn relu2_scale_f16(dev: &dyn Device, x: &Tensor, scale: f32) -> Result<Tenso
     Ok(out)
 }
 
-/// Build an Elementwise `out[i] = act(a[i])` kernel for `dtype`. (`ffai_gelu`
-/// is bench-only in the metaltile corpus — no registered correctness test — so
+/// Build an Elementwise `out[i] = act(a[i])` kernel for `dtype`. (`iron_gelu`
+/// is bench-only in the iron corpus — no registered correctness test — so
 /// we hand-build the IR the same way `binop_kernel` does for add/mul.)
 fn unary_act_kernel(name: &str, dtype: DType, kind: ActKind) -> Kernel {
     let mut k = Kernel::new(name);
@@ -4813,9 +4813,9 @@ fn unary_act_kernel(name: &str, dtype: DType, kind: ActKind) -> Kernel {
 /// `acc[i] += x[i] · s[i]`. Lets the MoE expert sum stay ON-DEVICE — each
 /// expert's `down` output is folded into `acc` on the GPU (one final download
 /// per layer instead of one per expert). `s` is the per-expert weight broadcast
-/// to `[len]`. Dispatches `ffai_fma_inplace`.
+/// to `[len]`. Dispatches `iron_fma_inplace`.
 pub fn fma_inplace(dev: &dyn Device, acc: &Tensor, x: &Tensor, s: &Tensor) -> Result<()> {
-    let mut k = Kernel::new("ffai_fma_inplace");
+    let mut k = Kernel::new("iron_fma_inplace");
     for (pname, is_out) in [("acc", true), ("x", false), ("s", false)] {
         k.params.push(Param { name: pname.into(), dtype: acc.dtype, shape: Shape::scalar(), is_output: is_out, kind: ParamKind::Tensor });
     }
@@ -4827,7 +4827,7 @@ pub fn fma_inplace(dev: &dyn Device, acc: &Tensor, x: &Tensor, s: &Tensor) -> Re
     k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: ValueId::new(2), rhs: ValueId::new(3) }, ValueId::new(4));
     k.body.push_op(Op::BinOp { op: BinOpKind::Add, lhs: ValueId::new(1), rhs: ValueId::new(4) }, ValueId::new(5));
     k.body.push_op_no_result(Op::Store { dst: "acc".into(), indices: idx(), value: ValueId::new(5), mask: None });
-    k.mode = ffai_kernels_core::ir::KernelMode::Elementwise;
+    k.mode = iron_kernels_core::ir::KernelMode::Elementwise;
     let n = acc.elem_count() as u32;
     let grid = Grid::d1(n.div_ceil(256), 256);
     dev.dispatch(&k, &[Binding::Buffer(acc.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(s.buffer.clone())], grid)?;
@@ -4839,7 +4839,7 @@ pub fn fma_inplace(dev: &dyn Device, acc: &Tensor, x: &Tensor, s: &Tensor) -> Re
 /// CLIP towers and the GELU-MLP LLM families.
 pub fn gelu(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
     let out = Tensor::empty(dev, x.shape.clone(), x.dtype)?;
-    let k = unary_act_kernel("ffai_gelu", x.dtype, ActKind::Gelu);
+    let k = unary_act_kernel("iron_gelu", x.dtype, ActKind::Gelu);
     let n = x.elem_count() as u32;
     let grid = Grid::d1(n.div_ceil(256), 256);
     dev.dispatch(
@@ -4852,7 +4852,7 @@ pub fn gelu(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
 
 /// LayerNorm `out = (x - mean) / sqrt(var + eps) * w + b`, normalized over the
 /// last dim. Mean-subtracting + bias (unlike RMSNorm). Dispatches the
-/// Reduction-mode `ffai_layer_norm` (one threadgroup per row, block = n/4 — needs
+/// Reduction-mode `iron_layer_norm` (one threadgroup per row, block = n/4 — needs
 /// the row width `n` divisible by `4·lsize`; ViT/SigLIP widths are). Used by
 /// every transformer with LayerNorm (vision towers, BERT-style, GPT-2, …).
 pub fn layer_norm(dev: &dyn Device, x: &Tensor, weight: &Tensor, bias: &Tensor, eps: f32) -> Result<Tensor> {
@@ -4860,7 +4860,7 @@ pub fn layer_norm(dev: &dyn Device, x: &Tensor, weight: &Tensor, bias: &Tensor, 
     let rows = x.elem_count() / n;
     let out = Tensor::empty(dev, x.shape.clone(), x.dtype)?;
     let eps_buf = scalar_buf(dev, eps.to_bits())?;
-    let k = lookup("ffai_layer_norm", x.dtype)?;
+    let k = lookup("iron_layer_norm", x.dtype)?;
     let grid = Grid { grid: [rows as u32, 1, 1], block: [(n / 4) as u32, 1, 1] };
     dev.dispatch(
         &k,
@@ -4877,14 +4877,14 @@ pub fn layer_norm(dev: &dyn Device, x: &Tensor, weight: &Tensor, bias: &Tensor, 
     Ok(out)
 }
 
-/// Fused SwiGLU `out = silu(gate) * up`, elementwise. Dispatches `ffai_swiglu`.
+/// Fused SwiGLU `out = silu(gate) * up`, elementwise. Dispatches `iron_swiglu`.
 pub fn swiglu(dev: &dyn Device, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     if gate.shape != up.shape {
         return Err(Error::Msg("swiglu: gate/up shape mismatch".into()));
     }
     elementwise_kernel(
         dev,
-        "ffai_swiglu",
+        "iron_swiglu",
         gate.dtype,
         gate.shape.clone(),
         vec![Binding::Buffer(gate.buffer.clone()), Binding::Buffer(up.buffer.clone())],
@@ -4892,14 +4892,14 @@ pub fn swiglu(dev: &dyn Device, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 }
 
 /// Embedding gather: `out[t, :] = table[indices[t], :]`. `table` is
-/// `[vocab, dim]`, `indices` is `[n_tokens]` (u32). Dispatches `ffai_gather`.
+/// `[vocab, dim]`, `indices` is `[n_tokens]` (u32). Dispatches `iron_gather`.
 pub fn gather(dev: &dyn Device, table: &Tensor, indices: &Tensor) -> Result<Tensor> {
     if table.shape.len() != 2 {
         return Err(Error::Msg(format!("gather: table must be 2-D, got {:?}", table.shape)));
     }
     let dim = table.shape[1];
     let n_tokens = indices.elem_count();
-    let k = lookup("ffai_gather", table.dtype)?;
+    let k = lookup("iron_gather", table.dtype)?;
     let out = Tensor::empty(dev, vec![n_tokens, dim], table.dtype)?;
     let n = (n_tokens * dim) as u32;
     let grid = Grid::d1(n.div_ceil(256), 256);
@@ -4920,7 +4920,7 @@ pub fn gather(dev: &dyn Device, table: &Tensor, indices: &Tensor) -> Result<Tens
 /// (`[n_nope .. head_dim]`, adjacent-pair / GPT-J convention) in place; the
 /// nope dims pass through. `qk` is `[n_heads, head_dim]`. Full-attention
 /// layers: YaRN disabled (freq_scale=1, ext_factor=0). Dispatches
-/// `ffai_dsv4_partial_rope` (grid `[n_heads, half_rot, 1]`). Mutates and
+/// `iron_dsv4_partial_rope` (grid `[n_heads, half_rot, 1]`). Mutates and
 /// returns a view of `qk`'s buffer (matches the Swift in-place RoPE).
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_partial_rope(
@@ -4934,7 +4934,7 @@ pub fn dsv4_partial_rope(
     theta_base: f32,
     inverse: bool,
 ) -> Result<Tensor> {
-    let k = lookup("ffai_partial_rope", qk.dtype)?;
+    let k = lookup("iron_partial_rope", qk.dtype)?;
     let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
     let f = |x: f32| Binding::Scalar(x.to_le_bytes().to_vec());
     // Bind qk as both input and output → in-place (nope dims preserved).
@@ -4961,7 +4961,7 @@ pub fn dsv4_partial_rope(
     Ok(Tensor::new(qk.buffer.clone(), qk.shape.clone(), qk.dtype))
 }
 
-/// Softmax over the last dim, row-wise. Dispatches `ffai_softmax`. Row width
+/// Softmax over the last dim, row-wise. Dispatches `iron_softmax`. Row width
 /// `n` must be a multiple of 1024 (the kernel's 4-elems/thread loop).
 pub fn softmax(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
     let n = *x.shape.last().ok_or_else(|| Error::Msg("softmax: scalar input".into()))?;
@@ -4969,7 +4969,7 @@ pub fn softmax(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
         return Err(Error::Msg(format!("softmax: row width {n} must be a multiple of 1024")));
     }
     let rows = x.elem_count() / n;
-    let k = lookup("ffai_softmax", x.dtype)?;
+    let k = lookup("iron_softmax", x.dtype)?;
     let out = Tensor::empty(dev, x.shape.clone(), x.dtype)?;
     let grid = Grid { grid: [rows as u32, 1, 1], block: [256, 1, 1] };
     dev.dispatch(
@@ -4985,7 +4985,7 @@ pub fn softmax(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
 }
 
 /// Llama-style rotary position embedding applied to a `[n_heads, head_dim]`
-/// Q or K tensor at sequence `position`. Dispatches `ffai_rope_llama`. Pass
+/// Q or K tensor at sequence `position`. Dispatches `iron_rope_llama`. Pass
 /// the freq-band knobs disabled (`scale_factor=1`, `low=1`, `high=1`,
 /// `orig_max=1e9`) for vanilla RoPE.
 #[allow(clippy::too_many_arguments)]
@@ -5002,9 +5002,9 @@ pub fn rope_llama(
     let head_dim = *qk.shape.last().ok_or_else(|| Error::Msg("rope: scalar input".into()))?;
     let n_heads = qk.elem_count() / head_dim;
     let half = head_dim / 2;
-    let k = lookup("ffai_rope_banded", qk.dtype)?;
+    let k = lookup("iron_rope_banded", qk.dtype)?;
     let out = Tensor::empty(dev, qk.shape.clone(), qk.dtype)?;
-    // ffai_rope_banded reads `position` from a `positions: [T]` u32 buffer and
+    // iron_rope_banded reads `position` from a `positions: [T]` u32 buffer and
     // selects the row via an outer grid axis; decode is the `T = 1` case (a
     // 1-element positions buffer). `row_stride` is the element stride between
     // consecutive rows (= n_heads*head_dim for a contiguous, non-fused-QKV qk).
@@ -5054,11 +5054,11 @@ pub fn rope_llama_many(
     high_freq_factor: f32,
     original_max_position: f32,
 ) -> Result<Tensor> {
-    use ffai_kernels_core::ir::KernelMode;
+    use iron_kernels_core::ir::KernelMode;
     let t = qk.elem_count() / (n_heads * head_dim);
     let half = head_dim / 2;
-    let k = cached_ir("ffai_rope_llama_many", qk.dtype, || {
-        let mut kk = ffai_kernels_std::kernels::rope::rope_banded::ffai_rope_banded::kernel_ir_for(qk.dtype);
+    let k = cached_ir("iron_rope_llama_many", qk.dtype, || {
+        let mut kk = iron_kernels_std::kernels::rope::rope_banded::iron_rope_banded::kernel_ir_for(qk.dtype);
         kk.mode = KernelMode::Grid3D;
         kk
     });
@@ -5104,10 +5104,10 @@ pub fn kv_append_many(
     head_dim: usize,
     max_seq: usize,
 ) -> Result<()> {
-    use ffai_kernels_core::ir::KernelMode;
+    use iron_kernels_core::ir::KernelMode;
     let t = src.elem_count() / (n_kv_heads * head_dim);
     let k = cached_ir("kv_cache_update_many", src.dtype, || {
-        let mut kk = ffai_kernels_std::kernels::kv_cache::update_many::ffai_kv_cache_update_many::kernel_ir_for(src.dtype);
+        let mut kk = iron_kernels_std::kernels::kv_cache::update_many::iron_kv_cache_update_many::kernel_ir_for(src.dtype);
         kk.mode = KernelMode::Grid3D;
         kk
     });
@@ -5268,8 +5268,8 @@ pub fn mamba_split_proj(
     m_nh: usize,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let kernel = cached_ir("mamba_split_proj", DType::F32, || {
-        use ffai_kernels_core::ir::KernelMode;
-        let mut k = ffai_kernels_std::kernels::ssm::scan::ffai_mamba_split_proj::kernel_ir_for();
+        use iron_kernels_core::ir::KernelMode;
+        let mut k = iron_kernels_std::kernels::ssm::scan::iron_mamba_split_proj::kernel_ir_for();
         k.mode = KernelMode::Grid3D;
         k
     });
@@ -5316,8 +5316,8 @@ pub fn mamba_split_conv(
     ng_ds: usize,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let kernel = cached_ir("mamba_split_conv", DType::F32, || {
-        use ffai_kernels_core::ir::KernelMode;
-        let mut k = ffai_kernels_std::kernels::ssm::scan::ffai_mamba_split_conv::kernel_ir_for();
+        use iron_kernels_core::ir::KernelMode;
+        let mut k = iron_kernels_std::kernels::ssm::scan::iron_mamba_split_conv::kernel_ir_for();
         k.mode = KernelMode::Grid3D;
         k
     });
@@ -5360,8 +5360,8 @@ pub fn gated_group_rmsnorm_batched(
 ) -> Result<Tensor> {
     let ng = di / gs;
     let kernel = cached_ir("gated_group_rmsnorm_batched", DType::F32, || {
-        use ffai_kernels_core::ir::KernelMode;
-        let mut k = ffai_kernels_std::kernels::ssm::scan::ffai_gated_group_rmsnorm_batched::kernel_ir_for();
+        use iron_kernels_core::ir::KernelMode;
+        let mut k = iron_kernels_std::kernels::ssm::scan::iron_gated_group_rmsnorm_batched::kernel_ir_for();
         k.mode = KernelMode::Reduction;
         k
     });
@@ -5420,7 +5420,7 @@ extern "C" __global__ void moe_batched_dequant_q4(
 /// experts' weights into a contiguous per-slot scratch buffer in a SINGLE dispatch
 /// (thread `i` → slot `i/(n_out*k_in)` → correct slot offset; reads `eid[slot]` for
 /// the global expert id). Then per-expert `gemm_tc_off` reads from each slot. The
-/// per-slot writes are what the plain `dispatch`+`ffai_dequant_q4` path could NOT do
+/// per-slot writes are what the plain `dispatch`+`iron_dequant_q4` path could NOT do
 /// (that kernel always writes `out[0..n_elem]`, so every expert clobbered slot 0).
 ///
 /// Device `relu2_scale_f16` eliminates the host relu² round-trip. No host syncs
@@ -6674,7 +6674,7 @@ extern "C" __global__ void moe_fp4_actq_pack(
     const int* __restrict__ gend, const float* __restrict__ gA,
     unsigned* __restrict__ Ap, unsigned* __restrict__ Asc,
     const unsigned* __restrict__ st,
-    int maxt, int K, int ffai_total, int act_mode, float act_scale, int use_st)
+    int maxt, int K, int iron_total, int act_mode, float act_scale, int use_st)
 {
     // Warp-per-(tile,kt): stage the 16x64 f16 tile to smem with coalesced
     // half2 loads (each lane: 2 rows x 16B), compute the 64 block-16 amaxes
@@ -6695,7 +6695,7 @@ extern "C" __global__ void moe_fp4_actq_pack(
     {
         int r0=lane>>1, c0=(lane&1)*32;      // each lane: row r0, cols c0..c0+31
         int row=base+r0;
-        bool live=(r0 < end-base)&&(row<ffai_total);
+        bool live=(r0 < end-base)&&(row<iron_total);
         long src_row=(use_st&&live)?(long)st[row]:(long)row;  // gather-on-read
         const __half* src=a+src_row*K+kt*64+c0;
         #pragma unroll
@@ -6761,7 +6761,7 @@ extern "C" __global__ void moe_fp4_actq_pack(
 // VARIANT: each warp computes 4 consecutive n8-tiles — A frags loaded once,
 // reused 4x; W streams per-subtile. Cuts A traffic 4x, raises mma density.
 // 16-byte async global->shared copy (per-warp staging; no block syncs).
-__device__ __forceinline__ void ffai_cp16(void* sm, const void* gm){
+__device__ __forceinline__ void iron_cp16(void* sm, const void* gm){
   unsigned saddr=(unsigned)__cvta_generic_to_shared(sm);
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"::"r"(saddr),"l"(gm));
 }
@@ -6772,7 +6772,7 @@ extern "C" __global__ void moe_fp4_grouped_mma_x4(
     const int* __restrict__ gend, const float* __restrict__ gA,
     const float* __restrict__ gw, __half* __restrict__ out,
     unsigned* amax_out,
-    int N, int K, int ffai_total, int am_mode, float am_scale)
+    int N, int K, int iron_total, int am_mode, float am_scale)
 {
     // Per-warp cp.async 2-stage smem W pipeline + A register prefetch: the
     // direct global->register W loads left the mma latency-bound (~42 TF);
@@ -6799,12 +6799,12 @@ extern "C" __global__ void moe_fp4_grouped_mma_x4(
         int c0=lane, c1=lane+32;                                              \
         int j0=c0>>4, j1=c1>>4;                                               \
         int nt_a=nt0+j0, nt_b=nt0+j1;                                         \
-        if(nt_a<NT) ffai_cp16(&smW[w][st_][j0*64+(c0&15)*4],                    \
+        if(nt_a<NT) iron_cp16(&smW[w][st_][j0*64+(c0&15)*4],                    \
             Wp+(((long)eid*NT+nt_a)*KT+(kt_))*64+(c0&15)*4);                  \
-        if(nt_b<NT) ffai_cp16(&smW[w][st_][j1*64+(c1&15)*4],                    \
+        if(nt_b<NT) iron_cp16(&smW[w][st_][j1*64+(c1&15)*4],                    \
             Wp+(((long)eid*NT+nt_b)*KT+(kt_))*64+(c1&15)*4);                  \
         if(lane<8){ int js=lane>>1, hf=lane&1; int nt_s=nt0+js;               \
-            if(nt_s<NT) ffai_cp16(&smS[w][st_][js*8+hf*4],                      \
+            if(nt_s<NT) iron_cp16(&smS[w][st_][js*8+hf*4],                      \
                 Wsc+(((long)eid*NT+nt_s)*KT+(kt_))*8+hf*4); }                 \
         asm volatile("cp.async.commit_group;");                               \
     }while(0)
@@ -6872,7 +6872,7 @@ extern "C" __global__ void moe_fp4_grouped_mma(
     const int* __restrict__ tok0, const int* __restrict__ eidv,
     const int* __restrict__ gend, const float* __restrict__ gA,
     const float* __restrict__ gw, __half* __restrict__ out,
-    int N, int K, int ffai_total)
+    int N, int K, int iron_total)
 {
     int KT=K/64, NT=N/8;
     int t=blockIdx.x;                       // tile index
@@ -8089,10 +8089,10 @@ pub fn add_rms_norm(
     let normed = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
     let eps_buf = scalar_buf(dev, eps.to_bits())?;
     // Reduction mode: one threadgroup per row, `tid` = lane within the row
-    // (the same TG=n/4 contract as ffai_rms_norm).
-    let k = cached_ir("ffai_add_rms_norm", a.dtype, || {
-        let mut k = ffai_kernels_std::kernels::ops::unary::ffai_add_rms_norm::kernel_ir_for(a.dtype);
-        k.mode = ffai_kernels_core::ir::KernelMode::Reduction;
+    // (the same TG=n/4 contract as iron_rms_norm).
+    let k = cached_ir("iron_add_rms_norm", a.dtype, || {
+        let mut k = iron_kernels_std::kernels::ops::unary::iron_add_rms_norm::kernel_ir_for(a.dtype);
+        k.mode = iron_kernels_core::ir::KernelMode::Reduction;
         k
     });
     let grid = Grid { grid: [rows as u32, 1, 1], block: [(n / 4) as u32, 1, 1] };

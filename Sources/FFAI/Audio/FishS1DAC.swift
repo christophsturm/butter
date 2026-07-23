@@ -27,7 +27,7 @@
 //     → FishS1DACDecoder (Snake+WNConvTranspose blocks → Tanh)
 //     → Tensor [1, 1, L]   (mono waveform, f32)
 //
-// CPU fallback: all convolutions run via `AudioMath` (CPU). A ffai-kernels
+// CPU fallback: all convolutions run via `AudioMath` (CPU). A iron
 // kernel for dilated depthwise Conv1d / ConvTranspose1d would accelerate
 // the decoder blocks. See FishS1DACQuantization.swift for the TODO.
 //

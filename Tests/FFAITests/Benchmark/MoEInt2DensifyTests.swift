@@ -12,7 +12,7 @@
 
 import Foundation
 import Metal
-import MetalTileSwift
+import IronSwift
 import TestHelpers
 import Testing
 

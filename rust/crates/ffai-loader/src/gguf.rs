@@ -9,7 +9,7 @@
 //! are opened transparently: pass any one part and all parts are mmapped and
 //! their tensor tables merged.
 
-use ffai_core::{Error, Result};
+use iron_core::{Error, Result};
 use std::collections::BTreeMap;
 
 use crate::iq2xxs_tables::{IQ2XXS_GRID, KSIGNS};
@@ -595,7 +595,7 @@ impl Gguf {
         }
     }
 
-    /// Repack a 2-D weight tensor into the resident-Q8 layout `ffai_ops::gemv_q8`
+    /// Repack a 2-D weight tensor into the resident-Q8 layout `iron_ops::gemv_q8`
     /// consumes: `(qs, scales, m, k)` where `m`/`k` are the [out, in] matrix dims,
     /// `scales` is `[m * k/32]` f32 (one per 32-block), and `qs` is the int8
     /// codes packed 4-per-u32 (8 u32/block) at `qs[r*(k/32)*8 + b*8 + i/4]`.
@@ -603,7 +603,7 @@ impl Gguf {
     /// For a Q8_0 tensor this is a *lossless* repack of the on-disk blocks (the
     /// f16 block scale is widened to f32, the 32 int8 are re-packed) — no second
     /// quantization. F16/F32 tensors are quantized per-32-block via amax/127, the
-    /// identical scheme to `ffai_ops::quantize_q8`. `k` (the in-dim, fastest GGUF
+    /// identical scheme to `iron_ops::quantize_q8`. `k` (the in-dim, fastest GGUF
     /// dim) must be a multiple of 32.
     pub fn q8_repack(&self, name: &str) -> Result<(Vec<u32>, Vec<f32>, usize, usize)> {
         let t = self.tensor(name).ok_or_else(|| Error::Msg(format!("tensor '{name}' not found")))?;

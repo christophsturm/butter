@@ -110,7 +110,7 @@ public final class VisionEncoderLayer: Module {
         //
         // GPU vs CPU bidirectional attention is gated on
         // `OpsValidation.sdpaBidirectionalIsProductionSafe` — the single
-        // source of truth for which head_dims have a passing ffai-kernels
+        // source of truth for which head_dims have a passing iron
         // production-shape GPU-correctness cell (16 heads × 576-patch tower,
         // 9216 threadgroups). The 2026-05-27 GlmOcr "pin" at d64 was a
         // wrong-dispatch bug (since fixed in `Ops.sdpaBidirectional`); d64,

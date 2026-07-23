@@ -6,9 +6,9 @@
 //!     cargo test -p ffai-cuda --features cuda --test hf_model -- --nocapture
 #![cfg(feature = "cuda")]
 
-use ffai_core::DType;
-use ffai_cuda::CudaDevice;
-use ffai_models::llama::{forward_single, load_hf};
+use iron_core::DType;
+use iron_cuda::CudaDevice;
+use iron_models::llama::{forward_single, load_hf};
 
 fn decode(b: &[u8], dt: DType) -> Vec<f32> {
     match dt {

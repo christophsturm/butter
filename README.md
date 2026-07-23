@@ -2,7 +2,7 @@
 
 **F*cking Fast AI.**
 
-A minimal, dependency-light LLM inference library for Apple Silicon, built on pre-compiled Metal kernels generated from the [ffai-kernels](https://github.com/thewafflehaus/ffai-kernels) DSL. No Python. No MLX. No C compilation. No JIT. No four-repo dependency chain.
+A minimal, dependency-light LLM inference library for Apple Silicon, built on pre-compiled Metal kernels generated from the [iron](https://github.com/thewafflehaus/iron) DSL. No Python. No MLX. No C compilation. No JIT. No four-repo dependency chain.
 
 **Just really f*cking fast AI on your Mac!** 🚀
 
@@ -114,19 +114,19 @@ Full flag list + recipes: [`using-the-cli.md` § `convert`](documentation/using-
 └────────────────────────┬────────────────────────────────┘
                          │ calls
 ┌────────────────────────▼────────────────────────────────┐
-│  MetalTileSwift (Swift, in-repo)                        │
+│  IronSwift (Swift, in-repo)                        │
 │   • Loads kernels.metallib (pre-compiled at build time) │
 │   • PSO cache, function-constant specialization         │
 │   • Generated typed wrappers (one per kernel)           │
 └────────────────────────┬────────────────────────────────┘
                          │ resources from
 ┌────────────────────────▼────────────────────────────────┐
-│  ffai-kernels (Rust, sibling repo)                         │
+│  iron (Rust, sibling repo)                         │
 │   • #[kernel] DSL → IR → MSL                            │
-│   • `ffaik emit` (ffai-kernels-cli) produces:               │
+│   • `iron emit` (wh-iron-cli) produces:               │
 │       kernels.metallib   (compiled by xcrun metal)      │
 │       manifest.json      (kernel metadata)              │
-│       MetalTileKernels.swift  (typed wrappers)          │
+│       IronKernels.swift  (typed wrappers)          │
 └─────────────────────────────────────────────────────────┘
 ```
 

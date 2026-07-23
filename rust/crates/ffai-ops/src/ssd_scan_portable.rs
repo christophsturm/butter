@@ -7,13 +7,13 @@
 //! `ssm_prefill_scan_ssd` (in `ssd_scan.rs`), but built ENTIRELY from portable
 //! registry kernels that codegen to MSL / HIP / SPIR-V — no `dispatch_raw_cuda`,
 //! no cuBLAS `cublasGemmStridedBatchedEx`. Runs on Apple hardware MMA (and HIP /
-//! Vulkan / RDNA4) via the portable `ffai_gemm_batched` Reduction-mode GEMM.
+//! Vulkan / RDNA4) via the portable `iron_gemm_batched` Reduction-mode GEMM.
 //!
-//! The 4 batched GEMMs (steps 1/2/4/5 below) run on `ffai_gemm_batched`
-//! (batch = nc·H, the SAME `out = input · weightᵀ` contraction `ffai_gemm`
+//! The 4 batched GEMMs (steps 1/2/4/5 below) run on `iron_gemm_batched`
+//! (batch = nc·H, the SAME `out = input · weightᵀ` contraction `iron_gemm`
 //! uses, replicated over the batch axis with per-matrix strides). The small
 //! segsum / Lmask / decay / transpose / recurrence / combine kernels run on
-//! the portable `ssd_*` `#[kernel]` ops in `metaltile-std::ffai::ssm`.
+//! the portable `ssd_*` `#[kernel]` ops in `wh-iron-std::ffai::ssm`.
 //!
 //! Everything stays f32 (no f16 GEMM) — portability + correctness first; the
 //! sequential scan also accumulates in f32, so this matches it tightly.
@@ -24,8 +24,8 @@
 //!
 //! Fixed for NemotronH: dh=64, ds=128, H=64, G=8 (hpg=8). L ∈ {128,256}.
 
-use ffai_core::{Binding, DType, Device, Error, Grid, Result, Tensor};
-use ffai_kernels_core::ir::KernelMode;
+use iron_core::{Binding, DType, Device, Error, Grid, Result, Tensor};
+use iron_kernels_core::ir::KernelMode;
 
 use crate::cached_ir;
 
@@ -137,8 +137,8 @@ pub fn ssm_prefill_scan_ssd_portable(
                   x_stride: usize,
                   o_stride: usize|
      -> Result<()> {
-        let kern = cached_ir("ffai_gemm_batched", DType::F32, || {
-            let mut k = ffai_kernels_std::kernels::gemm::dense::ffai_gemm_batched::kernel_ir_for(DType::F32);
+        let kern = cached_ir("iron_gemm_batched", DType::F32, || {
+            let mut k = iron_kernels_std::kernels::gemm::dense::iron_gemm_batched::kernel_ir_for(DType::F32);
             k.mode = KernelMode::Reduction;
             k
         });
@@ -314,18 +314,18 @@ pub fn ssm_prefill_scan_ssd_portable(
 
 /// Resolve one of the `ssd_*` portable elementwise kernels by name. They are
 /// f32-fixed (`kernel_ir_for()` with no dtype arg), Grid3D-dispatched.
-fn build_ssd_ir(name: &str) -> ffai_core::Kernel {
-    use ffai_kernels_std::kernels::ssm;
+fn build_ssd_ir(name: &str) -> iron_core::Kernel {
+    use iron_kernels_std::kernels::ssm;
     match name {
-        "ssd_lcs" => ssm::scan::ffai_ssd_lcs::kernel_ir_for(),
-        "ssd_gather_bc" => ssm::scan::ffai_ssd_gather_bc::kernel_ir_for(),
-        "ssd_xt" => ssm::scan::ffai_ssd_xt::kernel_ir_for(),
-        "ssd_mmask" => ssm::scan::ffai_ssd_mmask::kernel_ir_for(),
-        "ssd_bdt" => ssm::scan::ffai_ssd_bdt::kernel_ir_for(),
-        "ssd_recur" => ssm::scan::ffai_ssd_recur::kernel_ir_for(),
-        "ssd_combine" => ssm::scan::ffai_ssd_combine::kernel_ir_for(),
-        "ssd_g1_cb" => ssm::scan::ffai_ssd_g1_cb::kernel_ir_for(),
-        "ssd_g4_cs" => ssm::scan::ffai_ssd_g4_cs::kernel_ir_for(),
+        "ssd_lcs" => ssm::scan::iron_ssd_lcs::kernel_ir_for(),
+        "ssd_gather_bc" => ssm::scan::iron_ssd_gather_bc::kernel_ir_for(),
+        "ssd_xt" => ssm::scan::iron_ssd_xt::kernel_ir_for(),
+        "ssd_mmask" => ssm::scan::iron_ssd_mmask::kernel_ir_for(),
+        "ssd_bdt" => ssm::scan::iron_ssd_bdt::kernel_ir_for(),
+        "ssd_recur" => ssm::scan::iron_ssd_recur::kernel_ir_for(),
+        "ssd_combine" => ssm::scan::iron_ssd_combine::kernel_ir_for(),
+        "ssd_g1_cb" => ssm::scan::iron_ssd_g1_cb::kernel_ir_for(),
+        "ssd_g4_cs" => ssm::scan::iron_ssd_g4_cs::kernel_ir_for(),
         other => panic!("build_ssd_ir: unknown ssd kernel {other}"),
     }
 }

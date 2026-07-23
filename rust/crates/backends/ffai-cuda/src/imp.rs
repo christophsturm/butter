@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Real CUDA backend (compiled under `--features cuda`). Wraps
-//! `ffai_kernels_runtime::CudaDevice` — the NVRTC → PTX → driver path that
+//! `iron_kernels_runtime::CudaDevice` — the NVRTC → PTX → driver path that
 //! runs the kernel corpus bit-accurately on GB10 — behind the shared
-//! [`ffai_core::Device`] trait, so the engine layer above is identical to
+//! [`iron_core::Device`] trait, so the engine layer above is identical to
 //! the Metal/Vulkan paths.
 
 use std::any::Any;
@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::sync::{Arc, RwLock};
 
-use ffai_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
-use ffai_kernels_codegen::{CodegenBackend, CudaGenerator};
-use ffai_kernels_core::ir::KernelMode;
-use ffai_kernels_runtime::{CudaDevice as MtCudaDevice, CudaModule, FFAIError};
+use iron_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
+use iron_kernels_codegen::{CodegenBackend, CudaGenerator};
+use iron_kernels_core::ir::KernelMode;
+use iron_kernels_runtime::{CudaDevice as MtCudaDevice, CudaModule, FFAIError};
 
 fn dispatch_err(e: FFAIError) -> Error {
     Error::Dispatch(e.to_string())
@@ -43,7 +43,7 @@ struct CachedModule {
 unsafe impl Send for CachedModule {}
 unsafe impl Sync for CachedModule {}
 
-/// CUDA implementation of the shared [`Device`] trait. Holds the metaltile
+/// CUDA implementation of the shared [`Device`] trait. Holds the iron
 /// runtime device in an `Arc` so persistent tensors (which free on drop)
 /// keep the CUDA context alive as long as any buffer is live.
 pub struct CudaDevice {
@@ -259,13 +259,13 @@ impl Device for CudaDevice {
         src: &str,
         prog_name: &str,
         fn_name: &str,
-        ptrs: &[(&dyn ffai_core::DeviceBuffer, usize)],
+        ptrs: &[(&dyn iron_core::DeviceBuffer, usize)],
         scalars: &[Vec<u8>],
         grid: [u32; 3],
         block: [u32; 3],
         shared_bytes: u32,
         cooperative: bool,
-    ) -> ffai_core::Result<()> {
+    ) -> iron_core::Result<()> {
         // Compile (or reuse cached) module.
         let module = {
             let r = self.modules.read().unwrap();
@@ -289,7 +289,7 @@ impl Device for CudaDevice {
 
         for (buf, offset) in ptrs {
             let cb = buf.as_any().downcast_ref::<CudaBuffer>()
-                .ok_or_else(|| ffai_core::Error::Msg("dispatch_raw_cuda: buffer is not CudaBuffer".into()))?;
+                .ok_or_else(|| iron_core::Error::Msg("dispatch_raw_cuda: buffer is not CudaBuffer".into()))?;
             slots.push(Slot::Ptr(ptr_store.len()));
             ptr_store.push(cb.ptr + *offset as u64);
         }
@@ -328,7 +328,7 @@ impl Device for CudaDevice {
         m: usize,
         n: usize,
         k: usize,
-        dtype: ffai_core::DType,
+        dtype: iron_core::DType,
     ) -> Result<()> {
         let xb = x.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc: x not CudaBuffer".into()))?;
         let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc: w not CudaBuffer".into()))?;
@@ -344,7 +344,7 @@ impl Device for CudaDevice {
         m: usize,
         n: usize,
         k: usize,
-        ab_dtype: ffai_core::DType,
+        ab_dtype: iron_core::DType,
     ) -> Result<()> {
         let xb = x.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc_out_f32: x not CudaBuffer".into()))?;
         let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc_out_f32: w not CudaBuffer".into()))?;
@@ -697,7 +697,7 @@ impl Device for CudaDevice {
         x: &dyn DeviceBuffer, x_off: usize,
         w: &dyn DeviceBuffer, w_off: usize,
         out: &dyn DeviceBuffer, out_off: usize,
-        m: usize, n: usize, k: usize, dtype: ffai_core::DType,
+        m: usize, n: usize, k: usize, dtype: iron_core::DType,
     ) -> Result<()> {
         let xb = x.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc_off: x not CudaBuffer".into()))?;
         let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc_off: w not CudaBuffer".into()))?;
@@ -717,7 +717,7 @@ impl Device for CudaDevice {
         out: &dyn DeviceBuffer, stride_out: i64,
         m: usize, n: usize, k: usize,
         batch_count: usize,
-        dtype: ffai_core::DType,
+        dtype: iron_core::DType,
     ) -> Result<()> {
         let xb = x.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_strided_batched: x not CudaBuffer".into()))?;
         let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_strided_batched: w not CudaBuffer".into()))?;
@@ -737,7 +737,7 @@ impl Device for CudaDevice {
         out: &dyn DeviceBuffer, out_off: usize, stride_out: i64,
         m: usize, n: usize, k: usize,
         batch_count: usize,
-        dtype: ffai_core::DType,
+        dtype: iron_core::DType,
     ) -> Result<()> {
         let xb = x.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_strided_batched_off: x not CudaBuffer".into()))?;
         let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_strided_batched_off: w not CudaBuffer".into()))?;
@@ -752,16 +752,16 @@ impl Device for CudaDevice {
 
     fn gemm_batched(
         &self,
-        x_buf: &dyn ffai_core::DeviceBuffer,
+        x_buf: &dyn iron_core::DeviceBuffer,
         x_offsets: &[usize],
-        w_buf: &dyn ffai_core::DeviceBuffer,
+        w_buf: &dyn iron_core::DeviceBuffer,
         w_offsets: &[usize],
-        out_buf: &dyn ffai_core::DeviceBuffer,
+        out_buf: &dyn iron_core::DeviceBuffer,
         out_offsets: &[usize],
         m: usize,
         n: usize,
         k: usize,
-        dtype: ffai_core::DType,
+        dtype: iron_core::DType,
     ) -> Result<()> {
         let xb = x_buf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_batched: x_buf not CudaBuffer".into()))?;
         let wb = w_buf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_batched: w_buf not CudaBuffer".into()))?;
@@ -775,16 +775,16 @@ impl Device for CudaDevice {
 
     fn gemm_grouped(
         &self,
-        x_buf: &dyn ffai_core::DeviceBuffer,
+        x_buf: &dyn iron_core::DeviceBuffer,
         x_offsets: &[usize],
-        w_buf: &dyn ffai_core::DeviceBuffer,
+        w_buf: &dyn iron_core::DeviceBuffer,
         w_offsets: &[usize],
-        out_buf: &dyn ffai_core::DeviceBuffer,
+        out_buf: &dyn iron_core::DeviceBuffer,
         out_offsets: &[usize],
         m_per_group: &[i32],
         n: usize,
         k: usize,
-        dtype: ffai_core::DType,
+        dtype: iron_core::DType,
     ) -> Result<()> {
         let xb  = x_buf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_grouped: x_buf not CudaBuffer".into()))?;
         let wb  = w_buf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_grouped: w_buf not CudaBuffer".into()))?;

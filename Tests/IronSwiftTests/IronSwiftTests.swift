@@ -14,12 +14,12 @@
 //
 import Testing
 
-@testable import FFAIKernelsSwift
+@testable import IronSwift
 
-@Suite("FFAIKernelsSwift")
-struct FFAIKernelsSwiftTests {
+@Suite("IronSwift")
+struct IronSwiftTests {
     @Test("version is set")
     func version() {
-        #expect(FFAIKernelsSwiftInfo.version == "0.0.1-dev")
+        #expect(IronSwiftInfo.version == "0.0.1-dev")
     }
 }

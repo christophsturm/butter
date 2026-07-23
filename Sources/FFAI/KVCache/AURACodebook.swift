@@ -260,7 +260,7 @@ public enum AURACodebook {
     }
 
     /// Allocate a boundaries tensor in the requested activation dtype.
-    /// Post-metaltile #226, `aura_encode` takes `boundaries: Tensor<T>`
+    /// Post-iron #226, `aura_encode` takes `boundaries: Tensor<T>`
     /// — kernel-side bandwidth win (Π + boundaries dominate the encode
     /// kernel's memory traffic). Lloyd-Max boundary values are computed
     /// in Float; narrow dtypes (bf16/f16) round at the host-side

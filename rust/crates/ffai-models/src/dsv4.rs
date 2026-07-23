@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! DeepSeek-V4 Multi-head Latent Attention (decode), assembled from the
-//! verified DSv4 ops in [`ffai_ops`]. Single-token, single-position KV
+//! verified DSv4 ops in [`iron_ops`]. Single-token, single-position KV
 //! (`n_kv = 1`). Covers the full-attention layers; the CSA/HCA sparse path
 //! (compressor + Lightning indexer) is a separate track (WIP in the
 //! reference too). The mHC residual wrapping is the model loop's job.
 
-use ffai_core::{DType, Device, Result, Tensor};
-use ffai_ops as ops;
+use iron_core::{DType, Device, Result, Tensor};
+use iron_ops as ops;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MlaConfig {

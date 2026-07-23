@@ -5,7 +5,7 @@ FFAI ships as a SwiftPM package with three products:
 | Product | Use it for |
 |---|---|
 | `FFAI` | The main inference library — `Model.load(...)`, `generate(...)`, KV cache, sampling, tokenizer integration. |
-| `MetalTileSwift` | Lower-level: the pre-compiled `kernels.metallib`, PSO cache, and generated typed kernel wrappers. Pulled in transitively by `FFAI`; depend on it directly only when authoring new layers against raw kernels. |
+| `IronSwift` | Lower-level: the pre-compiled `kernels.metallib`, PSO cache, and generated typed kernel wrappers. Pulled in transitively by `FFAI`; depend on it directly only when authoring new layers against raw kernels. |
 | `ffai` | Executable target — the `ffai --model <id> --prompt "..."` CLI. |
 
 ## SwiftPM `Package.swift`
@@ -48,11 +48,11 @@ The HuggingFace cache lives at `~/.cache/huggingface/hub/` — same path Python'
 
 ## Local checkout (contributors)
 
-Cloning the repo to hack on FFAI itself requires the sibling [`ffai-kernels`](https://github.com/thewafflehaus/ffai-kernels) checkout (the Rust DSL that compiles kernels) and Cargo:
+Cloning the repo to hack on FFAI itself requires the sibling [`iron`](https://github.com/thewafflehaus/iron) checkout (the Rust DSL that compiles kernels) and Cargo:
 
 ```bash
 git clone https://github.com/thewafflehaus/FFAI
-git clone https://github.com/thewafflehaus/ffai-kernels
+git clone https://github.com/thewafflehaus/iron
 cd FFAI
 make setup-dev
 make install-hooks   # pre-commit / commit-msg / pre-push
@@ -60,7 +60,7 @@ make install-hooks   # pre-commit / commit-msg / pre-push
 
 `make setup-dev` (wrapping `./scripts/setup-dev.sh`) verifies Xcode CLI tools + `xcrun metal` + Swift + Cargo + `swift-format` (auto-installed via Homebrew if missing), resolves SPM deps, and runs the first build to populate `kernels.metallib`. `make install-hooks` points git at the in-tree hook scripts — see [`developing.md`](developing/developing.md#git-hooks) for what each one runs.
 
-End users adding FFAI as a SwiftPM dependency do **not** need Cargo, the ffai-kernels repo, or the hooks — they consume the pre-built metallib bundled into the package.
+End users adding FFAI as a SwiftPM dependency do **not** need Cargo, the iron repo, or the hooks — they consume the pre-built metallib bundled into the package.
 
 ## After install
 

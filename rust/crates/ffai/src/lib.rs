@@ -6,7 +6,7 @@
 //! Modular, multi-backend inference engine. One Rust core behind the
 //! [`Device`] trait; backends (Metal, CUDA, Vulkan, ROCm) are independent
 //! crates selected by cargo feature. Kernels are shared with the Swift
-//! engine via the metaltile IR.
+//! engine via the iron IR.
 //!
 //! ## Two engines, one product
 //!
@@ -17,10 +17,10 @@
 //!
 //! Use [`devices`] to enumerate every backend compiled into this build.
 
-pub use ffai_core::{
+pub use iron_core::{
     Backend, Binding, Device, DeviceBuffer, DType, Error, Grid, Kernel, Result, Tensor,
 };
-pub use ffai_ops as ops;
+pub use iron_ops as ops;
 
 use std::sync::Arc;
 
@@ -31,15 +31,15 @@ pub fn devices() -> Vec<Arc<dyn Device>> {
     let mut out: Vec<Arc<dyn Device>> = Vec::new();
 
     #[cfg(feature = "cuda")]
-    if let Ok(Some(d)) = ffai_cuda::CudaDevice::create() {
+    if let Ok(Some(d)) = iron_cuda::CudaDevice::create() {
         out.push(d);
     }
     #[cfg(feature = "metal")]
-    if let Ok(Some(d)) = ffai_metal::MetalDevice::create() {
+    if let Ok(Some(d)) = iron_metal::MetalDevice::create() {
         out.push(d);
     }
     #[cfg(feature = "vulkan")]
-    if let Ok(Some(d)) = ffai_vulkan::VulkanDevice::create() {
+    if let Ok(Some(d)) = iron_vulkan::VulkanDevice::create() {
         out.push(d);
     }
 

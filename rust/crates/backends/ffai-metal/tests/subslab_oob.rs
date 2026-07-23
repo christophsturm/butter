@@ -21,9 +21,9 @@
 //!   MTL_SHADER_VALIDATION=1 MTL_DEBUG_LAYER=1 METAL_DEVICE_WRAPPER_TYPE=1 \
 //!     cargo test -p ffai-metal --test subslab_oob -- --nocapture
 
-use ffai_core::{DType, Device, Tensor};
-use ffai_metal::MetalDevice;
-use ffai_ops::{slice, strided_col_copy};
+use iron_core::{DType, Device, Tensor};
+use iron_metal::MetalDevice;
+use iron_ops::{slice, strided_col_copy};
 
 fn tb_f32(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()

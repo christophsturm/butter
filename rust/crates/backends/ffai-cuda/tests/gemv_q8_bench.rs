@@ -1,7 +1,7 @@
 // Q8 GEMV throughput microbench — isolates kernel cost from decode orchestration.
-use ffai_core::{DType, Tensor};
-use ffai_ops::{gemv_q8, quantize_q8};
-use ffai_cuda::CudaDevice;
+use iron_core::{DType, Tensor};
+use iron_ops::{gemv_q8, quantize_q8};
+use iron_cuda::CudaDevice;
 use std::time::Instant;
 
 fn tbf(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }

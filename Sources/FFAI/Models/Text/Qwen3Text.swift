@@ -325,7 +325,7 @@ public final class Qwen3Layer: Module {
         //     `kvStride = maxSeq` (NOT `length`) — the per-head row
         //     stride is the allocated cache stride, not the live row
         //     count. Passing `length` aliases reads across head
-        //     boundaries (metaltile#203).
+        //     boundaries (iron#203).
         //   • `.dequantMirror` — fully dequant the cache via
         //     `prepareForAttention` and run the standard sdpaDecode.
         //     Same quality as compressed, gives back the memory win.
@@ -427,7 +427,7 @@ public final class Qwen3Layer: Module {
         }
         let oOut = oProj(attnReadyForOProj, on: cmd)
 
-        // Fused residual add + post-attn RMSNorm via ffai_add_rms_norm
+        // Fused residual add + post-attn RMSNorm via iron_add_rms_norm
         // (hidden ≤ 4096). Validator gate falls through for Qwen 3 14B/32B
         // (hidden 5120) and similarly wide variants.
         let postAttn: Tensor
@@ -552,7 +552,7 @@ public final class Qwen3Layer: Module {
         let attnFlat = attnOut.reshaped(to: [nRows, nHeads * headDim])
         let oOut = oProj.callMany(attnFlat, t: nRows, on: cmd, device: device)
 
-        // Fused residual add + post-attn RMSNorm via ffai_add_rms_norm
+        // Fused residual add + post-attn RMSNorm via iron_add_rms_norm
         // (hidden ≤ 4096). Validator gate covers wider Qwen 3 variants.
         let postAttn: Tensor
         let mlpNorm: Tensor
@@ -723,7 +723,7 @@ public final class Qwen3Model: TextGenerating {
 
         // Fallback to per-token loop when (a) AURA caches require
         // π-rotated K/V layout not implemented by the chunked path,
-        // or (b) head_dim != 128 — `ffai_sdpa_multi` is hardcoded to
+        // or (b) head_dim != 128 — `iron_sdpa_multi` is hardcoded to
         // d128 (Qwen 3 0.5B / 1.7B have d=64 vs d=128 on 4B+).
         let hasAura = caches.contains { $0 is AURAQuantizedKVCache }
         let headDimUnsupported = headDim != 128

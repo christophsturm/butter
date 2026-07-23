@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// FFAIKernelsLibrary surface coverage — verifies the metallib loader
+// IronLibrary surface coverage — verifies the metallib loader
 // produces a usable MTLDevice + MTLCommandQueue + MTLLibrary, that
 // repeated init succeeds (no global state poisoning), and that
 // `library.makeFunction(name:)` resolves known kernels and rejects
@@ -23,14 +23,14 @@ import Foundation
 import Metal
 import Testing
 
-@testable import FFAIKernelsSwift
+@testable import IronSwift
 
-@Suite("FFAIKernelsLibrary")
-struct FFAIKernelsLibraryTests {
+@Suite("IronLibrary")
+struct IronLibraryTests {
 
     @Test("default init loads the bundled kernels.metallib")
     func defaultInitSucceeds() throws {
-        let lib = try FFAIKernelsLibrary()
+        let lib = try IronLibrary()
         #expect(!lib.metallibURL.path.isEmpty)
         #expect(lib.metallibURL.lastPathComponent == "kernels.metallib")
     }
@@ -40,8 +40,8 @@ struct FFAIKernelsLibraryTests {
         // Two back-to-back inits must both succeed — this catches a
         // class of bug where the loader caches a half-built MTLLibrary
         // in a static var and the second caller gets a corrupted one.
-        let a = try FFAIKernelsLibrary()
-        let b = try FFAIKernelsLibrary()
+        let a = try IronLibrary()
+        let b = try IronLibrary()
         #expect(a.metallibURL == b.metallibURL)
         // Both libraries should be able to resolve the same kernel.
         #expect(a.library.makeFunction(name: "vector_add_f32") != nil)
@@ -50,7 +50,7 @@ struct FFAIKernelsLibraryTests {
 
     @Test("device + command queue are non-nil and usable")
     func deviceAndQueueAreUsable() throws {
-        let lib = try FFAIKernelsLibrary()
+        let lib = try IronLibrary()
         // Both surfaces are non-Optional, but exercising them confirms
         // the underlying MTL resources are alive (the queue can make
         // a cmdbuf, the device matches the queue's device).
@@ -61,7 +61,7 @@ struct FFAIKernelsLibraryTests {
 
     @Test("library.makeFunction resolves a known kernel name")
     func makeFunctionKnownKernel() throws {
-        let lib = try FFAIKernelsLibrary()
+        let lib = try IronLibrary()
         // vector_add_f32 is a kernel the manifest smoke test depends on,
         // so it's a stable canary across the kernel surface.
         let fn = lib.library.makeFunction(name: "vector_add_f32")
@@ -70,7 +70,7 @@ struct FFAIKernelsLibraryTests {
 
     @Test("library.makeFunction returns nil for an unknown kernel name")
     func makeFunctionUnknownKernel() throws {
-        let lib = try FFAIKernelsLibrary()
+        let lib = try IronLibrary()
         // A name that can't possibly exist — MTLLibrary.makeFunction(name:)
         // returns nil rather than throwing.
         let fn = lib.library.makeFunction(name: "absolutely_not_a_real_kernel_xyz")
@@ -81,7 +81,7 @@ struct FFAIKernelsLibraryTests {
 
     @Test("library.functionNames enumerates the bundled kernel surface")
     func functionNamesIsNonEmpty() throws {
-        let lib = try FFAIKernelsLibrary()
+        let lib = try IronLibrary()
         let names = lib.library.functionNames
         #expect(
             !names.isEmpty,
@@ -94,11 +94,11 @@ struct FFAIKernelsLibraryTests {
 
     @Test("shared singleton loads the same metallib as a fresh init")
     func sharedMatchesFreshInit() throws {
-        let fresh = try FFAIKernelsLibrary()
+        let fresh = try IronLibrary()
         // The shared singleton crashes on init failure rather than
         // throwing — touching `.metallibURL` is enough to verify it
         // initialised successfully.
-        let shared = FFAIKernelsLibrary.shared
+        let shared = IronLibrary.shared
         #expect(shared.metallibURL == fresh.metallibURL)
     }
 }

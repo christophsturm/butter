@@ -5,8 +5,8 @@
 //!
 //! Vulkan / SPIR-V backend — the portable GPU path (AMD / Intel / Android /
 //! anything with a Vulkan 1.2+ driver). Under `--features vulkan` it wraps
-//! `ffai_kernels_runtime::VulkanDevice` (IR → GlslGenerator → shaderc → SPIR-V →
-//! VkPipeline → dispatch) behind the shared [`ffai_core::Device`] trait — the
+//! `iron_kernels_runtime::VulkanDevice` (IR → GlslGenerator → shaderc → SPIR-V →
+//! VkPipeline → dispatch) behind the shared [`iron_core::Device`] trait — the
 //! same seam the Metal / CUDA backends implement, so everything above it is
 //! backend-agnostic. Without the feature it is a stub so non-Vulkan hosts
 //! still build the workspace.
@@ -18,7 +18,7 @@ pub use imp::{VulkanBuffer, VulkanDevice};
 
 #[cfg(not(feature = "vulkan"))]
 mod stub {
-    use ffai_core::{Device, Result};
+    use iron_core::{Device, Result};
     use std::sync::Arc;
 
     /// Stub: the crate builds on non-Vulkan hosts, but no device is available

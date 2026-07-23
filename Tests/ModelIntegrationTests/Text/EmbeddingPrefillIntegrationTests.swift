@@ -22,7 +22,7 @@
 // **fused** Llama / Qwen 2 path (one `Ops.sdpaMulti(causal: true)` per
 // layer + batched projections): Qwen 2.5 1.5B is the smallest loadable
 // checkpoint with the same backbone shape as Qwen 2-VL 2B —
-// `head_dim = 128`, which is the gate for the fused `ffai_sdpa_multi`
+// `head_dim = 128`, which is the gate for the fused `iron_sdpa_multi`
 // kernel. (Qwen 2-VL 2B itself can't be loaded yet: a pre-existing
 // quant-load crash blocks its e2e suite, independent of the prefill
 // batching this guards.)

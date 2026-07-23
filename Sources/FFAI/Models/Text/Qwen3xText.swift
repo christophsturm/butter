@@ -270,7 +270,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
             throw Qwen35Error.unsupportedConfig("GDN dims — \(reason)")
         }
         // The gated mixer RMSNorm runs over `linear_value_head_dim` rows;
-        // the ffai-kernels rms_norm_rows kernel needs the row size to be a
+        // the iron rms_norm_rows kernel needs the row size to be a
         // multiple of 128 and ≤ 4096.
         guard linearValueHeadDim % 128 == 0, linearValueHeadDim <= 4096 else {
             throw Qwen35Error.unsupportedConfig(
@@ -542,7 +542,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
     }
 
     /// Build one GDN mixer. Reads the split QKV / Z / B / A projections,
-    /// transposes the conv1d weight to the ffai-kernels `[kernel, channels]`
+    /// transposes the conv1d weight to the iron `[kernel, channels]`
     /// layout, and reads `A_log` + `dt_bias` to host arrays for the
     /// per-step gate computation.
     ///
@@ -575,7 +575,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
         let outProj = try loadLinear(
             base: "\(p).out_proj", in: weights, quantization: quant)
 
-        // conv1d.weight ships [conv_dim, kernel, 1]; the ffai-kernels kernel
+        // conv1d.weight ships [conv_dim, kernel, 1]; the iron kernel
         // wants [kernel, conv_dim].
         let convWSrc = try weights.tensor(named: "\(p).conv1d.weight")
         precondition(
@@ -657,7 +657,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
         // Batched gather BGEMM fast path: when the experts are mlx
         // int4-quantized AND the shapes satisfy the bm16 tile contract
         // (N%32 == 0, K%32 == 0), capture the stacked weight tensors so
-        // `MoELayer.decode` can dispatch `ffai_moe_gather_qmm_mma_int4_bm16_*`
+        // `MoELayer.decode` can dispatch `iron_moe_gather_qmm_mma_int4_bm16_*`
         // — one launch per projection instead of `topK` sequential
         // SwiGLU triplets (24 → 3 dispatches at `topK=8`).
         let stackedInt4 = tryLoadStackedInt4(
@@ -695,7 +695,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
     /// Try to load the stacked-int4-experts triplet for the batched
     /// gather BGEMM fast path in `MoELayer.decode`. Returns nil unless
     /// the checkpoint is mlx affine 4-bit AND the gate/up/down shapes
-    /// satisfy the `ffai_moe_gather_qmm_mma_int4_bm16_*` tile contract
+    /// satisfy the `iron_moe_gather_qmm_mma_int4_bm16_*` tile contract
     /// (`hidden % 32 == 0`, `moeIntermediate % 32 == 0`, derived bits
     /// per-tensor == 4). The returned tensors are direct handles into
     /// the safetensors mmap, so no extra allocations.
@@ -1174,13 +1174,13 @@ public final class GDNLayerCache: LayerCacheProtocol, @unchecked Sendable {
 //     (`Ops.sdpaPrefillQtiledD256`). Opt-out of the current default.
 //   FFAI_SDPA_LEGACY_D256=1
 //     Revert further, to the original per-query-row kernel
-//     (`ffai_sdpa_multi_d256`, one threadgroup per query with no K/V
+//     (`iron_sdpa_multi_d256`, one threadgroup per query with no K/V
 //     reuse across rows). Only takes effect when
 //     `FFAI_SDPA_QTILED_D256` is NOT also set. Opt-out, two steps back.
 //   FFAI_SDPA_BK16=0
 //     Revert the MMA d256 kernel's f16/bf16 dispatch from the BK=16
-//     K-block follow-up (`ffai_sdpa_prefill_mma_d256_bk16`) back to the
-//     BK=8 kernel (`ffai_sdpa_prefill_mma_d256`). f32 always uses BK=8
+//     K-block follow-up (`iron_sdpa_prefill_mma_d256_bk16`) back to the
+//     BK=8 kernel (`iron_sdpa_prefill_mma_d256`). f32 always uses BK=8
 //     (BK=16's threadgroup allocation exceeds the 32 KiB ceiling at
 //     f32, so there is no f32 BK=16 kernel to route to). Default: BK=16
 //     ON for f16/bf16. Only takes effect via `Ops.sdpaPrefillMmaD256`,
@@ -1204,18 +1204,18 @@ public final class GDNLayerCache: LayerCacheProtocol, @unchecked Sendable {
 //   shared entry for `QuantizedLinear.callMany`, covering GDN
 //   in-projections, attention QKV/out, and every other dense int4
 //   projection at prefill. Priority order at bits=4:
-//   `ffai_qmm_coop` (BN=64) > `ffai_qmm_mma_mpp` (BN=32) > `ffai_qmm_mma`
+//   `iron_qmm_coop` (BN=64) > `iron_qmm_mma_mpp` (BN=32) > `iron_qmm_mma`
 //   (manual simdgroup fallback).
 //   FFAI_QMM_COOP=0
 //     Force off the BN=64 wide-N cooperative-tensor kernel
-//     (`ffai_qmm_coop`); falls through to the MPP tier below. Default: ON
+//     (`iron_qmm_coop`); falls through to the MPP tier below. Default: ON
 //     on `Ops.mppAutoCapable` hardware (Apple GPU Family 9+ / macOS 26+)
 //     when the shape is eligible (`n % 64 == 0`, group_size 64). The
 //     fastest of the three dense int4 tiers on every shape measured.
 //   FFAI_QMM_COOP=1
 //     Force the coop kernel on even off the auto-capability check (A/B
 //     only; the kernel needs the same MPP/NAX hardware support as
-//     `ffai_qmm_mma_mpp`, this does not bypass that requirement).
+//     `iron_qmm_mma_mpp`, this does not bypass that requirement).
 //     CAUTION: unlike the shape/group-size checks (still enforced),
 //     forcing this on hardware below the MPP/NAX capability floor is
 //     untested territory - the auto-capability gate exists specifically
@@ -1223,7 +1223,7 @@ public final class GDNLayerCache: LayerCacheProtocol, @unchecked Sendable {
 //     exercises the forced-on + incapable-hardware combination.
 //   FFAI_QMM_MPP=0 | =1
 //     Force off / on the BN=32 MPP/NAX cooperative-tensor kernel
-//     (`ffai_qmm_mma_mpp`), the tier below coop. Default: auto-detected
+//     (`iron_qmm_mma_mpp`), the tier below coop. Default: auto-detected
 //     the same way as `FFAI_QMM_COOP`. Only reached when coop is off or
 //     the shape fails coop's `n % 64 == 0` guard (e.g. some vision-tower
 //     FFN dims).
@@ -1231,7 +1231,7 @@ public final class GDNLayerCache: LayerCacheProtocol, @unchecked Sendable {
 // ── GDN (Gated DeltaNet recurrent mixer) ────────────────────────────
 //   FFAI_GDN_NO_FUSED_PREP=1
 //     Opt out of the fused prep+recurrence single-token kernel
-//     (`ffai_gated_delta_prep_step`); revert to the legacy host-loop
+//     (`iron_gated_delta_prep_step`); revert to the legacy host-loop
 //     prep + `Ops.gatedDeltaStep`. Default: fused ON.
 //   FFAI_NO_FUSED_GDN_4=1
 //     Opt out of the batched 4-projection (qkv/z/b/a) single-dispatch
@@ -1249,8 +1249,8 @@ public final class GDNLayerCache: LayerCacheProtocol, @unchecked Sendable {
 //     kernel. Default: fast ON when the shape matches (Dk=Dv=128,
 //     Hv=32, Hk=16) and the WY path below is not active.
 //   FFAI_GDN_WY=1
-//     Opt in to the chunked-WY prefill pipeline (`ffai_gdn_wy_plan` +
-//     `ffai_gdn_wy_scan`) at T >= 64. Default: OFF, uses
+//     Opt in to the chunked-WY prefill pipeline (`iron_gdn_wy_plan` +
+//     `iron_gdn_wy_scan`) at T >= 64. Default: OFF, uses
 //     `gatedDeltaPrepChunk`/`gatedDeltaPrepChunkFast` instead.
 //   FFAI_NO_CONV1D_MANY=1
 //     Opt out of the batched T-token conv1d dispatch
@@ -1294,7 +1294,7 @@ public final class GDNLayerCache: LayerCacheProtocol, @unchecked Sendable {
 //     optional floor below which auto-MPP won't fire even on capable
 //     hardware; default floor 0 = always when hardware allows).
 //   FFAI_MOE_M1=1
-//     Route the decode-T=1 gather through the scalar `ffai_moe_gather
+//     Route the decode-T=1 gather through the scalar `iron_moe_gather
 //     _qmm_int4` kernel instead of the cooperative-tensor bm8/bm16/bm64
 //     variants (those lose ~15% to descriptor setup cost at T=1).
 //     Only takes effect when bm8 is not also selected.
@@ -1306,10 +1306,10 @@ public final class GDNLayerCache: LayerCacheProtocol, @unchecked Sendable {
 //     ON (cached) when the gate projection is 8-bit quantized.
 //   FFAI_MOE_TILEPLAN=0
 //     Opt out of the F-85 expert-aligned tile-plan gather-BGEMM
-//     (`ffai_moe_gather_qmm_mma_int4_bm16_mpp_tileplan`) at prefill,
+//     (`iron_moe_gather_qmm_mma_int4_bm16_mpp_tileplan`) at prefill,
 //     reverting to the fixed-16-row-stride bm16 default. Tile
 //     boundaries normally come from a device-built plan
-//     (`ffai_moe_build_tile_plan`) instead of that fixed stride, so
+//     (`iron_moe_build_tile_plan`) instead of that fixed stride, so
 //     every dispatched tile is single-expert and pays exactly one
 //     K-dimension pass, fixing the 28-39% skewed-routing penalty the
 //     fixed-stride kernel pays at low T. Only takes effect on the
@@ -1322,7 +1322,7 @@ public final class GDNLayerCache: LayerCacheProtocol, @unchecked Sendable {
 //     `moe_gather_qmm_tileplan_correctness.rs`.
 //   FFAI_MOE_COOP=0
 //     Opt out of the F-85 coop-core MoE gather GEMM (BM=32 tile plan
-//     over `ffai_moe_gather_qmm_coop`) at prefill, reverting to the
+//     over `iron_moe_gather_qmm_coop`) at prefill, reverting to the
 //     BM=16 tileplan default. Only takes effect where `FFAI_MOE_TILEPLAN`
 //     is also active and the coop core's own shape gate passes
 //     (`nOut % 64 == 0` on both legs, `groupSize == 64`) - a layer that
@@ -1349,10 +1349,10 @@ public final class GDNLayerCache: LayerCacheProtocol, @unchecked Sendable {
 //     and the paired lever's "own" dispatch below). Default: ON.
 //   FFAI_MOE_PAIRED=1
 //     Opt IN to the F-85 two-expert tile-pairing lever
-//     (`ffai_moe_gather_qmm_coop_paired`) at prefill. Below
+//     (`iron_moe_gather_qmm_coop_paired`) at prefill. Below
 //     `FFAI_MOE_PAIRED_MAX_MTOTAL` (see below), the coop tile plan splits
 //     into an "own" plan (full/17-31-row remainders, fed the UNCHANGED
-//     `ffai_moe_gather_qmm_coop` dispatch) and a "paired" plan (1-16-row
+//     `iron_moe_gather_qmm_coop` dispatch) and a "paired" plan (1-16-row
 //     remainders packed two experts to a tile, fed the new paired-GEMM
 //     dispatch), eliminating the masked-out padding those short
 //     remainders otherwise cost. Only takes effect where
@@ -1386,7 +1386,7 @@ public final class GDNLayerCache: LayerCacheProtocol, @unchecked Sendable {
 //     win.
 //   FFAI_MOE_COUNTING_SORT=0
 //     Opt out of the F-85 bucketed counting-sort replacement for
-//     `ffai_moe_sort_plan` (histogram -> prefix-sum -> scatter, same
+//     `iron_moe_sort_plan` (histogram -> prefix-sum -> scatter, same
 //     stable expert-ascending order), reverting to the original kernel's
 //     O(mTotal^2) per-thread linear scan. Only takes effect on the
 //     DEVPLAN2 device-sorted-plan path (`useDevPlan2`) - the only path
@@ -1396,7 +1396,7 @@ public final class GDNLayerCache: LayerCacheProtocol, @unchecked Sendable {
 //     4096/8192, ~10-15x at 16384, ~38x at 32768.
 //   FFAI_MOE_PARALLEL_PLAN=0
 //     Opt out of the parallelized MoE tile-plan builders
-//     (`ffai_moe_build_tile_plan_parallel` / `_bm32_parallel` /
+//     (`iron_moe_build_tile_plan_parallel` / `_bm32_parallel` /
 //     `_bm32_own_parallel` - one threadgroup per expert instead of a
 //     single threadgroup owning the whole plan build), reverting to the
 //     single-threadgroup builders. Applies wherever `FFAI_MOE_TILEPLAN`
@@ -1440,7 +1440,7 @@ public final class Qwen35GDNMixer: Module {
     let eps, invKeyScale: Float
     let dtype: DType
 
-    // ─── Fused `ffai_gated_delta_prep_step` path constants (fp32) ───────
+    // ─── Fused `iron_gated_delta_prep_step` path constants (fp32) ───────
     //
     // The fused kernel takes its tensors all in a single dtype. The GDN
     // recurrence state stays fp32 (see `GDNStateCache` header — bf16
@@ -1450,7 +1450,7 @@ public final class Qwen35GDNMixer: Module {
     // `Ops.castToF32`.
     //
     // Layout / values are pinned to the kernel's contract — see
-    // `crates/ffai-kernels-std/src/ffai/gated_delta_prep.rs`:
+    // `crates/crates/wh-iron-std/src/kernels/ssm/gated_delta_prep.rs`:
     //   qNormWeightF32 : [Hk·Dk] fp32, filled with `invKeyScale²` —
     //                    folds the per-head scale into the weight so
     //                    the kernel runs the *unweighted*
@@ -1472,8 +1472,8 @@ public final class Qwen35GDNMixer: Module {
     /// allocation per token.
     let epsBufFused: Tensor
 
-    /// `FFAI_GDN_FUSED_PREP=1` route through `ffai_gated_delta_prep_step`
-    /// + `ffai_gated_mixer_norm`. Cached at init so per-token env lookups
+    /// `FFAI_GDN_FUSED_PREP=1` route through `iron_gated_delta_prep_step`
+    /// + `iron_gated_mixer_norm`. Cached at init so per-token env lookups
     /// disappear and the GDN *layer* (not just the mixer) can branch on
     /// it — when fused, the mixer keeps `cmd` in-flight so the residual
     /// add + FFN chain onto the same command buffer.
@@ -1526,7 +1526,7 @@ public final class Qwen35GDNMixer: Module {
     private var zScratch: Tensor?
     private var bRawScratch: Tensor?
     private var aRawScratch: Tensor?
-    /// Single-dispatch `ffai_batched_4_qgemv_fast` fast path.
+    /// Single-dispatch `iron_batched_4_qgemv_fast` fast path.
     /// Constraints: in_dim%512==0, each out_dim%8==0, groupSize=64.
     private var fused4Eligible: Bool = false
 
@@ -1579,7 +1579,7 @@ public final class Qwen35GDNMixer: Module {
         self.negExpALogTF32 = makeF32Tensor35(aLog.map { -Foundation.exp($0) }, device: device)
         self.epsBufFused = makeF32Tensor35([eps], device: device)
         // Fused-prep is DEFAULT ON for Qwen3.6-A3B. The underlying
-        // `ffai_gated_delta_prep_step_{bf16,f16}` kernel was tuned for
+        // `iron_gated_delta_prep_step_{bf16,f16}` kernel was tuned for
         // Qwen3.6-A3B's `numValueHeads = 32` shape; at the dense
         // Qwen3.5-0.8B-4bit's `numValueHeads = 16` it silently produces
         // degenerate output (every GDN layer's recurrence collapses;
@@ -1636,7 +1636,7 @@ public final class Qwen35GDNMixer: Module {
                 groupSize: qQL.groupSize
             )
             // Single-dispatch fast path eligibility. The underlying
-            // `ffai_batched_4_qgemv_fast_{bf16,f16}` kernel was tuned
+            // `iron_batched_4_qgemv_fast_{bf16,f16}` kernel was tuned
             // against Qwen 3.6-A3B's `numValueHeads = 32` shape; at the
             // dense Qwen 3.5-0.8B's `numValueHeads = 16` it silently
             // produces degenerate output (post-attn b_raw / a_raw rows
@@ -1646,7 +1646,7 @@ public final class Qwen35GDNMixer: Module {
             // surfaced by `Qwen35TextIntegrationTests`). Gate at
             // `% 32 == 0` until the kernel ships a paired correctness
             // test at out_c=out_d=16 and the v_matrix-indexed bounds
-            // select is fixed in ffai-kernels-std.
+            // select is fixed in wh-iron-std.
             let inDim = qQL.weight.shape[1] * 8
             if inDim % 512 == 0
                 && convDim % 8 == 0 && valueDim % 8 == 0
@@ -1770,7 +1770,7 @@ public final class Qwen35GDNMixer: Module {
 
         // ── Fused GDN prep + recurrence path (opt-in) ─────────────────
         //
-        // `FFAI_GDN_FUSED_PREP=1` routes through `ffai_gated_delta_prep_step`,
+        // `FFAI_GDN_FUSED_PREP=1` routes through `iron_gated_delta_prep_step`,
         // which absorbs the per-head q/k RMSNorm + scale + g / beta math
         // + the recurrence kernel into ONE dispatch. Eliminates the
         // phase-1 host commit+wait (the host no longer needs convAct /
@@ -1992,7 +1992,7 @@ public final class Qwen35GDNMixer: Module {
     /// gemv launches saved at prefill. The recurrence cost is unchanged
     /// (a future `Ops.gatedDeltaChunk` rewrite of the recurrence T-loop
     /// folds that into one kernel; `gatedDeltaChunk` is already emitted
-    /// and tested in ffai-kernels-ffai PR #115).
+    /// and tested in iron-ffai PR #115).
     ///
     /// All work queued on `cmd`; no commit inside. Mirrors the fused
     /// single-token path's cmd ownership.
@@ -2217,7 +2217,7 @@ public final class Qwen35GDNMixer: Module {
             on: cmd)
 
         // `FFAI_GDN_WY=1` opts into the chunked-WY prefill pipeline
-        // (`ffai_gdn_wy_plan` + `ffai_gdn_wy_scan`, see `Ops.swift`) —
+        // (`iron_gdn_wy_plan` + `iron_gdn_wy_scan`, see `Ops.swift`) —
         // default OFF, `gatedDeltaPrepChunk` above stays the production
         // path untouched. The WY kernels' v1 require `t_len` to be an
         // exact multiple of their fixed chunk size `c=64`; `Ops
@@ -2230,7 +2230,7 @@ public final class Qwen35GDNMixer: Module {
         // the `t >= 64` half varies per call.
         let useWY = wyShapeEligible && t >= 64
         // Shape-specialized fast path: dispatches
-        // `ffai_gated_delta_prep_chunk_fast_d128_128_32_16` in place of the
+        // `iron_gated_delta_prep_chunk_fast_d128_128_32_16` in place of the
         // generic `gatedDeltaPrepChunk`: same math, same grid/TG geometry,
         // but Dk/Dv/Hv/Hk baked as compile-time constants instead of
         // `#[constexpr]` runtime buffer params, which is what let the Metal
@@ -2472,7 +2472,7 @@ public final class Qwen35AttentionMixer: Module {
             // keeps the fast path live for the two verified shapes and
             // routes 27B / future wider models to the unfused
             // per-projection gemv until a paired GPU correctness test
-            // at the wider inDim/qDim shape ships in ffai-kernels-std and
+            // at the wider inDim/qDim shape ships in wh-iron-std and
             // the kernel's per-column tile arithmetic is verified
             // there.
             if inDim % 512 == 0
@@ -2692,7 +2692,7 @@ public final class Qwen35AttentionMixer: Module {
         }
 
         // Gated output: attnOut * sigmoid(gate), then o_proj.
-        // Fused sigmoidMul via ffai_sigmoid_mul into cached scratch —
+        // Fused sigmoidMul via iron_sigmoid_mul into cached scratch —
         // saves 1 encoder per attn layer × 10 ≈ 170 µs/token.
         var attnFlat = auraUnrotatedOutput(
             attnOut, cache: kv, nHeads: nHeads, headDim: headDim, on: cmd)
@@ -2835,11 +2835,11 @@ public final class Qwen35AttentionMixer: Module {
             positions: appendPositions, on: cmd)
 
         // ── SDPA (fuse the T-token causal attention into ONE dispatch).
-        // d=128 wraps `ffai_sdpa_multi` (`Ops.sdpaMulti`, unchanged). d=256
+        // d=128 wraps `iron_sdpa_multi` (`Ops.sdpaMulti`, unchanged). d=256
         // (Qwen3.6-A3B full-attention layers) defaults to
-        // `Ops.sdpaPrefillMmaD256` (`ffai_sdpa_prefill_mma_d256`): a Stage-B
+        // `Ops.sdpaPrefillMmaD256` (`iron_sdpa_prefill_mma_d256`): a Stage-B
         // follow-up on the F-85 attention attribution that replaces the
-        // prior default `ffai_sdpa_prefill_qtiled_d256`'s scalar simd_sum
+        // prior default `iron_sdpa_prefill_qtiled_d256`'s scalar simd_sum
         // Q.K/P.V dot products with simdgroup-matrix MMA (BQ=32 vs the
         // scalar kernel's BQ=16; motivated by Stage-A profiling showing
         // the attention mixer's prefill GPU-time share growing from ~25%
@@ -2854,7 +2854,7 @@ public final class Qwen35AttentionMixer: Module {
         // prefill time). `FFAI_SDPA_QTILED_D256=1` reverts to the prior
         // default (the scalar Q-tiled kernel) for bisection.
         // `FFAI_SDPA_LEGACY_D256=1` reverts further, to the original
-        // `ffai_sdpa_multi_d256` (one threadgroup per (query, q_head),
+        // `iron_sdpa_multi_d256` (one threadgroup per (query, q_head),
         // no K/V reuse across rows) that the F-85 campaign identified
         // as the source of the original append-regime bandwidth waste.
         // Tier selection is instance-constant (depends only on `headDim`
@@ -3121,7 +3121,7 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
             xNorm, position: position, cache: kv,
             cmd: cmd, device: device)
 
-        // Fused residual add + post-mix RMSNorm via ffai_add_rms_norm
+        // Fused residual add + post-mix RMSNorm via iron_add_rms_norm
         // (hidden ≤ 4096). Validator gate falls through for wider
         // hybrids that may exceed the kernel's row-width cap.
         let postMix: Tensor
@@ -3199,7 +3199,7 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
             cache: kv, cmd: cmd, device: device
         ).reshaped(to: [t * hidden])
 
-        // ── Residual add — fused with post-norm via ffai_add_rms_norm
+        // ── Residual add — fused with post-norm via iron_add_rms_norm
         // (hidden ≤ 4096). Falls back to separate Ops.add + rmsNormRows
         // for wider hidden sizes via the validator gate.
         let postMix: Tensor
@@ -3253,7 +3253,7 @@ private func qwen35FinalNormLmHead(
         // `h.elementCount ≤ 2048` keeps the fast path live for the two
         // verified shapes and routes 27B / future wider models to the
         // unfused fallback until a paired GPU correctness test at the
-        // wider in_dim ships in ffai-kernels-std and the kernel inner-
+        // wider in_dim ships in wh-iron-std and the kernel inner-
         // loop / reduction-collapse arithmetic is verified there.
         h.elementCount <= 2048,
         // Bypass for diagnostics — also flip this off when reproducing
@@ -3303,7 +3303,7 @@ private func qwen35ApplyFFNMany(
 ) -> Tensor {
     // Post-norm over T rows of [hidden]. One rmsNormRows kernel —
     // unless the caller already produced the normed tensor via the
-    // fused `ffai_add_rms_norm` kernel.
+    // fused `iron_add_rms_norm` kernel.
     let ffnNorm =
         preNormed
         ?? Ops.rmsNormRows(
@@ -3337,7 +3337,7 @@ private func qwen35ApplyFFN(
     preNormed: Tensor? = nil
 ) -> Tensor {
     // `preNormed` lets the attention-layer caller supply the
-    // fused-kernel output of `ffai_add_rms_norm` (postMix already +
+    // fused-kernel output of `iron_add_rms_norm` (postMix already +
     // post-norm in one dispatch). When nil, we run the separate norm.
     let ffnNorm = preNormed ?? postNorm(postMix, on: cmd)
     switch ffn {
@@ -3610,11 +3610,11 @@ public final class Qwen35Model: TextGenerating {
     ///
     ///   1. A batched-T variant of every projection (`dequantGemv` /
     ///      `gemv` → batched `dequantGemm` / `gemm`). The existing
-    ///      `ffai_qmm_mma_m16` is BM=16 fixed; a dynamic-M qmm + chunking
+    ///      `iron_qmm_mma_m16` is BM=16 fixed; a dynamic-M qmm + chunking
     ///      dispatcher is needed.
     ///   2. A batched-T conv1d_causal (the GDN input projection's conv1d
     ///      is rolling over `convKernel`; chunked form exists in
-    ///      ffai-kernels-ffai's `ffai_gated_delta_chunk` for the *recurrence*
+    ///      iron-ffai's `iron_gated_delta_chunk` for the *recurrence*
     ///      but conv1d still has to step T times).
     ///   3. Per-layer `decodeMany(_ inputs: [T, hidden], ...)` on
     ///      `Qwen35GDNLayer` / `Qwen35AttentionLayer` that uses
@@ -4026,7 +4026,7 @@ private func zeroVector35(_ n: Int, dtype: DType, device: Device) -> Tensor {
     return t
 }
 
-/// Transpose HF conv1d.weight `[C, K, 1]` → `[K, C]` for the ffai-kernels
+/// Transpose HF conv1d.weight `[C, K, 1]` → `[K, C]` for the iron
 /// conv kernel. The trailing `1` is the depthwise group dim; row-major
 /// the source is `[c][k]`-ordered.
 private func transposeConv1dWeight35(

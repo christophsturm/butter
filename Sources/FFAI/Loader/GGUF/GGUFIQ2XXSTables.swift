@@ -26,7 +26,7 @@ enum GGUFIQ2XXSTables {
     /// as the absolute magnitude — the sign comes from `ksigns`.
     ///
     /// Returns the table as a `[u8]` of length 2048 in little-endian
-    /// layout so the metaltile kernel's `Tensor<u8> grid[256*8]` lookup
+    /// layout so the iron kernel's `Tensor<u8> grid[256*8]` lookup
     /// works directly (`grid[key*8 + lane]`).
     static let grid: [UInt8] = {
         var bytes = [UInt8]()

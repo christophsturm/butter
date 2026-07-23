@@ -7,5 +7,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-ffai-kernels-core.workspace = true
+wh-iron-core.workspace = true
 thiserror.workspace = true

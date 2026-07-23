@@ -75,7 +75,7 @@ struct Gemma3TextIntegrationTests {
 
         // Greedy decode + hard coherence assert. The first-light
         // all-NaN bug was a bf16 tanh overflow inside the GELU
-        // template; fixed in ffai-kernels preamble.rs by computing GELU
+        // template; fixed in iron preamble.rs by computing GELU
         // in fp32 with the tanh argument clamped to ±15. See
         // papers/gemma3-coherence-investigation-2026-05-19.md.
         let result = try await m.generate(

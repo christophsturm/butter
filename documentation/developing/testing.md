@@ -7,7 +7,7 @@ FFAI tests in three layers — kernel-wrapper correctness, Swift unit tests, and
 **Go through `make` — do not run bare `swift test`.** Each `ModelIntegrationTests` suite downloads a multi-GB checkpoint; an unconstrained parallel run loads several at once and OOMs the box (and can pin the GPU). The `make` targets cap parallelism correctly.
 
 ```bash
-make test-unit          # FFAITests + MetalTileSwiftTests — fast, parallel-safe
+make test-unit          # FFAITests + IronSwiftTests — fast, parallel-safe
 make test-integration   # ModelIntegrationTests — serialized (--num-workers 1)
 make test               # both in sequence — the full local CI gate
 make coverage           # unit-suite line coverage (≥ 80 %)
@@ -32,7 +32,7 @@ swift test --filter OpsTests          # unit suite — fast, no cap needed
 
 ```
 Tests/
-  MetalTileSwiftTests/      One file per kernel wrapper — numerical
+  IronSwiftTests/      One file per kernel wrapper — numerical
                             correctness vs a CPU reference across
                             fp32 / fp16 / bf16. Plus
                             KernelManifestSmokeTests.
@@ -54,7 +54,7 @@ Tests/
                             clips, … shared via the helpers).
 ```
 
-There are **no golden fixtures**. Cross-implementation token-parity vs mlx-lm proved to be a measure of rounding-mode alignment, not correctness — it was dropped. Numerical correctness now comes from the ffai-kernels-side per-kernel GPU-correctness tests (compared to a naive CPU oracle); the FFAI integration tests assert that the model *pipeline* produces coherent text.
+There are **no golden fixtures**. Cross-implementation token-parity vs mlx-lm proved to be a measure of rounding-mode alignment, not correctness — it was dropped. Numerical correctness now comes from the iron-side per-kernel GPU-correctness tests (compared to a naive CPU oracle); the FFAI integration tests assert that the model *pipeline* produces coherent text.
 
 ## Integration testing
 
@@ -146,7 +146,7 @@ struct FishSpeechIntegrationTests {
 
 Both patterns serialize through the same lock so the multi-GB downloads / GPU footprint stay capped regardless of how many integration suites the runner picks up.
 
-A non-trivial kernel lands with a paired ffai-kernels GPU-correctness test in the **same commit** (see ffai-kernels `docs/testing.md`).
+A non-trivial kernel lands with a paired iron GPU-correctness test in the **same commit** (see iron `docs/testing.md`).
 
 ## CI
 

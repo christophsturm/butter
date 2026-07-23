@@ -116,7 +116,7 @@ public final class AURAQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {
     /// `Tensor<T>` (matches the production C++ TQ+ fork pattern: fp16-
     /// stored norms / codebook, f32-at-use via cast-at-load).
     public let kCodebook: Tensor  // [2^keyBits]   dtype
-    public let kBoundaries: Tensor  // [2^keyBits-1] dtype — Lloyd-Max thresholds (Tensor<T> per metaltile #226)
+    public let kBoundaries: Tensor  // [2^keyBits-1] dtype — Lloyd-Max thresholds (Tensor<T> per iron #226)
     public let vCodebook: Tensor  // [2^valueBits] dtype
     public let vBoundaries: Tensor  // [2^valueBits-1] dtype
 
@@ -212,7 +212,7 @@ public final class AURAQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {
         precondition(
             kBoundaries.dtype == dtype,
             "AURAQuantizedKVCache: K boundaries dtype must match cache dtype \(dtype) "
-                + "— metaltile #226 unified rotation/boundaries to Tensor<T>")
+                + "— iron #226 unified rotation/boundaries to Tensor<T>")
         precondition(
             vCodebook.dtype == dtype,
             "AURAQuantizedKVCache: V codebook dtype must match cache dtype \(dtype)")
@@ -425,7 +425,7 @@ public final class AURAQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {
                 buffer: norms.buffer,
                 offset: norms.offset + h * normBytesPerHead + pos * normByteSize,
                 shape: [1], dtype: dtype)
-            // metaltile #226: aura_encode now takes rotation+boundaries
+            // iron #226: aura_encode now takes rotation+boundaries
             // as Tensor<T>. Use the activation-dtype copy of Π
             // (`rotationDtype`) instead of the legacy f32 `rotation`
             // field — the f32 field is kept around for any future

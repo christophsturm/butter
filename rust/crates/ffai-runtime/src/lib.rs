@@ -6,7 +6,7 @@
 //! Generation orchestration: logits selection, sampling, and the
 //! prefill→decode loop. **Pure CPU logic, zero GPU/backend dependency** — the
 //! model passes a `step(token, pos) -> logits` closure (which owns its KV cache
-//! and runs on whatever [`ffai_core::Device`](../ffai_core) it likes), and this
+//! and runs on whatever [`iron_core::Device`](../iron_core) it likes), and this
 //! drives it. So the generation runtime is written ONCE and shared across every
 //! backend, every model, and (via FFI) the Swift host.
 

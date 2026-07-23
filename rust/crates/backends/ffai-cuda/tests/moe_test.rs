@@ -11,9 +11,9 @@
 //! the shared op layer. (Real MoE-model-vs-HF verification follows once the
 //! large expert weights are staged.)
 
-use ffai_core::{DType, Device, Tensor};
-use ffai_cuda::CudaDevice;
-use ffai_models::moe::{ExpertWeights, MoeMlp, moe_mlp};
+use iron_core::{DType, Device, Tensor};
+use iron_cuda::CudaDevice;
+use iron_models::moe::{ExpertWeights, MoeMlp, moe_mlp};
 
 fn tb(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -111,8 +111,8 @@ fn moe_w4a16_marlin_vs_standard() {
         eprintln!("no CUDA device — skipping moe_w4a16_marlin_vs_standard");
         return;
     };
-    use ffai_core::{DType, Tensor};
-    use ffai_ops::{moe_w4a16, moe_w4a16_marlin, permute_q4_to_marlin, quantize_q4};
+    use iron_core::{DType, Tensor};
+    use iron_ops::{moe_w4a16, moe_w4a16_marlin, permute_q4_to_marlin, quantize_q4};
 
     // Problem dimensions: must be multiples of 64/32.
     // Use 4 experts, m_total=64, n_out=128, k_in=64.
@@ -247,8 +247,8 @@ fn moe_w4a16_straddle_vs_marlin() {
         eprintln!("no CUDA device — skipping moe_w4a16_straddle_vs_marlin");
         return;
     };
-    use ffai_core::{DType, Tensor};
-    use ffai_ops::{moe_bgemm_q4_bm64, moe_w4a16, moe_w4a16_marlin, permute_q4_to_marlin, quantize_q4};
+    use iron_core::{DType, Tensor};
+    use iron_ops::{moe_bgemm_q4_bm64, moe_w4a16, moe_w4a16_marlin, permute_q4_to_marlin, quantize_q4};
 
     const N_EXP: usize = 3;
     const M: usize = 128; // two 64-row M-tiles

@@ -46,14 +46,14 @@ public enum PSOCacheError: Error, CustomStringConvertible {
 }
 
 public final class PSOCache: @unchecked Sendable {
-    public static let shared = PSOCache(library: FFAIKernelsLibrary.shared)
+    public static let shared = PSOCache(library: IronLibrary.shared)
 
-    private let library: FFAIKernelsLibrary
+    private let library: IronLibrary
     private let lock = NSLock()  // protects `cache` reads + writes
     private let compileLock = NSLock()  // single-flight PSO compilation
     private var cache: [String: MTLComputePipelineState] = [:]
 
-    public init(library: FFAIKernelsLibrary) {
+    public init(library: IronLibrary) {
         self.library = library
     }
 
@@ -104,7 +104,7 @@ public final class PSOCache: @unchecked Sendable {
         }
         lock.unlock()
 
-        // MPP cooperative-tensor kernels (ffai_*_mpp_*) must be live-compiled
+        // MPP cooperative-tensor kernels (iron_*_mpp_*) must be live-compiled
         // from their .metal source, NOT loaded from the pre-built metallib.
         // The MetalPerformancePrimitives header inlines cooperative-tensor
         // type IDs + descriptor layouts that drift between SDK versions —
@@ -157,15 +157,15 @@ public final class PSOCache: @unchecked Sendable {
     /// (`mpp::tensor_ops::matmul2d` or the Metal-4 `metal::tensor` coop_tile)
     /// and must be live-compiled from .metal source on the running OS.
     /// Detected purely by name:
-    ///   • `_mpp_`  — the MPP `matmul2d` kernels (`ffai_qmm_mma_mpp_*`,
-    ///     `ffai_moe_gather_qmm_mma_int4_bm{8,16,64}_mpp_*`).
+    ///   • `_mpp_`  — the MPP `matmul2d` kernels (`iron_qmm_mma_mpp_*`,
+    ///     `iron_moe_gather_qmm_mma_int4_bm{8,16,64}_mpp_*`).
     ///   • `bgemm`  — the coop_tile MMA bgemms (moe_bgemm_*_bm64 / _view).
     /// Both lower cooperative-tensor ops whose type IDs / tile layouts are
     /// resolved against the SDK header at compile time; an offline `xcrun
     /// metal`→metallib bakes in types that disagree with the running OS's
     /// runtime, producing BIT-DETERMINISTIC WRONG output (verified: the
     /// metallib bm64 gives sumAbs 20718 vs the runtime-compiled 24583 on
-    /// identical inputs — see ffai-kernels moe_bm64_ragged_correctness).
+    /// identical inputs — see iron moe_bm64_ragged_correctness).
     /// Live-compile via `makeLibrary(source:)` resolves against the running
     /// OS's header. The bulk (gemv, elementwise, etc.) have no MMA → still
     /// load fast from kernels.metallib.
@@ -201,12 +201,12 @@ public final class PSOCache: @unchecked Sendable {
         return fn
     }
 
-    /// Locate `<name>.metal` next to the loaded metallib. `ffaik emit` writes
+    /// Locate `<name>.metal` next to the loaded metallib. `iron emit` writes
     /// per-kernel sources to `Resources/kernels/<name>.metal` alongside
     /// `Resources/kernels.metallib`, so we anchor the lookup off
     /// `library.metallibURL`.
     private static func locateMetalSource(_ name: String) throws -> URL {
-        let metallibURL = FFAIKernelsLibrary.shared.metallibURL
+        let metallibURL = IronLibrary.shared.metallibURL
         let kernelsDir = metallibURL.deletingLastPathComponent()
             .appendingPathComponent("kernels", isDirectory: true)
         let url = kernelsDir.appendingPathComponent("\(name).metal")
