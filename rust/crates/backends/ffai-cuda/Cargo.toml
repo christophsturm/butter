@@ -112,3 +112,7 @@ required-features = ["cuda"]
 [[test]]
 name = "all_models"
 required-features = ["cuda"]
+
+[[test]]
+name = "proj_fp8_bench"
+required-features = ["cuda"]

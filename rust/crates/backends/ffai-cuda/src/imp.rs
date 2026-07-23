@@ -412,6 +412,42 @@ impl Device for CudaDevice {
         let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("moe_grouped_cutlass: out not CudaBuffer".into()))?;
         self.dev.moe_grouped_cutlass(ab.ptr, wb.ptr, ob.ptr, group_rows, expert_ids, n, k).map_err(dispatch_err)
     }
+    #[allow(clippy::too_many_arguments)]
+    fn moe_marlin_gemm(
+        &self,
+        a: &dyn DeviceBuffer, b: &dyn DeviceBuffer, c: &dyn DeviceBuffer, c_tmp: &dyn DeviceBuffer,
+        b_scales: &dyn DeviceBuffer, global_scale: &dyn DeviceBuffer, topk_weights: &dyn DeviceBuffer,
+        sorted_token_ids: &dyn DeviceBuffer, expert_ids: &dyn DeviceBuffer, num_tokens_past_padded: &dyn DeviceBuffer,
+        workspace: &dyn DeviceBuffer,
+        moe_block: usize, num_experts: usize, top_k: usize, mul_topk_weights: bool,
+        prob_m: usize, prob_n: usize, prob_k: usize, num_groups: usize, group_size: usize,
+        sms: i32, use_fp32_reduce: bool,
+    ) -> Result<()> {
+        let g = |x: &dyn DeviceBuffer, nm: &str| x.as_any().downcast_ref::<CudaBuffer>().map(|b| b.ptr)
+            .ok_or_else(|| Error::Msg(format!("moe_marlin_gemm: {nm} not CudaBuffer")));
+        self.dev.moe_marlin_gemm(
+            g(a,"a")?, g(b,"b")?, g(c,"c")?, g(c_tmp,"c_tmp")?,
+            g(b_scales,"b_scales")?, g(global_scale,"global_scale")?, g(topk_weights,"topk_weights")?,
+            g(sorted_token_ids,"sorted_token_ids")?, g(expert_ids,"expert_ids")?, g(num_tokens_past_padded,"ntpp")?,
+            g(workspace,"workspace")?,
+            moe_block, num_experts, top_k, mul_topk_weights, prob_m, prob_n, prob_k, num_groups, group_size, sms, use_fp32_reduce,
+        ).map_err(dispatch_err)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn marlin_repack(
+        &self, b_q: &dyn DeviceBuffer, out: &dyn DeviceBuffer,
+        size_k: usize, size_n: usize, sms: i32, max_shared_mem: i32,
+    ) -> Result<()> {
+        let g = |x: &dyn DeviceBuffer, nm: &str| x.as_any().downcast_ref::<CudaBuffer>().map(|b| b.ptr)
+            .ok_or_else(|| Error::Msg(format!("marlin_repack: {nm} not CudaBuffer")));
+        self.dev.marlin_repack(g(b_q,"b_q")?, g(out,"out")?, size_k, size_n, sms, max_shared_mem).map_err(dispatch_err)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn marlin_build_routing(&self,off:&dyn DeviceBuffer,n_exp:usize,blk:usize,mt:usize,stid:&dyn DeviceBuffer,eid:&dyn DeviceBuffer,ntpp:&dyn DeviceBuffer)->Result<()>{
+        let gg=|x:&dyn DeviceBuffer,nm:&str| x.as_any().downcast_ref::<CudaBuffer>().map(|b|b.ptr).ok_or_else(||Error::Msg(format!("marlin_build_routing: {nm} not CudaBuffer")));
+        self.dev.marlin_build_routing(gg(off,"off")?,n_exp,blk,mt,gg(stid,"stid")?,gg(eid,"eid")?,gg(ntpp,"ntpp")?).map_err(dispatch_err)
+    }
 
     fn moe_grouped_cutlass_fp4(
         &self,
