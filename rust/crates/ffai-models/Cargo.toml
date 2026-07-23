@@ -11,3 +11,4 @@ ffai-core.workspace = true
 ffai-ops.workspace = true
 ffai-loader.workspace = true
 serde_json.workspace = true
+rayon.workspace = true
