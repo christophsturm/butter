@@ -291,7 +291,39 @@ extension Model {
         var rng = params.makeRNG()
         var tokenHistory = promptTokens  // grows as decode produces tokens; used by cpu-sample
 
+        // ─── Live quality-metric capture (design §5) ─────────────────────
+        // The single InspectTap drives this. `FFAI_TELEMETRY=ppl` opts into
+        // accumulating the model's self-perplexity over its own stream — the
+        // NLL of each token it actually picks. Off by default: when the flag
+        // is unset `capturePPL` is false and the hot path is byte-for-byte
+        // the existing fused-kernel sampler (no logit readback, no softmax).
+        //
+        // `.kld` / `.niah` are not actionable in the live decode loop — KLD
+        // needs a paired reference and NIAH is its own retrieval harness; both
+        // run through `ffai bench`. The tap flags still gate them there.
+        let tap = InspectTap.fromEnvironment
+        let capturePPL = tap.captures(.perplexity)
+        var liveNLLSum = 0.0
+        var liveNLLCount = 0
+
         func sampleNext(tokenId t: Int, position i: Int) -> Int {
+            // Capturing path: route through full logits so we can read the
+            // chosen token's probability. Only taken when the flag is on.
+            if capturePPL {
+                let logits = engine.forward(tokenId: t, position: i, caches: caches)
+                let chosen: Int
+                switch path {
+                case .greedyGPU:
+                    chosen = Perplexity.argmaxLogits(logits)
+                case .gpuCategorical, .cpuSample:
+                    chosen = Sampling.sample(
+                        logits, parameters: params,
+                        rng: &rng, tokenHistory: tokenHistory)
+                }
+                liveNLLSum += Perplexity.negLogSoftmaxAt(logits: logits, index: chosen)
+                liveNLLCount += 1
+                return chosen
+            }
             switch path {
             case .greedyGPU:
                 return textEngine.forwardSample(tokenId: t, position: i, caches: caches)
@@ -316,22 +348,17 @@ extension Model {
 
         // ─── Prefill ─────────────────────────────────────────────────
         //
-        // .6: chunked prefill. Pre-warm the KV cache for all but
-        // the last prompt position by calling `textEngine.forwardMulti(...)`
-        // in `prefillStepSize`-sized chunks (default 1024). Then sample
-        // the final position via the existing fused-kernel `sampleNext`
-        // path — that's the only position whose logits we actually need.
+        // Chunked prefill: `textEngine.forwardMulti(...)` in
+        // `prefillStepSize`-sized chunks over the full prompt. The last
+        // multi returns logits at the final prompt position; we sample
+        // the first generate token from those logits (no second stack).
         //
         // The default `forwardMulti` implementation in `TextGenerating`
         // falls back to a per-token loop, so families that haven't
-        // overridden it retain today's behaviour exactly. Optimised
-        // families (Llama, …) override `forwardMulti` with a single
-        // `Ops.sdpaMulti(causal: true)` dispatch over the whole chunk —
-        // that's the real long-prompt TTFT win.
+        // overridden it retain correct behaviour. Optimised families
+        // override `forwardMulti` with a batched attention/MLP path.
         //
-        // Empty prompts hit the early-return below. Single-token prompts
-        // skip the warm loop entirely (pos starts at 0, the while
-        // condition is false) and go straight to `sampleNext`.
+        // Empty prompts hit the early-return below.
         let prefillStart = Date()
         var nextToken = 0
         try profile.signpost("prefill") {
@@ -339,17 +366,27 @@ extension Model {
             // Honour the caller's explicit `prefillStepSize` if set;
             // otherwise fall through to the engine's tuned default
             // (1024 generic, 2048 GPT-OSS, 4096 Gemma 4 / Qwen 3.5 MoE).
+            // FFAI_PREFILL_STEP=<n> overrides both for chunk-size sweeps —
+            // larger chunks amortize per-chunk costs (KV append, gate/beta,
+            // sort plans, attention prefix re-reads) at the cost of larger
+            // transient activations.
             let chunkSize = max(
                 1,
-                params.prefillStepSize
+                ProcessInfo.processInfo.environment["FFAI_PREFILL_STEP"].flatMap(Int.init)
+                    ?? params.prefillStepSize
                     ?? textEngine.defaultPrefillStepSize)
+            // Multi over the full prompt (all n tokens). The last multi
+            // returns logits at the final prompt position so we can sample
+            // the first generate token without a second full layer stack
+            // (previously multi was n-1 then sampleNext re-forwarded last).
             var pos = 0
-            while pos < n - 1 {
+            var lastLogits: Tensor?
+            while pos < n {
                 try Task.checkCancellation()
-                let end = min(pos + chunkSize, n - 1)
+                let end = min(pos + chunkSize, n)
                 let chunk = Array(promptTokens[pos ..< end])
                 let cmd = Device.shared.makeCommandBuffer()
-                _ = textEngine.forwardMulti(
+                lastLogits = textEngine.forwardMulti(
                     tokenIds: chunk, startingAt: pos,
                     caches: caches, on: cmd,
                     device: Device.shared)
@@ -359,10 +396,23 @@ extension Model {
                 energyTracker.sampleThermal()
                 pos = end
             }
-            if n > 0 {
+            if n > 0, let logits = lastLogits {
                 try Task.checkCancellation()
-                let lastTok = promptTokens[n - 1]
-                nextToken = sampleNext(tokenId: lastTok, position: n - 1)
+                // Sample first generate token from multi logits (no re-forward).
+                let chosen: Int
+                if path == .greedyGPU || params.temperature == 0 {
+                    chosen = Sampling.argmax(logits)
+                } else {
+                    chosen = Sampling.sample(
+                        logits, parameters: params,
+                        rng: &rng, tokenHistory: tokenHistory)
+                }
+                if capturePPL {
+                    liveNLLSum += Perplexity.negLogSoftmaxAt(
+                        logits: logits, index: chosen)
+                    liveNLLCount += 1
+                }
+                nextToken = chosen
                 memTracker.sample()
             }
         }
@@ -439,13 +489,17 @@ extension Model {
                 Double(generated.count) / max(decodeTime, 1e-9)))
 
         let split = ThinkingSplit.split(tokens: generated, model: self)
+        // Live self-perplexity over the generated stream, when captured.
+        let livePerplexity: Double? =
+            (capturePPL && liveNLLCount > 0) ? exp(liveNLLSum / Double(liveNLLCount)) : nil
         let stats = makeStats(
             promptTokens: promptTokens, generatedCount: generated.count,
             contextSize: textEngine.maxContextWindow, prefillTime: prefillTime,
             decodeTime: decodeTime, ttftMs: ttftMs,
             perTokenWallclock: perTokenWallclock,
             memTracker: memTracker, energyTracker: energyTracker, caches: caches,
-            weightsBytes: weightsBytes, splitTokens: split
+            weightsBytes: weightsBytes, splitTokens: split,
+            genPerplexity: livePerplexity
         )
 
         continuation.yield(
@@ -462,7 +516,8 @@ extension Model {
         perTokenWallclock: [Double],
         memTracker: PhaseMemoryTracker, energyTracker: EnergyThermalTracker,
         caches: [any LayerCacheProtocol],
-        weightsBytes: Int, splitTokens: ThinkingSplit.Split?
+        weightsBytes: Int, splitTokens: ThinkingSplit.Split?,
+        genPerplexity: Double? = nil
     ) -> GenerationStats {
         let steady: Double? = {
             guard perTokenWallclock.count > 10 else { return nil }
@@ -489,7 +544,7 @@ extension Model {
             kvCacheAllocatedBytes: caches.totalBytesAllocated,
             kvCacheUsedBytes: caches.totalBytesInUse,
             thinkPerplexity: nil,
-            genPerplexity: nil,
+            genPerplexity: genPerplexity,
             thinkKLDivergence: nil,
             genKLDivergence: nil,
             thinkTokenCount: splitTokens.map { $0.thinkTokens.count },

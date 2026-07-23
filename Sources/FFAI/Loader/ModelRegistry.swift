@@ -459,6 +459,20 @@ public enum ModelRegistry {
             defaultGenerationParameters: variant.defaultGenerationParameters)
     }
 
+    public static func loadHy3(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try Hy3.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(
+            engine: engine,
+            defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
+
     public static func loadGranite4(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device

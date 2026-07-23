@@ -1,0 +1,114 @@
+[package]
+name = "ffai-cuda"
+description = "FFAI CUDA backend — wraps ffai-kernels-runtime's CudaDevice (NVRTC -> PTX -> driver) behind the ffai-core Device trait."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ffai-core.workspace = true
+ffai-kernels-core.workspace = true
+ffai-kernels-codegen = { workspace = true, optional = true }
+ffai-kernels-runtime = { workspace = true, optional = true }
+
+[dev-dependencies]
+ffai-modeltests.workspace = true
+ffai-core.workspace = true
+ffai-ops.workspace = true
+ffai-models.workspace = true
+ffai-loader.workspace = true
+ffai-kernels-core.workspace = true
+
+[features]
+# Off by default so macOS / non-CUDA hosts build the crate as a stub.
+# `--features cuda` pulls ffai-kernels-runtime's real CUDA device.
+cuda = ["dep:ffai-kernels-runtime", "dep:ffai-kernels-codegen", "ffai-kernels-runtime/cuda"]
+
+[[test]]
+name = "cuda_smoke"
+required-features = ["cuda"]
+
+[[test]]
+name = "ffai_model"
+required-features = ["cuda"]
+
+[[test]]
+name = "qwen3_real"
+required-features = ["cuda"]
+
+[[test]]
+name = "hf_model"
+required-features = ["cuda"]
+
+[[test]]
+name = "moe_test"
+required-features = ["cuda"]
+
+[[test]]
+name = "dsv4_test"
+required-features = ["cuda"]
+
+[[test]]
+name = "dsv4_mla"
+required-features = ["cuda"]
+
+[[test]]
+name = "dsv4_moe"
+required-features = ["cuda"]
+
+[[test]]
+name = "dsv4_layer"
+required-features = ["cuda"]
+
+[[test]]
+name = "qwen_moe"
+required-features = ["cuda"]
+
+[[test]]
+name = "ssm_test"
+required-features = ["cuda"]
+
+[[test]]
+name = "conv1d_test"
+required-features = ["cuda"]
+
+[[test]]
+name = "vit_ops"
+required-features = ["cuda"]
+
+[[test]]
+name = "siglip"
+required-features = ["cuda"]
+
+[[test]]
+name = "whisper"
+required-features = ["cuda"]
+
+[[test]]
+name = "whisper_base"
+required-features = ["cuda"]
+
+[[test]]
+name = "smolvlm"
+required-features = ["cuda"]
+
+[[test]]
+name = "gpt2_prefill"
+required-features = ["cuda"]
+
+[[test]]
+name = "llama_prefill"
+required-features = ["cuda"]
+
+[[test]]
+name = "gpt2_generate"
+required-features = ["cuda"]
+
+[[test]]
+name = "gpt2_kvcache"
+required-features = ["cuda"]
+
+[[test]]
+name = "all_models"
+required-features = ["cuda"]

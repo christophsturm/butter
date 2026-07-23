@@ -1,0 +1,16 @@
+[package]
+name = "ffai-modeltests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Shared, backend-agnostic model forwards + HF-reference verification. Each
+# `verify_*(dev: &dyn Device)` is written ONCE here and called by the thin
+# per-backend test wrappers in ffai-metal/ffai-cuda — so a model's logic
+# exists in exactly one place instead of a Metal test + a sed'd CUDA twin.
+[dependencies]
+ffai-core.workspace = true
+ffai-ops.workspace = true
+ffai-loader.workspace = true
+ffai-models.workspace = true
+ffai-runtime.workspace = true

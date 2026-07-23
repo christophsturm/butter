@@ -51,7 +51,20 @@ public struct BenchOptions: Sendable {
     public var quantization: String?
     public var wikitext2Corpus: URL?
     public var wikitext2MaxTokens: Int
+    /// Sliding `n_ctx` window for PPL/KLD scoring (design §6.1). `0` keeps
+    /// the legacy single-pass scoring (every token from position 0 of one
+    /// growing cache); `> 0` strides by `window/2` and scores only each
+    /// window's second half so scored tokens carry real left-context.
+    public var wikitext2ContextWindow: Int
     public var referenceModel: Model?
+    /// Phase B of two-phase KLD: score the candidate against a reference
+    /// distribution cached on disk by a prior `--save-ref-logits` run,
+    /// instead of co-loading a reference model (design §6.3).
+    public var referenceLogits: URL?
+    /// Phase A of two-phase KLD: dump this model's per-position log-probs
+    /// to disk so future candidates can KLD against it without re-running
+    /// the reference. Use with the bf16 reference as `--model`.
+    public var saveReferenceLogits: URL?
 
     public init(
         prompt: String? = nil,
@@ -60,7 +73,10 @@ public struct BenchOptions: Sendable {
         quantization: String? = nil,
         wikitext2Corpus: URL? = nil,
         wikitext2MaxTokens: Int = 2048,
-        referenceModel: Model? = nil
+        wikitext2ContextWindow: Int = 0,
+        referenceModel: Model? = nil,
+        referenceLogits: URL? = nil,
+        saveReferenceLogits: URL? = nil
     ) {
         self.prompt = prompt
         self.maxTokens = maxTokens
@@ -68,7 +84,10 @@ public struct BenchOptions: Sendable {
         self.quantization = quantization
         self.wikitext2Corpus = wikitext2Corpus
         self.wikitext2MaxTokens = wikitext2MaxTokens
+        self.wikitext2ContextWindow = wikitext2ContextWindow
         self.referenceModel = referenceModel
+        self.referenceLogits = referenceLogits
+        self.saveReferenceLogits = saveReferenceLogits
     }
 }
 
@@ -95,6 +114,8 @@ public struct BenchRunner {
             return try await runSummarization(options: options)
         case .wikitext2:
             return try await runWikiText2(options: options)
+        case .niah:
+            return try await runNIAH(options: options)
         default:
             throw BenchRunnerError.notImplemented(
                 method: method,
@@ -167,22 +188,56 @@ public struct BenchRunner {
         if tokens.count > options.wikitext2MaxTokens {
             tokens = Array(tokens.prefix(options.wikitext2MaxTokens))
         }
-        Debug.log(.bench, "wikitext2: scoring \(tokens.count) tokens")
+        // BOS handling (design §6.2): prepend the model's <bos> once so the
+        // first scored token has a real left-context anchor. Idempotent —
+        // skip when the tokenizer already emitted one or the family is not
+        // BOS-critical.
+        if model.engine.requiresLeadingBOS,
+            let bos = model.tokenizer.bosTokenId ?? model.config.bosTokenId,
+            tokens.first != bos
+        {
+            tokens.insert(bos, at: 0)
+        }
+        let window = options.wikitext2ContextWindow
+        Debug.log(
+            .bench,
+            "wikitext2: scoring \(tokens.count) tokens, contextWindow=\(window == 0 ? "off" : String(window))"
+        )
 
         // Capture a pre-PPL memory snapshot so the report still
         // surfaces realistic numbers (no decode loop populates them
         // for this method otherwise).
         let memTracker = PhaseMemoryTracker()
-        let pplResult = Perplexity.compute(model: model, tokens: tokens)
+        let pplResult = Perplexity.compute(
+            model: model, tokens: tokens, contextWindow: window)
         memTracker.endPrefill()
         memTracker.endDecode()
 
+        // Phase A: dump this model's reference distribution and stop — no
+        // candidate KLD here (this run's --model *is* the reference).
+        if let saveURL = options.saveReferenceLogits {
+            let n = try ReferenceLogitCache.write(
+                reference: model, tokens: tokens,
+                contextWindow: window, to: saveURL)
+            print("[BENCH] saved \(n) reference log-prob rows → \(saveURL.path)")
+        }
+
         var kld: Double?
-        if let ref = options.referenceModel {
-            let kldResult = Perplexity.klDivergence(
-                reference: ref, candidate: model, tokens: tokens
-            )
-            kld = kldResult.meanKLDivergence
+        var kldResult: Perplexity.KLDResult?
+        if let refLogits = options.referenceLogits {
+            // Phase B: cached reference, no second model in memory.
+            kldResult = try ReferenceLogitCache.klDivergence(
+                candidate: model, tokens: tokens,
+                referenceFile: refLogits, contextWindow: window)
+        } else if let ref = options.referenceModel {
+            // Live paired KLD (both models resident).
+            kldResult = Perplexity.klDivergence(
+                reference: ref, candidate: model,
+                tokens: tokens, contextWindow: window)
+        }
+        if let r = kldResult {
+            kld = r.meanKLDivergence
+            printKLDDistribution(r)
         }
 
         let weightsBytes = model.textEngine.parameters().reduce(0) { $0 + $1.1.byteCount }
@@ -210,5 +265,69 @@ public struct BenchRunner {
             genPerplexity: pplResult.perplexity,
             genKLDivergence: kld
         )
+    }
+
+    // MARK: - NIAH — needle-in-a-haystack retrieval
+
+    private func runNIAH(options: BenchOptions) async throws -> BenchRow {
+        // A single --ctx pins one context length; otherwise sweep the
+        // default grid (clamped to the model's max sequence by NIAH.run).
+        let lengths = options.contextSize.map { [$0] } ?? [1024, 2048, 4096]
+        let memTracker = PhaseMemoryTracker()
+        let result = NIAH.run(model: model, contextLengths: lengths)
+        memTracker.endPrefill()
+        memTracker.endDecode()
+
+        print("[BENCH] niah \(modelLabel)")
+        print("  ctx-tokens  depth  result  answer")
+        for t in result.trials {
+            let ctxStr = String(t.contextTokens)
+            let ctx = String(repeating: " ", count: max(0, 9 - ctxStr.count)) + ctxStr
+            let depth = String(format: "%.2f", t.depthFraction)
+            let verdict = t.passed ? "PASS" : "miss"
+            print("  \(ctx)  \(depth)  \(verdict)  \(t.answerPreview)")
+        }
+        print("  \(result.summaryLine)")
+
+        let weightsBytes = model.engine.parameters().reduce(0) { $0 + $1.1.byteCount }
+        let stats = GenerationStats(
+            promptTokens: result.trials.map(\.contextTokens).max() ?? 0,
+            generatedTokens: 0,
+            contextSize: model.engine.maxSeq,
+            prefillTimeS: 0, decodeTimeS: 0, timeToFirstTokenMs: 0,
+            steadyTokensPerSecond: nil,
+            baselineGPUBytes: memTracker.baseline.gpuBytes,
+            postPrefillGPUBytes: memTracker.postPrefill?.gpuBytes ?? 0,
+            postDecodeGPUBytes: memTracker.postDecode?.gpuBytes ?? 0,
+            prefillPeakGPUBytes: memTracker.prefillPeakBytes,
+            decodePeakGPUBytes: memTracker.decodePeakBytes,
+            wiredTicketBytes: memTracker.baseline.wiredTicketBytes,
+            weightsBytes: weightsBytes,
+            kvCacheAllocatedBytes: 0, kvCacheUsedBytes: 0,
+            thinkPerplexity: nil, genPerplexity: nil,
+            thinkKLDivergence: nil, genKLDivergence: nil,
+            thinkTokenCount: nil, genTokenCount: nil
+        )
+        return BenchRow(
+            model: modelLabel, method: BenchMethod.niah.rawValue,
+            quantization: options.quantization,
+            stats: stats, outputPreview: result.summaryLine,
+            genPerplexity: nil, genKLDivergence: nil
+        )
+    }
+
+    /// Print the full per-position KLD distribution + top-1 agreement.
+    /// Mean alone hides tail distortion — the p99 / max / top-1 flip rate
+    /// are the legible "is this quant broken" signals (design §6.4). The
+    /// report row still stores the mean for cross-comparability.
+    private func printKLDDistribution(_ r: Perplexity.KLDResult) {
+        guard let d = r.distribution else { return }
+        print("  KLD distribution over \(r.scoredTokens) positions (nats):")
+        print(String(format: "    mean   %.4f", d.mean))
+        print(String(format: "    median %.4f", d.median))
+        print(String(format: "    p90    %.4f", d.p90))
+        print(String(format: "    p99    %.4f", d.p99))
+        print(String(format: "    max    %.4f", d.max))
+        print(String(format: "    top-1 agreement %.2f%%", d.top1Agreement * 100))
     }
 }

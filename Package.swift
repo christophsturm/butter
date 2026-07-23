@@ -1,6 +1,6 @@
 // swift-tools-version: 6.1
 //
-// FFAI — F*cking Fast Apple Inference
+// FFAI — F*cking Fast AI
 //
 // Apple Silicon LLM inference library built on pre-compiled Metal kernels
 // generated from the ffai-kernels Rust DSL.

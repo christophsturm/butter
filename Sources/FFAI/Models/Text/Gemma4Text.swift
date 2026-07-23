@@ -1512,20 +1512,21 @@ enum Gemma4Ops {
         let nHeads = qk.elementCount / headDim
         let halfDim = headDim / 2  // pairing offset + freq denominator
         let rotatedPairs = rotatedDim / 2  // grid height — only these rotate
-        // ffai_rope_banded takes a [T] u32 positions buffer (T=1 for decode).
-        // depth = rotatedPairs so only the first rotatedPairs freq pairs
-        // rotate (partial rotary); half_dim stays the freq denominator.
-        // scaling off (scale/low/high=1, original_max_position=1).
-        let positions = Tensor.empty(shape: [1], dtype: .u32)
-        positions.copyIn(from: [UInt32(position)])
-        let rowStride = UInt32(nHeads * headDim)
         let grid = MTLSize(width: 1, height: nHeads, depth: rotatedPairs)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
+        // ffai_rope_banded reads position from a per-row `positions: [T]` u32
+        // buffer (decode = the T=1 case: a 1-element buffer); `row_stride` is
+        // the per-token stride in qk (`n_heads * head_dim`). Single-token decode
+        // here so a 1-element positions buffer + grid depth 1.
+        let posBuf = Device.shared.makeBuffer(length: 4)
+        var posVal = UInt32(position)
+        memcpy(posBuf.contents(), &posVal, 4)
+        let rowStride = UInt32(nHeads * headDim)
         switch qk.dtype {
         case .f32:
             FFAIKernels.ffai_rope_banded_f32(
                 qk: qk.buffer, qkOffset: qk.offset,
-                positions: positions.buffer, positionsOffset: positions.offset,
+                positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
                 head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
                 row_stride: rowStride, theta_base: thetaBase,
@@ -1535,7 +1536,7 @@ enum Gemma4Ops {
         case .f16:
             FFAIKernels.ffai_rope_banded_f16(
                 qk: qk.buffer, qkOffset: qk.offset,
-                positions: positions.buffer, positionsOffset: positions.offset,
+                positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
                 head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
                 row_stride: rowStride, theta_base: thetaBase,
@@ -1545,7 +1546,7 @@ enum Gemma4Ops {
         case .bf16:
             FFAIKernels.ffai_rope_banded_bf16(
                 qk: qk.buffer, qkOffset: qk.offset,
-                positions: positions.buffer, positionsOffset: positions.offset,
+                positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
                 head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
                 row_stride: rowStride, theta_base: thetaBase,

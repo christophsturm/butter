@@ -101,9 +101,22 @@ jobs:
         # the sibling ffai-kernels checkout. Run from ffai-kernels/ so its
         # rust-toolchain.toml (nightly, 2024 edition) is picked up.
         working-directory: ffai-kernels
+        # `ffaik build` spawns `__ffai_runner` (ffai-kernels-std bin) for
+        # kernel discovery, resolved by bare name via PATH. Build both and
+        # put target/release on PATH — building only `ffaik` never builds
+        # the sibling runner.
         run: |
-          cargo run --release --bin ffaik -- build --emit all \
+          cargo build --release --bin ffaik --bin __ffai_runner
+          PATH="$PWD/target/release:$PATH" ffaik build --emit all \
             --out ${{ github.workspace }}/FFAI/Sources/FFAIKernelsSwift
+          # The emitter does not prepend `// swift-format-ignore-file`;
+          # add it so the lint pass skips the generated wrappers.
+          OUT="${{ github.workspace }}/FFAI/Sources/FFAIKernelsSwift/Generated"
+          if [ -f "$OUT/FFAIKernels.swift" ] && ! head -1 "$OUT/FFAIKernels.swift" | grep -q swift-format-ignore-file; then
+            tmp="$OUT/FFAIKernels.swift.tmp"
+            { printf '// swift-format-ignore-file\n//\n'; cat "$OUT/FFAIKernels.swift"; } > "$tmp"
+            mv "$tmp" "$OUT/FFAIKernels.swift"
+          fi
 
       - name: Run unit tests (with coverage)
         # FFAITests + FFAIKernelsSwiftTests (kernel round-trip).

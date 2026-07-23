@@ -1,0 +1,26 @@
+[package]
+name = "ffai"
+description = "FFAI — F*cking Fast AI. Modular, multi-backend inference engine (Rust core). The Apple/iPhone production path is the Swift sibling under swift/."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ffai-core.workspace = true
+ffai-ops.workspace = true
+ffai-models.workspace = true
+ffai-runtime.workspace = true
+ffai-loader.workspace = true
+ffai-metal = { workspace = true, optional = true }
+ffai-cuda = { workspace = true, optional = true }
+ffai-vulkan = { workspace = true, optional = true }
+
+[features]
+# Pick backends at build time. Default = metal for Mac dev boxes; build a
+# CUDA host with `--no-default-features --features cuda`.
+default = ["metal"]
+metal = ["dep:ffai-metal"]
+cuda = ["dep:ffai-cuda", "ffai-cuda/cuda"]
+vulkan = ["dep:ffai-vulkan", "ffai-vulkan/vulkan"]
+all-backends = ["metal", "cuda", "vulkan"]

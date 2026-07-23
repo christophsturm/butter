@@ -59,13 +59,44 @@ import Metal
 ///      branch, so Swift's exclusivity tracking doesn't add cost.
 ///   3. `makeWorkCmd` returns the caller's `cmd` unchanged in
 ///      inactive mode (single branch + identity passthrough).
+/// Quality-telemetry metric selection, flag-gated on the tap. Each metric is
+/// independent; default `[]` means nothing is captured and the scoring path
+/// is never entered — so telemetry costs nothing unless explicitly enabled.
+public struct QualityMetrics: OptionSet, Sendable {
+    public let rawValue: Int
+    public init(rawValue: Int) { self.rawValue = rawValue }
+
+    public static let perplexity = QualityMetrics(rawValue: 1 << 0)
+    public static let kld = QualityMetrics(rawValue: 1 << 1)
+    public static let niah = QualityMetrics(rawValue: 1 << 2)
+
+    /// Parse a comma-separated env value, e.g. `FFAI_TELEMETRY=ppl,kld`.
+    /// Unknown tokens are ignored; `nil` / empty → no metrics.
+    public init(parsing csv: String?) {
+        var set: QualityMetrics = []
+        for raw in (csv ?? "").split(separator: ",") {
+            switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+            case "ppl", "perplexity": set.insert(.perplexity)
+            case "kld", "kl", "kl-divergence", "kldivergence": set.insert(.kld)
+            case "niah", "needle": set.insert(.niah)
+            default: break
+            }
+        }
+        self = set
+    }
+}
+
 public struct InspectTap: Sendable {
     public let active: Bool
     public let layerFilter: Set<Int>?
+    /// Quality metrics this tap captures. Default `[]` → none; gated per metric
+    /// so a disabled one does no work (no retained logits, no softmax / KL math).
+    public let metrics: QualityMetrics
 
-    public init(active: Bool, layerFilter: Set<Int>? = nil) {
+    public init(active: Bool, layerFilter: Set<Int>? = nil, metrics: QualityMetrics = []) {
         self.active = active
         self.layerFilter = layerFilter
+        self.metrics = metrics
     }
 
     /// Read `FFAI_INSPECT` + `FFAI_INSPECT_LAYERS` from the
@@ -83,7 +114,8 @@ public struct InspectTap: Sendable {
         let active = env["FFAI_INSPECT"] == "1"
         let filter: Set<Int>? = env["FFAI_INSPECT_LAYERS"]
             .map { Set($0.split(separator: ",").compactMap { Int($0) }) }
-        return InspectTap(active: active, layerFilter: filter)
+        let metrics = QualityMetrics(parsing: env["FFAI_TELEMETRY"])
+        return InspectTap(active: active, layerFilter: filter, metrics: metrics)
     }()
 
     /// Process-wide cached tap state. See `cachedFromEnvironment`
@@ -99,6 +131,15 @@ public struct InspectTap: Sendable {
         guard let filter = layerFilter else { return true }
         return filter.contains(layer)
     }
+
+    /// True when any quality metric is enabled. Guard the scoring path with
+    /// this so a metrics-off tap folds to a single bool check.
+    @inline(__always)
+    public var isCapturingMetrics: Bool { !metrics.isEmpty }
+
+    /// True when `metric` is enabled on this tap.
+    @inline(__always)
+    public func captures(_ metric: QualityMetrics) -> Bool { metrics.contains(metric) }
 
     /// Synchronously read a tensor's contents to fp32 and print
     /// shape + min/max/nan/inf/first-4. Commits the supplied

@@ -252,6 +252,15 @@ public enum OpsCoverageNotes {
             rationale:
                 "Chain-of-8 scalar FMA used by AURA encode rotation. Internal building block."),
 
+        // ── Probe / bench / test kernels ───────────────────────────
+        UncoveredKernel(
+            familyName: "ffai_sgload_smoke",
+            rationale: "Subgroup-load smoke test kernel — used only by ffai-kernels' own GPU probe."),
+        UncoveredKernel(
+            familyName: "ffai_rms_inv_scalar",
+            rationale:
+                "Bench-only helper used by RMSNorm correctness tests on the ffai-kernels side."),
+
         // ── Other ──────────────────────────────────────────────────
         UncoveredKernel(
             familyName: "ffai_gemv_masked",

@@ -128,9 +128,19 @@ jobs:
 
       - name: Generate kernel artifacts (ffaik build --emit all)
         working-directory: ffai-kernels
+        # Build `__ffai_runner` (ffai-kernels-std bin) alongside `ffaik` and put
+        # it on PATH — `ffaik build` spawns it by bare name and building only
+        # `ffaik` never builds the sibling runner.
         run: |
-          cargo run --release --bin ffaik -- build --emit all \
+          cargo build --release --bin ffaik --bin __ffai_runner
+          PATH="$PWD/target/release:$PATH" ffaik build --emit all \
             --out ${{ github.workspace }}/FFAI/Sources/FFAIKernelsSwift
+          OUT="${{ github.workspace }}/FFAI/Sources/FFAIKernelsSwift/Generated"
+          if [ -f "$OUT/FFAIKernels.swift" ] && ! head -1 "$OUT/FFAIKernels.swift" | grep -q swift-format-ignore-file; then
+            tmp="$OUT/FFAIKernels.swift.tmp"
+            { printf '// swift-format-ignore-file\n//\n'; cat "$OUT/FFAIKernels.swift"; } > "$tmp"
+            mv "$tmp" "$OUT/FFAIKernels.swift"
+          fi
 
       - name: Build (release, with tests + testability)
         # `--build-tests` produces the xctest bundle so the subsequent

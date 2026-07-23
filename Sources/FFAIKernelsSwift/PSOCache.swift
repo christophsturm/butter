@@ -112,22 +112,39 @@ public final class PSOCache: @unchecked Sendable {
         // baked-in MPP types disagree with the device runtime's, producing
         // bit-deterministic wrong output (e.g. cos 0.816 vs 0.999 oracle).
         // Live-compile via `makeLibrary(source:)` resolves MPP against the
-        // running OS's header, dodging the skew. See ollama #15594, #14432,
-        // llama.cpp PR #16634 for the same class of bug.
+        // running OS's header, dodging the skew. This is a known class of
+        // MPP header-skew bug.
+        //
         let function: MTLFunction
         if Self.isMppKernel(name) {
             function = try liveCompileMppFunction(name)
-        } else {
-            guard let fn = library.library.makeFunction(name: name) else {
-                throw PSOCacheError.kernelNotFound(name)
-            }
+        } else if let fn = library.library.makeFunction(name: name) {
             function = fn
+        } else {
+            throw PSOCacheError.kernelNotFound(name)
         }
-        let pso: MTLComputePipelineState
+        var pso: MTLComputePipelineState
         do {
             pso = try library.device.makeComputePipelineState(function: function)
         } catch {
-            throw PSOCacheError.psoCompileFailed(name, error)
+            // Some Metal toolchains reject certain MPP cooperative-tensor
+            // bodies at PSO creation (e.g. "unsupported deferred-static-alloca-
+            // size" on the bm8 matmul2d on macOS 26). Fall back to the AOT
+            // metallib function for MPP kernels: the offline `tile build`
+            // already compiled it, and this path is only taken when the live
+            // compile FAILS — so the skew the live-compile guards against does
+            // not apply (and on CI the metallib is built by the same toolchain
+            // that runs the tests, so there is no header skew to begin with).
+            guard Self.isMppKernel(name),
+                let aot = library.library.makeFunction(name: name)
+            else {
+                throw PSOCacheError.psoCompileFailed(name, error)
+            }
+            do {
+                pso = try library.device.makeComputePipelineState(function: aot)
+            } catch let aotError {
+                throw PSOCacheError.psoCompileFailed(name, aotError)
+            }
         }
 
         lock.lock()
@@ -136,21 +153,31 @@ public final class PSOCache: @unchecked Sendable {
         return pso
     }
 
-    /// Returns true for kernels that use `mpp::tensor_ops::matmul2d` and
-    /// must be live-compiled from .metal source on the running OS. Detected
-    /// purely by name — every ffai-kernels MPP kernel name contains `_mpp_`
-    /// (e.g. `ffai_qmm_mma_mpp_*`, `ffai_moe_gather_qmm_mma_int4_bm{8,16,64}_mpp_*`).
-    /// Non-MPP kernels (the bulk of the metallib) still load from
-    /// kernels.metallib — much faster PSO build.
+    /// Returns true for kernels that use cooperative-tensor MMA
+    /// (`mpp::tensor_ops::matmul2d` or the Metal-4 `metal::tensor` coop_tile)
+    /// and must be live-compiled from .metal source on the running OS.
+    /// Detected purely by name:
+    ///   • `_mpp_`  — the MPP `matmul2d` kernels (`ffai_qmm_mma_mpp_*`,
+    ///     `ffai_moe_gather_qmm_mma_int4_bm{8,16,64}_mpp_*`).
+    ///   • `bgemm`  — the coop_tile MMA bgemms (moe_bgemm_*_bm64 / _view).
+    /// Both lower cooperative-tensor ops whose type IDs / tile layouts are
+    /// resolved against the SDK header at compile time; an offline `xcrun
+    /// metal`→metallib bakes in types that disagree with the running OS's
+    /// runtime, producing BIT-DETERMINISTIC WRONG output (verified: the
+    /// metallib bm64 gives sumAbs 20718 vs the runtime-compiled 24583 on
+    /// identical inputs — see ffai-kernels moe_bm64_ragged_correctness).
+    /// Live-compile via `makeLibrary(source:)` resolves against the running
+    /// OS's header. The bulk (gemv, elementwise, etc.) have no MMA → still
+    /// load fast from kernels.metallib.
     private static func isMppKernel(_ name: String) -> Bool {
-        // Opt-out via env var, just in case a future kernel name accidentally
-        // matches `_mpp_` (e.g. an `_mppow_` variant). Default on.
+        // Opt-out via env var, in case a future kernel name accidentally
+        // matches (e.g. an `_mppow_` variant). Default on.
         if let raw = ProcessInfo.processInfo.environment["FFAI_PSO_LIVE_COMPILE_MPP"],
             raw == "0" || raw.lowercased() == "false"
         {
             return false
         }
-        return name.contains("_mpp_")
+        return name.contains("_mpp_") || name.contains("bgemm")
     }
 
     private func liveCompileMppFunction(_ name: String) throws -> MTLFunction {

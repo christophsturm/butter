@@ -152,8 +152,30 @@ public struct Qwen35Hybrid: Qwen35Variant {
     /// top-k 20, min-p 0.0, presence-penalty 0.0, repetition-penalty 1.0.
     /// (The card lists separate coding / non-thinking recipes; this is the
     /// general-purpose thinking default.)
+    ///
+    /// `prefillStepSize` is left `nil` here on purpose so the real
+    /// `ffai generate` path defers to `Qwen35Model.defaultPrefillStepSize`
+    /// (4096, since every layer here carries an MoE FFN). This field used
+    /// to hardcode 1024, silently overriding that tuned engine default
+    /// down to a quarter of its value on every real generation call. A
+    /// chunk-size sweep on an M5 Max (Qwen3.6-35B-A3B 4-bit, T =
+    /// 1024..32768, 3 interleaved trials per cell, `FFAI_PREFILL_STEP`
+    /// override) found the outer prefill chunk boundary has zero
+    /// numerical effect at this chunk-size range: `--dump-prefill-logits`
+    /// cosine was exactly 1.0 (bit-identical, not just close) at every
+    /// chunk size tested against the old 1024 default, and greedy
+    /// 32-token generation matched token-for-token across chunk sizes.
+    /// So raising the default from 1024 to 4096 is a pure throughput
+    /// lever here, not a quality tradeoff: it recovered 3.5 to 6.9
+    /// percent prefill throughput at T >= 4096 (drift-robust min of 3
+    /// interleaved trials), with no measurable change at T <= 1024
+    /// (already a single chunk there). 8192 was also swept and
+    /// rejected as the default: no further throughput win over 4096 at
+    /// T=16384/32768 (slightly slower, in fact) while peak process RSS
+    /// roughly doubled (about 80-88 GB vs 59-61 GB at T=16384/32768 on
+    /// this 128 GB machine). `FFAI_PREFILL_STEP=<n>` still overrides
+    /// either value for further experimentation.
     public static let defaultGenerationParameters = GenerationParameters(
-        prefillStepSize: 1024,
         temperature: 1.0,
         topP: 0.95,
         topK: 20,
@@ -986,68 +1008,54 @@ public final class Qwen35MoEFFN: Module {
         return result
     }
 
-    /// T-batched MoE FFN. `xNormFlat` is `[T, hidden]` flat; returns
-    /// `[T, hidden]` flat. `MoELayer.decodeMany` commits the caller's
-    /// `cmd`; the shared-expert SwiGLU runs on a fresh `work` cmd and
-    /// the per-row sigmoidScalarFMA fan-out on fresh `fmaCmd`s. Mirrors
-    /// the single-token `forward`'s commit pattern; the returned
-    /// `outFlat` is in-flight on the last committed `fmaCmd` and
-    /// downstream reads hazard-track against it.
+    /// T-batched MoE FFN. Optional `residual` folds `postMix + ffn` into
+    /// the final FMA cmd (caller must not add residual again). DEVPLAN2
+    /// chains shared + routed + FMA on one buffer and commits once.
     func forwardMany(
         _ xNormFlat: Tensor, t: Int,
-        cmd: MTLCommandBuffer, device: Device
+        cmd: MTLCommandBuffer, device: Device,
+        residual: Tensor? = nil
     ) -> Tensor {
         let dt = xNormFlat.dtype
-        let dtBytes = dt.byteSize
+        let chainOnCmd = moe.prefillChainsOnCallerCmd
+        let work = chainOnCmd ? cmd : device.makeCommandBuffer()
 
-        // ── Routed top-K experts — commits `cmd`. ────────────────────────
-        let routed = moe.decodeMany(xNormFlat, t: t, cmd: cmd, device: device)
-        // routed: `[T, hidden]` flat, on `work`-internal-committed cmd.
-
-        // ── Shared expert batched: SwiGLU + scalar gate logit ────────────
-        let work = device.makeCommandBuffer()
+        // Shared expert first (independent of routed).
         let xRows = xNormFlat.reshaped(to: [t, hidden])
         let sgAll = sharedGateProj.callMany(xRows, t: t, on: work, device: device)
         let suAll = sharedUpProj.callMany(xRows, t: t, on: work, device: device)
-        // Fused SwiGLU.
-        let sharedInnerAll = Ops.swiglu(gate: sgAll, up: suAll, on: work)
+        // In-place SwiGLU into gate slab — same pattern as MoELayer.decodeMany.
+        let sharedInnerAll = Ops.swiglu(gate: sgAll, up: suAll, on: work, into: sgAll)
         let sharedOutAll = sharedDownProj.callMany(
             sharedInnerAll, t: t,
             on: work, device: device)
-        // sharedExpertGate is `hidden → 1`; per row this is one scalar.
         let gateLogitsAll = sharedExpertGate.callMany(
             xRows, t: t,
             on: work, device: device)
-        work.commit()
 
-        // ── Per-row sigmoidScalarFMA fan-out ─────────────────────────────
-        // `Ops.sigmoidScalarFMA` requires a `[1]` scalar gate; row-slice
-        // each token's gate logit + run the FMA. T fmaCmd commits but
-        // each is one small kernel that pipelines on the queue.
+        let routed = moe.decodeMany(
+            xNormFlat, t: t, cmd: cmd, device: device,
+            commitAtEnd: !chainOnCmd)
+
         let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
-        for r in 0 ..< t {
-            let gateRow = Tensor(
-                buffer: gateLogitsAll.buffer,
-                offset: gateLogitsAll.offset + r * dtBytes,
-                shape: [1], dtype: dt)
-            let sharedRow = Tensor(
-                buffer: sharedOutAll.buffer,
-                offset: sharedOutAll.offset + r * hidden * dtBytes,
-                shape: [hidden], dtype: dt)
-            let routedRow = Tensor(
-                buffer: routed.buffer,
-                offset: routed.offset + r * hidden * dtBytes,
-                shape: [hidden], dtype: dt)
-            let outRow = Tensor(
-                buffer: outFlat.buffer,
-                offset: outFlat.offset + r * hidden * dtBytes,
-                shape: [hidden], dtype: dt)
-            let fmaCmd = device.makeCommandBuffer()
-            Ops.sigmoidScalarFMA(
-                gate: gateRow, value: sharedRow, base: routedRow,
-                into: outRow, on: fmaCmd)
-            fmaCmd.commit()
+        if let residual = residual {
+            precondition(
+                residual.elementCount == t * hidden
+                    && residual.dtype == dt,
+                "Qwen35MoEFFN.forwardMany: residual must be [T·hidden] \(dt)")
+            // Fused 4-input prefill: result = residual + routed +
+            // sigmoid(gate) · sharedOut. Saves 1 dispatch + 1
+            // [T·hidden] DRAM roundtrip vs sigmoidRowFMA then Ops.add.
+            Ops.sigmoidRowFMAResidual(
+                gate: gateLogitsAll, value: sharedOutAll, base: routed,
+                residual: residual, into: outFlat, t: t, hidden: hidden,
+                on: work)
+        } else {
+            Ops.sigmoidRowFMA(
+                gate: gateLogitsAll, value: sharedOutAll, base: routed,
+                into: outFlat, t: t, hidden: hidden, on: work)
         }
+        work.commit()
         return outFlat
     }
 }
@@ -1126,6 +1134,284 @@ public final class GDNLayerCache: LayerCacheProtocol, @unchecked Sendable {
     }
 }
 
+// ─── Prefill hot-path env var reference ──────────────────────────────
+//
+// This campaign added a number of env toggles across the Qwen3x prefill
+// and decode paths (attention, GDN, MoE). They have mixed polarity
+// (some opt IN to a new path with `=1`, some opt OUT of a new default
+// back to an older path), so this block is the one place to look them
+// up rather than re-deriving polarity from call sites scattered across
+// this file, `Ops.swift`, and `MoELayer.swift`. Grep each name for the
+// exact gate if the summary below isn't enough context.
+//
+// Reproduce the pre-campaign stack (attention back to the original
+// per-query-row kernel, GDN back to the generic non-specialized path,
+// prefill chunk size back to the old 1024 default):
+//
+//   FFAI_SDPA_LEGACY_D256=1 FFAI_GDN_NO_PREP_CHUNK_FAST=1 \
+//   FFAI_PREFILL_STEP=1024 <ffai command>
+//
+// (`FFAI_SDPA_LEGACY_D256=1` alone reverts d=256 attention two steps
+// past the current default: MMA -> Q-tiled -> legacy. Leave
+// `FFAI_SDPA_QTILED_D256` unset when using it, see the table below.)
+//
+// ── Chunk size ─────────────────────────────────────────────────────
+//   FFAI_PREFILL_STEP=<n>
+//     Override the prefill chunk size. Opt-in override, highest
+//     priority link in the resolution chain (env, then
+//     `GenerationParameters.prefillStepSize`, then
+//     `engine.defaultPrefillStepSize`) in both the real generate path
+//     (`Generate.swift`) and the `--dump-prefill-logits` diagnostic
+//     (`GenerateCommand.swift`): the two paths must resolve through
+//     the same chain or a param-level override silently diverges
+//     between what generation runs and what the diagnostic validates.
+//     Default when unset: family-tuned (4096 for Qwen3.5 MoE / 3.6).
+//
+// ── Attention (d=256 full-attention layers) ────────────────────────
+//   FFAI_SDPA_QTILED_D256=1
+//     Revert prefill d=256 attention from the default MMA kernel
+//     (`Ops.sdpaPrefillMmaD256`) to the prior scalar Q-tiled kernel
+//     (`Ops.sdpaPrefillQtiledD256`). Opt-out of the current default.
+//   FFAI_SDPA_LEGACY_D256=1
+//     Revert further, to the original per-query-row kernel
+//     (`ffai_sdpa_multi_d256`, one threadgroup per query with no K/V
+//     reuse across rows). Only takes effect when
+//     `FFAI_SDPA_QTILED_D256` is NOT also set. Opt-out, two steps back.
+//   FFAI_SDPA_BK16=0
+//     Revert the MMA d256 kernel's f16/bf16 dispatch from the BK=16
+//     K-block follow-up (`ffai_sdpa_prefill_mma_d256_bk16`) back to the
+//     BK=8 kernel (`ffai_sdpa_prefill_mma_d256`). f32 always uses BK=8
+//     (BK=16's threadgroup allocation exceeds the 32 KiB ceiling at
+//     f32, so there is no f32 BK=16 kernel to route to). Default: BK=16
+//     ON for f16/bf16. Only takes effect via `Ops.sdpaPrefillMmaD256`,
+//     so it composes with `FFAI_SDPA_QTILED_D256` / `FFAI_SDPA_LEGACY_D256`
+//     above the same way (those two bypass this kernel entirely; this
+//     gate only matters when neither is set).
+//   FFAI_FUSED_QKV_PREFILL=1
+//     Force the fused single-dispatch QKV kernel at prefill T > 8 too
+//     (normally reserved for T <= 8, where it beats the 3-separate-MMA-
+//     qmm default; routing it to large prefill M costs ~16% e2e).
+//     Opt-in, A/B only.
+//   FFAI_NO_FUSED_QKV=1
+//     Opt out of the fused-QKV eligibility check entirely (affects the
+//     small-T / decode routing above, not the general prefill default).
+//   FFAI_SDPA_2PASS_THRESHOLD=<n>
+//     Decode-only. KV length above which 2-pass flash-decoding kicks
+//     in for the attention mixer. Default 1024 when unset.
+//
+// ── Dense int4 GEMM (batched-prefill quantized projections, T > 1) ──
+//   Routes through `Ops.dequantGemmDynamicM` / `Ops.dispatchQmmMma`, the
+//   shared entry for `QuantizedLinear.callMany`, covering GDN
+//   in-projections, attention QKV/out, and every other dense int4
+//   projection at prefill. Priority order at bits=4:
+//   `ffai_qmm_coop` (BN=64) > `ffai_qmm_mma_mpp` (BN=32) > `ffai_qmm_mma`
+//   (manual simdgroup fallback).
+//   FFAI_QMM_COOP=0
+//     Force off the BN=64 wide-N cooperative-tensor kernel
+//     (`ffai_qmm_coop`); falls through to the MPP tier below. Default: ON
+//     on `Ops.mppAutoCapable` hardware (Apple GPU Family 9+ / macOS 26+)
+//     when the shape is eligible (`n % 64 == 0`, group_size 64). The
+//     fastest of the three dense int4 tiers on every shape measured.
+//   FFAI_QMM_COOP=1
+//     Force the coop kernel on even off the auto-capability check (A/B
+//     only; the kernel needs the same MPP/NAX hardware support as
+//     `ffai_qmm_mma_mpp`, this does not bypass that requirement).
+//     CAUTION: unlike the shape/group-size checks (still enforced),
+//     forcing this on hardware below the MPP/NAX capability floor is
+//     untested territory - the auto-capability gate exists specifically
+//     to keep this kernel off such hardware, and no test in this repo
+//     exercises the forced-on + incapable-hardware combination.
+//   FFAI_QMM_MPP=0 | =1
+//     Force off / on the BN=32 MPP/NAX cooperative-tensor kernel
+//     (`ffai_qmm_mma_mpp`), the tier below coop. Default: auto-detected
+//     the same way as `FFAI_QMM_COOP`. Only reached when coop is off or
+//     the shape fails coop's `n % 64 == 0` guard (e.g. some vision-tower
+//     FFN dims).
+//
+// ── GDN (Gated DeltaNet recurrent mixer) ────────────────────────────
+//   FFAI_GDN_NO_FUSED_PREP=1
+//     Opt out of the fused prep+recurrence single-token kernel
+//     (`ffai_gated_delta_prep_step`); revert to the legacy host-loop
+//     prep + `Ops.gatedDeltaStep`. Default: fused ON.
+//   FFAI_NO_FUSED_GDN_4=1
+//     Opt out of the batched 4-projection (qkv/z/b/a) single-dispatch
+//     fast path at decode. Default: ON when the shape is eligible
+//     (int4 weights, matching group size, dims divisible by 8/512).
+//   FFAI_GDN_NO_PREP_CHUNK=1
+//     Opt out of the chunked prep+recurrence prefill path
+//     (`forwardManyChunked`); revert to the per-token T-loop. Default:
+//     chunked ON.
+//   FFAI_GDN_NO_PREP_CHUNK_FAST=1
+//     Opt out of the shape-specialized fast GDN prep_chunk kernel
+//     (`Ops.gatedDeltaPrepChunkFast`, Dk/Dv/Hv/Hk baked as compile-time
+//     constants instead of `#[constexpr]` runtime params, measured
+//     ~3.7-4.2x faster at the production shape); revert to the generic
+//     kernel. Default: fast ON when the shape matches (Dk=Dv=128,
+//     Hv=32, Hk=16) and the WY path below is not active.
+//   FFAI_GDN_WY=1
+//     Opt in to the chunked-WY prefill pipeline (`ffai_gdn_wy_plan` +
+//     `ffai_gdn_wy_scan`) at T >= 64. Default: OFF, uses
+//     `gatedDeltaPrepChunk`/`gatedDeltaPrepChunkFast` instead.
+//   FFAI_NO_CONV1D_MANY=1
+//     Opt out of the batched T-token conv1d dispatch
+//     (`conv1dCausalStepSiluCastMany`); revert to per-token conv
+//     dispatches. Default: batched ON (conv_kernel == 4 only).
+//
+// ── Model-level forward routing ─────────────────────────────────────
+//   FFAI_LEGACY_FORWARDMANY=1
+//     Revert the whole multi-token decode path
+//     (`Qwen35Model.forwardMany`) to the old per-token loop. Default:
+//     batched forward.
+//   FFAI_PROFILE_LAYERS=1 | 2
+//     Per-layer commit+wait for GPU-time attribution (kills
+//     pipelining); =2 also records per-layer phase timings. Default:
+//     off (no profiling overhead).
+//
+// ── MoE (Qwen3.5 MoE checkpoints; `MoELayer` / `Qwen35MoEFFN`) ──────
+//   FFAI_MOE_BGEMM=1
+//     Opt in to the batched gather-BGEMM fast path at DECODE (T=1)
+//     only. It currently regresses vs the sequential per-expert matvec
+//     path at this model's topK=8/m_total=8 decode shape, so it stays
+//     opt-in there. Prefill (`decodeMany`, T > 1) always uses BGEMM
+//     unconditionally; this var does not affect prefill.
+//   FFAI_MOE_BGEMM_BM64=1
+//     Within the BGEMM path, opt in to the bm64 NAX cooperative-tensor
+//     tile kernel for mTotal >= 1024. Default: OFF (bm16 wins by
+//     3-5% end-to-end for this model's narrow experts); bm64 is kept
+//     available for wider-expert models or other hardware.
+//   FFAI_MOE_BGEMM_NO_BM64=1
+//     Force bm64 off even if `FFAI_MOE_BGEMM_BM64=1` is also set.
+//   FFAI_MOE_BGEMM_BM8=1
+//     Opt in to the bm8 tile kernel for decode T=1 (topK <= 8,
+//     mTotal <= 8). Default: OFF (bm16 default).
+//   FFAI_MOE_BGEMM_FORCE_T1=1
+//     Force BGEMM to also engage at mTotal == 1, for A/B comparison.
+//   FFAI_MOE_BGEMM_MPP=1
+//     Force the MPP (NAX cooperative-tensor, Apple GPU Family 9+ /
+//     macOS 26+) bm16 sub-variant on, bypassing the hardware
+//     auto-capability gate. Force off with `FFAI_MOE_BGEMM_NO_MPP=1`.
+//     Default: auto-detected (`FFAI_MOE_BGEMM_MPP_MIN=<mTotal>` sets an
+//     optional floor below which auto-MPP won't fire even on capable
+//     hardware; default floor 0 = always when hardware allows).
+//   FFAI_MOE_M1=1
+//     Route the decode-T=1 gather through the scalar `ffai_moe_gather
+//     _qmm_int4` kernel instead of the cooperative-tensor bm8/bm16/bm64
+//     variants (those lose ~15% to descriptor setup cost at T=1).
+//     Only takes effect when bm8 is not also selected.
+//   FFAI_MOE_GPU_ROUTER=0
+//     Opt out of the GPU-resident top-K router; revert to a per-token
+//     host `waitUntilCompleted` router. Default: GPU router ON.
+//   FFAI_MOE_NO_DEQUANT_GATE=1
+//     Opt out of caching the lazily-dequantized gate weight. Default:
+//     ON (cached) when the gate projection is 8-bit quantized.
+//   FFAI_MOE_TILEPLAN=0
+//     Opt out of the F-85 expert-aligned tile-plan gather-BGEMM
+//     (`ffai_moe_gather_qmm_mma_int4_bm16_mpp_tileplan`) at prefill,
+//     reverting to the fixed-16-row-stride bm16 default. Tile
+//     boundaries normally come from a device-built plan
+//     (`ffai_moe_build_tile_plan`) instead of that fixed stride, so
+//     every dispatched tile is single-expert and pays exactly one
+//     K-dimension pass, fixing the 28-39% skewed-routing penalty the
+//     fixed-stride kernel pays at low T. Only takes effect on the
+//     DEVPLAN2 device-sorted-plan path (see `DEVPLAN2` below) and
+//     when bm64/bm8 are not also selected. Default: ON. Gated on
+//     `--dump-prefill-logits` cosine 1.0 (bit-exact) + greedy-token
+//     match at T=512/1024/4096/16384 and a 1.02-1.03x e2e prefill win
+//     at every T from 512 through 32768, no high-T regression. Tests:
+//     kernels repo `moe_build_tile_plan_correctness.rs` +
+//     `moe_gather_qmm_tileplan_correctness.rs`.
+//   FFAI_MOE_COOP=0
+//     Opt out of the F-85 coop-core MoE gather GEMM (BM=32 tile plan
+//     over `ffai_moe_gather_qmm_coop`) at prefill, reverting to the
+//     BM=16 tileplan default. Only takes effect where `FFAI_MOE_TILEPLAN`
+//     is also active and the coop core's own shape gate passes
+//     (`nOut % 64 == 0` on both legs, `groupSize == 64`) - a layer that
+//     fails either check stays on the BM=16 tileplan path regardless of
+//     this flag. Default: auto-detected on `Ops.mppAutoCapable` hardware
+//     (Apple GPU Family 9+ / macOS 26+ - the same requirement
+//     `FFAI_QMM_COOP`'s auto-default checks, since this kernel wraps the
+//     same `matmul2d` cooperative-tensor core). `FFAI_MOE_COOP=1` force-
+//     enables past the hardware check (untested on incapable hardware,
+//     same caveat as `FFAI_QMM_COOP=1`). Isolated kernel bench shows
+//     +31-98% GB/s vs the BM=16 tileplan incumbent across mTotal
+//     4096/16384/32768; `--dump-prefill-logits` bit-exact (cosine 1.0,
+//     max_abs_dlogit 0.0) at T=512/1024/4096/16384; e2e prefill win
+//     14-23% at every T from 512 through 32768 (measured on
+//     `Ops.mppAutoCapable` hardware).
+//   FFAI_MOE_COOP_INDIRECT=0
+//     Opt out of the idle-tile-cost indirect dispatch for the coop GEMM
+//     above (`dispatchThreadgroupsIndirect` fed the device-computed real
+//     tile count instead of the static worst-case-capacity bound),
+//     reverting to the old direct/capacity dispatch - kept for A/B
+//     measurement, not a production fallback (the old path pays 10-21%
+//     idle-tile cost at the F-85 low-context mTotal targets). Only takes
+//     effect where `FFAI_MOE_COOP` is also active (both the plain path
+//     and the paired lever's "own" dispatch below). Default: ON.
+//   FFAI_MOE_PAIRED=1
+//     Opt IN to the F-85 two-expert tile-pairing lever
+//     (`ffai_moe_gather_qmm_coop_paired`) at prefill. Below
+//     `FFAI_MOE_PAIRED_MAX_MTOTAL` (see below), the coop tile plan splits
+//     into an "own" plan (full/17-31-row remainders, fed the UNCHANGED
+//     `ffai_moe_gather_qmm_coop` dispatch) and a "paired" plan (1-16-row
+//     remainders packed two experts to a tile, fed the new paired-GEMM
+//     dispatch), eliminating the masked-out padding those short
+//     remainders otherwise cost. Only takes effect where
+//     `FFAI_MOE_TILEPLAN` + `FFAI_MOE_COOP` are also active.
+//     DEFAULT OFF (opt-in, unlike every other MoE gate in this section -
+//     unset or `=0` stays off, `=1` enables). Isolated kernel bench
+//     GO/NO-GO shows a 7-12% win at mTotal=4096, 4-9% at 8192, parity at
+//     16384, and a 3-6% loss at 32768, but the real wiring must always
+//     dispatch the paired GEMM at its static worst-case tile capacity
+//     (no GPU-to-CPU readback of the real paired-tile count before
+//     dispatch), which the indirect-dispatch fix below only partially
+//     recovers - see `pairedEnabled`'s doc in `MoELayer.swift` for the
+//     full measurement history of why this stays opt-in. Gated on
+//     `--dump-prefill-logits` bit-exact (cosine 1.0, max_abs_dlogit 0.0)
+//     + greedy-token match at T=512/1024/4096/16384. Tests: kernels repo
+//     `moe_build_tile_plan_bm32_own_correctness.rs` +
+//     `moe_build_tile_plan_bm32_paired_correctness.rs` +
+//     `moe_gather_qmm_coop_paired.rs`'s kernel_tests.
+//   FFAI_MOE_PAIRED_INDIRECT=0
+//     Opt out of the paired-GEMM's own idle-tile-cost indirect dispatch
+//     (the root-cause fix for the worst-case-capacity regression
+//     `FFAI_MOE_PAIRED` above pays), reverting to the old direct/capacity
+//     dispatch - kept for A/B measurement against the indirect fix, not
+//     a production fallback. Only takes effect where `FFAI_MOE_PAIRED`
+//     is also active. Default: ON.
+//   FFAI_MOE_PAIRED_MAX_MTOTAL=<mTotal>
+//     Override the tile-pairing mTotal threshold (paired dispatch runs
+//     when mTotal < this value). Default: 16384, the measured
+//     parity boundary - chosen over 32768 (a measured 3-6% loss there)
+//     so the default never dispatches the extra pass where it cannot
+//     win.
+//   FFAI_MOE_COUNTING_SORT=0
+//     Opt out of the F-85 bucketed counting-sort replacement for
+//     `ffai_moe_sort_plan` (histogram -> prefix-sum -> scatter, same
+//     stable expert-ascending order), reverting to the original kernel's
+//     O(mTotal^2) per-thread linear scan. Only takes effect on the
+//     DEVPLAN2 device-sorted-plan path (`useDevPlan2`) - the only path
+//     that calls the sort-plan kernel at all. Default: ON.
+//     `--dump-prefill-logits` byte-identical at every T tested; isolated
+//     kernel bench shows the win growing with mTotal: ~6-9x at
+//     4096/8192, ~10-15x at 16384, ~38x at 32768.
+//   FFAI_MOE_PARALLEL_PLAN=0
+//     Opt out of the parallelized MoE tile-plan builders
+//     (`ffai_moe_build_tile_plan_parallel` / `_bm32_parallel` /
+//     `_bm32_own_parallel` - one threadgroup per expert instead of a
+//     single threadgroup owning the whole plan build), reverting to the
+//     single-threadgroup builders. Applies wherever `FFAI_MOE_TILEPLAN`
+//     is active - the plain bm16 path, the `FFAI_MOE_COOP` path, and the
+//     `FFAI_MOE_PAIRED` lever's "own" dispatch. Default: ON. Byte-exact
+//     against the original single-threadgroup builders across the full
+//     kernels-repo fixture set (dual CPU-oracle + live-original-kernel
+//     checks).
+//   DEVPLAN2=0
+//     Opt out of chaining the MoE prefill expert path onto the
+//     caller's own command buffer. Note: no `FFAI_` prefix (older
+//     name, predates this campaign's convention). Default: chains on
+//     the caller's command buffer when the GPU router is enabled and
+//     gating is softmax-then-topK.
+
 // ─── Qwen35GDNMixer — Gated Delta Net recurrent mixer ────────────────
 //
 // GPU owns every projection, the conv, the GDN recurrence kernel, the
@@ -1173,8 +1459,13 @@ public final class Qwen35GDNMixer: Module {
     //   kNormWeightF32 : [Hk·Dk] fp32, filled with `invKeyScale`.
     //   aLogTF32       : [Hv]    fp32.
     //   dtBiasTF32     : [Hv]    fp32.
+    //   negExpALogTF32 : [Hv]    fp32, `-exp(a_log)` — precomputed once
+    //                    here (host-side, `a_log` is a static per-head
+    //                    weight) for the chunked-WY prefill path's
+    //                    `Ops.gdnGateBeta`, which needs `g =
+    //                    exp(-exp(a_log)·dt)` but has no GPU negate op.
     let qNormWeightF32, kNormWeightF32: Tensor
-    let aLogTF32, dtBiasTF32: Tensor
+    let aLogTF32, dtBiasTF32, negExpALogTF32: Tensor
 
     /// fp32 epsilon as a 1-element buffer for `Ops.gatedMixerNorm`.
     /// Built once in init so the GPU-side phase-2 path doesn't pay an
@@ -1187,6 +1478,19 @@ public final class Qwen35GDNMixer: Module {
     /// it — when fused, the mixer keeps `cmd` in-flight so the residual
     /// add + FFN chain onto the same command buffer.
     let fused: Bool
+
+    /// Chunked-WY prefill pipeline eligibility (shape half of `useWY` in
+    /// `forwardManyChunked`; the `t >= 64` half stays a per-call check
+    /// since `t` varies). Cached at init for the same reason as `fused`
+    /// above - `FFAI_GDN_WY` and the head-dim shape guards are all
+    /// instance-constant, so re-reading the env on every chunk was a
+    /// dictionary lookup this mixer's forward path never needed.
+    let wyShapeEligible: Bool
+    /// Shape-specialized fast prep_chunk kernel eligibility (shape +
+    /// env half of `useFast` in `forwardManyChunked`; the `!useWY` half
+    /// stays a per-call check since `useWY` depends on per-call `t`).
+    /// Cached at init, same reasoning as `wyShapeEligible` above.
+    let fastPrepChunkEligible: Bool
 
     /// Pre-allocated per-call scratch tensors. The fused GDN path
     /// writes / reads these inside one command buffer per decode token;
@@ -1272,6 +1576,7 @@ public final class Qwen35GDNMixer: Module {
             [Float](repeating: kScale, count: hkDk), device: device)
         self.aLogTF32 = makeF32Tensor35(aLog, device: device)
         self.dtBiasTF32 = makeF32Tensor35(dtBias, device: device)
+        self.negExpALogTF32 = makeF32Tensor35(aLog.map { -Foundation.exp($0) }, device: device)
         self.epsBufFused = makeF32Tensor35([eps], device: device)
         // Fused-prep is DEFAULT ON for Qwen3.6-A3B. The underlying
         // `ffai_gated_delta_prep_step_{bf16,f16}` kernel was tuned for
@@ -1289,6 +1594,15 @@ public final class Qwen35GDNMixer: Module {
         self.fused =
             numValueHeads % 32 == 0
             && ProcessInfo.processInfo.environment["FFAI_GDN_NO_FUSED_PREP"] == nil
+        // See `wyShapeEligible`/`fastPrepChunkEligible` doc above - cached
+        // once here instead of read from `forwardManyChunked` on every
+        // chunk.
+        self.wyShapeEligible =
+            ProcessInfo.processInfo.environment["FFAI_GDN_WY"] != nil
+            && valueHeadDim % 32 == 0 && keyHeadDim % 16 == 0 && valueHeadDim % 16 == 0
+        self.fastPrepChunkEligible =
+            keyHeadDim == 128 && valueHeadDim == 128 && numValueHeads == 32 && numKeyHeads == 16
+            && ProcessInfo.processInfo.environment["FFAI_GDN_NO_PREP_CHUNK_FAST"] == nil
 
         // Per-decode-token scratch — pre-allocated once at init so the
         // fused GDN path doesn't pay 6 × MTLBuffer allocations per call.
@@ -1395,6 +1709,7 @@ public final class Qwen35GDNMixer: Module {
         _ xNorm: Tensor, cache: GDNLayerCache,
         cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
+        return Profile.signpost("gdn.forward") { () -> Tensor in
         // ── GPU phase 1: projections + conv + SiLU ────────────────────
         // 4-projection shared-encoder fast path when all inProj are int4
         // QuantizedLinear with the same groupSize. Saves 3 encoder
@@ -1651,6 +1966,7 @@ public final class Qwen35GDNMixer: Module {
             phase3.waitUntilCompleted()
         }
         return result
+        }  // Profile.signpost("gdn.forward")
     }
 
     /// T-batched GDN mixer forward. Returns `[T, hidden]` flat. Requires
@@ -1884,17 +2200,85 @@ public final class Qwen35GDNMixer: Module {
             shape: [t * numValueHeads * valueHeadDim],
             dtype: .f32, device: device)
 
-        Ops.gatedDeltaPrepChunk(
+        // Per-head RMSNorm of q/k, computed once per (b, t, hk_idx) —
+        // gatedDeltaPrepChunk's own grid would otherwise redundantly
+        // recompute it `valueHeadDim · (numValueHeads/numKeyHeads)` times.
+        let qNormedAll = Tensor.empty(
+            shape: [t * numKeyHeads * keyHeadDim], dtype: .f32, device: device)
+        let kNormedAll = Tensor.empty(
+            shape: [t * numKeyHeads * keyHeadDim], dtype: .f32, device: device)
+        Ops.gatedDeltaQKNormPrepass(
             convOut: convOutAllF32,
-            aLog: aLogTF32, dtBias: dtBiasTF32,
-            aRaw: aRawF32All, bRaw: bRawF32All,
             qNormWeight: qNormWeightF32, kNormWeight: kNormWeightF32,
-            stateIn: cache.gdn.current, stateOut: cache.gdn.next,
-            y: yF32All,
-            tLen: tLenScalar,
+            qNormed: qNormedAll, kNormed: kNormedAll,
+            tLen: tLenScalar, tCount: t,
             batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
             hv: numValueHeads, hk: numKeyHeads,
             on: cmd)
+
+        // `FFAI_GDN_WY=1` opts into the chunked-WY prefill pipeline
+        // (`ffai_gdn_wy_plan` + `ffai_gdn_wy_scan`, see `Ops.swift`) —
+        // default OFF, `gatedDeltaPrepChunk` above stays the production
+        // path untouched. The WY kernels' v1 require `t_len` to be an
+        // exact multiple of their fixed chunk size `c=64`; `Ops
+        // .gatedDeltaWYPrefill` now pads any ragged tail up to a multiple
+        // of 64 internally (zero q/k/v, `g=1`/`beta=0` no-op tokens — see
+        // its doc comment), so the only remaining fallback to
+        // `gatedDeltaPrepChunk` is `t < 64` (no full chunk to pad up to at
+        // all).
+        // Env + shape eligibility cached at init (`wyShapeEligible`) - only
+        // the `t >= 64` half varies per call.
+        let useWY = wyShapeEligible && t >= 64
+        // Shape-specialized fast path: dispatches
+        // `ffai_gated_delta_prep_chunk_fast_d128_128_32_16` in place of the
+        // generic `gatedDeltaPrepChunk`: same math, same grid/TG geometry,
+        // but Dk/Dv/Hv/Hk baked as compile-time constants instead of
+        // `#[constexpr]` runtime buffer params, which is what let the Metal
+        // compiler register-promote the per-lane recurrence state (measured
+        // ~3.7-4.2x faster at this exact shape; see `Ops.gatedDeltaPrepChunkFast`
+        // doc for the root-cause writeup). Only valid at Qwen3.6-35B-A3B's
+        // production GDN shape, so guard on the exact dims before dispatching,
+        // and keep an escape hatch back to the generic kernel for any other
+        // GDN-bearing shape or for A/B verification. Env + shape eligibility
+        // cached at init (`fastPrepChunkEligible`) - only the `!useWY` half
+        // varies per call (`useWY` itself depends on per-call `t`).
+        let useFast = !useWY && fastPrepChunkEligible
+        if useWY {
+            Ops.gatedDeltaWYPrefill(
+                convOut: convOutAllF32,
+                dtBias: dtBiasTF32, negExpALog: negExpALogTF32,
+                aRaw: aRawF32All, bRaw: bRawF32All,
+                qNormed: qNormedAll, kNormed: kNormedAll,
+                stateIn: cache.gdn.current, stateOut: cache.gdn.next,
+                y: yF32All,
+                tLen: tLenScalar, t: t,
+                dk: keyHeadDim, dv: valueHeadDim,
+                hv: numValueHeads, hk: numKeyHeads,
+                on: cmd, device: device)
+        } else if useFast {
+            Ops.gatedDeltaPrepChunkFast(
+                convOut: convOutAllF32,
+                aLog: aLogTF32, dtBias: dtBiasTF32,
+                aRaw: aRawF32All, bRaw: bRawF32All,
+                qNormed: qNormedAll, kNormed: kNormedAll,
+                stateIn: cache.gdn.current, stateOut: cache.gdn.next,
+                y: yF32All,
+                tLen: tLenScalar,
+                batchSize: 1,
+                on: cmd)
+        } else {
+            Ops.gatedDeltaPrepChunk(
+                convOut: convOutAllF32,
+                aLog: aLogTF32, dtBias: dtBiasTF32,
+                aRaw: aRawF32All, bRaw: bRawF32All,
+                qNormed: qNormedAll, kNormed: kNormedAll,
+                stateIn: cache.gdn.current, stateOut: cache.gdn.next,
+                y: yF32All,
+                tLen: tLenScalar,
+                batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
+                hv: numValueHeads, hk: numKeyHeads,
+                on: cmd)
+        }
         cache.gdn.swap()
         for _ in 0 ..< t { cache.advance() }
 
@@ -1989,6 +2373,18 @@ public final class Qwen35AttentionMixer: Module {
         return 1024  // default: only kick in at long KV
     }()
 
+    /// D=256 attention kernel tier, cached at init (same reasoning as
+    /// `sdpa2PassThreshold` above): `headDim` is instance-constant, so
+    /// re-deriving this from `ProcessInfo.environment` on every
+    /// `forwardMany` call (once per attention layer per prefill chunk,
+    /// and once per attention layer per decode token when the batched
+    /// decode path is active - see `FFAI_LEGACY_FORWARDMANY`) always
+    /// produced the same answer for the life of the mixer. Set together
+    /// in `init` below since `useLegacyD256Cached` only feeds
+    /// `useMmaD256Cached`'s derivation and has no other caller.
+    private let useMmaD256Cached: Bool
+    private let useQtiledD256Cached: Bool
+
     init(
         qProj: AnyLinear, kProj: AnyLinear, vProj: AnyLinear, oProj: AnyLinear,
         qNorm: RMSNorm, kNorm: RMSNorm,
@@ -2009,6 +2405,16 @@ public final class Qwen35AttentionMixer: Module {
         self.ropeTheta = ropeTheta
         self.attnOutputGate = attnOutputGate
         self.scale = 1.0 / Float(Double(headDim).squareRoot())
+        // See `useMmaD256Cached`/`useQtiledD256Cached` doc above - cached
+        // once here instead of read from `forwardMany` on every call.
+        let qtiledD256 =
+            headDim == 256
+                && ProcessInfo.processInfo.environment["FFAI_SDPA_QTILED_D256"] == "1"
+        let legacyD256 =
+            headDim == 256 && !qtiledD256
+                && ProcessInfo.processInfo.environment["FFAI_SDPA_LEGACY_D256"] == "1"
+        self.useQtiledD256Cached = qtiledD256
+        self.useMmaD256Cached = headDim == 256 && !legacyD256 && !qtiledD256
         if attnOutputGate {
             // Pre-build the row-index tensors for the gate-split
             // gather. Even rows = queries, odd rows = gates.
@@ -2098,6 +2504,7 @@ public final class Qwen35AttentionMixer: Module {
         _ xNorm: Tensor, position: Int, cache kv: any KVCacheProtocol,
         cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
+        return Profile.signpost("attn.forward") { () -> Tensor in
         // q_proj projects 2× heads when attn_output_gate is set: the
         // first `nHeads · headDim` elements are the queries, the second
         // half is the per-head sigmoid gate.
@@ -2294,6 +2701,7 @@ public final class Qwen35AttentionMixer: Module {
                 attnFlat, gate, on: cmd, into: attnFlatGatedScratch)
         }
         return oProj(attnFlat, on: cmd)
+        }  // Profile.signpost("attn.forward")
     }
 
     /// T-batched attention forward. `xNormFlat` is `[T, hidden]` flat
@@ -2327,17 +2735,20 @@ public final class Qwen35AttentionMixer: Module {
         let qDim = nHeads * headDim
         let kvDim = nKVHeads * headDim
 
-        // ── Projections — fused QKV qmm when constraints match ──────────
-        // `Ops.batchedQkvQmmFast` produces all three Q/K/V projections
-        // in ONE dispatch when the three QuantizedLinear projections
-        // share `bits=4`, `groupSize=64`, and `in_dim%512==0` /
-        // `out_*%8==0`. Replaces 3 `callMany` qmm encoders with 1 fused
-        // encoder. Predicate is the same `fusedQKVEligible` flag the
-        // single-token path uses.
+        // ── Projections ─────────────────────────────────────────────────
+        // `Ops.batchedQkvQmmFast` is a per-row GEMV-shaped kernel — a win
+        // at decode (T=1: 3 encoders → 1) but ~8× slower than the MMA qmm
+        // path at prefill M (measured M=1024: fused ~11.5ms vs 3 MMA qmms
+        // ~1.6ms per layer; routing it to prefill cost ~16% e2e). Use the
+        // fused kernel only for tiny T; batched prefill takes the three
+        // MMA `callMany` qmms. FFAI_FUSED_QKV_PREFILL=1 forces the old
+        // routing for A/B.
+        let fusedQkvAtPrefill =
+            ProcessInfo.processInfo.environment["FFAI_FUSED_QKV_PREFILL"] != nil || t <= 8
         let qOut: Tensor
         let kOut: Tensor
         let vOut: Tensor
-        if fusedQKVEligible, let bq = batchedQKV {
+        if fusedQKVEligible, fusedQkvAtPrefill, let bq = batchedQKV {
             let qDimW = bq.qW.shape[0]
             let kDimW = bq.kW.shape[0]
             let vDimW = bq.vW.shape[0]
@@ -2423,15 +2834,57 @@ public final class Qwen35AttentionMixer: Module {
             kFlat: kNormed, vFlat: vOut, t: t,
             positions: appendPositions, on: cmd)
 
-        // ── SDPA — fuse the T-token causal attention into ONE
-        // `Ops.sdpaMulti` dispatch. d=128 wraps `ffai_sdpa_multi`;
-        // d=256 (Qwen3.6-A3B full-attention layers) wraps
-        // `ffai_sdpa_multi_d256` — same semantics, head_dim-256 2-phase
-        // output reduction internally. T-loop `sdpaDecode` fallback only
-        // fires for other head_dims.
+        // ── SDPA (fuse the T-token causal attention into ONE dispatch).
+        // d=128 wraps `ffai_sdpa_multi` (`Ops.sdpaMulti`, unchanged). d=256
+        // (Qwen3.6-A3B full-attention layers) defaults to
+        // `Ops.sdpaPrefillMmaD256` (`ffai_sdpa_prefill_mma_d256`): a Stage-B
+        // follow-up on the F-85 attention attribution that replaces the
+        // prior default `ffai_sdpa_prefill_qtiled_d256`'s scalar simd_sum
+        // Q.K/P.V dot products with simdgroup-matrix MMA (BQ=32 vs the
+        // scalar kernel's BQ=16; motivated by Stage-A profiling showing
+        // the attention mixer's prefill GPU-time share growing from ~25%
+        // (T=4096) to ~70% (T=32768) while GDN/MoE per-chunk costs stayed
+        // flat). Quality gate (cosine vs the qtiled kernel) held
+        // >=0.994 at T=512..16384 across 3 non-repeating prompts per
+        // length, top1 match at every cell, deterministic greedy
+        // 32-token generation. Measured e2e prefill win on
+        // Qwen3.6-35B-A3B (M5 Max), median of 3 interleaved trials:
+        // 1.20x at T=4096, 1.67x at T=16384, 2.11x at T=32768 (the win
+        // grows with T, tracking attention's growing share of total
+        // prefill time). `FFAI_SDPA_QTILED_D256=1` reverts to the prior
+        // default (the scalar Q-tiled kernel) for bisection.
+        // `FFAI_SDPA_LEGACY_D256=1` reverts further, to the original
+        // `ffai_sdpa_multi_d256` (one threadgroup per (query, q_head),
+        // no K/V reuse across rows) that the F-85 campaign identified
+        // as the source of the original append-regime bandwidth waste.
+        // Tier selection is instance-constant (depends only on `headDim`
+        // and the env, both fixed for this mixer's lifetime) - cached
+        // once in `init` as `useMmaD256Cached`/`useQtiledD256Cached`
+        // instead of re-read from `ProcessInfo.environment` on every
+        // `forwardMany` call (once per attention layer per prefill chunk,
+        // and once per attention layer per decode token on the batched
+        // decode path).
+        let useMmaD256 = useMmaD256Cached
+        let useQtiled = useQtiledD256Cached
         let (cacheK, cacheV) = kv.prepareForAttention(on: cmd)
         let attnAll: Tensor
-        if headDim == 128 || headDim == 256 {
+        if useMmaD256 {
+            let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
+            attnAll = Ops.sdpaPrefillMmaD256(
+                q: qBlock, k: cacheK, v: cacheV,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
+                causal: true, scale: scale, on: cmd
+            ).reshaped(to: [t * qDim])
+        } else if useQtiled {
+            let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
+            attnAll = Ops.sdpaPrefillQtiledD256(
+                q: qBlock, k: cacheK, v: cacheV,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
+                causal: true, scale: scale, on: cmd
+            ).reshaped(to: [t * qDim])
+        } else if headDim == 128 || headDim == 256 {
             // qNormed is `[T, nHeads, headDim]` flat. Reshape into the
             // shape sdpaMulti expects (same buffer, no copy).
             let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
@@ -2584,18 +3037,26 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
             xNormFlat, t: t, cache: gc, cmd: cmd, device: device
         ).reshaped(to: [t * hidden])
 
-        // ── Residual add ────────────────────────────────────────────────
-        let postMix = Ops.add(hFlat, mixerOutFlat, on: cmd)
+        // Residual + post-norm (same fuse as attention when hidden fits).
+        let postMix: Tensor
+        let ffnNorm: Tensor?
+        if OpsValidation.validateAddRmsNorm(n: hidden) == nil {
+            let fused = Ops.addAndRmsNorm(
+                hFlat, mixerOutFlat,
+                weight: postNorm.weight, eps: postNorm.eps,
+                nRows: t, rowSize: hidden, on: cmd)
+            postMix = fused.residual
+            ffnNorm = fused.normed
+        } else {
+            postMix = Ops.add(hFlat, mixerOutFlat, on: cmd)
+            ffnNorm = nil
+        }
 
-        // ── FFN half — T-batched via qwen35ApplyFFNMany. ─────────────────
-        // For MoE FFN this dispatches `moe.decodeMany` (one BGEMM per
-        // gate/up/down at mTotal=T·topK + scatter-sum). For dense FFN
-        // it dispatches `mlp.forwardMany` (3 gemms). Mirrors the
-        // attention-layer's FFN dispatch.
         return qwen35ApplyFFNMany(
             ffn, postMix: postMix, t: t,
             postNorm: postNorm, hidden: hidden,
-            cmd: cmd, device: device)
+            cmd: cmd, device: device,
+            preNormed: ffnNorm)
     }
 }
 
@@ -2853,15 +3314,10 @@ private func qwen35ApplyFFNMany(
         let ffnOut = mlp.forwardMany(ffnNorm, t: t, cmd: cmd, device: device)
         return Ops.add(postMix, ffnOut.reshaped(to: [t * hidden]), on: cmd)
     case .moe(let moe):
-        // moe.forwardMany commits cmd; returns `[T, hidden]` flat on a
-        // fresh in-flight buffer. Run the residual add on a fresh
-        // addCmd so the returned tensor is independent of the
-        // already-committed cmd chain.
-        let ffnOut = moe.forwardMany(ffnNorm, t: t, cmd: cmd, device: device)
-        let addCmd = device.makeCommandBuffer()
-        let resultFlat = Ops.add(postMix, ffnOut, on: addCmd)
-        addCmd.commit()
-        return resultFlat
+        // Residual folded into forwardMany (no separate addCmd).
+        return moe.forwardMany(
+            ffnNorm, t: t, cmd: cmd, device: device,
+            residual: postMix)
     }
 }
 
@@ -3075,24 +3531,28 @@ public final class Qwen35Model: TextGenerating {
 
         // The embedding + layers run on internal buffers — never `cmd`.
         var workCmd = device.makeCommandBuffer()
-        var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
+        var h = Profile.signpost("model.embed") {
+            embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
+        }
         workCmd = tap.dumpLayerBoundary(
             h, label: "embed", layer: -1, cmd: workCmd, device: device)
 
-        for (i, layer) in layers.enumerated() {
-            h = layer.decode(
-                h, position: position, cache: caches[i],
-                cmd: workCmd, device: device)
-            // Refresh `workCmd` if the layer committed it.
-            let committed: Bool
-            switch layer {
-            case let l as Qwen35GDNLayer: committed = l.commitsCommandBuffer
-            case let l as Qwen35AttentionLayer: committed = l.commitsCommandBuffer
-            default: committed = false
+        Profile.signpost("model.layer_loop") {
+            for (i, layer) in layers.enumerated() {
+                h = layer.decode(
+                    h, position: position, cache: caches[i],
+                    cmd: workCmd, device: device)
+                // Refresh `workCmd` if the layer committed it.
+                let committed: Bool
+                switch layer {
+                case let l as Qwen35GDNLayer: committed = l.commitsCommandBuffer
+                case let l as Qwen35AttentionLayer: committed = l.commitsCommandBuffer
+                default: committed = false
+                }
+                if committed { workCmd = device.makeCommandBuffer() }
+                workCmd = tap.dumpLayerBoundary(
+                    h, label: "layer_out", layer: i, cmd: workCmd, device: device)
             }
-            if committed { workCmd = device.makeCommandBuffer() }
-            workCmd = tap.dumpLayerBoundary(
-                h, label: "layer_out", layer: i, cmd: workCmd, device: device)
         }
 
         // If the last layer was a non-committing attention layer with a
@@ -3111,8 +3571,10 @@ public final class Qwen35Model: TextGenerating {
         // Final norm + lm_head queue onto the caller's pristine `cmd`.
         // Fused rmsNorm+qgemv when lmHead is 4-bit QuantizedLinear with
         // matching constraints; falls back otherwise.
-        return qwen35FinalNormLmHead(
-            h: h, finalNorm: finalNorm, lmHead: lmHead, on: cmd)
+        return Profile.signpost("model.final_norm_lm_head") {
+            qwen35FinalNormLmHead(
+                h: h, finalNorm: finalNorm, lmHead: lmHead, on: cmd)
+        }
     }
 
     /// TextGenerating-protocol entry point for chunked prefill. Delegates
@@ -3284,7 +3746,18 @@ public final class Qwen35Model: TextGenerating {
         idsHost.withUnsafeBytes { _ = memcpy(idsBuf.contents(), $0.baseAddress!, t * 4) }
         let idsTensor = Tensor(buffer: idsBuf, offset: 0, shape: [t], dtype: .u32)
 
+        // FFAI_PROFILE_LAYERS=1|2: per-layer commit+wait for attribution
+        // only (kills pipelining). =2 also records per-layer phases.
+        // GPU windows cover the outer workCmd only — layers that commit
+        // internal buffers (MoE FFN paths) undercount slightly.
+        let profileLayers =
+            ProcessInfo.processInfo.environment["FFAI_PROFILE_LAYERS"] == "1"
+                || ProcessInfo.processInfo.environment["FFAI_PROFILE_LAYERS"] == "2"
+        let profilePerLayer =
+            ProcessInfo.processInfo.environment["FFAI_PROFILE_LAYERS"] == "2"
+
         var workCmd = device.makeCommandBuffer()
+        let embWall0 = profileLayers ? CFAbsoluteTimeGetCurrent() : 0
         var h = embedTokens(idsTensor, on: workCmd).reshaped(to: [t * hidden])
         // h is `[T, hidden]` flat. Dtype follows the embedding output —
         // for QuantizedEmbedding that's `scales.dtype` (model running
@@ -3294,14 +3767,51 @@ public final class Qwen35Model: TextGenerating {
         let dt = h.dtype
         let dtBytes = dt.byteSize
 
+        if profileLayers {
+            workCmd.commit()
+            workCmd.waitUntilCompleted()
+            let embWall = CFAbsoluteTimeGetCurrent() - embWall0
+            let embGpu = max(0, workCmd.gpuEndTime - workCmd.gpuStartTime)
+            Profile.shared.recordPhase("prefill.embed_wall", durationS: embWall)
+            Profile.shared.recordPhase("prefill.embed_gpu", durationS: embGpu)
+            workCmd = device.makeCommandBuffer()
+        }
+
+        var attnWall = 0.0, attnGpu = 0.0
+        var gdnWall = 0.0, gdnGpu = 0.0
+        var otherWall = 0.0, otherGpu = 0.0
+        var nAttn = 0, nGdn = 0, nOther = 0
+
         for (i, layer) in layers.enumerated() {
+            // Drain ObjC autorelease traffic from per-layer Tensor.empty /
+            // makeBuffer so multi-chunk prefill does not pin intermediate
+            // MTLBuffers until the outer pool drains (#38 class of bug).
+            autoreleasepool {
+            let layerStart = profileLayers ? CFAbsoluteTimeGetCurrent() : 0
             if let attn = layer as? Qwen35AttentionLayer {
                 h = attn.decodeMany(
                     h, t: t, startPosition: startPosition,
                     cache: caches[i],
                     cmd: workCmd, device: device)
                 // attn.decodeMany commits workCmd if MoE FFN. Refresh.
-                if attn.commitsCommandBuffer {
+                if profileLayers {
+                    if !attn.commitsCommandBuffer {
+                        workCmd.commit()
+                    }
+                    workCmd.waitUntilCompleted()
+                    let wall = CFAbsoluteTimeGetCurrent() - layerStart
+                    let gpu = max(0, workCmd.gpuEndTime - workCmd.gpuStartTime)
+                    attnWall += wall
+                    attnGpu += gpu
+                    nAttn += 1
+                    if profilePerLayer {
+                        Profile.shared.recordPhase(
+                            "L\(i).attn_wall", durationS: wall)
+                        Profile.shared.recordPhase(
+                            "L\(i).attn_gpu", durationS: gpu)
+                    }
+                    workCmd = device.makeCommandBuffer()
+                } else if attn.commitsCommandBuffer {
                     workCmd = device.makeCommandBuffer()
                 }
             } else if let gdn = layer as? Qwen35GDNLayer, gdn.mixer.fused {
@@ -3310,7 +3820,23 @@ public final class Qwen35Model: TextGenerating {
                     cache: caches[i],
                     cmd: workCmd, device: device)
                 // GDN's commitsCommandBuffer is always true; refresh.
-                workCmd = device.makeCommandBuffer()
+                if profileLayers {
+                    workCmd.waitUntilCompleted()
+                    let wall = CFAbsoluteTimeGetCurrent() - layerStart
+                    let gpu = max(0, workCmd.gpuEndTime - workCmd.gpuStartTime)
+                    gdnWall += wall
+                    gdnGpu += gpu
+                    nGdn += 1
+                    if profilePerLayer {
+                        Profile.shared.recordPhase(
+                            "L\(i).gdn_wall", durationS: wall)
+                        Profile.shared.recordPhase(
+                            "L\(i).gdn_gpu", durationS: gpu)
+                    }
+                    workCmd = device.makeCommandBuffer()
+                } else {
+                    workCmd = device.makeCommandBuffer()
+                }
             } else {
                 // GDN (legacy non-fused) or other — per-token loop with
                 // blit-back.
@@ -3339,7 +3865,41 @@ public final class Qwen35Model: TextGenerating {
                     if committed { workCmd = device.makeCommandBuffer() }
                 }
                 blitCmd.commit()
+                if profileLayers {
+                    blitCmd.waitUntilCompleted()
+                    let wall = CFAbsoluteTimeGetCurrent() - layerStart
+                    let gpu = max(0, blitCmd.gpuEndTime - blitCmd.gpuStartTime)
+                    otherWall += wall
+                    otherGpu += gpu
+                    nOther += 1
+                }
             }
+            }  // autoreleasepool
+        }
+
+        if profileLayers {
+            // Stable phase keys (layer counts live in the stderr summary
+            // line, not the key — dynamic keys fragment the profile table).
+            Profile.shared.recordPhase("prefill.attn_wall", durationS: attnWall)
+            Profile.shared.recordPhase("prefill.attn_gpu", durationS: attnGpu)
+            Profile.shared.recordPhase("prefill.gdn_wall", durationS: gdnWall)
+            Profile.shared.recordPhase("prefill.gdn_gpu", durationS: gdnGpu)
+            if nOther > 0 {
+                Profile.shared.recordPhase("prefill.other_wall", durationS: otherWall)
+                Profile.shared.recordPhase("prefill.other_gpu", durationS: otherGpu)
+            }
+            let totalGpu = attnGpu + gdnGpu + otherGpu
+            fputs(
+                String(
+                    format:
+                        "[PROFILE_LAYERS] T=%d  attn: wall=%.1fms gpu=%.1fms (%.0f%%)  gdn: wall=%.1fms gpu=%.1fms (%.0f%%)  total_gpu=%.1fms  (n_attn=%d n_gdn=%d)\n",
+                    t,
+                    attnWall * 1000, attnGpu * 1000,
+                    totalGpu > 0 ? 100 * attnGpu / totalGpu : 0,
+                    gdnWall * 1000, gdnGpu * 1000,
+                    totalGpu > 0 ? 100 * gdnGpu / totalGpu : 0,
+                    totalGpu * 1000, nAttn, nGdn),
+                stderr)
         }
 
         // Make sure all in-flight writes to `h` are resident before the

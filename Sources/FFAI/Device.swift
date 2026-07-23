@@ -23,6 +23,13 @@ import FFAIKernelsSwift
 public final class Device: @unchecked Sendable {
     public let mtlDevice: MTLDevice
     public let commandQueue: MTLCommandQueue
+    /// Second queue for concurrent compute (e.g. MoE gate ‖ up).
+    public let commandQueueB: MTLCommandQueue
+    /// Device-local event for cross-queue MoE / shared-expert sync.
+    public let syncEvent: MTLEvent
+    /// Monotonic value for `syncEvent` (encode signal/wait pairs).
+    private let syncEventLock = NSLock()
+    private var syncEventCounter: UInt64 = 0
 
     /// Lazy MTLResidencySet that pins the model's weight buffers so
     /// every command buffer skips per-allocation residency tracking.
@@ -44,6 +51,168 @@ public final class Device: @unchecked Sendable {
     public init(mtlDevice: MTLDevice, commandQueue: MTLCommandQueue) {
         self.mtlDevice = mtlDevice
         self.commandQueue = commandQueue
+        // Sibling queue for parallel dispatches (shared device/PSO cache).
+        guard let qB = mtlDevice.makeCommandQueue(
+            maxCommandBufferCount: MetalTileLibrary.defaultMaxCommandBufferCount)
+        else {
+            fatalError("Device: failed to create secondary command queue")
+        }
+        self.commandQueueB = qB
+        guard let ev = mtlDevice.makeEvent() else {
+            fatalError("Device: failed to create MTLEvent")
+        }
+        self.syncEvent = ev
+    }
+
+    public func makeCommandBufferB() -> MTLCommandBuffer {
+        guard let cb = commandQueueB.makeCommandBuffer() else {
+            fatalError("Device.makeCommandBufferB() returned nil")
+        }
+        return cb
+    }
+
+    /// Next monotonic value for cross-queue `syncEvent` signal/wait pairs.
+    public func nextSyncValue() -> UInt64 {
+        syncEventLock.lock()
+        defer { syncEventLock.unlock() }
+        syncEventCounter &+= 1
+        return syncEventCounter
+    }
+
+    // ─── Scratch slab — generic transient-buffer allocator ────────────
+    //
+    // `Device.makeBuffer` is the default path for persistent buffers.
+    // For transients that live for the duration of a forward sub-block
+    // — and would otherwise hammer Metal's internal driver pool with
+    // hundreds of `makeBuffer(length:)` calls per token — there's a
+    // **scratch slab**: a single pre-allocated `MTLBuffer` that callers
+    // slice into via offset bumps. `device.allocScratch(bytes:)` returns
+    // `(buffer, offset)`; `Tensor.scratch(shape:dtype:)` wraps the slice
+    // as a Tensor; `device.resetScratch()` rewinds the offset to 0.
+    //
+    // Wrap a sub-block in `device.withScratch { ... }`: it flips
+    // `scratchModeActive` on (so plain `Tensor.empty` routes through the
+    // slab) and rewinds the offset at scope exit. State that CARRIES
+    // OVER between scratch scopes (e.g., the mHC 4-channel residual)
+    // must NOT live in scratch — allocate it with the default
+    // `Device.makeBuffer` instead.
+    public var scratchSlabBytes: Int = 256 * 1024 * 1024  // 256 MB cap
+    private var scratchBuffer: MTLBuffer?
+    /// Optional second slab for ping-pong prefill (encode layer N+1 while
+    /// GPU runs layer N). Nil until `ensureScratchSlabPingPong` is called.
+    private var scratchBufferB: MTLBuffer?
+    private var scratchOffset: Int = 0
+    /// Which physical slab `scratchBuffer` currently aliases (0 or 1).
+    private var scratchPingPongIndex: Int = 0
+
+    /// When `true`, `Tensor.empty(...)` routes through the scratch slab
+    /// instead of allocating a fresh MTLBuffer. Set by
+    /// `withScratch { ... }` so callers don't need to switch every
+    /// allocation site over to `Tensor.scratch` explicitly.
+    public var scratchModeActive: Bool = false
+
+    // ─── Allocation counters (diagnostic) ────────────────────────────
+    public var bufferAllocCount: Int = 0
+    public var bufferAllocBytes: Int = 0
+    public var scratchAllocCount: Int = 0
+    public var scratchAllocBytes: Int = 0
+
+    // ─── Dequant-intermediate scratch (persistent reusable buffer) ────
+    //
+    // GGUF dequant kernels need 1-2 large transient buffers per call
+    // (e.g., IQ2_XXS expert tensor: ~524 MB qs intermediate + ~32 MB
+    // d_f32 scales). Caller commits + waits the dequant cmd buffer
+    // BEFORE returning, so the intermediate is safely reusable
+    // across calls. These slabs grow lazily to the largest size
+    // requested.
+    private var dequantIntermediateBuffers: [String: MTLBuffer] = [:]
+    private let scratchLock = NSLock()
+
+    /// Returns a pre-allocated MTLBuffer ≥ `minBytes` keyed by `tag`.
+    /// Thread-safe: multiple parallel staging tasks may call with
+    /// distinct slot-keyed tags concurrently.
+    public func intermediateScratch(tag: String, minBytes: Int) -> MTLBuffer {
+        scratchLock.lock()
+        defer { scratchLock.unlock() }
+        let need = max(minBytes, 64)
+        if let buf = dequantIntermediateBuffers[tag], buf.length >= need {
+            return buf
+        }
+        let alloc = max(need, (dequantIntermediateBuffers[tag]?.length ?? 0) * 2)
+        guard let buf = mtlDevice.makeBuffer(length: alloc, options: .storageModeShared) else {
+            fatalError("Device.intermediateScratch: failed to allocate \(alloc)-byte slab")
+        }
+        dequantIntermediateBuffers[tag] = buf
+        return buf
+    }
+
+    /// Process RSS in KB via a `ps` shell-out. Slow (~10 ms per call)
+    /// but works without entitlements. Use sparingly — only at
+    /// per-sub-block instrumentation points.
+    public static func currentRssKB() -> Int {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let task = Process()
+        task.launchPath = "/bin/ps"
+        task.arguments = ["-o", "rss=", "-p", "\(pid)"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        do { try task.run() } catch { return -1 }
+        task.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let s =
+            String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
+        return Int(s) ?? 0
+    }
+
+    /// Allocate `bytes` from the scratch slab (lazily creating the slab
+    /// on first use). 16-byte aligned. Fatal if the slab overflows —
+    /// caller should size `scratchSlabBytes` to fit one sub-block of
+    /// transients.
+    public func allocScratch(bytes: Int) -> (buffer: MTLBuffer, offset: Int) {
+        if scratchBuffer == nil {
+            scratchBuffer = mtlDevice.makeBuffer(
+                length: scratchSlabBytes, options: .storageModeShared)
+            guard scratchBuffer != nil else {
+                fatalError("Device.allocScratch: failed to allocate \(scratchSlabBytes)-byte slab")
+            }
+        }
+        let aligned = (scratchOffset + 15) & ~15
+        if aligned + bytes > scratchSlabBytes {
+            fatalError(
+                "Device.allocScratch: slab overflow — needed \(aligned + bytes), have \(scratchSlabBytes). Caller should resetScratch() between sub-blocks or grow scratchSlabBytes."
+            )
+        }
+        scratchOffset = aligned + bytes
+        scratchAllocCount += 1
+        scratchAllocBytes += bytes
+        return (scratchBuffer!, aligned)
+    }
+
+    /// Reset the scratch slab offset to 0. **Every Tensor sliced into
+    /// the slab via `Tensor.scratch(...)` becomes invalid after this
+    /// call** — all sub-block-local transients must be done with.
+    public func resetScratch() {
+        scratchOffset = 0
+    }
+
+    /// Convenience scope wrapper — runs the body with
+    /// `scratchModeActive = true` (so `Tensor.empty` transparently
+    /// uses the scratch slab), then resets the slab at scope exit.
+    /// Any Tensor sliced into the slab inside the body is INVALID
+    /// once `body` returns — carry-over state must be copied to a
+    /// persistent buffer (or allocated via `Tensor.empty` while
+    /// `scratchModeActive == false`) before the scope exits.
+    public func withScratch<T>(_ body: () throws -> T) rethrows -> T {
+        let wasActive = scratchModeActive
+        scratchModeActive = true
+        defer {
+            if !wasActive {
+                scratchModeActive = false
+                resetScratch()
+            }
+        }
+        return try body()
     }
 
     /// Allocate a fresh shared-storage MTLBuffer of the given byte length.
@@ -51,7 +220,93 @@ public final class Device: @unchecked Sendable {
         guard let buf = mtlDevice.makeBuffer(length: length, options: .storageModeShared) else {
             fatalError("Device.makeBuffer(length: \(length)) returned nil")
         }
+        bufferAllocCount += 1
+        bufferAllocBytes += length
         return buf
+    }
+
+    /// Ensure the scratch slab is at least `bytes`, reallocating if needed.
+    /// SAFE ONLY when no scratch slices are live (`scratchOffset == 0`) —
+    /// call at the top of a forward pass before any `allocScratch`. The slab
+    /// is a single reused buffer (not a per-call allocation), so growing it
+    /// for a large prefill chunk is bounded, not a leak. Decode keeps 256 MB.
+    public func ensureScratchSlab(_ bytes: Int) {
+        if let buf = scratchBuffer, buf.length >= bytes { return }
+        precondition(
+            scratchOffset == 0,
+            "ensureScratchSlab: cannot resize with \(scratchOffset) bytes of live slices")
+        scratchSlabBytes = bytes
+        scratchBuffer = mtlDevice.makeBuffer(length: bytes, options: .storageModeShared)
+        guard scratchBuffer != nil else {
+            fatalError("ensureScratchSlab: failed to allocate \(bytes)-byte slab")
+        }
+    }
+
+    /// Ensure both ping-pong slabs are ≥ `bytes`. Prefill can encode on
+    /// slab A while GPU executes from slab B, then flip.
+    public func ensureScratchSlabPingPong(_ bytes: Int) {
+        ensureScratchSlab(bytes)
+        if let b = scratchBufferB, b.length >= bytes { return }
+        precondition(
+            scratchOffset == 0,
+            "ensureScratchSlabPingPong: cannot resize with live slices")
+        scratchBufferB = mtlDevice.makeBuffer(length: bytes, options: .storageModeShared)
+        guard scratchBufferB != nil else {
+            fatalError("ensureScratchSlabPingPong: failed to allocate B slab (\(bytes) bytes)")
+        }
+    }
+
+    /// Swap active scratch slab with the alternate and rewind offset.
+    /// Caller must have waited for any GPU work that still references
+    /// the slab about to become active.
+    public func flipScratchSlab() {
+        precondition(
+            scratchOffset == 0 || !scratchModeActive,
+            "flipScratchSlab: active live slices — resetScratch first")
+        guard let b = scratchBufferB else {
+            fatalError("flipScratchSlab: call ensureScratchSlabPingPong first")
+        }
+        let a = scratchBuffer
+        scratchBuffer = b
+        scratchBufferB = a
+        scratchOffset = 0
+        scratchPingPongIndex ^= 1
+    }
+
+    /// Drop large prefill slabs so decode is not squeezed by 1–2 GB of
+    /// idle scratch. Next prefill re-allocates via ensureScratchSlab*.
+    public func releaseScratchSlabs() {
+        precondition(
+            !scratchModeActive && scratchOffset == 0,
+            "releaseScratchSlabs: scratch still active")
+        scratchBuffer = nil
+        scratchBufferB = nil
+        scratchSlabBytes = 256 * 1024 * 1024
+        scratchPingPongIndex = 0
+    }
+
+    // Cache of 4-byte scalar-argument buffers, keyed by value. Kernel
+    // scalar args (rmsNorm eps, RoPE start/step, …) were allocating a
+    // fresh 4-byte MTLBuffer on EVERY op call — ~5 rmsNorms/layer ×
+    // 43 layers = ~220 tiny allocations per token. Over a long
+    // (e.g. 32k) decode that churned millions of buffers and eventually
+    // tripped `makeBuffer returned nil`. Scalars are ~constant, so cache
+    // one reusable buffer per value.
+    nonisolated(unsafe) private var scalarBufCache: [Float: MTLBuffer] = [:]
+    private let scalarBufLock = NSLock()
+    public func scalarBuffer(_ value: Float) -> MTLBuffer {
+        scalarBufLock.lock()
+        defer { scalarBufLock.unlock() }
+        if let b = scalarBufCache[value] { return b }
+        guard let b = mtlDevice.makeBuffer(length: 4, options: .storageModeShared) else {
+            fatalError("Device.scalarBuffer: makeBuffer(4) returned nil")
+        }
+        var v = value
+        memcpy(b.contents(), &v, 4)
+        scalarBufCache[value] = b
+        bufferAllocCount += 1
+        bufferAllocBytes += 4
+        return b
     }
 
     /// Make a new MTLCommandBuffer.

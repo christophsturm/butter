@@ -74,6 +74,15 @@ struct GenerateTextCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Print top-5 next-token distribution instead of generating.")
     var verbose: Bool = false
 
+    // Generate-specific diagnostic; the shared sampling / KV / debug
+    // knobs live in `CommonGenerateOptions` above.
+    @Option(
+        name: .long,
+        help:
+            "Diagnostic. Run the chunked prefill path over the prompt and write the final-position logits as raw little-endian f32 to this path, then exit."
+    )
+    var dumpPrefillLogits: String?
+
     // ─── Nemotron-Labs-Diffusion tri-mode decoding ───────────────────
 
     @Option(
@@ -96,6 +105,50 @@ struct GenerateTextCommand: AsyncParsableCommand {
     func run() async throws {
         try common.applyGlobalFlags()
         let m = try await common.loadModel()
+
+        if let dumpPath = dumpPrefillLogits {
+            // Mirror driveGeneration's chunk loop so this exercises the exact
+            // prefill path (forwardMulti in prefillStepSize chunks), not the
+            // per-token forward the verbose flag uses.
+            let promptTokens = m.tokenizer.encode(text: prompt)
+            let caches = m.engine.makeLayerCaches()
+            // Resolve chunk size through the SAME chain as the real generate
+            // path (Generate.swift): env override, then the family/param-level
+            // override, then the engine default. Skipping the middle link here
+            // used to let a param-only chunk-size override go unseen by this
+            // diagnostic, so a quality gate run through the dump could
+            // validate a different chunk configuration than generation
+            // actually uses.
+            let chunkSize = max(
+                1,
+                ProcessInfo.processInfo.environment["FFAI_PREFILL_STEP"].flatMap(Int.init)
+                    ?? m.defaultGenerationParameters.prefillStepSize
+                    ?? m.engine.defaultPrefillStepSize)
+            var pos = 0
+            var lastLogits: Tensor?
+            while pos < promptTokens.count {
+                let end = min(pos + chunkSize, promptTokens.count)
+                let chunk = Array(promptTokens[pos ..< end])
+                let cmd = Device.shared.makeCommandBuffer()
+                lastLogits = m.engine.forwardMulti(
+                    tokenIds: chunk, startingAt: pos,
+                    caches: caches, on: cmd, device: Device.shared)
+                cmd.commit()
+                await cmd.completed()
+                pos = end
+            }
+            guard let l = lastLogits else { return }
+            let floats = l.toFloatArray()
+            var data = Data(count: floats.count * 4)
+            data.withUnsafeMutableBytes { raw in
+                floats.withUnsafeBytes { src in
+                    raw.copyMemory(from: src)
+                }
+            }
+            try data.write(to: URL(fileURLWithPath: dumpPath))
+            print("wrote \(floats.count) f32 logits to \(dumpPath)")
+            return
+        }
 
         if verbose {
             try runVerbose(model: m)

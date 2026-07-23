@@ -29,6 +29,50 @@ struct TensorTests {
         #expect(t.buffer.length >= 128)
     }
 
+    @Test("empty routes through the scratch slab when scratchModeActive")
+    func emptyRoutesThroughScratch() {
+        // Isolated device so we don't perturb Device.shared's scratch
+        // state, which other parallel suites allocate against.
+        let d = Device(
+            mtlDevice: Device.shared.mtlDevice,
+            commandQueue: Device.shared.commandQueue)
+
+        // Outside a scratch scope: fresh per-tensor buffer, offset 0,
+        // and no scratch accounting.
+        let plain = Tensor.empty(shape: [16], dtype: .f32, device: d)
+        #expect(plain.offset == 0)
+        #expect(d.scratchAllocCount == 0)
+
+        // Inside a scratch scope: two tensors share one slab buffer at
+        // bumping offsets.
+        var a: Tensor!
+        var b: Tensor!
+        d.withScratch {
+            a = Tensor.empty(shape: [16], dtype: .f32, device: d)  // 64 bytes
+            b = Tensor.empty(shape: [4], dtype: .f32, device: d)  // 16 bytes
+        }
+        #expect(a.buffer === b.buffer)
+        #expect(a.offset == 0)
+        #expect(b.offset == 64)  // 64 already 16-aligned
+        #expect(d.scratchAllocCount == 2)
+        // The plain buffer above is NOT the scratch slab.
+        #expect(plain.buffer !== a.buffer)
+    }
+
+    @Test("Tensor.scratch wraps a slab slice directly")
+    func scratchWrapsSlabSlice() {
+        let d = Device(
+            mtlDevice: Device.shared.mtlDevice,
+            commandQueue: Device.shared.commandQueue)
+        let s0 = Tensor.scratch(shape: [8], dtype: .f32, device: d)
+        let s1 = Tensor.scratch(shape: [8], dtype: .f32, device: d)
+        #expect(s0.buffer === s1.buffer)
+        #expect(s0.offset == 0)
+        #expect(s1.offset == 32)  // 8 × 4 bytes, already 16-aligned
+        #expect(s0.shape == [8])
+        #expect(s0.dtype == .f32)
+    }
+
     @Test("reshape preserves element count and storage")
     func reshape() {
         let t = Tensor.empty(shape: [2, 6], dtype: .f32)

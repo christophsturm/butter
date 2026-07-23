@@ -76,6 +76,207 @@ public enum Ops {
 
     // ─── Element-wise binary: add ────────────────────────────────────
 
+    /// In-place scaled add: `accum[i] += scalar * src[i]`.
+    public static func axpyScalarInplace(
+        _ accum: Tensor, _ src: Tensor, scalar: Float, on cmd: MTLCommandBuffer
+    ) {
+        precondition(accum.shape == src.shape, "axpyScalarInplace: shape mismatch")
+        precondition(accum.dtype == src.dtype, "axpyScalarInplace: dtype mismatch")
+        let n = accum.elementCount
+        let (grid, tg) = elementwiseGrid(n)
+        switch accum.dtype {
+        case .f32:
+            FFAIKernels.ffai_axpy_scalar_inplace_f32(
+                src: src.buffer, srcOffset: src.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                scalar: scalar,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            FFAIKernels.ffai_axpy_scalar_inplace_f16(
+                src: src.buffer, srcOffset: src.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                scalar: scalar,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            FFAIKernels.ffai_axpy_scalar_inplace_bf16(
+                src: src.buffer, srcOffset: src.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                scalar: scalar,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("axpyScalarInplace: unsupported dtype \(accum.dtype)")
+        }
+    }
+
+    /// Fused multi-expert (top-K=6) down gemv + weighted accumulate.
+    /// `accum[r] += Σ_k w[k] * (downs[k][r] · inners[k])`.
+    /// 1 dispatch replaces 18 (6 gemv + 6 mul + 6 add).
+    public static func moeDownWeightedSum6(
+        downs: [Tensor], inners: [Tensor], weights: Tensor, accum: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(downs.count == 6 && inners.count == 6,
+                     "moeDownWeightedSum6: expects exactly 6 of each")
+        precondition(weights.dtype == .f32 && weights.elementCount >= 6,
+                     "moeDownWeightedSum6: weights must be f32 of len 6")
+        let m = downs[0].shape[0]
+        let k = downs[0].shape[1]
+        precondition(k <= 2048, "moeDownWeightedSum6: k \(k) exceeds kernel TG staging cap 2048")
+        let dt = downs[0].dtype
+        let tgWidth = 256
+        let grid = MTLSize(width: m * tgWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch dt {
+        case .f16:
+            FFAIKernels.ffai_moe_down_weighted_sum_6_f16(
+                down_0: downs[0].buffer, down_0Offset: downs[0].offset,
+                inner_0: inners[0].buffer, inner_0Offset: inners[0].offset,
+                down_1: downs[1].buffer, down_1Offset: downs[1].offset,
+                inner_1: inners[1].buffer, inner_1Offset: inners[1].offset,
+                down_2: downs[2].buffer, down_2Offset: downs[2].offset,
+                inner_2: inners[2].buffer, inner_2Offset: inners[2].offset,
+                down_3: downs[3].buffer, down_3Offset: downs[3].offset,
+                inner_3: inners[3].buffer, inner_3Offset: inners[3].offset,
+                down_4: downs[4].buffer, down_4Offset: downs[4].offset,
+                inner_4: inners[4].buffer, inner_4Offset: inners[4].offset,
+                down_5: downs[5].buffer, down_5Offset: downs[5].offset,
+                inner_5: inners[5].buffer, inner_5Offset: inners[5].offset,
+                weights: weights.buffer, weightsOffset: weights.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                k: UInt32(k),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f32:
+            FFAIKernels.ffai_moe_down_weighted_sum_6_f32(
+                down_0: downs[0].buffer, down_0Offset: downs[0].offset,
+                inner_0: inners[0].buffer, inner_0Offset: inners[0].offset,
+                down_1: downs[1].buffer, down_1Offset: downs[1].offset,
+                inner_1: inners[1].buffer, inner_1Offset: inners[1].offset,
+                down_2: downs[2].buffer, down_2Offset: downs[2].offset,
+                inner_2: inners[2].buffer, inner_2Offset: inners[2].offset,
+                down_3: downs[3].buffer, down_3Offset: downs[3].offset,
+                inner_3: inners[3].buffer, inner_3Offset: inners[3].offset,
+                down_4: downs[4].buffer, down_4Offset: downs[4].offset,
+                inner_4: inners[4].buffer, inner_4Offset: inners[4].offset,
+                down_5: downs[5].buffer, down_5Offset: downs[5].offset,
+                inner_5: inners[5].buffer, inner_5Offset: inners[5].offset,
+                weights: weights.buffer, weightsOffset: weights.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                k: UInt32(k),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            FFAIKernels.ffai_moe_down_weighted_sum_6_bf16(
+                down_0: downs[0].buffer, down_0Offset: downs[0].offset,
+                inner_0: inners[0].buffer, inner_0Offset: inners[0].offset,
+                down_1: downs[1].buffer, down_1Offset: downs[1].offset,
+                inner_1: inners[1].buffer, inner_1Offset: inners[1].offset,
+                down_2: downs[2].buffer, down_2Offset: downs[2].offset,
+                inner_2: inners[2].buffer, inner_2Offset: inners[2].offset,
+                down_3: downs[3].buffer, down_3Offset: downs[3].offset,
+                inner_3: inners[3].buffer, inner_3Offset: inners[3].offset,
+                down_4: downs[4].buffer, down_4Offset: downs[4].offset,
+                inner_4: inners[4].buffer, inner_4Offset: inners[4].offset,
+                down_5: downs[5].buffer, down_5Offset: downs[5].offset,
+                inner_5: inners[5].buffer, inner_5Offset: inners[5].offset,
+                weights: weights.buffer, weightsOffset: weights.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                k: UInt32(k),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("moeDownWeightedSum6: unsupported dtype \(dt)")
+        }
+    }
+
+    /// Fused gate gemv + up gemv + SwiGLU. 1 dispatch replaces 3.
+    /// `inner[r] = silu(gate_w[r] · x) * (up_w[r] · x)`.
+    public static func gateUpSwigluFused(
+        gateW: Tensor, upW: Tensor, x: Tensor, inner: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(gateW.shape.count == 2 && upW.shape.count == 2, "gateUpSwigluFused: weights 2D")
+        precondition(x.shape.count == 1 && inner.shape.count == 1, "gateUpSwigluFused: vec/inner 1D")
+        precondition(gateW.shape == upW.shape, "gateUpSwigluFused: gate/up shape mismatch")
+        precondition(gateW.shape[0] == inner.shape[0], "gateUpSwigluFused: m mismatch")
+        precondition(gateW.shape[1] == x.shape[0], "gateUpSwigluFused: k mismatch")
+        let m = gateW.shape[0]
+        let k = gateW.shape[1]
+        let tgWidth = 256
+        let grid = MTLSize(width: m * tgWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch gateW.dtype {
+        case .f32:
+            FFAIKernels.ffai_gate_up_swiglu_fused_f32(
+                gate_w: gateW.buffer, gate_wOffset: gateW.offset,
+                up_w: upW.buffer, up_wOffset: upW.offset,
+                x: x.buffer, xOffset: x.offset,
+                inner: inner.buffer, innerOffset: inner.offset,
+                k: UInt32(k),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            FFAIKernels.ffai_gate_up_swiglu_fused_f16(
+                gate_w: gateW.buffer, gate_wOffset: gateW.offset,
+                up_w: upW.buffer, up_wOffset: upW.offset,
+                x: x.buffer, xOffset: x.offset,
+                inner: inner.buffer, innerOffset: inner.offset,
+                k: UInt32(k),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            FFAIKernels.ffai_gate_up_swiglu_fused_bf16(
+                gate_w: gateW.buffer, gate_wOffset: gateW.offset,
+                up_w: upW.buffer, up_wOffset: upW.offset,
+                x: x.buffer, xOffset: x.offset,
+                inner: inner.buffer, innerOffset: inner.offset,
+                k: UInt32(k),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("gateUpSwigluFused: unsupported dtype \(gateW.dtype)")
+        }
+    }
+
+    /// Fused gemv + weighted in-place accumulate:
+    /// `accum[r] += weight * (Σ_j mat[r, j] * vec[j])`.
+    /// Saves 2 dispatches per call (vs gemv → Tensor.filled(w) → mul → add).
+    public static func gemvAxpyInplace(
+        mat: Tensor, vec: Tensor, accum: Tensor, weight: Float,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(mat.shape.count == 2, "gemvAxpyInplace: mat must be 2D")
+        precondition(vec.shape.count == 1, "gemvAxpyInplace: vec must be 1D")
+        precondition(accum.shape.count == 1, "gemvAxpyInplace: accum must be 1D")
+        precondition(mat.shape[1] == vec.shape[0], "gemvAxpyInplace: k mismatch")
+        precondition(mat.shape[0] == accum.shape[0], "gemvAxpyInplace: m mismatch")
+        precondition(mat.dtype == vec.dtype && mat.dtype == accum.dtype, "gemvAxpyInplace: dtype mismatch")
+        let m = mat.shape[0]
+        let k = mat.shape[1]
+        let tgWidth = 256
+        let grid = MTLSize(width: m * tgWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch mat.dtype {
+        case .f32:
+            FFAIKernels.ffai_gemv_axpy_inplace_f32(
+                mat: mat.buffer, matOffset: mat.offset,
+                vec: vec.buffer, vecOffset: vec.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                k: UInt32(k), weight: weight,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            FFAIKernels.ffai_gemv_axpy_inplace_f16(
+                mat: mat.buffer, matOffset: mat.offset,
+                vec: vec.buffer, vecOffset: vec.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                k: UInt32(k), weight: weight,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            FFAIKernels.ffai_gemv_axpy_inplace_bf16(
+                mat: mat.buffer, matOffset: mat.offset,
+                vec: vec.buffer, vecOffset: vec.offset,
+                accum: accum.buffer, accumOffset: accum.offset,
+                k: UInt32(k), weight: weight,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("gemvAxpyInplace: unsupported dtype \(mat.dtype)")
+        }
+    }
+
     public static func add(
         _ a: Tensor, _ b: Tensor, on cmd: MTLCommandBuffer,
         into out: Tensor? = nil
@@ -456,6 +657,116 @@ public enum Ops {
     /// Cooperative-thread matrix-vector multiply. weight: [out_dim, in_dim],
     /// input: [in_dim], output: [out_dim]. One threadgroup per output row;
     /// threads cooperate on the dot-product reduction.
+    /// Device-side MoE dispatch plan (ffai_moe_sort_plan). From the router's
+    /// top-k expert ids [mTotal] produces sortedExperts/sourceTokens/invPerm
+    /// in one dispatch — no readback / wait / host sort.
+    public static func moeSortPlan(
+        topkIds: Tensor, sortedExperts: Tensor, sourceTokens: Tensor, invPerm: Tensor,
+        mTotal: Int, k: Int, on cmd: MTLCommandBuffer
+    ) {
+        let tgWidth = min(mTotal, 256)
+        let grid = MTLSize(width: mTotal, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        FFAIKernels.ffai_moe_sort_plan_f32(
+            topk_ids: topkIds.buffer, topk_idsOffset: topkIds.offset,
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            source_tokens: sourceTokens.buffer, source_tokensOffset: sourceTokens.offset,
+            inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+            m_total: UInt32(mTotal), k: UInt32(k),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Bucketed counting-sort replacement for `moeSortPlan` (F-85 prefill
+    /// gate). Same stable-order output contract, three dispatches on the
+    /// caller's command buffer instead of one, no readback between them,
+    /// same no-sync DEVPLAN2 property as the kernel it replaces:
+    ///   1. `ffai_moe_sort_plan_hist`    computes per-(block, expert) row counts.
+    ///   2. `ffai_moe_sort_plan_offsets` turns counts into each block's per-expert
+    ///      write offset.
+    ///   3. `ffai_moe_sort_plan_scatter` has each row write itself using its
+    ///      block's offset plus an in-block stable rank.
+    /// `blockCounts`/`blockOffsets` are fresh scratch each call (sized off
+    /// `mTotal`, which varies per prefill chunk), not cached, matching how
+    /// `sortedExperts`/`sourceTokens`/`invPerm` are already allocated fresh
+    /// per `decodeMany` call at this call site.
+    public static func moeSortPlanCounting(
+        topkIds: Tensor, sortedExperts: Tensor, sourceTokens: Tensor, invPerm: Tensor,
+        mTotal: Int, k: Int, nExperts: Int, blockSize: Int, on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            nExperts <= 256,
+            "moeSortPlanCounting: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let nBlocks = (mTotal + blockSize - 1) / blockSize
+        let blockCountsBuf = device.makeBuffer(length: nBlocks * nExperts * 4)
+        let blockOffsetsBuf = device.makeBuffer(length: nBlocks * nExperts * 4)
+
+        // Pass 1: per-block histogram. grid = nBlocks threadgroups, one
+        // lane per expert.
+        FFAIKernels.ffai_moe_sort_plan_hist_f32_threadgroups(
+            topk_ids: topkIds.buffer, topk_idsOffset: topkIds.offset,
+            block_counts: blockCountsBuf, block_countsOffset: 0,
+            m_total: UInt32(mTotal), n_experts: UInt32(nExperts), block_size: UInt32(blockSize),
+            gridSize: MTLSize(width: nBlocks, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: nExperts, height: 1, depth: 1),
+            on: cmd)
+
+        // Pass 2: counts -> per-block per-expert write offsets. One
+        // threadgroup, one lane per expert.
+        FFAIKernels.ffai_moe_sort_plan_offsets_f32_threadgroups(
+            block_counts: blockCountsBuf, block_countsOffset: 0,
+            block_offsets: blockOffsetsBuf, block_offsetsOffset: 0,
+            n_blocks: UInt32(nBlocks), n_experts: UInt32(nExperts),
+            gridSize: MTLSize(width: 1, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: nExperts, height: 1, depth: 1),
+            on: cmd)
+
+        // Pass 3: scatter. Same dispatchThreads convention as the
+        // original `ffai_moe_sort_plan` (grid in threads, data-sized).
+        let tgWidth = min(mTotal, 256)
+        FFAIKernels.ffai_moe_sort_plan_scatter_f32(
+            topk_ids: topkIds.buffer, topk_idsOffset: topkIds.offset,
+            block_offsets: blockOffsetsBuf, block_offsetsOffset: 0,
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            source_tokens: sourceTokens.buffer, source_tokensOffset: sourceTokens.offset,
+            inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+            m_total: UInt32(mTotal), k: UInt32(k), n_experts: UInt32(nExperts), block_size: UInt32(blockSize),
+            gridSize: MTLSize(width: mTotal, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: tgWidth, height: 1, depth: 1),
+            on: cmd)
+    }
+
+    /// Dequantize an mlx int4 affine-quantized `[outDim, inDim]` weight to a
+    /// dense `[outDim, inDim]` tensor in one dispatch (one thread per packed
+    /// u32 = 8 nibbles). Used to batch narrow-outDim projections (e.g. a
+    /// `hidden -> 1` gate) through a single dense `gemm` instead of a
+    /// per-row `dequantGemv` T-loop.
+    public static func affineDequantize(
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        outDim: Int, inDim: Int, groupSize: Int, bits: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor
+    ) {
+        precondition(weight.dtype == .u32, "affineDequantize: weight must be u32 packed")
+        precondition(bits == 4 || bits == 8, "affineDequantize: only bits 4/8 supported")
+        precondition(out.elementCount == outDim * inDim,
+            "affineDequantize: out must be outDim*inDim (\(outDim*inDim)), got \(out.elementCount)")
+        let packFactor = 32 / bits           // int4 -> 8, int8 -> 4 elems / u32
+        let packs = (outDim * inDim) / packFactor
+        let tgWidth = min(packs, 256)
+        let grid = MTLSize(width: packs, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let gs = UInt32(groupSize)
+        switch (bits, out.dtype) {
+        case (4, .f32): FFAIKernels.ffai_affine_dequantize_int4_f32(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, .f16): FFAIKernels.ffai_affine_dequantize_int4_f16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, .bf16): FFAIKernels.ffai_affine_dequantize_int4_bf16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (8, .f32): FFAIKernels.ffai_affine_dequantize_int8_f32(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (8, .f16): FFAIKernels.ffai_affine_dequantize_int8_f16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (8, .bf16): FFAIKernels.ffai_affine_dequantize_int8_bf16(w: weight.buffer, wOffset: weight.offset, scales: scales.buffer, scalesOffset: scales.offset, biases: biases.buffer, biasesOffset: biases.offset, out: out.buffer, outOffset: out.offset, group_size: gs, gridSize: grid, threadgroupSize: tg, on: cmd)
+        default: fatalError("affineDequantize: unsupported bits/dtype \(bits)/\(out.dtype)")
+        }
+    }
+
     public static func gemv(
         weight: Tensor, input: Tensor,
         on cmd: MTLCommandBuffer,
@@ -681,18 +992,10 @@ public enum Ops {
         // Allocate one or two eps buffers depending on whether the two
         // eps values match — RMSNorm pairs typically come from the
         // same checkpoint config and so share a single eps in practice.
-        let epsBuf1: MTLBuffer = {
-            let b = device.makeBuffer(length: 4)
-            var v = eps1
-            memcpy(b.contents(), &v, 4)
-            return b
-        }()
+        let epsBuf1: MTLBuffer = device.scalarBuffer(eps1)
         let epsBuf2: MTLBuffer = {
             if eps1 == eps2 { return epsBuf1 }
-            let b = device.makeBuffer(length: 4)
-            var v = eps2
-            memcpy(b.contents(), &v, 4)
-            return b
+            return device.scalarBuffer(eps2)
         }()
         @inline(__always)
         func dispatch(
@@ -760,9 +1063,7 @@ public enum Ops {
         let normed = normedOut ?? Tensor.empty(shape: a.shape, dtype: a.dtype)
 
         // eps as a 1-element f32 buffer.
-        var epsValue = eps
-        let epsBuf = device.makeBuffer(length: 4)
-        memcpy(epsBuf.contents(), &epsValue, 4)
+        let epsBuf = device.scalarBuffer(eps)
 
         // TPG = n / 4 (kernel vectorises in 4-elem chunks). One
         // threadgroup per row → grid = nRows * (n/4) threads × 1 × 1.
@@ -817,9 +1118,7 @@ public enum Ops {
         eps: Float, n: Int, nRows: Int, on cmd: MTLCommandBuffer
     ) {
         // eps as a 1-element f32 buffer.
-        var epsValue = eps
-        let epsBuf = device.makeBuffer(length: 4)
-        memcpy(epsBuf.contents(), &epsValue, 4)
+        let epsBuf = device.scalarBuffer(eps)
 
         // Kernel selection by row width `n` (each kernel owns a different
         // elements-per-thread ratio, so the wrong one corrupts the row):
@@ -951,22 +1250,19 @@ public enum Ops {
         let nHeads = qk.elementCount / headDim
         let halfDim = headDim / 2
         let result = out ?? Tensor.empty(shape: qk.shape, dtype: qk.dtype)
-        // `ffai_rope_banded` (the Llama-3 band-scaled RoPE) takes a `[T]` u32
-        // positions buffer — one position per token row. Single-token decode
-        // is T=1 with one position. `row_stride` advances one token row in
-        // `qk` (= nHeads*headDim); unused at T=1 but kept correct.
-        let positions = Tensor.empty(shape: [1], dtype: .u32)
-        positions.copyIn(from: [UInt32(position)])
-        let rowStride = UInt32(nHeads * headDim)
-        // Grid3D [T, nHeads, halfDim]: width=T=1, height=nHeads, depth=halfDim
-        // (program_id<0>=row, <1>=head, <2>=freq-pair — see rope_banded.rs).
         let grid = MTLSize(width: 1, height: nHeads, depth: halfDim)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
+        // Single-token decode: 1-element positions buffer, row_stride = per-token
+        // qk stride (n_heads * head_dim). See ffai_rope_banded contract.
+        let posBuf = Device.shared.makeBuffer(length: 4)
+        var posVal = UInt32(position)
+        memcpy(posBuf.contents(), &posVal, 4)
+        let rowStride = UInt32(nHeads * headDim)
         switch qk.dtype {
         case .f32:
             FFAIKernels.ffai_rope_banded_f32(
                 qk: qk.buffer, qkOffset: qk.offset,
-                positions: positions.buffer, positionsOffset: positions.offset,
+                positions: posBuf, positionsOffset: 0,
                 out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim),
                 half_dim: UInt32(halfDim),
@@ -980,7 +1276,7 @@ public enum Ops {
         case .f16:
             FFAIKernels.ffai_rope_banded_f16(
                 qk: qk.buffer, qkOffset: qk.offset,
-                positions: positions.buffer, positionsOffset: positions.offset,
+                positions: posBuf, positionsOffset: 0,
                 out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim),
                 half_dim: UInt32(halfDim),
@@ -994,7 +1290,7 @@ public enum Ops {
         case .bf16:
             FFAIKernels.ffai_rope_banded_bf16(
                 qk: qk.buffer, qkOffset: qk.offset,
-                positions: positions.buffer, positionsOffset: positions.offset,
+                positions: posBuf, positionsOffset: 0,
                 out: result.buffer, outOffset: result.offset,
                 head_dim: UInt32(headDim),
                 half_dim: UInt32(halfDim),
@@ -1047,20 +1343,20 @@ public enum Ops {
             "ropePartial: rotaryDim (\(rotaryDim)) must be even (rotate-half pairs)")
         let nHeads = qk.elementCount / headDim
         let halfRotary = rotaryDim / 2
-        // ffai_rope_banded: [T]=1 positions buffer; depth=halfRotary so only
-        // the first rotaryDim/2 freq pairs rotate; half_dim=halfRotary is both
-        // the pairing offset and freq denominator. In-place (out aliases qk).
-        let positions = Tensor.empty(shape: [1], dtype: .u32)
-        positions.copyIn(from: [UInt32(position)])
-        let rowStride = UInt32(nHeads * headDim)
-        // Grid3D [T, nHeads, halfRotary]: one thread per (row, head, rotary-pair).
+        // Grid: one thread per (head, rotary-pair). Writes in-place.
         let grid = MTLSize(width: 1, height: nHeads, depth: halfRotary)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
+        // Single-token decode: 1-element positions buffer, row_stride = per-token
+        // qk stride (n_heads * head_dim). See ffai_rope_banded contract.
+        let posBuf = Device.shared.makeBuffer(length: 4)
+        var posVal = UInt32(position)
+        memcpy(posBuf.contents(), &posVal, 4)
+        let rowStride = UInt32(nHeads * headDim)
         switch qk.dtype {
         case .f32:
             FFAIKernels.ffai_rope_banded_f32(
                 qk: qk.buffer, qkOffset: qk.offset,
-                positions: positions.buffer, positionsOffset: positions.offset,
+                positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
                 head_dim: UInt32(headDim),
                 half_dim: UInt32(halfRotary),
@@ -1074,7 +1370,7 @@ public enum Ops {
         case .f16:
             FFAIKernels.ffai_rope_banded_f16(
                 qk: qk.buffer, qkOffset: qk.offset,
-                positions: positions.buffer, positionsOffset: positions.offset,
+                positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
                 head_dim: UInt32(headDim),
                 half_dim: UInt32(halfRotary),
@@ -1088,7 +1384,7 @@ public enum Ops {
         case .bf16:
             FFAIKernels.ffai_rope_banded_bf16(
                 qk: qk.buffer, qkOffset: qk.offset,
-                positions: positions.buffer, positionsOffset: positions.offset,
+                positions: posBuf, positionsOffset: 0,
                 out: qk.buffer, outOffset: qk.offset,
                 head_dim: UInt32(headDim),
                 half_dim: UInt32(halfRotary),
@@ -1856,9 +2152,9 @@ public enum Ops {
             "Ops.dequantGemvInt4Two: dtype mismatch")
         let psoName: String
         switch input.dtype {
-        case .f32: psoName = "dequant_gemv_int4_f32"
-        case .f16: psoName = "dequant_gemv_int4_f16"
-        case .bf16: psoName = "dequant_gemv_int4_bf16"
+        case .f32: psoName = "ffai_dequant_gemv_int4_f32"
+        case .f16: psoName = "ffai_dequant_gemv_int4_f16"
+        case .bf16: psoName = "ffai_dequant_gemv_int4_bf16"
         default: fatalError("Ops.dequantGemvInt4Two: unsupported dtype \(input.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -1906,9 +2202,9 @@ public enum Ops {
             "Ops.dequantGemvInt4Three: dtype mismatch")
         let psoName: String
         switch input.dtype {
-        case .f32: psoName = "dequant_gemv_int4_f32"
-        case .f16: psoName = "dequant_gemv_int4_f16"
-        case .bf16: psoName = "dequant_gemv_int4_bf16"
+        case .f32: psoName = "ffai_dequant_gemv_int4_f32"
+        case .f16: psoName = "ffai_dequant_gemv_int4_f16"
+        case .bf16: psoName = "ffai_dequant_gemv_int4_bf16"
         default: fatalError("Ops.dequantGemvInt4Three: unsupported dtype \(input.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -1957,9 +2253,9 @@ public enum Ops {
             "Ops.dequantGemvInt4Four: dtype mismatch")
         let psoName: String
         switch input.dtype {
-        case .f32: psoName = "dequant_gemv_int4_f32"
-        case .f16: psoName = "dequant_gemv_int4_f16"
-        case .bf16: psoName = "dequant_gemv_int4_bf16"
+        case .f32: psoName = "ffai_dequant_gemv_int4_f32"
+        case .f16: psoName = "ffai_dequant_gemv_int4_f16"
+        case .bf16: psoName = "ffai_dequant_gemv_int4_bf16"
         default: fatalError("Ops.dequantGemvInt4Four: unsupported dtype \(input.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -2006,24 +2302,56 @@ public enum Ops {
         groupSize: Int = 64,
         on cmd: MTLCommandBuffer
     ) {
+        dequantGemvMany(
+            bits: 4, weights: weights, scales: scales, biases: biases,
+            inputs: inputs, outputs: outputs, groupSize: groupSize, on: cmd)
+    }
+
+    /// Encoder-batched `dequantGemv` for bits ∈ {2, 3, 4, 5, 6, 8}.
+    /// One PSO + one compute encoder; N dispatches rotate the five
+    /// buffers. Used by Hy3 MoE (topK=8 × gate/up/down = up to 24
+    /// gemvs per layer) to drop N-1 encoder begin/end pairs.
+    public static func dequantGemvMany(
+        bits: Int,
+        weights: [Tensor], scales: [Tensor], biases: [Tensor],
+        inputs: [Tensor], outputs: [Tensor],
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer
+    ) {
         let n = weights.count
         precondition(
             scales.count == n && biases.count == n && inputs.count == n && outputs.count == n,
-            "Ops.dequantGemvInt4Many: count mismatch")
+            "Ops.dequantGemvMany: count mismatch")
         guard n > 0 else { return }
         let dtype = inputs[0].dtype
         let psoName: String
-        switch dtype {
-        case .f32: psoName = "dequant_gemv_int4_f32"
-        case .f16: psoName = "dequant_gemv_int4_f16"
-        case .bf16: psoName = "dequant_gemv_int4_bf16"
-        default: fatalError("Ops.dequantGemvInt4Many: unsupported dtype \(dtype)")
+        switch (bits, dtype) {
+        case (2, .f32): psoName = "ffai_dequant_gemv_int2_f32"
+        case (2, .f16): psoName = "ffai_dequant_gemv_int2_f16"
+        case (2, .bf16): psoName = "ffai_dequant_gemv_int2_bf16"
+        case (3, .f32): psoName = "ffai_dequant_gemv_int3_f32"
+        case (3, .f16): psoName = "ffai_dequant_gemv_int3_f16"
+        case (3, .bf16): psoName = "ffai_dequant_gemv_int3_bf16"
+        case (4, .f32): psoName = "ffai_dequant_gemv_int4_f32"
+        case (4, .f16): psoName = "ffai_dequant_gemv_int4_f16"
+        case (4, .bf16): psoName = "ffai_dequant_gemv_int4_bf16"
+        case (5, .f32): psoName = "ffai_dequant_gemv_int5_f32"
+        case (5, .f16): psoName = "ffai_dequant_gemv_int5_f16"
+        case (5, .bf16): psoName = "ffai_dequant_gemv_int5_bf16"
+        case (6, .f32): psoName = "ffai_dequant_gemv_int6_f32"
+        case (6, .f16): psoName = "ffai_dequant_gemv_int6_f16"
+        case (6, .bf16): psoName = "ffai_dequant_gemv_int6_bf16"
+        case (8, .f32): psoName = "ffai_dequant_gemv_int8_f32"
+        case (8, .f16): psoName = "ffai_dequant_gemv_int8_f16"
+        case (8, .bf16): psoName = "ffai_dequant_gemv_int8_bf16"
+        default:
+            fatalError("Ops.dequantGemvMany: unsupported (bits=\(bits), dtype=\(dtype))")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
         let packedPerRow = weights[0].shape[1]
-        let inDim = packedPerRow * 32 / 4  // bits = 4 → 8 weights / u32
+        let inDim = packedPerRow * 32 / bits
         var inDimV = UInt32(inDim)
         var groupSizeV = UInt32(groupSize)
         enc.setBytes(&inDimV, length: 4, index: 5)
@@ -2033,10 +2361,10 @@ public enum Ops {
         for i in 0 ..< n {
             precondition(
                 weights[i].shape[1] == packedPerRow,
-                "Ops.dequantGemvInt4Many: inDim varies at index \(i)")
+                "Ops.dequantGemvMany: inDim varies at index \(i)")
             precondition(
                 inputs[i].dtype == dtype && outputs[i].dtype == dtype,
-                "Ops.dequantGemvInt4Many: dtype varies at index \(i)")
+                "Ops.dequantGemvMany: dtype varies at index \(i)")
             enc.setBuffer(weights[i].buffer, offset: weights[i].offset, index: 0)
             enc.setBuffer(scales[i].buffer, offset: scales[i].offset, index: 1)
             enc.setBuffer(biases[i].buffer, offset: biases[i].offset, index: 2)
@@ -2606,46 +2934,13 @@ public enum Ops {
         // output row). `dispatchThreads` counts THREADS not threadgroups
         // — total threads = outDim · 32 gives outDim threadgroups, one
         // per output row.
-        let tg = MTLSize(width: 32, height: 1, depth: 1)
-        let grid = MTLSize(width: outDim * 32, height: 1, depth: 1)
-        let inDimU = UInt32(inDim)
-        let outDimU = UInt32(outDim)
-        let groupSizeU = UInt32(groupSize)
-        switch input.dtype {
-        case .f32:
-            FFAIKernels.ffai_dequant_gemv_int4_expert_indexed_f32(
-                weights_stacked: weightsStacked.buffer, weights_stackedOffset: weightsStacked.offset,
-                scales_stacked: scalesStacked.buffer, scales_stackedOffset: scalesStacked.offset,
-                biases_stacked: biasesStacked.buffer, biases_stackedOffset: biasesStacked.offset,
-                input: input.buffer, inputOffset: input.offset,
-                expert_index: expertIndex.buffer, expert_indexOffset: expertIndex.offset,
-                output: out.buffer, outputOffset: out.offset,
-                in_dim: inDimU, out_dim: outDimU, group_size: groupSizeU,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
-        case .f16:
-            FFAIKernels.ffai_dequant_gemv_int4_expert_indexed_f16(
-                weights_stacked: weightsStacked.buffer, weights_stackedOffset: weightsStacked.offset,
-                scales_stacked: scalesStacked.buffer, scales_stackedOffset: scalesStacked.offset,
-                biases_stacked: biasesStacked.buffer, biases_stackedOffset: biasesStacked.offset,
-                input: input.buffer, inputOffset: input.offset,
-                expert_index: expertIndex.buffer, expert_indexOffset: expertIndex.offset,
-                output: out.buffer, outputOffset: out.offset,
-                in_dim: inDimU, out_dim: outDimU, group_size: groupSizeU,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
-        case .bf16:
-            FFAIKernels.ffai_dequant_gemv_int4_expert_indexed_bf16(
-                weights_stacked: weightsStacked.buffer, weights_stackedOffset: weightsStacked.offset,
-                scales_stacked: scalesStacked.buffer, scales_stackedOffset: scalesStacked.offset,
-                biases_stacked: biasesStacked.buffer, biases_stackedOffset: biasesStacked.offset,
-                input: input.buffer, inputOffset: input.offset,
-                expert_index: expertIndex.buffer, expert_indexOffset: expertIndex.offset,
-                output: out.buffer, outputOffset: out.offset,
-                in_dim: inDimU, out_dim: outDimU, group_size: groupSizeU,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
-        default:
-            fatalError(
-                "Ops.dequantGemvInt4ExpertIndexed: unsupported input dtype \(input.dtype)")
-        }
+        // Dispatch via PSOCache + encoder (Generated FFAIKernels may omit
+        // the affine int4 expert-indexed wrappers after a partial emit).
+        dequantGemvInt4ExpertIndexedMany(
+            weightsStacked: [weightsStacked], scalesStacked: [scalesStacked],
+            biasesStacked: [biasesStacked], inputs: [input],
+            expertIndices: [expertIndex], outputs: [out],
+            groupSize: groupSize, on: cmd)
     }
 
     /// Encoder-batched form of `dequantGemvInt4ExpertIndexed`. All N
@@ -2672,9 +2967,9 @@ public enum Ops {
         let dtype = inputs[0].dtype
         let psoName: String
         switch dtype {
-        case .f32: psoName = "dequant_gemv_int4_expert_indexed_f32"
-        case .f16: psoName = "dequant_gemv_int4_expert_indexed_f16"
-        case .bf16: psoName = "dequant_gemv_int4_expert_indexed_bf16"
+        case .f32: psoName = "ffai_dequant_gemv_int4_expert_indexed_f32"
+        case .f16: psoName = "ffai_dequant_gemv_int4_expert_indexed_f16"
+        case .bf16: psoName = "ffai_dequant_gemv_int4_expert_indexed_bf16"
         default:
             fatalError(
                 "Ops.dequantGemvInt4ExpertIndexedMany: unsupported dtype \(dtype)")
@@ -2714,6 +3009,202 @@ public enum Ops {
             enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
         }
         enc.endEncoding()
+    }
+
+    /// Encoder-batched int2 affine expert-indexed dequant-GEMV (MLX oQ2
+    /// pack: 16 vals/u32, scales+biases per group). Kernel name
+    /// `ffai_dequant_gemv_int2_expert_indexed_*` — may live in
+    /// `hy3_extra.metallib` or be live-compiled from
+    /// `Resources/kernels/`. Same buffer layout as the int4 affine form.
+    public static func dequantGemvInt2ExpertIndexedMany(
+        weightsStacked: [Tensor], scalesStacked: [Tensor], biasesStacked: [Tensor],
+        inputs: [Tensor], expertIndices: [Tensor], outputs: [Tensor],
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer,
+        concurrent: Bool = true
+    ) {
+        let n = weightsStacked.count
+        precondition(
+            scalesStacked.count == n && biasesStacked.count == n
+                && inputs.count == n && expertIndices.count == n
+                && outputs.count == n,
+            "Ops.dequantGemvInt2ExpertIndexedMany: count mismatch")
+        guard n > 0 else { return }
+        let dtype = inputs[0].dtype
+        let psoName: String
+        switch dtype {
+        case .f32: psoName = "ffai_dequant_gemv_int2_expert_indexed_f32"
+        case .f16: psoName = "ffai_dequant_gemv_int2_expert_indexed_f16"
+        case .bf16: psoName = "ffai_dequant_gemv_int2_expert_indexed_bf16"
+        default:
+            fatalError(
+                "Ops.dequantGemvInt2ExpertIndexedMany: unsupported dtype \(dtype)")
+        }
+        let outDim = weightsStacked[0].shape[1]
+        let packedPerRow = weightsStacked[0].shape[2]
+        let inDim = packedPerRow * 16  // int2 packs 16 weights per u32
+        var inDimV = UInt32(inDim)
+        var outDimV = UInt32(outDim)
+        var groupSizeV = UInt32(groupSize)
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        // Concurrent default: gate‖up and multi-expert gemvs have no
+        // producer-consumer edges within the batch (distinct out buffers).
+        // FFAI_HY3_SERIAL_EXPERT_GEMV=1 forces serial encoder.
+        let useConcurrent =
+            concurrent
+            && ProcessInfo.processInfo.environment["FFAI_HY3_SERIAL_EXPERT_GEMV"] == nil
+        let enc: MTLComputeCommandEncoder?
+        if useConcurrent {
+            enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
+        } else {
+            enc = cmd.makeComputeCommandEncoder()
+        }
+        guard let enc else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBytes(&inDimV, length: 4, index: 6)
+        enc.setBytes(&outDimV, length: 4, index: 7)
+        enc.setBytes(&groupSizeV, length: 4, index: 8)
+        // One SG per output row (tg=32). Wider TGs measured slower on
+        // Hy3 oQ2 decode (K=4096, outDim=1536/4096).
+        let tgWidth = 32
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let grid = MTLSize(width: outDim * tgWidth, height: 1, depth: 1)
+        for i in 0 ..< n {
+            precondition(
+                weightsStacked[i].shape[1] == outDim
+                    && weightsStacked[i].shape[2] == packedPerRow,
+                "Ops.dequantGemvInt2ExpertIndexedMany: weight shape varies at \(i)")
+            precondition(
+                inputs[i].dtype == dtype && outputs[i].dtype == dtype,
+                "Ops.dequantGemvInt2ExpertIndexedMany: dtype varies at \(i)")
+            precondition(
+                expertIndices[i].dtype == .u32 && expertIndices[i].elementCount == 1,
+                "Ops.dequantGemvInt2ExpertIndexedMany: expertIndices[\(i)] must be [1] u32")
+            enc.setBuffer(weightsStacked[i].buffer, offset: weightsStacked[i].offset, index: 0)
+            enc.setBuffer(scalesStacked[i].buffer, offset: scalesStacked[i].offset, index: 1)
+            enc.setBuffer(biasesStacked[i].buffer, offset: biasesStacked[i].offset, index: 2)
+            enc.setBuffer(inputs[i].buffer, offset: inputs[i].offset, index: 3)
+            enc.setBuffer(expertIndices[i].buffer, offset: expertIndices[i].offset, index: 4)
+            enc.setBuffer(outputs[i].buffer, offset: outputs[i].offset, index: 5)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        enc.endEncoding()
+    }
+
+    /// Multi-row Path B pre-score: for each of `tRows` tokens,
+    /// `unbiased[t·E+e] = sigmoid(logits[...])`,
+    /// `biased[t·E+e] = unbiased + bias[e]`. One dispatch over T·E.
+    public static func moeSigmoidBiasRows(
+        logits: Tensor, bias: Tensor,
+        unbiased: Tensor, biased: Tensor,
+        tRows: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        let total = tRows * nExperts
+        precondition(
+            logits.elementCount == total && unbiased.elementCount == total
+                && biased.elementCount == total,
+            "moeSigmoidBiasRows: logits/unbiased/biased must be [T·E]")
+        precondition(
+            bias.elementCount == nExperts,
+            "moeSigmoidBiasRows: bias must be [nExperts]")
+        precondition(
+            logits.dtype == bias.dtype && bias.dtype == unbiased.dtype
+                && unbiased.dtype == biased.dtype,
+            "moeSigmoidBiasRows: dtype mismatch")
+        let psoName: String
+        switch logits.dtype {
+        case .f32: psoName = "ffai_moe_sigmoid_bias_rows_f32"
+        case .f16: psoName = "ffai_moe_sigmoid_bias_rows_f16"
+        case .bf16: psoName = "ffai_moe_sigmoid_bias_rows_bf16"
+        default:
+            fatalError("Ops.moeSigmoidBiasRows: unsupported dtype \(logits.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(logits.buffer, offset: logits.offset, index: 0)
+        enc.setBuffer(bias.buffer, offset: bias.offset, index: 1)
+        enc.setBuffer(unbiased.buffer, offset: unbiased.offset, index: 2)
+        enc.setBuffer(biased.buffer, offset: biased.offset, index: 3)
+        var nE = UInt32(nExperts)
+        var tR = UInt32(tRows)
+        enc.setBytes(&nE, length: 4, index: 4)
+        enc.setBytes(&tR, length: 4, index: 5)
+        let tgWidth = min(total, 256)
+        let grid = MTLSize(width: total, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+    }
+
+    /// Hy3 / NemotronH Path B on device: top-K by biased scores, weights
+    /// from unbiased (renorm sum-to-1). Does NOT apply
+    /// `routed_scaling_factor` — caller multiplies after.
+    /// Single-row form — scores `[nExperts]`.
+    public static func moeRouterTopKBiased(
+        scoreBiased: Tensor, scoreUnbiased: Tensor,
+        indicesOut: Tensor, weightsOut: Tensor,
+        nExperts: Int, k: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        moeRouterTopKBiasedMany(
+            scoreBiased: scoreBiased, scoreUnbiased: scoreUnbiased,
+            indicesOut: indicesOut, weightsOut: weightsOut,
+            t: 1, nExperts: nExperts, k: k, on: cmd)
+    }
+
+    /// T-row Path B top-k. Scores `[T·nExperts]` (row-major), indices
+    /// `[T·k]` u32, weights `[T·k]`.
+    public static func moeRouterTopKBiasedMany(
+        scoreBiased: Tensor, scoreUnbiased: Tensor,
+        indicesOut: Tensor, weightsOut: Tensor,
+        t: Int, nExperts: Int, k: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(t > 0, "Ops.moeRouterTopKBiasedMany: t must be positive")
+        precondition(
+            scoreBiased.elementCount == t * nExperts
+                && scoreUnbiased.elementCount == t * nExperts,
+            "Ops.moeRouterTopKBiasedMany: scores must be [T·nExperts]")
+        precondition(
+            indicesOut.elementCount == t * k && indicesOut.dtype == .u32,
+            "Ops.moeRouterTopKBiasedMany: indicesOut must be [T·k] u32")
+        precondition(
+            weightsOut.elementCount == t * k
+                && weightsOut.dtype == scoreBiased.dtype,
+            "Ops.moeRouterTopKBiasedMany: weightsOut must be [T·k] matching scores")
+        let grd = MTLSize(width: t * 32, height: 1, depth: 1)
+        let tg = MTLSize(width: 32, height: 1, depth: 1)
+        switch scoreBiased.dtype {
+        case .f32:
+            FFAIKernels.ffai_moe_router_topk_biased_f32(
+                score_biased: scoreBiased.buffer, score_biasedOffset: scoreBiased.offset,
+                score_unbiased: scoreUnbiased.buffer, score_unbiasedOffset: scoreUnbiased.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k),
+                gridSize: grd, threadgroupSize: tg, on: cmd)
+        case .f16:
+            FFAIKernels.ffai_moe_router_topk_biased_f16(
+                score_biased: scoreBiased.buffer, score_biasedOffset: scoreBiased.offset,
+                score_unbiased: scoreUnbiased.buffer, score_unbiasedOffset: scoreUnbiased.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k),
+                gridSize: grd, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            FFAIKernels.ffai_moe_router_topk_biased_bf16(
+                score_biased: scoreBiased.buffer, score_biasedOffset: scoreBiased.offset,
+                score_unbiased: scoreUnbiased.buffer, score_unbiasedOffset: scoreUnbiased.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k),
+                gridSize: grd, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError(
+                "Ops.moeRouterTopKBiasedMany: unsupported dtype \(scoreBiased.dtype)")
+        }
     }
 
     /// MoE top-K router. Reads `[nExperts]` raw logits and writes
@@ -3570,9 +4061,9 @@ public enum Ops {
         let pos = UInt32(position)
         let psoName: String
         switch kSrc.dtype {
-        case .f32: psoName = "kv_cache_update_f32"
-        case .f16: psoName = "kv_cache_update_f16"
-        case .bf16: psoName = "kv_cache_update_bf16"
+        case .f32: psoName = "ffai_kv_cache_update_f32"
+        case .f16: psoName = "ffai_kv_cache_update_f16"
+        case .bf16: psoName = "ffai_kv_cache_update_bf16"
         default: fatalError("Ops.kvCacheUpdateKV: unsupported dtype \(kSrc.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -3628,9 +4119,9 @@ public enum Ops {
         let (grid, tg) = elementwiseGrid(total)
         let psoName: String
         switch kSrc.dtype {
-        case .f32: psoName = "kv_cache_update_many_f32"
-        case .f16: psoName = "kv_cache_update_many_f16"
-        case .bf16: psoName = "kv_cache_update_many_bf16"
+        case .f32: psoName = "ffai_kv_cache_update_many_f32"
+        case .f16: psoName = "ffai_kv_cache_update_many_f16"
+        case .bf16: psoName = "ffai_kv_cache_update_many_bf16"
         default: fatalError("Ops.kvCacheUpdateKVMany: unsupported dtype \(kSrc.dtype)")
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
@@ -3794,7 +4285,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
-                has_sink: 0, sink_logit: 0,
+                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .f16):
@@ -3832,6 +4323,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (96, .f16):
@@ -3854,6 +4346,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .f32):
@@ -3865,7 +4358,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
-                has_sink: 0, sink_logit: 0,
+                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .f16):
@@ -3877,7 +4370,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
-                has_sink: 0, sink_logit: 0,
+                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .bf16):
@@ -3889,7 +4382,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
-                has_sink: 0, sink_logit: 0,
+                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         // d512 routes to the dedicated `ffai_sdpa_decode_d512_*` kernel.
@@ -4279,6 +4772,210 @@ public enum Ops {
             fatalError(
                 "Ops.sdpaMulti: unsupported dtype \(q.dtype) at headDim \(headDim) "
                     + "— only (f32/f16/bf16) × (128, 256) are emitted")
+        }
+        return result
+    }
+
+    /// Q-tiled prefill-append SDPA for `headDim == 256`, the default d=256
+    /// prefill path (see `Qwen35AttentionMixer.forwardMany`;
+    /// `FFAI_SDPA_LEGACY_D256=1` reverts to `sdpaMulti`). One threadgroup
+    /// owns `BQ = 16` query rows for a single q_head and reuses each
+    /// loaded K/V block across all 16 rows before advancing, vs
+    /// `sdpaMulti`'s one-threadgroup-per-query-row (no K/V reuse across
+    /// rows, the mechanism behind the F-85 prefill-attention gap).
+    /// Wraps `ffai_sdpa_prefill_qtiled_d256`; see
+    /// `crates/ffai-kernels-std/src/kernels/sdpa/
+    /// sdpa_prefill_qtiled_d256.rs` for the tiling / masking contract.
+    /// TPG = 128 (4 simdgroups × 32 lanes); grid = `(ceil(nQuery/16),
+    /// nQHeads, 1)`. Ragged tiles (`nQuery` not a multiple of 16) are
+    /// handled inside the kernel (padded rows guarded off), so no extra
+    /// precondition beyond `sdpaMulti`'s own headDim/GQA/kvStride ones.
+    public static func sdpaPrefillQtiledD256(
+        q: Tensor, k: Tensor, v: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        baseKV: Int, nQuery: Int, kvStride: Int,
+        causal: Bool, scale: Float,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        if let reason = OpsValidation.validateSdpaMulti(
+            headDim: headDim, nQHeads: nQHeads, nKVHeads: nKVHeads,
+            baseKV: baseKV, nQuery: nQuery, kvStride: kvStride
+        ) {
+            preconditionFailure("Ops.sdpaPrefillQtiledD256: \(reason)")
+        }
+        precondition(
+            headDim == 256,
+            "Ops.sdpaPrefillQtiledD256: only headDim == 256 is emitted, got \(headDim)")
+        let headsPerGroup = nQHeads / nKVHeads
+        let result = out ?? Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: q.dtype)
+        let bq = 16
+        let tgX = (nQuery + bq - 1) / bq
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        // `dispatchThreads` wants the grid in TOTAL THREADS, not
+        // threadgroup counts (the kernel reads `tgid` via
+        // `threadgroup_position_in_grid`, so what matters is that
+        // grid/threadgroupSize divides out to (tgX, nQHeads, 1)
+        // threadgroups). Width is threadgroups-in-x times TPG.x, height
+        // is threadgroups-in-y times TPG.y (TPG.y == 1, so height equals
+        // nQHeads directly). Same convention as `Ops.gemm`'s 2-D tile
+        // dispatch above (`nTiles * threadsPerGroup` width, `mTiles`
+        // height, TPG height 1).
+        let grid = MTLSize(width: tgX * tg.width, height: nQHeads, depth: 1)
+        let causalFlag = UInt32(causal ? 1 : 0)
+        switch q.dtype {
+        case .f32:
+            FFAIKernels.ffai_sdpa_prefill_qtiled_d256_f32(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            FFAIKernels.ffai_sdpa_prefill_qtiled_d256_f16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            FFAIKernels.ffai_sdpa_prefill_qtiled_d256_bf16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError(
+                "Ops.sdpaPrefillQtiledD256: unsupported dtype \(q.dtype) "
+                    + "(only f32/f16/bf16 are emitted)")
+        }
+        return result
+    }
+
+    /// MMA (simdgroup-matrix) Q-tiled prefill-append SDPA for
+    /// `headDim == 256`. Same external contract as
+    /// `sdpaPrefillQtiledD256` (baseKV/nQuery/kvStride/causal-flag
+    /// prefill-append signature, GQA via nQHeads/nKVHeads, ragged
+    /// nQuery guarded inside the kernel) but each threadgroup owns
+    /// `BQ = 32` query rows for a single q_head, computed via
+    /// multi-simdgroup `simdgroup_matrix` MMA fragments rather than
+    /// `sdpaPrefillQtiledD256`'s scalar simd_sum dot products. Wraps
+    /// `ffai_sdpa_prefill_mma_d256`; see `crates/ffai-kernels-std/src/
+    /// kernels/sdpa/sdpa_prefill_mma_d256.rs`.
+    /// TPG = 128 (4 simdgroups x 32 lanes); grid = `(ceil(nQuery/32),
+    /// nQHeads, 1)` THREADGROUPS -- this is a coop-matrix MMA kernel,
+    /// so it must be dispatched with `dispatchThreadgroups` (the
+    /// `_threadgroups` generated variant), never the plain
+    /// `dispatchThreads` entry point (see `sdpaPrefillMma`'s note
+    /// below on this being a silent-corruption bug for coop-matrix
+    /// kernels, not just a perf one).
+    ///
+    /// f16/bf16 default to the BK=16 follow-up kernel
+    /// (`ffai_sdpa_prefill_mma_d256_bk16`, see `crates/ffai-kernels-std/
+    /// src/kernels/sdpa/sdpa_prefill_mma_d256_bk16.rs`): it halves the
+    /// K-block loop's iteration count by reusing each cooperative K/V
+    /// load across twice as many query rows, at a threadgroup-memory
+    /// cost that only fits f16/bf16 (33792 B at f32 would blow the 32
+    /// KiB ceiling, so f32 always stays on the BK=8 kernel below).
+    /// `FFAI_SDPA_BK16=0` reverts f16/bf16 to BK=8 for bisection. Cached
+    /// once (`sdpaBK16Enabled` below) rather than read from
+    /// `ProcessInfo.environment` on every call - this is the default
+    /// d=256 prefill attention kernel, dispatched once per attention
+    /// layer per prefill chunk and once per attention layer per decode
+    /// token on the batched decode path.
+    private static let sdpaBK16Enabled: Bool =
+        ProcessInfo.processInfo.environment["FFAI_SDPA_BK16"] != "0"
+
+    public static func sdpaPrefillMmaD256(
+        q: Tensor, k: Tensor, v: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        baseKV: Int, nQuery: Int, kvStride: Int,
+        causal: Bool, scale: Float,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        if let reason = OpsValidation.validateSdpaMulti(
+            headDim: headDim, nQHeads: nQHeads, nKVHeads: nKVHeads,
+            baseKV: baseKV, nQuery: nQuery, kvStride: kvStride
+        ) {
+            preconditionFailure("Ops.sdpaPrefillMmaD256: \(reason)")
+        }
+        precondition(
+            headDim == 256,
+            "Ops.sdpaPrefillMmaD256: only headDim == 256 is emitted, got \(headDim)")
+        let headsPerGroup = nQHeads / nKVHeads
+        let result = out ?? Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: q.dtype)
+        // Grid in THREADGROUPS directly: (ceil(nQuery/32), nQHeads, 1).
+        // Do NOT scale by tg.width the way the dispatchThreads-based
+        // sdpaPrefillQtiledD256 does above -- dispatchThreadgroups
+        // takes a threadgroup-count grid, not a total-thread grid.
+        let bq = 32
+        let tgX = (nQuery + bq - 1) / bq
+        let tgGrid = MTLSize(width: tgX, height: nQHeads, depth: 1)
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        let causalFlag = UInt32(causal ? 1 : 0)
+        let useBK16 = Self.sdpaBK16Enabled
+        switch q.dtype {
+        case .f32:
+            FFAIKernels.ffai_sdpa_prefill_mma_d256_f32_threadgroups(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            if useBK16 {
+                FFAIKernels.ffai_sdpa_prefill_mma_d256_bk16_f16_threadgroups(
+                    q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                    v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                    head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                    base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                    kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                    causal: causalFlag, scale: scale,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                FFAIKernels.ffai_sdpa_prefill_mma_d256_f16_threadgroups(
+                    q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                    v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                    head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                    base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                    kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                    causal: causalFlag, scale: scale,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            }
+        case .bf16:
+            if useBK16 {
+                FFAIKernels.ffai_sdpa_prefill_mma_d256_bk16_bf16_threadgroups(
+                    q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                    v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                    head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                    base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                    kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                    causal: causalFlag, scale: scale,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                FFAIKernels.ffai_sdpa_prefill_mma_d256_bf16_threadgroups(
+                    q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                    v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                    head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                    base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                    kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                    causal: causalFlag, scale: scale,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            }
+        default:
+            fatalError(
+                "Ops.sdpaPrefillMmaD256: unsupported dtype \(q.dtype) "
+                    + "(only f32/f16/bf16 are emitted)")
         }
         return result
     }
@@ -4810,10 +5507,22 @@ public enum Ops {
         on cmd: MTLCommandBuffer
     ) {
         precondition(
-            rotation.dtype == .f32 && boundaries.dtype == .f32 && codebook.dtype == .f32,
-            "Ops.auraEncode: rotation/boundaries/codebook must be f32")
+            rotation.dtype == input.dtype && boundaries.dtype == input.dtype,
+            "Ops.auraEncode: rotation/boundaries dtype must match input "
+                + "dtype (got rotation=\(rotation.dtype), "
+                + "boundaries=\(boundaries.dtype) vs input=\(input.dtype)) "
+                + "— metaltile #226 unified to Tensor<T>; the Π matrix "
+                + "dominates encoder bandwidth so narrowing it at f16/bf16 "
+                + "halves the dominant read")
+        precondition(
+            codebook.dtype == input.dtype,
+            "Ops.auraEncode: codebook dtype must match input dtype "
+                + "(got \(codebook.dtype) vs \(input.dtype))")
         precondition(packedOut.dtype == .u32, "Ops.auraEncode: packed_out must be u32")
-        precondition(normsOut.dtype == .f32, "Ops.auraEncode: norms_out must be f32")
+        precondition(
+            normsOut.dtype == input.dtype,
+            "Ops.auraEncode: norms_out dtype must match input dtype "
+                + "(got \(normsOut.dtype) vs \(input.dtype))")
         // Kernel-invariant validation — see OpsValidation.swift.
         if let reason = OpsValidation.validateAuraEncode(rows: rows, dim: dim, bits: bits) {
             preconditionFailure("Ops.auraEncode: \(reason)")
@@ -4988,8 +5697,10 @@ public enum Ops {
     ) {
         precondition(packed.dtype == .u32, "Ops.auraDequantRotated: packed must be u32")
         precondition(
-            norms.dtype == .f32 && codebook.dtype == .f32,
-            "Ops.auraDequantRotated: norms/codebook must be f32")
+            norms.dtype == out.dtype && codebook.dtype == out.dtype,
+            "Ops.auraDequantRotated: norms/codebook must match output "
+                + "dtype (got norms=\(norms.dtype), codebook=\(codebook.dtype) "
+                + "vs out=\(out.dtype)) — post-AURA-dtype-unification")
         let stride = cacheStride ?? tokens
         // Kernel-invariant validation (cacheStride row-stride contract,
         // packedWidth dim coverage, bit-width). See
@@ -5126,6 +5837,492 @@ public enum Ops {
     ///   * `x.dtype == rotation.dtype` (gemv requires matched dtypes —
     ///     the caller is expected to keep an activation-dtype copy of
     ///     the rotation alongside the f32 copy required by `auraEncode`)
+    /// AURA flash-SDPA (compressed decode). Walks the packed K + V
+    /// buffers directly — no dequant-to-mirror — saving a per-decode
+    /// `nKVHeads × maxSeq × headDim` materialisation. At Qwen3-1.7B /
+    /// maxSeq=32K that's ~1.8 GB of working-buffer reads eliminated per
+    /// decode step.
+    ///
+    /// Caller must:
+    ///   - have already applied Π to `q` (matches the existing
+    ///     `dequantMirror` decode path — Π applied to Q before SDPA so
+    ///     scores cancel; Π^T applied to the output before oProj).
+    ///   - confirm `supportsFlashSdpa(scheme:headDim:)` is true; this
+    ///     wrapper only covers the metaltile flash variants currently
+    ///     emitted: (kb=4, vb=2) and (kb=4, vb=4) × d ∈ {64, 128}.
+    ///   - own + pass a `sinks` tensor of shape `[nQHeads]` (zeroed +
+    ///     `hasSinks=false` gives a no-op attention-sink path).
+    ///
+    /// The kernel takes `q_rot` as fp32; this wrapper casts on the
+    /// caller's behalf into a scratch buffer if needed. Output dtype
+    /// is the model's activation dtype.
+    /// - Parameter liveLength: number of populated K/V rows the loop
+    ///   should iterate over (the attention upper bound).
+    /// - Parameter kvStride: per-KV-head row stride of the cache —
+    ///   typically `maxSeq` of the AURA KVCache. MUST equal the cache's
+    ///   allocated stride, not `liveLength`, otherwise off-head reads
+    ///   alias into the previous head's tail bytes when the cache isn't
+    ///   fully populated.
+    public static func auraFlashSdpa(
+        q: Tensor, sinks: Tensor,
+        kPacked: Tensor, kNorms: Tensor, kCodebook: Tensor,
+        vPacked: Tensor, vNorms: Tensor, vCodebook: Tensor,
+        into out: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        kPackedWidth: Int, vPackedWidth: Int,
+        liveLength: Int, kvStride: Int,
+        keyBits: Int, valueBits: Int,
+        scale: Float,
+        hasSinks: Bool = false, windowSize: Int = 0,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            kvStride >= liveLength,
+            "Ops.auraFlashSdpa: kvStride (\(kvStride)) must be ≥ liveLength (\(liveLength))")
+        precondition(
+            nQHeads % nKVHeads == 0,
+            "Ops.auraFlashSdpa: nQHeads (\(nQHeads)) must be divisible by nKVHeads (\(nKVHeads))")
+        precondition(
+            kPacked.dtype == .u32 && vPacked.dtype == .u32,
+            "Ops.auraFlashSdpa: packed K/V must be u32")
+        precondition(
+            kNorms.dtype == out.dtype && vNorms.dtype == out.dtype
+                && kCodebook.dtype == out.dtype && vCodebook.dtype == out.dtype,
+            "Ops.auraFlashSdpa: norms + codebooks must match activation "
+                + "dtype (got \(kNorms.dtype) vs \(out.dtype))")
+        precondition(
+            sinks.dtype == out.dtype,
+            "Ops.auraFlashSdpa: sinks must match activation dtype "
+                + "(got \(sinks.dtype) vs \(out.dtype))")
+        precondition(
+            q.dtype == out.dtype,
+            "Ops.auraFlashSdpa: q dtype must match activation dtype "
+                + "(got \(q.dtype) vs \(out.dtype))")
+
+        // The flash kernel's contract (aura_flash_sdpa.rs header):
+        // `q_rot` is WHT-rotated AND **pre-scaled** by the caller. The
+        // kernel computes `(Q · centroid) * k_norm` with no internal
+        // scale — caller must bake the softmax scale (1/√headDim) into
+        // Q before dispatch. Scratch + scale buffer cached by
+        // (shape, dtype, scale) so the hot decode path doesn't pay 2×
+        // Metal buffer allocations per attn layer per token.
+        //
+        // Post-dtype-unification the multiply happens in the activation
+        // dtype — kernel does cast-at-load to f32 internally, matching
+        // the precision of every other AURA kernel (encode / score /
+        // value / 2-pass), and the C++ TQ+ fork's production pattern.
+        let qScratch = AuraFlashScratchCache.qScratch(
+            shape: q.shape, dtype: out.dtype)
+        let scaleBuf = AuraFlashScratchCache.scaleBuffer(
+            shape: q.shape, scale: scale, dtype: out.dtype)
+        _ = Ops.mul(q, scaleBuf, on: cmd, into: qScratch)
+
+        let dim = UInt32(headDim)
+        let kpw = UInt32(kPackedWidth)
+        let vpw = UInt32(vPackedWidth)
+        let tokens = UInt32(liveLength)
+        let kvStrideU = UInt32(kvStride)
+        let repeatCount = UInt32(nQHeads / nKVHeads)
+        let numQ = UInt32(nQHeads)
+        let sinksFlag: UInt32 = hasSinks ? 1 : 0
+        let win = UInt32(windowSize)
+
+        // Grid invariant from `aura_flash_sdpa.rs`: one simdgroup per
+        // Q head. grid = [32, nQHeads, 1], tg = [32, 1, 1].
+        let grid = MTLSize(width: 32, height: nQHeads, depth: 1)
+        let tg = MTLSize(width: 32, height: 1, depth: 1)
+
+        switch (keyBits, valueBits, headDim, out.dtype) {
+        case (4, 2, 128, .f32):
+            FFAIKernels.ffai_aura_flash_sdpa_kb4_vb2_d128_f32(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount, num_q_heads: numQ,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 2, 128, .f16):
+            FFAIKernels.ffai_aura_flash_sdpa_kb4_vb2_d128_f16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount, num_q_heads: numQ,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 2, 128, .bf16):
+            FFAIKernels.ffai_aura_flash_sdpa_kb4_vb2_d128_bf16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount, num_q_heads: numQ,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 4, 128, .f32):
+            FFAIKernels.ffai_aura_flash_sdpa_kb4_vb4_d128_f32(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount, num_q_heads: numQ,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 4, 128, .f16):
+            FFAIKernels.ffai_aura_flash_sdpa_kb4_vb4_d128_f16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount, num_q_heads: numQ,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 4, 128, .bf16):
+            FFAIKernels.ffai_aura_flash_sdpa_kb4_vb4_d128_bf16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount, num_q_heads: numQ,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            preconditionFailure(
+                "Ops.auraFlashSdpa: unsupported (keyBits=\(keyBits), "
+                    + "valueBits=\(valueBits), headDim=\(headDim), "
+                    + "dtype=\(out.dtype)). Caller must check "
+                    + "supportsFlashSdpa(scheme:headDim:dtype:) first.")
+        }
+    }
+
+    /// Predicate for the `auraFlashSdpa` supported-scheme set. Returns
+    /// true when the metaltile flash kernel exists for this combo.
+    public static func supportsAuraFlashSdpa(
+        keyBits: Int, valueBits: Int, headDim: Int, dtype: DType
+    ) -> Bool {
+        guard [DType.f32, .f16, .bf16].contains(dtype) else { return false }
+        // d=64 metaltile kernels exist but FFAI side hasn't wired their
+        // Ops dispatch yet — gate to d=128 (Qwen3 / Llama-3 family).
+        guard headDim == 128 else { return false }
+        if keyBits == 4 && (valueBits == 2 || valueBits == 4) { return true }
+        return false
+    }
+
+    /// AURA flash-SDPA — two-pass token-parallel variant. Same external
+    /// contract as `auraFlashSdpa` but dispatches `aura_flash_p1` +
+    /// `aura_flash_pass2` instead of the single-pass kernel. Pass 1
+    /// fans tokens across `num_blocks × nQHeads` simdgroups (single-pass
+    /// dispatches one simdgroup per Q head, which starves the GPU at
+    /// long context). Pass 2 reduces the per-block partials.
+    ///
+    /// **Block-size contract.** `num_blocks = ceil(liveLength /
+    /// blockSize)`. `blockSize = 64` is the FA-2 conventional choice and
+    /// saturates an M5 Max around liveLength≈4K (~16 q-heads × 64 blocks
+    /// = 1024 active simdgroups). The kernel takes `block_size` as a
+    /// runtime scalar so the wrapper is free to tune per-call.
+    ///
+    /// Uses the non-causal `aura_flash_p1` variant — safe for decode
+    /// T=1 because `q_position == liveLength-1` and all populated K rows
+    /// satisfy `t ≤ q_position`. The causal variant exists for kb4_vb2
+    /// only; using non-causal everywhere unifies the dispatch surface.
+    ///
+    /// Caller owns the partials. Reuse across decode steps is safe — the
+    /// shapes depend only on `(nQHeads, headDim, blockSize, kvStride)`
+    /// and the wrapper writes the full surface each call.
+    public static func auraFlashSdpa2Pass(
+        q: Tensor,
+        kPacked: Tensor, kNorms: Tensor, kCodebook: Tensor,
+        vPacked: Tensor, vNorms: Tensor, vCodebook: Tensor,
+        into out: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        kPackedWidth: Int, vPackedWidth: Int,
+        liveLength: Int, kvStride: Int,
+        keyBits: Int, valueBits: Int,
+        scale: Float,
+        blockSize: Int,
+        partialO: Tensor, partialM: Tensor, partialL: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            kvStride >= liveLength,
+            "Ops.auraFlashSdpa2Pass: kvStride (\(kvStride)) must be ≥ liveLength (\(liveLength))")
+        precondition(
+            nQHeads % nKVHeads == 0,
+            "Ops.auraFlashSdpa2Pass: nQHeads (\(nQHeads)) must be divisible by nKVHeads (\(nKVHeads))")
+        precondition(
+            kPacked.dtype == .u32 && vPacked.dtype == .u32,
+            "Ops.auraFlashSdpa2Pass: packed K/V must be u32")
+        precondition(
+            kNorms.dtype == out.dtype && vNorms.dtype == out.dtype
+                && kCodebook.dtype == out.dtype && vCodebook.dtype == out.dtype,
+            "Ops.auraFlashSdpa2Pass: norms + codebooks must match "
+                + "activation dtype (got \(kNorms.dtype) vs \(out.dtype))")
+        precondition(
+            q.dtype == out.dtype,
+            "Ops.auraFlashSdpa2Pass: q dtype must match activation dtype")
+        precondition(
+            blockSize > 0 && blockSize % 32 == 0,
+            "Ops.auraFlashSdpa2Pass: blockSize (\(blockSize)) must be a "
+                + "positive multiple of 32")
+        let numBlocks = (liveLength + blockSize - 1) / blockSize
+        precondition(
+            partialO.dtype == out.dtype && partialM.dtype == out.dtype
+                && partialL.dtype == out.dtype,
+            "Ops.auraFlashSdpa2Pass: partials must match activation dtype")
+        precondition(
+            partialO.elementCount >= nQHeads * numBlocks * headDim,
+            "Ops.auraFlashSdpa2Pass: partialO too small for nQHeads * numBlocks * headDim")
+        precondition(
+            partialM.elementCount >= nQHeads * numBlocks
+                && partialL.elementCount >= nQHeads * numBlocks,
+            "Ops.auraFlashSdpa2Pass: partialM/L too small for nQHeads * numBlocks")
+
+        // Same q pre-scale flow as the single-pass wrapper — kernel
+        // expects pre-scaled Q in activation dtype.
+        let qScratch = AuraFlashScratchCache.qScratch(
+            shape: q.shape, dtype: out.dtype)
+        let scaleBuf = AuraFlashScratchCache.scaleBuffer(
+            shape: q.shape, scale: scale, dtype: out.dtype)
+        _ = Ops.mul(q, scaleBuf, on: cmd, into: qScratch)
+
+        let dim = UInt32(headDim)
+        let kpw = UInt32(kPackedWidth)
+        let vpw = UInt32(vPackedWidth)
+        let tokens = UInt32(liveLength)
+        let kvStrideU = UInt32(kvStride)
+        let repeatCount = UInt32(nQHeads / nKVHeads)
+        let numBlocksU = UInt32(numBlocks)
+        let blockSizeU = UInt32(blockSize)
+        // Causal masking unused by the non-causal variant; pass 0.
+        let qPosition: UInt32 = 0
+
+        // Pass 1: Grid3D (lane, q_idx, block_idx), tg = (32, 1, 1).
+        // Raw threads = [32, nQHeads, numBlocks] groups into
+        // [1, nQHeads, numBlocks] TGs of 32 lanes each.
+        let p1Grid = MTLSize(width: 32, height: nQHeads, depth: numBlocks)
+        let p1Tg = MTLSize(width: 32, height: 1, depth: 1)
+        // Pass 2: tg = (32, 1, 1) per q_idx; kernel reads
+        // `q_idx = tgid_x`. Raw threads = [nQHeads*32, 1, 1] groups into
+        // [nQHeads, 1, 1] TGs, one per q_idx — matches the end-to-end
+        // `aura_flash_gpu_correctness.rs` dispatch shape.
+        let p2Grid = MTLSize(width: nQHeads * 32, height: 1, depth: 1)
+        let p2Tg = MTLSize(width: 32, height: 1, depth: 1)
+
+        switch (keyBits, valueBits, headDim, out.dtype) {
+        case (4, 2, 128, .f32):
+            FFAIKernels.ffai_aura_flash_p1_kb4_vb2_d128_f32(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount,
+                num_blocks: numBlocksU, block_size: blockSizeU,
+                q_position: qPosition,
+                gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
+            FFAIKernels.ffai_aura_flash_pass2_d128_f32(
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                output: out.buffer, outputOffset: out.offset,
+                dim: dim, num_blocks: numBlocksU,
+                gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
+        case (4, 2, 128, .f16):
+            FFAIKernels.ffai_aura_flash_p1_kb4_vb2_d128_f16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount,
+                num_blocks: numBlocksU, block_size: blockSizeU,
+                q_position: qPosition,
+                gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
+            FFAIKernels.ffai_aura_flash_pass2_d128_f16(
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                output: out.buffer, outputOffset: out.offset,
+                dim: dim, num_blocks: numBlocksU,
+                gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
+        case (4, 2, 128, .bf16):
+            FFAIKernels.ffai_aura_flash_p1_kb4_vb2_d128_bf16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount,
+                num_blocks: numBlocksU, block_size: blockSizeU,
+                q_position: qPosition,
+                gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
+            FFAIKernels.ffai_aura_flash_pass2_d128_bf16(
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                output: out.buffer, outputOffset: out.offset,
+                dim: dim, num_blocks: numBlocksU,
+                gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
+        case (4, 4, 128, .f32):
+            FFAIKernels.ffai_aura_flash_p1_kb4_vb4_d128_f32(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount,
+                num_blocks: numBlocksU, block_size: blockSizeU,
+                q_position: qPosition,
+                gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
+            FFAIKernels.ffai_aura_flash_pass2_d128_f32(
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                output: out.buffer, outputOffset: out.offset,
+                dim: dim, num_blocks: numBlocksU,
+                gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
+        case (4, 4, 128, .f16):
+            FFAIKernels.ffai_aura_flash_p1_kb4_vb4_d128_f16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount,
+                num_blocks: numBlocksU, block_size: blockSizeU,
+                q_position: qPosition,
+                gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
+            FFAIKernels.ffai_aura_flash_pass2_d128_f16(
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                output: out.buffer, outputOffset: out.offset,
+                dim: dim, num_blocks: numBlocksU,
+                gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
+        case (4, 4, 128, .bf16):
+            FFAIKernels.ffai_aura_flash_p1_kb4_vb4_d128_bf16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount,
+                num_blocks: numBlocksU, block_size: blockSizeU,
+                q_position: qPosition,
+                gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
+            FFAIKernels.ffai_aura_flash_pass2_d128_bf16(
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                output: out.buffer, outputOffset: out.offset,
+                dim: dim, num_blocks: numBlocksU,
+                gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
+        default:
+            preconditionFailure(
+                "Ops.auraFlashSdpa2Pass: unsupported (keyBits=\(keyBits), "
+                    + "valueBits=\(valueBits), headDim=\(headDim), "
+                    + "dtype=\(out.dtype)). Caller must check "
+                    + "supportsAuraFlashSdpa2Pass(...) first.")
+        }
+    }
+
+    /// Predicate for the `auraFlashSdpa2Pass` supported-scheme set.
+    /// Matches `supportsAuraFlashSdpa` today — both wrappers cover the
+    /// same metaltile-emitted (kb=4, vb∈{2,4}) × d=128 cells.
+    public static func supportsAuraFlashSdpa2Pass(
+        keyBits: Int, valueBits: Int, headDim: Int, dtype: DType
+    ) -> Bool {
+        guard [DType.f32, .f16, .bf16].contains(dtype) else { return false }
+        guard headDim == 128 else { return false }
+        if keyBits == 4 && (valueBits == 2 || valueBits == 4) { return true }
+        return false
+    }
+
     public static func auraRotatePerHead(
         _ x: Tensor, rotation: Tensor,
         nHeads: Int, headDim: Int,
@@ -5182,6 +6379,45 @@ public enum Ops {
     // internally — BM=16 with boundary masking). Grid =
     //   [N / 32, ceil(mTotal / 16), 1]
     // Threadgroup = [64, 1, 1] (2 simdgroups).
+    /// Grow-only identity row-map (`x_rows[i] = i`) for the bm16 MPP
+    /// gather family's pre-gathered-X layout. An iota of capacity N
+    /// serves any mTotal <= N — the kernel reads only the first m_total
+    /// entries. Refilled only on growth.
+    private static let identityRowsLock = NSLock()
+    nonisolated(unsafe) private static var identityRowsBuf: MTLBuffer?
+    static func identityRowsBuffer(minCount: Int, device: Device) -> MTLBuffer {
+        identityRowsLock.lock()
+        defer { identityRowsLock.unlock() }
+        if let buf = identityRowsBuf, buf.length >= minCount * 4 { return buf }
+        let cap = max(minCount, 8192)
+        let buf = device.makeBuffer(length: cap * 4)
+        let ptr = buf.contents().bindMemory(to: UInt32.self, capacity: cap)
+        for i in 0 ..< cap { ptr[i] = UInt32(i) }
+        identityRowsBuf = buf
+        return buf
+    }
+
+    /// Whether the MPP auto-default may fire: Apple GPU Family 9+ (M3+)
+    /// and macOS 26+ (Metal 4 — the MPP header live-compile requires it).
+    /// Cached once; explicit FFAI_MOE_BGEMM_MPP=1 bypasses this.
+    ///
+    /// Module-visible (not `private`) rather than duplicated: `MoELayer`'s
+    /// F-85 coop-core MoE gather gate (`coopEnabled`) also wraps a
+    /// `matmul2d`/cooperative-tensor kernel (`ffai_moe_gather_qmm_coop`)
+    /// with the same Family-9/macOS-26 requirement, and unlike
+    /// `dispatchQmmMma`'s coop tier below (which falls back to a cheaper
+    /// tier on incapable hardware), that kernel has no lower-level
+    /// fallback of its own once dispatched - the capability check has to
+    /// happen at the `MoELayer` call site, so it reuses this same cached
+    /// check instead of re-deriving it.
+    static let mppAutoCapable: Bool = {
+        guard
+            ProcessInfo.processInfo.isOperatingSystemAtLeast(
+                OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0))
+        else { return false }
+        return Device.shared.mtlDevice.supportsFamily(.apple9)
+    }()
+
     public static func moeGatherDequantGemmInt4(
         input: Tensor,
         weight: Tensor, scales: Tensor, biases: Tensor,
@@ -5230,9 +6466,26 @@ public enum Ops {
         // generated Swift wrapper calls `dispatchThreads` (grid counted
         // in TOTAL threads) so total threads = grid × tg per axis.
         //
-        // FFAI_MOE_BGEMM_MPP=1 opts into the NAX cooperative-tensor
-        // path — macOS 26.2+ on gen-≥17 GPU silicon only (M5 Max yes).
-        let useMpp = ProcessInfo.processInfo.environment["FFAI_MOE_BGEMM_MPP"] != nil
+        // NAX cooperative-tensor (MPP): macOS 26+ / Apple GPU Family 9+ (M3+).
+        // Force on: FFAI_MOE_BGEMM_MPP=1. Force off: FFAI_MOE_BGEMM_NO_MPP=1.
+        // Optional floor: FFAI_MOE_BGEMM_MPP_MIN=<mTotal> (default 0 = always
+        // when hardware allows). Measured 2026-07-18 M5 Max Qwen3.6-A3B:
+        // force-on beats simdgroup at short T too (T=57 +9%, T=82 +6%)
+        // and is neutral/better at long T — the old mTotal≥1024 floor was
+        // leaving short/mid prefill on the slower path. Auto must still
+        // not route M1–M2 or pre-Metal-4 into a live-compile that cannot
+        // find the MPP header (same .apple9 gate the MPP tests use).
+        // Force-on skips the gate: explicit opt-in owns unsupported HW.
+        let env = ProcessInfo.processInfo.environment
+        let useMpp: Bool
+        if env["FFAI_MOE_BGEMM_NO_MPP"] != nil {
+            useMpp = false
+        } else if env["FFAI_MOE_BGEMM_MPP"] != nil {
+            useMpp = true
+        } else {
+            let mppMin = Int(env["FFAI_MOE_BGEMM_MPP_MIN"] ?? "") ?? 0
+            useMpp = mTotal >= mppMin && Self.mppAutoCapable
+        }
         let tgWidth = useMpp ? 32 : 64
         let grid = MTLSize(
             width: (nOut / 32) * tgWidth,
@@ -5245,6 +6498,8 @@ public enum Ops {
         let groupSizeU = UInt32(groupSize)
 
         if useMpp {
+            // Identity x_rows: X is pre-gathered, row i reads x[i, :].
+            let idRows = Self.identityRowsBuffer(minCount: mTotal, device: Device.shared)
             switch input.dtype {
             case .f32:
                 FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_f32(
@@ -5253,6 +6508,7 @@ public enum Ops {
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
                     indices: indices.buffer, indicesOffset: indices.offset,
+                    x_rows: idRows, x_rowsOffset: 0,
                     out: out.buffer, outOffset: out.offset,
                     m_total: mTotalU, n_out: nOutU, k_in: kInU,
                     group_size: groupSizeU,
@@ -5264,13 +6520,27 @@ public enum Ops {
                     scales: scales.buffer, scalesOffset: scales.offset,
                     biases: biases.buffer, biasesOffset: biases.offset,
                     indices: indices.buffer, indicesOffset: indices.offset,
+                    x_rows: idRows, x_rowsOffset: 0,
+                    out: out.buffer, outOffset: out.offset,
+                    m_total: mTotalU, n_out: nOutU, k_in: kInU,
+                    group_size: groupSizeU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            case .bf16:
+                // Qwen3.x activations are often bf16; kernel is already emitted.
+                FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_bf16(
+                    x: input.buffer, xOffset: input.offset,
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    indices: indices.buffer, indicesOffset: indices.offset,
+                    x_rows: idRows, x_rowsOffset: 0,
                     out: out.buffer, outOffset: out.offset,
                     m_total: mTotalU, n_out: nOutU, k_in: kInU,
                     group_size: groupSizeU,
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             default:
                 fatalError(
-                    "Ops.moeGatherDequantGemmInt4: MPP variant only emits f32/f16 (got \(input.dtype))"
+                    "Ops.moeGatherDequantGemmInt4: MPP unsupported dtype \(input.dtype)"
                 )
             }
             return
@@ -5315,6 +6585,913 @@ public enum Ops {
         }
     }
 
+    // MARK: - F-85 expert-aligned tile-plan MoE gather GEMM
+
+    /// Host-computable worst-case tile-plan capacity for `moeBuildTilePlan` /
+    /// `moeGatherDequantGemmInt4TilePlan`: `ceil(mTotal/16) + nExperts`. This
+    /// is a provable upper bound on `sum_e ceil(count[e]/16)` (every expert
+    /// contributes at most one "ceiling" tile beyond its exact `count/16`
+    /// share) that depends only on `mTotal`/`nExperts` - both known on the
+    /// host before routing runs - so callers can size and dispatch the
+    /// plan-builder AND the tileplan GEMM with a fully static grid, no
+    /// GPU→CPU sync to read back the real tile count. See
+    /// `ffai_moe_build_tile_plan`'s dispatch-invariants doc (kernels repo,
+    /// `moe_tile_plan_builder.rs`) for the proof sketch and the zero-fill
+    /// contract that makes the padding entries this bound reserves safe to
+    /// dispatch as inert tiles.
+    public static func moeTilePlanCapacity(mTotal: Int, nExperts: Int) -> Int {
+        (mTotal + 15) / 16 + nExperts
+    }
+
+    /// Device-side tile-plan builder (`ffai_moe_build_tile_plan`). Reads the
+    /// already expert-sorted `sortedExperts [mTotal]` device buffer (the
+    /// routing step's own sort output - no host readback) and writes
+    /// `tileExpert`/`tileRowStart`/`tileRowCount`, one entry per expert-
+    /// aligned BM=16 tile, ascending by expert id. Real entries occupy
+    /// indices `[0, realTileCount)`; the caller must have zero-filled the
+    /// buffers out to `capacity` (from `moeTilePlanCapacity`) before this
+    /// call - this kernel only writes the real entries, it does not know
+    /// `capacity` and never touches padding.
+    ///
+    /// One threadgroup, `nExperts` lanes - the kernel's own threadgroup
+    /// scratch array is sized for 256 lanes (Qwen3.6-35B-A3B's expert
+    /// count); `nExperts` above that would silently under-allocate.
+    public static func moeBuildTilePlan(
+        sortedExperts: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeBuildTilePlan: sortedExperts must be u32")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeBuildTilePlan: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeBuildTilePlan: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let grid = MTLSize(width: nExperts, height: 1, depth: 1)
+        let tg = MTLSize(width: nExperts, height: 1, depth: 1)
+        FFAIKernels.ffai_moe_build_tile_plan_f32(
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+            tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+            tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+            m_total: UInt32(mTotal), n_experts: UInt32(nExperts),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Expert-aligned tile-plan MoE gather GEMM
+    /// (`ffai_moe_gather_qmm_mma_int4_bm16_mpp_tileplan`, F-85). Same
+    /// dequant math, same BM=16/BN=32/BK=16 MPP geometry as
+    /// `moeGatherDequantGemmInt4`'s MPP path - the only difference is tile
+    /// boundaries come from a host-dispatched, device-built plan
+    /// (`tileExpert`/`tileRowStart`/`tileRowCount`, see `moeBuildTilePlan`)
+    /// instead of a fixed 16-row M-stride, so every dispatched tile is
+    /// single-expert by construction and pays exactly one K-dimension pass.
+    ///
+    /// `capacity` is the dispatch grid's tile-axis extent - the host
+    /// worst-case bound from `moeTilePlanCapacity`, NOT the real tile
+    /// count (which would need a GPU→CPU sync to read back). Tiles at or
+    /// past the real count read `tileRowCount == 0` (the caller's
+    /// zero-fill) and are masked out by the same `mr < row_count` tail
+    /// check that handles an ordinary trailing partial tile - they stage
+    /// no X row and write no output, just redundant W-dequant work.
+    public static func moeGatherDequantGemmInt4TilePlan(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        xRows: Tensor,
+        capacity: Int, nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(weight.dtype == .u32, "moeGatherDequantGemmInt4TilePlan: weight must be u32 packed")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeGatherDequantGemmInt4TilePlan: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            xRows.dtype == .u32, "moeGatherDequantGemmInt4TilePlan: xRows must be u32")
+        precondition(
+            input.dtype == scales.dtype && scales.dtype == biases.dtype,
+            "moeGatherDequantGemmInt4TilePlan: input/scales/biases dtype must match")
+        precondition(
+            out.dtype == input.dtype,
+            "moeGatherDequantGemmInt4TilePlan: out dtype must match input")
+        precondition(
+            nOut % 32 == 0,
+            "moeGatherDequantGemmInt4TilePlan: nOut (\(nOut)) must be multiple of 32")
+        precondition(
+            kIn % 16 == 0,
+            "moeGatherDequantGemmInt4TilePlan: kIn (\(kIn)) must be multiple of 16")
+
+        // Single simdgroup (32-thread) MPP kernel, same as the sibling
+        // bm16_mpp dispatch: thread-counted grid, tile axis = capacity
+        // (host worst-case bound, static - see moeTilePlanCapacity).
+        let grid = MTLSize(width: (nOut / 32) * 32, height: capacity, depth: 1)
+        let tg = MTLSize(width: 32, height: 1, depth: 1)
+        let nOutU = UInt32(nOut)
+        let kInU = UInt32(kIn)
+        let groupSizeU = UInt32(groupSize)
+
+        switch input.dtype {
+        case .f32:
+            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_tileplan_f32(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+                tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+                tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_tileplan_f16(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+                tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+                tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm16_mpp_tileplan_bf16(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+                tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+                tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.moeGatherDequantGemmInt4TilePlan: unsupported dtype \(input.dtype)")
+        }
+    }
+
+    // MARK: - F-85 coop-core MoE gather GEMM (BM=32 tile plan)
+
+    /// BM=32 sibling of `moeTilePlanCapacity`: `ceil(mTotal/32) + nExperts`,
+    /// the worst-case tile count for `moeBuildTilePlanBm32` /
+    /// `moeGatherDequantGemmInt4CoopTilePlan`. Same proof as the BM=16
+    /// bound (every expert contributes at most one "ceiling" tile beyond
+    /// its exact `count/32` share) with the tile height doubled.
+    public static func moeTilePlanCapacityBm32(mTotal: Int, nExperts: Int) -> Int {
+        (mTotal + 31) / 32 + nExperts
+    }
+
+    /// Device-side BM=32 tile-plan builder (`ffai_moe_build_tile_plan_bm32`).
+    /// Same contract as `moeBuildTilePlan` - reads the already expert-sorted
+    /// `sortedExperts` buffer, writes `tileExpert`/`tileRowStart`/
+    /// `tileRowCount` for BM=32 tiles - just the tile-height constant
+    /// doubled. Caller must zero-fill the plan buffers out to
+    /// `moeTilePlanCapacityBm32` before this call, same padding contract.
+    /// `tileCountGateUp`/`tileCountDown` (F-85 idle-tile-cost follow-up):
+    /// one-element u32 views the caller has already positioned at the
+    /// "count" word (word 1) of its own two
+    /// `MTLDispatchThreadgroupsIndirectArguments`-shaped triples - see
+    /// `Ops.moeGatherDequantGemmInt4CoopTilePlanIndirect`. The two legs
+    /// need independent triples because they differ in `n_out` (word 0),
+    /// but both receive the SAME device-computed real tile count here.
+    public static func moeBuildTilePlanBm32(
+        sortedExperts: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        tileCountGateUp: Tensor, tileCountDown: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeBuildTilePlanBm32: sortedExperts must be u32")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeBuildTilePlanBm32: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            tileCountGateUp.dtype == .u32 && tileCountDown.dtype == .u32,
+            "moeBuildTilePlanBm32: tileCountGateUp/tileCountDown must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeBuildTilePlanBm32: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let grid = MTLSize(width: nExperts, height: 1, depth: 1)
+        let tg = MTLSize(width: nExperts, height: 1, depth: 1)
+        FFAIKernels.ffai_moe_build_tile_plan_bm32_f32(
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+            tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+            tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+            tile_count_gateup: tileCountGateUp.buffer, tile_count_gateupOffset: tileCountGateUp.offset,
+            tile_count_down: tileCountDown.buffer, tile_count_downOffset: tileCountDown.offset,
+            m_total: UInt32(mTotal), n_experts: UInt32(nExperts),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Coop-core MoE gather GEMM (`ffai_moe_gather_qmm_coop`, F-85 gather
+    /// variant). Reuses `ffai_qmm_coop`'s inner loop/staging (TPG=128, 4 SG
+    /// 2x2 warp grid, BN=64) against a BM=32 tile plan - the tile height
+    /// matches this core's native M-tile exactly, so a plan tile maps to
+    /// one threadgroup with no pairing logic, mirroring
+    /// `moeGatherDequantGemmInt4TilePlan`'s BM=16 dispatch shape one tile
+    /// height up. `capacity` is `moeTilePlanCapacityBm32`'s host worst-case
+    /// bound (the dispatch grid's tile-axis extent), not the real tile
+    /// count - same zero-fill/inert-tile padding contract as the BM=16
+    /// sibling. Requires `nOut % 64 == 0` (BN=64) and `groupSize == 64`
+    /// (baked group-size assumption shared with the dense coop core);
+    /// callers outside that shape must use the BM=16 tileplan path instead.
+    public static func moeGatherDequantGemmInt4CoopTilePlan(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        xRows: Tensor,
+        capacity: Int, nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(weight.dtype == .u32, "moeGatherDequantGemmInt4CoopTilePlan: weight must be u32 packed")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeGatherDequantGemmInt4CoopTilePlan: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            xRows.dtype == .u32, "moeGatherDequantGemmInt4CoopTilePlan: xRows must be u32")
+        precondition(
+            input.dtype == scales.dtype && scales.dtype == biases.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlan: input/scales/biases dtype must match")
+        precondition(
+            out.dtype == input.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlan: out dtype must match input")
+        precondition(
+            nOut % 64 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlan: nOut (\(nOut)) must be multiple of 64 (BN tile)")
+        precondition(
+            kIn % 32 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlan: kIn (\(kIn)) must be multiple of 32 (BK tile)")
+        precondition(
+            kIn.isMultiple(of: groupSize) && kIn / groupSize > 0,
+            "moeGatherDequantGemmInt4CoopTilePlan: groupSize (\(groupSize)) must divide kIn (\(kIn))")
+
+        // 4-SG coop-core dispatch: threadgroup-counted grid, tile axis =
+        // capacity (host worst-case bound, static - see
+        // moeTilePlanCapacityBm32).
+        let grid = MTLSize(width: nOut / 64, height: capacity, depth: 1)
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        let nOutU = UInt32(nOut)
+        let kInU = UInt32(kIn)
+        let groupSizeU = UInt32(groupSize)
+
+        switch input.dtype {
+        case .f32:
+            FFAIKernels.ffai_moe_gather_qmm_coop_f32_threadgroups(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+                tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+                tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            FFAIKernels.ffai_moe_gather_qmm_coop_f16_threadgroups(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+                tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+                tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            FFAIKernels.ffai_moe_gather_qmm_coop_bf16_threadgroups(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+                tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+                tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.moeGatherDequantGemmInt4CoopTilePlan: unsupported dtype \(input.dtype)")
+        }
+    }
+
+    /// Indirect-dispatch sibling of `moeGatherDequantGemmInt4CoopTilePlan`
+    /// (F-85 idle-tile-cost follow-up). An ablation on the production
+    /// coop kernel's guard structure found no early exit before the
+    /// K-loop: every dispatched threadgroup, including worst-case-capacity
+    /// padding whose `tileRowCount == 0`, pays the full W dequant and
+    /// `coop_tile_run` matmul, not a cheap masked skip - same-binary
+    /// capacity-vs-real-tile-count dispatch measured 10-21% idle-tile cost
+    /// at the F-85 low-context mTotal targets. Same kernel, same buffer
+    /// contract as `moeGatherDequantGemmInt4CoopTilePlan` - the only
+    /// difference is the dispatch grid comes from a device-written
+    /// `MTLDispatchThreadgroupsIndirectArguments` triple
+    /// (`indirectArgs`/`indirectArgsOffset`, produced by
+    /// `Ops.moeBuildTilePlanBm32`'s `tileCountGateUp`/`tileCountDown`
+    /// outputs) instead of the host worst-case `capacity` bound, so idle
+    /// tiles beyond the REAL tile count launch zero threadgroups instead
+    /// of running a masked-but-still-full K-loop.
+    ///
+    /// Hand-encoded rather than routed through a generated `_threadgroups`
+    /// wrapper: the generated Swift bindings only emit a fixed
+    /// `dispatchThreadgroups(_:threadsPerThreadgroup:)` call taking a
+    /// host-computed `MTLSize`, with no indirect-buffer variant (metaltile
+    /// codegen limitation - out of scope to change for this fix). The PSO
+    /// itself is unchanged (same pipeline the generated wrapper uses,
+    /// fetched by the same name from the shared `PSOCache`), and every
+    /// `setBuffer`/`setBytes` call below mirrors the generated
+    /// `..._threadgroups` wrapper's binding order index-for-index - see
+    /// `ffai_moe_gather_qmm_coop_<dtype>_threadgroups` in
+    /// `FFAIKernels.swift` for the reference this must stay in sync with
+    /// if that kernel's signature ever changes.
+    public static func moeGatherDequantGemmInt4CoopTilePlanIndirect(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        xRows: Tensor,
+        indirectArgs: MTLBuffer, indirectArgsOffset: Int = 0,
+        nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(
+            weight.dtype == .u32, "moeGatherDequantGemmInt4CoopTilePlanIndirect: weight must be u32 packed")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeGatherDequantGemmInt4CoopTilePlanIndirect: tile_expert/tile_row_start/tile_row_count must be u32"
+        )
+        precondition(
+            xRows.dtype == .u32, "moeGatherDequantGemmInt4CoopTilePlanIndirect: xRows must be u32")
+        precondition(
+            input.dtype == scales.dtype && scales.dtype == biases.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlanIndirect: input/scales/biases dtype must match")
+        precondition(
+            out.dtype == input.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlanIndirect: out dtype must match input")
+        precondition(
+            nOut % 64 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlanIndirect: nOut (\(nOut)) must be multiple of 64 (BN tile)")
+        precondition(
+            kIn % 32 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlanIndirect: kIn (\(kIn)) must be multiple of 32 (BK tile)")
+        precondition(
+            kIn.isMultiple(of: groupSize) && kIn / groupSize > 0,
+            "moeGatherDequantGemmInt4CoopTilePlanIndirect: groupSize (\(groupSize)) must divide kIn (\(kIn))")
+
+        let kernelName: String
+        switch input.dtype {
+        case .f32: kernelName = "ffai_moe_gather_qmm_coop_f32"
+        case .f16: kernelName = "ffai_moe_gather_qmm_coop_f16"
+        case .bf16: kernelName = "ffai_moe_gather_qmm_coop_bf16"
+        default:
+            fatalError("Ops.moeGatherDequantGemmInt4CoopTilePlanIndirect: unsupported dtype \(input.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: kernelName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(weight.buffer, offset: weight.offset, index: 1)
+        enc.setBuffer(scales.buffer, offset: scales.offset, index: 2)
+        enc.setBuffer(biases.buffer, offset: biases.offset, index: 3)
+        enc.setBuffer(tileExpert.buffer, offset: tileExpert.offset, index: 4)
+        enc.setBuffer(tileRowStart.buffer, offset: tileRowStart.offset, index: 5)
+        enc.setBuffer(tileRowCount.buffer, offset: tileRowCount.offset, index: 6)
+        enc.setBuffer(xRows.buffer, offset: xRows.offset, index: 7)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 8)
+        var nOutV = UInt32(nOut)
+        enc.setBytes(&nOutV, length: 4, index: 9)
+        var kInV = UInt32(kIn)
+        enc.setBytes(&kInV, length: 4, index: 10)
+        var groupSizeV = UInt32(groupSize)
+        enc.setBytes(&groupSizeV, length: 4, index: 11)
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        enc.dispatchThreadgroups(
+            indirectBuffer: indirectArgs, indirectBufferOffset: indirectArgsOffset,
+            threadsPerThreadgroup: tg)
+        enc.endEncoding()
+    }
+
+    /// Worst-case tile-plan capacity for `moeBuildTilePlanBm32Paired` /
+    /// `moeGatherDequantGemmInt4CoopTilePlanPaired`: `ceil(nExperts / 2)`
+    /// paired tiles at most (every candidate expert pairs with at most one
+    /// other; an odd leftover still costs one tile with an inert B half).
+    public static func moePairedTilePlanCapacity(nExperts: Int) -> Int {
+        (nExperts + 1) / 2
+    }
+
+    /// Device-side "own" BM=32 tile-plan builder for the F-85 tile-pairing
+    /// lever (`ffai_moe_build_tile_plan_bm32_own`). Same contract and same
+    /// worst-case capacity as `moeBuildTilePlanBm32` - the only difference
+    /// is that an expert's `1..=16`-row remainder does not get a tile here
+    /// (those rows are pairing candidates, handled by the separate
+    /// `moeBuildTilePlanBm32Paired` / `moeGatherDequantGemmInt4CoopTilePlanPaired`
+    /// dispatch instead). Caller zero-fills the plan buffers out to
+    /// `moeTilePlanCapacityBm32` before this call, same padding contract.
+    /// `tileCountGateUp`/`tileCountDown` (F-85 idle-tile-cost follow-up):
+    /// same contract as `moeBuildTilePlanBm32`'s own outputs - the real
+    /// "own" tile count, which is typically a much smaller fraction of the
+    /// shared worst-case capacity than the unpaired builder's own count
+    /// (stripping the pairing candidates out shrinks the real count while
+    /// the capacity bound stays the same), so this leg's indirect-dispatch
+    /// win is larger whenever the pairing lever is opted into.
+    public static func moeBuildTilePlanBm32Own(
+        sortedExperts: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        tileCountGateUp: Tensor, tileCountDown: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeBuildTilePlanBm32Own: sortedExperts must be u32")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeBuildTilePlanBm32Own: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            tileCountGateUp.dtype == .u32 && tileCountDown.dtype == .u32,
+            "moeBuildTilePlanBm32Own: tileCountGateUp/tileCountDown must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeBuildTilePlanBm32Own: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let grid = MTLSize(width: nExperts, height: 1, depth: 1)
+        let tg = MTLSize(width: nExperts, height: 1, depth: 1)
+        FFAIKernels.ffai_moe_build_tile_plan_bm32_own_f32(
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+            tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+            tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+            tile_count_gateup: tileCountGateUp.buffer, tile_count_gateupOffset: tileCountGateUp.offset,
+            tile_count_down: tileCountDown.buffer, tile_count_downOffset: tileCountDown.offset,
+            m_total: UInt32(mTotal), n_experts: UInt32(nExperts),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Phase 1 of the parallelized tile-plan builders (F-85 small-M
+    /// follow-up, `ffai_moe_tile_plan_expert_counts`). Dispatches ONE
+    /// THREADGROUP PER EXPERT (`nExperts` groups, one thread each) so every
+    /// expert's binary search over `sortedExperts` runs concurrently across
+    /// the GPU's cores instead of serially on the single core the original
+    /// builders' one-threadgroup dispatch confines all `nExperts` lanes to.
+    /// Writes `expertRowBase[e]`/`expertCount[e]`, the same row-range values
+    /// any of the three single-threadgroup builders would compute locally
+    /// for expert `e` - shared by all three tile-height variants below,
+    /// since the row range a sorted-expert array implies for an expert does
+    /// not depend on the tile height it will be sliced into.
+    ///
+    /// Callers (`moeBuildTilePlanParallel`/`Bm32Parallel`/`Bm32OwnParallel`
+    /// below) allocate `expertRowBase`/`expertCount` as fresh per-call
+    /// scratch, matching `moeSortPlanCounting`'s `blockCounts`/
+    /// `blockOffsets` convention - not cached, since `nExperts` is fixed
+    /// per model but this keeps every caller's allocation lifetime obvious.
+    public static func moeTilePlanExpertCounts(
+        sortedExperts: Tensor,
+        expertRowBase: Tensor, expertCount: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeTilePlanExpertCounts: sortedExperts must be u32")
+        precondition(
+            expertRowBase.dtype == .u32 && expertCount.dtype == .u32,
+            "moeTilePlanExpertCounts: expertRowBase/expertCount must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeTilePlanExpertCounts: nExperts (\(nExperts)) exceeds the kernel's 256-expert scope"
+        )
+        let grid = MTLSize(width: nExperts, height: 1, depth: 1)
+        let tg = MTLSize(width: 1, height: 1, depth: 1)
+        FFAIKernels.ffai_moe_tile_plan_expert_counts_f32_threadgroups(
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            expert_row_base: expertRowBase.buffer, expert_row_baseOffset: expertRowBase.offset,
+            expert_count: expertCount.buffer, expert_countOffset: expertCount.offset,
+            m_total: UInt32(mTotal),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Parallelized sibling of `moeBuildTilePlan` (F-85 small-M follow-up):
+    /// dispatches `moeTilePlanExpertCounts` (phase 1, per-expert parallel)
+    /// then `ffai_moe_build_tile_plan_parallel` (phase 2 - prefix sum +
+    /// tile emission only, no per-lane binary search left). Identical
+    /// output format/contract to `moeBuildTilePlan` - same
+    /// `tileExpert`/`tileRowStart`/`tileRowCount`, same worst-case capacity
+    /// and zero-fill padding convention. Gated by `FFAI_MOE_PARALLEL_PLAN`
+    /// in `MoELayer.swift`; `moeBuildTilePlan` remains the escape hatch.
+    public static func moeBuildTilePlanParallel(
+        sortedExperts: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeBuildTilePlanParallel: sortedExperts must be u32")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeBuildTilePlanParallel: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeBuildTilePlanParallel: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let rowBaseBuf = device.makeBuffer(length: nExperts * 4)
+        let countBuf = device.makeBuffer(length: nExperts * 4)
+        let expertRowBase = Tensor(buffer: rowBaseBuf, offset: 0, shape: [nExperts], dtype: .u32)
+        let expertCount = Tensor(buffer: countBuf, offset: 0, shape: [nExperts], dtype: .u32)
+        moeTilePlanExpertCounts(
+            sortedExperts: sortedExperts, expertRowBase: expertRowBase, expertCount: expertCount,
+            mTotal: mTotal, nExperts: nExperts, on: cmd)
+
+        let grid = MTLSize(width: 1, height: 1, depth: 1)
+        let tg = MTLSize(width: nExperts, height: 1, depth: 1)
+        FFAIKernels.ffai_moe_build_tile_plan_parallel_f32_threadgroups(
+            expert_row_base: expertRowBase.buffer, expert_row_baseOffset: expertRowBase.offset,
+            expert_count: expertCount.buffer, expert_countOffset: expertCount.offset,
+            tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+            tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+            tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+            n_experts: UInt32(nExperts),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Parallelized sibling of `moeBuildTilePlanBm32` (F-85 small-M
+    /// follow-up) - same two-phase split as `moeBuildTilePlanParallel`,
+    /// BM=32 tile height, including the `tileCountGateUp`/`tileCountDown`
+    /// indirect-dispatch outputs. Gated by `FFAI_MOE_PARALLEL_PLAN`;
+    /// `moeBuildTilePlanBm32` remains the escape hatch.
+    public static func moeBuildTilePlanBm32Parallel(
+        sortedExperts: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        tileCountGateUp: Tensor, tileCountDown: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeBuildTilePlanBm32Parallel: sortedExperts must be u32")
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeBuildTilePlanBm32Parallel: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            tileCountGateUp.dtype == .u32 && tileCountDown.dtype == .u32,
+            "moeBuildTilePlanBm32Parallel: tileCountGateUp/tileCountDown must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeBuildTilePlanBm32Parallel: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let rowBaseBuf = device.makeBuffer(length: nExperts * 4)
+        let countBuf = device.makeBuffer(length: nExperts * 4)
+        let expertRowBase = Tensor(buffer: rowBaseBuf, offset: 0, shape: [nExperts], dtype: .u32)
+        let expertCount = Tensor(buffer: countBuf, offset: 0, shape: [nExperts], dtype: .u32)
+        moeTilePlanExpertCounts(
+            sortedExperts: sortedExperts, expertRowBase: expertRowBase, expertCount: expertCount,
+            mTotal: mTotal, nExperts: nExperts, on: cmd)
+
+        let grid = MTLSize(width: 1, height: 1, depth: 1)
+        let tg = MTLSize(width: nExperts, height: 1, depth: 1)
+        FFAIKernels.ffai_moe_build_tile_plan_bm32_parallel_f32_threadgroups(
+            expert_row_base: expertRowBase.buffer, expert_row_baseOffset: expertRowBase.offset,
+            expert_count: expertCount.buffer, expert_countOffset: expertCount.offset,
+            tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+            tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+            tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+            tile_count_gateup: tileCountGateUp.buffer, tile_count_gateupOffset: tileCountGateUp.offset,
+            tile_count_down: tileCountDown.buffer, tile_count_downOffset: tileCountDown.offset,
+            n_experts: UInt32(nExperts),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Parallelized sibling of `moeBuildTilePlanBm32Own` (F-85 small-M
+    /// follow-up) - same two-phase split, excludes `1..=16`-row pairing
+    /// candidates like the original "own" builder. Gated by
+    /// `FFAI_MOE_PARALLEL_PLAN`; `moeBuildTilePlanBm32Own` remains the
+    /// escape hatch.
+    public static func moeBuildTilePlanBm32OwnParallel(
+        sortedExperts: Tensor,
+        tileExpert: Tensor, tileRowStart: Tensor, tileRowCount: Tensor,
+        tileCountGateUp: Tensor, tileCountDown: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeBuildTilePlanBm32OwnParallel: sortedExperts must be u32"
+        )
+        precondition(
+            tileExpert.dtype == .u32 && tileRowStart.dtype == .u32 && tileRowCount.dtype == .u32,
+            "moeBuildTilePlanBm32OwnParallel: tile_expert/tile_row_start/tile_row_count must be u32")
+        precondition(
+            tileCountGateUp.dtype == .u32 && tileCountDown.dtype == .u32,
+            "moeBuildTilePlanBm32OwnParallel: tileCountGateUp/tileCountDown must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeBuildTilePlanBm32OwnParallel: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let rowBaseBuf = device.makeBuffer(length: nExperts * 4)
+        let countBuf = device.makeBuffer(length: nExperts * 4)
+        let expertRowBase = Tensor(buffer: rowBaseBuf, offset: 0, shape: [nExperts], dtype: .u32)
+        let expertCount = Tensor(buffer: countBuf, offset: 0, shape: [nExperts], dtype: .u32)
+        moeTilePlanExpertCounts(
+            sortedExperts: sortedExperts, expertRowBase: expertRowBase, expertCount: expertCount,
+            mTotal: mTotal, nExperts: nExperts, on: cmd)
+
+        let grid = MTLSize(width: 1, height: 1, depth: 1)
+        let tg = MTLSize(width: nExperts, height: 1, depth: 1)
+        FFAIKernels.ffai_moe_build_tile_plan_bm32_own_parallel_f32_threadgroups(
+            expert_row_base: expertRowBase.buffer, expert_row_baseOffset: expertRowBase.offset,
+            expert_count: expertCount.buffer, expert_countOffset: expertCount.offset,
+            tile_expert: tileExpert.buffer, tile_expertOffset: tileExpert.offset,
+            tile_row_start: tileRowStart.buffer, tile_row_startOffset: tileRowStart.offset,
+            tile_row_count: tileRowCount.buffer, tile_row_countOffset: tileRowCount.offset,
+            tile_count_gateup: tileCountGateUp.buffer, tile_count_gateupOffset: tileCountGateUp.offset,
+            tile_count_down: tileCountDown.buffer, tile_count_downOffset: tileCountDown.offset,
+            n_experts: UInt32(nExperts),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Device-side PAIR-ONLY BM=32 tile-plan builder for the F-85
+    /// tile-pairing lever (`ffai_moe_build_tile_plan_bm32_paired`). Reads
+    /// the SAME `sortedExperts` array as `moeBuildTilePlanBm32Own` and
+    /// produces the complementary `1..=16`-row remainder tiles those rows
+    /// were excluded from, packed two experts to a tile (`_a`/`_b` halves,
+    /// `tile_row_count_b == 0` marks an odd leftover's inert B half).
+    /// Caller zero-fills all six plan buffers out to
+    /// `moePairedTilePlanCapacity(nExperts:)` before this call - required,
+    /// not just a courtesy, since the odd-leftover case depends on the
+    /// zero fill.
+    /// `pairCountGateUp`/`pairCountDown` (F-85 follow-up): one-element u32
+    /// views the caller has already positioned at the "count" word (word 1)
+    /// of its own two `MTLDispatchThreadgroupsIndirectArguments`-shaped
+    /// triples - see `Ops.moeGatherDequantGemmInt4CoopTilePlanPairedIndirect`.
+    /// The two legs need independent triples because they differ in
+    /// `n_out` (word 0), but both receive the SAME device-computed value
+    /// here (the real paired-tile count does not depend on `n_out`).
+    public static func moeBuildTilePlanBm32Paired(
+        sortedExperts: Tensor,
+        tileExpertA: Tensor, tileRowStartA: Tensor, tileRowCountA: Tensor,
+        tileExpertB: Tensor, tileRowStartB: Tensor, tileRowCountB: Tensor,
+        pairCountGateUp: Tensor, pairCountDown: Tensor,
+        mTotal: Int, nExperts: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            sortedExperts.dtype == .u32, "moeBuildTilePlanBm32Paired: sortedExperts must be u32")
+        precondition(
+            tileExpertA.dtype == .u32 && tileRowStartA.dtype == .u32 && tileRowCountA.dtype == .u32
+                && tileExpertB.dtype == .u32 && tileRowStartB.dtype == .u32
+                && tileRowCountB.dtype == .u32,
+            "moeBuildTilePlanBm32Paired: all six tile_*_a/_b buffers must be u32")
+        precondition(
+            pairCountGateUp.dtype == .u32 && pairCountDown.dtype == .u32,
+            "moeBuildTilePlanBm32Paired: pairCountGateUp/pairCountDown must be u32")
+        precondition(
+            nExperts <= 256,
+            "moeBuildTilePlanBm32Paired: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let grid = MTLSize(width: nExperts, height: 1, depth: 1)
+        let tg = MTLSize(width: nExperts, height: 1, depth: 1)
+        FFAIKernels.ffai_moe_build_tile_plan_bm32_paired_f32(
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            tile_expert_a: tileExpertA.buffer, tile_expert_aOffset: tileExpertA.offset,
+            tile_row_start_a: tileRowStartA.buffer, tile_row_start_aOffset: tileRowStartA.offset,
+            tile_row_count_a: tileRowCountA.buffer, tile_row_count_aOffset: tileRowCountA.offset,
+            tile_expert_b: tileExpertB.buffer, tile_expert_bOffset: tileExpertB.offset,
+            tile_row_start_b: tileRowStartB.buffer, tile_row_start_bOffset: tileRowStartB.offset,
+            tile_row_count_b: tileRowCountB.buffer, tile_row_count_bOffset: tileRowCountB.offset,
+            pair_count_gateup: pairCountGateUp.buffer, pair_count_gateupOffset: pairCountGateUp.offset,
+            pair_count_down: pairCountDown.buffer, pair_count_downOffset: pairCountDown.offset,
+            m_total: UInt32(mTotal), n_experts: UInt32(nExperts),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Two-expert PAIRED-tile MoE gather GEMM (`ffai_moe_gather_qmm_coop_paired`,
+    /// F-85 tile-pairing lever). Separate dispatch from
+    /// `moeGatherDequantGemmInt4CoopTilePlan` - fed the `moeBuildTilePlanBm32Paired`
+    /// plan instead of the regular tile plan, over the SAME sorted-row
+    /// space (`xRows`/`out`), covering only the `1..=16`-row remainder
+    /// rows that plan's "own" sibling excludes. `capacity` is
+    /// `moePairedTilePlanCapacity(nExperts:)`'s host worst-case bound, not
+    /// the real paired-tile count - same zero-fill/inert-tile padding
+    /// contract as the unpaired sibling. Same shape requirements
+    /// (`nOut % 64 == 0`, `groupSize == 64`) as the unpaired coop core -
+    /// this kernel reuses its inner loop/staging geometry per-half.
+    public static func moeGatherDequantGemmInt4CoopTilePlanPaired(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        tileExpertA: Tensor, tileRowStartA: Tensor, tileRowCountA: Tensor,
+        tileExpertB: Tensor, tileRowStartB: Tensor, tileRowCountB: Tensor,
+        xRows: Tensor,
+        capacity: Int, nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(
+            weight.dtype == .u32, "moeGatherDequantGemmInt4CoopTilePlanPaired: weight must be u32 packed")
+        precondition(
+            tileExpertA.dtype == .u32 && tileRowStartA.dtype == .u32 && tileRowCountA.dtype == .u32
+                && tileExpertB.dtype == .u32 && tileRowStartB.dtype == .u32
+                && tileRowCountB.dtype == .u32,
+            "moeGatherDequantGemmInt4CoopTilePlanPaired: all six tile_*_a/_b buffers must be u32")
+        precondition(
+            xRows.dtype == .u32, "moeGatherDequantGemmInt4CoopTilePlanPaired: xRows must be u32")
+        precondition(
+            input.dtype == scales.dtype && scales.dtype == biases.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlanPaired: input/scales/biases dtype must match")
+        precondition(
+            out.dtype == input.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlanPaired: out dtype must match input")
+        precondition(
+            nOut % 64 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlanPaired: nOut (\(nOut)) must be multiple of 64 (BN tile)")
+        precondition(
+            kIn % 32 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlanPaired: kIn (\(kIn)) must be multiple of 32 (BK tile)")
+        precondition(
+            kIn.isMultiple(of: groupSize) && kIn / groupSize > 0,
+            "moeGatherDequantGemmInt4CoopTilePlanPaired: groupSize (\(groupSize)) must divide kIn (\(kIn))")
+
+        let grid = MTLSize(width: nOut / 64, height: capacity, depth: 1)
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        let nOutU = UInt32(nOut)
+        let kInU = UInt32(kIn)
+        let groupSizeU = UInt32(groupSize)
+
+        switch input.dtype {
+        case .f32:
+            FFAIKernels.ffai_moe_gather_qmm_coop_paired_f32_threadgroups(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert_a: tileExpertA.buffer, tile_expert_aOffset: tileExpertA.offset,
+                tile_row_start_a: tileRowStartA.buffer, tile_row_start_aOffset: tileRowStartA.offset,
+                tile_row_count_a: tileRowCountA.buffer, tile_row_count_aOffset: tileRowCountA.offset,
+                tile_expert_b: tileExpertB.buffer, tile_expert_bOffset: tileExpertB.offset,
+                tile_row_start_b: tileRowStartB.buffer, tile_row_start_bOffset: tileRowStartB.offset,
+                tile_row_count_b: tileRowCountB.buffer, tile_row_count_bOffset: tileRowCountB.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            FFAIKernels.ffai_moe_gather_qmm_coop_paired_f16_threadgroups(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert_a: tileExpertA.buffer, tile_expert_aOffset: tileExpertA.offset,
+                tile_row_start_a: tileRowStartA.buffer, tile_row_start_aOffset: tileRowStartA.offset,
+                tile_row_count_a: tileRowCountA.buffer, tile_row_count_aOffset: tileRowCountA.offset,
+                tile_expert_b: tileExpertB.buffer, tile_expert_bOffset: tileExpertB.offset,
+                tile_row_start_b: tileRowStartB.buffer, tile_row_start_bOffset: tileRowStartB.offset,
+                tile_row_count_b: tileRowCountB.buffer, tile_row_count_bOffset: tileRowCountB.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            FFAIKernels.ffai_moe_gather_qmm_coop_paired_bf16_threadgroups(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                tile_expert_a: tileExpertA.buffer, tile_expert_aOffset: tileExpertA.offset,
+                tile_row_start_a: tileRowStartA.buffer, tile_row_start_aOffset: tileRowStartA.offset,
+                tile_row_count_a: tileRowCountA.buffer, tile_row_count_aOffset: tileRowCountA.offset,
+                tile_expert_b: tileExpertB.buffer, tile_expert_bOffset: tileExpertB.offset,
+                tile_row_start_b: tileRowStartB.buffer, tile_row_start_bOffset: tileRowStartB.offset,
+                tile_row_count_b: tileRowCountB.buffer, tile_row_count_bOffset: tileRowCountB.offset,
+                x_rows: xRows.buffer, x_rowsOffset: xRows.offset,
+                out: out.buffer, outOffset: out.offset,
+                n_out: nOutU, k_in: kInU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.moeGatherDequantGemmInt4CoopTilePlanPaired: unsupported dtype \(input.dtype)")
+        }
+    }
+
+    /// Indirect-dispatch sibling of `moeGatherDequantGemmInt4CoopTilePlanPaired`
+    /// (F-85 follow-up - the root-cause fix for the padding regression that
+    /// gate documented). Same kernel, same buffer contract - the only
+    /// difference is the dispatch grid comes from a device-written
+    /// `MTLDispatchThreadgroupsIndirectArguments` triple
+    /// (`indirectArgs`/`indirectArgsOffset`, produced by
+    /// `Ops.moeBuildTilePlanBm32Paired`'s `pairCountGateUp`/`pairCountDown`
+    /// outputs) instead of the host worst-case `capacity` bound, so idle
+    /// tiles beyond the REAL paired-tile count launch zero threadgroups
+    /// instead of running a masked-but-still-full K-loop.
+    ///
+    /// Hand-encoded rather than routed through a generated `_threadgroups`
+    /// wrapper: the generated Swift bindings only emit a fixed
+    /// `dispatchThreadgroups(_:threadsPerThreadgroup:)` call taking a
+    /// host-computed `MTLSize`, with no indirect-buffer variant (metaltile
+    /// codegen limitation - out of scope to change for this fix). The PSO
+    /// itself is unchanged (same pipeline the generated wrapper uses,
+    /// fetched by the same name from the shared `PSOCache`), and every
+    /// `setBuffer`/`setBytes` call below mirrors the generated
+    /// `..._threadgroups` wrapper's binding order index-for-index - see
+    /// `ffai_moe_gather_qmm_coop_paired_<dtype>_threadgroups` in
+    /// `FFAIKernels.swift` for the reference this must stay in sync with
+    /// if that kernel's signature ever changes.
+    public static func moeGatherDequantGemmInt4CoopTilePlanPairedIndirect(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        tileExpertA: Tensor, tileRowStartA: Tensor, tileRowCountA: Tensor,
+        tileExpertB: Tensor, tileRowStartB: Tensor, tileRowCountB: Tensor,
+        xRows: Tensor,
+        indirectArgs: MTLBuffer, indirectArgsOffset: Int = 0,
+        nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(
+            weight.dtype == .u32,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: weight must be u32 packed")
+        precondition(
+            tileExpertA.dtype == .u32 && tileRowStartA.dtype == .u32 && tileRowCountA.dtype == .u32
+                && tileExpertB.dtype == .u32 && tileRowStartB.dtype == .u32
+                && tileRowCountB.dtype == .u32,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: all six tile_*_a/_b buffers must be u32"
+        )
+        precondition(
+            xRows.dtype == .u32,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: xRows must be u32")
+        precondition(
+            input.dtype == scales.dtype && scales.dtype == biases.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: input/scales/biases dtype must match"
+        )
+        precondition(
+            out.dtype == input.dtype,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: out dtype must match input")
+        precondition(
+            nOut % 64 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: nOut (\(nOut)) must be multiple of 64 (BN tile)"
+        )
+        precondition(
+            kIn % 32 == 0,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: kIn (\(kIn)) must be multiple of 32 (BK tile)"
+        )
+        precondition(
+            kIn.isMultiple(of: groupSize) && kIn / groupSize > 0,
+            "moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: groupSize (\(groupSize)) must divide kIn (\(kIn))"
+        )
+
+        let kernelName: String
+        switch input.dtype {
+        case .f32: kernelName = "ffai_moe_gather_qmm_coop_paired_f32"
+        case .f16: kernelName = "ffai_moe_gather_qmm_coop_paired_f16"
+        case .bf16: kernelName = "ffai_moe_gather_qmm_coop_paired_bf16"
+        default:
+            fatalError(
+                "Ops.moeGatherDequantGemmInt4CoopTilePlanPairedIndirect: unsupported dtype \(input.dtype)"
+            )
+        }
+        let pso = PSOCache.shared.pipelineState(for: kernelName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(weight.buffer, offset: weight.offset, index: 1)
+        enc.setBuffer(scales.buffer, offset: scales.offset, index: 2)
+        enc.setBuffer(biases.buffer, offset: biases.offset, index: 3)
+        enc.setBuffer(tileExpertA.buffer, offset: tileExpertA.offset, index: 4)
+        enc.setBuffer(tileRowStartA.buffer, offset: tileRowStartA.offset, index: 5)
+        enc.setBuffer(tileRowCountA.buffer, offset: tileRowCountA.offset, index: 6)
+        enc.setBuffer(tileExpertB.buffer, offset: tileExpertB.offset, index: 7)
+        enc.setBuffer(tileRowStartB.buffer, offset: tileRowStartB.offset, index: 8)
+        enc.setBuffer(tileRowCountB.buffer, offset: tileRowCountB.offset, index: 9)
+        enc.setBuffer(xRows.buffer, offset: xRows.offset, index: 10)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 11)
+        var nOutV = UInt32(nOut)
+        enc.setBytes(&nOutV, length: 4, index: 12)
+        var kInV = UInt32(kIn)
+        enc.setBytes(&kInV, length: 4, index: 13)
+        var groupSizeV = UInt32(groupSize)
+        enc.setBytes(&groupSizeV, length: 4, index: 14)
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        enc.dispatchThreadgroups(
+            indirectBuffer: indirectArgs, indirectBufferOffset: indirectArgsOffset,
+            threadsPerThreadgroup: tg)
+        enc.endEncoding()
+    }
+
     // MARK: - Batched-T prefill kernels (Qwen3.5 / Qwen3.6 hybrid prefill)
 
     /// Multi-token Gated Delta Net recurrence over a chunk of `T` tokens.
@@ -5332,11 +7509,11 @@ public enum Ops {
     ///   * `v, y`  : `[T, Hv, Dv]`   row-major
     ///   * `g, beta` : `[T, Hv]`     row-major
     ///   * `stateIn / stateOut` : `[Hv, Dv, Dk]` (one state per `hv`)
-    ///   * `tLen`  : `[1]` u32 — number of tokens in this chunk (runtime
+    ///   * `tLen`  : `[1]` u32 - number of tokens in this chunk (runtime
     ///                scalar, NOT a constexpr; same PSO works for every
     ///                chunk length).
     ///
-    /// All input tensors must share the activation dtype `T` — the
+    /// All input tensors must share the activation dtype `T` - the
     /// kernel is emitted in f32 / f16 / bf16 variants. For Qwen3.5 the
     /// state is f32 (see `GDNStateCache.dtype`); pass q/k/v/g/beta as f32
     /// tensors as well.
@@ -5417,6 +7594,82 @@ public enum Ops {
         }
     }
 
+    /// Transpose `[T, H, D]` → `[H, T, D]` (f16). Live-compile.
+    public static func transposeTHD_f16(
+        _ input: Tensor, t: Int, h: Int, d: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(input.dtype == .f16)
+        let result = out ?? Tensor.empty(shape: [h, t, d], dtype: .f16)
+        var tU = UInt32(t), hU = UInt32(h), dU = UInt32(d)
+        let pso = PSOCache.shared.pipelineState(for: "ffai_transpose_thd_f16")
+        guard let enc = cmd.makeComputeCommandEncoder() else { return result }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(result.buffer, offset: result.offset, index: 1)
+        enc.setBytes(&tU, length: 4, index: 2)
+        enc.setBytes(&hU, length: 4, index: 3)
+        enc.setBytes(&dU, length: 4, index: 4)
+        // 2D grid (t, h*d) — depth axis capped on Metal.
+        let hd = h * d
+        enc.dispatchThreads(
+            MTLSize(width: t, height: hd, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(t, 32), height: min(hd, 32), depth: 1))
+        enc.endEncoding()
+        return result
+    }
+
+    /// Transpose `[H, T, D]` → `[T, H, D]` (f16).
+    public static func transposeHTD_f16(
+        _ input: Tensor, t: Int, h: Int, d: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(input.dtype == .f16)
+        let result = out ?? Tensor.empty(shape: [t, h, d], dtype: .f16)
+        var tU = UInt32(t), hU = UInt32(h), dU = UInt32(d)
+        let pso = PSOCache.shared.pipelineState(for: "ffai_transpose_htd_f16")
+        guard let enc = cmd.makeComputeCommandEncoder() else { return result }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(result.buffer, offset: result.offset, index: 1)
+        enc.setBytes(&tU, length: 4, index: 2)
+        enc.setBytes(&hU, length: 4, index: 3)
+        enc.setBytes(&dU, length: 4, index: 4)
+        let hd = h * d
+        enc.dispatchThreads(
+            MTLSize(width: t, height: hd, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(t, 32), height: min(hd, 32), depth: 1))
+        enc.endEncoding()
+        return result
+    }
+
+    /// Compact K/V `[nKV, maxSeq, D]` → packed `[nKV, kLen, D]` (f16).
+    public static func compactKV_f16(
+        src: Tensor, nKV: Int, maxSeq: Int, kLen: Int, headDim: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil,
+        encoder: MTLComputeCommandEncoder? = nil
+    ) -> Tensor {
+        precondition(src.dtype == .f16 && kLen > 0 && kLen <= maxSeq)
+        let result = out ?? Tensor.empty(shape: [nKV, kLen, headDim], dtype: .f16)
+        var nKVU = UInt32(nKV), maxU = UInt32(maxSeq), kU = UInt32(kLen), dU = UInt32(headDim)
+        let pso = PSOCache.shared.pipelineState(for: "ffai_compact_kv_f16")
+        let ownsEnc = encoder == nil
+        guard let enc = encoder ?? cmd.makeComputeCommandEncoder() else { return result }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(src.buffer, offset: src.offset, index: 0)
+        enc.setBuffer(result.buffer, offset: result.offset, index: 1)
+        enc.setBytes(&nKVU, length: 4, index: 2)
+        enc.setBytes(&maxU, length: 4, index: 3)
+        enc.setBytes(&kU, length: 4, index: 4)
+        enc.setBytes(&dU, length: 4, index: 5)
+        let td = kLen * headDim
+        enc.dispatchThreads(
+            MTLSize(width: nKV, height: td, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1, height: min(td, 256), depth: 1))
+        if ownsEnc { enc.endEncoding() }
+        return result
+    }
+
     /// Batched-Q causal SDPA prefill via the simdgroup-matrix MMA kernel.
     /// Replaces `T` independent `sdpaDecode` calls (each O(K) per
     /// q-head, T separate dispatches) with one dispatch that tiles the
@@ -5457,20 +7710,18 @@ public enum Ops {
             q.dtype == k.dtype && k.dtype == v.dtype,
             "Ops.sdpaPrefillMma: q/k/v must share dtype")
         let result = out ?? Tensor.empty(shape: [nQHeads, qLen, headDim], dtype: q.dtype)
-        // Grid: (qLen/BQ, n_q_heads, 1) threadgroups, 128 threads per
-        // group (4 simdgroups). dispatchThreads counts threads, so width
-        // = (qLen/32) * 128, height = n_q_heads.
+        // Grid in THREADGROUPS: (qLen/BQ, n_q_heads, 1), TPG=128
+        // (4 simdgroups). Must use dispatchThreadgroups for coop-matrix
+        // MMA — dispatchThreads was a silent perf bug (≈ sdpaMulti cost).
         let threadsPerGroup = 128
         let bq = 32
-        let grid = MTLSize(
-            width: (qLen / bq) * threadsPerGroup,
-            height: nQHeads, depth: 1)
+        let tgGrid = MTLSize(width: qLen / bq, height: nQHeads, depth: 1)
         let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
         let gqaFactor = nQHeads / nKVHeads
 
         switch q.dtype {
         case .f32:
-            FFAIKernels.ffai_sdpa_prefill_mma_f32(
+            FFAIKernels.ffai_sdpa_prefill_mma_f32_threadgroups(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -5479,9 +7730,9 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor),
                 n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
                 scale: scale,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
+                gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_sdpa_prefill_mma_f16(
+            FFAIKernels.ffai_sdpa_prefill_mma_f16_threadgroups(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -5490,9 +7741,9 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor),
                 n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
                 scale: scale,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
+                gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_sdpa_prefill_mma_bf16(
+            FFAIKernels.ffai_sdpa_prefill_mma_bf16_threadgroups(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -5501,7 +7752,7 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor),
                 n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
                 scale: scale,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
+                gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.sdpaPrefillMma: unsupported dtype \(q.dtype)")
         }
@@ -5527,20 +7778,37 @@ public enum Ops {
     /// uses the cooperative-tensor `mpp::tensor_ops::matmul2d` per the
     /// ffai-kernels MPP NAX primitive landing.
     ///
-    /// WARNING — KNOWN CORRECTNESS ISSUE (2026-05-21). Dispatch shape
-    /// matches the ffai-kernels-std `moe_gather_qmm_mpp_bm64_correctness`
-    /// test
-    /// (grid = `[ceil(N/64), ceil(M/64), 1]` threadgroups,
-    /// tg = `[128, 1, 1]` for 4 SGs WM=WN=2), but `forwardManyEquivalence`
-    /// at T=8 mTotal=64 produces top-1 argmax 279 with logit 12.25 vs
-    /// reference argmax 52290 logit 17.125 — the tokens are present in
-    /// both top-5 lists but with a ~5-logit scale drift. Suspected
-    /// bf16-output-scale or buffer-binding mismatch between the
-    /// Swift-side wrapper and the kernel's expected layout. Cosine
-    /// ≥ 0.999 in the upstream test (f32 output) — bf16 output path
-    /// may need its own verification. Use **only** behind
-    /// `FFAI_MOE_BGEMM_BM64=1` after re-verifying against the kernel
-    /// source. Bm16 default ships the 2.69× T=32 win.
+    /// FIXED (2026-07-18, round-3 MoE tile lever). The 2026-05-21 note
+    /// below described a real bug, now root-caused: this call used the
+    /// plain `dispatchThreads`-based wrapper with `gridSize` scaled to
+    /// TOTAL THREADS (`(nOut/64)*128`), but `ffai_moe_gather_qmm_mma_
+    /// int4_bm64_mpp` is a coop_tile / cooperative-tensor kernel, and the
+    /// codegen itself documents that `dispatchThreads` puts Metal in
+    /// non-uniform-threadgroup mode. That silently produces wrong
+    /// results for `matmul2d`, even when the grid divides evenly by the
+    /// threadgroup size (see `emit_swift_wrapper_threadgroups` in
+    /// ffai-kernels-codegen/src/emit.rs). The already-shipped Hy3 int2
+    /// BM64 / expert-grid path (`moeGatherDequantGemmInt2` above) never
+    /// hit this because it hand-encodes `dispatchThreadgroups` directly
+    /// instead of going through the generated wrapper. That is the
+    /// reference fix, applied here via the codegen's `_threadgroups`
+    /// wrapper variant (grid now in THREADGROUP counts, not threads).
+    /// A CPU-oracle test extended with a skewed/ragged routing fixture
+    /// (empty experts plus one heavy expert straddling tile boundaries,
+    /// `moe_gather_qmm_mma_int4_bm64_mpp_matches_m1_skewed_ragged`)
+    /// confirms the kernel's own math was already correct, so the bug
+    /// was Swift-side dispatch, not the tile logic.
+    ///
+    /// Old warning (2026-05-21, root cause now known): dispatch shape
+    /// matched the metaltile-std `moe_gather_qmm_mpp_bm64_correctness`
+    /// test (grid = `[ceil(N/64), ceil(M/64), 1]` threadgroups, tg =
+    /// `[128, 1, 1]` for 4 SGs WM=WN=2), but `forwardManyEquivalence` at
+    /// T=8 mTotal=64 produced top-1 argmax 279 with logit 12.25 vs
+    /// reference argmax 52290 logit 17.125. The tokens were present in
+    /// both top-5 lists but with a scale drift, the signature of a
+    /// non-uniform-dispatch coop_tile miscompile rather than a wrong
+    /// offset. Still opt-in via `FFAI_MOE_BGEMM_BM64=1`, default stays
+    /// off pending a measured e2e win (bm16 ships the shipped baseline).
     public static func moeGatherDequantGemmInt4Bm64Mpp(
         input: Tensor,
         weight: Tensor, scales: Tensor, biases: Tensor,
@@ -5584,10 +7852,19 @@ public enum Ops {
         // Per `ffai-kernels-std/src/ffai/moe_mpp_bm64.rs`:
         //   BM = BN = 64, BK = 32. 4 SGs per TG, WM = WN = 2.
         //   Threadgroup size [128, 1, 1]. Grid [N/64, ceil(M/64), 1].
-        // dispatchThreads (total threads): width = (N/64)·128.
+        // This is a coop_tile (cooperative-tensor matmul2d) kernel, so the
+        // grid MUST be dispatched in THREADGROUP counts via the codegen's
+        // `_threadgroups` wrapper (raw `dispatchThreadgroups`), matching
+        // the already-shipped Hy3 int2 BM64 / expert-grid path just above.
+        // The plain (thread-count, `dispatchThreads`) wrapper puts Metal
+        // in non-uniform-threadgroup mode, which is documented (see
+        // ffai-kernels-codegen/src/emit.rs) to silently corrupt
+        // cooperative-tensor kernels even on an evenly-divided grid, and
+        // was the actual cause of the 2026-05-21 correctness bug this
+        // kernel was gated off for.
         let tgWidth = 128
         let grid = MTLSize(
-            width: (nOut / 64) * tgWidth,
+            width: nOut / 64,
             height: (mTotal + 63) / 64,
             depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
@@ -5598,7 +7875,7 @@ public enum Ops {
 
         switch input.dtype {
         case .f32:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_f32(
+            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_f32_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -5609,7 +7886,7 @@ public enum Ops {
                 group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_f16(
+            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_f16_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -5620,7 +7897,7 @@ public enum Ops {
                 group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
-            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_bf16(
+            FFAIKernels.ffai_moe_gather_qmm_mma_int4_bm64_mpp_bf16_threadgroups(
                 x: input.buffer, xOffset: input.offset,
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
@@ -5909,6 +8186,88 @@ public enum Ops {
         }
     }
 
+    /// q/k RMSNorm pre-pass for `gatedDeltaPrepChunk`. `gatedDeltaPrepChunk`'s
+    /// dispatch grid is `[Dv, batchSize·hv, 1]` — every one of the `Dv`
+    /// threadgroups sharing a given `(b, hv_idx)` would otherwise
+    /// redundantly recompute the identical q/k RMSNorm (q/k don't depend
+    /// on `dv_idx`), and GQA groups recompute it again across their
+    /// shared `hk_idx`. This kernel computes it once per `(b, t, hk_idx)`
+    /// — grid `[tLen, batchSize·hk, 1]`, fully parallel across tokens —
+    /// and writes dense `qNormed`/`kNormed` that `gatedDeltaPrepChunk`
+    /// loads directly instead of recomputing.
+    ///
+    /// Shape contract (all share dtype except `tLen`):
+    ///   - `convOut`     : `[batchSize, tLen, 2·hk·dk + hv·dv]`
+    ///   - `qNormWeight` / `kNormWeight` : `[hk·dk]`
+    ///   - `qNormed` / `kNormed` : `[batchSize, tLen, hk, dk]` (output)
+    public static func gatedDeltaQKNormPrepass(
+        convOut: Tensor,
+        qNormWeight: Tensor, kNormWeight: Tensor,
+        qNormed: Tensor, kNormed: Tensor,
+        tLen: Tensor, tCount: Int,
+        batchSize: Int, dk: Int, dv: Int, hv: Int, hk: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            convOut.dtype == qNormWeight.dtype && qNormWeight.dtype == kNormWeight.dtype
+                && kNormWeight.dtype == qNormed.dtype && qNormed.dtype == kNormed.dtype,
+            "Ops.gatedDeltaQKNormPrepass: every tensor must share dtype")
+        precondition(
+            dk % 32 == 0,
+            "Ops.gatedDeltaQKNormPrepass: dk (\(dk)) must be a multiple of 32")
+        precondition(
+            hv % hk == 0,
+            "Ops.gatedDeltaQKNormPrepass: hv (\(hv)) must be a multiple of hk (\(hk)) (GQA)")
+        precondition(
+            tLen.dtype == .u32 && tLen.elementCount == 1,
+            "Ops.gatedDeltaQKNormPrepass: tLen must be a [1] u32 scalar buffer")
+        // `tCount` (host Int) drives dispatch grid width; `tLen` (GPU
+        // scalar) drives the kernel body's `bt = b·t_total + t` — same
+        // split as `gatedDeltaPrepChunk`'s runtime-`tLen` convention, just
+        // that here T is also a grid dimension so the host needs it too.
+        let tgWidth = 32
+        let grid = MTLSize(width: tCount * tgWidth, height: batchSize * hk, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let dkU = UInt32(dk)
+        let dvU = UInt32(dv)
+        let hvU = UInt32(hv)
+        let hkU = UInt32(hk)
+        switch convOut.dtype {
+        case .f32:
+            FFAIKernels.ffai_gated_delta_qknorm_prepass_f32(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            FFAIKernels.ffai_gated_delta_qknorm_prepass_f16(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            FFAIKernels.ffai_gated_delta_qknorm_prepass_bf16(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.gatedDeltaQKNormPrepass: unsupported dtype \(convOut.dtype)")
+        }
+    }
+
     /// Chunked-prefill counterpart to `gatedDeltaPrepStep`. Runs the
     /// fused GDN prep + recurrence over a contiguous range of tokens
     /// in one dispatch instead of looping the single-token kernel,
@@ -5922,8 +8281,9 @@ public enum Ops {
     ///   - `aLog`      : `[hv]` per-head log-decay
     ///   - `dtBias`    : `[hv]` per-head delta-t bias
     ///   - `aRaw`/`bRaw` : `[batchSize, tLen, hv]` chunk gates
-    ///   - `qNormWeight` / `kNormWeight` : `[dk]` Q-norm / K-norm
-    ///     applied before the recurrence
+    ///   - `qNormed` / `kNormed` : `[batchSize, tLen, hk, dk]`, from
+    ///     `gatedDeltaQKNormPrepass` — must be dispatched on the same
+    ///     `convOut`/`tLen` chunk beforehand.
     ///   - `stateIn` / `stateOut` : `[batchSize, hv, dv, dk]` fp32
     ///     recurrent state (read-once / write-once across the chunk)
     ///   - `y`         : `[batchSize, tLen, hv·dv]` output activations
@@ -5931,7 +8291,7 @@ public enum Ops {
         convOut: Tensor,
         aLog: Tensor, dtBias: Tensor,
         aRaw: Tensor, bRaw: Tensor,
-        qNormWeight: Tensor, kNormWeight: Tensor,
+        qNormed: Tensor, kNormed: Tensor,
         stateIn: Tensor, stateOut: Tensor, y: Tensor,
         tLen: Tensor,
         batchSize: Int, dk: Int, dv: Int, hv: Int, hk: Int,
@@ -5940,8 +8300,8 @@ public enum Ops {
         precondition(
             convOut.dtype == aLog.dtype && aLog.dtype == dtBias.dtype
                 && dtBias.dtype == aRaw.dtype && aRaw.dtype == bRaw.dtype
-                && bRaw.dtype == qNormWeight.dtype && qNormWeight.dtype == kNormWeight.dtype
-                && kNormWeight.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
+                && bRaw.dtype == qNormed.dtype && qNormed.dtype == kNormed.dtype
+                && kNormed.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
                 && stateOut.dtype == y.dtype,
             "Ops.gatedDeltaPrepChunk: every tensor must share dtype")
         precondition(
@@ -5956,11 +8316,13 @@ public enum Ops {
         precondition(
             tLen.dtype == .u32 && tLen.elementCount == 1,
             "Ops.gatedDeltaPrepChunk: tLen must be a [1] u32 scalar buffer")
-        // One simdgroup per (head, dv index) ; grid sweeps batch · hv
-        // along Y. Kernel walks tLen tokens internally.
-        let tgWidth = 32
+        // 4 SGs per TG pack 4 Dv slots (reference Metal GDN geometry).
+        // Grid TGs: [ceil(Dv/4), batch·Hv, 1], TG 128. Kernel walks tLen
+        // tokens internally with state register-resident.
+        let tgWidth = 128
+        let dvTiles = (dv + 3) / 4
         let grid = MTLSize(
-            width: dv * tgWidth,
+            width: dvTiles * tgWidth,
             height: batchSize * hv,
             depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
@@ -5976,8 +8338,8 @@ public enum Ops {
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
                 a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
                 b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
-                q_normed: qNormWeight.buffer, q_normedOffset: qNormWeight.offset,
-                k_normed: kNormWeight.buffer, k_normedOffset: kNormWeight.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
                 state_in: stateIn.buffer, state_inOffset: stateIn.offset,
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
@@ -5991,8 +8353,8 @@ public enum Ops {
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
                 a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
                 b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
-                q_normed: qNormWeight.buffer, q_normedOffset: qNormWeight.offset,
-                k_normed: kNormWeight.buffer, k_normedOffset: kNormWeight.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
                 state_in: stateIn.buffer, state_inOffset: stateIn.offset,
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
@@ -6006,8 +8368,8 @@ public enum Ops {
                 dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
                 a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
                 b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
-                q_normed: qNormWeight.buffer, q_normedOffset: qNormWeight.offset,
-                k_normed: kNormWeight.buffer, k_normedOffset: kNormWeight.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
                 state_in: stateIn.buffer, state_inOffset: stateIn.offset,
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
@@ -6019,9 +8381,512 @@ public enum Ops {
         }
     }
 
+    /// Shape-specialized fast path for `gatedDeltaPrepChunk`, valid ONLY at
+    /// the Qwen3.6-35B-A3B production GDN shape (Dk=Dv=128, Hv=32, Hk=16;
+    /// see `config.json`'s `linear_key_head_dim` / `linear_value_head_dim` /
+    /// `linear_num_value_heads` / `linear_num_key_heads`).
+    ///
+    /// Root cause this works around: the generic kernel's `dk`/`dv`/`hv`/`hk`
+    /// are `#[constexpr]` DSL params, but the MSL backend lowers every
+    /// `#[constexpr]` to an ordinary runtime `constant T &name [[buffer(N)]]`,
+    /// so `n_per_t = dk / 32` is NOT a compile-time constant to the Metal
+    /// shader compiler, and the per-lane `state_reg`/`k_cache` arrays can't
+    /// be unrolled into registers; every iteration of the T-token recurrence
+    /// pays a real indexed-memory round trip instead. This dispatches a
+    /// sibling kernel (`ffai_gated_delta_prep_chunk_fast_d128_128_32_16`)
+    /// that bakes `Dk`/`Dv`/`Hv`/`Hk` as true Rust-level compile-time
+    /// constants (`#[kernel(variants(...))]`, the same mechanism already
+    /// used by `ffai_gated_delta_step_record`'s shape specialization), so
+    /// the Metal compiler can fully unroll and register-promote. Measured
+    /// ~3.7-4.2x faster than the generic kernel at this exact shape (see
+    /// `bench_gated_delta_prep_chunk_fast_t1024` / `_t4096` vs
+    /// `bench_gated_delta_prep_chunk_prod_t1024` / `_t4096` in
+    /// `gated_delta_prep_chunk.rs`). Same grid/TG geometry as
+    /// `gatedDeltaPrepChunk`; this does not change grid-level parallelism.
+    ///
+    /// No `dk`/`dv`/`hv`/`hk` parameters. Callers must confirm the shape
+    /// matches before calling (see `Qwen35GDNMixer.forwardManyChunked`'s
+    /// guard). `batchSize`/`hv` are still needed for grid sizing.
+    public static func gatedDeltaPrepChunkFast(
+        convOut: Tensor,
+        aLog: Tensor, dtBias: Tensor,
+        aRaw: Tensor, bRaw: Tensor,
+        qNormed: Tensor, kNormed: Tensor,
+        stateIn: Tensor, stateOut: Tensor, y: Tensor,
+        tLen: Tensor,
+        batchSize: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            convOut.dtype == aLog.dtype && aLog.dtype == dtBias.dtype
+                && dtBias.dtype == aRaw.dtype && aRaw.dtype == bRaw.dtype
+                && bRaw.dtype == qNormed.dtype && qNormed.dtype == kNormed.dtype
+                && kNormed.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
+                && stateOut.dtype == y.dtype,
+            "Ops.gatedDeltaPrepChunkFast: every tensor must share dtype")
+        precondition(
+            tLen.dtype == .u32 && tLen.elementCount == 1,
+            "Ops.gatedDeltaPrepChunkFast: tLen must be a [1] u32 scalar buffer")
+        // Fixed production shape: Dv=128, Hv=32 (Dk/Hk are baked into the
+        // kernel and never touch grid sizing; grid math mirrors
+        // `gatedDeltaPrepChunk` exactly at dv=128/hv=32).
+        let dv = 128
+        let hv = 32
+        let tgWidth = 128
+        let dvTiles = (dv + 3) / 4
+        let grid = MTLSize(
+            width: dvTiles * tgWidth,
+            height: batchSize * hv,
+            depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch convOut.dtype {
+        case .f32:
+            FFAIKernels.ffai_gated_delta_prep_chunk_fast_d128_128_32_16_f32(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            FFAIKernels.ffai_gated_delta_prep_chunk_fast_d128_128_32_16_f16(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            FFAIKernels.ffai_gated_delta_prep_chunk_fast_d128_128_32_16_bf16(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.gatedDeltaPrepChunkFast: unsupported dtype \(convOut.dtype)")
+        }
+    }
+
+    // ─── Chunked-WY GDN prefill (`ffai_gdn_wy_plan` + `ffai_gdn_wy_scan`) ──
+    //
+    // Opt-in alternative to `gatedDeltaPrepChunk` — see
+    // `Qwen35GDNMixer.forwardManyChunked` for the `FFAI_GDN_WY=1` gate and
+    // the `t % c == 0` fallback to `gatedDeltaPrepChunk` for ragged chunks.
+
+    /// Grow-once tagged scratch tensor for the chunked-WY GDN prefill path.
+    /// Same discipline as `Hy3Text.swift`'s (file-private) `hy3ScratchTensor`
+    /// — reuses `Device.intermediateScratch`'s tagged, grow-to-largest-size
+    /// buffer instead of a fresh `Tensor.empty` per layer/chunk, keyed by a
+    /// tag that encodes the shape so distinct shapes never alias.
+    private static func wyScratchTensor(
+        shape: [Int], dtype: DType, tag: String, device: Device
+    ) -> Tensor {
+        let n = shape.reduce(1, *)
+        let bytes = max(n * dtype.byteSize, 64)
+        let buf = device.intermediateScratch(tag: tag, minBytes: bytes)
+        return Tensor(buffer: buf, offset: 0, shape: shape, dtype: dtype)
+    }
+
+    /// General N-D strided copy/broadcast, wrapping `ffai_strided_copy_nd`
+    /// (module doc: handles padded copies, transposes, broadcasts via a
+    /// zero stride, and arbitrary slices). `shape`/`strides` are **element**
+    /// counts, not bytes; `rank = shape.count`. `srcBuffer`/`srcByteOffset`
+    /// are taken raw (rather than a `Tensor`) so callers can point at an
+    /// arbitrary sub-slab of a larger buffer (e.g. the `v` slice inside
+    /// `gatedDeltaWYPrefill`'s packed `conv_out`).
+    ///
+    /// `shape`/`strides` are packed into two fresh tiny `MTLBuffer`s per
+    /// call (mirrors `forwardManyChunked`'s `tLenBuf` — a fresh buffer per
+    /// dispatch, not a tagged scratch slab, since these are 2-rank/8-byte
+    /// constants and a shared tagged buffer would race across pipelined
+    /// command buffers).
+    private static func stridedCopyNd(
+        srcBuffer: MTLBuffer, srcByteOffset: Int, dtype: DType,
+        shape: [Int], strides: [Int],
+        outBuffer: MTLBuffer, outByteOffset: Int,
+        on cmd: MTLCommandBuffer, device: Device
+    ) {
+        precondition(
+            shape.count == strides.count,
+            "Ops.stridedCopyNd: shape/strides rank mismatch")
+        let rank = shape.count
+        let nOut = shape.reduce(1, *)
+        var shapeVals = shape.map { UInt32($0) }
+        var strideVals = strides.map { UInt32($0) }
+        let shapeBuf = device.makeBuffer(length: rank * 4)
+        let stridesBuf = device.makeBuffer(length: rank * 4)
+        _ = shapeVals.withUnsafeMutableBytes { raw in
+            memcpy(shapeBuf.contents(), raw.baseAddress!, rank * 4)
+        }
+        _ = strideVals.withUnsafeMutableBytes { raw in
+            memcpy(stridesBuf.contents(), raw.baseAddress!, rank * 4)
+        }
+        let (grid, tg) = elementwiseGrid(nOut)
+        switch dtype {
+        case .f32:
+            FFAIKernels.ffai_strided_copy_nd_f32(
+                src: srcBuffer, srcOffset: srcByteOffset,
+                shape: shapeBuf, shapeOffset: 0,
+                strides: stridesBuf, stridesOffset: 0,
+                out: outBuffer, outOffset: outByteOffset,
+                rank: UInt32(rank),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            FFAIKernels.ffai_strided_copy_nd_f16(
+                src: srcBuffer, srcOffset: srcByteOffset,
+                shape: shapeBuf, shapeOffset: 0,
+                strides: stridesBuf, stridesOffset: 0,
+                out: outBuffer, outOffset: outByteOffset,
+                rank: UInt32(rank),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            FFAIKernels.ffai_strided_copy_nd_bf16(
+                src: srcBuffer, srcOffset: srcByteOffset,
+                shape: shapeBuf, shapeOffset: 0,
+                strides: stridesBuf, stridesOffset: 0,
+                out: outBuffer, outOffset: outByteOffset,
+                rank: UInt32(rank),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.stridedCopyNd: unsupported dtype \(dtype)")
+        }
+    }
+
+    /// Per-token GDN gate/beta for the chunked-WY prefill pipeline
+    /// (`ffai_gdn_wy_plan`/`ffai_gdn_wy_scan`), which — unlike
+    /// `gatedDeltaPrepChunk` — consume precomputed `g`/`beta` tensors
+    /// instead of computing them internally from raw `a_raw`/`b_raw` +
+    /// `a_log`/`dt_bias`.
+    ///
+    /// Dispatches the fused `ffai_gdn_gate_beta` kernel (one dispatch),
+    /// replacing what used to be a ~6-dispatch elementwise chain (sigmoid,
+    /// two broadcasts, add, softplus, mul, exp — see git history for the
+    /// old implementation).
+    ///
+    /// Math (identical to `gatedDeltaPrepChunk`'s internal per-token g/beta
+    /// — same un-clamped softplus `ffai_gated_delta_prep_chunk` bakes in,
+    /// `log(exp(x)+1)`; the fused kernel now matches that production
+    /// oracle's formula exactly, superseding the old chain's use of the
+    /// numerically-stable `ffai_softplus` kernel — the same real value
+    /// away from overflow, which the learned `a_raw`/`dt_bias` activations
+    /// never approach):
+    ///   - `dt   = log(exp(a_raw + dt_bias) + 1)`
+    ///   - `g    = exp(-exp(a_log) * dt) = exp(negExpALog * dt)`
+    ///   - `beta = sigmoid(b_raw)`
+    ///
+    /// `negExpALog = -exp(a_log)` is precomputed once on the host at model
+    /// load (`a_log` is a static per-head weight, not runtime data — see
+    /// `Qwen35GDNMixer.negExpALogTF32`).
+    ///
+    /// `dt_bias`/`negExpALog` are `[Hv]`; `a_raw`/`b_raw` (and `g`/`beta`)
+    /// are `[rows, Hv]` (`rows = B·T`, B=1 here) — the kernel broadcasts
+    /// the `[Hv]` constants against the `[rows, Hv]` runtime chunk via
+    /// `idx % hv` internally (no host-side broadcast dispatch needed).
+    public static func gdnGateBeta(
+        aRaw: Tensor, bRaw: Tensor,
+        dtBias: Tensor, negExpALog: Tensor,
+        g: Tensor, beta: Tensor,
+        rows: Int, hv: Int,
+        on cmd: MTLCommandBuffer, device: Device
+    ) {
+        precondition(
+            aRaw.elementCount == rows * hv && bRaw.elementCount == rows * hv
+                && g.elementCount == rows * hv && beta.elementCount == rows * hv,
+            "Ops.gdnGateBeta: aRaw/bRaw/g/beta must be [rows·hv]")
+        precondition(
+            dtBias.elementCount == hv && negExpALog.elementCount == hv,
+            "Ops.gdnGateBeta: dtBias/negExpALog must be [hv]")
+        precondition(
+            aRaw.dtype == .f32 && bRaw.dtype == .f32 && dtBias.dtype == .f32
+                && negExpALog.dtype == .f32 && g.dtype == .f32 && beta.dtype == .f32,
+            "Ops.gdnGateBeta: fp32 only (matches gatedDeltaPrepChunk's fp32 g/beta convention)")
+
+        let n = rows * hv
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        FFAIKernels.ffai_gdn_gate_beta_f32(
+            a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+            b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+            dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+            neg_exp_a_log: negExpALog.buffer, neg_exp_a_logOffset: negExpALog.offset,
+            g: g.buffer, gOffset: g.offset,
+            beta: beta.buffer, betaOffset: beta.offset,
+            hv: UInt32(hv),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+    }
+
+    /// Chunked-WY GDN prefill — two-kernel (`ffai_gdn_wy_plan` +
+    /// `ffai_gdn_wy_scan`) alternative to `gatedDeltaPrepChunk`. Opt-in via
+    /// `FFAI_GDN_WY=1`, default OFF (see `Qwen35GDNMixer.forwardManyChunked`).
+    ///
+    /// `_plan`/`_scan`'s v1 require `t_len` to be an exact multiple of
+    /// their fixed chunk size `c=64` — both kernels' module docs document
+    /// this as: FFAI pads a short prefill tail up to a multiple of `c`
+    /// upstream with `g=1, β=0` no-op tokens (a true no-op on the
+    /// recurrence: decay ×1, delta ×0 → state unchanged; the padded rows'
+    /// `y` output is simply never read). This function IS that upstream
+    /// pad: real `t` only needs to be `>= c` (the caller — see
+    /// `Qwen35GDNMixer.forwardManyChunked` — still falls back to
+    /// `gatedDeltaPrepChunk` for `t < c`, where there's no full chunk to
+    /// pad up to). When `t` is already a multiple of `c` (the common case
+    /// — `prefillStepSize` keeps every chunk but the last aligned) this is
+    /// a pure passthrough with zero extra dispatches; padding only kicks
+    /// in for a genuinely ragged tail/short prompt.
+    ///
+    /// Shape contract (B=1, matching the mixer's batching):
+    ///   - `convOut`         : `[T, 2·Hk·Dk + Hv·Dv]` fp32 — the `v` slab is
+    ///     sliced out of its packed row here (`ffai_gdn_wy_plan` wants a
+    ///     dense `[T,Hv,Dv]`, unlike `gatedDeltaPrepChunk`, which reads the
+    ///     packed layout directly).
+    ///   - `qNormed`/`kNormed` : `[T, Hk, Dk]` fp32, from
+    ///     `gatedDeltaQKNormPrepass` (reused as-is — already the dense
+    ///     layout `ffai_gdn_wy_plan` wants).
+    ///   - `aRaw`/`bRaw`     : `[T, Hv]` fp32, from `castToF32Two`.
+    ///   - `stateIn`/`stateOut` : `[Hv, Dv, Dk]` fp32 recurrent state.
+    ///   - `y`               : `[T, Hv, Dv]` fp32 (matches `gatedDeltaPrepChunk`'s `y`) —
+    ///     always real-`t`-sized regardless of internal padding.
+    public static func gatedDeltaWYPrefill(
+        convOut: Tensor,
+        dtBias: Tensor, negExpALog: Tensor,
+        aRaw: Tensor, bRaw: Tensor,
+        qNormed: Tensor, kNormed: Tensor,
+        stateIn: Tensor, stateOut: Tensor, y: Tensor,
+        tLen: Tensor, t: Int,
+        dk: Int, dv: Int, hv: Int, hk: Int,
+        on cmd: MTLCommandBuffer, device: Device
+    ) {
+        let c = 64
+        precondition(
+            t >= c,
+            "Ops.gatedDeltaWYPrefill: t (\(t)) must be >= c=\(c) — "
+                + "caller must fall back to gatedDeltaPrepChunk when there's no full chunk")
+        precondition(
+            dk % 16 == 0 && dv % 16 == 0,
+            "Ops.gatedDeltaWYPrefill: dk/dv (\(dk)/\(dv)) must be multiples of 16 (ffai_gdn_wy_plan MMA tiling)")
+        precondition(
+            dv % 32 == 0,
+            "Ops.gatedDeltaWYPrefill: dv (\(dv)) must be a multiple of 32 (ffai_gdn_wy_scan v1 requirement)")
+        precondition(
+            hv % hk == 0,
+            "Ops.gatedDeltaWYPrefill: hv (\(hv)) must be a multiple of hk (\(hk)) (GQA)")
+        precondition(
+            convOut.dtype == .f32 && qNormed.dtype == .f32 && kNormed.dtype == .f32
+                && stateIn.dtype == .f32 && stateOut.dtype == .f32 && y.dtype == .f32,
+            "Ops.gatedDeltaWYPrefill: fp32 only (matches the mixer's fused-prep fp32 convention)")
+
+        let tPadded = ((t + c - 1) / c) * c
+        let nc = tPadded / c
+        let n = hv  // B=1
+        let convDim = 2 * hk * dk + hv * dv
+        let dtBytes = DType.f32.byteSize
+        let ragged = tPadded != t
+
+        // ── v: dense [Tpadded, Hv, Dv] sliced out of conv_out's packed
+        // row; zero-filled tail when ragged (zero v-row is itself already
+        // a no-op contribution, but the tail's real no-op-ness comes from
+        // g=1/beta=0 below — v's own value there doesn't matter).
+        let vAll = wyScratchTensor(
+            shape: [tPadded * hv * dv], dtype: .f32, tag: "gdn_wy_v_\(tPadded)x\(hv)x\(dv)",
+            device: device)
+        stridedCopyNd(
+            srcBuffer: convOut.buffer,
+            srcByteOffset: convOut.offset + (2 * hk * dk) * dtBytes,
+            dtype: .f32,
+            shape: [t, hv * dv], strides: [convDim, 1],
+            outBuffer: vAll.buffer, outByteOffset: vAll.offset,
+            on: cmd, device: device)
+        if ragged {
+            let validBytes = t * hv * dv * dtBytes
+            let tailBytes = (tPadded - t) * hv * dv * dtBytes
+            let blit = cmd.makeBlitCommandEncoder()!
+            blit.fill(
+                buffer: vAll.buffer,
+                range: (vAll.offset + validBytes) ..< (vAll.offset + validBytes + tailBytes),
+                value: 0)
+            blit.endEncoding()
+        }
+
+        // ── g/beta from a_raw/b_raw + dt_bias/negExpALog over the real
+        // `t` rows; ragged tail padded to the documented (g=1, beta=0)
+        // no-op via a stride-0 broadcast from a 1-element scalar buffer
+        // (same broadcast idiom `stridedCopyNd` already uses for
+        // dt_bias/negExpALog above — `blit.fill` can't express a non-zero
+        // fp32 bit pattern like 1.0f, which isn't a uniform byte).
+        let gAll = wyScratchTensor(
+            shape: [tPadded * hv], dtype: .f32, tag: "gdn_wy_g_\(tPadded)x\(hv)", device: device)
+        let betaAll = wyScratchTensor(
+            shape: [tPadded * hv], dtype: .f32, tag: "gdn_wy_beta_\(tPadded)x\(hv)", device: device)
+        gdnGateBeta(
+            aRaw: aRaw, bRaw: bRaw, dtBias: dtBias, negExpALog: negExpALog,
+            g: Tensor(buffer: gAll.buffer, offset: gAll.offset, shape: [t * hv], dtype: .f32),
+            beta: Tensor(buffer: betaAll.buffer, offset: betaAll.offset, shape: [t * hv], dtype: .f32),
+            rows: t, hv: hv, on: cmd, device: device)
+        if ragged {
+            let padRows = tPadded - t
+            stridedCopyNd(
+                srcBuffer: device.scalarBuffer(1.0), srcByteOffset: 0, dtype: .f32,
+                shape: [padRows * hv], strides: [0],
+                outBuffer: gAll.buffer, outByteOffset: gAll.offset + t * hv * dtBytes,
+                on: cmd, device: device)
+            stridedCopyNd(
+                srcBuffer: device.scalarBuffer(0.0), srcByteOffset: 0, dtype: .f32,
+                shape: [padRows * hv], strides: [0],
+                outBuffer: betaAll.buffer, outByteOffset: betaAll.offset + t * hv * dtBytes,
+                on: cmd, device: device)
+        }
+
+        // ── q/k: passthrough when already chunk-aligned; zero-padded
+        // grow-once scratch copies when ragged (mirrors the ragged-T qmm
+        // pad pattern in `dequantGemmDynamicM`).
+        let qForKernel: Tensor
+        let kForKernel: Tensor
+        if ragged {
+            let qPadded = wyScratchTensor(
+                shape: [tPadded * hk * dk], dtype: .f32, tag: "gdn_wy_qpad_\(tPadded)x\(hk)x\(dk)",
+                device: device)
+            let kPadded = wyScratchTensor(
+                shape: [tPadded * hk * dk], dtype: .f32, tag: "gdn_wy_kpad_\(tPadded)x\(hk)x\(dk)",
+                device: device)
+            let validBytes = t * hk * dk * dtBytes
+            let tailBytes = (tPadded - t) * hk * dk * dtBytes
+            let blit = cmd.makeBlitCommandEncoder()!
+            blit.copy(
+                from: qNormed.buffer, sourceOffset: qNormed.offset,
+                to: qPadded.buffer, destinationOffset: qPadded.offset, size: validBytes)
+            blit.copy(
+                from: kNormed.buffer, sourceOffset: kNormed.offset,
+                to: kPadded.buffer, destinationOffset: kPadded.offset, size: validBytes)
+            blit.fill(
+                buffer: qPadded.buffer,
+                range: (qPadded.offset + validBytes) ..< (qPadded.offset + validBytes + tailBytes),
+                value: 0)
+            blit.fill(
+                buffer: kPadded.buffer,
+                range: (kPadded.offset + validBytes) ..< (kPadded.offset + validBytes + tailBytes),
+                value: 0)
+            blit.endEncoding()
+            qForKernel = qPadded
+            kForKernel = kPadded
+        } else {
+            qForKernel = qNormed
+            kForKernel = kNormed
+        }
+
+        // ── y: write straight into the caller's buffer when aligned;
+        // otherwise scratch at Tpadded, sliced back to the real `t` rows
+        // the caller actually allocated/reads.
+        let yForKernel: Tensor
+        if ragged {
+            yForKernel = wyScratchTensor(
+                shape: [tPadded * hv * dv], dtype: .f32, tag: "gdn_wy_ypad_\(tPadded)x\(hv)x\(dv)",
+                device: device)
+        } else {
+            yForKernel = y
+        }
+
+        // ── t_len: the plan/scan kernels need the PADDED length (their
+        // `NC = t_len/c` sizes the chunk loop) — a fresh tiny buffer per
+        // ragged dispatch, same discipline as `stridedCopyNd`'s
+        // shape/strides buffers (not tagged scratch: a shared buffer would
+        // race across pipelined command buffers).
+        let tLenForKernel: Tensor
+        if ragged {
+            let buf = device.makeBuffer(length: 4)
+            var tPaddedU32 = UInt32(tPadded)
+            memcpy(buf.contents(), &tPaddedU32, 4)
+            tLenForKernel = Tensor(buffer: buf, offset: 0, shape: [1], dtype: .u32)
+        } else {
+            tLenForKernel = tLen
+        }
+
+        // ── K1 intermediates (grow-once tagged scratch, tag by shape) ───
+        let u = wyScratchTensor(
+            shape: [n * nc * c * dv], dtype: .f32, tag: "gdn_wy_u_\(n)x\(nc)x\(c)x\(dv)", device: device)
+        let yLocal = wyScratchTensor(
+            shape: [n * nc * c * dv], dtype: .f32, tag: "gdn_wy_ylocal_\(n)x\(nc)x\(c)x\(dv)",
+            device: device)
+        let qEff = wyScratchTensor(
+            shape: [n * nc * c * dk], dtype: .f32, tag: "gdn_wy_qeff_\(n)x\(nc)x\(c)x\(dk)",
+            device: device)
+        let pS = wyScratchTensor(
+            shape: [n * nc * dk * dk], dtype: .f32, tag: "gdn_wy_ps_\(n)x\(nc)x\(dk)x\(dk)", device: device)
+        let uS = wyScratchTensor(
+            shape: [n * nc * dv * dk], dtype: .f32, tag: "gdn_wy_us_\(n)x\(nc)x\(dv)x\(dk)", device: device)
+
+        // ── K1: ffai_gdn_wy_plan — chunk-parallel, dispatchThreadgroups
+        // (coop_tile/MMA kernel). Grid (TGs): [Tpadded/C, B·Hv, 1], TG [512,1,1].
+        let gridK1 = MTLSize(width: nc, height: n, depth: 1)
+        let tgK1 = MTLSize(width: 512, height: 1, depth: 1)
+        FFAIKernels.ffai_gdn_wy_plan_f32_threadgroups(
+            q: qForKernel.buffer, qOffset: qForKernel.offset,
+            k: kForKernel.buffer, kOffset: kForKernel.offset,
+            v: vAll.buffer, vOffset: vAll.offset,
+            g: gAll.buffer, gOffset: gAll.offset,
+            beta: betaAll.buffer, betaOffset: betaAll.offset,
+            t_len: tLenForKernel.buffer, t_lenOffset: tLenForKernel.offset,
+            u: u.buffer, uOffset: u.offset,
+            y_local: yLocal.buffer, y_localOffset: yLocal.offset,
+            q_eff: qEff.buffer, q_effOffset: qEff.offset,
+            p_s: pS.buffer, p_sOffset: pS.offset,
+            u_s: uS.buffer, u_sOffset: uS.offset,
+            dk: UInt32(dk), dv: UInt32(dv), hv: UInt32(hv), hk: UInt32(hk), c: UInt32(c),
+            gridSize: gridK1, threadgroupSize: tgK1, on: cmd)
+
+        // ── K2: ffai_gdn_wy_scan — chunk-sequential, dispatchThreadgroups.
+        // Grid (TGs): [Dv/32, B·Hv, 1], TG [128,1,1].
+        let gridK2 = MTLSize(width: dv / 32, height: n, depth: 1)
+        let tgK2 = MTLSize(width: 128, height: 1, depth: 1)
+        FFAIKernels.ffai_gdn_wy_scan_f32_threadgroups(
+            q_eff: qEff.buffer, q_effOffset: qEff.offset,
+            y_local: yLocal.buffer, y_localOffset: yLocal.offset,
+            p_s: pS.buffer, p_sOffset: pS.offset,
+            u_s: uS.buffer, u_sOffset: uS.offset,
+            state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+            state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+            y: yForKernel.buffer, yOffset: yForKernel.offset,
+            t_len: tLenForKernel.buffer, t_lenOffset: tLenForKernel.offset,
+            dk: UInt32(dk), dv: UInt32(dv), hv: UInt32(hv), c: UInt32(c),
+            gridSize: gridK2, threadgroupSize: tgK2, on: cmd)
+
+        // ── Slice yForKernel's real-t rows back into the caller's `y`
+        // when we dispatched into padded scratch.
+        if ragged {
+            let blit = cmd.makeBlitCommandEncoder()!
+            blit.copy(
+                from: yForKernel.buffer, sourceOffset: yForKernel.offset,
+                to: y.buffer, destinationOffset: y.offset,
+                size: t * hv * dv * dtBytes)
+            blit.endEncoding()
+        }
+    }
+
     // ─── Dynamic-M batched-prefill int4 qmm ───────────────────────────
     //
-    // Host-side driver around `ffai_qmm_mma`. The kernel's dispatch grid is
+    // Host-side driver around `ffai_qmm_mma` (and, at bits=4 on eligible
+    // shapes/hardware, the faster `ffai_qmm_coop` / `ffai_qmm_mma_mpp`
+    // cooperative-tensor tiers; see `dispatchQmmMma`'s doc for the
+    // priority order). The BN=32 kernels' dispatch grid is
     // `[N/32, ceil(M/32), 1]` × tg `[128, 1, 1]` — M is purely grid-Y
     // sized at runtime, so any `M % 32 == 0` is a clean dispatch. The
     // driver pads ragged `T → mPadded = ceil(T/32) * 32` with zero rows
@@ -6074,8 +8939,8 @@ public enum Ops {
             kIn % 32 == 0,
             "Ops.dequantGemmDynamicM: kIn (\(kIn)) must be multiple of 32 (BK tile)")
         precondition(
-            bits == 2 || bits == 4,
-            "Ops.dequantGemmDynamicM: only int2 and int4 supported (got bits=\(bits))")
+            bits == 2 || bits == 4 || bits == 8,
+            "Ops.dequantGemmDynamicM: only int2/int4/int8 supported (got bits=\(bits))")
 
         let mPadded = ((t + 31) / 32) * 32
         let gsPerRow = kIn / groupSize
@@ -6092,106 +8957,270 @@ public enum Ops {
             return
         }
 
-        // Slow path: pad X to mPadded with zero rows, dispatch into a
-        // padded output, copy the first T rows back to `out`. The trailing
-        // (mPadded - T) rows are dispatched but their outputs are discarded.
+        // Slow path: pad X → mPadded, qmm, slice first T rows to `out`.
+        // Per-call pads (not one shared intermediateScratch pair): a
+        // single pad false-hazards every concurrent callMany on the same
+        // cmd when T%32!=0. `Tensor.empty` / scratch-slab bumps stay unique;
+        // the cmd retains the buffer until GPU completion.
         //
-        // Both the input → xPadded copy and the outPadded → out slice run
-        // as MTLBlit on `cmd`. Previously they were host `memcpy`s through
-        // `buffer.contents()`, which assumes the input tensor is RESIDENT
-        // — fine for chunked-prefill callers that hand it a pre-committed
-        // buffer, but UNSAFE for the batched-prefill caller chain where
-        // `input` is the in-flight output of an upstream kernel on the
-        // same `cmd`. Host-side memcpy of in-flight data reads stale
-        // memory and silently produces garbage projections. Blits on
-        // `cmd` get Metal hazard-tracking between the prior write and
-        // the copy.
-        let xPadded = Tensor.empty(
-            shape: [mPadded, kIn], dtype: input.dtype,
-            device: device)
-        let validInBytes = t * kIn * input.dtype.byteSize
-        let tailZeroBytes = (mPadded - t) * kIn * input.dtype.byteSize
-        let blit = cmd.makeBlitCommandEncoder()!
-        blit.copy(
-            from: input.buffer, sourceOffset: input.offset,
-            to: xPadded.buffer, destinationOffset: xPadded.offset,
-            size: validInBytes)
-        if tailZeroBytes > 0 {
-            blit.fill(
-                buffer: xPadded.buffer,
-                range: (xPadded.offset + validInBytes)
-                    ..< (xPadded.offset + validInBytes + tailZeroBytes),
-                value: 0)
+        // autoreleasepool is CRITICAL here: outside scratch mode each call
+        // allocates a fresh pad pair via `mtlDevice.makeBuffer` (no pool),
+        // and ObjC-bridged buffers are pinned by the enclosing autorelease
+        // pool until it drains — hundreds of ragged callManys per prefill
+        // would accumulate GBs of RSS (the DeepSeekV4 prefill freeze class).
+        // The cmd retains the pads at encode time, so releasing our
+        // references at pool exit is safe.
+        autoreleasepool {
+            let xPadded = Tensor.empty(
+                shape: [mPadded, kIn], dtype: input.dtype, device: device)
+            let outPadded = Tensor.empty(
+                shape: [mPadded, nOut], dtype: input.dtype, device: device)
+            let validInBytes = t * kIn * input.dtype.byteSize
+            let tailZeroBytes = (mPadded - t) * kIn * input.dtype.byteSize
+            let blit = cmd.makeBlitCommandEncoder()!
+            blit.copy(
+                from: input.buffer, sourceOffset: input.offset,
+                to: xPadded.buffer, destinationOffset: xPadded.offset,
+                size: validInBytes)
+            if tailZeroBytes > 0 {
+                blit.fill(
+                    buffer: xPadded.buffer,
+                    range: (xPadded.offset + validInBytes)
+                        ..< (xPadded.offset + validInBytes + tailZeroBytes),
+                    value: 0)
+            }
+            blit.endEncoding()
+            dispatchQmmMma(
+                weight: weight, scales: scales, biases: biases,
+                input: xPadded, output: outPadded,
+                m: mPadded, n: nOut, k: kIn, gsPerRow: gsPerRow, bits: bits,
+                on: cmd)
+
+            // Slice first T rows of outPadded → out (MTLBlit on `cmd`).
+            let validOutBytes = t * nOut * input.dtype.byteSize
+            let outBlit = cmd.makeBlitCommandEncoder()!
+            outBlit.copy(
+                from: outPadded.buffer, sourceOffset: outPadded.offset,
+                to: out.buffer, destinationOffset: out.offset,
+                size: validOutBytes)
+            outBlit.endEncoding()
         }
-        blit.endEncoding()
-
-        let outPadded = Tensor.empty(
-            shape: [mPadded, nOut], dtype: input.dtype,
-            device: device)
-        dispatchQmmMma(
-            weight: weight, scales: scales, biases: biases,
-            input: xPadded, output: outPadded,
-            m: mPadded, n: nOut, k: kIn, gsPerRow: gsPerRow, bits: bits,
-            on: cmd)
-
-        // Slice first T rows of outPadded → out (MTLBlit on `cmd`).
-        let validOutBytes = t * nOut * input.dtype.byteSize
-        let outBlit = cmd.makeBlitCommandEncoder()!
-        outBlit.copy(
-            from: outPadded.buffer, sourceOffset: outPadded.offset,
-            to: out.buffer, destinationOffset: out.offset,
-            size: validOutBytes)
-        outBlit.endEncoding()
     }
+
+    /// Encode an int8 affine MPP QMM onto an existing (possibly concurrent)
+    /// encoder. Same geometry as `dispatchQmmMma` bits=8 MPP path.
+    /// Caller owns encoder lifetime. `m`/`n`/`k` must already satisfy
+    /// tile multiples (m%32==0, n%32==0, k%32==0).
+    public static func encodeDequantGemmInt8Mpp(
+        input: Tensor, weight: Tensor, scales: Tensor, biases: Tensor,
+        m: Int, n: Int, k: Int, groupSize: Int,
+        into out: Tensor,
+        encoder: MTLComputeCommandEncoder
+    ) {
+        precondition(weight.dtype == .u32)
+        precondition(n % 32 == 0 && m % 32 == 0 && k % 32 == 0)
+        precondition(k.isMultiple(of: groupSize))
+        let gsPerRow = k / groupSize
+        let tgGrid = MTLSize(width: n / 32, height: m / 32, depth: 1)
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        var kU = UInt32(k)
+        var nU = UInt32(n)
+        var gsU = UInt32(gsPerRow)
+        let psoName: String
+        switch input.dtype {
+        case .f32: psoName = "ffai_qmm_mma_mpp_int8_f32"
+        case .f16: psoName = "ffai_qmm_mma_mpp_int8_f16"
+        case .bf16: psoName = "ffai_qmm_mma_mpp_int8_bf16"
+        default: fatalError("encodeDequantGemmInt8Mpp: dtype \(input.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        encoder.setComputePipelineState(pso)
+        encoder.setBuffer(weight.buffer, offset: weight.offset, index: 0)
+        encoder.setBuffer(scales.buffer, offset: scales.offset, index: 1)
+        encoder.setBuffer(biases.buffer, offset: biases.offset, index: 2)
+        encoder.setBuffer(input.buffer, offset: input.offset, index: 3)
+        encoder.setBuffer(out.buffer, offset: out.offset, index: 4)
+        encoder.setBytes(&kU, length: 4, index: 5)
+        encoder.setBytes(&nU, length: 4, index: 6)
+        encoder.setBytes(&gsU, length: 4, index: 7)
+        encoder.dispatchThreadgroups(tgGrid, threadsPerThreadgroup: tg)
+    }
+
+    /// `FFAI_QMM_MPP` / `FFAI_QMM_COOP` raw env strings, cached once.
+    /// `dispatchQmmMma` below is the shared entry for every dense int4
+    /// projection at prefill (GDN in-projections, attention QKV/out,
+    /// every other quantized linear), so this fires many times per layer
+    /// per forward call; re-fetching the whole process environment
+    /// dictionary that often was pure overhead once the tier decision
+    /// stabilizes for the life of the process.
+    private static let qmmMppEnvRaw: String? =
+        ProcessInfo.processInfo.environment["FFAI_QMM_MPP"]
+    private static let qmmCoopEnvRaw: String? =
+        ProcessInfo.processInfo.environment["FFAI_QMM_COOP"]
 
     /// Inner dispatcher for `dequantGemmDynamicM`. Grid is `[N/32, M/32, 1]`
     /// × tg `[128, 1, 1]` (4 SGs WM=WN=2 per the canonical `ffai_qmm_mma`).
     /// `dispatchThreads` counts total threads per axis, so grid.x = N/32·128.
     /// `bits` selects the int4 (unsuffixed) or int2 variant; the int2 kernel
     /// uses the same geometry but unpacks 16 codes per u32 (vs 8 nibbles).
+    ///
+    /// `m` must already be a multiple of 32 (BM tile) — callers pad ragged
+    /// `T` up to 32 before reaching here (`dequantGemmDynamicM`'s slow
+    /// path); the `m/32` grid math below silently truncates otherwise.
+    ///
+    /// bits=4 additionally prefers, in order:
+    ///  1. `ffai_qmm_coop` (BN=64 wide-N cooperative-tensor kernel, two
+    ///     `matmul2d` ops per simdgroup sharing one staged X-tile; see its
+    ///     module doc for the isolated-bench case for widening past MPP's
+    ///     BN=32). Requires `n % 64 == 0` in addition to the group-size
+    ///     gate below; a caller with a narrower N (not a multiple of 64,
+    ///     e.g. some vision-tower FFN dims) falls through to tier 2/3
+    ///     regardless of the gate. Gate: `FFAI_QMM_COOP=0` (force off) /
+    ///     `=1` (force on); unset auto-detects on `Ops.mppAutoCapable`
+    ///     hardware (default ON there; this is the fastest of the three
+    ///     tiers on every dense int4 shape measured so far).
+    ///  2. `ffai_qmm_mma_mpp` (MPP/NAX cooperative-tensor kernel,
+    ///     live-compiled via `MetalPerformancePrimitives`) over the manual
+    ///     simdgroup ladder, same idea as the existing bits=8 MPP arm
+    ///     below. Gate: `Ops.mppAutoCapable` (Apple GPU Family 9+ /
+    ///     macOS 26+, the same cached capability check the MoE bgemm work
+    ///     added; reused here rather than duplicated), overridable via
+    ///     `FFAI_QMM_MPP=0` (force off) / `FFAI_QMM_MPP=1` (force on).
+    ///  3. `ffai_qmm_mma` (manual simdgroup ladder), the fallback for any
+    ///     shape or hardware neither tier above can serve.
+    /// Both cooperative-tensor kernels bake `group_size=64` (Qwen3.6-A3B's
+    /// default; see their module docs); a caller quantized at a different
+    /// group size falls back to the simdgroup path regardless of either
+    /// gate, since those kernels would silently read scales/biases at the
+    /// wrong stride otherwise.
     private static func dispatchQmmMma(
         weight: Tensor, scales: Tensor, biases: Tensor,
         input: Tensor, output: Tensor,
         m: Int, n: Int, k: Int, gsPerRow: Int, bits: Int,
         on cmd: MTLCommandBuffer
     ) {
+        precondition(
+            m % 32 == 0,
+            "Ops.dispatchQmmMma: m (\(m)) must be a multiple of 32 (BM tile) — caller must pad")
+        // Prefer threadgroups dispatch for MMA (grid = tile counts).
         let tgWidth = 128
-        let grid = MTLSize(
-            width: (n / 32) * tgWidth,
-            height: m / 32,
-            depth: 1)
+        let tgGrid = MTLSize(width: n / 32, height: m / 32, depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        // Generated wrappers take a "total threads" grid; convert.
+        let grid = MTLSize(
+            width: tgGrid.width * tgWidth,
+            height: tgGrid.height,
+            depth: 1)
+        // ffai_qmm_coop's BN=64 tile halves the N-tile count vs the BN=32
+        // tiers above.
+        let coopGrid = MTLSize(width: n / 64, height: m / 32, depth: 1)
         let kU = UInt32(k)
         let nU = UInt32(n)
         let gsU = UInt32(gsPerRow)
+        let mppRequested4: Bool
+        switch Self.qmmMppEnvRaw {
+        case "0": mppRequested4 = false
+        case "1": mppRequested4 = true
+        default: mppRequested4 = Self.mppAutoCapable
+        }
+        let useMpp4 = mppRequested4 && gsPerRow > 0 && k % gsPerRow == 0 && k / gsPerRow == 64
+        let coopRequested4: Bool
+        switch Self.qmmCoopEnvRaw {
+        case "0": coopRequested4 = false
+        case "1": coopRequested4 = true
+        default: coopRequested4 = Self.mppAutoCapable
+        }
+        let useCoop4 =
+            coopRequested4 && n % 64 == 0 && gsPerRow > 0 && k % gsPerRow == 0
+            && k / gsPerRow == 64
         switch (bits, input.dtype) {
         case (4, .f32):
-            FFAIKernels.ffai_qmm_mma_f32(
-                w: weight.buffer, wOffset: weight.offset,
-                scales: scales.buffer, scalesOffset: scales.offset,
-                biases: biases.buffer, biasesOffset: biases.offset,
-                x: input.buffer, xOffset: input.offset,
-                out: output.buffer, outOffset: output.offset,
-                k: kU, n: nU, gs_per_row: gsU,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
+            if useCoop4 {
+                FFAIKernels.ffai_qmm_coop_f32_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: coopGrid, threadgroupSize: tg, on: cmd)
+            } else if useMpp4 {
+                FFAIKernels.ffai_qmm_mma_mpp_f32_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                FFAIKernels.ffai_qmm_mma_f32(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            }
         case (4, .f16):
-            FFAIKernels.ffai_qmm_mma_f16(
-                w: weight.buffer, wOffset: weight.offset,
-                scales: scales.buffer, scalesOffset: scales.offset,
-                biases: biases.buffer, biasesOffset: biases.offset,
-                x: input.buffer, xOffset: input.offset,
-                out: output.buffer, outOffset: output.offset,
-                k: kU, n: nU, gs_per_row: gsU,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
+            if useCoop4 {
+                FFAIKernels.ffai_qmm_coop_f16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: coopGrid, threadgroupSize: tg, on: cmd)
+            } else if useMpp4 {
+                FFAIKernels.ffai_qmm_mma_mpp_f16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                FFAIKernels.ffai_qmm_mma_f16(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            }
         case (4, .bf16):
-            FFAIKernels.ffai_qmm_mma_bf16(
-                w: weight.buffer, wOffset: weight.offset,
-                scales: scales.buffer, scalesOffset: scales.offset,
-                biases: biases.buffer, biasesOffset: biases.offset,
-                x: input.buffer, xOffset: input.offset,
-                out: output.buffer, outOffset: output.offset,
-                k: kU, n: nU, gs_per_row: gsU,
-                gridSize: grid, threadgroupSize: tg, on: cmd)
+            if useCoop4 {
+                FFAIKernels.ffai_qmm_coop_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: coopGrid, threadgroupSize: tg, on: cmd)
+            } else if useMpp4 {
+                FFAIKernels.ffai_qmm_mma_mpp_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                FFAIKernels.ffai_qmm_mma_bf16(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            }
         case (2, .f32):
             FFAIKernels.ffai_qmm_mma_int2_f32(
                 w: weight.buffer, wOffset: weight.offset,
@@ -6219,6 +9248,67 @@ public enum Ops {
                 out: output.buffer, outOffset: output.offset,
                 k: kU, n: nU, gs_per_row: gsU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (8, .f32):
+            // Prefer MPP/NAX int8 (live-compile) unless FFAI_HY3_QMM_MMA=1.
+            if ProcessInfo.processInfo.environment["FFAI_HY3_QMM_MMA"] == nil {
+                FFAIKernels.ffai_qmm_mma_mpp_int8_f32_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                FFAIKernels.ffai_qmm_mma_int8_f32(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            }
+        case (8, .f16):
+            if ProcessInfo.processInfo.environment["FFAI_HY3_QMM_MMA"] == nil {
+                FFAIKernels.ffai_qmm_mma_mpp_int8_f16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                FFAIKernels.ffai_qmm_mma_int8_f16(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            }
+        case (8, .bf16):
+            if ProcessInfo.processInfo.environment["FFAI_HY3_QMM_MMA"] == nil {
+                FFAIKernels.ffai_qmm_mma_mpp_int8_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+            } else {
+                FFAIKernels.ffai_qmm_mma_int8_bf16(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            }
         default:
             fatalError("Ops.dequantGemmDynamicM: unsupported (bits=\(bits), dtype=\(input.dtype))")
         }
@@ -6402,6 +9492,52 @@ public enum Ops {
         default:
             fatalError("Ops.castToF32: unsupported input dtype \(input.dtype)")
         }
+    }
+
+    /// bf16 → f16 elementwise cast (2-byte → 2-byte). Supports **in-place**
+    /// when `input` and `output` share buffer+offset (Hy3 oQ2 load path:
+    /// promote checkpoint BF16 scales without doubling resident weight
+    /// storage). Live-compiled from `Resources/kernels/ffai_cast_bf16_to_f16.metal`.
+    /// Returns a Tensor view with `dtype == .f16` over `output`'s storage.
+    @discardableResult
+    public static func castBf16ToF16(
+        _ input: Tensor,
+        into output: Tensor? = nil,
+        on cmd: MTLCommandBuffer
+    ) -> Tensor {
+        precondition(
+            input.dtype == .bf16,
+            "Ops.castBf16ToF16: input must be bf16, got \(input.dtype)")
+        let out: Tensor
+        if let o = output {
+            precondition(
+                o.elementCount == input.elementCount,
+                "Ops.castBf16ToF16: count mismatch")
+            // In-place or separate: out may be labeled bf16 or f16.
+            out = o
+        } else {
+            out = input  // in-place on same buffer
+        }
+        let n = input.elementCount
+        guard n > 0 else {
+            return Tensor(
+                buffer: out.buffer, offset: out.offset, shape: out.shape, dtype: .f16)
+        }
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let pso = PSOCache.shared.pipelineState(for: "ffai_cast_bf16_to_f16_f32")
+        guard let enc = cmd.makeComputeCommandEncoder() else {
+            return Tensor(
+                buffer: out.buffer, offset: out.offset, shape: out.shape, dtype: .f16)
+        }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 1)
+        enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+        return Tensor(
+            buffer: out.buffer, offset: out.offset, shape: out.shape, dtype: .f16)
     }
 
     /// One silu-cast plus two plain casts to f32 on the SAME compute
@@ -6709,9 +9845,7 @@ public enum Ops {
             inDim % groupSize == 0,
             "Ops.rmsNormQgemvInt4Fast: in_dim must divide group_size=64")
         // eps as a 1-element f32 buffer.
-        var epsValue = eps
-        let epsBuf = device.makeBuffer(length: 4)
-        memcpy(epsBuf.contents(), &epsValue, 4)
+        let epsBuf = device.scalarBuffer(eps)
         let tg = MTLSize(width: 64, height: 1, depth: 1)
         let nTiles = outDim / 8
         let grid = MTLSize(width: nTiles * 64, height: 1, depth: 1)
@@ -6813,9 +9947,7 @@ public enum Ops {
         let grid = MTLSize(width: nTiles * tpg, height: 1, depth: 1)
         let tg = MTLSize(width: tpg, height: 1, depth: 1)
         // eps as a 1-element f32 buffer.
-        var epsValue = eps
-        let epsBuf = device.makeBuffer(length: 4)
-        memcpy(epsBuf.contents(), &epsValue, 4)
+        let epsBuf = device.scalarBuffer(eps)
         switch out.dtype {
         case .f32:
             FFAIKernels.ffai_gated_rms_norm_qgemv_int4_fast_f32(
@@ -7037,6 +10169,60 @@ public enum Ops {
         }
     }
 
+    /// Row-broadcast sigmoid FMA over a `[T, hidden]` layout:
+    /// `out[r, h] = base[r, h] + sigmoid(gate[r]) * value[r, h]`.
+    /// The T-batched form of `sigmoidScalarFMA` — one dispatch replaces
+    /// the per-row command-buffer fan-out at batched prefill.
+    public static func sigmoidRowFMA(
+        gate: Tensor, value: Tensor, base: Tensor,
+        into out: Tensor, t: Int, hidden: Int, on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            gate.dtype == value.dtype && value.dtype == base.dtype && base.dtype == out.dtype,
+            "Ops.sigmoidRowFMA: all tensors must share dtype")
+        precondition(
+            gate.elementCount == t,
+            "Ops.sigmoidRowFMA: gate must be [T] (got \(gate.elementCount), T=\(t))")
+        precondition(
+            value.elementCount == t * hidden && base.elementCount == t * hidden
+                && out.elementCount == t * hidden,
+            "Ops.sigmoidRowFMA: value / base / out must be T*hidden")
+
+        let n = t * hidden
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let hiddenU = UInt32(hidden)
+        switch out.dtype {
+        case .f32:
+            FFAIKernels.ffai_sigmoid_row_fma_f32(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            FFAIKernels.ffai_sigmoid_row_fma_f16(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            FFAIKernels.ffai_sigmoid_row_fma_bf16(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.sigmoidRowFMA: unsupported dtype \(out.dtype)")
+        }
+    }
+
     // ─── Fused SwiGLU ─────────────────────────────────────────────────
     //
     // Wraps `ffai_swiglu_{f32,f16,bf16}`. Computes `out[i] = silu(gate[i]) * up[i]`
@@ -7136,6 +10322,59 @@ public enum Ops {
         enc.endEncoding()
     }
 
+    /// DSv4 SwiGLU-with-limit (single): `silu(min(gate,limit)) * clip(up,±limit)`.
+    public static func swigluLimit(
+        gate: Tensor, up: Tensor, limit: Float, on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(gate.dtype == up.dtype && gate.elementCount == up.elementCount,
+            "Ops.swigluLimit: gate/up mismatch")
+        let result = out ?? Tensor.empty(shape: gate.shape, dtype: gate.dtype)
+        swigluLimitMany(gates: [gate], ups: [up], outs: [result], limit: limit, on: cmd)
+        return result
+    }
+
+    /// DSv4 SwiGLU-with-limit, N dispatches sharing one encoder:
+    /// `out = silu(min(gate, limit)) * clip(up, -limit, +limit)`. DSv4
+    /// trains with swiglu_limit=10; the clamp is essential — unclamped
+    /// silu(gate)*up overflows fp16 in the deep high-magnitude layers.
+    public static func swigluLimitMany(
+        gates: [Tensor], ups: [Tensor], outs: [Tensor], limit: Float,
+        on cmd: MTLCommandBuffer
+    ) {
+        let n = gates.count
+        precondition(ups.count == n && outs.count == n, "Ops.swigluLimitMany: count mismatch")
+        guard n > 0 else { return }
+        let dtype = gates[0].dtype
+        let psoName: String
+        switch dtype {
+        case .f32: psoName = "ffai_swiglu_limit_f32"
+        case .f16: psoName = "ffai_swiglu_limit_f16"
+        case .bf16: psoName = "ffai_swiglu_limit_bf16"
+        default: fatalError("Ops.swigluLimitMany: unsupported dtype \(dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        var lim = limit
+        for i in 0 ..< n {
+            let count = gates[i].elementCount
+            precondition(ups[i].elementCount == count && outs[i].elementCount == count,
+                "Ops.swigluLimitMany: shape mismatch at index \(i)")
+            precondition(ups[i].dtype == dtype && outs[i].dtype == dtype,
+                "Ops.swigluLimitMany: dtype mismatch at index \(i)")
+            let tgWidth = min(count, 256)
+            enc.setBuffer(gates[i].buffer, offset: gates[i].offset, index: 0)
+            enc.setBuffer(ups[i].buffer, offset: ups[i].offset, index: 1)
+            enc.setBuffer(outs[i].buffer, offset: outs[i].offset, index: 2)
+            enc.setBytes(&lim, length: 4, index: 3)
+            enc.dispatchThreads(
+                MTLSize(width: count, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1))
+        }
+        enc.endEncoding()
+    }
+
     // ─── MoE gather quantised matmul, scalar m1 ────────────────────────
     //
     // Wraps `ffai_moe_gather_qmm_int4_{f32,f16,bf16}`. One TG per
@@ -7224,6 +10463,412 @@ public enum Ops {
         }
     }
 
+    /// Compact sorted expert ids into an active-only list + row spans and
+    /// write `MTLDispatchThreadgroupsIndirectArguments` for gate/up and down.
+    /// Single TG, thread 0. Live-compile `ffai_moe_compact_active_experts`.
+    public static func moeCompactActiveExperts(
+        sortedExperts: Tensor,
+        activeExperts: Tensor,
+        rowLo: Tensor,
+        rowHi: Tensor,
+        nActiveOut: Tensor,
+        indirectGU: Tensor,
+        indirectDown: Tensor,
+        mTotal: Int,
+        nOutGU: Int,
+        nOutDown: Int,
+        nExpertsCap: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(sortedExperts.dtype == .u32)
+        precondition(activeExperts.dtype == .u32 && rowLo.dtype == .u32 && rowHi.dtype == .u32)
+        precondition(nActiveOut.dtype == .u32 && nActiveOut.elementCount >= 1)
+        precondition(indirectGU.dtype == .u32 && indirectGU.elementCount >= 3)
+        precondition(indirectDown.dtype == .u32 && indirectDown.elementCount >= 3)
+        var mTotalU = UInt32(mTotal)
+        var nOutGUU = UInt32(nOutGU)
+        var nOutDownU = UInt32(nOutDown)
+        var capU = UInt32(nExpertsCap)
+        let pso = PSOCache.shared.pipelineState(for: "ffai_moe_compact_active_experts_f32")
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(sortedExperts.buffer, offset: sortedExperts.offset, index: 0)
+        enc.setBuffer(activeExperts.buffer, offset: activeExperts.offset, index: 1)
+        enc.setBuffer(rowLo.buffer, offset: rowLo.offset, index: 2)
+        enc.setBuffer(rowHi.buffer, offset: rowHi.offset, index: 3)
+        enc.setBuffer(nActiveOut.buffer, offset: nActiveOut.offset, index: 4)
+        enc.setBuffer(indirectGU.buffer, offset: indirectGU.offset, index: 5)
+        enc.setBuffer(indirectDown.buffer, offset: indirectDown.offset, index: 6)
+        enc.setBytes(&mTotalU, length: 4, index: 7)
+        enc.setBytes(&nOutGUU, length: 4, index: 8)
+        enc.setBytes(&nOutDownU, length: 4, index: 9)
+        enc.setBytes(&capU, length: 4, index: 10)
+        enc.dispatchThreadgroups(
+            MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// Densify active expert int2 weights + f16 scales/biases into contiguous
+    /// `[nActive, nOut, …]` slabs. One TG per active expert.
+    public static func moeDensifyInt2Experts(
+        weightSrc: Tensor, scalesSrc: Tensor, biasesSrc: Tensor,
+        activeExperts: Tensor,
+        weightDst: Tensor, scalesDst: Tensor, biasesDst: Tensor,
+        nOut: Int, kIn: Int, groupSize: Int, nActive: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(weightSrc.dtype == .u32 && weightDst.dtype == .u32)
+        precondition(scalesSrc.dtype == .f16 && biasesSrc.dtype == .f16)
+        precondition(kIn % 16 == 0 && kIn.isMultiple(of: groupSize))
+        precondition(nActive > 0)
+        let packsPerRow = kIn / 16
+        let groupsPerRow = kIn / groupSize
+        var nOutU = UInt32(nOut)
+        var packsU = UInt32(packsPerRow)
+        var groupsU = UInt32(groupsPerRow)
+        var nActiveU = UInt32(nActive)
+        let pso = PSOCache.shared.pipelineState(for: "ffai_moe_densify_int2_experts_f16")
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(weightSrc.buffer, offset: weightSrc.offset, index: 0)
+        enc.setBuffer(scalesSrc.buffer, offset: scalesSrc.offset, index: 1)
+        enc.setBuffer(biasesSrc.buffer, offset: biasesSrc.offset, index: 2)
+        enc.setBuffer(activeExperts.buffer, offset: activeExperts.offset, index: 3)
+        enc.setBuffer(weightDst.buffer, offset: weightDst.offset, index: 4)
+        enc.setBuffer(scalesDst.buffer, offset: scalesDst.offset, index: 5)
+        enc.setBuffer(biasesDst.buffer, offset: biasesDst.offset, index: 6)
+        enc.setBytes(&nOutU, length: 4, index: 7)
+        enc.setBytes(&packsU, length: 4, index: 8)
+        enc.setBytes(&groupsU, length: 4, index: 9)
+        enc.setBytes(&nActiveU, length: 4, index: 10)
+        enc.dispatchThreadgroups(
+            MTLSize(width: nActive, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// Remap sorted expert ids → dense `[0, nActive)` using active list.
+    public static func moeRemapExpertsDense(
+        sortedExperts: Tensor,
+        activeExperts: Tensor,
+        denseIndices: Tensor,
+        mTotal: Int, nActive: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(sortedExperts.dtype == .u32 && activeExperts.dtype == .u32)
+        precondition(denseIndices.dtype == .u32 && denseIndices.elementCount >= mTotal)
+        var mTotalU = UInt32(mTotal)
+        var nActiveU = UInt32(nActive)
+        let pso = PSOCache.shared.pipelineState(for: "ffai_moe_remap_experts_dense_f32")
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(sortedExperts.buffer, offset: sortedExperts.offset, index: 0)
+        enc.setBuffer(activeExperts.buffer, offset: activeExperts.offset, index: 1)
+        enc.setBuffer(denseIndices.buffer, offset: denseIndices.offset, index: 2)
+        enc.setBytes(&mTotalU, length: 4, index: 3)
+        enc.setBytes(&nActiveU, length: 4, index: 4)
+        let tpg = 256
+        let grid = MTLSize(width: (mTotal + tpg - 1) / tpg * tpg, height: 1, depth: 1)
+        enc.dispatchThreads(grid, threadsPerThreadgroup: MTLSize(width: tpg, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// Active-only expert-outer int2 gather QMM (f16). `tgid.y` indexes the
+    /// compact active list from `moeCompactActiveExperts`. Prefer
+    /// `dispatchIndirect` so empty experts never launch.
+    public static func moeGatherDequantGemmInt2Active(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        activeExperts: Tensor, rowLo: Tensor, rowHi: Tensor,
+        mTotal: Int, nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor,
+        encoder: MTLComputeCommandEncoder? = nil,
+        indirectArgs: Tensor? = nil,
+        nActiveFallback: Int = 0
+    ) {
+        precondition(weight.dtype == .u32)
+        precondition(
+            input.dtype == .f16 || input.dtype == .bf16,
+            "moeGatherDequantGemmInt2Active: only f16/bf16 (got \(input.dtype))")
+        precondition(nOut % 32 == 0 && kIn % 16 == 0)
+        precondition(kIn.isMultiple(of: groupSize))
+        let psoName: String
+        switch input.dtype {
+        case .f16: psoName = "ffai_moe_gather_qmm_mma_eg_int2_active_mpp_f16"
+        case .bf16: psoName = "ffai_moe_gather_qmm_mma_eg_int2_active_mpp_bf16"
+        default: fatalError("moeGatherDequantGemmInt2Active: \(input.dtype)")
+        }
+        // bf16 active kernel may be missing — fall back to f16 name only.
+        let pso: MTLComputePipelineState
+        do {
+            pso = try PSOCache.shared.pipelineStateThrowing(for: psoName)
+        } catch {
+            // No bf16 active kernel yet — callers should use f16 promote.
+            fatalError("moeGatherDequantGemmInt2Active: PSO \(psoName): \(error)")
+        }
+        let ownsEnc = encoder == nil
+        guard let enc = encoder ?? cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        var mTotalU = UInt32(mTotal)
+        var nOutU = UInt32(nOut)
+        var kInU = UInt32(kIn)
+        var groupSizeU = UInt32(groupSize)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(weight.buffer, offset: weight.offset, index: 1)
+        enc.setBuffer(scales.buffer, offset: scales.offset, index: 2)
+        enc.setBuffer(biases.buffer, offset: biases.offset, index: 3)
+        enc.setBuffer(activeExperts.buffer, offset: activeExperts.offset, index: 4)
+        enc.setBuffer(rowLo.buffer, offset: rowLo.offset, index: 5)
+        enc.setBuffer(rowHi.buffer, offset: rowHi.offset, index: 6)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 7)
+        enc.setBytes(&mTotalU, length: 4, index: 8)
+        enc.setBytes(&nOutU, length: 4, index: 9)
+        enc.setBytes(&kInU, length: 4, index: 10)
+        enc.setBytes(&groupSizeU, length: 4, index: 11)
+        let tg = MTLSize(width: 32, height: 1, depth: 1)
+        if let ind = indirectArgs {
+            enc.dispatchThreadgroups(
+                indirectBuffer: ind.buffer,
+                indirectBufferOffset: ind.offset,
+                threadsPerThreadgroup: tg)
+        } else {
+            let nA = max(nActiveFallback, 1)
+            enc.dispatchThreadgroups(
+                MTLSize(width: nOut / 32, height: nA, depth: 1),
+                threadsPerThreadgroup: tg)
+        }
+        if ownsEnc { enc.endEncoding() }
+    }
+
+    /// Affine int2 MoE gather QMM — BM=16/BN=32 (default), BM=BN=64 (opt-in),
+    /// or expert-outer grid. Prefer expert-sorted `indices` so contiguous
+    /// runs share weight loads.
+    ///
+    /// Default: MPP `ffai_moe_gather_qmm_mma_int2_bm16_mpp_*` (1 SG, tpg=32,
+    /// live-compile from Resources/kernels).
+    /// - `FFAI_HY3_MOE_BM64=1` (+ `nOut%64==0`, `kIn%32==0`): BM64 MPP
+    ///   (4 SG, tpg=128) — better for fat experts / long runs.
+    /// - `FFAI_HY3_MOE_MMA=1`: simdgroup-MMA BM16 (tpg=64), live-compiled.
+    /// - `FFAI_HY3_EXPERT_GRID=1` + `nExperts`: expert-outer MPP.
+    public static func moeGatherDequantGemmInt2(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        indices: Tensor,
+        mTotal: Int, nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor,
+        encoder: MTLComputeCommandEncoder? = nil,
+        nExperts: Int = 0
+    ) {
+        precondition(weight.dtype == .u32, "moeGatherDequantGemmInt2: weight must be u32 packed")
+        precondition(
+            indices.dtype == .u32 && indices.elementCount == mTotal,
+            "moeGatherDequantGemmInt2: indices must be [mTotal] u32")
+        precondition(
+            input.dtype == scales.dtype && scales.dtype == biases.dtype
+                && out.dtype == input.dtype,
+            "moeGatherDequantGemmInt2: dtype mismatch")
+        precondition(
+            input.elementCount == mTotal * kIn,
+            "moeGatherDequantGemmInt2: input elements \(input.elementCount) ≠ mTotal·kIn \(mTotal * kIn)")
+        precondition(
+            out.elementCount == mTotal * nOut,
+            "moeGatherDequantGemmInt2: out elements \(out.elementCount) ≠ mTotal·nOut \(mTotal * nOut)")
+        precondition(
+            nOut % 32 == 0 && kIn % 16 == 0,
+            "moeGatherDequantGemmInt2: nOut multiple of 32, kIn of 16 (got nOut=\(nOut) kIn=\(kIn))")
+        precondition(
+            kIn.isMultiple(of: groupSize),
+            "moeGatherDequantGemmInt2: group_size must divide k_in")
+
+        // Expert-outer grid when mTotal is large. FFAI_HY3_NO_EXPERT_GRID=1
+        // disables; FFAI_HY3_EXPERT_GRID=1 forces.
+        let useExpertGrid: Bool = {
+            guard nExperts > 0 else { return false }
+            if ProcessInfo.processInfo.environment["FFAI_HY3_NO_EXPERT_GRID"] != nil {
+                return false
+            }
+            if ProcessInfo.processInfo.environment["FFAI_HY3_EXPERT_GRID"] != nil {
+                return true
+            }
+            return mTotal >= 1536
+        }()
+        let useBm64 =
+            !useExpertGrid
+            && ProcessInfo.processInfo.environment["FFAI_HY3_MOE_BM64"] != nil
+            && nOut % 64 == 0
+            && kIn % 32 == 0
+            && mTotal >= 64
+        let useBm8 =
+            !useExpertGrid && !useBm64
+            && ProcessInfo.processInfo.environment["FFAI_HY3_MOE_BM8"] != nil
+        let useMma =
+            !useExpertGrid && !useBm64 && !useBm8
+            && ProcessInfo.processInfo.environment["FFAI_HY3_MOE_MMA"] != nil
+        // BM64: 4 SG; BM16 MMA: 2 SG; expert-grid/BM16/BM8 MPP: 1 SG.
+        let tgWidth = useBm64 ? 128 : (useMma ? 64 : 32)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        var mTotalU = UInt32(mTotal)
+        var nOutU = UInt32(nOut)
+        var kInU = UInt32(kIn)
+        var groupSizeU = UInt32(groupSize)
+        var nExpertsU = UInt32(nExperts)
+        let psoName: String
+        if useExpertGrid {
+            switch input.dtype {
+            case .f32: psoName = "ffai_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_f32"
+            case .f16: psoName = "ffai_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_f16"
+            case .bf16: psoName = "ffai_moe_gather_qmm_mma_eg_int2_expert_grid_mpp_bf16"
+            default:
+                fatalError("Ops.moeGatherDequantGemmInt2: unsupported dtype \(input.dtype)")
+            }
+        } else if useBm64 {
+            switch input.dtype {
+            case .f32: psoName = "ffai_moe_gather_qmm_mma_int2_bm64_mpp_f32"
+            case .f16: psoName = "ffai_moe_gather_qmm_mma_int2_bm64_mpp_f16"
+            case .bf16: psoName = "ffai_moe_gather_qmm_mma_int2_bm64_mpp_bf16"
+            default:
+                fatalError("Ops.moeGatherDequantGemmInt2: unsupported dtype \(input.dtype)")
+            }
+        } else if useBm8 {
+            switch input.dtype {
+            case .f32: psoName = "ffai_moe_gather_qmm_mma_int2_bm8_mpp_f32"
+            case .f16: psoName = "ffai_moe_gather_qmm_mma_int2_bm8_mpp_f16"
+            case .bf16: psoName = "ffai_moe_gather_qmm_mma_int2_bm8_mpp_bf16"
+            default:
+                fatalError("Ops.moeGatherDequantGemmInt2: unsupported dtype \(input.dtype)")
+            }
+        } else if useMma {
+            switch input.dtype {
+            case .f32: psoName = "ffai_moe_gather_qmm_mma_int2_bm16_f32"
+            case .f16: psoName = "ffai_moe_gather_qmm_mma_int2_bm16_f16"
+            case .bf16: psoName = "ffai_moe_gather_qmm_mma_int2_bm16_bf16"
+            default:
+                fatalError("Ops.moeGatherDequantGemmInt2: unsupported dtype \(input.dtype)")
+            }
+        } else {
+            switch input.dtype {
+            case .f32: psoName = "ffai_moe_gather_qmm_mma_int2_bm16_mpp_f32"
+            case .f16: psoName = "ffai_moe_gather_qmm_mma_int2_bm16_mpp_f16"
+            case .bf16: psoName = "ffai_moe_gather_qmm_mma_int2_bm16_mpp_bf16"
+            default:
+                fatalError("Ops.moeGatherDequantGemmInt2: unsupported dtype \(input.dtype)")
+            }
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        let ownsEnc = encoder == nil
+        guard let enc = encoder ?? cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(weight.buffer, offset: weight.offset, index: 1)
+        enc.setBuffer(scales.buffer, offset: scales.offset, index: 2)
+        enc.setBuffer(biases.buffer, offset: biases.offset, index: 3)
+        enc.setBuffer(indices.buffer, offset: indices.offset, index: 4)
+        // The bm16_mpp family carries an x_rows row-map (identity here —
+        // X is pre-gathered); its out/constexpr bindings shift by one.
+        // The other tiles keep the original ABI.
+        let hasXRows = !useExpertGrid && !useBm64 && !useBm8 && !useMma
+        if hasXRows {
+            let idRows = Self.identityRowsBuffer(minCount: mTotal, device: Device.shared)
+            enc.setBuffer(idRows, offset: 0, index: 5)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 6)
+            enc.setBytes(&mTotalU, length: 4, index: 7)
+            enc.setBytes(&nOutU, length: 4, index: 8)
+            enc.setBytes(&kInU, length: 4, index: 9)
+            enc.setBytes(&groupSizeU, length: 4, index: 10)
+        } else {
+            enc.setBuffer(out.buffer, offset: out.offset, index: 5)
+            enc.setBytes(&mTotalU, length: 4, index: 6)
+            enc.setBytes(&nOutU, length: 4, index: 7)
+            enc.setBytes(&kInU, length: 4, index: 8)
+            enc.setBytes(&groupSizeU, length: 4, index: 9)
+            if useExpertGrid {
+                enc.setBytes(&nExpertsU, length: 4, index: 10)
+            }
+        }
+        let tgGrid: MTLSize
+        if useExpertGrid {
+            // One TG per 32 N-cols.
+            tgGrid = MTLSize(width: nOut / 32, height: nExperts, depth: 1)
+        } else if useBm64 {
+            tgGrid = MTLSize(
+                width: nOut / 64,
+                height: (mTotal + 63) / 64,
+                depth: 1)
+        } else if useBm8 {
+            tgGrid = MTLSize(
+                width: nOut / 32,
+                height: (mTotal + 7) / 8,
+                depth: 1)
+        } else {
+            tgGrid = MTLSize(
+                width: nOut / 32,
+                height: (mTotal + 15) / 16,
+                depth: 1)
+        }
+        enc.dispatchThreadgroups(tgGrid, threadsPerThreadgroup: tg)
+        if ownsEnc { enc.endEncoding() }
+    }
+
+    /// Gather QMM for **int2 affine** (MLX oQ2, scales+biases) — Hy3
+    /// reduction-style fallback. `expertIds` is `[tRows]` u32 expert index per
+    /// gathered row (token-order or expert-sorted). Kernel is
+    /// live-compiled from `Resources/kernels/`.
+    public static func moeGatherDequantGemmInt2M1(
+        _ x: Tensor, _ weight: Tensor, _ scales: Tensor, _ biases: Tensor,
+        _ expertIds: Tensor,
+        _ tRows: Int, _ mOut: Int, _ kIn: Int,
+        _ nExperts: Int, _ groupSize: Int,
+        _ cmd: MTLCommandBuffer, _ out: Tensor
+    ) {
+        precondition(weight.dtype == .u32, "moeGatherDequantGemmInt2M1: weight must be u32 packed")
+        precondition(
+            expertIds.dtype == .u32 && expertIds.elementCount == tRows,
+            "moeGatherDequantGemmInt2M1: expertIds must be [tRows] u32")
+        precondition(
+            scales.dtype == x.dtype && biases.dtype == x.dtype && out.dtype == x.dtype,
+            "moeGatherDequantGemmInt2M1: dtype mismatch")
+        precondition(
+            kIn.isMultiple(of: groupSize),
+            "moeGatherDequantGemmInt2M1: group_size must divide k_in")
+        // One threadgroup per gathered row; threads partition m_out.
+        // (Older form was one TG per (row, out_col) → millions of launches.)
+        let tgWidth = 256
+        let grid = MTLSize(width: tRows * tgWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        var kInV = UInt32(kIn)
+        var mOutV = UInt32(mOut)
+        var nExpertsV = UInt32(nExperts)
+        var groupSizeV = UInt32(groupSize)
+        let psoName: String
+        switch x.dtype {
+        case .f32: psoName = "ffai_moe_gather_qmm_int2_f32"
+        case .f16: psoName = "ffai_moe_gather_qmm_int2_f16"
+        case .bf16: psoName = "ffai_moe_gather_qmm_int2_bf16"
+        default:
+            fatalError("Ops.moeGatherDequantGemmInt2M1: unsupported dtype \(x.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(x.buffer, offset: x.offset, index: 0)
+        enc.setBuffer(weight.buffer, offset: weight.offset, index: 1)
+        enc.setBuffer(scales.buffer, offset: scales.offset, index: 2)
+        enc.setBuffer(biases.buffer, offset: biases.offset, index: 3)
+        enc.setBuffer(expertIds.buffer, offset: expertIds.offset, index: 4)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 5)
+        enc.setBytes(&kInV, length: 4, index: 6)
+        enc.setBytes(&mOutV, length: 4, index: 7)
+        enc.setBytes(&nExpertsV, length: 4, index: 8)
+        enc.setBytes(&groupSizeV, length: 4, index: 9)
+        enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+    }
+
     /// LayerNorm: `out = (x − mean) / sqrt(var + eps) · weight + bias`.
     /// Backed by `ffai_layer_norm_*` (one TG per row, TPG=1024). Used by
     /// vision-transformer encoders (SigLIP / CLIP) and audio frontends —
@@ -7248,9 +10893,7 @@ public enum Ops {
             x.dtype == weight.dtype && weight.dtype == bias.dtype,
             "Ops.layerNorm: x/weight/bias dtype mismatch")
         let result = out ?? Tensor.empty(shape: x.shape, dtype: x.dtype)
-        var epsValue = eps
-        let epsBuf = device.makeBuffer(length: 4)
-        memcpy(epsBuf.contents(), &epsValue, 4)
+        let epsBuf = device.scalarBuffer(eps)
         // TPG=1024 per the kernel's reduce-tree contract. One TG per row.
         let tgWidth = 1024
         let grid = MTLSize(width: nRows * tgWidth, height: 1, depth: 1)
@@ -8974,5 +12617,144 @@ public enum Ops {
             fatalError("Ops.vocoderISTFT: unsupported dtype \(specRe.dtype)")
         }
         return result
+    }
+}
+
+/// Process-wide scratch cache for `Ops.auraFlashSdpa`. The flash
+/// wrapper allocates a same-shape Q scratch (for the scale multiply)
+/// and a same-shape scale buffer (filled with the softmax scale value)
+/// on every call. Per-decode-token across ~28 attention layers, those
+/// Metal buffer allocations cost ~3 ms — enough to make the
+/// compressed path lose to dequant-mirror at short KV. This cache
+/// allocates each scratch ONCE per (shape, dtype, scale) tuple and
+/// reuses it across all subsequent calls. The decode pipeline is
+/// single-inference-per-instance (see `Qwen35AttentionMixer` threading
+/// contract) so an `NSLock` around the dictionary is sufficient.
+///
+/// Post-AURA-dtype-unification, the Q scratch + scale buffer follow
+/// the activation dtype directly (was f32-only pre-unification, paired
+/// with the legacy `Tensor<f32>` kernel sig).
+final class AuraFlashScratchCache: @unchecked Sendable {
+    static let shared = AuraFlashScratchCache()
+
+    private let lock = NSLock()
+    private var qScratchByKey: [ScratchKey: Tensor] = [:]
+    private var scaleBufByKey: [ScaleKey: Tensor] = [:]
+    private var partialsByKey: [PartialsKey: PartialsScratch] = [:]
+
+    /// Optional override for the FA-2 block size used by
+    /// `Ops.auraFlashSdpa2Pass` via `Qwen3Layer.forward`. Set to a value
+    /// in {32, 64, 128, 256} (or any multiple of 32) to override the
+    /// default 64. Bench-only knob — production should leave nil.
+    /// `nonisolated(unsafe)` because the single-inference-per-instance
+    /// threading contract (see `AuraFlashScratchCache` header) makes
+    /// races a non-issue and the bench surface needs simple writes.
+    nonisolated(unsafe) public static var blockSizeOverride: Int?
+
+    private struct ScratchKey: Hashable {
+        let count: Int
+        let dtype: DType
+    }
+
+    private struct ScaleKey: Hashable {
+        let count: Int
+        let dtype: DType
+        let scaleBits: UInt32
+    }
+
+    /// Keys the 2-pass partial-O / M / L scratch by the longest decode-
+    /// time shape: `(nQHeads, maxBlocks, headDim, dtype)`. Cache hot path
+    /// allocates once at first call (sized for `maxSeq/blockSize` blocks)
+    /// and reuses; the kernel overwrites the full surface each call.
+    private struct PartialsKey: Hashable {
+        let nQHeads: Int
+        let maxBlocks: Int
+        let headDim: Int
+        let dtype: DType
+    }
+
+    /// Bundled partials triple — `Ops.auraFlashSdpa2Pass` takes the three
+    /// buffers separately so the caller can reuse them across schemes.
+    struct PartialsScratch {
+        let partialO: Tensor
+        let partialM: Tensor
+        let partialL: Tensor
+    }
+
+    static func qScratch(shape: [Int], dtype: DType) -> Tensor {
+        shared.qScratch(shape: shape, dtype: dtype)
+    }
+
+    static func scaleBuffer(shape: [Int], scale: Float, dtype: DType) -> Tensor {
+        shared.scaleBuffer(shape: shape, scale: scale, dtype: dtype)
+    }
+
+    /// Cached 2-pass partials sized for the worst-case `(nQHeads,
+    /// maxBlocks, headDim, dtype)`. `maxBlocks` should be sized for the
+    /// cache's `maxSeq / blockSize` so all decode-step sizes fit.
+    static func partials(
+        nQHeads: Int, maxBlocks: Int, headDim: Int, dtype: DType
+    ) -> PartialsScratch {
+        shared.partials(
+            nQHeads: nQHeads, maxBlocks: maxBlocks, headDim: headDim, dtype: dtype)
+    }
+
+    private func partials(
+        nQHeads: Int, maxBlocks: Int, headDim: Int, dtype: DType
+    ) -> PartialsScratch {
+        let key = PartialsKey(
+            nQHeads: nQHeads, maxBlocks: maxBlocks, headDim: headDim, dtype: dtype)
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = partialsByKey[key] { return cached }
+        let o = Tensor.empty(
+            shape: [nQHeads, maxBlocks, headDim], dtype: dtype, device: .shared)
+        let m = Tensor.empty(
+            shape: [nQHeads, maxBlocks], dtype: dtype, device: .shared)
+        let l = Tensor.empty(
+            shape: [nQHeads, maxBlocks], dtype: dtype, device: .shared)
+        let scratch = PartialsScratch(partialO: o, partialM: m, partialL: l)
+        partialsByKey[key] = scratch
+        return scratch
+    }
+
+    private func qScratch(shape: [Int], dtype: DType) -> Tensor {
+        let count = shape.reduce(1, *)
+        let key = ScratchKey(count: count, dtype: dtype)
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = qScratchByKey[key], cached.shape == shape {
+            return cached
+        }
+        let fresh = Tensor.empty(shape: shape, dtype: dtype, device: .shared)
+        qScratchByKey[key] = fresh
+        return fresh
+    }
+
+    private func scaleBuffer(shape: [Int], scale: Float, dtype: DType) -> Tensor {
+        let count = shape.reduce(1, *)
+        let key = ScaleKey(count: count, dtype: dtype, scaleBits: scale.bitPattern)
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = scaleBufByKey[key], cached.shape == shape {
+            return cached
+        }
+        // Host-side conversion from Float into the target dtype. The
+        // scale is a single value broadcast across the buffer; bf16/f16
+        // narrow it once at construction.
+        let fresh = Tensor.empty(shape: shape, dtype: dtype, device: .shared)
+        switch dtype {
+        case .f32:
+            fresh.copyIn(from: [Float](repeating: scale, count: count))
+        case .f16:
+            fresh.copyIn(from: [Float16](repeating: Float16(scale), count: count))
+        case .bf16:
+            let bf16Bits = UInt16(truncatingIfNeeded: scale.bitPattern >> 16)
+            fresh.copyIn(from: [UInt16](repeating: bf16Bits, count: count))
+        default:
+            fatalError("AuraFlashScratchCache: unsupported scale dtype \(dtype)")
+        }
+        scaleBufByKey[key] = fresh
+        return fresh
     }
 }

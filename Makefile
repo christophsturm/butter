@@ -7,6 +7,7 @@
 
 # ─── Paths ────────────────────────────────────────────────────────────
 PROJECT_ROOT := $(shell pwd)
+# Sibling kernels DSL.
 FFAI_KERNELS_DIR := $(PROJECT_ROOT)/../ffai-kernels
 KERNEL_OUT := $(PROJECT_ROOT)/Sources/FFAIKernelsSwift
 
@@ -63,8 +64,19 @@ regenerate-kernels: ## run `ffaik build --emit` to regenerate metallib + Swift w
 	@#   $(KERNEL_OUT)/Resources/manifest.json            IR descriptor
 	@#   $(KERNEL_OUT)/Generated/FFAIKernels.swift   dispatch wrappers
 	@#
-	cd $(FFAI_KERNELS_DIR) && cargo run --release \
-	  --bin ffaik -- build --emit all --out $(KERNEL_OUT)
+	@# `ffaik build` spawns `__ffai_runner` by bare name via PATH, so build
+	@# it alongside `ffaik` — building only `ffaik` never builds the sibling
+	@# runner. Reuse both binaries when they are already present.
+	@if [ -x "$(FFAI_KERNELS_DIR)/target/release/ffaik" ] && \
+	   [ -x "$(FFAI_KERNELS_DIR)/target/release/__ffai_runner" ]; then \
+	  (cd $(FFAI_KERNELS_DIR) && PATH="$$PWD/target/release:$$PATH" \
+	    ffaik build --emit all --out $(KERNEL_OUT)); \
+	else \
+	  (cd $(FFAI_KERNELS_DIR) && \
+	    cargo build --release --bin ffaik --bin __ffai_runner && \
+	    PATH="$$PWD/target/release:$$PATH" \
+	      ffaik build --emit all --out $(KERNEL_OUT)); \
+	fi
 	@# Prepend the `// swift-format-ignore-file` directive so swift-format
 	@# skips the generated wrappers. The directive needs to live on line 1
 	@# for swift-format to honor it. Until ffai-kernels' codegen emits it
@@ -75,6 +87,18 @@ regenerate-kernels: ## run `ffaik build --emit` to regenerate metallib + Swift w
 	    tmp="$$gen.tmp"; \
 	    { printf '// swift-format-ignore-file\n//\n'; cat "$$gen"; } > "$$tmp" && mv "$$tmp" "$$gen"; \
 	  fi
+
+# ─── Bench ────────────────────────────────────────────────────────────
+# Quality benches (wikitext2 perplexity / KLD, NIAH retrieval) forced-decode
+# an entire corpus. In debug that's far too slow for the numbers to mean
+# anything (design §7), and the CLI hard-refuses a debug quality bench. Always
+# go through release. Pass-through args via ARGS=:
+#
+#   make bench ARGS="--method wikitext2 --model <repo> --wikitext2-corpus wiki.test.raw"
+#   make bench ARGS="--method niah --model <long-ctx-repo>"
+.PHONY: bench
+bench: regenerate-kernels ## run `ffai bench` in release (quality benches require it)
+	swift run -c release ffai bench $(ARGS)
 
 # ─── Test ─────────────────────────────────────────────────────────────
 #

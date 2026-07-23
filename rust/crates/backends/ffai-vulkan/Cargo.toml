@@ -1,0 +1,40 @@
+[package]
+name = "ffai-vulkan"
+description = "FFAI Vulkan backend — wraps ffai-kernels-runtime's VulkanDevice (GlslGenerator -> shaderc -> SPIR-V -> VkPipeline) behind the ffai-core Device trait. The portable GPU path for non-CUDA / non-Apple hardware."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ffai-core.workspace = true
+ffai-kernels-core = { workspace = true, optional = true }
+ffai-kernels-runtime = { workspace = true, optional = true }
+
+[dev-dependencies]
+ffai-core.workspace = true
+ffai-kernels-core.workspace = true
+ffai-models.workspace = true
+ffai-loader.workspace = true
+ffai-runtime.workspace = true
+
+[features]
+# Off by default so macOS / non-Vulkan hosts build the crate as a stub.
+# `--features vulkan` pulls ffai-kernels-runtime's real Vulkan device.
+vulkan = ["dep:ffai-kernels-core", "dep:ffai-kernels-runtime", "ffai-kernels-runtime/vulkan"]
+
+[[test]]
+name = "vulkan_smoke"
+required-features = ["vulkan"]
+
+[[test]]
+name = "qwen25_gguf_vulkan"
+required-features = ["vulkan"]
+
+[[test]]
+name = "qwen25_first_logit_diag"
+required-features = ["vulkan"]
+
+[[test]]
+name = "qwen25_prefill_coopmat"
+required-features = ["vulkan"]

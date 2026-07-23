@@ -43,11 +43,21 @@ struct Qwen35HybridTests {
     @Test("Qwen35Hybrid default generation parameters match the Qwen card")
     func defaultGenerationParameters() {
         let p = Qwen35Hybrid.defaultGenerationParameters
+        // Sampling follows the Qwen model card (thinking / general-purpose
+        // recipe), not greedy — see `defaultGenerationParameters`.
         #expect(p.maxTokens == nil)
         #expect(p.temperature == 1.0)
         #expect(p.topP == 0.95)
         #expect(p.topK == 20)
-        #expect((p.prefillStepSize ?? 0) >= 256)
+        // `nil` on purpose: this family used to hardcode 1024, silently
+        // overriding `Qwen35Model.defaultPrefillStepSize` (4096, this
+        // architecture is always MoE) on every real generation call. A
+        // chunk-size sweep found no numerical difference between chunk
+        // sizes at this range (bit-identical dumped prefill logits) and
+        // a throughput win from deferring to the tuned engine default,
+        // so the family-level override was removed rather than bumped
+        // to a second hardcoded number.
+        #expect(p.prefillStepSize == nil)
     }
 }
 

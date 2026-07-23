@@ -494,6 +494,13 @@ extension ModelRegistry {
             modelTypes: NemotronH.modelTypes, architectures: NemotronH.architectures,
             load: { c, w, o, d in try ModelRegistry.loadNemotronH(config: c, weights: w, options: o, device: d) }),
         ModelEntry(
+            family: "Hy3", kind: .llm,
+            summary:
+                "Tencent Hy3 295B-A21B MoE: sigmoid+bias router, shared expert, QK-norm→RoPE. Prefer mlx 2-bit oQ2 on Apple Silicon.",
+            repos: ["tencent/Hy3", "tencent/Hy3-FP8", "mlx-community/Hy3-oQ2"],
+            modelTypes: Hy3.modelTypes, architectures: Hy3.architectures,
+            load: { c, w, o, d in try ModelRegistry.loadHy3(config: c, weights: w, options: o, device: d) }),
+        ModelEntry(
             family: "Granite 4", kind: .llm,
             summary: "Stack-interleaved Mamba 2 / attention + dense or MoE FFN.",
             repos: ["mlx-community/granite-4.0-1b-4bit", "mlx-community/granite-4.0-h-tiny-4bit"],

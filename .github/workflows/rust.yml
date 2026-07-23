@@ -1,0 +1,73 @@
+name: Rust CI
+
+# Build + test the Rust engine under `rust/` on Apple Silicon (Metal
+# backend). Path-filtered to `rust/**` so it only runs when the Rust
+# port changes, leaving the Swift CI (ci.yml) untouched.
+#
+# The CUDA and Vulkan backends are feature-gated OFF by default
+# (default = metal), so this job needs no CUDA/Vulkan SDK: the backend
+# crates compile as stubs in the workspace build. Their real device
+# paths are exercised on the dedicated CUDA / Vulkan hosts, not here.
+
+on:
+  push:
+    branches: [main, dev]
+    paths: ['rust/**', '.github/workflows/rust.yml']
+  pull_request:
+    branches: [main, dev]
+    paths: ['rust/**', '.github/workflows/rust.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/dev' }}
+
+jobs:
+  build_and_test:
+    if: github.repository_owner == 'thewafflehaus'
+    name: Rust build + test (Apple Silicon, Metal)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: rust
+
+    steps:
+      - name: Checkout FFAI
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry/git + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
+
+      - name: Sync ffai-kernels to dev tip
+        # The ffai-kernels crates are a `branch = "dev"` git dependency, which
+        # Cargo.lock pins to a specific rev. Re-resolve just those crates so
+        # CI tracks the live dev branch (the rest of the lock stays put), and
+        # picks up kernel fixes the moment they land on ffai-kernels dev.
+        run: cargo update -p ffai-kernels-core -p ffai-kernels-codegen -p ffai-kernels-runtime -p ffai-kernels-std
+
+      - name: Build workspace (default = metal backend)
+        run: cargo build --workspace
+
+      - name: Test workspace (serialized GPU access)
+        # GPU-touching tests race the Metal driver when run in parallel
+        # (PSO-compile contention -> NaN), so pin to one test thread for
+        # determinism. Real-model integration tests skip when their
+        # checkpoint is absent, so no multi-GB HF download happens here.
+        env:
+          RUST_TEST_THREADS: '1'
+        run: cargo test --workspace

@@ -1,0 +1,19 @@
+[package]
+name = "ffai-ffi"
+description = "C-ABI bridge over the shared FFAI engine layer — lets Swift (and any C caller) consume the same Device/ops the CUDA path uses."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+ffai.workspace = true
+
+[features]
+default = ["metal"]
+metal = ["ffai/metal"]
+cuda = ["ffai/cuda"]
+vulkan = ["ffai/vulkan"]

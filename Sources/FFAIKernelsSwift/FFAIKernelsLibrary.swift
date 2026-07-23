@@ -87,13 +87,11 @@ public final class FFAIKernelsLibrary: @unchecked Sendable {
         {
             return parsed
         }
-        // 64 lets the Metal driver pipeline more cmd-buffers in flight
-        // before applying backpressure. Measured as a 2-3% prefill
-        // T=512 win on Qwen3.6-A3B / M5 Max vs the 16 default — the
-        // bump absorbs per-cmd-buffer encode latency across more
-        // concurrent submissions. Set FFAI_MAX_COMMAND_BUFFERS to
-        // override for triage.
-        return 64
+        // 128 covers deep stacks (Hy3 = 80 layers) that fire one cmdbuf
+        // per layer without mid-stack wait. 64 was a 2-3% Qwen prefill
+        // win vs 16, but stalls Hy3 decode after layer 64. Override via
+        // FFAI_MAX_COMMAND_BUFFERS for triage.
+        return 128
     }()
 
     /// Process-wide singleton. Lazily initialized; throws on first access if
