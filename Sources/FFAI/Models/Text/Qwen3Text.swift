@@ -348,7 +348,7 @@ public final class Qwen3Layer: Module {
             // `AuraFlashScratchCache.blockSizeOverride` is the bench
             // knob for re-sweeping; production leaves it nil.
             let blockSize = AuraFlashScratchCache.blockSizeOverride ?? 32
-            let maxBlocks = (auraCache.maxSeq + blockSize - 1) / blockSize
+            let maxBlocks = (auraCache.capacity + blockSize - 1) / blockSize
             let partials = AuraFlashScratchCache.partials(
                 nQHeads: nHeads, maxBlocks: maxBlocks,
                 headDim: headDim, dtype: h.dtype)
@@ -364,7 +364,7 @@ public final class Qwen3Layer: Module {
                 nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
                 kPackedWidth: auraCache.kPackedWidth,
                 vPackedWidth: auraCache.vPackedWidth,
-                liveLength: auraCache.length, kvStride: auraCache.maxSeq,
+                liveLength: auraCache.length, kvStride: auraCache.capacity,
                 keyBits: auraCache.scheme.keyBits,
                 valueBits: auraCache.scheme.valueBits,
                 scale: scale,
@@ -398,7 +398,7 @@ public final class Qwen3Layer: Module {
                 nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
                 kPackedWidth: auraCache.kPackedWidth,
                 vPackedWidth: auraCache.vPackedWidth,
-                liveLength: auraCache.length, kvStride: auraCache.maxSeq,
+                liveLength: auraCache.length, kvStride: auraCache.capacity,
                 keyBits: auraCache.scheme.keyBits,
                 valueBits: auraCache.scheme.valueBits,
                 scale: scale,
@@ -410,7 +410,7 @@ public final class Qwen3Layer: Module {
             attnOut = Ops.sdpaDecode(
                 q: qForSdpa, k: cacheK, v: cacheV,
                 nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-                nKV: cache.length, kvStride: cache.maxSeq,
+                nKV: cache.length, kvStride: cache.capacity,
                 scale: scale, on: cmd)
         }
 

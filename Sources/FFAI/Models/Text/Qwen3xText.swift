@@ -2873,7 +2873,7 @@ public final class Qwen35AttentionMixer: Module {
             attnAll = Ops.sdpaPrefillMmaD256(
                 q: qBlock, k: cacheK, v: cacheV,
                 nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-                baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
+                baseKV: startPosition, nQuery: t, kvStride: kv.capacity,
                 causal: true, scale: scale, on: cmd
             ).reshaped(to: [t * qDim])
         } else if useQtiled {
@@ -2881,7 +2881,7 @@ public final class Qwen35AttentionMixer: Module {
             attnAll = Ops.sdpaPrefillQtiledD256(
                 q: qBlock, k: cacheK, v: cacheV,
                 nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-                baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
+                baseKV: startPosition, nQuery: t, kvStride: kv.capacity,
                 causal: true, scale: scale, on: cmd
             ).reshaped(to: [t * qDim])
         } else if headDim == 128 || headDim == 256 {

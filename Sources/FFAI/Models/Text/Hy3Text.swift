@@ -497,18 +497,18 @@ private func hy3SdpaPrefill(
             tag: "hy3_sdpa_vpack_\(nKVHeads)_\(kLen)_\(headDim)", device: dev)
         if let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) {
             _ = Ops.compactKV_f16(
-                src: cacheK, nKV: nKVHeads, maxSeq: cache.maxSeq,
+                src: cacheK, nKV: nKVHeads, maxSeq: cache.capacity,
                 kLen: kLen, headDim: headDim, on: cmd, into: kPacked, encoder: enc)
             _ = Ops.compactKV_f16(
-                src: cacheV, nKV: nKVHeads, maxSeq: cache.maxSeq,
+                src: cacheV, nKV: nKVHeads, maxSeq: cache.capacity,
                 kLen: kLen, headDim: headDim, on: cmd, into: vPacked, encoder: enc)
             enc.endEncoding()
         } else {
             _ = Ops.compactKV_f16(
-                src: cacheK, nKV: nKVHeads, maxSeq: cache.maxSeq,
+                src: cacheK, nKV: nKVHeads, maxSeq: cache.capacity,
                 kLen: kLen, headDim: headDim, on: cmd, into: kPacked)
             _ = Ops.compactKV_f16(
-                src: cacheV, nKV: nKVHeads, maxSeq: cache.maxSeq,
+                src: cacheV, nKV: nKVHeads, maxSeq: cache.capacity,
                 kLen: kLen, headDim: headDim, on: cmd, into: vPacked)
         }
         let outHTD = hy3ScratchTensor(
@@ -527,7 +527,7 @@ private func hy3SdpaPrefill(
     return Ops.sdpaMulti(
         q: q, k: cacheK, v: cacheV,
         nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-        baseKV: position, nQuery: nRows, kvStride: cache.maxSeq,
+        baseKV: position, nQuery: nRows, kvStride: cache.capacity,
         causal: true, scale: scale, on: cmd)
 }
 
@@ -790,7 +790,7 @@ final class Hy3DenseLayer: Hy3LayerProtocol {
             q: qRotated,
             k: kCache, v: vCache,
             nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-            nKV: cache.length, kvStride: cache.maxSeq,
+            nKV: cache.length, kvStride: cache.capacity,
             scale: scale, on: cmd)
         let attn = oProj(attnOut.reshaped(to: [nHeads * headDim]), on: cmd)
         let h2 = Ops.add(residual, attn, on: cmd)
@@ -1086,7 +1086,7 @@ final class Hy3MoELayer: Hy3LayerProtocol {
             q: qRotated,
             k: kCache, v: vCache,
             nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-            nKV: cache.length, kvStride: cache.maxSeq,
+            nKV: cache.length, kvStride: cache.capacity,
             scale: scale, on: cmd)
         let attn = oProj(attnOut.reshaped(to: [nHeads * headDim]), on: cmd)
         let h2 = Ops.add(residual, attn, on: cmd)
@@ -2216,7 +2216,7 @@ public final class Hy3Model: LanguageModel {
         let cap = maxSeq ?? self.maxSeq
         return (0 ..< nLayers).map { _ in
             KVCache(
-                nKVHeads: nKVHeads, headDim: headDim, maxSeq: cap,
+                nKVHeads: nKVHeads, headDim: headDim, contextLength: cap,
                 dtype: dtype, eviction: .unbounded, device: device)
         }
     }
