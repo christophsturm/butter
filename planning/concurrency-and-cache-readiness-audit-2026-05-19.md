@@ -78,7 +78,7 @@ public struct KVCacheSnapshot: Sendable {
 
 ## 2. Race-condition surface — current state
 
-Audited every lock + `@unchecked Sendable` in `Sources/FFAI/`. Summary:
+Audited every lock + `@unchecked Sendable` in `Sources/ButterSwift/`. Summary:
 
 | Component | Lock | Risk under upcoming features |
 |---|---|---|
@@ -176,7 +176,7 @@ Default extension implements it as a per-token loop on top of `forward(...on cmd
 
 ## 4. Inspect command — what to extend for the new features
 
-The current `ffai inspect` surface is plenty for single-sequence model bring-up. The upcoming features need:
+The current `butter inspect` surface is plenty for single-sequence model bring-up. The upcoming features need:
 
 - **Per-slot KV occupancy** in batched mode — `inspect --batched` shows N slots' `length / maxSize / eviction-state`.
 - **Speculative-decode hit rate** — `inspect --spec --tokens N` shows the empirical accept rate of the chosen speculative scheme on a probe prompt.

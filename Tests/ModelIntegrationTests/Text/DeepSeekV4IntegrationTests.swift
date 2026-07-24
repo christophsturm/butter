@@ -19,7 +19,7 @@
 //
 // Skipped by default — the DSv4-Flash checkpoint is ~86 GB, so every
 // test guard-returns unless a checkpoint is staged at
-// `$FFAI_DSV4_GGUF_PATH` (default `~/models/deepseek-v4-flash`). The
+// `$BUTTER_DSV4_GGUF_PATH` (default `~/models/deepseek-v4-flash`). The
 // GGUF path is a parallel loader (`DeepSeekV4Flash.loadModelFromGGUF`),
 // not the standard `Model.load` safetensors flow, so these construct
 // the model directly.
@@ -27,7 +27,7 @@
 import Foundation
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("DeepSeekV4 integration", .serialized)
 struct DeepSeekV4IntegrationTests {
@@ -35,7 +35,7 @@ struct DeepSeekV4IntegrationTests {
     /// Local checkpoint dir, or `nil` to skip (model too big for CI).
     private var modelPath: String? {
         let env =
-            ProcessInfo.processInfo.environment["FFAI_DSV4_GGUF_PATH"]
+            ProcessInfo.processInfo.environment["BUTTER_DSV4_GGUF_PATH"]
             ?? NSString("~/models/deepseek-v4-flash").expandingTildeInPath
         guard FileManager.default.fileExists(atPath: env) else { return nil }
         return env
@@ -60,7 +60,7 @@ struct DeepSeekV4IntegrationTests {
     @Test("Loads from GGUF and exposes the expected layer geometry")
     func loadsAndHasExpectedShapes() throws {
         guard let dir = modelPath else {
-            print("DeepSeekV4IntegrationTests: skipping (no model at FFAI_DSV4_GGUF_PATH)")
+            print("DeepSeekV4IntegrationTests: skipping (no model at BUTTER_DSV4_GGUF_PATH)")
             return
         }
         let bundle = try GGUFTensorBundle(directory: URL(fileURLWithPath: dir))
@@ -99,7 +99,7 @@ struct DeepSeekV4IntegrationTests {
     @Test("Forward from BOS produces finite, NaN-free logits")
     func forwardProducesSaneLogits() throws {
         guard let dir = modelPath else {
-            print("DeepSeekV4IntegrationTests: skipping (no model at FFAI_DSV4_GGUF_PATH)")
+            print("DeepSeekV4IntegrationTests: skipping (no model at BUTTER_DSV4_GGUF_PATH)")
             return
         }
         let bundle = try GGUFTensorBundle(directory: URL(fileURLWithPath: dir))

@@ -1,6 +1,6 @@
-# Design — `ffai bench --mactop` integration
+# Design — `butter bench --mactop` integration
 
-Spawn `mactop` alongside `ffai bench`, capture CPU / GPU / memory / power / temperature samples for the bench window, pin fans high during the run, and write the resulting time series next to the existing markdown + JSON sidecar. Density over grammar; companion to the other `planning/*-design.md` docs.
+Spawn `mactop` alongside `butter bench`, capture CPU / GPU / memory / power / temperature samples for the bench window, pin fans high during the run, and write the resulting time series next to the existing markdown + JSON sidecar. Density over grammar; companion to the other `planning/*-design.md` docs.
 
 ---
 
@@ -29,7 +29,7 @@ Not used: `--prometheus` (out of scope), `--overlay` / `--menubar` (TUI-only), `
 
 ## 3. CLI surface
 
-New flags on `BenchCommand` (`Sources/FFAICLI/BenchCommand.swift`):
+New flags on `BenchCommand` (`Sources/ButterCLI/BenchCommand.swift`):
 
 ```
 --mactop                       Spawn mactop alongside the bench. Captures
@@ -40,7 +40,7 @@ New flags on `BenchCommand` (`Sources/FFAICLI/BenchCommand.swift`):
 --mactop-interval-ms <N>       mactop sample interval. Default 500.
 
 --mactop-pin-fans              During the bench window, pin fans to their
-                               maximum SMC value. Requires running ffai
+                               maximum SMC value. Requires running butter
                                under sudo so mactop's --fan-control can
                                write SMC. Restores prior fan mode on exit.
                                Implies --mactop.
@@ -53,7 +53,7 @@ New flags on `BenchCommand` (`Sources/FFAICLI/BenchCommand.swift`):
 
 ## 4. Process lifecycle
 
-`BenchCommand.run()` adds a `MactopProbe` actor (new file `Sources/FFAICLI/MactopProbe.swift`) wrapped around the bench invocation:
+`BenchCommand.run()` adds a `MactopProbe` actor (new file `Sources/ButterCLI/MactopProbe.swift`) wrapped around the bench invocation:
 
 ```text
 1. Resolve mactop binary (--mactop-binary or first on PATH).
@@ -61,7 +61,7 @@ New flags on `BenchCommand` (`Sources/FFAICLI/BenchCommand.swift`):
 
 2. If --mactop-pin-fans:
    - Require euid == 0 (geteuid). If not root, error:
-     "ffai bench --mactop-pin-fans must run under sudo
+     "butter bench --mactop-pin-fans must run under sudo
       (mactop --fan-control writes SMC)."
    - Snapshot current fan mode via `mactop --dump-temps` so we can
      log the pre-bench thermal regime in the sidecar.
@@ -69,13 +69,13 @@ New flags on `BenchCommand` (`Sources/FFAICLI/BenchCommand.swift`):
 3. Spawn mactop subprocess:
      mactop --headless --format json --pretty \
             -i <interval-ms> --count 0 \
-            --pid <ffai-pid> \
+            --pid <butter-pid> \
             --unit-temp celsius \
             [--fan-control]   # only when --mactop-pin-fans
 
    Capture stdout via Pipe; line-buffer; parse each line as one
    JSON sample; append to an in-memory ring buffer. stderr goes
-   straight to the FFAI process's stderr.
+   straight to the Butter process's stderr.
 
 4. Run the bench (existing BenchRunner.run path).
 
@@ -132,7 +132,7 @@ The markdown report keeps its existing row schema for cross-compat with mlx-swif
 
 `--fan-control` writes the `F<N>Md` / `F<N>Tg` SMC keys. macOS locks these to root. Implications:
 
-- `--mactop-pin-fans` requires `sudo ffai bench …`. Document this prominently in the flag's help and in `documentation/`.
+- `--mactop-pin-fans` requires `sudo butter bench …`. Document this prominently in the flag's help and in `documentation/`.
 - mactop is invoked with `--fan-control` only when `--mactop-pin-fans` is set. Plain `--mactop` runs unprivileged (read-only sensors).
 - On exit (clean, signal, or crash) mactop restores the prior fan mode by releasing the SMC override. We trust mactop here rather than re-implementing fan management. Cross-check: `--dump-temps` before + after to confirm restoration; warn if the post-bench mode doesn't match the pre-bench snapshot.
 - M1 / M2 / M3 / M4 fan SMC keys differ; mactop handles the per-chip mapping. We do **not** thread chip family into our own code — mactop is the abstraction.
@@ -154,20 +154,20 @@ The markdown report keeps its existing row schema for cross-compat with mlx-swif
 - **Threshold-based fan control.** v1 pins fans for the entire bench window; the `temp ≥ 85 °C` ramp variant is a v2 once we have baseline temp histograms across the model zoo.
 - **Prometheus / external scrape.** mactop's `--prometheus <port>` is left unwired; this design ships file-based capture only. Hooking a scrape later is a one-line addition (forward the flag).
 - **Per-kernel attribution.** mactop samples are wall-clock global — they don't attribute power / temp to specific Metal kernels. That belongs to a `--profiling 2` / `os_signpost` + Metal System Trace integration, separate roadmap item.
-- **Continuous-bench thermal logging** outside `ffai bench`. The flag is bench-scoped; the inference engine itself stays observation-free in v1.
+- **Continuous-bench thermal logging** outside `butter bench`. The flag is bench-scoped; the inference engine itself stays observation-free in v1.
 
 ## 9. Implementation files
 
 | File | Change |
 |---|---|
-| `Sources/FFAICLI/BenchCommand.swift` | Add four `@Flag` / `@Option`s; wrap `runner.run(...)` with `MactopProbe.withProbe(...)`; thread sidecar summary into the existing `BenchmarkWriter.append(...)` |
-| `Sources/FFAICLI/MactopProbe.swift` | NEW. Actor managing subprocess lifecycle, stdout parsing, SIGINT/SIGTERM/SIGKILL escalation, root-check + SMC pre/post snapshot |
-| `Sources/FFAI/Bench/BenchmarkRow.swift` (or wherever the row + sidecar codable lives) | Add optional `mactop: MactopSummary` field; new `MactopSummary` codable |
-| `Tests/FFAICLITests/MactopProbeTests.swift` | NEW. Stub-binary tests: spawn a `bash -c 'echo {...}; sleep'` fake mactop, confirm we parse, SIGINT, summarise. No real mactop dep in CI |
+| `Sources/ButterCLI/BenchCommand.swift` | Add four `@Flag` / `@Option`s; wrap `runner.run(...)` with `MactopProbe.withProbe(...)`; thread sidecar summary into the existing `BenchmarkWriter.append(...)` |
+| `Sources/ButterCLI/MactopProbe.swift` | NEW. Actor managing subprocess lifecycle, stdout parsing, SIGINT/SIGTERM/SIGKILL escalation, root-check + SMC pre/post snapshot |
+| `Sources/ButterSwift/Bench/BenchmarkRow.swift` (or wherever the row + sidecar codable lives) | Add optional `mactop: MactopSummary` field; new `MactopSummary` codable |
+| `Tests/ButterCLITests/MactopProbeTests.swift` | NEW. Stub-binary tests: spawn a `bash -c 'echo {...}; sleep'` fake mactop, confirm we parse, SIGINT, summarise. No real mactop dep in CI |
 | `documentation/cli/bench.md` (or equivalent) | Document the four flags, the sudo requirement, the sidecar schema |
 
 ## 10. Unresolved
 
 - Should `--mactop-pin-fans` *also* re-pin fans every N seconds defensively in case mactop's SMC write decays? Probably no — the fan setpoint persists until explicitly released — but worth a bench-during-development check.
-- Does `--pid <ffai-pid>` correctly attribute GPU% on Apple Silicon? mactop's GPU sampling is via IOReport, which is system-global on the Apple GPU. `--pid` likely only narrows the CPU% / memory columns. Verify and document.
+- Does `--pid <butter-pid>` correctly attribute GPU% on Apple Silicon? mactop's GPU sampling is via IOReport, which is system-global on the Apple GPU. `--pid` likely only narrows the CPU% / memory columns. Verify and document.
 - Where does the mactop NDJSON live when `--report-dir` isn't writable? Default behaviour today errors on the existing markdown / sidecar write; keep that contract.

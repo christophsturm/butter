@@ -18,9 +18,9 @@
 //
 // Why a "coherent" check and not a golden-fixture comparison:
 //
-//   An earlier `expectGoldenMatch` flow compared FFAI's token stream
+//   An earlier `expectGoldenMatch` flow compared Butter's token stream
 //   against mlx-lm's stream for the same prompt at temperature=0.
-//   That signal degraded as FFAI added kernels and features mlx-lm
+//   That signal degraded as Butter added kernels and features mlx-lm
 //   doesn't have (AURA, GDN, Mamba 2 hybrid layers, sinks-fused SDPA,
 //   …) — token-by-token parity vs another implementation became more
 //   a measure of how aligned our rounding modes happened to be (RoPE
@@ -28,7 +28,7 @@
 //   correctness signal. Neither implementation has a bug — they made
 //   different reasonable choices.
 //
-//   Per-kernel correctness now comes from metaltile's GPU
+//   Per-kernel correctness now comes from iron's GPU
 //   correctness tests (compared against a naive CPU oracle, much
 //   tighter than cross-impl comparison). The job of these
 //   integration tests is just to verify that the pipeline — load,

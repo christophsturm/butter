@@ -1,6 +1,6 @@
 # Chat Templates
 
-Most modern chat / instruct models ship with a Jinja chat template in their `tokenizer_config.json`. FFAI calls into swift-transformers' `Tokenizer.applyChatTemplate(...)` to render those templates; you pass typed `ChatMessage` values + a typed `ChatTemplateOptions` and FFAI threads the right variables into the Jinja context.
+Most modern chat / instruct models ship with a Jinja chat template in their `tokenizer_config.json`. Butter calls into swift-transformers' `Tokenizer.applyChatTemplate(...)` to render those templates; you pass typed `ChatMessage` values + a typed `ChatTemplateOptions` and Butter threads the right variables into the Jinja context.
 
 The plain `Model.generate(prompt:...)` API takes a raw string — no chat template applied — which means *you* are responsible for rendering. Use the `messages:` overloads instead when working with chat / instruct models.
 
@@ -72,7 +72,7 @@ The template does the per-family rendering. We pass typed inputs through the wel
 | **GPT-OSS (Harmony)** | `reasoning_effort: "high"` (etc.) → analysis + final channel structure. The GPT-OSS family ships; pair with the `ThinkingSplit.harmony` scanner to partition the analysis + final channels. |
 | **Gemma 3 / 4** | `<channel\|reasoning\|>` markers when reasoning is enabled. The Gemma 3 / 4 family files ship; the ThinkingSplit scanner partitions the reasoning segment. |
 | **Llama 3 instruct** | Standard chat template, no reasoning hooks. |
-| **Tools / function calling** | Templates that read `tools` render correctly via swift-transformers' `applyChatTemplate(...)` — but FFAI doesn't yet expose a typed Swift surface for tool-call args / results. See [Tool calling](#tool-calling) below. |
+| **Tools / function calling** | Templates that read `tools` render correctly via swift-transformers' `applyChatTemplate(...)` — but Butter doesn't yet expose a typed Swift surface for tool-call args / results. See [Tool calling](#tool-calling) below. |
 
 ## Errors
 
@@ -102,7 +102,7 @@ print(model.tokenizer.decode(tokens: ids, skipSpecialTokens: false))
 
 The Jinja chat templates we render via swift-transformers' `AutoTokenizer.applyChatTemplate(...)` already support the `tools` Jinja variable that most modern instruct checkpoints reference — Qwen 3, Llama 3.1+, Granite, Mistral, GPT-OSS Harmony, and friends all ship templates that render a tool / function-spec preamble into the prompt when the variable is set. **What ships today is the rendering side**: pass a tools list through `ChatTemplateOptions.extraContext["tools"] = [...]` (or whatever variable name the template reads) and the rendered prompt will include the tool preamble exactly as the upstream template defines it.
 
-**What's not yet wired** is the typed Swift surface on FFAI's side: `ChatMessage` doesn't carry `toolCalls` / `toolResults` fields, and there's no per-family tool-call *parser* that takes a stream of generated tokens and produces a typed `[ToolCall(name:arguments:)]` value. The model can emit a tool call (the template tells it how); FFAI just hands you the raw tokens / text and lets you parse them yourself today.
+**What's not yet wired** is the typed Swift surface on Butter's side: `ChatMessage` doesn't carry `toolCalls` / `toolResults` fields, and there's no per-family tool-call *parser* that takes a stream of generated tokens and produces a typed `[ToolCall(name:arguments:)]` value. The model can emit a tool call (the template tells it how); Butter just hands you the raw tokens / text and lets you parse them yourself today.
 
 Queued in [`planning/session-plan.md`](../planning/session-plan.md) — the work is per-family scanners (similar shape to the [Thinking-vs-Generation Split](observability.md#thinking-vs-generation-split) scanners) plus the typed `ChatMessage` extension and a `.toolCalling` capability bit so callers can branch on whether a loaded model supports it.
 

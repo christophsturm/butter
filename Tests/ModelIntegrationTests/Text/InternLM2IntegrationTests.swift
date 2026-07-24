@@ -20,7 +20,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("InternLM2 Integration", .serialized)
 struct InternLM2IntegrationTests {

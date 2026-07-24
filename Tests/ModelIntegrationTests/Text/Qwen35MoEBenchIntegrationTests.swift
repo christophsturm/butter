@@ -25,7 +25,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 private let qwen35MoELocalPath = "/Users/tom/models/Qwen3.5-35B-A3B-4bit"
 

@@ -28,7 +28,7 @@
 import Foundation
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("GraniteSpeech Integration", .serialized)
 struct GraniteSpeechIntegrationTests {

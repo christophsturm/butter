@@ -1,4 +1,4 @@
-# FFAI — Makefile
+# Butter — Makefile
 #
 # Common dev-loop targets. See planning/plan.md for the phased
 # build-out and scripts/ for the longer-form scripts.
@@ -7,11 +7,9 @@
 
 # ─── Paths ────────────────────────────────────────────────────────────
 PROJECT_ROOT := $(shell pwd)
-# Sibling kernels DSL (renamed from metaltile → ffai-kernels).
-FFAI_KERNELS_DIR := $(PROJECT_ROOT)/../ffai-kernels
-# Back-compat alias for older scripts.
-METALTILE_DIR := $(FFAI_KERNELS_DIR)
-KERNEL_OUT := $(PROJECT_ROOT)/Sources/MetalTileSwift
+# Sibling kernels DSL (renamed to Iron as part of the org rebrand).
+IRON_DIR := $(PROJECT_ROOT)/../iron
+KERNEL_OUT := $(PROJECT_ROOT)/Sources/IronSwift
 
 # ─── Help ─────────────────────────────────────────────────────────────
 .PHONY: help
@@ -50,38 +48,35 @@ build-release: regenerate-kernels ## swift build (release)
 	swift build -c release
 
 .PHONY: regenerate-kernels
-regenerate-kernels: ## run `ffaik build --emit` to regenerate metallib + Swift wrappers
-	@if [ ! -d "$(FFAI_KERNELS_DIR)" ]; then \
-	  echo "Error: ffai-kernels not found at $(FFAI_KERNELS_DIR)"; \
-	  echo "Clone the sibling repo at ../ffai-kernels."; \
+regenerate-kernels: ## run `iron build --emit` to regenerate metallib + Swift wrappers
+	@if [ ! -d "$(IRON_DIR)" ]; then \
+	  echo "Error: iron not found at $(IRON_DIR)"; \
+	  echo "Clone the sibling repo at ../iron."; \
 	  exit 1; \
 	fi
-	@# Run from ffai-kernels so its rust-toolchain.toml is honored.
-	@# `ffaik build` writes:
+	@# Run from iron so its rust-toolchain.toml is honored.
+	@# `iron build` writes:
 	@#   $(KERNEL_OUT)/Resources/kernels/<name>.metal
 	@#   $(KERNEL_OUT)/Resources/kernels.metallib
 	@#   $(KERNEL_OUT)/Resources/manifest.json
-	@#   $(KERNEL_OUT)/Generated/FFAIKernels.swift
-	@# Build `__ffai_runner` too — ffaik spawns it by bare name via PATH.
-	@if [ -x "$(FFAI_KERNELS_DIR)/target/release/ffaik" ] && \
-	   [ -x "$(FFAI_KERNELS_DIR)/target/release/__ffai_runner" ]; then \
-	  (cd $(FFAI_KERNELS_DIR) && PATH="$$PWD/target/release:$$PATH" \
-	    ffaik build --emit all --out $(KERNEL_OUT)); \
+	@#   $(KERNEL_OUT)/Generated/IronKernels.swift
+	@# Build `__iron_runner` too — iron spawns it by bare name via PATH.
+	@if [ -x "$(IRON_DIR)/target/release/iron" ] && \
+	   [ -x "$(IRON_DIR)/target/release/__iron_runner" ]; then \
+	  (cd $(IRON_DIR) && PATH="$$PWD/target/release:$$PATH" \
+	    iron build --emit all --out $(KERNEL_OUT)); \
 	else \
-	  (cd $(FFAI_KERNELS_DIR) && \
-	    cargo build --release --bin ffaik --bin __ffai_runner && \
+	  (cd $(IRON_DIR) && \
+	    cargo build --release --bin iron --bin __iron_runner && \
 	    PATH="$$PWD/target/release:$$PATH" \
-	      ffaik build --emit all --out $(KERNEL_OUT)); \
+	      iron build --emit all --out $(KERNEL_OUT)); \
 	fi
 	@# Prepend `// swift-format-ignore-file` so swift-format skips wrappers.
-	@gen=$(KERNEL_OUT)/Generated/FFAIKernels.swift; \
+	@gen=$(KERNEL_OUT)/Generated/IronKernels.swift; \
 	  if [ -f "$$gen" ] && ! head -1 "$$gen" | grep -q swift-format-ignore-file; then \
 	    tmp="$$gen.tmp"; \
 	    { printf '// swift-format-ignore-file\n//\n'; cat "$$gen"; } > "$$tmp" && mv "$$tmp" "$$gen"; \
 	  fi
-	@# Compat shim: FFAI still calls MetalTileKernels.* (pre-rebrand name).
-	@printf '// swift-format-ignore-file\n//\npublic typealias MetalTileKernels = FFAIKernels\n' \
-	  > $(KERNEL_OUT)/Generated/MetalTileKernels.swift
 
 # ─── Bench ────────────────────────────────────────────────────────────
 # Quality benches (wikitext2 perplexity / KLD, NIAH retrieval) forced-decode
@@ -92,15 +87,15 @@ regenerate-kernels: ## run `ffaik build --emit` to regenerate metallib + Swift w
 #   make bench ARGS="--method wikitext2 --model <repo> --wikitext2-corpus wiki.test.raw"
 #   make bench ARGS="--method niah --model <long-ctx-repo>"
 .PHONY: bench
-bench: regenerate-kernels ## run `ffai bench` in release (quality benches require it)
-	swift run -c release ffai bench $(ARGS)
+bench: regenerate-kernels ## run `butter bench` in release (quality benches require it)
+	swift run -c release butter bench $(ARGS)
 
 # ─── Test ─────────────────────────────────────────────────────────────
 #
 # Production-parity defaults. The 2026-05-19 GPU-pin root cause —
 # wrong-dispatch-shape Ops wrappers — is fixed at the source (see the
-# post-mortem in papers/ and OpsValidation in Sources/FFAI/). Test
-# runs now use the same FFAI_MAX_COMMAND_BUFFERS=16 cap as production,
+# post-mortem in papers/ and OpsValidation in Sources/ButterSwift/). Test
+# runs now use the same BUTTER_MAX_COMMAND_BUFFERS=16 cap as production,
 # so anything that passes in CI is proven safe under production load.
 #
 # Defense in depth still in place:
@@ -122,8 +117,8 @@ bench: regenerate-kernels ## run `ffai bench` in release (quality benches requir
 #     loading at a time.
 #
 # Targets:
-# - `make test-unit`         — FFAITests + MetalTileSwiftTests at the
-#                              production cap (FFAI_MAX_COMMAND_BUFFERS=16).
+# - `make test-unit`         — ButterTests + IronSwiftTests at the
+#                              production cap (BUTTER_MAX_COMMAND_BUFFERS=16).
 # - `make test-integration`  — ModelIntegrationTests at production cap + ModelLoadLock
 #                              + `--parallel --num-workers 1` (memory
 #                              pressure, not GPU). Matches release.yml.
@@ -138,8 +133,8 @@ bench: regenerate-kernels ## run `ffai bench` in release (quality benches requir
 test: regenerate-kernels test-unit test-integration ## run unit then integration test suites
 
 .PHONY: test-unit
-test-unit: regenerate-kernels ## unit + Metal tests at production cap (FFAI_MAX_COMMAND_BUFFERS=16)
-	FFAI_MAX_COMMAND_BUFFERS=16 swift test --filter "FFAITests|MetalTileSwiftTests"
+test-unit: regenerate-kernels ## unit + Metal tests at production cap (BUTTER_MAX_COMMAND_BUFFERS=16)
+	BUTTER_MAX_COMMAND_BUFFERS=16 swift test --filter "ButterTests|IronSwiftTests"
 
 .PHONY: test-integration
 test-integration: regenerate-kernels ## end-to-end model tests; production cap + ModelLoadLock; matches release.yml
@@ -147,21 +142,21 @@ test-integration: regenerate-kernels ## end-to-end model tests; production cap +
 	@# Model.load() across suites so multi-GB checkpoints load one at a
 	@# time. --num-workers 1 caps Swift Testing's cross-suite parallelism
 	@# to one model resident at a time (memory pressure, not GPU).
-	FFAI_MAX_COMMAND_BUFFERS=16 swift test --parallel --num-workers 1 --filter "ModelIntegrationTests"
+	BUTTER_MAX_COMMAND_BUFFERS=16 swift test --parallel --num-workers 1 --filter "ModelIntegrationTests"
 
 .PHONY: test-stress
 test-stress: regenerate-kernels ## canary; production cap with uncapped parallelism — run after touching dispatch code
-	@echo "Stress mode. Running unit + integration at FFAI_MAX_COMMAND_BUFFERS=16"
+	@echo "Stress mode. Running unit + integration at BUTTER_MAX_COMMAND_BUFFERS=16"
 	@echo "with no --num-workers cap on integration. If anything regresses our"
 	@echo "wrapper-precondition / PSOCache / ModelLoadLock defenses, this is"
 	@echo "where it surfaces."
 	@echo ""
-	FFAI_MAX_COMMAND_BUFFERS=16 swift test --filter "FFAITests|MetalTileSwiftTests"
-	FFAI_MAX_COMMAND_BUFFERS=16 swift test --filter "ModelIntegrationTests"
+	BUTTER_MAX_COMMAND_BUFFERS=16 swift test --filter "ButterTests|IronSwiftTests"
+	BUTTER_MAX_COMMAND_BUFFERS=16 swift test --filter "ModelIntegrationTests"
 
 .PHONY: coverage
 coverage: ## swift test with coverage report (unit suite only, matches ci.yml)
-	FFAI_MAX_COMMAND_BUFFERS=16 ./scripts/coverage.sh
+	BUTTER_MAX_COMMAND_BUFFERS=16 ./scripts/coverage.sh
 
 .PHONY: integration-bisect
 integration-bisect: regenerate-kernels ## run each ModelIntegrationTests/*IntegrationTests suite alone; tag GPU-pinned exits
@@ -188,9 +183,9 @@ integration-bisect: regenerate-kernels ## run each ModelIntegrationTests/*Integr
 #
 # Files that should be skipped opt out at the source-file level via
 # `// swift-format-ignore-file` on line 1. See
-# Sources/MetalTileSwift/Generated/FFAIKernels.swift for the
-# canonical example (the file is auto-regenerated by metaltile's
-# `tile build --emit swift`; the directive needs to be re-emitted at
+# Sources/IronSwift/Generated/IronKernels.swift for the
+# canonical example (the file is auto-regenerated by Iron's
+# `iron build --emit swift`; the directive needs to be re-emitted at
 # the top by the codegen — see planning/session-plan.md).
 .PHONY: format
 format: ## run swift-format on all .swift files
@@ -201,17 +196,17 @@ format-check: ## swift-format lint (no writes)
 	xcrun swift-format lint --configuration .swift-format --recursive . && echo "format OK"
 
 # ─── Docs ─────────────────────────────────────────────────────────────
-# User-facing documentation lives at https://ffai.dev
-# (source: github.com/thewafflehaus/ffai-website).
+# User-facing documentation lives at the butter-website repo (../butter-website)
+# (source: github.com/thewafflehaus/butter-website).
 #
 # The website fetches markdown from this repo at build time, so committing
 # changes to documentation/, README.md, planning/architecture.md, or
 # planning/roadmap.md on `main` triggers a rebuild via a GitHub Action.
 
-WEBSITE_DIR := $(PROJECT_ROOT)/../ffai-website
+WEBSITE_DIR := $(PROJECT_ROOT)/../butter-website
 
 .PHONY: docs
-docs: ## verify markdown + preview the docs site locally (if ../ffai-website is checked out)
+docs: ## verify markdown + preview the docs site locally (if ../butter-website is checked out)
 	./scripts/verify-docs.sh
 	@if [ -d "$(WEBSITE_DIR)" ]; then \
 	  echo ""; \
@@ -223,7 +218,7 @@ docs: ## verify markdown + preview the docs site locally (if ../ffai-website is 
 	else \
 	  echo ""; \
 	  echo "Tip: clone the docs site to preview locally:"; \
-	  echo "  git clone https://github.com/thewafflehaus/ffai-website $(WEBSITE_DIR)"; \
+	  echo "  git clone https://github.com/thewafflehaus/butter-website $(WEBSITE_DIR)"; \
 	fi
 
 .PHONY: docs-verify
@@ -234,7 +229,7 @@ docs-verify: ## swift-docc target-by-target verification only (no website previe
 .PHONY: clean
 clean: ## remove .build and generated kernel artifacts
 	rm -rf .build
-	rm -f Sources/MetalTileSwift/Resources/kernels.metallib
-	rm -f Sources/MetalTileSwift/Resources/manifest.json
-	rm -rf Sources/MetalTileSwift/Resources/kernels
-	rm -rf Sources/MetalTileSwift/Generated/FFAIKernels.swift
+	rm -f Sources/IronSwift/Resources/kernels.metallib
+	rm -f Sources/IronSwift/Resources/manifest.json
+	rm -rf Sources/IronSwift/Resources/kernels
+	rm -rf Sources/IronSwift/Generated/IronKernels.swift

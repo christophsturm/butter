@@ -27,7 +27,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("SmolLM Integration", .serialized)
 struct SmolLMIntegrationTests {

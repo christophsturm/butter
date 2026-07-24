@@ -17,7 +17,7 @@
 // equivalence, and first-token greedy decode.
 //
 // The whole suite is gated on the local-checkpoint path existing —
-// it ships with FFAI as a reference for how to load Qwen3.6-A3B from
+// it ships with Butter as a reference for how to load Qwen3.6-A3B from
 // a local snapshot. When the path doesn't resolve, the suite is
 // disabled (visibly, by Swift Testing) rather than silently returning
 // from each test.
@@ -26,7 +26,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 private let qwen36LocalPath = "/Users/tom/models/Qwen3.6-35B-A3B-4bit"
 private let qwen36CheckpointAvailable =
@@ -70,7 +70,7 @@ struct Qwen36TextIntegrationTests {
 
     @Test("Qwen3.6-35B-A3B bench — short prefill + decode steady-state")
     func benchShort() async throws {
-        // FFAI's Qwen35 model does single-token forward steps for both
+        // Butter's Qwen35 model does single-token forward steps for both
         // prefill and decode (no batched prefill on this branch), so a
         // 4K/32K prefill takes prohibitively long. A 128-token prefill +
         // 64 decode steps is enough to see steady-state decode tps

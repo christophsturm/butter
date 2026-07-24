@@ -177,7 +177,7 @@ for suite in "${SUITES[@]}"; do
   # "macOS unavailable" and fails the whole build with bogus errors
   # like "argument passed to call that takes no arguments". See the
   # 2026-05-24 bisect-resume autopsy.
-  FFAI_MAX_COMMAND_BUFFERS=16 ${TIMER[@]+"${TIMER[@]}"} \
+  BUTTER_MAX_COMMAND_BUFFERS=16 ${TIMER[@]+"${TIMER[@]}"} \
     arch -arm64 swift test --filter "${suite}$" > "$log" 2>&1
   rc=$?
   dur=$(( SECONDS - start ))

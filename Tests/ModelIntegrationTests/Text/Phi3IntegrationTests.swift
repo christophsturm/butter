@@ -25,7 +25,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Phi Integration", .serialized)
 struct Phi3IntegrationTests {

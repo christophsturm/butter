@@ -1,0 +1,9 @@
+[package]
+name = "wh-butter-runtime"
+description = "Butter generation runtime: KV cache, sampler, decode loop. Backend-neutral."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

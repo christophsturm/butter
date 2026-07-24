@@ -1,0 +1,20 @@
+[package]
+name = "wh-butter-cli"
+description = "Butter command-line front end."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "butter"
+path = "src/main.rs"
+
+[dependencies]
+wh-butter.workspace = true
+
+[features]
+default = ["metal"]
+metal = ["wh-butter/metal"]
+cuda = ["wh-butter/cuda"]
+vulkan = ["wh-butter/vulkan"]

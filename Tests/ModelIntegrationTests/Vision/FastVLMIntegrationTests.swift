@@ -33,7 +33,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("FastVLM Vision Integration", .serialized)
 struct FastVLMIntegrationTests {

@@ -1,9 +1,9 @@
 # Benchmarking
 
-`ffai bench` is the canonical perf harness — same set of methods mlx-swift-lm exposes via its `--method` flag, same `BenchRow` schema in the markdown + JSON sidecar so analysis tooling stays cross-compatible.
+`butter bench` is the canonical perf harness — same set of methods mlx-swift-lm exposes via its `--method` flag, same `BenchRow` schema in the markdown + JSON sidecar so analysis tooling stays cross-compatible.
 
 ```bash
-ffai bench --method simple --model mlx-community/Qwen3.5-0.8B-MLX-4bit \
+butter bench --method simple --model mlx-community/Qwen3.5-0.8B-MLX-4bit \
            --prompt "Once upon a time" --max-tokens 64 --quantization bf16
 ```
 
@@ -33,8 +33,8 @@ The JSON sidecar is the source of truth — the markdown is re-rendered determin
 Stubs fail fast with the dependency name they're waiting on rather than producing garbage:
 
 ```
-$ ffai bench --method niah --model mlx-community/Qwen3.5-0.8B-MLX-4bit
-Error: ffai bench --method niah: not implemented yet — needs
+$ butter bench --method niah --model mlx-community/Qwen3.5-0.8B-MLX-4bit
+Error: butter bench --method niah: not implemented yet — needs
 sliding-window attention mask + needle-position bookkeeping. Tracked
 alongside its parent feature in planning/plan.md.
 ```
@@ -57,10 +57,10 @@ alongside its parent feature in planning/plan.md.
 
 ## KLD comparison with `--ref-model`
 
-KL divergence vs a reference distribution is the right way to quantify "how much fidelity does this quantization cost vs the bf16 parent". `ffai bench --ref-model <bf16-repo> --method simple <quantized-repo>` loads both models simultaneously and runs them in lockstep over the same generated tokens.
+KL divergence vs a reference distribution is the right way to quantify "how much fidelity does this quantization cost vs the bf16 parent". `butter bench --ref-model <bf16-repo> --method simple <quantized-repo>` loads both models simultaneously and runs them in lockstep over the same generated tokens.
 
 ```bash
-ffai bench --method simple \
+butter bench --method simple \
            --model     mlx-community/Qwen3-4B-4bit \
            --ref-model mlx-community/Qwen3-4B-bf16 \
            --prompt "Once upon a time" --max-tokens 64 \
@@ -84,7 +84,7 @@ The number is only meaningful when the reference is a higher-fidelity sibling of
 The markdown re-renders from the JSON sidecar on every append:
 
 ```markdown
-# FFAI Bench — apple-m1-max
+# Butter Bench — apple-m1-max
 
 - System RAM: 64.00 GB
 - OS: 15.4.0
@@ -95,11 +95,11 @@ The markdown re-renders from the JSON sidecar on every append:
 | unsloth/Llama-3.2-1B | simple | bf16 | 131072 | 5 | 60.71 | 64.06 | 65.20 | 82.34 | 64 | 1.21 GB | 1.27 GB | 4.5 MB | 1.15 GB | - | - | Once upon a time, ... |
 ```
 
-Field-for-field, the row schema mirrors mlx-swift-lm's `ResultRow` so analysis scripts (jq queries, plotting tools) work cross-repo without modification. The full schema lives in [`Sources/FFAI/Benchmark/BenchmarkWriter.swift`](../Sources/FFAI/Benchmark/BenchmarkWriter.swift).
+Field-for-field, the row schema mirrors mlx-swift-lm's `ResultRow` so analysis scripts (jq queries, plotting tools) work cross-repo without modification. The full schema lives in [`Sources/ButterSwift/Benchmark/BenchmarkWriter.swift`](../Sources/ButterSwift/Benchmark/BenchmarkWriter.swift).
 
 ## CLI streaming semantics
 
-`ffai bench simple` consumes the generation stream silently (no per-token `print`), then writes the row + prints a summary at the end. This eliminates per-token I/O from the measurement — important for short-prompt high-tok/s methods where stdout flushing would otherwise be a meaningful fraction of decode time. `ffai generate` does print incrementally because that's the user-facing UX.
+`butter bench simple` consumes the generation stream silently (no per-token `print`), then writes the row + prints a summary at the end. This eliminates per-token I/O from the measurement — important for short-prompt high-tok/s methods where stdout flushing would otherwise be a meaningful fraction of decode time. `butter generate` does print incrementally because that's the user-facing UX.
 
 ## Method-specific notes
 
@@ -111,7 +111,7 @@ Cost: roughly N forward passes for N tokens (greedy is one forward per token; pe
 
 ### Methods that aren't shipped yet
 
-`niah`, `multi-turn`, `tool-calling`, `ngram-*`, and `vision` exist as enum cases + CLI strings but throw `BenchRunnerError.notImplemented` when invoked. The dependency each one needs is named in the error message + the [BenchMethod.dependency](../Sources/FFAI/Benchmark/BenchMethod.swift) enum. They ship alongside their parent features per [`planning/plan.md`](../planning/plan.md).
+`niah`, `multi-turn`, `tool-calling`, `ngram-*`, and `vision` exist as enum cases + CLI strings but throw `BenchRunnerError.notImplemented` when invoked. The dependency each one needs is named in the error message + the [BenchMethod.dependency](../Sources/ButterSwift/Benchmark/BenchMethod.swift) enum. They ship alongside their parent features per [`planning/plan.md`](../planning/plan.md).
 
 ## Programmatic access
 
@@ -135,4 +135,4 @@ print(urls.markdown.path)
 - [Observability](observability.md) — `--stats`, `--debug`, `--profiling`, perplexity helpers, KLD math.
 - [Performance](performance.md) — current `tok/s` baseline numbers per model + the Phase 4 wave-by-wave perf history.
 - [`planning/plan.md`](../planning/plan.md) — what's in / out of scope per phase, including the bench methods that ship alongside their parent features.
-- mlx-swift-lm's [benchmarks/README.md](https://github.com/ml-explore/mlx-swift-lm/blob/main/benchmarks/README.md) — the upstream method matrix + report shape FFAI mirrors.
+- mlx-swift-lm's [benchmarks/README.md](https://github.com/ml-explore/mlx-swift-lm/blob/main/benchmarks/README.md) — the upstream method matrix + report shape Butter mirrors.

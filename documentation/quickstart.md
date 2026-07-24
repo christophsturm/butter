@@ -3,7 +3,7 @@
 Generate text in 5 lines:
 
 ```swift
-import FFAI
+import ButterSwift
 
 let model = try await Model.load("mlx-community/Qwen3.5-0.8B-MLX-4bit")
 let result = try await model.generate(prompt: "Once upon a time")
@@ -29,11 +29,11 @@ print(result.text)
 
 ## CLI
 
-The same surface ships as the `ffai` executable. See [using-the-cli.md](using-the-cli.md) for how to build the binary and get it on `PATH`; once that's done:
+The same surface ships as the `butter` executable. See [using-the-cli.md](using-the-cli.md) for how to build the binary and get it on `PATH`; once that's done:
 
 ```bash
-ffai --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time"
-ffai --model mlx-community/Qwen3-4B-4bit --prompt "Hello" --max-tokens 128
+butter --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time"
+butter --model mlx-community/Qwen3-4B-4bit --prompt "Hello" --max-tokens 128
 ```
 
 Tokens are streamed to stdout as they're generated. Pass `--no-streaming` to print the full text once at the end (matches the buffered API exactly). Pass `--stats` for the post-run `[STATS]` block (per-phase memory, TTFT, KV cache, wired ticket — see [observability.md](observability.md)). Pass `--verbose` to print the top-5 next-token distribution from a single prefill instead of generating.
@@ -65,7 +65,7 @@ The final chunk carries the full `GenerationStats` (peak GPU, KV cache size, TTF
 
 ## Chat / multi-turn
 
-For instruct / chat models, pass `[ChatMessage]` and FFAI applies the tokenizer's chat template:
+For instruct / chat models, pass `[ChatMessage]` and Butter applies the tokenizer's chat template:
 
 ```swift
 let messages: [ChatMessage] = [
@@ -115,20 +115,20 @@ let model = try await Model.load(
 
 ## Custom model cache path
 
-By default FFAI shares a snapshot cache with Python's `huggingface_hub`. The standard discovery order is:
+By default Butter shares a snapshot cache with Python's `huggingface_hub`. The standard discovery order is:
 
 1. **`HF_HOME` env var** — if set, the cache lives under `$HF_HOME/hub/` (or `$HF_HOME` if it's already a `hub` dir).
 2. **`~/.cache/huggingface/hub/`** — the default fallback.
 
-Three ways to point FFAI somewhere else, easiest first:
+Three ways to point Butter somewhere else, easiest first:
 
 ### 1. `HF_HOME` env var (CLI + library)
 
-Cleanest for ad-hoc relocation — works for both the `ffai` CLI and any Swift code calling `Model.load(...)`. Same env var Python's `huggingface_hub` honors, so the cache stays shared with `mlx-lm`, `huggingface-cli`, etc.
+Cleanest for ad-hoc relocation — works for both the `butter` CLI and any Swift code calling `Model.load(...)`. Same env var Python's `huggingface_hub` honors, so the cache stays shared with `mlx-lm`, `huggingface-cli`, etc.
 
 ```bash
 export HF_HOME=/Volumes/Big/hf-cache
-ffai --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time"
+butter --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time"
 ```
 
 ### 2. `LoadOptions.cacheDirectory` (programmatic)
@@ -155,7 +155,7 @@ let model = try await Model.load("/Volumes/Big/models/llama-3.2-1B-snapshot")
 ```
 
 ```bash
-ffai --model /Volumes/Big/models/llama-3.2-1B-snapshot --prompt "Once upon a time"
+butter --model /Volumes/Big/models/llama-3.2-1B-snapshot --prompt "Once upon a time"
 ```
 
 `ModelLocator.isLocalPath(_:)` decides this — anything that starts with `/`, `./`, `../`, or `~` (or just exists on disk) routes to the local-path branch and never hits the network. The directory needs at minimum:
@@ -211,14 +211,14 @@ for _ in 0..<64 {
 
 | Want to … | Read |
 |---|---|
-| Add FFAI to your project | [installation.md](installation.md) |
+| Add Butter to your project | [installation.md](installation.md) |
 | See which models are supported | [models.md](models.md) |
 | Understand the three-layer stack | [architecture.md](architecture.md) |
 | Stream tokens to a UI | [streaming.md](streaming.md) |
 | Use chat / instruct models | [chat-templates.md](chat-templates.md) |
 | Tune sampling / prefill / `maxTokens` | [generation-parameters.md](generation-parameters.md) |
 | See per-phase memory + tok/s in `--stats` | [observability.md](observability.md) |
-| Run benchmarks (`ffai bench`) | [benchmarking.md](benchmarking.md) |
+| Run benchmarks (`butter bench`) | [benchmarking.md](benchmarking.md) |
 | Pick a KV cache strategy | [kv-cache.md](kv-cache.md) |
 | Use 3 / 4 / 5 / 6 / 8-bit quantized weights | [quantization.md](quantization.md) |
 | Check current `tok/s` numbers | [performance.md](performance.md) |

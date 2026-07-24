@@ -37,7 +37,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("VoxtralRealtime Integration", .serialized)
 struct VoxtralRealtimeIntegrationTests {

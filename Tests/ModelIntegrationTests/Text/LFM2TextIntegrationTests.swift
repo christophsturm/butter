@@ -35,7 +35,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("LFM2 Text Integration", .serialized)
 struct LFM2TextIntegrationTests {

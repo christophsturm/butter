@@ -1,6 +1,6 @@
 # Publishing: branches, releases, docs
 
-How FFAI's branching, release, and docs-publishing pipeline fit together. **Read this before cutting your first release.**
+How Butter's branching, release, and docs-publishing pipeline fit together. **Read this before cutting your first release.**
 
 ## Branches
 
@@ -20,9 +20,9 @@ Day-to-day: branch off `dev`, PR back to `dev`. Release-time: PR `dev` → `main
    - `prerelease_tag` — `alpha` / `beta` / `rc` / `none`
    - `override_version` — bypass auto-bump (e.g. `0.2.0-alpha`)
    - `tag_prefix` — `v` (default) or `auto` (inherit from last tag)
-3. The workflow does the rest: clean test pass on macOS, then [`scripts/release.sh`](../../scripts/release.sh) computes the next version from `git describe`, **rewrites `FFAI.version` in `Sources/FFAI/FFAI.swift` to match the new tag** (and commits the bump on `main` with `[skip ci]`), creates `release/<tag>` branch
+3. The workflow does the rest: clean test pass on macOS, then [`scripts/release.sh`](../../scripts/release.sh) computes the next version from `git describe`, **rewrites `Butter.version` in `Sources/ButterSwift/Butter.swift` to match the new tag** (and commits the bump on `main` with `[skip ci]`), creates `release/<tag>` branch
    + an annotated tag pointing at the bump commit, pushes branch + tag + the updated `main`. Finally `gh release create --generate-notes` publishes the GitHub Release targeting the release branch.
-4. The `release: published` event automatically fires [`notify-docs.yml`](../../.github/workflows/notify-docs.yml), which dispatches the [ffai-website](https://github.com/thewafflehaus/ffai-website) build against the new tag.
+4. The `release: published` event automatically fires [`notify-docs.yml`](../../.github/workflows/notify-docs.yml), which dispatches the [butter-website](https://github.com/thewafflehaus/butter-website) build against the new tag.
 
 Always run the Release workflow **from `main`** (the branch picker in the workflow_dispatch UI). The workflow guards against running off any other branch.
 
@@ -30,12 +30,12 @@ Always run the Release workflow **from `main`** (the branch picker in the workfl
 
 Before computing the version and creating the tag, the release workflow runs [`scripts/update-license.sh`](../../scripts/update-license.sh) to prepend the Apache 2.0 header to any source file missing it; the workflow commits the result so the tagged commit provably carries the header on every code + test file. The script is idempotent — a no-op when the pre-commit hook (`make install-hooks`) already kept headers in sync locally.
 
-## What the script does to `FFAI.version`
+## What the script does to `Butter.version`
 
-There's exactly one in-code version string, [`FFAI.version`](../../Sources/FFAI/FFAI.swift), surfaced by `ffai --version` + on every CLI invocation + recorded in bench reports. `release.sh` keeps it in lockstep with the tag automatically:
+There's exactly one in-code version string, [`Butter.version`](../../Sources/ButterSwift/Butter.swift), surfaced by `butter --version` + on every CLI invocation + recorded in bench reports. `release.sh` keeps it in lockstep with the tag automatically:
 
-- **If `FFAI.version` already matches** the computed `NEW_VERSION` (e.g. a contributor manually bumped it in the release PR), the script logs `no bump needed` and proceeds.
-- **Otherwise** it rewrites the string literal, commits the change on the current branch with `chore: bump FFAI.version to <tag> [skip ci]`, and `git push origin <branch>`. The release branch + tag are created on the bump commit, so any checkout of the tag carries the matching version string.
+- **If `Butter.version` already matches** the computed `NEW_VERSION` (e.g. a contributor manually bumped it in the release PR), the script logs `no bump needed` and proceeds.
+- **Otherwise** it rewrites the string literal, commits the change on the current branch with `chore: bump Butter.version to <tag> [skip ci]`, and `git push origin <branch>`. The release branch + tag are created on the bump commit, so any checkout of the tag carries the matching version string.
 
 Convention for `dev` between releases: suffix `-dev` (e.g. `"0.2.0-dev"` after v0.1.0 ships) so stale dev builds are easy to spot in CLI output and bench logs. This bump is **not** automated today — open a manual PR on dev after each release.
 
@@ -45,16 +45,16 @@ Convention for `dev` between releases: suffix `-dev` (e.g. `"0.2.0-dev"` after v
 
 ```bash
 PUSH=0 BUMP_TYPE=minor PRERELEASE_TAG=alpha ./scripts/release.sh
-# FFAI.version already at 0.1.0 — no bump needed.
+# Butter.version already at 0.1.0 — no bump needed.
 # (or:)
-# [dry-run] would bump FFAI.version: 0.0.5-dev → 0.1.0-alpha + commit.
+# [dry-run] would bump Butter.version: 0.0.5-dev → 0.1.0-alpha + commit.
 # tag=v0.1.0-alpha
 # version=0.1.0-alpha
 # release_branch=release/v0.1.0-alpha
 # commit=<sha of HEAD>
 ```
 
-Dry-run doesn't write to `FFAI.swift` or make any commits — it only creates the local tag + release branch (which point at unchanged HEAD). Clean up with:
+Dry-run doesn't write to `Butter.swift` or make any commits — it only creates the local tag + release branch (which point at unchanged HEAD). Clean up with:
 
 ```bash
 git tag -d v0.1.0-alpha
@@ -89,33 +89,33 @@ So title PRs intentionally — `feat: …` for features, `fix: …` for bugs, `c
 
 ## Docs site publishing chain
 
-The user-facing site at [**https://thewafflehaus.github.io/ffai-website/**](https://thewafflehaus.github.io/ffai-website/) **only rebuilds against immutable FFAI release tags** — never `main` HEAD. Unreleased doc changes land on dev → main but stay invisible to the published site until the next release.
+The user-facing site at [**https://thewafflehaus.github.io/butter-website/**](https://thewafflehaus.github.io/butter-website/) **only rebuilds against immutable Butter release tags** — never `main` HEAD. Unreleased doc changes land on dev → main but stay invisible to the published site until the next release.
 
 ```
-FFAI release published
+Butter release published
         │
         ▼
-notify-docs.yml      (FFAI / .github/workflows/)
+notify-docs.yml      (Butter / .github/workflows/)
         │
-        │ workflow_dispatch (Actions: write on ffai-website)
+        │ workflow_dispatch (Actions: write on butter-website)
         ▼
-deploy.yml           (ffai-website / .github/workflows/)
+deploy.yml           (butter-website / .github/workflows/)
         │
-        │ checkouts FFAI@<tag>, syncs markdown, builds Astro,
+        │ checkouts Butter@<tag>, syncs markdown, builds Astro,
         │ deploys to GH Pages
         ▼
-https://thewafflehaus.github.io/ffai-website/
+https://thewafflehaus.github.io/butter-website/
 ```
 
 Site rebuilds also happen when:
-- You push to `main` on ffai-website (site source changed — Astro components, CSS, sidebar). Pins to FFAI's latest published release.
-- You manually trigger ffai-website's `deploy.yml` from the Actions tab. Same — pins to latest release.
+- You push to `main` on butter-website (site source changed — Astro components, CSS, sidebar). Pins to Butter's latest published release.
+- You manually trigger butter-website's `deploy.yml` from the Actions tab. Same — pins to latest release.
 
-Either way the docs content stays pinned to a real release; you can iterate on the site itself between FFAI releases.
+Either way the docs content stays pinned to a real release; you can iterate on the site itself between Butter releases.
 
 ## The cross-repo dispatch token
 
-`notify-docs.yml` calls `gh workflow run deploy.yml` on ffai-website, which requires authentication. The `WEBSITE_DISPATCH_TOKEN` repo secret holds a fine-grained PAT scoped to **only** `ffai-website` with:
+`notify-docs.yml` calls `gh workflow run deploy.yml` on butter-website, which requires authentication. The `WEBSITE_DISPATCH_TOKEN` repo secret holds a fine-grained PAT scoped to **only** `butter-website` with:
 
 | Permission | Level |
 |---|---|
@@ -123,7 +123,7 @@ Either way the docs content stays pinned to a real release; you can iterate on t
 | Contents | Read-only |
 | Metadata | Read-only |
 
-**No `Contents: write` on ffai-website.** The dispatch uses `workflow_dispatch` (not `repository_dispatch`) so the worst a leaked token could do is spam-trigger the deploy workflow or cancel runs — it can't modify ffai-website's repo contents.
+**No `Contents: write` on butter-website.** The dispatch uses `workflow_dispatch` (not `repository_dispatch`) so the worst a leaked token could do is spam-trigger the deploy workflow or cancel runs — it can't modify butter-website's repo contents.
 
 If the secret is missing the notify workflow logs a warning and exits 0 gracefully (no failed Actions run); the release still gets created, the site just won't rebuild until you set the token.
 
@@ -132,15 +132,15 @@ If the secret is missing the notify workflow logs a warning and exits 0 graceful
 When you need to force a rebuild without cutting a release:
 
 ```bash
-# Re-deploy the site against whatever the latest FFAI release is.
-gh workflow run deploy.yml --repo thewafflehaus/ffai-website
+# Re-deploy the site against whatever the latest Butter release is.
+gh workflow run deploy.yml --repo thewafflehaus/butter-website
 
-# Re-deploy against a specific FFAI release (e.g. roll back the docs).
-gh workflow run deploy.yml --repo thewafflehaus/ffai-website \
-  --field ffai_tag=v0.1.0
+# Re-deploy against a specific Butter release (e.g. roll back the docs).
+gh workflow run deploy.yml --repo thewafflehaus/butter-website \
+  --field butter_tag=v0.1.0
 
 # Re-run the full notify → dispatch chain (useful to test the token).
-gh workflow run notify-docs.yml --repo thewafflehaus/FFAI \
+gh workflow run notify-docs.yml --repo thewafflehaus/butter \
   --field tag=v0.1.0
 ```
 

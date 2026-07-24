@@ -28,7 +28,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 /// Synthetic clean audio fixture for offline 48 kHz path — separate
 /// from the shared 16 kHz `clean_001.wav` fixture (which targets STT).

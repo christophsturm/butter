@@ -1,10 +1,10 @@
-# FFAI
+# Butter
 
-**F*cking Fast AI.**
+**Melt away latency with ultra-smooth local inference.**
 
-A minimal, dependency-light LLM inference library for Apple Silicon, built on pre-compiled Metal kernels generated from the [metaltile](https://github.com/thewafflehaus/metaltile) DSL. No Python. No MLX. No C compilation. No JIT. No four-repo dependency chain.
+A minimal, dependency-light LLM inference library for Apple Silicon, built on pre-compiled Metal kernels generated from the [iron](https://github.com/thewafflehaus/iron) DSL. No Python. No MLX. No C compilation. No JIT. No four-repo dependency chain.
 
-**Just really f*cking fast AI on your Mac!** 🚀
+**Just really smooth, fast AI on your Mac!** 🚀
 
 ## Status
 
@@ -23,11 +23,11 @@ Early bootstrap — the dense-text, hybrid, vision-language, and audio model wav
 | **One-line model loading** | `Model.load("org/repo")` and you're generating. Download, cache, tokenizer, prewarm — one async call. | ✅ |
 | **HuggingFace native** | Pull any compatible model straight from the Hub. Same cache as Python. | ✅ |
 | **3 / 4 / 5 / 6 / 8-bit quantization** | Run beefy models on lean machines. The `mlx-community` quants you're already using. | ✅ |
-| **Native MLX 4-bit conversion** | `ffai convert <repo>` quantizes any FFAI-loadable checkpoint to MLX 4-bit using our own GPU kernel — no Python, no `mlx-lm`, no `mlx-vlm`. Optional one-flag HF upload. | ✅ |
+| **Native MLX 4-bit conversion** | `butter convert <repo>` quantizes any Butter-loadable checkpoint to MLX 4-bit using our own GPU kernel — no Python, no `mlx-lm`, no `mlx-vlm`. Optional one-flag HF upload. | ✅ |
 | **Single-buffer-per-token dispatch** | Forward + sample on one Metal command buffer per token. Just 4 bytes cross CPU↔GPU. | ✅ |
 | **Capability-driven hot loading/unloading** | Only load what you'll use. Add and remove vision and audio encoders as you need them. | ✅ |
 | **Async lifecycle stream** | Real progress for your UI — download, load, ready — as an `AsyncStream`. | ✅ |
-| **Built in performance profiling** | Run benchmarks using the FFAI CLI and get performance telemtry data as you do inference. | ✅ |
+| **Built in performance profiling** | Run benchmarks using the Butter CLI and get performance telemtry data as you do inference. | ✅ |
 | **Streaming generation** | Streaming inference support across all models. | ✅ |
 | **Quantized KV cache** | Squeeze long contexts into a fraction of the memory. Affine 4/8-bit + AURA compressed. | ✅ |
 | **Hybrid models (GDN + SSM)** | Qwen 3.5, Mamba 2, NemotronH, Jamba, GraniteMoeHybrid, FalconH1 — attention mixed with recurrence. | ✅ |
@@ -45,13 +45,13 @@ For the longer-form view of what's shipped vs planned, see [`planning/roadmap.md
 Install via SwiftPM:
 
 ```swift
-.package(url: "https://github.com/thewafflehaus/FFAI", from: "0.1.0")
+.package(url: "https://github.com/thewafflehaus/butter", from: "0.1.0")
 ```
 
 Then generate text in five lines:
 
 ```swift
-import FFAI
+import ButterSwift
 
 let model = try await Model.load("mlx-community/Qwen3.5-0.8B-MLX-4bit")
 let result = try await model.generate(
@@ -64,21 +64,21 @@ print("\(result.tokensPerSecond) tok/s")
 
 `Model.load` resolves the HuggingFace repo, downloads the snapshot (or hits the cache), parses `config.json`, mmap-loads weights into per-tensor MTLBuffers, attaches the tokenizer, and prewarms the PSO cache. The first call costs a few seconds; subsequent loads of the same repo are near-instant.
 
-CLI equivalent (the `ffai` executable target):
+CLI equivalent (the `butter` executable target):
 
 ```bash
-ffai --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time"
+butter --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time"
 ```
 
 See [`quickstart.md`](documentation/quickstart.md) for streaming, chat templates, capability gating, and lower-level forward APIs. Using a non-default cache directory (external SSD, shared cache between Python tools, etc.)? See [Custom model cache path](documentation/quickstart.md#custom-model-cache-path).
 
 ## Models Supported
 
-FFAI ships the most comprehensive Apple Silicon model coverage of any single library — **LLMs, VLMs, vision, STT, STS, TTS, and Omni models** all running real HuggingFace checkpoints end-to-end through one loader. Pass a repo ID, the registry resolves the architecture, downloads the snapshot, and routes to the right family.
+Butter ships the most comprehensive Apple Silicon model coverage of any single library — **LLMs, VLMs, vision, STT, STS, TTS, and Omni models** all running real HuggingFace checkpoints end-to-end through one loader. Pass a repo ID, the registry resolves the architecture, downloads the snapshot, and routes to the right family.
 
-Run `ffai models` for the live list with copy-paste repo IDs, or browse the full breakdown by family + capability in [`documentation/models.md`](documentation/models.md).
+Run `butter models` for the live list with copy-paste repo IDs, or browse the full breakdown by family + capability in [`documentation/models.md`](documentation/models.md).
 
-**Quantization.** Affine **2 / 3 / 4 / 5 / 6 / 8-bit** (mlx-community packed-uint32 format) ships today, with per-tensor bit-width derivation for mixed-precision checkpoints. `ffai convert` accepts per-tensor specs — any of `2 / 3 / 4 / 5 / 6 / 8 / fp16 / bf16` independently for `--bits` / `--embedding-bits` / `--lm-head-bits` / `--vision-bits`, so a single conversion can mix bit-widths across roles. **GGUF format is the remaining gap** — see [`quantization.md`](documentation/quantization.md) for what's wired up now vs queued.
+**Quantization.** Affine **2 / 3 / 4 / 5 / 6 / 8-bit** (mlx-community packed-uint32 format) ships today, with per-tensor bit-width derivation for mixed-precision checkpoints. `butter convert` accepts per-tensor specs — any of `2 / 3 / 4 / 5 / 6 / 8 / fp16 / bf16` independently for `--bits` / `--embedding-bits` / `--lm-head-bits` / `--vision-bits`, so a single conversion can mix bit-widths across roles. **GGUF format is the remaining gap** — see [`quantization.md`](documentation/quantization.md) for what's wired up now vs queued.
 
 ### Adding a model
 
@@ -88,14 +88,14 @@ Step-by-step walkthrough with copy-pasteable templates: [`documentation/developi
 
 ### Quantize a Model
 
-`ffai convert` quantizes any bf16/fp16 HuggingFace checkpoint to MLX 4-bit or 8bit affine format using FFAI's own GPU kernels — no Python deps, no `mlx-lm` / `mlx-vlm` install, and it works on architectures `mlx-lm` rejects (custom-modeling-code families like Soprano, Nemotron-H, FastVLM):
+`butter convert` quantizes any bf16/fp16 HuggingFace checkpoint to MLX 4-bit or 8bit affine format using Butter's own GPU kernels — no Python deps, no `mlx-lm` / `mlx-vlm` install, and it works on architectures `mlx-lm` rejects (custom-modeling-code families like Soprano, Nemotron-H, FastVLM):
 
 ```bash
-# Pull, quantize, and write to ~/.cache/ffai/converts/.
-ffai convert HuggingFaceTB/SmolLM2-360M-Instruct
+# Pull, quantize, and write to ~/.cache/butter/converts/.
+butter convert HuggingFaceTB/SmolLM2-360M-Instruct
 
 # Also upload to a HF repo you control (uses your `hf` CLI auth).
-ffai convert HuggingFaceTB/SmolLM2-360M-Instruct \
+butter convert HuggingFaceTB/SmolLM2-360M-Instruct \
     --upload-repo ekryski/SmolLM2-360M-Instruct-4bit
 ```
 
@@ -105,7 +105,7 @@ Full flag list + recipes: [`using-the-cli.md` § `convert`](documentation/using-
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  FFAI (Swift)                                           │
+│  Butter (Swift)                                           │
 │   • Tensor (MTLBuffer-backed)                           │
 │   • Module / Linear / Embedding / RMSNorm               │
 │   • Model definitions (Llama, Qwen, …)                  │
@@ -114,19 +114,19 @@ Full flag list + recipes: [`using-the-cli.md` § `convert`](documentation/using-
 └────────────────────────┬────────────────────────────────┘
                          │ calls
 ┌────────────────────────▼────────────────────────────────┐
-│  MetalTileSwift (Swift, in-repo)                        │
+│  IronSwift (Swift, in-repo)                        │
 │   • Loads kernels.metallib (pre-compiled at build time) │
 │   • PSO cache, function-constant specialization         │
 │   • Generated typed wrappers (one per kernel)           │
 └────────────────────────┬────────────────────────────────┘
                          │ resources from
 ┌────────────────────────▼────────────────────────────────┐
-│  metaltile (Rust, sibling repo)                         │
+│  iron (Rust, sibling repo)                         │
 │   • #[kernel] DSL → IR → MSL                            │
-│   • `tile emit` (metaltile-cli) produces:               │
+│   • `tile emit` (iron-cli) produces:               │
 │       kernels.metallib   (compiled by xcrun metal)      │
 │       manifest.json      (kernel metadata)              │
-│       MetalTileKernels.swift  (typed wrappers)          │
+│       IronKernels.swift  (typed wrappers)          │
 └─────────────────────────────────────────────────────────┘
 ```
 

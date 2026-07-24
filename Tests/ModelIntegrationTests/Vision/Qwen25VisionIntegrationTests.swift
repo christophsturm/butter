@@ -33,7 +33,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Qwen2.5 Vision Integration (image + video)", .serialized)
 struct Qwen25VisionIntegrationTests {

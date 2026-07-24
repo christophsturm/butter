@@ -32,7 +32,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("LFM2 Vision Integration", .serialized)
 struct LFM2VisionIntegrationTests {

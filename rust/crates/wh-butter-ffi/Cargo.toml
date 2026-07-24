@@ -1,0 +1,19 @@
+[package]
+name = "wh-butter-ffi"
+description = "C-ABI bridge over the shared Butter engine layer — lets Swift (and any C caller) consume the same Device/ops the CUDA path uses."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+wh-butter.workspace = true
+
+[features]
+default = ["metal"]
+metal = ["wh-butter/metal"]
+cuda = ["wh-butter/cuda"]
+vulkan = ["wh-butter/vulkan"]

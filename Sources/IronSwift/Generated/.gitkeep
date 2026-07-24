@@ -1,0 +1,3 @@
+# Generated/IronKernels.swift is produced by iron-emit at build
+# time. It contains one strongly-typed Swift function per kernel. See
+# planning/plan.md Phase 0.

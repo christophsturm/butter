@@ -29,7 +29,7 @@
 
 import AVFoundation
 import CoreGraphics
-import FFAI
+import ButterSwift
 import Foundation
 import Testing
 
@@ -179,7 +179,7 @@ public enum VisionTestHelpers {
         return frames
     }
 
-    /// Convert a CoreGraphics image to FFAI's `RGBImage` (planar-friendly
+    /// Convert a CoreGraphics image to Butter's `RGBImage` (planar-friendly
     /// RGB Floats in [0,1]). Drops the alpha channel if present.
     private static func rgbImage(from cg: CGImage) throws -> RGBImage {
         let w = cg.width

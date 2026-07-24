@@ -111,7 +111,7 @@ public struct InspectTap: Sendable {
     public var metrics: QualityMetrics            // default []  → nothing captured
     public var isCapturingMetrics: Bool { !metrics.isEmpty }
 
-    // fromEnvironment also parses e.g. FFAI_TELEMETRY=ppl,kld → .perplexity ∪ .kld
+    // fromEnvironment also parses e.g. BUTTER_TELEMETRY=ppl,kld → .perplexity ∪ .kld
 }
 ```
 
@@ -200,28 +200,28 @@ in log-space with the right direction (`klAtPosition`). The work to make these
 ## 7. Release-only benches (separate but related gap)
 
 Quality benches forced-decode an entire corpus; in **debug** this is painfully
-slow. metaltile already runs its bench tooling in release (`cargo run --release`).
-FFAI's bench path is not pinned today. Proposed:
+slow. iron already runs its bench tooling in release (`cargo run --release`).
+Butter's bench path is not pinned today. Proposed:
 
-- `ffai bench` (and any bench CI step) builds/runs with `swift run -c release` /
+- `butter bench` (and any bench CI step) builds/runs with `swift run -c release` /
   `swift build -c release`.
 - Optionally a guard that warns (or refuses) if a quality bench is invoked from a
   debug build, so we never publish debug-speed numbers by accident.
 
 ## 8. Usage — how to run
 
-Quality metrics run through the `ffai bench` CLI. PPL and KLD work **today**;
-the `FFAI_TELEMETRY` live-capture flag and NIAH are the follow-ups this design
+Quality metrics run through the `butter bench` CLI. PPL and KLD work **today**;
+the `BUTTER_TELEMETRY` live-capture flag and NIAH are the follow-ups this design
 adds the surface for.
 
 **Perplexity** (WikiText-2 forced-decode) — works today:
 
 ```bash
 # debug (slow — quick smoke only)
-ffai bench --method wikitext2 --model <hf-repo-or-local-path>
+butter bench --method wikitext2 --model <hf-repo-or-local-path>
 
 # release — use this for real numbers (see §7)
-swift run -c release ffai bench --method wikitext2 \
+swift run -c release butter bench --method wikitext2 \
     --model <hf-repo-or-local-path> \
     --wikitext2-max-tokens 4096            # corpus token cap (default 2048)
 ```
@@ -230,7 +230,7 @@ swift run -c release ffai bench --method wikitext2 \
 (unquantized) variant of the same architecture as `--ref-model`:
 
 ```bash
-swift run -c release ffai bench --method wikitext2 \
+swift run -c release butter bench --method wikitext2 \
     --model     <quantized-repo-or-path> \
     --ref-model <bf16-reference-repo-or-path>
 # emits Gen PPL + Gen KLD columns into ./benchmarks (override with --report-dir)
@@ -241,16 +241,16 @@ unset) — the env var `InspectTap` parses, consumed by the live-capture
 follow-up:
 
 ```bash
-FFAI_TELEMETRY=ppl,kld   ffai <generate|serve> ...   # capture PPL + KLD live
-FFAI_TELEMETRY=ppl       ffai <generate|serve> ...   # perplexity only
-# unset → nothing captured, no overhead (mirrors FFAI_INSPECT / FFAI_INSPECT_LAYERS)
+BUTTER_TELEMETRY=ppl,kld   butter <generate|serve> ...   # capture PPL + KLD live
+BUTTER_TELEMETRY=ppl       butter <generate|serve> ...   # perplexity only
+# unset → nothing captured, no overhead (mirrors BUTTER_INSPECT / BUTTER_INSPECT_LAYERS)
 ```
 
 **NIAH** (needle-in-a-haystack retrieval) — *target*; lands as a follow-up
 (`Telemetry/NIAH.swift`) over the same contract:
 
 ```bash
-swift run -c release ffai bench --method niah --model <long-ctx-repo>
+swift run -c release butter bench --method niah --model <long-ctx-repo>
 ```
 
 ## 9. Settled vs open
@@ -267,7 +267,7 @@ swift run -c release ffai bench --method niah --model <long-ctx-repo>
 **Open for the call:**
 1. **Handoff type:** logits (math centralized — recommended) vs log-probs (model
    does its own softmax).
-2. **Flag config surface:** env var name + grammar (e.g. `FFAI_TELEMETRY=ppl,kld`),
+2. **Flag config surface:** env var name + grammar (e.g. `BUTTER_TELEMETRY=ppl,kld`),
    and whether `BenchRunner` sets the flags programmatically vs via env.
 3. **KLD file split** — own `Telemetry/KLDivergence.swift` or stay co-located in
    `Telemetry/Perplexity.swift` (shared `negLogSoftmaxAt` / `decodeLogSoftmax`).

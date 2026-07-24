@@ -1,12 +1,12 @@
 # Architecture
 
-FFAI is three layers, all in this repo except `metaltile` (a sibling Rust crate). The longer-form diagrams live in [`planning/architecture.md`](../planning/architecture.md); this page covers the user-facing model — what each layer is responsible for and how a single token moves through the stack.
+Butter is three layers, all in this repo except `iron` (a sibling Rust crate). The longer-form diagrams live in [`planning/architecture.md`](../planning/architecture.md); this page covers the user-facing model — what each layer is responsible for and how a single token moves through the stack.
 
 ## The three layers
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  FFAI (Swift)                                           │
+│  Butter (Swift)                                           │
 │   • Tensor (MTLBuffer-backed)                           │
 │   • Module / Linear / Embedding / RMSNorm               │
 │   • Model definitions (Llama, Qwen, …)                  │
@@ -15,37 +15,37 @@ FFAI is three layers, all in this repo except `metaltile` (a sibling Rust crate)
 └────────────────────────┬────────────────────────────────┘
                          │ calls
 ┌────────────────────────▼────────────────────────────────┐
-│  MetalTileSwift (Swift, in-repo)                        │
+│  IronSwift (Swift, in-repo)                        │
 │   • Loads kernels.metallib (pre-compiled at build time) │
 │   • PSO cache, function-constant specialization         │
 │   • Generated typed wrappers (one per kernel)           │
 └────────────────────────┬────────────────────────────────┘
                          │ resources from
 ┌────────────────────────▼────────────────────────────────┐
-│  metaltile (Rust, sibling repo)                         │
+│  iron (Rust, sibling repo)                         │
 │   • #[kernel] DSL → IR → MSL                            │
-│   • `tile build --emit all` (metaltile-cli) produces:               │
+│   • `iron build --emit all` (iron-cli) produces:               │
 │       kernels.metallib   (compiled by xcrun metal)      │
 │       manifest.json      (kernel metadata)              │
-│       MetalTileKernels.swift  (typed wrappers)          │
+│       IronKernels.swift  (typed wrappers)          │
 └─────────────────────────────────────────────────────────┘
 ```
 
-### `metaltile` (Rust)
+### `iron` (Rust)
 
-A `#[kernel]` proc-macro lowers a small Rust DSL into an IR; the codegen back-end emits Metal Shading Language. Authoring lives here: new kernels are Rust `pub fn`s in `crates/metaltile-std/src/ops/`, annotated with `#[bench_kernel(...)]` so the registry picks them up. End users never touch Rust — they consume the artifacts shipped in `Sources/MetalTileSwift/Resources/`.
+A `#[kernel]` proc-macro lowers a small Rust DSL into an IR; the codegen back-end emits Metal Shading Language. Authoring lives here: new kernels are Rust `pub fn`s in `crates/iron-std/src/ops/`, annotated with `#[bench_kernel(...)]` so the registry picks them up. End users never touch Rust — they consume the artifacts shipped in `Sources/IronSwift/Resources/`.
 
-### `MetalTileSwift`
+### `IronSwift`
 
-A thin Swift wrapper that loads `kernels.metallib` once (`MetalTileLibrary.shared`), maintains a PSO cache keyed on `(name, MTLFunctionConstantValues)`, and exposes one typed function per kernel via the generated `MetalTileKernels.swift`. Function-constant specialization lets us produce a single MSL source that spans dtype/shape variants — at PSO instantiation time the constants get baked into the pipeline.
+A thin Swift wrapper that loads `kernels.metallib` once (`IronLibrary.shared`), maintains a PSO cache keyed on `(name, MTLFunctionConstantValues)`, and exposes one typed function per kernel via the generated `IronKernels.swift`. Function-constant specialization lets us produce a single MSL source that spans dtype/shape variants — at PSO instantiation time the constants get baked into the pipeline.
 
-### `FFAI`
+### `Butter`
 
 The user-facing layer:
 
 - **`Tensor`** — `MTLBuffer` + shape + dtype + strides + byte offset. Owns memory directly; no `MLXArray` middle-man.
 - **`Module`** — protocol with named-parameter discovery.
-- **Layers** — `Linear`, `Embedding`, `RMSNorm`, `RoPE`, attention blocks. Each is a thin call to `MetalTileSwift` kernels.
+- **Layers** — `Linear`, `Embedding`, `RMSNorm`, `RoPE`, attention blocks. Each is a thin call to `IronSwift` kernels.
 - **Models** — one Swift file per family per folder. Text-only families live at `Models/Text/<F>.swift` (`Models/Text/Llama.swift`, `Models/Text/Mistral.swift`). VL families add a `Models/<F>.swift` orchestrator + `Models/Vision/<F>Vision.swift` tower; the paired text impl lives at `Models/Text/<F>Text.swift` (e.g. `Models/Text/Qwen3Text.swift`). Audio families live under `Models/Audio/{STT,TTS,STS,VAD,Omni}/<F>.swift`. Family files use a protocol + per-variant struct pattern so adding `Qwen35MoE` etc. doesn't bloat a switch. See [developing/adding-a-model.md](developing/adding-a-model.md) for the full layout rule.
 - **Loader** — `Model.load(...)` resolves an HF id (or local path), downloads via `swift-huggingface`, parses `config.json`, mmap-loads weights into per-tensor MTLBuffers, dispatches to the right family, attaches the tokenizer.
 - **Inference** — `KVCache`, `Sampling`, `Generate` (the prefill + decode loop).
@@ -53,16 +53,16 @@ The user-facing layer:
 ## The build pipeline
 
 ```
-┌──────────────┐ tile build        ┌──────────────────┐  xcrun metal   ┌────────────────────┐
+┌──────────────┐ iron build        ┌──────────────────┐  xcrun metal   ┌────────────────────┐
 │  Rust kernels│ --emit all --out  │  *.metal sources │   + metallib   │  kernels.metallib  │
 │  (#[kernel]) │ ─────────────────▶│  manifest.json   │ ──────────────▶│  manifest.json     │
-└──────────────┘                   │  MetalTileKernels│                │  MetalTileKernels  │
+└──────────────┘                   │  IronKernels│                │  IronKernels  │
                                    │  .swift (typed)  │                │  .swift (typed)    │
                                    └──────────────────┘                └────────────────────┘
                                                                               │
                                                                               ▼
                                                                 ┌──────────────────────────┐
-                                                                │ Sources/MetalTileSwift/  │
+                                                                │ Sources/IronSwift/  │
                                                                 │   Resources/             │
                                                                 │   Generated/             │
                                                                 └──────────────────────────┘
@@ -73,7 +73,7 @@ The user-facing layer:
                                                                   a pre-compiled metallib
 ```
 
-Kernel regeneration is `make regenerate-kernels` (which `make build` runs automatically). End users adding FFAI as a SwiftPM dep don't run this — they consume the metallib that ships in the package.
+Kernel regeneration is `make regenerate-kernels` (which `make build` runs automatically). End users adding Butter as a SwiftPM dep don't run this — they consume the metallib that ships in the package.
 
 ## A single token, end-to-end
 
@@ -134,7 +134,7 @@ Disabled modalities skip weight allocation entirely — the vision encoder of a 
 
 ```
 Sources/
-  FFAI/                     User-facing library
+  Butter/                     User-facing library
     Tensor.swift            MTLBuffer + shape/dtype/strides
     BufferPool.swift        Per-token activation slab allocator
     DType.swift             Supported tensor dtypes
@@ -144,7 +144,7 @@ Sources/
     LanguageModel.swift     Protocol implemented by text-family models
     VisionModel.swift       Protocol implemented by VL orchestrators
     AudioModel.swift        Protocol implemented by audio families
-    FFAI.swift              Public umbrella + version
+    Butter.swift              Public umbrella + version
     Loader/                 Model.load, ModelConfig, ModelLocator,
                             ModelDownloader, ModelRegistry, Device, …
     Ops/                    Public GPU op wrappers (Ops.swift,
@@ -156,8 +156,8 @@ Sources/
     Stats/                  GenerationStats, Perplexity, ThinkingSplit
     Telemetry/              Debug / Profile + signposts
     Benchmark/              Bench, IndirectDispatch, MemoryStats, …
-    CLI/                    `ffai` subcommands (also linked into the
-                            FFAICLI executable target)
+    CLI/                    `butter` subcommands (also linked into the
+                            ButterCLI executable target)
     Models/
       <Family>.swift        family root (main interface, dispatch
                             entry point for VL/multi-modal orchestrators)
@@ -173,17 +173,17 @@ Sources/
       DecoderLayer.swift     shared per-layer mixer protocol
       MoELayer.swift         shared MoE routing + dispatch
 
-  MetalTileSwift/           Pre-compiled kernels + dispatch wrappers
-    MetalTileLibrary.swift  Singleton MTLDevice + MTLLibrary loader
+  IronSwift/           Pre-compiled kernels + dispatch wrappers
+    IronLibrary.swift  Singleton MTLDevice + MTLLibrary loader
     PSOCache.swift          (name, function-constants) → PSO
     Resources/              kernels.metallib + manifest.json
-    Generated/              MetalTileKernels.swift (typed wrappers)
+    Generated/              IronKernels.swift (typed wrappers)
 
-  FFAICLI/                  ffai executable entry point
+  ButterCLI/                  butter executable entry point
 
 Tests/
-  MetalTileSwiftTests/      One file per kernel + KernelManifestSmokeTests
-  FFAITests/                Offline unit tests — mirror Sources/FFAI/
+  IronSwiftTests/      One file per kernel + KernelManifestSmokeTests
+  ButterTests/                Offline unit tests — mirror Sources/ButterSwift/
                             layout (Generation/, KVCache/, Ops/, Stats/, …)
   ModelIntegrationTests/    Per-family end-to-end checkpoint downloads,
                             grouped by modality (Text/, Audio/Omni/,

@@ -31,7 +31,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Qwen35 Vision Integration", .serialized)
 struct Qwen35VisionIntegrationTests {

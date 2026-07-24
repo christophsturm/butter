@@ -1,12 +1,12 @@
 name: CI
 
-# Build + unit-test FFAI on Apple Silicon. Runs on:
+# Build + unit-test Butter on Apple Silicon. Runs on:
 #   - every push to `main` (release branch — gate before tagging)
 #   - every push to `dev`  (working branch — catch regressions early)
 #   - every PR targeting either branch
 #
-# Scope is intentionally limited to the **unit suite** (FFAITests +
-# MetalTileSwiftTests). The integration suite (ModelTests) downloads
+# Scope is intentionally limited to the **unit suite** (ButterTests +
+# IronSwiftTests). The integration suite (ModelTests) downloads
 # multi-GB HuggingFace snapshots + does real end-to-end inference —
 # too slow for every PR, and OOM-prone on the runner's 7 GB cap.
 # The release workflow exercises the integration suite right before
@@ -37,27 +37,27 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
-        working-directory: FFAI
+        working-directory: Butter
 
     steps:
-      - name: Checkout FFAI
+      - name: Checkout Butter
         uses: actions/checkout@v6
         with:
-          path: FFAI
+          path: Butter
 
-      - name: Checkout sibling ffai-kernels
+      - name: Checkout sibling iron
         # Pinned to `dev` for now because:
-        #   - thewafflehaus/ffai-kernels main is behind upstream's CLI rework.
-        #   - upstream/ffai-kernels main is a `gm` placeholder commit.
-        #   - All the kernels FFAI's Ops.swift expects live on
-        #     thewafflehaus/ffai-kernels dev (post the ek/std-kernels merge).
+        #   - thewafflehaus/iron main is behind upstream's CLI rework.
+        #   - upstream/iron main is a `gm` placeholder commit.
+        #   - All the kernels Butter's Ops.swift expects live on
+        #     thewafflehaus/iron dev (post the ek/std-kernels merge).
         # Move back to `main` once we sync our org's main from upstream's
-        # post-CLI-rework main, or cut a ffai-kernels release tag and pin to it.
+        # post-CLI-rework main, or cut an iron release tag and pin to it.
         uses: actions/checkout@v6
         with:
-          repository: thewafflehaus/ffai-kernels
+          repository: thewafflehaus/iron
           ref: dev
-          path: ffai-kernels
+          path: iron
 
       - name: Show toolchain
         run: |
@@ -70,14 +70,14 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo registry + ffai-kernels build
+      - name: Cache cargo registry + iron build
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ${{ github.workspace }}/ffai-kernels/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('ffai-kernels/Cargo.lock', 'ffai-kernels/Cargo.toml') }}
+            ${{ github.workspace }}/iron/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('iron/Cargo.lock', 'iron/Cargo.toml') }}
           restore-keys: |
             cargo-${{ runner.os }}-
 
@@ -85,40 +85,37 @@ jobs:
         uses: actions/cache@v5
         with:
           path: |
-            FFAI/.build
+            Butter/.build
             ~/Library/Caches/org.swift.swiftpm
-          key: spm-${{ runner.os }}-${{ hashFiles('FFAI/Package.swift', 'FFAI/Package.resolved') }}
+          key: spm-${{ runner.os }}-${{ hashFiles('Butter/Package.swift', 'Butter/Package.resolved') }}
           restore-keys: |
             spm-${{ runner.os }}-
 
       - name: Resolve Swift packages
         run: swift package resolve
 
-      - name: Generate kernel artifacts (ffaik build --emit all)
-        # Compiles ffai-kernels and produces kernels.metallib + manifest.json
-        # + Generated/FFAIKernels.swift into FFAI/Sources/MetalTileSwift/.
-        # Run from ffai-kernels/ so its rust-toolchain.toml is picked up.
-        working-directory: ffai-kernels
-        # `ffaik build` spawns `__ffai_runner` (ffai-kernels-std bin) for
+      - name: Generate kernel artifacts (iron build --emit all)
+        # Compiles iron and produces kernels.metallib + manifest.json
+        # + Generated/IronKernels.swift into Butter/Sources/IronSwift/.
+        # Run from iron/ so its rust-toolchain.toml is picked up.
+        working-directory: iron
+        # `iron build` spawns `__iron_runner` (iron-std bin) for
         # kernel discovery, resolved by bare name via PATH. Build both and
-        # put target/release on PATH — building only `ffaik` never builds
+        # put target/release on PATH — building only `iron` never builds
         # the sibling runner.
         run: |
-          cargo build --release --bin ffaik --bin __ffai_runner
-          PATH="$PWD/target/release:$PATH" ffaik build --emit all \
-            --out ${{ github.workspace }}/FFAI/Sources/MetalTileSwift
-          # Compat shim: FFAI still dispatches via MetalTileKernels.*
-          OUT="${{ github.workspace }}/FFAI/Sources/MetalTileSwift/Generated"
-          printf '// swift-format-ignore-file\n//\npublic typealias MetalTileKernels = FFAIKernels\n' \
-            > "$OUT/MetalTileKernels.swift"
-          if [ -f "$OUT/FFAIKernels.swift" ] && ! head -1 "$OUT/FFAIKernels.swift" | grep -q swift-format-ignore-file; then
-            tmp="$OUT/FFAIKernels.swift.tmp"
-            { printf '// swift-format-ignore-file\n//\n'; cat "$OUT/FFAIKernels.swift"; } > "$tmp"
-            mv "$tmp" "$OUT/FFAIKernels.swift"
+          cargo build --release --bin iron --bin __iron_runner
+          PATH="$PWD/target/release:$PATH" iron build --emit all \
+            --out ${{ github.workspace }}/Butter/Sources/IronSwift
+          OUT="${{ github.workspace }}/Butter/Sources/IronSwift/Generated"
+          if [ -f "$OUT/IronKernels.swift" ] && ! head -1 "$OUT/IronKernels.swift" | grep -q swift-format-ignore-file; then
+            tmp="$OUT/IronKernels.swift.tmp"
+            { printf '// swift-format-ignore-file\n//\n'; cat "$OUT/IronKernels.swift"; } > "$tmp"
+            mv "$tmp" "$OUT/IronKernels.swift"
           fi
 
       - name: Run unit tests (with coverage)
-        # FFAITests + MetalTileSwiftTests (kernel round-trip).
+        # ButterTests + IronSwiftTests (kernel round-trip).
         # Integration tests (ModelTests) are deliberately excluded — they
         # ship a different way (release.yml runs them right before tagging).
         #
@@ -130,7 +127,7 @@ jobs:
         # symptom is tests pass but the run exits 1 with "The folder
         # 'codecov' doesn't exist". Letting swift test own the build keeps
         # the coverage and testability flags in lockstep.
-        run: swift test --enable-code-coverage --filter "FFAITests|MetalTileSwiftTests"
+        run: swift test --enable-code-coverage --filter "ButterTests|IronSwiftTests"
 
       - name: Coverage summary
         if: always()
@@ -139,7 +136,7 @@ jobs:
           PROF_DATA="$BIN_PATH/codecov/default.profdata"
           if [ -f "$PROF_DATA" ]; then
             xcrun llvm-cov report \
-              "$BIN_PATH/FFAIPackageTests.xctest/Contents/MacOS/FFAIPackageTests" \
+              "$BIN_PATH/ButterPackageTests.xctest/Contents/MacOS/ButterPackageTests" \
               -instr-profile="$PROF_DATA" \
               -ignore-filename-regex='(\.build|Tests|Generated)' || true
           else
@@ -152,5 +149,5 @@ jobs:
         with:
           name: test-results
           path: |
-            FFAI/.build/**/Logs/Test/*.xcresult
+            Butter/.build/**/Logs/Test/*.xcresult
           retention-days: 7

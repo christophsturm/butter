@@ -32,7 +32,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("FalconH1 Integration", .serialized)
 struct FalconH1IntegrationTests {

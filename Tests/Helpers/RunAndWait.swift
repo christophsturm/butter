@@ -14,7 +14,7 @@
 //
 // Shared GPU-test helper: encode + commit + wait inside an
 // autoreleasepool. Lives in the shared `TestHelpers` target so every
-// test target depending on it (FFAITests, ModelIntegrationTests) can
+// test target depending on it (ButterTests, ModelIntegrationTests) can
 // invoke `runAndWait { ... }` without duplicating the source file.
 //
 // Why the pool: `commandQueue.makeCommandBuffer()` returns an
@@ -33,7 +33,7 @@
 // each call. Per Apple's Memory Management docs this is the standard
 // fix for objc-bridged code in tight loops.
 
-import FFAI
+import ButterSwift
 import Foundation
 import Metal
 

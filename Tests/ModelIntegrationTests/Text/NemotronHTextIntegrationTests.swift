@@ -13,11 +13,11 @@
 // limitations under the License.
 //
 // Slow integration test: downloads (or hits cache) the smallest
-// FFAI-runnable NemotronH checkpoint and runs end-to-end greedy
+// Butter-runnable NemotronH checkpoint and runs end-to-end greedy
 // generation. Skipped automatically if the network or checkpoint isn't
 // available.
 //
-// NemotronH is FFAI's first *stack-interleaved* hybrid — a
+// NemotronH is Butter's first *stack-interleaved* hybrid — a
 // `hybrid_override_pattern` string assigns each decoder layer one mixer
 // kind (Mamba 2 "M", attention "*", dense squared-ReLU MLP "-"), and
 // the kinds vary down the stack. This test exercises the heterogeneous
@@ -27,7 +27,7 @@
 // no-RoPE attention.
 //
 // ekryski/Nemotron-H-4B-Base-8K-4bit (~4B params, bf16) is the smallest
-// published NemotronH checkpoint whose config the shipped FFAI path can
+// published NemotronH checkpoint whose config the shipped Butter path can
 // run end-to-end: its Mamba layers have d_inner/n_groups = 896, a valid
 // rmsNormRows row size, and the pattern carries no MoE ("E") layers.
 // The MoE-bearing Cascade-2 / Nemotron-3 checkpoints are rejected at
@@ -37,7 +37,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("NemotronH Text Integration", .serialized)
 struct NemotronHTextIntegrationTests {

@@ -22,7 +22,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Qwen3 Text Integration", .serialized)
 struct Qwen3TextIntegrationTests {

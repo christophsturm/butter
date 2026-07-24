@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 # setup-dev.sh
-# One-time development environment setup for FFAI.
+# One-time development environment setup for Butter.
 # Verifies toolchains, resolves dependencies, runs first build.
 #
 #   ./scripts/setup-dev.sh
@@ -24,7 +24,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-METALTILE_DIR="$PROJECT_ROOT/../metaltile"
+IRON_DIR="$PROJECT_ROOT/../iron"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -36,7 +36,7 @@ warn() { echo -e "${YELLOW}  ⚠${NC}  $1"; }
 fail() { echo -e "${RED}  ✗${NC} $1"; exit 1; }
 
 echo ""
-echo "Setting up FFAI development environment..."
+echo "Setting up Butter development environment..."
 echo ""
 
 # ─────────────────────────────────────────────
@@ -91,19 +91,19 @@ else
 fi
 
 # ─────────────────────────────────────────────
-# Sibling metaltile checkout
+# Sibling iron checkout
 # ─────────────────────────────────────────────
 echo ""
-echo "Checking sibling metaltile repo..."
-if [ ! -d "$METALTILE_DIR" ]; then
-    warn "metaltile not found at $METALTILE_DIR"
+echo "Checking sibling iron repo..."
+if [ ! -d "$IRON_DIR" ]; then
+    warn "iron not found at $IRON_DIR"
     echo ""
     echo "Clone it with:"
-    echo "  cd $(dirname "$PROJECT_ROOT") && git clone https://github.com/thewafflehaus/metaltile"
+    echo "  cd $(dirname "$PROJECT_ROOT") && git clone https://github.com/thewafflehaus/iron"
     echo ""
-    fail "metaltile checkout required for kernel generation"
+    fail "iron checkout required for kernel generation"
 fi
-ok "metaltile: $METALTILE_DIR"
+ok "iron: $IRON_DIR"
 
 # ─────────────────────────────────────────────
 # Resolve packages

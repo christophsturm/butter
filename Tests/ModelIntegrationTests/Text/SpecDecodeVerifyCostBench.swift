@@ -27,7 +27,7 @@ import Metal
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 private let qwen36VerifyPath = "/Users/tom/models/Qwen3.6-35B-A3B-4bit"
 

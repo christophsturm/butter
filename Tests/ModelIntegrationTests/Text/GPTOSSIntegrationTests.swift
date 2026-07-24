@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Slow integration test: loads the smallest FFAI-runnable GPT-OSS-20B
+// Slow integration test: loads the smallest Butter-runnable GPT-OSS-20B
 // checkpoint (a 4-bit / MXFP4-quantized tag) and runs end-to-end greedy
 // generation. Skipped automatically if no checkpoint is cached.
 //
@@ -30,16 +30,16 @@
 //   3. Bias-corrected q/k/v/o projections (`attention_bias`).
 //
 // The MoE experts ship MXFP4-quantized; the loader transcodes them to
-// FFAI's affine-int4 format at load time (see GPTOSSMoE.swift).
+// Butter's affine-int4 format at load time (see GPTOSSMoE.swift).
 //
 // `mlx-community/gpt-oss-20b-MXFP4-Q8` (~11 GB) is the target — it fits
 // in the dev box's memory budget. The transcode is lossy, so the test
-// asserts pipeline-level *coherence* (the FFAI integration contract),
+// asserts pipeline-level *coherence* (the Butter integration contract),
 // not cross-implementation token parity.
 //
-// Env-gated: GPT-OSS-20B is FFAI's heaviest integration target. A
+// Env-gated: GPT-OSS-20B is Butter's heaviest integration target. A
 // debug-build greedy decode of a ~20B MoE runs for minutes, so this
-// suite runs only when `FFAI_BUILD_MACHINE` is set — keeping it out of
+// suite runs only when `BUTTER_BUILD_MACHINE` is set — keeping it out of
 // the routine `make test-integration` gate and matching the GPT-OSS
 // row of `ModelKVCacheMatrixIntegrationTests`.
 
@@ -47,13 +47,13 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "GPTOSS Integration", .serialized,
     .enabled(
-        if: ProcessInfo.processInfo.environment["FFAI_BUILD_MACHINE"] != nil,
-        "GPT-OSS-20B is build-machine-only; set FFAI_BUILD_MACHINE to run")
+        if: ProcessInfo.processInfo.environment["BUTTER_BUILD_MACHINE"] != nil,
+        "GPT-OSS-20B is build-machine-only; set BUTTER_BUILD_MACHINE to run")
 )
 struct GPTOSSIntegrationTests {
 

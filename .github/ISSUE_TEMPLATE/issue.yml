@@ -12,8 +12,8 @@ body:
         relevant signal without scraping freeform prose.
 
         **Before filing:**
-        - Search [existing issues](https://github.com/thewafflehaus/FFAI/issues?q=is%3Aissue) to avoid duplicates.
-        - For features: check [`planning/roadmap.md`](https://github.com/thewafflehaus/FFAI/blob/main/planning/roadmap.md) — it may already be planned.
+        - Search [existing issues](https://github.com/thewafflehaus/butter/issues?q=is%3Aissue) to avoid duplicates.
+        - For features: check [`planning/roadmap.md`](https://github.com/thewafflehaus/butter/blob/main/planning/roadmap.md) — it may already be planned.
         - For bugs: try `main` HEAD; many issues are already fixed.
 
   - type: checkboxes
@@ -39,7 +39,7 @@ body:
         happened (or what should happen), why does it matter?
       placeholder: |
         Loading mlx-community/Qwen3-1.7B-bf16 fails on first call
-        with "X" on macOS 15.4.0 / M1 Max / Xcode 16.2 / FFAI commit
+        with "X" on macOS 15.4.0 / M1 Max / Xcode 16.2 / Butter commit
         abc123. The same checkpoint loads fine in mlx-lm.
     validations:
       required: true
@@ -57,7 +57,7 @@ body:
           already considered.
       placeholder: |
         ```bash
-        ffai generate -m mlx-community/Qwen3-1.7B-bf16 -p "Hi"
+        butter generate -m mlx-community/Qwen3-1.7B-bf16 -p "Hi"
         # → Error: ...
         ```
 
@@ -73,13 +73,13 @@ body:
       description: |
         Required for bugs / perf issues. Optional for features and
         discussions. Paste output of `swift --version` + `xcodebuild
-        -version` + `sw_vers` + the FFAI commit / version you're on.
+        -version` + `sw_vers` + the Butter commit / version you're on.
       render: shell
       placeholder: |
         macOS 15.4.0 (M1 Max, 64GB)
         Xcode 16.2 (Build version 16C5032a)
         Apple Swift version 6.1
-        FFAI: thewafflehaus/FFAI@abc1234 (dev)
+        Butter: thewafflehaus/butter@abc1234 (dev)
     validations:
       required: false
 
@@ -108,5 +108,5 @@ body:
       options:
         - label: I searched for duplicate issues.
           required: true
-        - label: I read [`CONTRIBUTING.md`](https://github.com/thewafflehaus/FFAI/blob/main/CONTRIBUTING.md).
+        - label: I read [`CONTRIBUTING.md`](https://github.com/thewafflehaus/butter/blob/main/CONTRIBUTING.md).
           required: true

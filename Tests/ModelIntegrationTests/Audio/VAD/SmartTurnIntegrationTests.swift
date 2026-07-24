@@ -31,7 +31,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("SmartTurn Integration", .serialized)
 struct SmartTurnIntegrationTests {

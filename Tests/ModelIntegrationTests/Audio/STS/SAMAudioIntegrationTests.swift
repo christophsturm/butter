@@ -26,7 +26,7 @@
 import Foundation
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("SAMAudio Integration", .serialized)
 struct SAMAudioIntegrationTests {

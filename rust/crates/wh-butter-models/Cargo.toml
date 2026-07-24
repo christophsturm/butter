@@ -1,0 +1,13 @@
+[package]
+name = "wh-butter-models"
+description = "Butter model definitions (forward passes) as backend-neutral Rust. Ported from Butter-Swift Models/, validated against it as the oracle."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wh-butter-core.workspace = true
+wh-butter-ops.workspace = true
+wh-butter-loader.workspace = true
+serde_json.workspace = true

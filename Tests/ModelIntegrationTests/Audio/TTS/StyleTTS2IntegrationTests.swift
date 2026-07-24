@@ -22,7 +22,7 @@
 //
 // The full acoustic synthesize() path requires the ALBERT + prosody predictor
 // + KittenDecoder forward pass — operators (batched GEMM, multi-head attention,
-// 1-D conv, BiLSTM) not yet in FFAI's Ops set. The placeholder path verifies
+// 1-D conv, BiLSTM) not yet in Butter's Ops set. The placeholder path verifies
 // load + config without running the acoustic stack. See
 // StyleTTS2Error.acousticFrontEndNotWired.
 //
@@ -32,7 +32,7 @@
 import Foundation
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("StyleTTS2 Integration", .serialized)
 struct StyleTTS2IntegrationTests {
@@ -185,7 +185,7 @@ struct StyleTTS2IntegrationTests {
     @Test("AudioModelRegistry.load throws for non-audio directory")
     func registryRejectsTextModel() async throws {
         let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ffai-s2tts-int-\(UUID().uuidString)")
+            .appendingPathComponent("butter-s2tts-int-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: dir) }
         try FileManager.default.createDirectory(
             at: dir,

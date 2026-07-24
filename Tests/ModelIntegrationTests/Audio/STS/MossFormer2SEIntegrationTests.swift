@@ -31,7 +31,7 @@
 import Foundation
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("MossFormer2SE Integration", .serialized)
 struct MossFormer2SEIntegrationTests {

@@ -14,7 +14,7 @@
 //
 // MiniCPM5-1B — OpenBMB's 1B base text model. Declares
 // `architectures: ["LlamaForCausalLM"]` + `model_type: "llama"`, so it
-// routes through FFAI's existing Llama dense loader with no family-
+// routes through Butter's existing Llama dense loader with no family-
 // specific code. Two integration variants are pinned:
 //
 //   - `openbmb/MiniCPM5-1B` — upstream bf16 (24 layers, hidden=1536,
@@ -32,7 +32,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("MiniCPM5 Integration", .serialized)
 struct MiniCPM5IntegrationTests {

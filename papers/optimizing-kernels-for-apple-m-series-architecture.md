@@ -1,16 +1,16 @@
 # Optimizing Kernels for Apple M-series Architecture
 
-**Authors:** Eric Kryski **Hardware target:** Apple M1 → M5 series (Max class) **Software target:** [FFAI](https://github.com/ekryski/FFAI) on [metaltile](https://github.com/0xClandestine/metaltile) **Status:** Living reference — extend when we discover new optimization patterns.
+**Authors:** Eric Kryski **Hardware target:** Apple M1 → M5 series (Max class) **Software target:** [Butter](https://github.com/thewafflehaus/butter) on [iron](https://github.com/thewafflehaus/iron) **Status:** Living reference — extend when we discover new optimization patterns.
 
-This document is the working reference for everyone writing kernels in metaltile or wrappers in FFAI. It covers:
+This document is the working reference for everyone writing kernels in iron or wrappers in Butter. It covers:
 
 - A **glossary** of Metal / Apple-GPU vocabulary used throughout the codebase.
 - The **hardware**: unified memory, GPU cache hierarchy, per-generation specs, the M5 matrix unit.
 - The **inference model**: what an op is, how decode tokens flow CPU→GPU, where time goes.
 - **Optimization strategies** with concrete recommendations for our kernel families.
-- **FFAI / metaltile conventions** that consumers of the codegen surface need to know.
+- **Butter / iron conventions** that consumers of the codegen surface need to know.
 
-Sections 2–3 are adapted from earlier Sam-project performance notes; sections 1, 4–6 are new and FFAI-specific.
+Sections 2–3 are adapted from earlier Sam-project performance notes; sections 1, 4–6 are new and Butter-specific.
 
 ---
 
@@ -24,9 +24,9 @@ Terms with specific meanings in Apple's Metal vocabulary that show up across our
 | **Simdgroup** | A hardware-fixed group of 32 lanes that execute in lockstep on one shader-core scheduler slot. `simd_sum`, `simd_max`, `simd_broadcast`, `simd_shuffle_xor` all reduce/communicate across these 32 lanes. NVIDIA equivalent: warp. |
 | **Threadgroup** | A software-defined group of 1–32 simdgroups (32–1024 threads). Shares `threadgroup`-scoped memory and `threadgroup_barrier()`. Cooperative cross-simdgroup work happens here. |
 | **TPG** | **Threads Per Threadgroup.** The width of the threadgroup, in threads. Hard-capped at 1024 on M-series. Must be a multiple of 32 if the kernel uses any `simd_*` intrinsic (else only partial simdgroups participate, which is undefined). Set at dispatch time via `threadsPerThreadgroup`. |
-| **Grid** | The total dispatch geometry, expressed as a 3D box of threadgroups. Metal hierarchically subdivides: `grid` → `threadgroups` → `simdgroups` → `lanes`. metaltile's `dispatch_with_grid([gx,gy,gz], [tx,ty,tz])` takes grid in *threadgroups* and tg size in *threads*; total threads = `gx*gy*gz*tx*ty*tz`. |
+| **Grid** | The total dispatch geometry, expressed as a 3D box of threadgroups. Metal hierarchically subdivides: `grid` → `threadgroups` → `simdgroups` → `lanes`. iron's `dispatch_with_grid([gx,gy,gz], [tx,ty,tz])` takes grid in *threadgroups* and tg size in *threads*; total threads = `gx*gy*gz*tx*ty*tz`. |
 | **Dispatch** | One `dispatchThreadgroups()` (or `dispatchThreads()`) call on a `MTLComputeCommandEncoder`. Encoded into a command buffer. Carries a PSO, a binding table, and the grid geometry. |
-| **Op** | An MLX / metaltile abstraction over a dispatch. One op = set PSO + bind buffers + set scalars + dispatch. ~5–10 µs of CPU encoding cost per op. Reshape / transpose / slice are NOT ops — they create array view metadata with zero GPU cost. |
+| **Op** | An MLX / iron abstraction over a dispatch. One op = set PSO + bind buffers + set scalars + dispatch. ~5–10 µs of CPU encoding cost per op. Reshape / transpose / slice are NOT ops — they create array view metadata with zero GPU cost. |
 | **Command Buffer (CB)** | An ordered sequence of dispatches and resource bindings, committed to a `MTLCommandQueue` for GPU execution. Metal keeps every buffer referenced by a CB alive until the CB completes — peak memory tracks CB granularity. |
 | **Pipeline State Object (PSO)** | A compiled-kernel + binding-layout artifact. Compiled from MSL once per `(kernel, function-constants)` pair, then cached in `PSOCache.shared`. Per-dispatch cost amortizes to a hash lookup. |
 | **Register file** | Per-GPU-core SRAM holding per-thread variables. ~208 KB/core on M1 Max; ~210 KB/core × 40 cores ≈ 8.2 MiB total on M5 Max. Cleared between dispatches. Register pressure caps occupancy. |
@@ -34,8 +34,8 @@ Terms with specific meanings in Apple's Metal vocabulary that show up across our
 | **L1 / L2 / SLC** | GPU L1 (8 KB / core), GPU L2 (512 KB shared by all GPU cores), SLC = System Level Cache (48 MB on M1 Max; shared between CPU, GPU, ANE). Only SLC is big enough to amortize anything model-scale. |
 | **Unified Memory** | CPU and GPU read the same physical LPDDR memory — no copy, no PCIe. Bandwidth: 400 GB/s on M1 Max, 614 GB/s on M5 Max. Decode at our model sizes is bandwidth-bound on weight reads. |
 | **ANE (Apple Neural Engine)** | Dedicated 16-core neural accelerator with 32 MB SRAM. Native int8 / fp16 / bf16 / fp32. Runs in parallel with the GPU — ops on ANE don't consume GPU cycles. Accessed via CoreML (public) or `_ANEClient` (private). |
-| **Reduction mode** | metaltile `KernelMode::Reduction`: kernel uses `simd_*` intrinsics and/or `threadgroup_alloc` to cooperate across threads in a group. `program_id<0>` lowers to `tgid_x` (threadgroup index). Carries strict TPG invariants. |
-| **Grid3D mode** | metaltile `KernelMode::Grid3D`: "one thread per output element" pattern. `program_id<i>` lowers to `thread_position_in_grid.{x,y,z}`. No simdgroup arithmetic; no TPG invariant. |
+| **Reduction mode** | iron `KernelMode::Reduction`: kernel uses `simd_*` intrinsics and/or `threadgroup_alloc` to cooperate across threads in a group. `program_id<0>` lowers to `tgid_x` (threadgroup index). Carries strict TPG invariants. |
+| **Grid3D mode** | iron `KernelMode::Grid3D`: "one thread per output element" pattern. `program_id<i>` lowers to `thread_position_in_grid.{x,y,z}`. No simdgroup arithmetic; no TPG invariant. |
 | **Occupancy** | Active simdgroups per GPU core, ÷ peak simdgroups the core can hold. Bound by register pressure and threadgroup-memory pressure. Higher occupancy = better latency hiding for memory loads. |
 | **Vector / Steel attention** | MLX naming for two SDPA variants. *Vector* is the per-query-vector kernel used at decode (Q is 1 row); *Steel* is the tiled flash-attention kernel used at prefill (Q is many rows). |
 | **GQA / Grouped-Query Attention** | Multiple Q heads share a single KV head, so the cache shrinks by the GQA factor. `heads_per_group = nQHeads / nKVHeads`. |
@@ -220,7 +220,7 @@ Metal keeps every buffer referenced by a CB alive until the CB completes. MLX ba
 
 ---
 
-## 4. Kernel Optimization Strategies for FFAI
+## 4. Kernel Optimization Strategies for Butter
 
 This is the prescriptive section — apply these patterns when porting or writing a new kernel.
 
@@ -284,7 +284,7 @@ Each fusion adds register pressure; check occupancy doesn't drop below the unfus
 
 ### 4.5 Quantize the KV cache, not just the weights
 
-Decode is bandwidth-bound. Weights are 4-bit already; the KV cache is often the next-largest bandwidth consumer. AURA (FFAI's bit-pack codec) compresses K and V to 2–8 bits with a rotated-codebook quantizer; long-context attention reads compressed K/V from DRAM and dequantizes on-the-fly in the attention kernel. See `papers/aura-compression-algorithm.md`.
+Decode is bandwidth-bound. Weights are 4-bit already; the KV cache is often the next-largest bandwidth consumer. AURA (Butter's bit-pack codec) compresses K and V to 2–8 bits with a rotated-codebook quantizer; long-context attention reads compressed K/V from DRAM and dequantizes on-the-fly in the attention kernel. See `papers/aura-compression-algorithm.md`.
 
 Rough numbers: at 16K context, Gemma4 E2B's full-precision KV cache is ~3 MB / layer / token (read once per token). AURA at 4-bit drops that 4×.
 
@@ -333,11 +333,11 @@ If you see asyncEval times that don't track CPU graph-build work, this is the fi
 
 ---
 
-## 5. FFAI / metaltile Conventions
+## 5. Butter / iron Conventions
 
 ### 5.1 DISPATCH INVARIANTS blocks
 
-Every reduction-mode kernel in `metaltile-std/src/{ffai,mlx}/` carries a `## DISPATCH INVARIANTS` docblock at the top of its `.rs` source. Example from `sdpa_decode.rs`:
+Every reduction-mode kernel in `iron-std/src/{butter,mlx}/` carries a `## DISPATCH INVARIANTS` docblock at the top of its `.rs` source. Example from `sdpa_decode.rs`:
 
 ```rust
 //! ## DISPATCH INVARIANTS
@@ -352,9 +352,9 @@ Every reduction-mode kernel in `metaltile-std/src/{ffai,mlx}/` carries a `## DIS
 //! - n_kv ≤ kv_stride.
 ```
 
-Consumers (FFAI's `OpsValidation`, GPU correctness tests) cite this block in their error messages. New reduction kernels MUST include one.
+Consumers (Butter's `OpsValidation`, GPU correctness tests) cite this block in their error messages. New reduction kernels MUST include one.
 
-### 5.2 metaltile `dispatch_with_grid` semantics
+### 5.2 iron `dispatch_with_grid` semantics
 
 `Context::dispatch_with_grid(kernel, buffers, constexprs, grid_xyz, tg_xyz)` calls `dispatchThreadgroups_threadsPerThreadgroup(grid_xyz, tg_xyz)`. So:
 
@@ -370,22 +370,22 @@ When porting a new kernel:
 
 | Layer | Catches | Location |
 |---|---|---|
-| **Codegen smoke** | DSL → MSL emission, `xcrun metal` accepts the output | `cargo test -p metaltile-std --lib` + `make emit-all` |
-| **MSL snapshots** (insta) | Codegen pass output drift; reviewable text diffs in PRs | `crates/metaltile-codegen/tests/msl_snapshots.rs` |
-| **GPU correctness** | Numerical disagreement vs naive CPU reference, on real Metal | `crates/metaltile-std/tests/<kernel>_gpu_correctness.rs` |
+| **Codegen smoke** | DSL → MSL emission, `xcrun metal` accepts the output | `cargo test -p iron-std --lib` + `make emit-all` |
+| **MSL snapshots** (insta) | Codegen pass output drift; reviewable text diffs in PRs | `crates/iron-codegen/tests/msl_snapshots.rs` |
+| **GPU correctness** | Numerical disagreement vs naive CPU reference, on real Metal | `crates/iron-std/tests/<kernel>_gpu_correctness.rs` |
 | **MLX side-by-side** (bench) | Numerical parity vs upstream MLX kernel | `make bench-vv` |
 
-The first three are CI-runnable; the bench is local-only (needs MLX checkout). For an FFAI-only kernel (no MLX counterpart), MLX side-by-side doesn't apply — rely on the first three plus the FFAI integration test.
+The first three are CI-runnable; the bench is local-only (needs MLX checkout). For an Butter-only kernel (no MLX counterpart), MLX side-by-side doesn't apply — rely on the first three plus the Butter integration test.
 
-### 5.4 Wrapping a kernel in FFAI
+### 5.4 Wrapping a kernel in Butter
 
-`Sources/FFAI/Ops.swift` is the consumer-facing Swift API over `MetalTileKernels.*`. For reduction-mode kernels, the wrapper MUST:
+`Sources/ButterSwift/Ops.swift` is the consumer-facing Swift API over `IronKernels.*`. For reduction-mode kernels, the wrapper MUST:
 
 1. Cite the kernel's `DISPATCH INVARIANTS` block as a source of truth.
 2. Encode every invariant as a `precondition` via the matching `OpsValidation.validate*` function.
 3. Compute dispatch geometry from invariants, never from `elementwiseGrid`.
 
-See `Sources/FFAI/OpsValidation.swift` for the pattern and `FFAI/CLAUDE.md §"Wrapping kernels in FFAI"` for the longer-form rationale.
+See `Sources/ButterSwift/OpsValidation.swift` for the pattern and `Butter/CLAUDE.md §"Wrapping kernels in Butter"` for the longer-form rationale.
 
 ---
 
@@ -451,5 +451,5 @@ Internal:
 - `papers/aura-compression-algorithm.md` — KV cache codec.
 - `papers/beyond-quadratic-attention-on-apple-silicon.md` — long-context attention strategies.
 - `papers/speculative-decoding-on-apple-silicon.md` — Phase 8 batching + speculative decode plans.
-- `FFAI/CLAUDE.md §"Wrapping kernels in FFAI"` — required-reading checklist for Ops wrapper authors.
-- `metaltile/CLAUDE.md` and `metaltile/CONTRIBUTING.md` — DSL idioms and review conventions.
+- `Butter/CLAUDE.md §"Wrapping kernels in Butter"` — required-reading checklist for Ops wrapper authors.
+- `iron/CLAUDE.md` and `iron/CONTRIBUTING.md` — DSL idioms and review conventions.

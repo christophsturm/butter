@@ -38,7 +38,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Gemma4 Text Integration", .serialized)
 struct Gemma4TextIntegrationTests {
@@ -116,8 +116,8 @@ struct Gemma4TextIntegrationTests {
     @Test(
         "Gemma4Dense (31B): load + greedy generate produces coherent output",
         .enabled(
-            if: ProcessInfo.processInfo.environment["FFAI_BUILD_MACHINE"] != nil,
-            "Gemma 4 31B is build-machine-only; set FFAI_BUILD_MACHINE to run")
+            if: ProcessInfo.processInfo.environment["BUTTER_BUILD_MACHINE"] != nil,
+            "Gemma 4 31B is build-machine-only; set BUTTER_BUILD_MACHINE to run")
     )
     func loadAndGenerateDense() async throws {
         // The smallest non-PLE dense Gemma 4 is 31B — only available as
@@ -147,8 +147,8 @@ struct Gemma4TextIntegrationTests {
     @Test(
         "Gemma4MoE (26B-A4B): load + greedy generate produces coherent output",
         .enabled(
-            if: ProcessInfo.processInfo.environment["FFAI_BUILD_MACHINE"] != nil,
-            "Gemma 4 26B-A4B is build-machine-only; set FFAI_BUILD_MACHINE to run")
+            if: ProcessInfo.processInfo.environment["BUTTER_BUILD_MACHINE"] != nil,
+            "Gemma 4 26B-A4B is build-machine-only; set BUTTER_BUILD_MACHINE to run")
     )
     func loadAndGenerateMoE() async throws {
         // 26B-A4B is the mixture-of-experts variant: every layer runs a

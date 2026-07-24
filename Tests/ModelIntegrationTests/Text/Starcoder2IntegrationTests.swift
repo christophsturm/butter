@@ -20,7 +20,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Starcoder2 Integration", .serialized)
 struct Starcoder2IntegrationTests {

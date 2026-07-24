@@ -1,0 +1,26 @@
+[package]
+name = "wh-butter"
+description = "Butter — Melt away latency with ultra-smooth local inference. Modular, multi-backend inference engine (Rust core). The Apple/iPhone production path is the Swift sibling under swift/."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wh-butter-core.workspace = true
+wh-butter-ops.workspace = true
+wh-butter-models.workspace = true
+wh-butter-runtime.workspace = true
+wh-butter-loader.workspace = true
+wh-butter-metal = { workspace = true, optional = true }
+wh-butter-cuda = { workspace = true, optional = true }
+wh-butter-vulkan = { workspace = true, optional = true }
+
+[features]
+# Pick backends at build time. Default = metal for Mac dev boxes; build a
+# CUDA host with `--no-default-features --features cuda`.
+default = ["metal"]
+metal = ["dep:wh-butter-metal"]
+cuda = ["dep:wh-butter-cuda", "wh-butter-cuda/cuda"]
+vulkan = ["dep:wh-butter-vulkan", "wh-butter-vulkan/vulkan"]
+all-backends = ["metal", "cuda", "vulkan"]

@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // End-to-end test: download mlx-community/Qwen3-1.7B-3bit and assert
-// FFAI's greedy decode produces coherent output. Exercises the
+// Butter's greedy decode produces coherent output. Exercises the
 // dequant_gemv_int3 kernel end-to-end on Qwen3 1.7B.
 //
 // Skipped if network/checkpoint isn't available.
@@ -22,7 +22,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Qwen3 3-bit Integration", .serialized)
 struct Quantized3bitIntegrationTests {

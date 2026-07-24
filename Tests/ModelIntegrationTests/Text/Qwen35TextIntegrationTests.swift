@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Slow integration test: downloads (or hits cache) the smallest
-// FFAI-runnable Qwen3.5 checkpoint and runs end-to-end greedy
+// Butter-runnable Qwen3.5 checkpoint and runs end-to-end greedy
 // generation. Skipped automatically if the network or checkpoint isn't
 // available.
 //
@@ -48,7 +48,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Qwen35 Text Integration", .serialized)
 struct Qwen35TextIntegrationTests {

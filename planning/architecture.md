@@ -1,6 +1,6 @@
-# FFAI — Architecture
+# Butter — Architecture
 
-This document is a **visual** reference for how FFAI works end-to-end: how Metal kernels are generated, how kernels are loaded into the process, how a model is downloaded and bound to GPU memory, and how a single inference token flows through the system.
+This document is a **visual** reference for how Butter works end-to-end: how Metal kernels are generated, how kernels are loaded into the process, how a model is downloaded and bound to GPU memory, and how a single inference token flows through the system.
 
 For the *what we're building and when* see [`plan.md`](plan.md).
 
@@ -15,7 +15,7 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
                            ──────────
 
   ┌──────────────────────────────────────────────────────────────┐
-  │  metaltile (Rust workspace, sibling repo)                    │
+  │  iron (Rust workspace, sibling repo)                    │
   │                                                              │
   │   #[kernel] fn rms_norm<T>(x, w, out, eps, n) { … }          │
   │   #[kernel] fn rope(q, k, freqs, offset, n) { … }            │
@@ -24,8 +24,8 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
   │              │ proc-macro expansion → IR                     │
   │              ▼                                               │
   │   ┌──────────────────────────┐                               │
-  │   │  metaltile-core          │   SSA IR (Kernel, Op,         │
-  │   │  metaltile-codegen       │   Block, ConstExpr, …)        │
+  │   │  iron-core          │   SSA IR (Kernel, Op,         │
+  │   │  iron-codegen       │   Block, ConstExpr, …)        │
   │   │                          │                               │
   │   │  6-pass pipeline:        │                               │
   │   │  TypeCheck → ConstFold   │                               │
@@ -39,39 +39,39 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
                       │
                       ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │  tile build --emit all --out Sources/MetalTileSwift          │
-  │  (metaltile-cli, dev sibling repo)                           │
+  │  iron build --emit all --out Sources/IronSwift          │
+  │  (iron-cli, dev sibling repo)                           │
   │                                                              │
   │  Walks the inventory of `BenchSpec`-registered kernels,      │
   │  for each (kernel × dtype):                                  │
   │   1. Codegen MSL → write Resources/kernels/<name>.metal      │
   │   2. Append to Resources/manifest.json (name, params,        │
   │      dtype, constexprs, mode)                                │
-  │   3. Append to Generated/MetalTileKernels.swift              │
+  │   3. Append to Generated/IronKernels.swift              │
   │      (one strongly-typed Swift func per kernel)              │
   │                                                              │
   │  Then: shell out to                                          │
   │   xcrun -sdk macosx metal -c   *.metal → *.air               │
   │   xcrun -sdk macosx metallib   *.air   → kernels.metallib    │
   │                                                              │
-  │  Emit logic lives in metaltile-codegen::emit so other        │
+  │  Emit logic lives in iron-codegen::emit so other        │
   │  tooling (build scripts, future SPM plugins) can consume     │
   │  it without going through the CLI binary.                    │
   └───────────────────┬──────────────────────────────────────────┘
                       │
                       ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │  Sources/MetalTileSwift/                                     │
+  │  Sources/IronSwift/                                     │
   │   ├─ Resources/                                              │
   │   │   ├─ kernels.metallib       ← compiled Metal binary      │
   │   │   ├─ manifest.json          ← per-kernel metadata        │
   │   │   └─ kernels/*.metal        ← MSL sources (debug aid)    │
   │   └─ Generated/                                              │
-  │       └─ MetalTileKernels.swift ← typed Swift wrappers       │
+  │       └─ IronKernels.swift ← typed Swift wrappers       │
   └──────────────────────────────────────────────────────────────┘
 
            │
-           │  `make regenerate-kernels` runs `tile build --emit all` before
+           │  `make regenerate-kernels` runs `iron build --emit all` before
            │  every `make build` / `make test`
            ▼
    swift build / swift test  →  ready Swift package
@@ -82,14 +82,14 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
 - Kernel changes never require Swift source edits — the wrappers and metallib are regenerated.
 - The `.metal` files are checked in (per `.gitignore` policy: optional; default is regenerate). This makes diffs reviewable and lets contributors inspect what got generated without running cargo.
 - All compilation happens at build time. **Zero runtime JIT.**
-- Kernel sources in metaltile-std are split into `crates/metaltile-std/src/mlx/` (each kernel has an MLX side-by-side comparison via `tile bench` + `check_equiv`) and `crates/metaltile-std/src/ffai/` (model-specific kernels with no MLX upstream counterpart at the pinned `MLX_COMMIT`; correctness validated by FFAI integration tests against real models). Kernels graduate from `ffai/` to `mlx/` when an MLX counterpart ships upstream or someone wires a hand-written runner. The `tile build --emit all` pipeline is agnostic — both folders feed the same `kernels.metallib` + `manifest.json` + `MetalTileKernels.swift` outputs.
-- **No CPU interpreter.** The `metaltile-interp` crate was dropped in upstream PRs #16 / #17. Correctness verification now runs through three layers on the Apple Silicon GPU: (1) per-kernel `<kernel>_gpu_correctness.rs` tests under `crates/metaltile-std/tests/` comparing against a naive CPU reference in fp32 (pattern from PR #35); (2) MLX side-by-side via `tile bench` + `check_equiv` for `mlx/` kernels with an upstream counterpart; (3) FFAI integration tests on real models for `ffai/` kernels. Codegen-side text diffs are caught by `insta` MSL golden snapshots under `crates/metaltile-codegen/tests/snapshots/` (PR #25).
+- Kernel sources in iron-std are split into `crates/iron-std/src/mlx/` (each kernel has an MLX side-by-side comparison via `iron bench` + `check_equiv`) and `crates/iron-std/src/butter/` (model-specific kernels with no MLX upstream counterpart at the pinned `MLX_COMMIT`; correctness validated by Butter integration tests against real models). Kernels graduate from `butter/` to `mlx/` when an MLX counterpart ships upstream or someone wires a hand-written runner. The `iron build --emit all` pipeline is agnostic — both folders feed the same `kernels.metallib` + `manifest.json` + `IronKernels.swift` outputs.
+- **No CPU interpreter.** The `iron-interp` crate was dropped in upstream PRs #16 / #17. Correctness verification now runs through three layers on the Apple Silicon GPU: (1) per-kernel `<kernel>_gpu_correctness.rs` tests under `crates/iron-std/tests/` comparing against a naive CPU reference in fp32 (pattern from PR #35); (2) MLX side-by-side via `iron bench` + `check_equiv` for `mlx/` kernels with an upstream counterpart; (3) Butter integration tests on real models for `butter/` kernels. Codegen-side text diffs are caught by `insta` MSL golden snapshots under `crates/iron-codegen/tests/snapshots/` (PR #25).
 
 ---
 
 ## 2. Process startup (kernel loading)
 
-Happens once when the FFAI process launches.
+Happens once when the Butter process launches.
 
 ```
                           PROCESS STARTUP
@@ -99,7 +99,7 @@ Happens once when the FFAI process launches.
       │
       ▼
   ┌────────────────────────────────────────┐
-  │  MetalTileLibrary.shared (lazy)        │
+  │  IronLibrary.shared (lazy)        │
   │                                        │
   │  1. MTLCreateSystemDefaultDevice()     │
   │  2. device.makeLibrary(URL: bundle     │
@@ -149,7 +149,7 @@ Models are organized into **family files** (one per major architectural lineage:
                        MODEL FILE LAYOUT
                        ─────────────────
 
-  Sources/FFAI/Models/
+  Sources/ButterSwift/Models/
    ├─ Llama.swift          (Llama 3.x: 1B, 3B, 8B, 70B)
    ├─ Qwen35.swift          (Qwen3.5 dense+hybrid+MoE+VL+Omni)
    ├─ Mistral.swift        (Mistral 7B, Mixtral 8x7B/8x22B)
@@ -550,7 +550,7 @@ This is the hot loop. For each token to generate, we run one forward pass throug
                            ▼
   ┌─────────────────────────────────────────────────────────┐
   │  embed_tokens(prev_token)                               │
-  │   → MetalTileKernels.gather(                            │
+  │   → IronKernels.gather(                            │
   │       table:  embed_tokens.weight,                      │
   │       index:  prev_token,                               │
   │       out:    h /* [1, hidden] */,                      │
@@ -561,61 +561,61 @@ This is the hot loop. For each token to generate, we run one forward pass throug
    for each TransformerBlock layer:
    ┌─────────────────────────────────────────────────────────┐
    │  // -- attention --                                     │
-   │  MetalTileKernels.rms_norm(                             │
+   │  IronKernels.rms_norm(                             │
    │     x: h, weight: layer.input_layernorm.weight,         │
    │     out: x_norm, eps:, on: cmdBuf)                      │
    │                                                         │
-   │  MetalTileKernels.gemv_fp16(                            │
+   │  IronKernels.gemv_fp16(                            │
    │     x: x_norm, w: layer.self_attn.q_proj.weight,        │
    │     out: q, on: cmdBuf)                                 │
    │  // … same for k, v                                     │
    │                                                         │
-   │  MetalTileKernels.rope(                                 │
+   │  IronKernels.rope(                                 │
    │     q: q, k: k, freqs: rope_freqs,                      │
    │     offset: cache.length, on: cmdBuf)                   │
    │                                                         │
    │  cache.append(k, v)   // writes into pre-alloc'd        │
    │                       // KV MTLBuffer at offset         │
    │                                                         │
-   │  MetalTileKernels.sdpa_decode(                          │
+   │  IronKernels.sdpa_decode(                          │
    │     q: q,                                               │
    │     k_cache: cache.k_buffer,                            │
    │     v_cache: cache.v_buffer,                            │
    │     length: cache.length,                               │
    │     out: attn_out, on: cmdBuf)                          │
    │                                                         │
-   │  MetalTileKernels.gemv_fp16(                            │
+   │  IronKernels.gemv_fp16(                            │
    │     x: attn_out, w: layer.self_attn.o_proj.weight,      │
    │     out: o, on: cmdBuf)                                 │
    │                                                         │
-   │  MetalTileKernels.add(h, o, out: h, on: cmdBuf)         │
+   │  IronKernels.add(h, o, out: h, on: cmdBuf)         │
    │                                                         │
    │  // -- mlp --                                           │
-   │  MetalTileKernels.rms_norm(                             │
+   │  IronKernels.rms_norm(                             │
    │     x: h, weight: layer.post_attention_layernorm.weight,│
    │     out: x_norm, eps:, on: cmdBuf)                      │
    │                                                         │
-   │  MetalTileKernels.gemv_fp16(                            │
+   │  IronKernels.gemv_fp16(                            │
    │     x: x_norm, w: layer.mlp.gate_proj.weight,           │
    │     out: gate, on: cmdBuf)                              │
-   │  MetalTileKernels.gemv_fp16(                            │
+   │  IronKernels.gemv_fp16(                            │
    │     x: x_norm, w: layer.mlp.up_proj.weight,             │
    │     out: up, on: cmdBuf)                                │
    │                                                         │
-   │  MetalTileKernels.silu_mul(                             │
+   │  IronKernels.silu_mul(                             │
    │     a: gate, b: up, out: g, on: cmdBuf)                 │
    │                                                         │
-   │  MetalTileKernels.gemv_fp16(                            │
+   │  IronKernels.gemv_fp16(                            │
    │     x: g, w: layer.mlp.down_proj.weight,                │
    │     out: d, on: cmdBuf)                                 │
    │                                                         │
-   │  MetalTileKernels.add(h, d, out: h, on: cmdBuf)         │
+   │  IronKernels.add(h, d, out: h, on: cmdBuf)         │
    └────────────────────────┬────────────────────────────────┘
                             │
                             ▼
   ┌─────────────────────────────────────────────────────────┐
-  │  MetalTileKernels.rms_norm(h, model.norm.weight, …)     │
-  │  MetalTileKernels.gemv_fp16(h, lm_head.weight, → logits)│
+  │  IronKernels.rms_norm(h, model.norm.weight, …)     │
+  │  IronKernels.gemv_fp16(h, lm_head.weight, → logits)│
   └────────────────────────┬────────────────────────────────┘
                            │
                            ▼
@@ -637,10 +637,10 @@ This is the hot loop. For each token to generate, we run one forward pass throug
                   (feed back to next loop iter)
 ```
 
-**What each `MetalTileKernels.*` call does internally:**
+**What each `IronKernels.*` call does internally:**
 
 ```
-   MetalTileKernels.rms_norm(x:, weight:, out:, eps:, on: cmdBuf)
+   IronKernels.rms_norm(x:, weight:, out:, eps:, on: cmdBuf)
        │
        ▼
    pso = PSOCache.shared.get(
@@ -744,13 +744,13 @@ The per-token decode shown above is **Mode 1: Eager**. It's what we ship in Phas
 
 **Lessons from a prior ICB experiment in mlx-swift-lm**
 
-A previous attempt at ICB + argument buffers in mlx-swift-lm didn't yield the expected throughput win. Two takeaways inform the FFAI design:
+A previous attempt at ICB + argument buffers in mlx-swift-lm didn't yield the expected throughput win. Two takeaways inform the Butter design:
 
-1. **Per-token state must be ping-ponged (or triple-buffered).** The per-token arg buffer (activation pool slots, KV length, RNG state) is updated by the CPU *while* the GPU is still reading the previous token's arg buffer. Without distinct buffers for token N, N+1, N+2, the CPU stalls or the GPU reads stale data. FFAI's `.argumentBuffers` and `.icb` modes triple-buffer the per-token arg buffer by construction.
+1. **Per-token state must be ping-ponged (or triple-buffered).** The per-token arg buffer (activation pool slots, KV length, RNG state) is updated by the CPU *while* the GPU is still reading the previous token's arg buffer. Without distinct buffers for token N, N+1, N+2, the CPU stalls or the GPU reads stale data. Butter's `.argumentBuffers` and `.icb` modes triple-buffer the per-token arg buffer by construction.
 
-2. **Dispatch optimization is a smaller lever than memory bandwidth.** The mlx-swift-lm experiment cut command-buffer build time significantly but token throughput barely moved — because GPU memory bandwidth, not CPU dispatch, was the actual bottleneck on the hot path. This is why FFAI's bigger optimization lever is **fused kernels** (one activation read, multiple ops happen in registers/threadgroup memory) rather than dispatch mode upgrades.
+2. **Dispatch optimization is a smaller lever than memory bandwidth.** The mlx-swift-lm experiment cut command-buffer build time significantly but token throughput barely moved — because GPU memory bandwidth, not CPU dispatch, was the actual bottleneck on the hot path. This is why Butter's bigger optimization lever is **fused kernels** (one activation read, multiple ops happen in registers/threadgroup memory) rather than dispatch mode upgrades.
 
-3. **The 4-repo interface change cost was a separate killer.** Adding argument buffers to MLX kernels meant changing kernel signatures across mlx → mlx-c → mlx-swift → mlx-swift-lm. In FFAI a kernel signature change is a Rust edit + cargo rebuild. The complexity cost of dispatch mode upgrades drops by an order of magnitude.
+3. **The 4-repo interface change cost was a separate killer.** Adding argument buffers to MLX kernels meant changing kernel signatures across mlx → mlx-c → mlx-swift → mlx-swift-lm. In Butter a kernel signature change is a Rust edit + cargo rebuild. The complexity cost of dispatch mode upgrades drops by an order of magnitude.
 
 **How we keep all three options open from Phase 2:**
 
@@ -767,7 +767,7 @@ A previous attempt at ICB + argument buffers in mlx-swift-lm didn't yield the ex
 
 In MLX/mlx-swift-lm, sampling reads the full logits vector to CPU every token (~60-200KB), runs argmax/top-k/top-p in Swift, and returns the next token id. That's a mandatory CPU↔GPU sync per token, plus the actual memory transfer.
 
-FFAI runs sampling on the GPU as a final kernel in the per-token command buffer:
+Butter runs sampling on the GPU as a final kernel in the per-token command buffer:
 
 ```
    ┌─────────────────────────────────────────────────────────┐
@@ -788,7 +788,7 @@ FFAI runs sampling on the GPU as a final kernel in the per-token command buffer:
    Swift advances the loop with next_token
 ```
 
-✅ **Shipped.** `Ops.softmaxCategoricalSample(...)` (Sources/FFAI/Ops/Ops.swift) and `Ops.argmax(...)` run inside the per-token command buffer; the only CPU↔GPU readback is the 4-byte chosen-token id. The legacy CPU-readback path (`forwardCPUSample`) is kept behind a debug flag for repro / comparison but is not on the hot path. `GenerationParameters.temperature` / `topP` / `topK` / `minP` all dispatch through GPU kernels.
+✅ **Shipped.** `Ops.softmaxCategoricalSample(...)` (Sources/ButterSwift/Ops/Ops.swift) and `Ops.argmax(...)` run inside the per-token command buffer; the only CPU↔GPU readback is the 4-byte chosen-token id. The legacy CPU-readback path (`forwardCPUSample`) is kept behind a debug flag for repro / comparison but is not on the hot path. `GenerationParameters.temperature` / `topP` / `topK` / `minP` all dispatch through GPU kernels.
 
 ---
 
@@ -976,14 +976,14 @@ The throughput win comes from amortising one verifier forward over multiple acce
 
 ## 5. Where this differs from MLX
 
-| Concern | MLX path | FFAI path |
+| Concern | MLX path | Butter path |
 |---|---|---|
 | Kernel source | MSL string passed to `metal_kernel()` | Rust `#[kernel]` → MSL at build time |
 | Compilation | JIT on first call (~1-2ms) | Pre-compiled into `.metallib`, only PSO specialization at runtime (~100-500µs once per fn-const combo) |
 | Tensor type | `MLXArray` (lazy graph node, hides MTLBuffer) | `Tensor` (direct MTLBuffer + offset + shape) |
 | Dispatch timing | Lazy: graph traversal + planning + encode + submit on `eval()` | Eager: Swift code is the dispatch order, no graph traversal step |
 | Dispatch modes | One mode (lazy graph) | Three modes (Eager / Argument buffers / ICB) selectable at load time |
-| Op fusion | Automatic via lazy graph compiler | Manual via fused kernels in metaltile (compile-time, profileable) |
+| Op fusion | Automatic via lazy graph compiler | Manual via fused kernels in iron (compile-time, profileable) |
 | Sampling | CPU readback per token (~60-200KB) | On-GPU sampling kernel, 4-byte readback |
 | Custom kernel cost | ~55-95µs per call (Swift→C→C++→Metal marshaling) | ~5-10µs per call eager / sub-µs amortized in ICB mode |
 | Kernel iteration | Edit MLX C++ → mlx-c → mlx-swift → mlx-swift-lm | Edit Rust `#[kernel]` → rebuild Swift package |
@@ -995,11 +995,11 @@ The throughput win comes from amortising one verifier forward over multiple acce
 
 ```
   ┌─────────────────────────────────────────────────────────┐
-  │  app / FFAICLI                                          │
+  │  app / ButterCLI                                          │
   └────────────────────┬────────────────────────────────────┘
                        │ calls
   ┌────────────────────▼────────────────────────────────────┐
-  │  FFAI                                                   │
+  │  Butter                                                   │
   │                                                         │
   │  Core text path                                         │
   │   Tensor • Module • Linear • Embedding • RMSNorm •      │
@@ -1030,7 +1030,7 @@ The throughput win comes from amortising one verifier forward over multiple acce
            │ kernels             │ HF + tokenizers
            ▼                     ▼
   ┌────────────────────┐   ┌──────────────────────────────┐
-  │  MetalTileSwift    │   │  swift-huggingface           │
+  │  IronSwift    │   │  swift-huggingface           │
   │  (in-repo)         │   │  swift-transformers          │
   │                    │   │  (external SPM dependencies) │
   │  • Library loader  │   └──────────────────────────────┘
@@ -1047,13 +1047,13 @@ The throughput win comes from amortising one verifier forward over multiple acce
 
   Build-time only (not in runtime graph):
   ┌──────────────────────────────────────────────────────────┐
-  │  metaltile (Rust workspace, sibling repo)                │
+  │  iron (Rust workspace, sibling repo)                │
   │  Generates kernels.metallib + manifest + Swift wrappers  │
-  │  via the `tile build --emit all --out <dir>` CLI command │
-  │  (metaltile-cli).                                        │
+  │  via the `iron build --emit all --out <dir>` CLI command │
+  │  (iron-cli).                                        │
   └──────────────────────────────────────────────────────────┘
 ```
 
 **Runtime dependencies:** Metal framework, swift-huggingface, swift-transformers. That's it.
 
-**Build-time dependencies:** add Xcode (for `xcrun metal`), a Rust toolchain (for `tile`), and the metaltile sibling repo checkout until the `tile` binary ships via Homebrew.
+**Build-time dependencies:** add Xcode (for `xcrun metal`), a Rust toolchain (for `tile`), and the iron sibling repo checkout until the `iron` binary ships via Homebrew.

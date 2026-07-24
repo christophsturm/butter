@@ -18,7 +18,7 @@
 // `throws` and the checkpoint is a hard requirement, not a "skip if
 // missing".
 //
-// LlamaTTS reuses FFAI's `LlamaModel` engine for the acoustic backbone
+// LlamaTTS reuses Butter's `LlamaModel` engine for the acoustic backbone
 // and adds the Orpheus prompt framing + autoregressive SNAC-code decode
 // loop. The SNAC neural codec (the waveform-synthesis tail) is a
 // separate codec port; this suite verifies the model loads, the prompt
@@ -29,7 +29,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("LlamaTTS Integration", .serialized)
 struct LlamaTTSIntegrationTests {

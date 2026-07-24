@@ -34,7 +34,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 #if canImport(CoreImage)
     import CoreImage

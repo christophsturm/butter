@@ -32,7 +32,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Gemma4 Vision Integration", .serialized)
 struct Gemma4VisionIntegrationTests {

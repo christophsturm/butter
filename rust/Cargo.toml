@@ -1,18 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/ffai-core",
-    "crates/ffai-ops",
-    "crates/ffai-loader",
-    "crates/ffai-runtime",
-    "crates/ffai-models",
-    "crates/ffai-modeltests",
-    "crates/ffai",
-    "crates/ffai-cli",
-    "crates/ffai-ffi",
-    "crates/backends/ffai-metal",
-    "crates/backends/ffai-cuda",
-    "crates/backends/ffai-vulkan",
+    "crates/wh-butter-core",
+    "crates/wh-butter-ops",
+    "crates/wh-butter-loader",
+    "crates/wh-butter-runtime",
+    "crates/wh-butter-models",
+    "crates/wh-butter-modeltests",
+    "crates/wh-butter",
+    "crates/wh-butter-cli",
+    "crates/wh-butter-ffi",
+    "crates/backends/wh-butter-metal",
+    "crates/backends/wh-butter-cuda",
+    "crates/backends/wh-butter-vulkan",
 ]
 
 [workspace.package]
@@ -20,29 +20,29 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Eric Kryski (@ekryski)", "Tom Turney (@TheTom)"]
-repository = "https://github.com/thewafflehaus/FFAI"
+repository = "https://github.com/thewafflehaus/butter"
 
 [workspace.dependencies]
 # ── engine crates ────────────────────────────────────────────────────
-ffai-core = { path = "crates/ffai-core" }
-ffai-ops = { path = "crates/ffai-ops" }
-ffai-loader = { path = "crates/ffai-loader" }
-ffai-runtime = { path = "crates/ffai-runtime" }
-ffai-models = { path = "crates/ffai-models" }
-ffai = { path = "crates/ffai" }
-ffai-modeltests = { path = "crates/ffai-modeltests" }
+wh-butter-core = { path = "crates/wh-butter-core" }
+wh-butter-ops = { path = "crates/wh-butter-ops" }
+wh-butter-loader = { path = "crates/wh-butter-loader" }
+wh-butter-runtime = { path = "crates/wh-butter-runtime" }
+wh-butter-models = { path = "crates/wh-butter-models" }
+wh-butter = { path = "crates/wh-butter" }
+wh-butter-modeltests = { path = "crates/wh-butter-modeltests" }
 # ── backend crates ───────────────────────────────────────────────────
-ffai-metal = { path = "crates/backends/ffai-metal" }
-ffai-cuda = { path = "crates/backends/ffai-cuda" }
-ffai-vulkan = { path = "crates/backends/ffai-vulkan" }
-# ── shared kernel toolchain (external: the ffai-kernels cuda/metal repo) ──
+wh-butter-metal = { path = "crates/backends/wh-butter-metal" }
+wh-butter-cuda = { path = "crates/backends/wh-butter-cuda" }
+wh-butter-vulkan = { path = "crates/backends/wh-butter-vulkan" }
+# ── shared kernel toolchain (external: the Iron cuda/metal repo) ──
 # Canonical pointer is the org `dev` branch, so a fresh clone is
-# self-contained. For local co-development against a sibling ffai-kernels
+# self-contained. For local co-development against a sibling iron
 # checkout, add a `[patch]` override in your own (uncommitted) config.
-ffai-kernels-core = { git = "https://github.com/thewafflehaus/ffai-kernels", branch = "dev" }
-ffai-kernels-codegen = { git = "https://github.com/thewafflehaus/ffai-kernels", branch = "dev" }
-ffai-kernels-runtime = { git = "https://github.com/thewafflehaus/ffai-kernels", branch = "dev" }
-ffai-kernels-std = { git = "https://github.com/thewafflehaus/ffai-kernels", branch = "dev" }
+wh-iron-core = { git = "https://github.com/thewafflehaus/iron", branch = "dev" }
+wh-iron-codegen = { git = "https://github.com/thewafflehaus/iron", branch = "dev" }
+wh-iron-runtime = { git = "https://github.com/thewafflehaus/iron", branch = "dev" }
+wh-iron-std = { git = "https://github.com/thewafflehaus/iron", branch = "dev" }
 # ── third-party ──────────────────────────────────────────────────────
 thiserror = "2"
 serde_json = "1"
@@ -53,7 +53,7 @@ rustc-hash = "2"       # FxHash for already-hashed / densely-numeric keys
 
 # Perf build for benchmarks (fat-LTO inlines parking_lot locks, Arc/Rc clones,
 # FNV/Fx hash closures into the hot path). Kept OUT of [profile.release] on
-# purpose: fat-LTO + codegen-units=1 balloons build time with the ffai-kernels
+# purpose: fat-LTO + codegen-units=1 balloons build time with the iron
 # patch, and `panic="abort"` would break `cargo test`. (Rust-playbook split.)
 [profile.bench]
 inherits = "release"

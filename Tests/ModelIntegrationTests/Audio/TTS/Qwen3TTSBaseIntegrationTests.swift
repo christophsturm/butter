@@ -37,7 +37,7 @@
 import Foundation
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Qwen3TTSBase Integration", .serialized)
 struct Qwen3TTSBaseIntegrationTests {

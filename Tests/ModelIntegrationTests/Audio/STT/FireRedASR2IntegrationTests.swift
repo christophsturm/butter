@@ -33,7 +33,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("FireRedASR2 Integration", .serialized)
 struct FireRedASR2IntegrationTests {

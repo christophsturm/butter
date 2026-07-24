@@ -32,7 +32,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("MiniCPMV Vision Integration (image + video)", .serialized)
 struct MiniCPMVIntegrationTests {

@@ -28,7 +28,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("SileroVAD Integration", .serialized)
 struct SileroVADIntegrationTests {

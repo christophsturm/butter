@@ -1,10 +1,10 @@
 # Adding a Model
 
-How to port a new architecture into FFAI. Both in-tree families (`Llama`, `Qwen3`) were added with this flow; copy whichever is structurally closest to your target.
+How to port a new architecture into Butter. Both in-tree families (`Llama`, `Qwen3`) were added with this flow; copy whichever is structurally closest to your target.
 
 ## File layout
 
-`Sources/FFAI/Models/` mirrors the user-facing modality grouping:
+`Sources/ButterSwift/Models/` mirrors the user-facing modality grouping:
 
 ```text
 Models/
@@ -31,7 +31,7 @@ Models/
 
 The `Vision` / `Text` / `<Sub>` suffix on per-modality files is a SwiftPM constraint: object files are named by basename only, so `Text/<F>.swift` and `Vision/<F>.swift` would collide on `.o` output.
 
-For shared building blocks: cross-family helpers (e.g. the GEMM K-tile padding, patch-embed reshape) live in [`Vision/VisionTowerOps.swift`](../../Sources/FFAI/Models/Vision/VisionTowerOps.swift) as module-internal top-level functions. MoE routing + per-expert dispatch live in [`MoELayer.swift`](../../Sources/FFAI/Models/MoELayer.swift) so optimisations (expert co-location, SSD streaming) land in one place.
+For shared building blocks: cross-family helpers (e.g. the GEMM K-tile padding, patch-embed reshape) live in [`Vision/VisionTowerOps.swift`](../../Sources/ButterSwift/Models/Vision/VisionTowerOps.swift) as module-internal top-level functions. MoE routing + per-expert dispatch live in [`MoELayer.swift`](../../Sources/ButterSwift/Models/MoELayer.swift) so optimisations (expert co-location, SSD streaming) land in one place.
 
 ## Decide if it's a new family or a new variant
 
@@ -59,7 +59,7 @@ What you want from the reference:
 
 ## Step 2 — confirm the kernel coverage
 
-Open `Sources/FFAI/Ops.swift` and verify every op the forward pass needs exists. Most modern LLMs reuse the existing kernel set:
+Open `Sources/ButterSwift/Ops.swift` and verify every op the forward pass needs exists. Most modern LLMs reuse the existing kernel set:
 
 - `gather` (embedding lookup)
 - `rms_norm` + `multiRowRMSNorm`
@@ -71,11 +71,11 @@ Open `Sources/FFAI/Ops.swift` and verify every op the forward pass needs exists.
 - `kv_cache_update`
 - `argmax`
 
-If your model needs something new (attention sinks, fused MoE, sliding-window mask, GDN step, SSM scan), that's a metaltile-side addition first — see [developing.md § Writing a new kernel](developing.md#writing-a-new-kernel).
+If your model needs something new (attention sinks, fused MoE, sliding-window mask, GDN step, SSM scan), that's a iron-side addition first — see [developing.md § Writing a new kernel](developing.md#writing-a-new-kernel).
 
 ## Step 3 — write the family file
 
-Copy `Sources/FFAI/Models/Text/Llama.swift` as a template. Structure:
+Copy `Sources/ButterSwift/Models/Text/Llama.swift` as a template. Structure:
 
 ```swift
 public enum <Family> {
@@ -122,7 +122,7 @@ Key invariants the implementation must preserve:
 
 ## Step 4 — declare family defaults
 
-Each variant struct carries a static `defaultGenerationParameters: GenerationParameters` that captures the sampling + length values that family ships with. The `Model` instance threads this through as `model.defaultGenerationParameters`, and `Model.generate(prompt:parameters:)` falls back to it when the caller passes `nil`. This is what the user gets when they do `ffai --model <repo>` with no sampling flags.
+Each variant struct carries a static `defaultGenerationParameters: GenerationParameters` that captures the sampling + length values that family ships with. The `Model` instance threads this through as `model.defaultGenerationParameters`, and `Model.generate(prompt:parameters:)` falls back to it when the caller passes `nil`. This is what the user gets when they do `butter --model <repo>` with no sampling flags.
 
 Pull the values from the reference implementation. mlx-swift-lm's `Libraries/MLXLLM/Models/<Family>.swift` declares `defaultPrefillStepSize`; per-checkpoint sampling defaults live in `LLMRegistry`. Pull representative-checkpoint values for each variant. Reasonable starting points if the reference is silent:
 
@@ -156,7 +156,7 @@ Sampling fields are no-ops on the greedy decode path until Phase 5 — declare t
 
 ## Step 5 — register the family
 
-In `Sources/FFAI/Model.swift`, `ModelRegistry.dispatchAndLoad`:
+In `Sources/ButterSwift/Model.swift`, `ModelRegistry.dispatchAndLoad`:
 
 ```swift
 if let arch = config.architecture, <Family>.architectures.contains(arch) {
@@ -182,16 +182,16 @@ public static func load<Family>(...) throws -> Loaded {
 
 ## Step 6 — verify correctness
 
-FFAI does **not** pin correctness with golden fixtures. There is no Python dependency in the test loop. Correctness comes from two layers:
+Butter does **not** pin correctness with golden fixtures. There is no Python dependency in the test loop. Correctness comes from two layers:
 
-- **Per-kernel GPU correctness** — every non-trivial kernel lands with a metaltile-side `<kernel>_gpu_correctness` test comparing the GPU result against a naive CPU oracle in fp32 (see metaltile's `docs/testing.md`). This is the tight numerical signal. If your family needed a new kernel, that test ships in the same commit on the metaltile side.
-- **Per-family coherence** — the FFAI integration test (Step 8) loads a real checkpoint, greedy-decodes, and asserts the model produces coherent text. The contract is "the pipeline produces coherent output", not bit-parity with mlx-lm / mlx-vlm — cross-implementation token parity proved to be a measure of rounding-mode alignment, not correctness, and was dropped.
+- **Per-kernel GPU correctness** — every non-trivial kernel lands with a iron-side `<kernel>_gpu_correctness` test comparing the GPU result against a naive CPU oracle in fp32 (see iron's `docs/testing.md`). This is the tight numerical signal. If your family needed a new kernel, that test ships in the same commit on the iron side.
+- **Per-family coherence** — the Butter integration test (Step 8) loads a real checkpoint, greedy-decodes, and asserts the model produces coherent text. The contract is "the pipeline produces coherent output", not bit-parity with mlx-lm / mlx-vlm — cross-implementation token parity proved to be a measure of rounding-mode alignment, not correctness, and was dropped.
 
 ## Step 7 — wire inspect hooks
 
-`ffai inspect` is the first command every dev reaches for when a new model produces broken output. Every family file calls the shared `InspectTap` utility (`Sources/FFAI/Inspect/InspectTap.swift`) at layer boundaries inside `<Family>Model.forward(...)` so the `--layer-trace` diagnostic surface works uniformly across families.
+`butter inspect` is the first command every dev reaches for when a new model produces broken output. Every family file calls the shared `InspectTap` utility (`Sources/ButterSwift/Inspect/InspectTap.swift`) at layer boundaries inside `<Family>Model.forward(...)` so the `--layer-trace` diagnostic surface works uniformly across families.
 
-The pattern, lifted from `LlamaModel.forward` (the canonical reference — `Sources/FFAI/Models/Text/Llama.swift`):
+The pattern, lifted from `LlamaModel.forward` (the canonical reference — `Sources/ButterSwift/Models/Text/Llama.swift`):
 
 ```swift
 public func forward(tokenId: Int, position: Int,
@@ -200,7 +200,7 @@ public func forward(tokenId: Int, position: Int,
     // 1. Pick up the env-driven tap state. Cached at the first
     //    call site so subsequent forwards pay a static-load cost
     //    only — no per-token env-dict allocation. No-op when
-    //    FFAI_INSPECT isn't set.
+    //    BUTTER_INSPECT isn't set.
     let tap = InspectTap.fromEnvironment
 
     // 2. When taps are active, route work onto a *private* cmdbuf
@@ -250,7 +250,7 @@ public func forward(tokenId: Int, position: Int,
 }
 ```
 
-The `<Family>Layer.forward(...)` stays clean — no taps inside the layer's hot path. That's deliberate: layer-boundary taps localise *which* layer is failing in two `ffai inspect --layer-trace` runs. For inside-layer triage (which op in layer N produced the NaN), drop temporary fine-grained `tap.dumpLayerBoundary(...)` calls between ops as you debug, then remove them before merging. The canonical worked example (a single GELU NaN inside layer 1's MLP that the standardized boundary tap localised in seconds once `ffai inspect --layer-trace --trace-layers 0,1,2,3,4` was the first thing the dev ran) is documented in the Gemma 3 coherence investigation that lived in `papers/` during that fix.
+The `<Family>Layer.forward(...)` stays clean — no taps inside the layer's hot path. That's deliberate: layer-boundary taps localise *which* layer is failing in two `butter inspect --layer-trace` runs. For inside-layer triage (which op in layer N produced the NaN), drop temporary fine-grained `tap.dumpLayerBoundary(...)` calls between ops as you debug, then remove them before merging. The canonical worked example (a single GELU NaN inside layer 1's MLP that the standardized boundary tap localised in seconds once `butter inspect --layer-trace --trace-layers 0,1,2,3,4` was the first thing the dev ran) is documented in the Gemma 3 coherence investigation that lived in `papers/` during that fix.
 
 **Required:** every new family file MUST follow this pattern. The `InspectSmokeTests` integration test (Tests/ModelIntegrationTests/) asserts the inspect path runs end-to-end against a representative model from each family; that test will fail loudly if a family file forgets to wire `InspectTap` calls.
 

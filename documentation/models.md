@@ -1,8 +1,8 @@
 # Supported Models
 
-FFAI runs every family below directly from HuggingFace through
+Butter runs every family below directly from HuggingFace through
 `Model.load("org/repo")` (or `AudioModel.load(...)` / `VADModel.load(...)`
-for the non-text-decoder contracts). The `ffai models` CLI lists the
+for the non-text-decoder contracts). The `butter models` CLI lists the
 verified repo IDs per family; pass any other mlx-format conversion of a
 supported architecture and the loader picks it up via
 `ModelRegistry.dispatchAndLoad`.
@@ -16,12 +16,12 @@ This page is the canonical landing for:
 For porting a new architecture, see
 [developing/adding-a-model.md](developing/adding-a-model.md). For the
 per-family Swift type prefix and source layout, see the
-`Sources/FFAI/Models/<X>.swift` family roots.
+`Sources/ButterSwift/Models/<X>.swift` family roots.
 
 ## Supported families
 
 The Sizes column lists the parameter scales we ship in the CLI catalog
-(`ffai models`); the Quants column lists the bit-widths we know are
+(`butter models`); the Quants column lists the bit-widths we know are
 published. Any 3 / 4 / 5 / 6 / 8-bit mlx affine conversion of a listed
 architecture also loads.
 
@@ -86,15 +86,15 @@ contract), **STS** (speech-to-speech).
 The audio families do **not** route through `ModelRegistry` /
 `LanguageModel` — those describe a pure text-in / text-out causal
 decoder. STT is audio-in / text-out, TTS is text-in / audio-out. They
-load through [`AudioModelRegistry`](../Sources/FFAI/CLI/AudioModelRegistry.swift)
+load through [`AudioModelRegistry`](../Sources/ButterSwift/CLI/AudioModelRegistry.swift)
 which inspects `config.json`, picks the family, and reports the audio
-[`Capability`](../Sources/FFAI/Capability.swift) set.
+[`Capability`](../Sources/ButterSwift/Capability.swift) set.
 
 Whisper, Kokoro and Qwen-Omni share the
-[`AudioEncoder`](../Sources/FFAI/AudioEncoder.swift) module (Whisper-style
+[`AudioEncoder`](../Sources/ButterSwift/AudioEncoder.swift) module (Whisper-style
 conv stem + bidirectional transformer) and the
-[`AudioPreprocessing`](../Sources/FFAI/AudioPreprocessing.swift) front-end
-(log-Mel STFT framing). The three FFAI audio kernels — `mel_spectrogram`,
+[`AudioPreprocessing`](../Sources/ButterSwift/AudioPreprocessing.swift) front-end
+(log-Mel STFT framing). The three Butter audio kernels — `mel_spectrogram`,
 `audio_conv1d`, `vocoder_istft` — are wrapped by `Ops.melSpectrogram`,
 `Ops.audioConv1d`, `Ops.vocoderISTFT`. SenseVoice carries its own
 Kaldi-style FBANK + LFR front-end and a depthwise FSMN memory block on
@@ -104,10 +104,10 @@ the CPU path.
 
 VAD models have a third contract — audio waveform in, per-frame
 speech-probability stream out. They load through
-[`VADModelRegistry`](../Sources/FFAI/CLI/VADModelRegistry.swift) which
+[`VADModelRegistry`](../Sources/ButterSwift/CLI/VADModelRegistry.swift) which
 exposes `loadFromDirectory` / `fromPretrained` and a
 `detect(audio:sampleRate:)` returning a
-[`VADOutput`](../Sources/FFAI/VADOutput.swift).
+[`VADOutput`](../Sources/ButterSwift/VADOutput.swift).
 
 | Family | `model_type` | Notes |
 |---|---|---|
@@ -122,7 +122,7 @@ recognised by the registry; full loaders are follow-on ports.
 Codecs (encoder + quantizer + decoder) turn a waveform into discrete
 codes and back; autoregressive TTS families (Orpheus / LlamaTTS, Marvis,
 …) emit codes that a codec renders to audio. They live under
-[`Sources/FFAI/Models/Audio/`](../Sources/FFAI/Models/Audio) — see the
+[`Sources/ButterSwift/Models/Audio/`](../Sources/ButterSwift/Models/Audio) — see the
 codec table in [audio.md](audio.md) for SNAC, EnCodec, Mimi, Descript
 DAC, Vocos, BigVGAN, DACVAE.
 

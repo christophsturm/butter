@@ -1,17 +1,17 @@
 name: Trigger docs rebuild
 
-# Docs are versioned by FFAI release. Every published release fires
-# `workflow_dispatch` on ffai-website's `deploy.yml`, passing the
+# Docs are versioned by Butter release. Every published release fires
+# `workflow_dispatch` on butter-website's `deploy.yml`, passing the
 # release tag + metadata as inputs. Uses the least-privilege scope
-# (Actions: write on ffai-website only) so a leaked
-# WEBSITE_DISPATCH_TOKEN can't modify ffai-website's repo contents —
+# (Actions: write on butter-website only) so a leaked
+# WEBSITE_DISPATCH_TOKEN can't modify butter-website's repo contents —
 # the worst an attacker could do with the token is spam-trigger the
 # deploy workflow or cancel runs.
 #
 # Required secret: WEBSITE_DISPATCH_TOKEN
 #   Type:        Fine-grained personal access token
 #   Resource owner: thewafflehaus
-#   Repository access: Only `ffai-website`
+#   Repository access: Only `butter-website`
 #   Permissions:
 #     - Actions:  Read and write   ← needed to call `workflow_dispatch`
 #     - Contents: Read-only        ← needed to resolve refs (e.g. `--ref main`)
@@ -26,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'FFAI release tag to dispatch for (defaults to latest)'
+        description: 'Butter release tag to dispatch for (defaults to latest)'
         required: false
         type: string
 
@@ -71,7 +71,7 @@ jobs:
             echo "__BODY_EOF__"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Trigger ffai-website deploy
+      - name: Trigger butter-website deploy
         if: steps.meta.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_TOKEN }}
@@ -82,14 +82,14 @@ jobs:
           BODY:         ${{ steps.meta.outputs.body }}
         run: |
           # `gh workflow run` POSTs to /actions/workflows/{id}/dispatches.
-          # Token needs Actions:write on ffai-website. Multi-line BODY
+          # Token needs Actions:write on butter-website. Multi-line BODY
           # is passed via env var → --field, which gh handles correctly.
           gh workflow run deploy.yml \
-            --repo thewafflehaus/ffai-website \
+            --repo thewafflehaus/butter-website \
             --ref main \
-            --field ffai_tag="$TAG" \
-            --field ffai_release_name="$NAME" \
-            --field ffai_release_url="$URL" \
-            --field ffai_release_published_at="$PUBLISHED_AT" \
-            --field ffai_release_body="$BODY"
-          echo "dispatched ffai-website/deploy.yml for $TAG"
+            --field butter_tag="$TAG" \
+            --field butter_release_name="$NAME" \
+            --field butter_release_url="$URL" \
+            --field butter_release_published_at="$PUBLISHED_AT" \
+            --field butter_release_body="$BODY"
+          echo "dispatched butter-website/deploy.yml for $TAG"
