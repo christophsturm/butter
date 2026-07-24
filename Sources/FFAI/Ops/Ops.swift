@@ -4323,7 +4323,6 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
-                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (96, .f16):
@@ -4346,7 +4345,6 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
-                has_sink: 0, sink_logit: 0.0,
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .f32):
