@@ -27,12 +27,12 @@ fn dispatch_err(e: IronError) -> Error {
 ///
 /// Holds an `Arc<MtCudaDevice>` so the CUDA CONTEXT outlives this module. A
 /// `CudaModule`'s `Drop` calls `cuModuleUnload`, which faults
-/// (STATUS_ACCESS_VIOLATION, 0xc0000005) if the context was already destroyed —
+/// (STATUS_ACCESS_VIOLATION, 0xc0000005) if the context was already destroyed,
 /// which is exactly what happened at process teardown: this device's `dev` field
 /// (its only context-keepalive) dropped before the `modules` cache, destroying
 /// the context, then the cached modules unloaded into the dead context. Pinning
 /// the context here (and dropping `module` before `_dev` via field order below)
-/// guarantees the module always unloads while its context is still live — the
+/// guarantees the module always unloads while its context is still live, the
 /// same invariant `CudaBuffer` already upholds for device allocations.
 struct CachedModule {
     // Field DECLARATION ORDER is DROP ORDER: `module` (cuModuleUnload) must run
@@ -51,7 +51,7 @@ pub struct CudaDevice {
     name: String,
     /// Compile-once cache: kernel name → loaded module.
     modules: RwLock<HashMap<String, Arc<CachedModule>>>,
-    /// Memoized shared-mem bytes per (kernel, block_x) — avoids re-walking the
+    /// Memoized shared-mem bytes per (kernel, block_x), avoids re-walking the
     /// kernel IR on every dispatch (hot in decode: ~hundreds of dispatches/token).
     shared: RwLock<HashMap<(String, u32), u32>>,
 }
@@ -74,8 +74,26 @@ impl CudaDevice {
         }
     }
 
+    /// Cache key for a compiled module. The bare kernel name is NOT unique:
+    /// registry kernels share one name across their dtype variants (the ops
+    /// layer keys its IR cache by (name, dtype), but the same name reaches
+    /// this backend for every variant). Keying compiled modules by name alone
+    /// silently reused the first-compiled dtype's binary for every other
+    /// dtype, which reads with the wrong element stride and faults (or worse,
+    /// corrupts silently). Fold each param's dtype into the key.
+    fn module_key(kernel: &Kernel) -> String {
+        use std::fmt::Write as _;
+        let mut key = kernel.name.clone();
+        key.push('|');
+        for p in &kernel.params {
+            let _ = write!(key, "{:?},", p.dtype);
+        }
+        key
+    }
+
     fn module_for(&self, kernel: &Kernel) -> Result<Arc<CachedModule>> {
-        if let Some(m) = self.modules.read().unwrap().get(&kernel.name) {
+        let mkey = Self::module_key(kernel);
+        if let Some(m) = self.modules.read().unwrap().get(&mkey) {
             return Ok(m.clone());
         }
         let cg = CudaGenerator::new();
@@ -95,7 +113,7 @@ impl CudaDevice {
         self.modules
             .write()
             .unwrap()
-            .insert(kernel.name.clone(), cached.clone());
+            .insert(mkey, cached.clone());
         Ok(cached)
     }
 }
@@ -124,7 +142,7 @@ impl DeviceBuffer for CudaBuffer {
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
         // Return to the device's size-bucketed pool instead of a synchronous
-        // cuMemFree — the hot decode path reuses these every token.
+        // cuMemFree, the hot decode path reuses these every token.
         self.dev.free_raw_pooled(self.ptr, self.len);
     }
 }
@@ -162,7 +180,7 @@ impl Device for CudaDevice {
     }
 
     fn alloc_zeroed(&self, len: usize) -> Result<Arc<dyn DeviceBuffer>> {
-        // Stream-ordered device memset — no host zero buffer, no pageable
+        // Stream-ordered device memset, no host zero buffer, no pageable
         // H2D copy. A [s,hid] f32 MoE accumulator is ~22 MB; uploading zeros
         // for it cost ~4-6 ms of host-blocking copy per E-layer.
         let ptr = self.dev.alloc_raw(len).map_err(dispatch_err)?;
@@ -181,7 +199,9 @@ impl Device for CudaDevice {
     fn dispatch(&self, kernel: &Kernel, bindings: &[Binding], grid: Grid) -> Result<()> {
         let module = self.module_for(kernel)?;
         let func = module.module.function(&kernel.name).map_err(dispatch_err)?;
-        let skey = (kernel.name.clone(), grid.block[0]);
+        // Same dtype-collision hazard as the module cache: shared-memory sizing
+        // depends on element widths, so fold the param dtypes in.
+        let skey = (Self::module_key(kernel), grid.block[0]);
         let shared = if let Some(&s) = self.shared.read().unwrap().get(&skey) {
             s
         } else {
@@ -230,7 +250,7 @@ impl Device for CudaDevice {
             }
         }
 
-        // Async launch (no per-dispatch cuCtxSynchronize) — kernels pipeline on the
+        // Async launch (no per-dispatch cuCtxSynchronize), kernels pipeline on the
         // ordered default stream; `download`/`synchronize` sync when results are read.
         self.dev
             .launch_async(func, grid.grid, grid.block, shared, &mut args)
@@ -311,7 +331,7 @@ impl Device for CudaDevice {
 
         // Use cooperative launch only when NOT inside a CUDA graph capture
         // (cuLaunchCooperativeKernel is not capturable). Fall back to regular
-        // launch during capture — the caller (moe_fused_ffn) must not use
+        // launch during capture, the caller (moe_fused_ffn) must not use
         // grid.sync() in that code path (handled by NEMOTRON_GRAPH exclusion).
         if cooperative && !self.dev.is_capturing() {
             self.dev.launch_async_coop(func, grid, block, shared_bytes, &mut args).map_err(dispatch_err)
@@ -412,6 +432,19 @@ impl Device for CudaDevice {
         let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("moe_grouped_cutlass: out not CudaBuffer".into()))?;
         self.dev.moe_grouped_cutlass(ab.ptr, wb.ptr, ob.ptr, group_rows, expert_ids, n, k).map_err(dispatch_err)
     }
+
+    // NOTE(rebrand-merge): PR #70 also implemented moe_marlin_gemm /
+    // marlin_repack / marlin_build_routing here, calling through to
+    // `self.dev.{moe_marlin_gemm,marlin_repack,marlin_build_routing}` on the
+    // raw `wh_iron_runtime::CudaDevice`. Those methods don't exist on
+    // `thewafflehaus/iron@dev`'s CudaDevice — the marlin/NVFP4 CUDA runtime
+    // support was apparently only ever on the pre-rebrand kernel-toolchain
+    // fork this branch was originally pinned to. Left unimplemented here
+    // (falls through to the wh-butter-core default "unsupported on this
+    // backend" stub) until the iron runtime crate grows real marlin
+    // support; re-add the three pass-through impls verbatim from this
+    // crate's pre-rebrand-merge git history (PR #70 / a27773ec, `src/imp.rs`)
+    // once it does.
 
     fn moe_grouped_cutlass_fp4(
         &self,

@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use crate::iq2xxs_tables::{IQ2XXS_GRID, KSIGNS};
 
-/// GGML tensor type (subset).
+/// GGUF tensor dtype code (subset).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgmlType {
     F32,
@@ -50,7 +50,7 @@ pub struct GgufTensor {
     pub ggml_type: GgmlType,
     pub offset: u64, // within the data section
     /// Which file part this tensor's data lives in (0 for single-file GGUF;
-    /// the split index for llama.cpp multi-part `*-NNNNN-of-MMMMM.gguf`).
+    /// the split index for the reference C++ implementation's multi-part `*-NNNNN-of-MMMMM.gguf` naming).
     pub part: usize,
 }
 
@@ -62,6 +62,11 @@ pub struct Gguf {
     parts: Vec<memmap2::Mmap>,
     /// Per-part data-section start offset (after that part's header).
     data_starts: Vec<usize>,
+    /// The path passed to `open` (part 0 for a split GGUF), kept so callers
+    /// that need to identify the source file on disk (e.g. an on-disk cache
+    /// keyed off the file's size/mtime) don't have to thread the original
+    /// path alongside every `&Gguf` themselves.
+    source_path: String,
     tensors: BTreeMap<String, GgufTensor>,
     pub metadata_u32: BTreeMap<String, u32>,
     pub metadata_str: BTreeMap<String, String>,
@@ -162,7 +167,7 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 /// Unpack the j-th 6-bit (scale, min) pair from a Q4_K/Q5_K block's packed
-/// 12-byte `scales` array. This is the canonical GGML `get_scale_min_k4`:
+/// 12-byte `scales` array. This mirrors the reference C++ implementation's canonical `get_scale_min_k4`:
 /// the 8 sub-block scales/mins are stored 6 bits each, split across the first
 /// 8 bytes (low 6 bits) and the last 4 bytes (high 2 bits + extra 4-bit field).
 #[inline]
@@ -287,7 +292,7 @@ fn parse_header(bytes: &[u8], path: &str) -> Result<ParsedHeader> {
     })
 }
 
-/// If `path` matches the llama.cpp split pattern `*-NNNNN-of-MMMMM.gguf`,
+/// If `path` matches the reference C++ implementation's split pattern `*-NNNNN-of-MMMMM.gguf`,
 /// return the list of all part paths in order (1..=MMMMM). Otherwise return
 /// `None` (single-file GGUF). The given `path` may be any one of the parts.
 fn split_parts(path: &str) -> Option<Vec<String>> {
@@ -354,6 +359,7 @@ impl Gguf {
         Ok(Gguf {
             parts,
             data_starts,
+            source_path: path.to_string(),
             tensors,
             metadata_u32: m.metadata_u32,
             metadata_str: m.metadata_str,
@@ -362,6 +368,12 @@ impl Gguf {
             metadata_arr_i32: m.metadata_arr_i32,
             metadata_arr_f32: m.metadata_arr_f32,
         })
+    }
+
+    /// The path this `Gguf` was opened from (part 0's path for a split GGUF,
+    /// see [`Self::open`]).
+    pub fn path(&self) -> &str {
+        &self.source_path
     }
 
     /// Read a `u32`/int scalar from metadata under `key`.
@@ -601,7 +613,7 @@ impl Gguf {
     /// codes packed 4-per-u32 (8 u32/block) at `qs[r*(k/32)*8 + b*8 + i/4]`.
     ///
     /// For a Q8_0 tensor this is a *lossless* repack of the on-disk blocks (the
-    /// f16 block scale is widened to f32, the 32 int8 are re-packed) — no second
+    /// f16 block scale is widened to f32, the 32 int8 are re-packed): no second
     /// quantization. F16/F32 tensors are quantized per-32-block via amax/127, the
     /// identical scheme to `wh_butter_ops::quantize_q8`. `k` (the in-dim, fastest GGUF
     /// dim) must be a multiple of 32.
@@ -623,7 +635,7 @@ impl Gguf {
             GgmlType::Q8_0 => {
                 // On-disk block of 32: f16 scale (2 bytes) + 32 int8. The block
                 // order is row-major over [out, in], so block (r,b) is at linear
-                // block index r*bpr + b — exactly the gemv_q8 ordering. Lossless.
+                // block index r*bpr + b, exactly the gemv_q8 ordering. Lossless.
                 let nblocks = m * bpr;
                 let b = self.raw(t, nblocks * 34);
                 for blk in 0..nblocks {

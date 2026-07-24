@@ -23,6 +23,7 @@ authors = ["Eric Kryski (@ekryski)", "Tom Turney (@TheTom)"]
 repository = "https://github.com/thewafflehaus/butter"
 
 [workspace.dependencies]
+rayon = "1"
 # ── engine crates ────────────────────────────────────────────────────
 wh-butter-core = { path = "crates/wh-butter-core" }
 wh-butter-ops = { path = "crates/wh-butter-ops" }

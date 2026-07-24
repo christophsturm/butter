@@ -532,6 +532,7 @@ dependencies = [
 name = "wh-butter-models"
 version = "0.1.0"
 dependencies = [
+ "rayon",
  "serde_json",
  "wh-butter-core",
  "wh-butter-loader",

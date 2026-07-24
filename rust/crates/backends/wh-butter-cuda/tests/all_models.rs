@@ -8,11 +8,10 @@ fn all_models_on_cuda() {
     wh_butter_modeltests::run_all(dev.as_ref(), "GB10 sm_121");
 }
 
-/// FAST FUSE_SLICECAST lever A/B on a small same-family model (loads in seconds).
-/// See `wh_butter_modeltests::bench_smallmodel_fuse_slicecast`. Default mamba2-130m;
-/// FUSE_SC_MODEL=falcon for Falcon-H1-0.5B. Off-vs-on bit-exact + timing.
-#[test]
-fn smallmodel_fuse_slicecast_ab() {
-    let Some(dev) = CudaDevice::create().expect("cuda") else { eprintln!("no CUDA — skip"); return; };
-    wh_butter_modeltests::bench_smallmodel_fuse_slicecast(dev.as_ref(), "GB10 sm_121");
-}
+// NOTE(rebrand-merge): this file used to also have a `smallmodel_fuse_slicecast_ab`
+// test calling `wh_butter_modeltests::bench_smallmodel_fuse_slicecast`, but that
+// function doesn't exist anywhere in the modeltests crate on the original
+// PR #70 (a27773ec) commit either (pre-existing dead reference, not
+// something this cherry-pick introduced — the FUSE_SLICECAST bench was
+// apparently never actually landed in wh-butter-modeltests). Dropped rather
+// than stubbed since there's no reference implementation to port.

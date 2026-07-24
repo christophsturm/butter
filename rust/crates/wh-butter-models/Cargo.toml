@@ -11,3 +11,4 @@ wh-butter-core.workspace = true
 wh-butter-ops.workspace = true
 wh-butter-loader.workspace = true
 serde_json.workspace = true
+rayon.workspace = true

@@ -50,7 +50,7 @@ mod ssd_scan_portable;
 pub use ssd_scan_portable::ssm_prefill_scan_ssd_portable;
 
 /// Cache of resolved kernel IR keyed by (name, dtype). Resolving walks the
-/// whole test registry building setups, which is expensive — a forward pass
+/// whole test registry building setups, which is expensive: a forward pass
 /// dispatches the same handful of kernels hundreds of times, so cache them.
 /// FxHashMap (single-cycle hash) + parking_lot Mutex (unpoisoned, inlinable).
 fn kernel_cache() -> &'static Mutex<FxHashMap<(String, DType), Kernel>> {
@@ -59,7 +59,7 @@ fn kernel_cache() -> &'static Mutex<FxHashMap<(String, DType), Kernel>> {
 }
 
 /// Cache an inline-built kernel IR by (name, dtype). `kernel_ir_for` rebuilds the
-/// full IR (~30+ ops) on every call — on the decode hot path that's ~250
+/// full IR (~30+ ops) on every call, on the decode hot path that's ~250
 /// rebuilds/token. Build once, clone thereafter.
 fn cached_ir(name: &str, dtype: DType, build: impl FnOnce() -> Kernel) -> Kernel {
     let key = (name.to_string(), dtype);
@@ -180,7 +180,51 @@ fn elementwise(
 }
 
 /// Elementwise sum `a + b` (e.g. residual connections).
+const ADD16_SRC: &str = r#"
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+extern "C" __global__ void butter_add_f16(const __half* __restrict__ a, const __half* __restrict__ b, __half* __restrict__ out, long n){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; long stride=(long)gridDim.x*blockDim.x;
+    for(;i<n;i+=stride) out[i]=__hadd(a[i],b[i]);
+}
+extern "C" __global__ void butter_add_bf16(const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, long n){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; long stride=(long)gridDim.x*blockDim.x;
+    for(;i<n;i+=stride) out[i]=__float2bfloat16(__bfloat162float(a[i])+__bfloat162float(b[i]));
+}
+"#;
+
+const MULSCALAR16_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void butter_mul_scalar_f16(const __half* __restrict__ a, __half* __restrict__ out, float sc, long n){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; long stride=(long)gridDim.x*blockDim.x;
+    for(;i<n;i+=stride) out[i]=__float2half(__half2float(a[i])*sc);
+}
+"#;
+
+/// Elementwise `out = a * scale` for an f16 tensor (raw CUDA). Used to undo a
+/// /256 pre-scale that keeps an f16 intermediate inside the f16 range.
+pub fn mul_scalar_f16(dev: &dyn Device, a: &Tensor, scale: f32) -> Result<Tensor> {
+    let out = Tensor::empty(dev, a.shape.clone(), DType::F16)?;
+    let n = a.elem_count();
+    dev.dispatch_raw_cuda(MULSCALAR16_SRC, "mul_scalar_f16.cu", "butter_mul_scalar_f16",
+        &[(a.buffer.as_ref(), a.offset), (out.buffer.as_ref(), 0)],
+        &[scale.to_le_bytes().to_vec(), (n as i64).to_le_bytes().to_vec()],
+        [(n as u32).div_ceil(256).max(1), 1, 1], [256, 1, 1], 0, false)?;
+    Ok(out)
+}
+
 pub fn add(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    // 16-bit DSL elementwise vec4 codegen IMAs; route f16/bf16 through a raw kernel.
+    if a.dtype == DType::F16 || a.dtype == DType::BF16 {
+        let out = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
+        let n = a.elem_count();
+        let fname = if a.dtype == DType::F16 { "butter_add_f16" } else { "butter_add_bf16" };
+        dev.dispatch_raw_cuda(ADD16_SRC, "add16.cu", fname,
+            &[(a.buffer.as_ref(), a.offset), (b.buffer.as_ref(), b.offset), (out.buffer.as_ref(), 0)],
+            &[(n as i64).to_le_bytes().to_vec()],
+            [(n as u32).div_ceil(256).max(1), 1, 1], [256, 1, 1], 0, false)?;
+        return Ok(out);
+    }
     elementwise(dev, a, b, BinOpKind::Add, "iron_add")
 }
 
@@ -196,24 +240,34 @@ extern "C" __global__ void butter_add3(
 {
     long i=(long)blockIdx.x*blockDim.x+threadIdx.x;
     long stride=(long)gridDim.x*blockDim.x;
-    // association matches the unfused path exactly: xt + (acc + sd) — a
+    // association matches the unfused path exactly: xt + (acc + sd), a
     // left-assoc a+b+c flipped the d32768 argmax via last-ulp drift.
     for(;i<n;i+=stride) out[i]=a[i]+(b[i]+c[i]);
 }
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+extern "C" __global__ void butter_add3_f16(const __half* __restrict__ a, const __half* __restrict__ b, const __half* __restrict__ c, __half* __restrict__ out, long n){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; long stride=(long)gridDim.x*blockDim.x;
+    for(;i<n;i+=stride){ float r=__half2float(a[i])+(__half2float(b[i])+__half2float(c[i])); out[i]=__float2half(r);} }
+extern "C" __global__ void butter_add3_bf16(const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b, const __nv_bfloat16* __restrict__ c, __nv_bfloat16* __restrict__ out, long n){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; long stride=(long)gridDim.x*blockDim.x;
+    for(;i<n;i+=stride){ float r=__bfloat162float(a[i])+(__bfloat162float(b[i])+__bfloat162float(c[i])); out[i]=__float2bfloat16(r);} }
 "#;
 
-/// Fused three-way elementwise sum `a + b + c` (f32, CUDA raw path) — one
+/// Fused three-way elementwise sum `a + b + c` (f32, CUDA raw path), one
 /// launch + no intermediate tensor for the per-E-layer
 /// `residual + routed_acc + shared_out` merge (was two `iron_add` launches).
 pub fn add3(dev: &dyn Device, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<Tensor> {
     let out = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
     let n = a.elem_count();
     let l = |v: i64| v.to_le_bytes().to_vec();
-    dev.dispatch_raw_cuda(ADD3_SRC, "add3.cu", "butter_add3",
+    let fname = match a.dtype { DType::F16 => "butter_add3_f16", DType::BF16 => "butter_add3_bf16", _ => "butter_add3" };
+    let per = if a.dtype == DType::F32 { 256 * 4 } else { 256 };
+    dev.dispatch_raw_cuda(ADD3_SRC, "add3.cu", fname,
         &[(a.buffer.as_ref(), a.offset), (b.buffer.as_ref(), b.offset),
           (c.buffer.as_ref(), c.offset), (out.buffer.as_ref(), 0)],
         &[l(n as i64)],
-        [(n as u32).div_ceil(256 * 4).max(1), 1, 1], [256, 1, 1], 0, false)?;
+        [(n as u32).div_ceil(per).max(1), 1, 1], [256, 1, 1], 0, false)?;
     Ok(out)
 }
 
@@ -243,7 +297,7 @@ pub fn swiglu_limit(dev: &dyn Device, gate: &Tensor, up: &Tensor, limit: f32) ->
 }
 
 /// DSv4 MoE router scoring: `score_unbiased[e] = sqrt(softplus(logit[e]))`,
-/// `score_biased[e] = score_unbiased[e] + bias[e]`. Computed **host-side** —
+/// `score_biased[e] = score_unbiased[e] + bias[e]`. Computed **host-side**,
 /// the router operates on the tiny `[n_experts]` logit vector that the MoE
 /// already downloads for top-k selection, so a GPU kernel buys nothing and
 /// avoids the multi-output dispatch path. `biased` selects the top-k experts;
@@ -403,7 +457,7 @@ pub fn dsv4_mhc_sinkhorn_split(
 }
 
 
-/// mHC collapse: `out[d] = Σ_c pre[c] · state[c, d]` — mix the 4-channel
+/// mHC collapse: `out[d] = Σ_c pre[c] · state[c, d]`, mix the 4-channel
 /// residual state `[n_hc, hidden]` down to `[hidden]` using the per-channel
 /// `pre` weights. Single token. Dispatches `iron_dsv4_mhc_collapse`.
 pub fn dsv4_mhc_collapse(
@@ -481,7 +535,9 @@ pub fn rms_norm(dev: &dyn Device, x: &Tensor, weight: &Tensor, eps: f32) -> Resu
 
     // Fast path: 4 elems/thread, needs n a multiple of 128 and ≤ 4096.
     // Otherwise the strided wide variant handles any row width.
-    let (kname, block) = if n % 128 == 0 && n <= 4096 {
+    // 16-bit (f16/bf16) DSL vec4 fast-path codegen is broken (IMAs); route them
+    // through the scalar wide variant. f32 keeps the fast path.
+    let (kname, block) = if x.dtype == DType::F32 && n % 128 == 0 && n <= 4096 {
         ("iron_rms_norm", (n / 4) as u32)
     } else {
         ("iron_rms_norm_wide", 256u32)
@@ -534,7 +590,7 @@ pub fn gemv(dev: &dyn Device, mat: &Tensor, vec: &Tensor) -> Result<Tensor> {
     Ok(out)
 }
 
-/// Q8_0 grouped matvec — weights stay QUANTIZED resident (int8, block 32, one
+/// Q8_0 grouped matvec, weights stay QUANTIZED resident (int8, block 32, one
 /// f32 scale/block): `out[r] = Σ_k dequant(qs[r,k], scales[r, k/32]) ·
 /// x[(r/rows_per_group)·k_in + k]`. `qs` is u32-packed (4 int8/u32, 8 u32/block),
 /// `scales` is `[m_out · k_in/32]` f32. Dense gemv ⇒ `rows_per_group = m_out`
@@ -640,7 +696,7 @@ pub fn gemm_q8_mpp(
 /// `out[r,o] = x[r,o] + bias[o]`. The decode path adds a `[n]` bias to a single
 /// `[n]` projection with plain [`add`]; the batched prefill path needs the same
 /// bias on every token row, but [`add`] is shape-strict (no broadcast). This is
-/// a fully on-device elementwise kernel (`out[i] = x[i] + bias[i % n]`) — no
+/// a fully on-device elementwise kernel (`out[i] = x[i] + bias[i % n]`), no
 /// host round-trip, so it works on device-local (non-mappable) weight buffers.
 /// Returns `[n_rows, n]` f32.
 pub fn add_bias_rows(dev: &dyn Device, x: &Tensor, bias: &Tensor, n_rows: usize, n: usize) -> Result<Tensor> {
@@ -793,7 +849,7 @@ pub fn slice(dev: &dyn Device, src: &Tensor, off: usize, len: usize) -> Result<T
     // Defensive bounds check. The kernel reads `src[off + i]` for i in [0, len),
     // addressing a sub-slab purely via `off` against the RAW bound buffer (the
     // tensor.offset is ignored by design). A caller binding a buffer that does
-    // not hold `off + len` elements triggers an out-of-bounds READ — silent
+    // not hold `off + len` elements triggers an out-of-bounds READ, silent
     // garbage on Metal, a deterministic MMU-fault on CUDA. Fail loudly, naming
     // the shapes, so the mis-sized caller is obvious on every backend.
     let need = off + len; // max element read is src[off + len - 1]
@@ -854,7 +910,7 @@ pub fn cast_bf16_f32(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
     Ok(out)
 }
 
-/// Device Mamba dt: `softplus(dt_raw + dt_bias)` — no host round-trip.
+/// Device Mamba dt: `softplus(dt_raw + dt_bias)`, no host round-trip.
 pub fn softplus_add(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let k = cached_ir("iron_softplus_add", DType::F32, || { let mut k = wh_iron_std::kernels::ssm::scan::iron_softplus_add::kernel_ir(); k.mode = wh_iron_core::ir::KernelMode::Grid3D; k });
     let n = a.elem_count();
@@ -930,8 +986,154 @@ pub fn conv1d_causal_prefill(
     Ok(y)
 }
 
+const CONV1D_PREFILL_V4_SRC: &str = r#"
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float silu_f32(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+extern "C" __global__ void conv1d_causal_prefill_v4(
+    const float* __restrict__ xbc,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    float* __restrict__ y,
+    int conv_dim4, int kc, int total4)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total4) return;
+    int ti = idx / conv_dim4;
+    int ci4 = idx - ti * conv_dim4;
+    const float4* __restrict__ x4 = reinterpret_cast<const float4*>(xbc);
+    const float4* __restrict__ w4 = reinterpret_cast<const float4*>(w);
+    const float4* __restrict__ b4 = reinterpret_cast<const float4*>(bias);
+    float4 acc = b4[ci4];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= kc) break;
+        int src_t = ti - (kc - 1 - k);
+        if (src_t >= 0) {
+            float4 xv = x4[(size_t)src_t * conv_dim4 + ci4];
+            float4 wv = w4[(size_t)k * conv_dim4 + ci4];
+            acc.x += xv.x * wv.x;
+            acc.y += xv.y * wv.y;
+            acc.z += xv.z * wv.z;
+            acc.w += xv.w * wv.w;
+        }
+    }
+    acc.x = silu_f32(acc.x);
+    acc.y = silu_f32(acc.y);
+    acc.z = silu_f32(acc.z);
+    acc.w = silu_f32(acc.w);
+    reinterpret_cast<float4*>(y)[idx] = acc;
+}
+
+extern "C" __global__ void conv1d_causal_prefill_split_v4(
+    const float* __restrict__ xbc,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    float* __restrict__ x_out,
+    float* __restrict__ b_out,
+    float* __restrict__ c_out,
+    int conv_dim4, int di4, int ng_ds4, int kc, int total4)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total4) return;
+    int ti = idx / conv_dim4;
+    int ci4 = idx - ti * conv_dim4;
+    const float4* __restrict__ x4 = reinterpret_cast<const float4*>(xbc);
+    const float4* __restrict__ w4 = reinterpret_cast<const float4*>(w);
+    const float4* __restrict__ b4 = reinterpret_cast<const float4*>(bias);
+    float4 acc = b4[ci4];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= kc) break;
+        int src_t = ti - (kc - 1 - k);
+        if (src_t >= 0) {
+            float4 xv = x4[(size_t)src_t * conv_dim4 + ci4];
+            float4 wv = w4[(size_t)k * conv_dim4 + ci4];
+            acc.x += xv.x * wv.x;
+            acc.y += xv.y * wv.y;
+            acc.z += xv.z * wv.z;
+            acc.w += xv.w * wv.w;
+        }
+    }
+    acc.x = silu_f32(acc.x);
+    acc.y = silu_f32(acc.y);
+    acc.z = silu_f32(acc.z);
+    acc.w = silu_f32(acc.w);
+    if (ci4 < di4) {
+        reinterpret_cast<float4*>(x_out)[(size_t)ti * di4 + ci4] = acc;
+    } else if (ci4 < di4 + ng_ds4) {
+        int j = ci4 - di4;
+        reinterpret_cast<float4*>(b_out)[(size_t)ti * ng_ds4 + j] = acc;
+    } else {
+        int j = ci4 - di4 - ng_ds4;
+        reinterpret_cast<float4*>(c_out)[(size_t)ti * ng_ds4 + j] = acc;
+    }
+}
+"#;
+
+/// Fused raw-float4 causal conv1d+SiLU that writes the post-conv x/B/C split
+/// surfaces directly, deleting the temp [s,conv_dim] conv output + the split
+/// launch. Equivalent to conv1d_causal_prefill + mamba_split_conv. Escape with
+/// NEMOTRON_CONV_PREFILL_SPLIT_OFF=1 (falls back to that pair).
+pub fn conv1d_causal_prefill_split(
+    dev: &dyn Device,
+    xbc_in: &Tensor,
+    w: &Tensor,
+    bias: &Tensor,
+    s: usize,
+    conv_dim: usize,
+    di: usize,
+    ng_ds: usize,
+    kc: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let raw_ok = std::env::var("NEMOTRON_CONV_PREFILL_RAW_OFF").is_err()
+        && std::env::var("NEMOTRON_CONV_PREFILL_SPLIT_OFF").is_err()
+        && xbc_in.dtype == DType::F32 && w.dtype == DType::F32 && bias.dtype == DType::F32
+        && xbc_in.offset % 16 == 0 && w.offset % 16 == 0 && bias.offset % 16 == 0
+        && di + 2 * ng_ds == conv_dim
+        && di % 4 == 0 && ng_ds % 4 == 0 && conv_dim % 4 == 0;
+    if raw_ok {
+        let x_out = Tensor::empty(dev, vec![s * di], DType::F32)?;
+        let b_out = Tensor::empty(dev, vec![s * ng_ds], DType::F32)?;
+        let c_out = Tensor::empty(dev, vec![s * ng_ds], DType::F32)?;
+        let i = |v: i32| v.to_le_bytes().to_vec();
+        let total4 = (s * conv_dim / 4) as u32;
+        if dev.dispatch_raw_cuda(
+            CONV1D_PREFILL_V4_SRC,
+            "conv1d_prefill_v4.cu",
+            "conv1d_causal_prefill_split_v4",
+            &[
+                (xbc_in.buffer.as_ref(), xbc_in.offset),
+                (w.buffer.as_ref(), w.offset),
+                (bias.buffer.as_ref(), bias.offset),
+                (x_out.buffer.as_ref(), 0),
+                (b_out.buffer.as_ref(), 0),
+                (c_out.buffer.as_ref(), 0),
+            ],
+            &[
+                i((conv_dim / 4) as i32),
+                i((di / 4) as i32),
+                i((ng_ds / 4) as i32),
+                i(kc as i32),
+                i(total4 as i32),
+            ],
+            [total4.div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+            false,
+        ).is_ok() {
+            return Ok((x_out, b_out, c_out));
+        }
+    }
+    let y = conv1d_causal_prefill(dev, xbc_in, w, bias, s, conv_dim, kc)?;
+    mamba_split_conv(dev, &y, s, conv_dim, di, ng_ds)
+}
+
 /// Extract `[s, width]` columns from row-major `src [s, stride]` at column offset `col_off`.
-/// Returns `dst [s * width]` — a contiguous slab. Used to carve z, xbc, dt_raw out of
+/// Returns `dst [s * width]`, a contiguous slab. Used to carve z, xbc, dt_raw out of
 /// the [s, in_proj_out] projection matrix on device (NEMOTRON_CONV_DEVICE path).
 pub fn strided_col_copy(
     dev: &dyn Device,
@@ -943,10 +1145,10 @@ pub fn strided_col_copy(
 ) -> Result<Tensor> {
     let kernel = lookup("iron_strided_col_copy", DType::F32)?;
     // Defensive bounds check. The kernel reads `src[ti*stride + col_off + ci]`
-    // for ti in [0, s), ci in [0, width) — a sub-slab addressed purely via the
+    // for ti in [0, s), ci in [0, width): a sub-slab addressed purely via the
     // host stride/col_off against the RAW bound buffer (tensor.offset ignored by
     // design). A caller binding a row-stride/offset/width that overruns the
-    // bound buffer triggers an out-of-bounds READ — silent garbage on Metal, a
+    // bound buffer triggers an out-of-bounds READ, silent garbage on Metal, a
     // deterministic MMU-fault on CUDA. Fail loudly, naming the shapes.
     if s != 0 && width != 0 {
         let need = (s - 1) * stride + col_off + width; // max read is src[need - 1]
@@ -960,6 +1162,7 @@ pub fn strided_col_copy(
     }
     let dst = Tensor::empty(dev, vec![s * width], DType::F32)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let total = (s * width) as u32;
     dev.dispatch(
         &kernel,
         &[
@@ -969,16 +1172,97 @@ pub fn strided_col_copy(
             u(col_off as u32),
             u(width as u32),
         ],
-        // PERF: 64 threads/block (was 1). `width` is one of {di=4096, ng*ds=1024,
-        // m_nh=64} — all multiples of 64, so s*width is divisible by 64 → exact grid.
-        { let n = (s * width) as u32; let b = 64u32; Grid { grid: [n / b, 1, 1], block: [b, 1, 1] } },
+        // The kernel has no internal idx guard, so the grid must cover exactly
+        // s*width threads. Laguna's gate-column extraction is not always
+        // 64-aligned (head counts 48/72): use the largest power-of-two block
+        // (<= 64) that divides the total — 64 for the common aligned shapes.
+        {
+            let b = 1u32 << total.trailing_zeros().min(6);
+            Grid { grid: [total / b, 1, 1], block: [b, 1, 1] }
+        },
+    )?;
+    Ok(dst)
+}
+
+const EXTRACT_COLS_SRC: &str = r#"
+extern "C" __global__ void butter_extract_cols(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int rows, int stride, int col_off, int width)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * width;
+    if (i >= total) return;
+    int c = (int)(i % width);
+    long r = i / width;
+    dst[i] = src[r * stride + col_off + c];
+}
+"#;
+
+// f16 mirror of EXTRACT_COLS_SRC: same indexing, 16-bit loads/stores. Added
+// so prefill's Marlin/grouped-MoE-GEMM column splits (both f16-native
+// producers) can extract without a whole-buffer cast_f16_f32 first, see
+// `extract_cols`'s doc.
+const EXTRACT_COLS_F16_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void butter_extract_cols_f16(
+    const __half* __restrict__ src, __half* __restrict__ dst,
+    int rows, int stride, int col_off, int width)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * width;
+    if (i >= total) return;
+    int c = (int)(i % width);
+    long r = i / width;
+    dst[i] = src[r * stride + col_off + c];
+}
+"#;
+
+/// Extract a `[rows, width]` column range starting at `col_off` from every
+/// row of a `[rows, stride]` row-major buffer (`stride >= col_off + width`).
+/// Used to split Laguna's fused `[T, n_q_rows+2*n_kv_rows+n_g_rows]`
+/// QKVG-concat batched-prefill projection back into its Q/K/V/gate column
+/// ranges (and, in f16, to split a Marlin/grouped-MoE-GEMM's fused
+/// `[gate;up]` output without a cast first). Originally added as a
+/// workaround for a `strided_col_copy` launch-geometry bug (fixed grid
+/// dropped the tail whenever `rows*width` wasn't a multiple of 64, true for
+/// Laguna's gate column range, whose width is the per-layer head count of 48
+/// or 72, neither 64-aligned, times an arbitrary chunk length).
+/// `strided_col_copy` now div_ceils its grid and guards in-kernel, so this
+/// raw CUDA path is kept as-is only to avoid touching a call site mid-flight
+/// elsewhere; this kernel's grid is sized to cover every element regardless
+/// of `rows*width`'s divisibility. f32 and f16 (dispatched on `src.dtype`);
+/// any other dtype errors.
+pub fn extract_cols(dev: &dyn Device, src: &Tensor, rows: usize, stride: usize, col_off: usize, width: usize) -> Result<Tensor> {
+    let (elem_bytes, cuda_src, prog_name, fn_name) = match src.dtype {
+        DType::F32 => (DType::F32.size_bytes(), EXTRACT_COLS_SRC, "extract_cols.cu", "butter_extract_cols"),
+        DType::F16 => (DType::F16.size_bytes(), EXTRACT_COLS_F16_SRC, "extract_cols_f16.cu", "butter_extract_cols_f16"),
+        other => return Err(Error::Msg(format!("extract_cols: unsupported dtype {other:?} (f32/f16 only)"))),
+    };
+    if rows != 0 && width != 0 {
+        let need = (rows - 1) * stride + col_off + width; // max read is src[need - 1]
+        let have = src.buffer.len() / elem_bytes;
+        if need > have {
+            return Err(Error::Msg(format!(
+                "extract_cols OOB: rows={rows} stride={stride} col_off={col_off} width={width} \
+                 needs {need} {:?} elems but bound buffer holds {have}", src.dtype
+            )));
+        }
+    }
+    let dst = Tensor::empty(dev, vec![rows * width], src.dtype)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let total = (rows * width) as u32;
+    dev.dispatch_raw_cuda(
+        cuda_src, prog_name, fn_name,
+        &[(src.buffer.as_ref(), src.offset), (dst.buffer.as_ref(), 0)],
+        &[i(rows as i32), i(stride as i32), i(col_off as i32), i(width as i32)],
+        [total.div_ceil(256).max(1), 1, 1], [256, 1, 1], 0, false,
     )?;
     Ok(dst)
 }
 
 /// Batched softplus + tiled bias: `dst[ti*n + hi] = softplus(src[ti*n + hi] + bias[hi])`.
 /// Converts the raw `[s, m_nh]` dt_raw tensor + dt_bias to `dt_all [s, m_nh]` on device.
-/// (NEMOTRON_CONV_DEVICE path — replaces the CPU softplus loop.)
+/// (NEMOTRON_CONV_DEVICE path, replaces the CPU softplus loop.)
 pub fn softplus_add_rows(
     dev: &dyn Device,
     src: &Tensor,
@@ -1021,6 +1305,82 @@ pub fn moe_gather_up_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &T
     dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(hid as u32), u(inter as u32), u(rpt)], Grid { grid: [(inter as u32).div_ceil(rpt), top_k as u32, 1], block: [32 * rpt, 1, 1] })?;
     Ok(out)
 }
+// Single-block strided argmax over an f32 vector (the 100K-vocab logit row).
+// Ties resolve to the LOWEST index, matching the host-side scan. One block of
+// 1024 threads striding n, then a shared-memory tree reduce: microseconds at
+// vocab scale, and it shrinks the per-step D2H from the full logit row to 4
+// bytes for greedy decode.
+const ARGMAX_F32_SRC: &str = r#"
+extern "C" __global__ void butter_argmax_f32(
+    const float* __restrict__ x, unsigned* __restrict__ out, int n)
+{
+    __shared__ float sv[1024];
+    __shared__ unsigned si[1024];
+    int tid = threadIdx.x;
+    float best = -3.4028235e38f;
+    unsigned bi = 0u;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float v = x[i];
+        if (v > best || (v == best && (unsigned)i < bi)) { best = v; bi = (unsigned)i; }
+    }
+    sv[tid] = best; si[tid] = bi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sv[tid + s] > sv[tid] || (sv[tid + s] == sv[tid] && si[tid + s] < si[tid])) {
+                sv[tid] = sv[tid + s]; si[tid] = si[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out[0] = si[0];
+}
+"#;
+
+/// Device argmax of an f32 vector: returns a 1-element u32 tensor holding the
+/// index of the maximum (ties: lowest index). Greedy decode downloads these 4
+/// bytes instead of the whole logit row.
+pub fn argmax_f32_device(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
+    let n = x.elem_count();
+    let out = Tensor::empty(dev, vec![1], DType::U32)?;
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        ARGMAX_F32_SRC, "argmax_f32.cu", "butter_argmax_f32",
+        &[(x.buffer.as_ref(), x.offset), (out.buffer.as_ref(), 0)],
+        &[i(n as i32)],
+        [1, 1, 1], [1024, 1, 1], 0, false,
+    )?;
+    Ok(out)
+}
+
+/// Batched MoE expert gather GEMV, plain (no fused activation): one
+/// `[top_k*inter]` output from the contiguous `[n_exp*inter, hid]` Q4 stack.
+/// The SwiGLU MoE path calls this for the gate and up stacks, then applies
+/// the activation elementwise before the down gather. F16 per-block scales.
+///
+/// TODO(rebrand-merge): blocked — dispatches `iron_moe_gather_q4` via
+/// `wh_iron_std`'s kernel IR, but the pinned `thewafflehaus/iron@dev` kernel
+/// library only ships `iron_moe_gather_q4_relu2/_down/_down_accum` — the
+/// plain (non-relu2) variant this needs is not present upstream yet. Kept as
+/// an always-error stub until that kernel lands in the iron repo.
+pub fn moe_gather_q4(_dev: &dyn Device, _qs: &Tensor, _scales: &Tensor, _x: &Tensor, _idx: &Tensor, _top_k: usize, _inter: usize, _hid: usize) -> Result<Tensor> {
+    Err(Error::Msg("moe_gather_q4: blocked — iron_moe_gather_q4 kernel not yet in thewafflehaus/iron@dev (only _relu2/_down/_down_accum variants exist)".into()))
+}
+
+/// Batched MoE GATE+UP gather with FUSED inline SwiGLU: reads the SAME
+/// activation `x` once and computes both the gate and up dot products for
+/// each (slot, inter-row), writing `silu(gate)·up` straight to a single
+/// `[top_k*inter]` output. Replaces two `moe_gather_q4` calls (gate stack,
+/// up stack) plus a host-side elementwise SwiGLU pass with one dispatch.
+/// F16 per-block scales on both `gate_scales` and `up_scales`.
+#[allow(clippy::too_many_arguments)]
+/// TODO(rebrand-merge): blocked — same iron-kernel gap as `moe_gather_q4`
+/// above (`iron_moe_gather_q4_swiglu` not in `thewafflehaus/iron@dev` yet).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gather_q4_swiglu(_dev: &dyn Device, _gate_qs: &Tensor, _gate_scales: &Tensor, _up_qs: &Tensor, _up_scales: &Tensor, _x: &Tensor, _idx: &Tensor, _top_k: usize, _inter: usize, _hid: usize) -> Result<Tensor> {
+    Err(Error::Msg("moe_gather_q4_swiglu: blocked — iron_moe_gather_q4_swiglu kernel not yet in thewafflehaus/iron@dev".into()))
+}
+
 /// Batched MoE down + router-weighted accumulate into `acc[hid]`. `qs` is the
 /// contiguous `[n_exp*hid, inter]` Q4 weight; `x` is the `[top_k*inter]` up output.
 #[allow(clippy::too_many_arguments)]
@@ -1112,7 +1472,7 @@ extern "C" __global__ void moe_fused_ffn(
 {
     cg::grid_group gg = cg::this_grid();
 
-    // Global warp id — one warp per acc[h] for phase 2.
+    // Global warp id, one warp per acc[h] for phase 2.
     int tid     = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int lane    = threadIdx.x & 31;
     int warp_id = tid >> 5;
@@ -1232,7 +1592,7 @@ pub fn moe_fused_ffn(
 /// Router-weighted sum of per-expert down outputs into `acc`: `acc[h] += Σ wts·downs[·,h]`.
 /// Fully ON-DEVICE MoE router (NemotronH sigmoid + e_score_correction_bias, top-k by
 /// biased score, weights from unbiased renormalized to sum-1, ×routed_scaling_factor).
-/// Returns (idx[top_k] U32, wts[top_k] F32) WITHOUT a host round-trip — replaces the
+/// Returns (idx[top_k] U32, wts[top_k] F32) WITHOUT a host round-trip, replaces the
 /// per-layer dl(gate)+host-topk+up(idx) sync that drains the async pipeline 23×/token.
 pub fn moe_router_device(dev: &dyn Device, gate_logits: &Tensor, bias: &Tensor, n_exp: usize, top_k: usize, scale: f32) -> Result<(Tensor, Tensor)> {
     use wh_iron_core::ir::KernelMode;
@@ -1254,12 +1614,12 @@ pub fn moe_router_device(dev: &dyn Device, gate_logits: &Tensor, bias: &Tensor, 
 /// On-device MoE route + counting-sort. Replaces the per-E-layer HOST `triples`
 /// round-trip (router logits → host → sigmoid+topk+sort → upload) that stalls the
 /// GPU every MoE layer and blocks CUDA-graph capture of prefill. Given gate logits
-/// `[s, n_exp]` (f32) + bias `[n_exp]`, produces — ALL on device:
-///   sorted_tok `[mt]` u32 — token index per sorted slot (mt = s*top_k)
-///   sorted_wt  `[mt]` f32 — router weight per slot (sigmoid, normalized, ·scale)
-///   offsets    `[n_exp+1]` u32 — group boundaries (expert e's rows = [off[e],off[e+1]))
+/// `[s, n_exp]` (f32) + bias `[n_exp]`, produces (ALL on device):
+///   sorted_tok `[mt]` u32, token index per sorted slot (mt = s*top_k)
+///   sorted_wt  `[mt]` f32, router weight per slot (sigmoid, normalized, ·scale)
+///   offsets    `[n_exp+1]` u32, group boundaries (expert e's rows = [off[e],off[e+1]))
 /// Tokens grouped contiguously by expert. Order within an expert is atomic-cursor
-/// (not stable) — same near-tie nondeterminism as the existing GROUPED_GEMM path.
+/// (not stable), same near-tie nondeterminism as the existing GROUPED_GEMM path.
 const MOE_BATCHED_ROUTER_SRC: &str = r#"
 extern "C" __global__ void moe_batched_router(
     const float* __restrict__ logits, const float* __restrict__ bias,
@@ -1336,6 +1696,32 @@ extern "C" __global__ void moe_scatter_sort(
         base += __popc(mask);
     }
 }
+
+extern "C" __global__ void moe_scatter_sort_rowpos(
+    const unsigned* __restrict__ idx, const float* __restrict__ wt,
+    const unsigned* __restrict__ offsets, unsigned* __restrict__ sorted_tok,
+    float* __restrict__ sorted_wt, unsigned* __restrict__ rowpos,
+    int mt, int top_k, int n_exp)
+{
+    // Same stable expert-major ordering as moe_scatter_sort, plus a token-major
+    // slot -> sorted-row map for deterministic fixed-top_k output scatter.
+    int e = (blockIdx.x*blockDim.x + threadIdx.x) >> 5; if (e >= n_exp) return;
+    int lane = threadIdx.x & 31;
+    unsigned base = offsets[e];
+    for (int w = 0; w < mt; w += 32) {
+        int i = w + lane;
+        bool match = (i < mt) && (idx[i] == (unsigned)e);
+        unsigned mask = __ballot_sync(0xffffffffu, match);
+        if (match) {
+            unsigned rank = __popc(mask & ((1u << lane) - 1u));
+            unsigned pos = base + rank;
+            sorted_tok[pos] = (unsigned)(i / top_k);
+            sorted_wt[pos] = wt[i];
+            rowpos[i] = pos;
+        }
+        base += __popc(mask);
+    }
+}
 "#;
 
 #[allow(clippy::type_complexity)]
@@ -1377,6 +1763,42 @@ pub fn moe_route_sort_device(
     Ok((sorted_tok, sorted_wt, offsets))
 }
 
+#[allow(clippy::type_complexity)]
+pub fn moe_route_sort_device_rowpos(
+    dev: &dyn Device, gate_logits: &Tensor, bias: &Tensor, n_exp: usize, top_k: usize, scale: f32,
+) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    let s = gate_logits.elem_count() / n_exp;
+    let mt = s * top_k;
+    let idx = Tensor::empty(dev, vec![mt], DType::U32)?;
+    let wt = Tensor::empty(dev, vec![mt], DType::F32)?;
+    let counts = Tensor::new(dev.alloc_zeroed(n_exp * 4).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![n_exp], DType::U32);
+    let offsets = Tensor::empty(dev, vec![n_exp + 1], DType::U32)?;
+    let cursor = Tensor::empty(dev, vec![n_exp], DType::U32)?;
+    let sorted_tok = Tensor::empty(dev, vec![mt], DType::U32)?;
+    let sorted_wt = Tensor::empty(dev, vec![mt], DType::F32)?;
+    let rowpos = Tensor::empty(dev, vec![mt], DType::U32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    let blk = if n_exp >= 256 { 256 } else { n_exp.max(32) } as u32;
+    dev.dispatch_raw_cuda(MOE_BATCHED_ROUTER_SRC, "moe_route_sort.cu", "moe_batched_router",
+        &[(gate_logits.buffer.as_ref(), gate_logits.offset), (bias.buffer.as_ref(), bias.offset),
+          (idx.buffer.as_ref(), 0), (wt.buffer.as_ref(), 0)],
+        &[i(s as i32), i(n_exp as i32), i(top_k as i32), f(scale)],
+        [s as u32, 1, 1], [blk, 1, 1], 0, false)?;
+    dev.dispatch_raw_cuda(MOE_HIST_SRC, "moe_hist.cu", "moe_hist",
+        &[(idx.buffer.as_ref(), 0), (counts.buffer.as_ref(), 0)],
+        &[i(mt as i32)], [(mt as u32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
+    dev.dispatch_raw_cuda(MOE_PREFIX_SRC, "moe_prefix.cu", "moe_prefix",
+        &[(counts.buffer.as_ref(), 0), (offsets.buffer.as_ref(), 0), (cursor.buffer.as_ref(), 0)],
+        &[i(n_exp as i32)], [1, 1, 1], [32, 1, 1], 0, false)?;
+    let _ = &cursor;
+    dev.dispatch_raw_cuda(MOE_SCATTER_SORT_SRC, "moe_scatter_sort.cu", "moe_scatter_sort_rowpos",
+        &[(idx.buffer.as_ref(), 0), (wt.buffer.as_ref(), 0), (offsets.buffer.as_ref(), 0),
+          (sorted_tok.buffer.as_ref(), 0), (sorted_wt.buffer.as_ref(), 0), (rowpos.buffer.as_ref(), 0)],
+        &[i(mt as i32), i(top_k as i32), i(n_exp as i32)], [((n_exp * 32) as u32).div_ceil(128), 1, 1], [128, 1, 1], 0, false)?;
+    Ok((sorted_tok, sorted_wt, offsets, rowpos, wt))
+}
+
 pub fn moe_weighted_sum(dev: &dyn Device, downs: &Tensor, wts: &Tensor, acc: &Tensor, hid: usize, top_k: usize) -> Result<()> {
     let k = cached_ir("iron_moe_weighted_sum", acc.dtype, || { let mut k = wh_iron_std::kernels::moe::moe_gather_q4::iron_moe_weighted_sum::kernel_ir_for(acc.dtype); k.mode = wh_iron_core::ir::KernelMode::Grid3D; k });
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
@@ -1384,7 +1806,7 @@ pub fn moe_weighted_sum(dev: &dyn Device, downs: &Tensor, wts: &Tensor, acc: &Te
     Ok(())
 }
 
-// ── Q4 (4-bit) family — half the weight DRAM of Q8 (the decode lever). ──
+// ── Q4 (4-bit) family, half the weight DRAM of Q8 (the decode lever). ──
 fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor, x: &Tensor, acc: Option<&Tensor>, scale_buf: Option<&Tensor>, m_out: usize, k_in: usize, rows_per_group: usize) -> Result<Tensor> {
     // 2-row tiling: 2 output rows per warp, shared activation read, 2 weight
     // streams in flight (more memory-level-parallelism on the latency-bound Q4 read).
@@ -1422,7 +1844,7 @@ fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor
     } else {
         // relu2 / accum: multi-warp capable (rows_per_tg warps/TG). The shared-
         // expert matrices (3712×2688, 2688×3712) are small; rpt>1 gives no
-        // measured gain (these kernels are NOT latency-bound — the ~50% BW the
+        // measured gain (these kernels are NOT latency-bound, the ~50% BW the
         // sync-bracketed profiler showed is a measurement artifact, the kernel
         // time is small). Default rpt=1 (bit-identical to the original single-
         // warp form); BUTTER_GEMV_SHARED_RPT overrides for experimentation.
@@ -1433,7 +1855,10 @@ fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor
     dev.dispatch(&k, &b, grid)?;
     Ok(out)
 }
-/// Q4 matvec `out = Wq4·x`. (block 32, int4 [-7,7], f32 scale/block.)
+/// Q4 matvec `out = Wq4·x`. Block 32, int4 [-7,7], ONE F16 SCALE PER BLOCK:
+/// the coalesced/relu2/accum kernels read `scales` as f16, so convert the f32
+/// scales from [`quantize_q4`] with an f32-to-f16 pass before upload (raw f32
+/// bytes get silently reinterpreted as garbage f16 and inflate every output).
 pub fn gemv_q4(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rpg: usize) -> Result<Tensor> {
     gemv_q4_dispatch(dev, "plain", qs, scales, x, None, None, m_out, k_in, rpg)
 }
@@ -1450,6 +1875,9 @@ pub fn gemv_q4_accum(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor,
 /// Quantize a row-major `[m,k]` F32 weight to Q4 blocks (block 32, symmetric int4
 /// in [-7,7], f32 scale `amax/7`). Returns `(qs_u32, scales)`: qs `[m·k/32·4]`
 /// (8 nibbles/u32, 4 u32/block), scales `[m·k/32]`. `k` must be a multiple of 32.
+/// NOTE: the returned scales are host f32; the `gemv_q4`/`gemv_q4_relu2`/
+/// `gemv_q4_accum` device kernels expect them uploaded as F16 (see the
+/// `gemv_q4` doc). Only `MT_GEMV_VEC`'s vectorized kernel takes f32 scales.
 pub fn quantize_q4(w: &[f32], m: usize, k: usize) -> (Vec<u32>, Vec<f32>) {
     assert_eq!(k % 32, 0, "quantize_q4: k must be a multiple of 32");
     let bpr = k / 32;
@@ -1523,7 +1951,7 @@ fn enc_e2m1(v: f32) -> u8 {
 }
 
 /// Encode a non-negative scale `s` to a UE4M3 byte (4 exp bits bias-7, 3 mantissa,
-/// no sign — NVFP4's micro-scale type). Round-to-nearest over representable values.
+/// no sign, NVFP4's micro-scale type). Round-to-nearest over representable values.
 #[inline]
 fn enc_ue4m3(s: f32) -> u8 {
     if s <= 0.0 { return 0; }
@@ -1555,12 +1983,60 @@ pub fn dec_ue4m3(b: u8) -> f32 {
 ///
 /// Returns `(codes, scales, global)`:
 /// - `codes`: `[m · k/8]` u32, 8 e2m1 nibbles per u32 (nibble j of word w = element
-///   `w*8 + j` of the row), row-major — same packing convention as [`quantize_q4`].
+///   `w*8 + j` of the row), row-major: same packing convention as [`quantize_q4`].
 /// - `scales`: `[m · k/16]` UE4M3 bytes (one per 16-element K-block, row-major).
 /// - `global`: per-tensor f32; the true block scale is `dec_ue4m3(scale) * global`.
 ///   Chosen so each block's `amax/6` lands in UE4M3's representable range.
 ///
 /// Example: `let (codes, scales, g) = quantize_nvfp4(&w, n_rows, k_in);`
+#[inline]
+fn marlin_f32_to_f16(f: f32) -> u16 {
+    let x = f.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let e = ((x >> 23) & 0xff) as i32 - 112; // 127 - 15
+    if e <= 0 { return sign; }
+    if e >= 0x1f { return sign | 0x7c00; }
+    let m = (x >> 13) & 0x3ff;
+    let round = (x >> 12) & 1;
+    let v = ((e as u32) << 10) | m;
+    sign | ((v + round) as u16)
+}
+
+/// Convert per-16 NVFP4 block-scale VALUES `[ngroup, n]` (row-major; value =
+/// dec_ue4m3(byte)*global) into the marlin S0E5M3 fp8 byte layout the GEMM reads.
+/// Mirrors marlin_permute_scales(group<K) + nvfp4_marlin_process_scales (f16,
+/// scale_factor=1): scale_perm 64-permute, [0,2,1,3] 4-interleave, x2^7, zero-if<2,
+/// reinterpret f16 bits `<<1`, take the high byte (= S0E5M3). Returns `[ngroup*n]` u8.
+pub fn marlin_s0e5m3_scales(vals: &[f32], ngroup: usize, n: usize) -> Vec<u8> {
+    let total = ngroup * n;
+    assert_eq!(vals.len(), total);
+    assert_eq!(total % 64, 0, "marlin_s0e5m3_scales: ngroup*n must be a multiple of 64");
+    // scale_perm (64): [i + 8*j for i in 0..8 for j in 0..8]
+    let mut sp = [0usize; 64];
+    let mut idx = 0;
+    for i in 0..8 { for j in 0..8 { sp[idx] = i + 8 * j; idx += 1; } }
+    // A: 64-chunk column permute (marlin_permute_scales)
+    let mut s1 = vec![0f32; total];
+    for r in 0..(total / 64) {
+        for j in 0..64 { s1[r * 64 + j] = vals[r * 64 + sp[j]]; }
+    }
+    // B: 4-chunk interleave [0,2,1,3]
+    let il = [0usize, 2, 1, 3];
+    let mut s2 = vec![0f32; total];
+    for r in 0..(total / 4) {
+        for j in 0..4 { s2[r * 4 + j] = s1[r * 4 + il[j]]; }
+    }
+    // C: x2^7, zero-if<2, f16 bits <<1, high byte = S0E5M3
+    let mut out = vec![0u8; total];
+    for p in 0..total {
+        let mut v = s2[p] * 128.0;
+        if v < 2.0 { v = 0.0; }
+        let shifted = marlin_f32_to_f16(v) << 1;
+        out[p] = (shifted >> 8) as u8;
+    }
+    out
+}
+
 pub fn quantize_nvfp4(w: &[f32], m: usize, k: usize) -> (Vec<u32>, Vec<u8>, f32) {
     assert_eq!(k % 16, 0, "quantize_nvfp4: k must be a multiple of 16");
     let nblk = k / 16;
@@ -1611,7 +2087,7 @@ pub fn dequantize_nvfp4(codes: &[u32], scales: &[u8], global: f32, m: usize, k: 
     out
 }
 
-/// Round-trip a row-major `[m, k]` f32 buffer through NVFP4 quantize→dequantize —
+/// Round-trip a row-major `[m, k]` f32 buffer through NVFP4 quantize→dequantize,
 /// i.e. inject exactly the E2M1+UE4M3 block-16 quantization noise the native FP4
 /// GEMM would see, without any kernel. Used to de-risk argmax before building the
 /// real FP4 path (`NEMOTRON_FP4_SIM`).
@@ -1621,7 +2097,7 @@ pub fn nvfp4_roundtrip(w: &[f32], m: usize, k: usize) -> Vec<f32> {
 }
 
 /// Prefill linear: `out[r, :] = weight · input[r, :]` for a block of rows in
-/// one dispatch — `weight` is `[out_dim, in_dim]`, `input` is `[n_rows, in_dim]`,
+/// one dispatch, `weight` is `[out_dim, in_dim]`, `input` is `[n_rows, in_dim]`,
 /// result `[n_rows, out_dim]`. Dispatches the 32×32-tiled Reduction kernel
 /// `iron_gemm` (weight read once per tile, reused across the row block — the
 /// many-token path that a `gemv`-per-row would re-stream). Requires
@@ -1662,7 +2138,7 @@ pub fn matmul(dev: &dyn Device, weight: &Tensor, input: &Tensor) -> Result<Tenso
 }
 
 /// Tensor-core GEMM via cuBLAS (Path A escape hatch). Computes the row-major
-/// `out[m,n] = x[m,k] · w[n,k]ᵀ` — the projection `out[r,o] = Σ_k w[o,k]·x[r,k]`
+/// `out[m,n] = x[m,k] · w[n,k]ᵀ`, the projection `out[r,o] = Σ_k w[o,k]·x[r,k]`
 /// where `w` is the DENSE `[n,k]` weight (f16/bf16, NOT quantized) and `x` is
 /// `[m,k]`. Runs on the GB10 tensor cores (f32 accumulate). The caller dequants
 /// the Q4 weight to f16/bf16 once, then this hits real TFLOP/s (vs the
@@ -1687,7 +2163,7 @@ pub fn gemm_cublas(
 /// `cast_f16_f32` into the matmul. `x`/`w` are f16/bf16; cuBLAS already
 /// accumulates in f32, so the only change is the D-layout type → no extra
 /// kernel, no MFU loss. Lets the model keep the residual stream f32 (required
-/// — f16/bf16 residual overflows/loses argmax) without a separate cast pass.
+///, f16/bf16 residual overflows/loses argmax) without a separate cast pass.
 /// CUDA-only; other backends error (model gates this on `is_cuda`).
 pub fn gemm_cublas_f32out(
     dev: &dyn Device,
@@ -1826,7 +2302,7 @@ pub fn dequant_q4(
 }
 
 /// Like [`dequant_q4`] but dequants the `[m,k]` slab starting at block offset
-/// `blk_off` (in 32-value Q4 blocks) inside the qs/scales pool — used to peel
+/// `blk_off` (in 32-value Q4 blocks) inside the qs/scales pool, used to peel
 /// one MoE expert's rows out of the contiguous `[n_exp*out, k]` Q4 pool without
 /// a tensor view. `blk_off = expert * m * (k/32)`.
 #[allow(clippy::too_many_arguments)]
@@ -1845,7 +2321,7 @@ pub fn dequant_q4_off(
     // against the RAW bound buffers, reading up to qs[(blk_off + m*bpr - 1)*4 + 3]
     // and scales[blk_off + m*bpr - 1]. If a caller binds a buffer that doesn't
     // actually hold blk_off+slab blocks (an under-sized scratch / per-expert pool),
-    // that is an out-of-bounds READ — silent garbage on Metal, a deterministic
+    // that is an out-of-bounds READ, silent garbage on Metal, a deterministic
     // MMU-fault (Xid 31 VIRT_READ) on CUDA. Fail loudly here, naming the shapes,
     // so the mis-sized caller is obvious on every backend.
     let bpr = k / 32;
@@ -1885,7 +2361,7 @@ pub fn dequant_q4_off(
     Ok(out)
 }
 
-/// Multi-query (prefill) SDPA — attends `n_query` query rows against a shared
+/// Multi-query (prefill) SDPA, attends `n_query` query rows against a shared
 /// K/V cache in one dispatch. `causal=1` → query `r` attends `[0, base_kv+r+1)`
 /// (causal within the block, prefix fully visible); `causal=0` → bidirectional
 /// over `[0, base_kv+n_query)`. Q/out `[n_query, n_q_heads, head_dim]`, K/V
@@ -1958,7 +2434,7 @@ pub fn sdpa_multi(
 //
 // GQA fan-out (16 query heads : 1 KV head) is handled by issuing the batched
 // GEMM **once per KV group** with the K/V stride set to 0 (the 16 query heads in
-// a group all read the same KV slab — no duplicated KV is materialised).
+// a group all read the same KV slab, no duplicated KV is materialised).
 //
 // Q is pre-scaled by `scale` in the transpose kernel, so the GEMM/softmax run on
 // already-scaled logits (matches `iron_sdpa_multi`, which folds `scale` into Q).
@@ -1966,7 +2442,7 @@ pub fn sdpa_multi(
 /// Grouped MoE GEMM via mma.sync (register-O), ONE launch for ALL experts.
 /// `out[t,n] = Σ_k A[t,k]·W[grp(t)][n,k]` over sorted tokens (each contiguous
 /// token range = one expert). Reads the RESIDENT f16 expert weights directly via
-/// a device pointer array — no f16 scratch (that's what sank cuBLAS-grouped) —
+/// a device pointer array, no f16 scratch (that's what sank cuBLAS-grouped),
 /// and runs every expert's output tiles concurrently to FILL the GPU (the skinny
 /// m≈96 per-expert cuBLAS GEMMs hit only ~15 CTAs → 1.5% MFU). Same m16n8k16
 /// register-O technique + fragment packing as `sdpa_flash_mma`'s QKᵀ. 1 warp /
@@ -1976,6 +2452,7 @@ const MOE_GROUPED_GEMM_MMA_SRC: &str = r#"
 __device__ __forceinline__ unsigned pk2(__half a, __half b){
     return (unsigned)__half_as_ushort(a) | ((unsigned)__half_as_ushort(b) << 16);
 }
+__device__ __forceinline__ unsigned ld32(const __half* p){ return *reinterpret_cast<const unsigned*>(p); }
 #define CPA(SD, SP, V) asm volatile("cp.async.cg.shared.global [%0],[%1],16,%2;\n" \
     :: "r"(SD), "l"(SP), "r"((V)?16:0))
 // BM=64, BN=128: each block computes 128 N-cols so the loaded A tile is reused
@@ -2020,14 +2497,14 @@ extern "C" __global__ void moe_grouped_gemm_mma(
         __syncthreads();
         int buf = c&1;
         for (int ks=0; ks<NKS; ks++){ int ko=ks*16;
-            unsigned a0=pk2(As[buf][wrow+gid][ko+2*tid4],   As[buf][wrow+gid][ko+2*tid4+1]);
-            unsigned a1=pk2(As[buf][wrow+gid+8][ko+2*tid4], As[buf][wrow+gid+8][ko+2*tid4+1]);
-            unsigned a2=pk2(As[buf][wrow+gid][ko+2*tid4+8], As[buf][wrow+gid][ko+2*tid4+9]);
-            unsigned a3=pk2(As[buf][wrow+gid+8][ko+2*tid4+8],As[buf][wrow+gid+8][ko+2*tid4+9]);
+            unsigned a0=ld32(&As[buf][wrow+gid][ko+2*tid4]);
+            unsigned a1=ld32(&As[buf][wrow+gid+8][ko+2*tid4]);
+            unsigned a2=ld32(&As[buf][wrow+gid][ko+2*tid4+8]);
+            unsigned a3=ld32(&As[buf][wrow+gid+8][ko+2*tid4+8]);
             #pragma unroll
             for (int s=0;s<NS;s++){ int nb=s*8;
-                unsigned b0=pk2(Ws[buf][nb+gid][ko+2*tid4],   Ws[buf][nb+gid][ko+2*tid4+1]);
-                unsigned b1=pk2(Ws[buf][nb+gid][ko+2*tid4+8], Ws[buf][nb+gid][ko+2*tid4+9]);
+                unsigned b0=ld32(&Ws[buf][nb+gid][ko+2*tid4]);
+                unsigned b1=ld32(&Ws[buf][nb+gid][ko+2*tid4+8]);
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                     "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
                     :"+f"(oc[s][0]),"+f"(oc[s][1]),"+f"(oc[s][2]),"+f"(oc[s][3])
@@ -2044,7 +2521,7 @@ extern "C" __global__ void moe_grouped_gemm_mma(
 }
 "#;
 
-/// CUTLASS grouped MoE GEMM — `out[t,n] = Σ_k A[t,k]·W[eid][n,k]` over sorted
+/// CUTLASS grouped MoE GEMM, `out[t,n] = Σ_k A[t,k]·W[eid][n,k]` over sorted
 /// token groups. `a` f16 `[mt,K]`; `w_base` contiguous f16 expert slab
 /// `[n_exp,N,K]`; `g_starts[g]..g_starts[g+1]` = group g's token range;
 /// `expert_ids[g]` selects the slab. Beats cuBLAS/the hand-rolled kernel on the
@@ -2068,7 +2545,7 @@ pub fn moe_grouped_gemm_cutlass(
     Ok(out)
 }
 
-/// Grouped MoE GEMM (mma.sync register-O) — `out[t,n] = Σ_k A[t,k]·W[eid][n,k]`
+/// Grouped MoE GEMM (mma.sync register-O), `out[t,n] = Σ_k A[t,k]·W[eid][n,k]`
 /// for sorted tokens. `a` is `[mt,K]` f16; `w_base` is the contiguous f16 expert
 /// weight slab `[n_exp,N,K]`; `g_starts[g]..g_starts[g+1]` is group g's token
 /// range; `expert_ids[g]` selects the weight slab. ONE launch, all experts'
@@ -2128,6 +2605,15 @@ __device__ __forceinline__ __half dqn(unsigned w, int nib, __half sc){
     unsigned short t = (unsigned short)((((w>>(nib*4))&0xf) ^ 0x8) | 0x6400u);
     return __hmul(__hsub(__ushort_as_half(t), __float2half(1032.f)), sc);
 }
+// Vectorized dequant: two adjacent nibbles (low,high of the byte at bit-offset sh)
+// -> packed f16x2, SIMD affine. Bit-exact to pk2(dqn(n0),dqn(n1)). sh=(nib_even)*4.
+__device__ __forceinline__ unsigned dq2(unsigned w, int sh, __half sc){
+    unsigned two = (w >> sh) & 0xFFu;
+    unsigned packed = ((((two & 0xf0u) << 12) | (two & 0xfu)) ^ 0x00080008u) | 0x64006400u;
+    __half2 h = *reinterpret_cast<__half2*>(&packed);
+    h = __hmul2(__hsub2(h, __float2half2_rn(1032.0f)), __half2half2(sc));
+    return *reinterpret_cast<unsigned*>(&h);
+}
 #define CPA(SD,SP) asm volatile("cp.async.cg.shared.global [%0],[%1],16,16;\n" :: "r"(SD), "l"(SP))
 // BN=128 (NS=16): each block does 128 N-cols → the loaded A tile is reused over
 // 2x the weights, halving redundant A reads (the bottleneck). Weight/scale loads
@@ -2138,10 +2624,18 @@ extern "C" __global__ void moe_q4_grouped_mma(
     const __half* __restrict__ Sc,
     const int* __restrict__ tok0_arr, const int* __restrict__ eid_arr, const int* __restrict__ gend_arr,
     __half* __restrict__ Out,
-    int N, int K)
+    int N, int K, int band_n)
 {
-    const int BM=64,BN=128,BK=64,NS=16,NKS=4,GS=32,WPR=BK/8,GPR=BK/GS;
-    int bx=blockIdx.x, by=blockIdx.y;
+    const int BM=64,BN=128,BK=32,NS=16,NKS=2,GS=32,WPR=BK/8,GPR=BK/GS; // BK32 occ-tune (smem 25->12.5KB)
+    // band_n=0 (default): grid=[tile,nblk] with tile fast-varying -> a full
+    // tile sweep (crossing experts) happens before the N-block advances.
+    // band_n=1 (BUTTER_LAGUNA_SCHED=1): grid=[nblk,tile] with nblk fast-varying ->
+    // a BAND of consecutive CTAs sweeps every N-block of the SAME tile (same
+    // expert weight rows) before moving to the next tile, so the immediately
+    // prior tile of that same expert (if any, from a >64-row group) just
+    // touched the identical weight footprint -> L2 reuse across the band.
+    int bx = band_n ? blockIdx.y : blockIdx.x;
+    int by = band_n ? blockIdx.x : blockIdx.y;
     int tok0=tok0_arr[bx], gend=gend_arr[bx], eid=eid_arr[bx], n0=by*BN;
     int tid=threadIdx.x,warp=tid>>5,lane=tid&31,gid=lane>>2,tid4=lane&3,wrow=warp*16;
     __shared__ __half   As[2][BM][BK];
@@ -2151,7 +2645,7 @@ extern "C" __global__ void moe_q4_grouped_mma(
     int nchunk=K/BK, WPB=K/32;
     long ebase=(long)eid*N;
 #define LOADC(C,BUF) do{ int kc=(C)*BK; \
-    for(int e=tid;e<BM*8;e+=128){ int r=e/8,k8=(e%8)*8; int t=tok0+r; int v=(t<gend); \
+    for(int e=tid;e<BM*(BK/8);e+=128){ int r=e/(BK/8),k8=(e%(BK/8))*8; int t=tok0+r; int v=(t<gend); \
         unsigned sd=(unsigned)__cvta_generic_to_shared(&As[BUF][r][k8]); \
         const __half* sp=&A[(long)(v?t:tok0)*K + kc + k8]; CPA(sd,sp); } \
     for(int e=tid;e<BN*WPR/4;e+=128){ int f=e*4,r=f/WPR,w0=f%WPR; long wr=ebase+((n0+r<N)?(n0+r):0); \
@@ -2177,8 +2671,8 @@ extern "C" __global__ void moe_q4_grouped_mma(
             for(int s=0;s<NS;s++){ int nrow=s*8+gid;
                 unsigned wA=Wqs[buf][nrow][c0/8], wB=Wqs[buf][nrow][(c0+8)/8];
                 __half sA=Scs[buf][nrow][c0/GS], sB=Scs[buf][nrow][(c0+8)/GS];
-                unsigned b0=pk2(dqn(wA,c0&7,sA),     dqn(wA,(c0+1)&7,sA));
-                unsigned b1=pk2(dqn(wB,(c0+8)&7,sB), dqn(wB,(c0+9)&7,sB));
+                unsigned b0=dq2(wA,(c0&7)*4,sA);
+                unsigned b1=dq2(wB,(c0&7)*4,sB);
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                     "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
                     :"+f"(oc[s][0]),"+f"(oc[s][1]),"+f"(oc[s][2]),"+f"(oc[s][3])
@@ -2195,11 +2689,27 @@ extern "C" __global__ void moe_q4_grouped_mma(
 }
 "#;
 
+// BUTTER_LAGUNA_SCHED=1: A/B switch for the two Laguna prefill CTA-scheduling
+// levers on the Q4 grouped GEMM (see moe_q4_grouped_mma / _dev below). Default
+// off = byte-identical launch geometry to before this change.
+#[inline]
+fn laguna_sched_on() -> bool {
+    std::env::var("BUTTER_LAGUNA_SCHED").as_deref() != Ok("0")
+}
+
 /// Q4-native grouped MoE GEMM: `out[t,n] = Σ_k A[t,k]·dequant(Qs[eid,n,k])` over
 /// sorted token groups. `a` f16 `[mt,K]`; `qs` u32 + `sc` f16 = the model's
 /// contiguous `[n_exp*N, K]` Q4 pool (moe_up_all/down_all); `g_starts[g]..[g+1]`
 /// = group g's token range; `expert_ids[g]` selects the expert. Single launch,
 /// no dequant/slab. Returns `out[mt,N]` f16. `K%64==0`, `N%64==0`.
+///
+/// `BUTTER_LAGUNA_SCHED=1` turns on two scheduling levers (both host-side data
+/// here already, so no extra device sync): (1) tiles are emitted in
+/// DESCENDING group-row order instead of expert order, so the biggest groups'
+/// CTAs launch first and small trailing groups' stragglers overlap with them
+/// instead of forming a ragged tail; (2) the launch grid is transposed so a
+/// band of consecutive CTAs sweeps all N-blocks of one tile (weight-tile L2
+/// reuse) before moving to the next tile, see `band_n` in the kernel source.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_q4_grouped_mma(
     dev: &dyn Device,
@@ -2217,9 +2727,21 @@ pub fn moe_q4_grouped_mma(
     if n % 64 != 0 { return Err(Error::Msg(format!("moe_q4_grouped_mma: N {n} %64!=0"))); }
     let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
     if n_active == 0 || mt == 0 { return Ok(out); }
+    let band_n = laguna_sched_on();
+    // Default: expert order 0..n_active. BUTTER_LAGUNA_SCHED=1: descending group
+    // row-count, so the largest groups' tiles are emitted (and thus launched)
+    // first. Purely a host-side Vec reorder, g_starts/expert_ids are already
+    // host slices, so this adds no new device sync.
+    let order: Vec<usize> = if band_n {
+        let mut idx: Vec<usize> = (0..n_active).collect();
+        idx.sort_by_key(|&g| std::cmp::Reverse(g_starts[g + 1] - g_starts[g]));
+        idx
+    } else {
+        (0..n_active).collect()
+    };
     // Per-m-tile descriptors (BM=64 token rows each, never crossing a group).
     let (mut tok0, mut eid, mut gend) = (Vec::new(), Vec::new(), Vec::new());
-    for g in 0..n_active {
+    for &g in &order {
         let (s, e) = (g_starts[g], g_starts[g + 1]);
         let mut t = s;
         while t < e { tok0.push(t as i32); eid.push(expert_ids[g] as i32); gend.push(e as i32); t += 64; }
@@ -2231,13 +2753,17 @@ pub fn moe_q4_grouped_mma(
     };
     let (t0d, eidd, ged) = (up_i32(&tok0)?, up_i32(&eid)?, up_i32(&gend)?);
     let i = |x: i32| x.to_le_bytes().to_vec();
-    let grid = [n_mtiles as u32, (n as u32).div_ceil(128), 1];
+    let grid = if band_n {
+        [(n as u32).div_ceil(128), n_mtiles as u32, 1]
+    } else {
+        [n_mtiles as u32, (n as u32).div_ceil(128), 1]
+    };
     dev.dispatch_raw_cuda(
         MOE_Q4_GROUPED_MMA_SRC, "moe_q4_grouped_mma.cu", "moe_q4_grouped_mma",
         &[(a.buffer.as_ref(), a.offset), (qs.buffer.as_ref(), qs.offset), (sc.buffer.as_ref(), sc.offset),
           (t0d.buffer.as_ref(), 0), (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
           (out.buffer.as_ref(), 0)],
-        &[i(n as i32), i(k as i32)],
+        &[i(n as i32), i(k as i32), i(band_n as i32)],
         grid, [128, 1, 1], 0, false)?;
     Ok(out)
 }
@@ -2246,14 +2772,33 @@ pub fn moe_q4_grouped_mma(
 // `offsets[n_exp+1]` (no host sync) → graph-safe. One thread walks the experts,
 // emitting one descriptor per BM=64-row tile; padding tiles get gend=0 (the GEMM
 // early-exits on them). maxt = mt/BM + n_exp is a per-S constant → fixed launch.
+//
+// `desc!=0` (BUTTER_LAGUNA_SCHED=1): before walking, the single thread does an
+// O(n_exp^2) descending selection-sort of the experts by row-count (`offsets`
+// deltas) into `order`, using dynamic shared mem (2*n_exp ints) as scratch, and
+// walks experts in that order instead of 0..n_exp. n_exp is at most a few
+// hundred (one routing step of one layer/chunk) so this is negligible next to
+// the GEMM launch it precedes; no host readback of `offsets` is added.
 const MOE_BUILD_TILES_SRC: &str = r#"
 extern "C" __global__ void moe_build_tiles(
     const unsigned* __restrict__ offsets, int* __restrict__ tok0,
-    int* __restrict__ eid, int* __restrict__ gend, int n_exp, int BM, int maxt)
+    int* __restrict__ eid, int* __restrict__ gend, int n_exp, int BM, int maxt, int desc)
 {
     if (blockIdx.x || threadIdx.x) return;
+    extern __shared__ int smem[];
+    int* cnt = smem;          // [n_exp], only used when desc!=0
+    int* order = smem + n_exp; // [n_exp]
+    if (desc) {
+        for (int e = 0; e < n_exp; e++) { cnt[e] = (int)(offsets[e+1] - offsets[e]); order[e] = e; }
+        for (int i2 = 0; i2 < n_exp; i2++) {
+            int best = i2;
+            for (int j = i2 + 1; j < n_exp; j++) if (cnt[order[j]] > cnt[order[best]]) best = j;
+            if (best != i2) { int tmp = order[i2]; order[i2] = order[best]; order[best] = tmp; }
+        }
+    }
     int t = 0;
-    for (int e = 0; e < n_exp; e++) {
+    for (int ii = 0; ii < n_exp; ii++) {
+        int e = desc ? order[ii] : ii;
         unsigned s = offsets[e], en = offsets[e+1];
         for (unsigned x = s; x < en; x += (unsigned)BM) {
             if (t < maxt) { tok0[t]=(int)x; eid[t]=e; gend[t]=(int)en; t++; }
@@ -2266,6 +2811,11 @@ extern "C" __global__ void moe_build_tiles(
 /// Fully-on-device Q4 grouped MoE GEMM: builds tile descriptors on-device from
 /// `offsets` (device `[n_exp+1]` u32) with a FIXED launch (grid=[maxt,N/64],
 /// maxt = mt/64 + n_exp) → NO host sync, graph-capturable. Returns `out[mt,N]` f16.
+///
+/// `BUTTER_LAGUNA_SCHED=1` turns on the same two scheduling levers as
+/// `moe_q4_grouped_mma`: descending group-row tile order (computed ON DEVICE
+/// in `moe_build_tiles`, since this path only has a device `offsets` buffer:
+/// no new device->host sync is added) and the transposed/banded launch grid.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_q4_grouped_mma_dev(
     dev: &dyn Device,
@@ -2282,24 +2832,33 @@ pub fn moe_q4_grouped_mma_dev(
     if n % 64 != 0 { return Err(Error::Msg(format!("moe_q4_grouped_mma_dev: N {n} %64!=0"))); }
     let out = Tensor::empty(dev, vec![mt.max(1), n], DType::F16)?;
     if mt == 0 { return Ok(out); }
+    let band_n = laguna_sched_on();
     let maxt = mt.div_ceil(64) + n_exp;
     let t0d = Tensor::empty(dev, vec![maxt], DType::U32)?;
     let eidd = Tensor::empty(dev, vec![maxt], DType::U32)?;
     let ged = Tensor::empty(dev, vec![maxt], DType::U32)?;
     let i = |x: i32| x.to_le_bytes().to_vec();
+    // 2 int arrays of n_exp each, only needed (and only touched by the
+    // kernel) when desc!=0. Kept at 0 in the default/off path so that path's
+    // launch geometry is byte-identical to before this change.
+    let build_shared = if band_n { (2 * n_exp * std::mem::size_of::<i32>()) as u32 } else { 0 };
     dev.dispatch_raw_cuda(
         MOE_BUILD_TILES_SRC, "moe_build_tiles.cu", "moe_build_tiles",
         &[(offsets.buffer.as_ref(), offsets.offset), (t0d.buffer.as_ref(), 0),
           (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0)],
-        &[i(n_exp as i32), i(64), i(maxt as i32)],
-        [1, 1, 1], [1, 1, 1], 0, false)?;
-    let grid = [maxt as u32, (n as u32).div_ceil(128), 1];
+        &[i(n_exp as i32), i(64), i(maxt as i32), i(band_n as i32)],
+        [1, 1, 1], [1, 1, 1], build_shared, false)?;
+    let grid = if band_n {
+        [(n as u32).div_ceil(128), maxt as u32, 1]
+    } else {
+        [maxt as u32, (n as u32).div_ceil(128), 1]
+    };
     dev.dispatch_raw_cuda(
         MOE_Q4_GROUPED_MMA_SRC, "moe_q4_grouped_mma.cu", "moe_q4_grouped_mma",
         &[(a.buffer.as_ref(), a.offset), (qs.buffer.as_ref(), qs.offset), (sc.buffer.as_ref(), sc.offset),
           (t0d.buffer.as_ref(), 0), (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
           (out.buffer.as_ref(), 0)],
-        &[i(n as i32), i(k as i32)],
+        &[i(n as i32), i(k as i32), i(band_n as i32)],
         grid, [128, 1, 1], 0, false)?;
     Ok(out)
 }
@@ -2565,11 +3124,11 @@ extern "C" __global__ void sdpa_tc_finalize(
 /// FUSED single-kernel causal FlashAttention (no HBM score/prob materialization,
 /// no qprep/kprep/vprep passes). One warp per (head, query row): the warp holds
 /// `Q[r]` in registers, streams K/V rows from HBM, and runs the online softmax +
-/// `O` accumulation entirely in registers — scores never touch global memory.
+/// `O` accumulation entirely in registers, scores never touch global memory.
 /// Causal is exploited by looping `p` only to `base_kv + r` (the masked upper
 /// triangle is never computed, ~2× fewer FLOPs than the materialized path).
 /// hd must be a multiple of 32 (warp lanes own `hd/32` dims each). Q/K/V F32 or
-/// F16; output matches `q.dtype`. This is v1 (scalar FMA, no tensor cores) — it
+/// F16; output matches `q.dtype`. This is v1 (scalar FMA, no tensor cores), it
 /// wins by removing the 6-dispatch HBM round-trip + the causal waste; the wmma
 /// upgrade is the follow-up. NEMOTRON_FLASH_FUSED=1 in the model.
 const SDPA_FLASH_FUSED_SRC: &str = r#"
@@ -2660,7 +3219,7 @@ const SDPA_FLASH_WMMA_SRC: &str = r#"
 #include <mma.h>
 using namespace nvcuda;
 extern "C" __global__ void sdpa_flash_wmma(
-    const __half* __restrict__ q_in,   // [Sq, nq, 128] (already scaled? no — scaled here)
+    const __half* __restrict__ q_in,   // [Sq, nq, 128] (already scaled? no, scaled here)
     const __half* __restrict__ k_in,   // [nkv, kv_stride, 128]
     const __half* __restrict__ v_in,   // [nkv, kv_stride, 128]
     __half*       __restrict__ out,    // [Sq, nq, 128]
@@ -2768,7 +3327,7 @@ extern "C" __global__ void sdpa_flash_wmma(
 "#;
 
 /// FlashAttention-2 with register-resident O (mma.sync m16n8k16). v3 of the fused
-/// path: O lives in registers (acc fragments), not shared — freeing ~16KB so the
+/// path: O lives in registers (acc fragments), not shared: freeing ~16KB so the
 /// 1-warp/16-row block hits high occupancy (v2's 30KB shared capped it at ~11%).
 /// QKᵀ + P·V via `mma.sync` (manual fragment packing, documented layout); the
 /// causal mask + online softmax round-trip the small S/P tiles through shared
@@ -3151,7 +3710,7 @@ extern "C" __global__ void sdpa_flash_mma_w4s(
 }
 
 // FP8 (e4m3) attention v2: QK and PV via m16n8k32 e4m3 mma (2x f16 rate).
-// K/V are PRE-QUANTIZED to e4m3 buffers once per call (kv_to_e4m3 below) —
+// K/V are PRE-QUANTIZED to e4m3 buffers once per call (kv_to_e4m3 below),
 // v1 quantized in-smem on every KV re-read (frexp per element x 32
 // row-blocks) which ate the mma savings; v2 staging is byte copies and the
 // KV re-read traffic halves. BC=32 keys/tile so the PV k32 mma is fully
@@ -3373,7 +3932,7 @@ pub fn sdpa_flash_mma(
     let kv_chunk_target = 8192usize;
     let n_part = n_kv.div_ceil(kv_chunk_target).min(8);
     // FP8 attention (NEMOTRON_FLASH_FP8=1): e4m3 QK and PV mma at 2x the f16
-    // tensor-core rate — attention at depth is mma-compute-bound. Static
+    // tensor-core rate, attention at depth is mma-compute-bound. Static
     // conservative scales (16x: |x|<28 covers the post-softmax-scale Q and the
     // K/V ranges with e4m3's 448 ceiling). Quant-regime lever.
     if std::env::var("NEMOTRON_FLASH_FP8").is_ok() {
@@ -3432,7 +3991,7 @@ pub fn sdpa_flash_mma(
             [n_el.div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
         return Ok(out);
     }
-    // 4-warp blocks: 64 query rows/block sharing the K/V smem stage —
+    // 4-warp blocks: 64 query rows/block sharing the K/V smem stage,
     // 2.7x the 1-warp kernel at S=2048, bit-identical output.
     let grid = [nq as u32, (sq as u32).div_ceil(64), 1];
     dev.dispatch_raw_cuda(
@@ -3552,7 +4111,7 @@ pub fn sdpa_flash_fused(
     Ok(out)
 }
 
-/// Tensor-core prefill SDPA — drop-in faster replacement for [`sdpa_multi`].
+/// Tensor-core prefill SDPA, drop-in faster replacement for [`sdpa_multi`].
 /// Same signature/semantics (causal/full, GQA, head_dim=128, Q pre-scaled by
 /// `scale`), but runs QKᵀ and P·V on the cuBLAS tensor cores with a
 /// FlashAttention online-softmax loop tiled over KV. Q/K/V may be F32 or F16;
@@ -3640,7 +4199,7 @@ pub fn sdpa_multi_tc(
 
         // ── softmax + causal mask for this block ────────────────────────────
         // scores/p_blk are PACKED at pitch `blk` (head stride sq*blk, row pitch
-        // blk) — only the first nq*sq*blk f16 of the bk-sized allocation are used.
+        // blk), only the first nq*sq*blk f16 of the bk-sized allocation are used.
         // This keeps the GEMM's lda == k == blk valid for the final partial block.
         dev.dispatch_raw_cuda(SDPA_TC_SOFTMAX_SRC, "sdpa_tc_softmax.cu", "sdpa_tc_softmax",
             &[(scores.buffer.as_ref(), 0), (p_blk.buffer.as_ref(), 0),
@@ -3694,9 +4253,10 @@ pub fn sdpa_multi_tc(
 /// share one set of GEMMs while attention stays block-diagonal (correct).
 ///
 /// NOTE: this computes the full `[Sq, n_kv]` QKᵀ and masks off-segment to
-/// −inf — bit-correct, but still O((ΣL)²) QKᵀ. The segment-skip optimisation
-/// (only run KV blocks intersecting a query's segment → O(ΣLᵢ²)) is the
-/// follow-up that turns correctness into the throughput win.
+/// −inf, bit-correct, but still O((ΣL)²) QKᵀ for the packed-segment case.
+/// The `seg_len == KV-block-size` branch below skips that; `win` (below)
+/// is the analogous skip for a per-row SLIDING WINDOW instead of a packed
+/// segment boundary.
 pub fn sdpa_multi_tc_varlen(
     dev: &dyn Device,
     q: &Tensor,
@@ -3714,6 +4274,16 @@ pub fn sdpa_multi_tc_varlen(
     heads_per_group: u32,
     causal: bool,
     scale: f32,
+    // Sliding-window block skip. 0 = off (no effect on any existing caller).
+    // When `win > 0`, `seg_lo` is expected to encode a sliding window of
+    // width `win` (`seg_lo[r] = max(0, (base_kv+r) - (win-1))`, exactly what
+    // Laguna's sliding-layer prefill already uploads) and the per-KV-block
+    // query-row range fed to the QKᵀ/PV GEMMs is restricted to the rows
+    // whose window can possibly reach that block, see the derivation at
+    // the `q_lo`/`q_cnt` computation below. Independent of `seg_len`/the
+    // packed-segment skip: a caller should pass exactly one of the two
+    // (Laguna always passes `seg_len = 0` and this `win`).
+    win: u32,
 ) -> Result<Tensor> {
     let hd = head_dim;
     let nq = n_q_heads as usize;
@@ -3766,21 +4336,58 @@ pub fn sdpa_multi_tc_varlen(
     let mut kb0 = 0usize;
     while kb0 < n_kv {
         let blk = bk.min(n_kv - kb0);
-        // Segment-skip: when each KV-block is exactly one packed segment
-        // (seg_len == bk), only that segment's query rows [kb0, kb0+blk) attend
-        // to this block — every other row masks to p=0. Restrict the expensive
-        // QKᵀ/PV tensor-core GEMMs to that range (O((NL)²)→O(NL²)); the cheap
-        // full-range softmax/merge correctly no-op the off-segment rows.
-        let (q_lo, q_cnt) = if seg_len != 0 && seg_len as usize == bk { (kb0, blk) } else { (0, sq) };
-        for g in 0..nkv {
-            let q_off = g * hpg * sq * hd * 2 + q_lo * hd * 2;
-            let k_off = (g * n_kv + kb0) * hd * 2;
-            let s_off = g * hpg * sq * blk * 2 + q_lo * blk * 2;
-            dev.gemm_strided_batched_off(
-                qh.buffer.as_ref(),     q_off, (sq*hd) as i64 * el,
-                kh.buffer.as_ref(),     k_off, 0,
-                scores.buffer.as_ref(), s_off, (sq*blk) as i64 * el,
-                q_cnt, blk, hd, hpg, DType::F16)?;
+        // Query-range skip: restrict the expensive QKᵀ/PV tensor-core GEMMs
+        // to the rows that can possibly attend anywhere in KV block [kb0,
+        // kb0+blk), the cheap full-range softmax/merge below still apply
+        // the real per-element mask, so a range that's a SUPERSET of the
+        // true set is always safe (the extra rows just mask to p=0); a
+        // range narrower than the true set would silently drop attention
+        // mass. Only ever shrink, never tighten past that guarantee.
+        //
+        // Packed-segment mode (seg_len == bk): each KV-block is exactly one
+        // packed segment, so only that segment's own rows [kb0, kb0+blk)
+        // attend to it, row index and absolute KV position coincide in
+        // this mode (packed sequences are laid out from base_kv=0).
+        //
+        // Sliding-window mode (win != 0): causal means query absolute
+        // position i_abs can reach KV position kb0 (the block's first
+        // index) only if i_abs >= kb0. The window means i_abs can reach KV
+        // position kb0+blk-1 (the block's last index) only if that index is
+        // still inside the window, i.e. seg_lo[i] = i_abs - win + 1 <=
+        // kb0+blk-1, i.e. i_abs < kb0 + blk + win. So the absolute-position
+        // range that can touch this block is [kb0, kb0+blk+win). Row `r` of
+        // this call sits at absolute position `base + r` (base_kv is this
+        // chunk's starting position), so convert that absolute range to a
+        // row-index range and clamp into [0, sq).
+        let (q_lo, q_cnt) = if win != 0 {
+            let lo_abs = kb0 as i64;
+            let hi_abs_excl = kb0 as i64 + blk as i64 + win as i64;
+            let lo_r = (lo_abs - base as i64).max(0);
+            let hi_r = (hi_abs_excl - base as i64).min(sq as i64);
+            if hi_r > lo_r { (lo_r as usize, (hi_r - lo_r) as usize) } else { (0, 0) }
+        } else if seg_len != 0 && seg_len as usize == bk {
+            (kb0, blk)
+        } else {
+            (0, sq)
+        };
+        // q_cnt == 0: no row in this chunk can reach this block at all (the
+        // derivation above is a superset of the true reachable set, so an
+        // empty computed range proves the true set is also empty). Skip the
+        // QKᵀ/PV GEMMs and vprep entirely; softmax/merge stay unconditional
+        // below (softmax re-derives bm/bl fresh every iteration straight
+        // from the mask, and merge's `l_b <= 0` early-return means it never
+        // reads the skipped o_blk/vt buffers, so this is correctness-safe).
+        if q_cnt > 0 {
+            for g in 0..nkv {
+                let q_off = g * hpg * sq * hd * 2 + q_lo * hd * 2;
+                let k_off = (g * n_kv + kb0) * hd * 2;
+                let s_off = g * hpg * sq * blk * 2 + q_lo * blk * 2;
+                dev.gemm_strided_batched_off(
+                    qh.buffer.as_ref(),     q_off, (sq*hd) as i64 * el,
+                    kh.buffer.as_ref(),     k_off, 0,
+                    scores.buffer.as_ref(), s_off, (sq*blk) as i64 * el,
+                    q_cnt, blk, hd, hpg, DType::F16)?;
+            }
         }
         // varlen softmax: causal upper (base+r) AND segment lower (seg_lo[r]).
         dev.dispatch_raw_cuda(SDPA_TC_SOFTMAX_VARLEN_SRC, "sdpa_tc_softmax_varlen.cu", "sdpa_tc_softmax_varlen",
@@ -3789,19 +4396,21 @@ pub fn sdpa_multi_tc_varlen(
               (seg_lo.buffer.as_ref(), seg_lo.offset)],
             &[i(nq as i32), i(sq as i32), i(blk as i32), i(kb0 as i32), i(base as i32)],
             [(nq*sq) as u32, 1, 1], [256,1,1], 0, false)?;
-        dev.dispatch_raw_cuda(SDPA_TC_VPREP_SRC, "sdpa_tc_vprep.cu", "sdpa_tc_vprep",
-            &[(v.buffer.as_ref(), v.offset), (vt.buffer.as_ref(), 0)],
-            &[i(nkv as i32), i(kv_stride as i32), i(hd as i32), i(kb0 as i32), i(blk as i32), i(in_f32)],
-            blk256(nkv*blk*hd), [256,1,1], 0, false)?;
-        for g in 0..nkv {
-            let p_off = g * hpg * sq * blk * 2 + q_lo * blk * 2;
-            let v_off = g * hd * blk * 2;
-            let o_off = g * hpg * sq * hd * 2 + q_lo * hd * 2;
-            dev.gemm_strided_batched_off(
-                p_blk.buffer.as_ref(), p_off, (sq*blk) as i64 * el,
-                vt.buffer.as_ref(),    v_off, 0,
-                o_blk.buffer.as_ref(), o_off, (sq*hd) as i64 * el,
-                q_cnt, hd, blk, hpg, DType::F16)?;
+        if q_cnt > 0 {
+            dev.dispatch_raw_cuda(SDPA_TC_VPREP_SRC, "sdpa_tc_vprep.cu", "sdpa_tc_vprep",
+                &[(v.buffer.as_ref(), v.offset), (vt.buffer.as_ref(), 0)],
+                &[i(nkv as i32), i(kv_stride as i32), i(hd as i32), i(kb0 as i32), i(blk as i32), i(in_f32)],
+                blk256(nkv*blk*hd), [256,1,1], 0, false)?;
+            for g in 0..nkv {
+                let p_off = g * hpg * sq * blk * 2 + q_lo * blk * 2;
+                let v_off = g * hd * blk * 2;
+                let o_off = g * hpg * sq * hd * 2 + q_lo * hd * 2;
+                dev.gemm_strided_batched_off(
+                    p_blk.buffer.as_ref(), p_off, (sq*blk) as i64 * el,
+                    vt.buffer.as_ref(),    v_off, 0,
+                    o_blk.buffer.as_ref(), o_off, (sq*hd) as i64 * el,
+                    q_cnt, hd, blk, hpg, DType::F16)?;
+            }
         }
         dev.dispatch_raw_cuda(SDPA_TC_MERGE_SRC, "sdpa_tc_merge.cu", "sdpa_tc_merge",
             &[(o_blk.buffer.as_ref(), 0), (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0),
@@ -3823,7 +4432,7 @@ pub fn sdpa_multi_tc_varlen(
 /// NemotronH-Nano-30B Mamba2 cell (Dh=64, Ds=128, H=64, G=8, n_per_t=4).
 ///
 /// The existing `ssm_step_record_d64_128_64_8` runs a serial loop over T
-/// positions per (h, dh) cell — the serial chain of length T is the bottleneck.
+/// positions per (h, dh) cell, the serial chain of length T is the bottleneck.
 /// This kernel replaces it with a **two-pass parallel segment scan**:
 ///
 /// **Pass 1 (parallel)**: `N_SEG` warp-segments each process `T/N_SEG` positions
@@ -4013,7 +4622,7 @@ void ssm_chunked_prefill(
 /// Grid3D: `[1, Dh=64, H=64]`, block `[WARP × N_SEG]` = `[32 × 32 = 1024]`.
 /// Shared mem per block: ~17KB (partial states + alpha + s_in scratch).
 ///
-/// Returns `(state_out, y)` — same signature as `ssm_prefill_scan`.
+/// Returns `(state_out, y)`, same signature as `ssm_prefill_scan`.
 #[allow(clippy::too_many_arguments)]
 pub fn ssm_prefill_scan_chunked(
     dev: &dyn Device,
@@ -4040,7 +4649,7 @@ pub fn ssm_prefill_scan_chunked(
     let y = Tensor::empty(dev, vec![t * nh * dhu], x.dtype)?;
     let state_out = Tensor::empty(dev, state_in.shape.clone(), x.dtype)?;
     // N_SEG must divide t_total (or kernel pads). 64 divides 512,2048,8192.
-    // For t_total not divisible by 64, pass as-is — the kernel uses a guard.
+    // For t_total not divisible by 64, pass as-is: the kernel uses a guard.
     let t_bytes = t_total.to_le_bytes().to_vec();
     // Grid: [1, Dh, H]. Block: [WARP * N_SEG] = [32 * 64] = [2048].
     let grid = [1u32, dh, n_heads];
@@ -4078,7 +4687,7 @@ pub fn ssm_prefill_scan_chunked(
     Ok((state_out, y))
 }
 
-/// Mamba2 SSD **batched-prefill scan** — runs the sequential SSD forward over
+/// Mamba2 SSD **batched-prefill scan**, runs the sequential SSD forward over
 /// all `t_total` prompt tokens in ONE dispatch, emitting every per-token
 /// `y[t]` plus the final recurrent `state_out` (for decode continuity).
 /// Dispatches `ssm_step_record_d64_128_64_8` (Nemotron cell: Dh=64, Ds=128,
@@ -4112,7 +4721,7 @@ pub fn ssm_prefill_scan(
     let (nh, dhu, dsu) = (n_heads as usize, dh as usize, ds as usize);
     let y = Tensor::empty(dev, vec![t * nh * dhu], x.dtype)?;
     let state_out = Tensor::empty(dev, state_in.shape.clone(), x.dtype)?;
-    // Tape outputs — written by the kernel, unused by prefill.
+    // Tape outputs, written by the kernel, unused by prefill.
     let da_log = Tensor::empty(dev, vec![t * nh * dsu], x.dtype)?;
     let dbx_log = Tensor::empty(dev, vec![t * nh * dhu * dsu], x.dtype)?;
     // mask buffer: has_mask=0 → kernel ignores contents, but the binding must exist.
@@ -4239,13 +4848,160 @@ pub fn sdpa_decode(
     Ok(out)
 }
 
-/// GQA-aware split-K flash-decode SDPA (MLX `sdpa_vector_2pass` port, head_dim
-/// 128). Pass 1: grid `(n_kv_heads, blocks)`, block `(32, gqa_factor)` — one
+// ── CUDA-graph-capturable dense decode SDPA (raw CUDA, head_dim 128) ────
+//
+// The registry `iron_sdpa_decode` kernel above takes `n_kv` as a launch-time
+// constexpr, fine for eager decode (a fresh launch every token) but wrong
+// for a captured graph, which replays the exact same recorded launch (same
+// baked `n_kv`) every token. Rather than plumb a buffer-read `n_kv` through
+// the iron registry kernel (invasive: `n_kv` there is a `#[constexpr]`
+// used to size the unroll-friendly loop bound), this is a hand-written raw
+// CUDA fallback that reads `n_kv` from a 1-element `u32` device buffer at
+// kernel runtime instead. Same single-pass online-softmax algorithm as the
+// registry kernel's dense path (`iron_sdpa_decode` with `sink_end=0,
+// window_start=0, has_sink=0`): block per Q-head, 1024 threads (32 warps x
+// 32 lanes), each lane owns 4 of the 128 head dims, `__shfl_xor_sync`
+// butterfly reduction (broadcasts to every lane, matching MSL's
+// all-to-all `simd_sum`/`simd_max`), f32 accumulation throughout. Verified
+// against `sdpa_decode`'s output in `crates/backends/wh-butter-cuda/tests/laguna.rs`.
+const SDPA_DECODE_NBUF_SRC: &str = r#"
+extern "C" __global__ void butter_sdpa_decode_nbuf(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ out, const unsigned int* __restrict__ n_kv_buf,
+    int head_dim, int kv_stride, int heads_per_group, float scale)
+{
+    int q_head = blockIdx.x;
+    int kv_head = q_head / heads_per_group;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int sg = tid >> 5;
+    int ns = blockDim.x >> 5;
+    unsigned int n_kv = n_kv_buf[0];
+
+    __shared__ float tg_max[32];
+    __shared__ float tg_sum[32];
+    __shared__ float tg_out0[1056];
+    __shared__ float tg_out1[1056];
+    __shared__ float tg_out2[1056];
+    __shared__ float tg_out3[1056];
+
+    int q_off = q_head * head_dim;
+    long kv_head_base = (long)kv_head * kv_stride * head_dim;
+    int d0 = lane * 4;
+
+    float qs[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) qs[i] = q[q_off + d0 + i] * scale;
+
+    float run_max = -3.4028235e38f;
+    float run_sum = 0.0f;
+    float os[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (unsigned int t = sg; t < n_kv; t += ns) {
+        long base = kv_head_base + (long)t * head_dim;
+        long kv0 = base + d0;
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) partial += qs[i] * k[kv0 + i];
+        for (int mask = 16; mask > 0; mask >>= 1) partial += __shfl_xor_sync(0xffffffffu, partial, mask);
+        float score = partial;
+        float new_max = fmaxf(score, run_max);
+        float factor = expf(run_max - new_max);
+        float weight = expf(score - new_max);
+        run_sum = run_sum * factor + weight;
+        run_max = new_max;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) os[i] = os[i] * factor + weight * v[kv0 + i];
+    }
+
+    if (lane == 0) { tg_max[sg] = run_max; tg_sum[sg] = run_sum; }
+    __syncthreads();
+    if (sg == 0) {
+        float g_max_raw = (lane < ns) ? tg_max[lane] : -3.4028235e38f;
+        float g_max = g_max_raw;
+        for (int mask = 16; mask > 0; mask >>= 1) g_max = fmaxf(g_max, __shfl_xor_sync(0xffffffffu, g_max, mask));
+        float g_sum_in = (lane < ns) ? tg_sum[lane] * expf(g_max_raw - g_max) : 0.0f;
+        float g_sum = g_sum_in;
+        for (int mask = 16; mask > 0; mask >>= 1) g_sum += __shfl_xor_sync(0xffffffffu, g_sum, mask);
+        if (lane == 0) { tg_max[0] = g_max; tg_sum[0] = g_sum; }
+    }
+    __syncthreads();
+    float g_max = tg_max[0];
+    float g_sum = tg_sum[0];
+    float rescale = (g_sum > 0.0f) ? expf(run_max - g_max) / g_sum : 0.0f;
+    int stride = ns + 1;
+    int idx = lane * stride + sg;
+    tg_out0[idx] = os[0] * rescale;
+    tg_out1[idx] = os[1] * rescale;
+    tg_out2[idx] = os[2] * rescale;
+    tg_out3[idx] = os[3] * rescale;
+    __syncthreads();
+    if (sg == 0) {
+        float so0 = 0.0f, so1 = 0.0f, so2 = 0.0f, so3 = 0.0f;
+        for (int g = 0; g < ns; g++) {
+            int ri = lane * stride + g;
+            so0 += tg_out0[ri];
+            so1 += tg_out1[ri];
+            so2 += tg_out2[ri];
+            so3 += tg_out3[ri];
+        }
+        int out_off = q_off + d0;
+        out[out_off]     = so0;
+        out[out_off + 1] = so1;
+        out[out_off + 2] = so2;
+        out[out_off + 3] = so3;
+    }
+}
+"#;
+
+/// CUDA-graph-capturable fallback of [`sdpa_decode`] for `head_dim == 128`
+/// (Laguna's only head_dim): reads the filled KV length `n_kv` from a
+/// 1-element `u32` device buffer instead of a baked-in launch scalar. Dense
+/// causal only (no sink / sliding-window mask), Laguna's sliding layers
+/// bound the KV walk via the buffer's VALUE (the ring's current filled
+/// length), so a separate window mask isn't needed. f32 only. See the
+/// kernel-source doc above for the algorithm.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_nbuf(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    n_kv_buf: &Tensor,
+    kv_stride: u32,
+    heads_per_group: u32,
+    scale: f32,
+) -> Result<Tensor> {
+    if head_dim != 128 {
+        return Err(Error::Msg(format!("sdpa_decode_nbuf: only head_dim 128 is implemented, got {head_dim}")));
+    }
+    let n_q_heads = q.elem_count() / head_dim;
+    let out = Tensor::empty(dev, vec![n_q_heads, head_dim], DType::F32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        SDPA_DECODE_NBUF_SRC, "sdpa_decode_nbuf.cu", "butter_sdpa_decode_nbuf",
+        &[
+            (q.buffer.as_ref(), q.offset),
+            (k.buffer.as_ref(), k.offset),
+            (v.buffer.as_ref(), v.offset),
+            (out.buffer.as_ref(), 0),
+            (n_kv_buf.buffer.as_ref(), n_kv_buf.offset),
+        ],
+        &[i(head_dim as i32), i(kv_stride as i32), i(heads_per_group as i32), f(scale)],
+        [n_q_heads as u32, 1, 1], [1024, 1, 1], 0, false,
+    )?;
+    Ok(out)
+}
+
+/// GQA-aware split-K flash-decode SDPA (ported from a reference ML framework's `sdpa_vector_2pass`, head_dim
+/// 128). Pass 1: grid `(n_kv_heads, blocks)`, block `(32, gqa_factor)`: one
 /// simdgroup per Q-head of the group, so the `gqa_factor` heads SHARE each K/V
-/// load (the single-pass kernel re-reads the shared KV head `gqa_factor`× — at
+/// load (the single-pass kernel re-reads the shared KV head `gqa_factor`×, at
 /// 32K that's the dominant cost). Each block-row strides a `1/blocks` slice of
 /// the KV positions, emitting per-block (max, sum, partial_o). Pass 2: grid
-/// `(n_q_heads)`, block 1024 — online-softmax merge of the `blocks` partials.
+/// `(n_q_heads)`, block 1024: online-softmax merge of the `blocks` partials.
 /// `blocks` MUST be a multiple of 32 (pass-2 reducer constraint). Kernel math
 /// is registry-validated (`test_butter_sdpa_decode_2pass_combined`, f32/f16/bf16).
 #[allow(clippy::too_many_arguments)]
@@ -4412,7 +5168,7 @@ fn elementwise_kernel(
     bindings.push(Binding::Buffer(out.buffer.clone()));
     let n = out.elem_count() as u32;
     let grid = Grid::d1(n.div_ceil(256), 256);
-    // output binding goes in its signature position — callers pass inputs,
+    // output binding goes in its signature position, callers pass inputs,
     // we append the single output last (matches a,…,out param order).
     dev.dispatch(&k, &bindings, grid)?;
     Ok(out)
@@ -4423,7 +5179,7 @@ pub fn silu(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
     elementwise_kernel(dev, "iron_silu", x.dtype, x.shape.clone(), vec![Binding::Buffer(x.buffer.clone())])
 }
 
-/// ReLU² activation `out = max(x,0)²`, elementwise — NemotronH MoE expert act.
+/// ReLU² activation `out = max(x,0)²`, elementwise: NemotronH MoE expert act.
 /// Built inline (Relu → square) so the expert `up → relu² → down` chain stays
 /// ON-DEVICE (no host round-trip between the two Q8 GEMVs). Dispatches `iron_relu2`.
 pub fn relu2(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
@@ -4520,8 +5276,8 @@ pub fn moe_scatter_add(
 /// The atomicAdd variant (`moe_scatter_add_f32`) is run-to-run NONdeterministic:
 /// floating-point `atomicAdd` completes in hardware-arbitrated (nondeterministic)
 /// order, so when several routed experts for the same token accumulate into the
-/// same `acc[token,h]`, the summation order — and thus the low bits of the result
-/// — varies between identical runs. That jitter propagates through 52 layers and
+/// same `acc[token,h]`, the summation order: and thus the low bits of the result
+///, varies between identical runs. That jitter propagates through 52 layers and
 /// can flip the final argmax at deep context.
 ///
 /// This variant is bit-exact reproducible: one block per `(token, h-block)`, and
@@ -4579,6 +5335,59 @@ extern "C" __global__ void moe_scatter_add_det_f16(
         acc[t * hid + h] = sum;
     }
 }
+
+// f16-input fixed-top_k variant: rowpos maps token-major router slots
+// (t*top_k+j) to expert-major sorted rows. This skips the token CSR rebuild.
+extern "C" __global__ void moe_scatter_add_topk_det_f16(
+    const __half*   __restrict__ dn,
+    const unsigned* __restrict__ rowpos,
+    const float*    __restrict__ wt_token_major,
+    float*                       acc,
+    int s, int top_k, int hid, float unscale)
+{
+    int t = (int)blockIdx.x;
+    int h = (int)(blockIdx.y * BLOCK_H + threadIdx.x);
+    if (t < s && h < hid) {
+        float sum = 0.f;
+        int base = t * top_k;
+        for (int j = 0; j < top_k; ++j) {
+            unsigned r = rowpos[base + j];
+            sum += __half2float(dn[(int)r * hid + h]) * (wt_token_major[base + j] * unscale);
+        }
+        acc[t * hid + h] = sum;
+    }
+}
+
+extern "C" __global__ void moe_scatter_add_topk_det_f16_x2(
+    const __half*   __restrict__ dn,
+    const unsigned* __restrict__ rowpos,
+    const float*    __restrict__ wts_tok,
+    float*                       acc,
+    int s, int top_k, int hid, float unscale)
+{
+    int t = (int)blockIdx.x;
+    int h = ((int)blockIdx.y * BLOCK_H + threadIdx.x) * 2;
+    if (t < s && h < hid) {
+        float sum0 = 0.f;
+        float sum1 = 0.f;
+        int base = t * top_k;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j < top_k) {
+                int r = (int)rowpos[base + j];
+                float w = wts_tok[base + j] * unscale;
+                long idx = (long)r * hid + h;
+                __half2 hv = *reinterpret_cast<const __half2*>(dn + idx);
+                float2 fv = __half22float2(hv);
+                sum0 += fv.x * w;
+                sum1 += fv.y * w;
+            }
+        }
+        long out = (long)t * hid + h;
+        acc[out] = sum0;
+        acc[out + 1] = sum1;
+    }
+}
 "#;
 
 /// Deterministic MoE scatter-add (drop-in for [`moe_scatter_add`] on the prefill
@@ -4586,7 +5395,7 @@ extern "C" __global__ void moe_scatter_add_det_f16(
 /// host before uploading). Builds a CSR index grouping rows by token in ascending
 /// row order, uploads it, and runs the atomic-free deterministic kernel.
 ///
-/// `acc` is WRITTEN (not accumulated) — every output token is fully summed here,
+/// `acc` is WRITTEN (not accumulated), every output token is fully summed here,
 /// so it need not be pre-zeroed, but tokens with no routed rows are set to 0.
 pub fn moe_scatter_add_det(
     dev: &dyn Device,
@@ -4662,6 +5471,34 @@ extern "C" __global__ void moe_token_csr(
 /// runs the deterministic moe_scatter_add_det kernel. Same result as the host
 /// `moe_scatter_add_det` but host-sync-free → graph-capturable.
 #[allow(clippy::too_many_arguments)]
+/// x2 variant of moe_scatter_add_topk_det_f16: 2 hidden-dims/thread via __half2
+/// vectorized loads. Exact; falls back to the x1 kernel on odd hid.
+pub fn moe_scatter_add_topk_det_f16_x2(
+    dev: &dyn Device,
+    dn: &Tensor,
+    rowpos: &Tensor,
+    wts_tok: &Tensor,
+    acc: &Tensor,
+    s: usize,
+    top_k: usize,
+    hid: usize,
+    unscale: f32,
+) -> Result<()> {
+    if hid % 2 != 0 {
+        return moe_scatter_add_topk_det_f16(dev, dn, rowpos, wts_tok, acc, s, top_k, hid, unscale);
+    }
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let pairs = (hid as u32).div_ceil(2);
+    dev.dispatch_raw_cuda(
+        MOE_SCATTER_ADD_DET_SRC,
+        "moe_scatter_add_det.cu",
+        "moe_scatter_add_topk_det_f16_x2",
+        &[(dn.buffer.as_ref(), 0), (rowpos.buffer.as_ref(), rowpos.offset),
+          (wts_tok.buffer.as_ref(), wts_tok.offset), (acc.buffer.as_ref(), 0)],
+        &[i(s as i32), i(top_k as i32), i(hid as i32), unscale.to_le_bytes().to_vec()],
+        [s as u32, pairs.div_ceil(128), 1], [128, 1, 1], 0, false)
+}
+
 pub fn moe_scatter_add_det_dev(
     dev: &dyn Device,
     dn: &Tensor,
@@ -4701,6 +5538,39 @@ pub fn moe_scatter_add_det_dev(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn moe_scatter_add_topk_det_f16(
+    dev: &dyn Device,
+    dn: &Tensor,
+    rowpos: &Tensor,
+    wt_token_major: &Tensor,
+    acc: &Tensor,
+    s: usize,
+    top_k: usize,
+    hid: usize,
+    unscale: f32,
+) -> Result<()> {
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        MOE_SCATTER_ADD_DET_SRC,
+        "moe_scatter_add_det.cu",
+        "moe_scatter_add_topk_det_f16",
+        &[
+            (dn.buffer.as_ref(), 0),
+            (rowpos.buffer.as_ref(), rowpos.offset),
+            (wt_token_major.buffer.as_ref(), wt_token_major.offset),
+            (acc.buffer.as_ref(), 0),
+        ],
+        &[i(s as i32), i(top_k as i32), i(hid as i32), f(unscale)],
+        [s as u32, (hid as u32).div_ceil(128), 1],
+        [128, 1, 1],
+        0,
+        false,
+    )?;
+    Ok(())
+}
+
 /// Expand per-expert CSR offsets `[n_exp+1]` into a per-row expert-id vector
 /// `[mt]` on device: `idx[r] = e` for every `r` in `[off[e], off[e+1])`.
 /// Graph-safe replacement for the host `triples.map(|(e,_,_)| e)` build -- lets
@@ -4736,6 +5606,38 @@ pub fn moe_expert_ids_from_offsets(dev: &dyn Device, off: &Tensor, n_exp: usize,
 /// scale, and cast-back-to-f16 that the MoE prefill loop previously did by
 /// downloading to host, computing on CPU, and re-uploading. One kernel replaces
 /// the full host-round-trip between the up and down GEMMs.
+const RELU2_SCALE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__ void relu2_scale_bf16(
+    const __nv_bfloat16* __restrict__ inp,
+    __nv_bfloat16*       __restrict__ out,
+    int n, float scale)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        float v = __bfloat162float(inp[i]);
+        if (v < 0.f) v = 0.f;
+        // bf16 range (~3e38) holds relu^2 for this model; no f16-style clamp needed.
+        out[i] = __float2bfloat16(v * v * scale);
+    }
+}
+"#;
+
+/// relu(x)^2 * scale for a BF16 tensor: reads BF16, squares in FP32, writes BF16.
+/// Unlike the f16 variant there is no square-safe clamp (bf16 exponent range holds
+/// the squared activations), so the FFN intermediate is not range-distorted.
+pub fn relu2_scale_bf16(dev: &dyn Device, x: &Tensor, scale: f32) -> Result<Tensor> {
+    let n = x.elem_count();
+    let out = Tensor::empty(dev, x.shape.clone(), DType::BF16)?;
+    let block = 256u32;
+    let grid = (n as u32).div_ceil(block);
+    dev.dispatch_raw_cuda(RELU2_SCALE_BF16_SRC, "relu2_scale_bf16.cu", "relu2_scale_bf16",
+        &[(x.buffer.as_ref(), x.offset), (out.buffer.as_ref(), 0)],
+        &[(n as i32).to_le_bytes().to_vec(), scale.to_le_bytes().to_vec()],
+        [grid, 1, 1], [block, 1, 1], 0, false)?;
+    Ok(out)
+}
+
 const RELU2_SCALE_F16_SRC: &str = r#"
 #include <cuda_fp16.h>
 extern "C" __global__ void relu2_scale_f16(
@@ -4810,7 +5712,7 @@ fn unary_act_kernel(name: &str, dtype: DType, kind: ActKind) -> Kernel {
 }
 
 /// Fused multiply-add into an accumulator, elementwise IN-PLACE:
-/// `acc[i] += x[i] · s[i]`. Lets the MoE expert sum stay ON-DEVICE — each
+/// `acc[i] += x[i] · s[i]`. Lets the MoE expert sum stay ON-DEVICE, each
 /// expert's `down` output is folded into `acc` on the GPU (one final download
 /// per layer instead of one per expert). `s` is the per-expert weight broadcast
 /// to `[len]`. Dispatches `iron_fma_inplace`.
@@ -4960,6 +5862,526 @@ pub fn dsv4_partial_rope(
     dev.dispatch(&k, &bindings, grid)?;
     Ok(Tensor::new(qk.buffer.clone(), qk.shape.clone(), qk.dtype))
 }
+
+// ── Laguna YaRN partial-rotary RoPE (raw CUDA) ───────────────────────────
+//
+// Laguna's full-attention layers rotate only the first `n_rot` (partial-
+// rotary) dims of each head with NEOX pairing (`j`, `j+n_rot/2`) and a YaRN
+// frequency/magnitude correction; the tail dims pass through unrotated. The
+// sliding-window layers reuse the same kernel with `n_rot == head_dim`,
+// `freq_scale = 1.0`, `ext_factor = 0.0`, `attn_factor = 1.0` (plain RoPE,
+// no passthrough, no magnitude scaling).
+//
+// Ports the corr_dims + ramp + mscale math from the reference C++ engine's
+// YaRN rope kernel (`ggml_rope_yarn_corr_dims` + `rope_yarn` in that
+// engine's CUDA rope source) bit-for-bit:
+//   corr_dim(n_rotations) = n_rot * ln(n_orig_ctx / (n_rotations * 2π)) / (2 * ln(theta_base))
+//   corr_low  = max(0, floor(corr_dim(beta_fast)))
+//   corr_high = min(n_rot - 1, ceil(corr_dim(beta_slow)))
+//   ramp(j)   = 1 - clamp((j - corr_low) / max(0.001, corr_high - corr_low), 0, 1)
+//   theta     = lerp(freq_scale * theta_extrap, theta_extrap, ramp(j) * ext_factor)
+//   mscale    = attn_factor * (ext_factor != 0 ? 1 + 0.1 * ln(1 / freq_scale) : 1)
+//
+// IMPORTANT: `attn_factor` here is the model's stored `attention_factor`
+// (e.g. 1.4852030263919618 for Laguna-S-2.1's factor-128 YaRN), passed
+// straight through, this kernel re-applies the `1 + 0.1*ln(1/freq_scale)`
+// correction internally exactly as the reference engine does (the engine's
+// the reference engine's context handling pre-cancels its OWN internally-derived default mscale
+// against this same term before folding in the config's `attn_factor`; the
+// net effect is that `attn_factor` reaches the rope kernel unmodified and
+// gets this multiplier applied once, INSIDE the kernel). Do not pre-apply
+// the correction a second time in caller code.
+const ROPE_YARN_PARTIAL_SRC: &str = r#"
+extern "C" __global__ void butter_rope_yarn_partial(
+    const float* __restrict__ qk, float* __restrict__ out,
+    int head_dim, int n_rot, int position,
+    float theta_base, float freq_scale, float ext_factor, float attn_factor,
+    float corr_low, float corr_high)
+{
+    int h = blockIdx.x;
+    int tid = threadIdx.y;
+    int half_rot = n_rot / 2;
+    const float* row_in  = qk  + (long)h * head_dim;
+    float*       row_out = out + (long)h * head_dim;
+
+    if (tid < half_rot) {
+        int j = tid;
+        float theta_scale  = powf(theta_base, -2.0f / (float)n_rot);
+        float theta_extrap = (float)position * powf(theta_scale, (float)j);
+        float theta_interp = freq_scale * theta_extrap;
+        float theta        = theta_interp;
+        // attn_factor IS the final magnitude scale (mscale). The reference
+        // stack cancels its kernel's internal 1 + 0.1*ln(1/freq_scale)
+        // re-multiply by pre-dividing on the host, so the net scale equals the
+        // model's stored attention_factor; we just apply it directly.
+        float mscale       = attn_factor;
+        if (ext_factor != 0.0f) {
+            float y        = ((float)j - corr_low) / fmaxf(0.001f, corr_high - corr_low);
+            float ramp     = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+            float ramp_mix = ramp * ext_factor;
+            theta  = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        }
+        float cos_t = cosf(theta) * mscale;
+        float sin_t = sinf(theta) * mscale;
+        float x0 = row_in[j];
+        float x1 = row_in[j + half_rot];
+        row_out[j]            = x0 * cos_t - x1 * sin_t;
+        row_out[j + half_rot] = x0 * sin_t + x1 * cos_t;
+    } else {
+        // Passthrough tail: copy the two contiguous elements at [n_rot + 2p,
+        // n_rot + 2p + 1) unrotated (matches the reference NEOX kernel's
+        // untouched-tail convention).
+        int p   = tid - half_rot;
+        int idx = n_rot + 2 * p;
+        if (idx < head_dim) {
+            row_out[idx]     = row_in[idx];
+            row_out[idx + 1] = row_in[idx + 1];
+        }
+    }
+}
+"#;
+
+/// YaRN-scaled partial-rotary RoPE (NEOX pairing) for a `[n_heads, head_dim]`
+/// Q or K tensor at sequence `position`. `n_rot` is the number of rotated
+/// dims (`<= head_dim`; the rest pass through unrotated). Pass `n_rot ==
+/// head_dim`, `freq_scale = 1.0`, `ext_factor = 0.0`, `attn_factor = 1.0` for
+/// plain (non-YaRN) RoPE, `beta_fast`/`beta_slow`/`n_orig_ctx` are then
+/// unused (the ramp contributes zero once `ext_factor` is zero). f32 only.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_yarn_partial(
+    dev: &dyn Device,
+    qk: &Tensor,
+    position: u32,
+    n_rot: u32,
+    theta_base: f32,
+    freq_scale: f32,
+    ext_factor: f32,
+    attn_factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    n_orig_ctx: u32,
+) -> Result<Tensor> {
+    let head_dim = *qk.shape.last().ok_or_else(|| Error::Msg("rope_yarn_partial: scalar input".into()))?;
+    let n_heads = qk.elem_count() / head_dim;
+    if n_rot == 0 || n_rot as usize > head_dim || n_rot % 2 != 0 {
+        return Err(Error::Msg(format!(
+            "rope_yarn_partial: n_rot {n_rot} invalid for head_dim {head_dim}"
+        )));
+    }
+    // ggml_rope_yarn_corr_dims: the [low, high] band (in rotated-pair-index
+    // units) where the rotary frequency ramps from interpolated (YaRN-scaled)
+    // to extrapolated (raw). Degenerate but harmless when ext_factor == 0.
+    let corr_dim = |n_rotations: f32| -> f32 {
+        n_rot as f32 * (n_orig_ctx as f32 / (n_rotations * 2.0 * std::f32::consts::PI)).ln()
+            / (2.0 * theta_base.ln())
+    };
+    let corr_low = corr_dim(beta_fast).floor().max(0.0);
+    let corr_high = corr_dim(beta_slow).ceil().min(n_rot as f32 - 1.0);
+
+    let out = Tensor::empty(dev, qk.shape.clone(), DType::F32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    let half = (head_dim / 2) as u32;
+    dev.dispatch_raw_cuda(
+        ROPE_YARN_PARTIAL_SRC, "rope_yarn_partial.cu", "butter_rope_yarn_partial",
+        &[(qk.buffer.as_ref(), qk.offset), (out.buffer.as_ref(), 0)],
+        &[
+            i(head_dim as i32), i(n_rot as i32), i(position as i32),
+            f(theta_base), f(freq_scale), f(ext_factor), f(attn_factor),
+            f(corr_low), f(corr_high),
+        ],
+        [n_heads as u32, 1, 1], [1, half, 1], 0, false,
+    )?;
+    Ok(out)
+}
+
+const ROPE_YARN_PARTIAL_POSBUF_SRC: &str = r#"
+extern "C" __global__ void butter_rope_yarn_partial_posbuf(
+    const float* __restrict__ qk, float* __restrict__ out,
+    const unsigned int* __restrict__ pos_buf,
+    int head_dim, int n_rot,
+    float theta_base, float freq_scale, float ext_factor, float attn_factor,
+    float corr_low, float corr_high)
+{
+    int position = (int)pos_buf[0];
+    int h = blockIdx.x;
+    int tid = threadIdx.y;
+    int half_rot = n_rot / 2;
+    const float* row_in  = qk  + (long)h * head_dim;
+    float*       row_out = out + (long)h * head_dim;
+
+    if (tid < half_rot) {
+        int j = tid;
+        float theta_scale  = powf(theta_base, -2.0f / (float)n_rot);
+        float theta_extrap = (float)position * powf(theta_scale, (float)j);
+        float theta_interp = freq_scale * theta_extrap;
+        float theta        = theta_interp;
+        float mscale       = attn_factor;
+        if (ext_factor != 0.0f) {
+            float y        = ((float)j - corr_low) / fmaxf(0.001f, corr_high - corr_low);
+            float ramp     = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+            float ramp_mix = ramp * ext_factor;
+            theta  = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        }
+        float cos_t = cosf(theta) * mscale;
+        float sin_t = sinf(theta) * mscale;
+        float x0 = row_in[j];
+        float x1 = row_in[j + half_rot];
+        row_out[j]            = x0 * cos_t - x1 * sin_t;
+        row_out[j + half_rot] = x0 * sin_t + x1 * cos_t;
+    } else {
+        int p   = tid - half_rot;
+        int idx = n_rot + 2 * p;
+        if (idx < head_dim) {
+            row_out[idx]     = row_in[idx];
+            row_out[idx + 1] = row_in[idx + 1];
+        }
+    }
+}
+"#;
+
+/// CUDA-graph-capturable variant of [`rope_yarn_partial`]: identical math,
+/// but `position` is read from a 1-element `u32` device buffer at kernel
+/// runtime instead of being baked in as a launch-time scalar. A captured
+/// graph replays the exact same recorded launch every token, so any value
+/// that changes per token (the sequence position) has to live behind a
+/// stable pointer whose CONTENTS the caller updates before each replay,
+/// rather than as an argument frozen at capture time. `corr_low`/`corr_high`
+/// depend only on the (per-layer-type, capture-time-constant) RoPE constants,
+/// so those stay ordinary scalars. Used by Laguna's decode path under
+/// `BUTTER_LAGUNA_GRAPH=1`; the plain scalar-position `rope_yarn_partial` above
+/// remains the default (eager, non-graph) path.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_yarn_partial_posbuf(
+    dev: &dyn Device,
+    qk: &Tensor,
+    pos_buf: &Tensor,
+    n_rot: u32,
+    theta_base: f32,
+    freq_scale: f32,
+    ext_factor: f32,
+    attn_factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    n_orig_ctx: u32,
+) -> Result<Tensor> {
+    let head_dim = *qk.shape.last().ok_or_else(|| Error::Msg("rope_yarn_partial_posbuf: scalar input".into()))?;
+    let n_heads = qk.elem_count() / head_dim;
+    if n_rot == 0 || n_rot as usize > head_dim || n_rot % 2 != 0 {
+        return Err(Error::Msg(format!(
+            "rope_yarn_partial_posbuf: n_rot {n_rot} invalid for head_dim {head_dim}"
+        )));
+    }
+    // Same YaRN corr-dims derivation as `rope_yarn_partial`, a function of
+    // the RoPE constants only, never the runtime position.
+    let corr_dim = |n_rotations: f32| -> f32 {
+        n_rot as f32 * (n_orig_ctx as f32 / (n_rotations * 2.0 * std::f32::consts::PI)).ln()
+            / (2.0 * theta_base.ln())
+    };
+    let corr_low = corr_dim(beta_fast).floor().max(0.0);
+    let corr_high = corr_dim(beta_slow).ceil().min(n_rot as f32 - 1.0);
+
+    let out = Tensor::empty(dev, qk.shape.clone(), DType::F32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    let half = (head_dim / 2) as u32;
+    dev.dispatch_raw_cuda(
+        ROPE_YARN_PARTIAL_POSBUF_SRC, "rope_yarn_partial_posbuf.cu", "butter_rope_yarn_partial_posbuf",
+        &[
+            (qk.buffer.as_ref(), qk.offset),
+            (out.buffer.as_ref(), 0),
+            (pos_buf.buffer.as_ref(), pos_buf.offset),
+        ],
+        &[
+            i(head_dim as i32), i(n_rot as i32),
+            f(theta_base), f(freq_scale), f(ext_factor), f(attn_factor),
+            f(corr_low), f(corr_high),
+        ],
+        [n_heads as u32, 1, 1], [1, half, 1], 0, false,
+    )?;
+    Ok(out)
+}
+
+const ROPE_YARN_PARTIAL_MANY_SRC: &str = r#"
+extern "C" __global__ void butter_rope_yarn_partial_many(
+    const float* __restrict__ qk, float* __restrict__ out,
+    const unsigned int* __restrict__ positions,
+    int head_dim, int n_rot, int n_heads,
+    float theta_base, float freq_scale, float ext_factor, float attn_factor,
+    float corr_low, float corr_high)
+{
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.z;
+    int half_rot = n_rot / 2;
+    int position = (int)positions[t];
+    long row_off = ((long)t * n_heads + h) * head_dim;
+    const float* row_in  = qk  + row_off;
+    float*       row_out = out + row_off;
+
+    if (tid < half_rot) {
+        int j = tid;
+        float theta_scale  = powf(theta_base, -2.0f / (float)n_rot);
+        float theta_extrap = (float)position * powf(theta_scale, (float)j);
+        float theta_interp = freq_scale * theta_extrap;
+        float theta        = theta_interp;
+        float mscale       = attn_factor;
+        if (ext_factor != 0.0f) {
+            float y        = ((float)j - corr_low) / fmaxf(0.001f, corr_high - corr_low);
+            float ramp     = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+            float ramp_mix = ramp * ext_factor;
+            theta  = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        }
+        float cos_t = cosf(theta) * mscale;
+        float sin_t = sinf(theta) * mscale;
+        float x0 = row_in[j];
+        float x1 = row_in[j + half_rot];
+        row_out[j]            = x0 * cos_t - x1 * sin_t;
+        row_out[j + half_rot] = x0 * sin_t + x1 * cos_t;
+    } else {
+        int p   = tid - half_rot;
+        int idx = n_rot + 2 * p;
+        if (idx < head_dim) {
+            row_out[idx]     = row_in[idx];
+            row_out[idx + 1] = row_in[idx + 1];
+        }
+    }
+}
+"#;
+
+/// Batched [`rope_yarn_partial`]: applies YaRN-scaled partial-rotary RoPE to
+/// ALL `T` rows of a `[T, n_heads, head_dim]` Q or K tensor in ONE dispatch,
+/// each row `t` rotated at `positions[t]` (one absolute sequence position per
+/// token row) instead of a single scalar `position` shared by every row.
+/// Replaces the T-loop of per-token `rope_yarn_partial` calls in the Laguna
+/// prefill attention path. Same math/params as `rope_yarn_partial` (pass
+/// `n_rot == head_dim`, `freq_scale = 1.0`, `ext_factor = 0.0`,
+/// `attn_factor = 1.0` for plain, non-YaRN RoPE: Laguna's sliding-window
+/// layers use exactly this). Grid `[T, n_heads, 1]`, block `[1, 1, head_dim/2]`
+/// (covers both the rotated-pair range and the passthrough-tail range, same
+/// as the scalar-position kernel). f32 only.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_yarn_partial_many(
+    dev: &dyn Device,
+    qk: &Tensor,
+    positions: &Tensor,
+    n_heads: usize,
+    n_rot: u32,
+    theta_base: f32,
+    freq_scale: f32,
+    ext_factor: f32,
+    attn_factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    n_orig_ctx: u32,
+) -> Result<Tensor> {
+    let head_dim = *qk.shape.last().ok_or_else(|| Error::Msg("rope_yarn_partial_many: scalar input".into()))?;
+    let t = qk.elem_count() / (n_heads * head_dim);
+    if positions.elem_count() != t {
+        return Err(Error::Msg(format!(
+            "rope_yarn_partial_many: positions len {} != T {t}", positions.elem_count()
+        )));
+    }
+    if n_rot == 0 || n_rot as usize > head_dim || n_rot % 2 != 0 {
+        return Err(Error::Msg(format!(
+            "rope_yarn_partial_many: n_rot {n_rot} invalid for head_dim {head_dim}"
+        )));
+    }
+    // Same YaRN corr-dims derivation as `rope_yarn_partial`, depends only on
+    // the (per-layer-type, chunk-invariant) RoPE constants, never on position.
+    let corr_dim = |n_rotations: f32| -> f32 {
+        n_rot as f32 * (n_orig_ctx as f32 / (n_rotations * 2.0 * std::f32::consts::PI)).ln()
+            / (2.0 * theta_base.ln())
+    };
+    let corr_low = corr_dim(beta_fast).floor().max(0.0);
+    let corr_high = corr_dim(beta_slow).ceil().min(n_rot as f32 - 1.0);
+
+    let out = Tensor::empty(dev, qk.shape.clone(), DType::F32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    let half = (head_dim / 2) as u32;
+    dev.dispatch_raw_cuda(
+        ROPE_YARN_PARTIAL_MANY_SRC, "rope_yarn_partial_many.cu", "butter_rope_yarn_partial_many",
+        &[
+            (qk.buffer.as_ref(), qk.offset),
+            (out.buffer.as_ref(), 0),
+            (positions.buffer.as_ref(), positions.offset),
+        ],
+        &[
+            i(head_dim as i32), i(n_rot as i32), i(n_heads as i32),
+            f(theta_base), f(freq_scale), f(ext_factor), f(attn_factor),
+            f(corr_low), f(corr_high),
+        ],
+        [t as u32, n_heads as u32, 1], [1, 1, half], 0, false,
+    )?;
+    Ok(out)
+}
+
+/// Write a single `u32` scalar into an existing 1-element device buffer, in
+/// place, without reallocating. Laguna's CUDA-graph decode path
+/// (`BUTTER_LAGUNA_GRAPH=1`) keeps a small persistent "workspace" of such
+/// buffers (token id, RoPE position, KV length) whose device POINTERS get
+/// captured into the graph and must never move; only their contents change
+/// from token to token. Call this OUTSIDE any graph-capture region, it must
+/// run eagerly every step, right before the (captured or replayed) decode
+/// work that reads the buffer.
+pub fn write_u32(dev: &dyn Device, buf: &Tensor, val: u32) -> Result<()> {
+    dev.dispatch_raw_cuda(
+        WRITE_U32_SRC, "write_u32.cu", "butter_write_u32",
+        &[(buf.buffer.as_ref(), buf.offset)],
+        &[val.to_le_bytes().to_vec()],
+        [1, 1, 1], [1, 1, 1], 0, false,
+    )
+}
+
+const WRITE_U32_SRC: &str = r#"
+extern "C" __global__ void butter_write_u32(unsigned int* __restrict__ buf, unsigned int val)
+{
+    buf[0] = val;
+}
+"#;
+
+// ── Laguna per-head softplus attention gate (raw CUDA) ───────────────────
+//
+// `g` holds one raw (pre-activation) gate scalar per head, projected from
+// the same normed hidden state that feeds Q/K/V (`g_proj(attn_norm(x))`,
+// NOT the attention output). This multiplies `softplus(g[h])` into every
+// element of head `h`'s attention output, broadcasting the scalar across
+// `head_dim`, applied BEFORE `o_proj`.
+const GATE_SOFTPLUS_MUL_PERHEAD_SRC: &str = r#"
+extern "C" __global__ void butter_gate_softplus_mul_perhead(
+    const float* __restrict__ attn, const float* __restrict__ g,
+    float* __restrict__ out, int head_dim, int n_heads)
+{
+    int h = blockIdx.x;
+    int i = threadIdx.x;
+    if (h >= n_heads || i >= head_dim) return;
+    float gv = g[h];
+    // softplus(x) = log1p(exp(x)); linear for large x where exp(x) overflows.
+    float sp = gv > 20.0f ? gv : log1pf(expf(gv));
+    out[h * head_dim + i] = attn[h * head_dim + i] * sp;
+}
+"#;
+
+/// Per-head softplus attention gate: `out[h, i] = attn[h, i] * softplus(g[h])`
+/// for `attn` `[n_heads, head_dim]` and `g` `[n_heads]` (one raw gate scalar
+/// per head, broadcast over `head_dim`). Laguna's XS.2/S.2 attention-output
+/// gate, applied before `o_proj`. f32 only.
+pub fn gate_softplus_mul_perhead(dev: &dyn Device, attn: &Tensor, g: &Tensor) -> Result<Tensor> {
+    let head_dim = *attn.shape.last().ok_or_else(|| Error::Msg("gate_softplus_mul_perhead: scalar attn".into()))?;
+    let n_heads = attn.elem_count() / head_dim;
+    if g.elem_count() != n_heads {
+        return Err(Error::Msg(format!(
+            "gate_softplus_mul_perhead: g has {} elems, expected {n_heads} (one per head)",
+            g.elem_count()
+        )));
+    }
+    let out = Tensor::empty(dev, attn.shape.clone(), DType::F32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        GATE_SOFTPLUS_MUL_PERHEAD_SRC, "gate_softplus_mul_perhead.cu", "butter_gate_softplus_mul_perhead",
+        &[(attn.buffer.as_ref(), attn.offset), (g.buffer.as_ref(), g.offset), (out.buffer.as_ref(), 0)],
+        &[i(head_dim as i32), i(n_heads as i32)],
+        [n_heads as u32, 1, 1], [head_dim as u32, 1, 1], 0, false,
+    )?;
+    Ok(out)
+}
+
+const GATE_SOFTPLUS_MUL_PERHEAD_MANY_SRC: &str = r#"
+extern "C" __global__ void butter_gate_softplus_mul_perhead_many(
+    const float* __restrict__ attn, const float* __restrict__ g,
+    float* __restrict__ out, int head_dim)
+{
+    long row = (long)blockIdx.x;   // flat (t * n_heads + h)
+    int i = threadIdx.x;
+    if (i >= head_dim) return;
+    float gv = g[row];
+    float sp = gv > 20.0f ? gv : log1pf(expf(gv));
+    out[row * head_dim + i] = attn[row * head_dim + i] * sp;
+}
+"#;
+
+/// Batched [`gate_softplus_mul_perhead`]: `out[t, h, i] = attn[t, h, i] *
+/// softplus(g[t, h])` for `attn` `[T, n_heads, head_dim]` and `g` `[T,
+/// n_heads]` (one raw gate scalar per token-head, broadcast over
+/// `head_dim`). Replaces the T-loop of per-token `gate_softplus_mul_perhead`
+/// calls in the Laguna prefill attention path, applied before `o_proj`,
+/// same as the decode path. f32 only.
+pub fn gate_softplus_mul_perhead_many(dev: &dyn Device, attn: &Tensor, g: &Tensor, n_heads: usize) -> Result<Tensor> {
+    let head_dim = *attn.shape.last().ok_or_else(|| Error::Msg("gate_softplus_mul_perhead_many: scalar attn".into()))?;
+    let rows = attn.elem_count() / head_dim;
+    if g.elem_count() != rows {
+        return Err(Error::Msg(format!(
+            "gate_softplus_mul_perhead_many: g has {} elems, expected {rows} (T*n_heads)",
+            g.elem_count()
+        )));
+    }
+    let _ = n_heads; // rows already folds T*n_heads; kept for call-site clarity/shape docs
+    let out = Tensor::empty(dev, attn.shape.clone(), DType::F32)?;
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        GATE_SOFTPLUS_MUL_PERHEAD_MANY_SRC, "gate_softplus_mul_perhead_many.cu", "butter_gate_softplus_mul_perhead_many",
+        &[(attn.buffer.as_ref(), attn.offset), (g.buffer.as_ref(), g.offset), (out.buffer.as_ref(), 0)],
+        &[i(head_dim as i32)],
+        [rows as u32, 1, 1], [head_dim as u32, 1, 1], 0, false,
+    )?;
+    Ok(out)
+}
+
+/// One-time compaction of a linear prefill K/V scratch buffer into a
+/// fixed-size decode ring: copies the LAST `copy_len` absolute positions
+/// `[copy_start, copy_start+copy_len)` from `src` `[n_kv_heads, src_cap,
+/// head_dim]` into `dst` `[n_kv_heads, ring_cap, head_dim]` at ring slot
+/// `abs_pos % ring_cap`. Used once per sliding-window layer after a Laguna
+/// prefill finishes the whole prompt, to hand off from the prefill-only
+/// linear scratch (`LagunaPrefillScratch`, sized to the prompt) to the
+/// persistent decode ring (`LagunaKvCache`'s fixed `sliding_window`-slot
+/// buffer) so decode can continue exactly where prefill left off. f32 only.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_compact_ring(
+    dev: &dyn Device,
+    src: &Tensor,
+    dst: &Tensor,
+    n_kv_heads: usize,
+    src_cap: usize,
+    head_dim: usize,
+    ring_cap: usize,
+    copy_start: usize,
+    copy_len: usize,
+) -> Result<()> {
+    if copy_len == 0 {
+        return Ok(());
+    }
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let total = (n_kv_heads * copy_len * head_dim) as u32;
+    dev.dispatch_raw_cuda(
+        KV_COMPACT_RING_SRC, "kv_compact_ring.cu", "butter_kv_compact_ring",
+        &[(src.buffer.as_ref(), src.offset), (dst.buffer.as_ref(), dst.offset)],
+        &[
+            i(n_kv_heads as i32), i(src_cap as i32), i(head_dim as i32),
+            i(ring_cap as i32), i(copy_start as i32), i(copy_len as i32),
+        ],
+        [total.div_ceil(256).max(1), 1, 1], [256, 1, 1], 0, false,
+    )
+}
+
+const KV_COMPACT_RING_SRC: &str = r#"
+extern "C" __global__ void butter_kv_compact_ring(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int n_kv_heads, int src_cap, int hd, int ring_cap, int copy_start, int copy_len)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)n_kv_heads * copy_len * hd;
+    if (i >= total) return;
+    int d = (int)(i % hd);
+    long t = i / hd;
+    int c = (int)(t % copy_len);   // 0..copy_len
+    int h = (int)(t / copy_len);   // kv head
+    int src_pos = copy_start + c;  // absolute position within the scratch
+    int dst_slot = src_pos % ring_cap;
+    dst[((long)h * ring_cap + dst_slot) * hd + d] = src[((long)h * src_cap + src_pos) * hd + d];
+}
+"#;
 
 /// Softmax over the last dim, row-wise. Dispatches `iron_softmax`. Row width
 /// `n` must be a multiple of 1024 (the kernel's 4-elems/thread loop).
@@ -5290,18 +6712,131 @@ pub fn mamba_split_proj(
             u(m_nh as u32),
         ],
         // PERF: pack threads/block (was block:[1,1,1] = 1 thread/block, 1/32 of a
-        // warp — this split was ~its full cost in launch overhead, not memory). The
+        // warp, this split was ~its full cost in launch overhead, not memory). The
         // kernel uses a global linear element id (gid_x), so block size is transparent
         // as long as the grid covers exactly s*in_proj_out threads. in_proj_out (10304
         // = 64*161) is a multiple of 64 → s*in_proj_out always divisible by 64.
         {
             let nt = (s * in_proj_out) as u32;
-            let b = if nt % 64 == 0 { 64u32 } else if nt % 32 == 0 { 32u32 } else { 1u32 };
+            let b = if nt % 512 == 0 { 512u32 } else if nt % 256 == 0 { 256u32 } else if nt % 64 == 0 { 64u32 } else if nt % 32 == 0 { 32u32 } else { 1u32 };
             Grid { grid: [nt / b, 1, 1], block: [b, 1, 1] }
         },
     )?;
     Ok((z_out, xbc_out, dt_out))
 }
+const MAMBA_SPLIT_V4_SRC: &str = r#"
+#include <cuda_runtime.h>
+
+extern "C" __global__ void mamba_split_proj_v4(
+    const float* __restrict__ proj,
+    float* __restrict__ z_out,
+    float* __restrict__ xbc_out,
+    float* __restrict__ dt_out,
+    int in_proj_out4, int di4, int conv_dim4, int m_nh4, int total4)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total4) return;
+    int row4 = di4 + conv_dim4 + m_nh4;
+    int ti = idx / row4;
+    int ci4 = idx - ti * row4;
+    const float4* __restrict__ src4 = reinterpret_cast<const float4*>(proj);
+    float4 v = src4[(size_t)ti * in_proj_out4 + ci4];
+    if (ci4 < di4) {
+        reinterpret_cast<float4*>(z_out)[(size_t)ti * di4 + ci4] = v;
+    } else if (ci4 < di4 + conv_dim4) {
+        int j = ci4 - di4;
+        reinterpret_cast<float4*>(xbc_out)[(size_t)ti * conv_dim4 + j] = v;
+    } else {
+        int j = ci4 - di4 - conv_dim4;
+        reinterpret_cast<float4*>(dt_out)[(size_t)ti * m_nh4 + j] = v;
+    }
+}
+
+__device__ __forceinline__ float mamba_softplus(float x) {
+    return x > 20.0f ? x : logf(1.0f + expf(x));
+}
+
+extern "C" __global__ void mamba_split_proj_softplus_v4(
+    const float* __restrict__ proj,
+    const float* __restrict__ bias,
+    float* __restrict__ z_out,
+    float* __restrict__ xbc_out,
+    float* __restrict__ dt_out,
+    int in_proj_out4, int di4, int conv_dim4, int m_nh4, int total4)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total4) return;
+    int row4 = di4 + conv_dim4 + m_nh4;
+    int ti = idx / row4;
+    int ci4 = idx - ti * row4;
+    const float4* __restrict__ src4 = reinterpret_cast<const float4*>(proj);
+    float4 v = src4[(size_t)ti * in_proj_out4 + ci4];
+    if (ci4 < di4) {
+        reinterpret_cast<float4*>(z_out)[(size_t)ti * di4 + ci4] = v;
+    } else if (ci4 < di4 + conv_dim4) {
+        int j = ci4 - di4;
+        reinterpret_cast<float4*>(xbc_out)[(size_t)ti * conv_dim4 + j] = v;
+    } else {
+        int j = ci4 - di4 - conv_dim4;
+        int b = j << 2;
+        v.x = mamba_softplus(v.x + bias[b + 0]);
+        v.y = mamba_softplus(v.y + bias[b + 1]);
+        v.z = mamba_softplus(v.z + bias[b + 2]);
+        v.w = mamba_softplus(v.w + bias[b + 3]);
+        reinterpret_cast<float4*>(dt_out)[(size_t)ti * m_nh4 + j] = v;
+    }
+}
+"#;
+
+/// Fused raw-float4 in_proj split (z/xbc/dt) WITH dt-bias+softplus folded into
+/// the dt band. Replaces mamba_split_proj + softplus_add_rows. Escape with
+/// NEMOTRON_MAMBA_SPLIT_RAW_OFF=1 or NEMOTRON_MAMBA_SPLIT_SOFTPLUS_OFF=1.
+pub fn mamba_split_proj_softplus(
+    dev: &dyn Device,
+    proj: &Tensor,
+    bias: &Tensor,
+    s: usize,
+    in_proj_out: usize,
+    di: usize,
+    conv_dim: usize,
+    m_nh: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let raw_ok = std::env::var("NEMOTRON_MAMBA_SPLIT_RAW_OFF").is_err()
+        && std::env::var("NEMOTRON_MAMBA_SPLIT_SOFTPLUS_OFF").is_err()
+        && proj.dtype == DType::F32 && bias.dtype == DType::F32
+        && proj.offset % 16 == 0 && bias.offset % 4 == 0
+        && di % 4 == 0 && conv_dim % 4 == 0 && m_nh % 4 == 0 && in_proj_out % 4 == 0;
+    if raw_ok {
+        let z_out  = Tensor::empty(dev, vec![s * di], DType::F32)?;
+        let xbc_out = Tensor::empty(dev, vec![s * conv_dim], DType::F32)?;
+        let dt_out  = Tensor::empty(dev, vec![s * m_nh], DType::F32)?;
+        let i = |v: i32| v.to_le_bytes().to_vec();
+        let total4 = (s * (di + conv_dim + m_nh) / 4) as u32;
+        if dev.dispatch_raw_cuda(
+            MAMBA_SPLIT_V4_SRC,
+            "mamba_split_v4.cu",
+            "mamba_split_proj_softplus_v4",
+            &[
+                (proj.buffer.as_ref(), proj.offset),
+                (bias.buffer.as_ref(), bias.offset),
+                (z_out.buffer.as_ref(), 0),
+                (xbc_out.buffer.as_ref(), 0),
+                (dt_out.buffer.as_ref(), 0),
+            ],
+            &[i((in_proj_out / 4) as i32), i((di / 4) as i32), i((conv_dim / 4) as i32), i((m_nh / 4) as i32), i(total4 as i32)],
+            [total4.div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+            false,
+        ).is_ok() {
+            return Ok((z_out, xbc_out, dt_out));
+        }
+    }
+    let (z, xbc, dt_raw) = mamba_split_proj(dev, proj, s, in_proj_out, di, conv_dim, m_nh)?;
+    let dt = softplus_add_rows(dev, &dt_raw, bias, s, m_nh)?;
+    Ok((z, xbc, dt))
+}
+
 
 // ── Fused Mamba conv-output split (Part-B: 3 strided_col_copy → 1 dispatch) ─
 //
@@ -5348,6 +6883,35 @@ pub fn mamba_split_conv(
 // Processes S tokens in one dispatch.  Each thread-group handles one (token,
 // norm-group) pair.  Replaces the host dl+compute+upload loop in the
 // CONV_DEVICE prefill path (TODO comment at line ~1543 of modeltests/lib.rs).
+/// RMSNorm with f16 output only. Equivalent to `cast_f32_f16(rms_norm(...))`,
+/// but avoids the intermediate f32 norm tensor and the separate cast launch.
+/// TODO(rebrand-merge): the fast-path fused kernel (`iron_rms_norm_f16out`)
+/// isn't in `thewafflehaus/iron@dev` yet, so this always takes the
+/// `rms_norm` + `cast_f32_f16` fallback below (same numerics, one extra
+/// dispatch) instead of the single-pass fused kernel.
+pub fn rms_norm_f16out(dev: &dyn Device, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+    let out = rms_norm(dev, x, weight, eps)?;
+    cast_f32_f16(dev, &out)
+}
+
+/// TODO(rebrand-merge): the fused kernel (`iron_gated_group_rmsnorm_batched_f16out`)
+/// isn't in `thewafflehaus/iron@dev` yet (only the plain, non-f16out
+/// `iron_gated_group_rmsnorm_batched` is) — always takes the
+/// `gated_group_rmsnorm_batched` + `cast_f32_f16` fallback below.
+pub fn gated_group_rmsnorm_batched_f16out(
+    dev: &dyn Device,
+    y: &Tensor,
+    z: &Tensor,
+    w: &Tensor,
+    eps: f32,
+    s: usize,
+    di: usize,
+    gs: usize,
+) -> Result<Tensor> {
+    let out = gated_group_rmsnorm_batched(dev, y, z, w, eps, s, di, gs)?;
+    cast_f32_f16(dev, &out)
+}
+
 pub fn gated_group_rmsnorm_batched(
     dev: &dyn Device,
     y: &Tensor,
@@ -5449,14 +7013,14 @@ extern "C" __global__ void moe_w4a16(
     const int m_tile_base = blockIdx.y * 64;
     const int warp_id     = threadIdx.x >> 5;
     // 2×2 warp layout: warp_id 0→(m=0,n=0), 1→(m=0,n=32), 2→(m=32,n=0), 3→(m=32,n=32)
-    (void)(threadIdx.x & 31); // lane — unused in this kernel (warp_id sufficient)
+    (void)(threadIdx.x & 31); // lane, unused in this kernel (warp_id sufficient)
     const int warp_m_base = (warp_id >> 1) * 32; // 0 or 32
     const int warp_n_base = (warp_id  & 1) * 32; // 0 or 32
 
     // ── Shared memory layout ───────────────────────────────────────────────
-    // smem_X  [64×32] f16  = 4096 bytes  — row-major [m_local, k_local]
-    // smem_WT [32×64] f16  = 4096 bytes  — row-major [k_local, n_local] = W transposed
-    // smem_C  [64×64] f32  = 16384 bytes — output accumulation tile
+    // smem_X  [64×32] f16  = 4096 bytes, row-major [m_local, k_local]
+    // smem_WT [32×64] f16  = 4096 bytes, row-major [k_local, n_local] = W transposed
+    // smem_C  [64×64] f32  = 16384 bytes, output accumulation tile
     __shared__ __half smem_X [64 * 32]; // [m_local][k_local]
     __shared__ __half smem_WT[32 * 64]; // [k_local][n_local]  ← W^T
     __shared__ float  smem_C [64 * 64];
@@ -5617,8 +7181,8 @@ extern "C" __global__ void moe_w4a16(
 //       row_group = j / 32          (0..7, each group = 8 consecutive rows)
 //       nibble i  → output row (row_group*8 + i), k = k_tile_base + k_local
 //
-// This layout makes thread `t` load tile_base+t and tile_base+t+128 — two
-// consecutive addresses — covering the full 64×32 tile with 4 cache lines
+// This layout makes thread `t` load tile_base+t and tile_base+t+128, two
+// consecutive addresses, covering the full 64×32 tile with 4 cache lines
 // per warp per load, vs ~64 scattered cache lines in the standard layout.
 //
 // `n_exp`  = total experts in the weight pool (all experts, packed contiguously)
@@ -5770,9 +7334,9 @@ extern "C" __global__ void moe_w4a16_marlin(
     const int t           = threadIdx.x;  // 0..127
 
     // ── Shared memory layout ───────────────────────────────────────────────
-    // smem_X  [64×32] f16  = 4096 bytes  — row-major [m_local, k_local]
-    // smem_WT [32×64] f16  = 4096 bytes  — row-major [k_local, n_local] (W^T)
-    // smem_C  [64×64] f32  = 16384 bytes — output accumulation tile
+    // smem_X  [64×32] f16  = 4096 bytes, row-major [m_local, k_local]
+    // smem_WT [32×64] f16  = 4096 bytes, row-major [k_local, n_local] (W^T)
+    // smem_C  [64×64] f32  = 16384 bytes, output accumulation tile
     __shared__ __half smem_X [64 * 32];
     __shared__ __half smem_WT[32 * 64];
     __shared__ float  smem_C [64 * 64];
@@ -6187,7 +7751,7 @@ extern "C" __global__ void moe_w4a16_marlin128(
 }
 "#;
 
-/// W4A16 MoE grouped GEMM — Marlin coalesced layout.
+/// W4A16 MoE grouped GEMM, Marlin coalesced layout.
 ///
 /// Drop-in replacement for `moe_w4a16` but requires `qs` to be in Marlin
 /// tile-major layout (from `permute_q4_to_marlin`). Achieves coalesced
@@ -6274,7 +7838,7 @@ pub fn moe_w4a16_marlin(
 /// W4A16 MoE grouped GEMM (Marlin-style, WMMA tensor cores, inline Q4 dequant).
 ///
 /// Drop-in replacement for `moe_bgemm_q4_bm64`. Uses `mma.sync m16n16k16` with
-/// weights staged as W^T in smem — no f16 weight scratch in global memory, no
+/// weights staged as W^T in smem, no f16 weight scratch in global memory, no
 /// 2× weight bandwidth. `n_out % 64 == 0` required.
 ///
 /// Returns `[m_total, n_out]` f16 (same contract as `moe_bgemm_q4_bm64`).
@@ -6328,7 +7892,7 @@ pub fn moe_grouped_gemm(
     sc_up: &Tensor,
     qs_dn: &Tensor,
     sc_dn: &Tensor,
-    xs_f16: &Tensor,        // [mt, hid] f16 — rows sorted by expert id
+    xs_f16: &Tensor,        // [mt, hid] f16: rows sorted by expert id
     g_starts: &[usize],     // length = n_active + 1
     expert_ids: &[usize],   // expert id for each group
     hid: usize,
@@ -6364,10 +7928,10 @@ pub fn moe_grouped_gemm(
     // Defensive bounds check on caller-supplied scratch pools. The chunked
     // batched-dequant writes f16 expert weights to slot `c0..c1` of the scratch
     // at byte offset `c0*{up,dn}_slot*2`, and the per-expert GEMM reads/writes
-    // `slot*{up,dn}_slot*2` — so the scratch MUST hold `n_active` full slots
+    // `slot*{up,dn}_slot*2`, so the scratch MUST hold `n_active` full slots
     // (`n_active*{up,dn}_slot` f16 elems). A caller binding an under-sized pool
     // (e.g. sized for fewer active experts than this token batch routed to)
-    // triggers an out-of-bounds WRITE — silent corruption on Metal, a
+    // triggers an out-of-bounds WRITE, silent corruption on Metal, a
     // deterministic MMU-fault on CUDA. Fail loudly here, naming the shapes.
     if let Some(scratch) = up_scratch {
         let need = n_active * up_slot;
@@ -6399,7 +7963,7 @@ pub fn moe_grouped_gemm(
     // arrays serializes the stream. Per-expert cuBLAS (27 TFLOP/s) remains best.
 
     // ── UP scratch: full `n_active` slots (distinct regions per chunk so chunk
-    // N+1's dequant overlaps chunk N's GEMMs — same-buffer reuse would serialize). ──
+    // N+1's dequant overlaps chunk N's GEMMs, same-buffer reuse would serialize). ──
     let up_w_owned: Option<Tensor>;
     let up_w = if let Some(scratch) = up_scratch {
         Tensor { buffer: scratch.buffer.clone(), offset: 0, shape: vec![n_active * inter, hid], dtype: DType::F16 }
@@ -6514,7 +8078,7 @@ pub fn moe_grouped_gemm(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// NVFP4 (mxf4nvf4) grouped MoE GEMM — native Blackwell block-scaled FP4 mma.
+// NVFP4 (mxf4nvf4) grouped MoE GEMM, native Blackwell block-scaled FP4 mma.
 // Fragment-packed layout: weights repacked once at load (nvfp4_pack_w), acts
 // quantized+packed per layer (moe_fp4_actq_pack), one fixed-launch grouped mma
 // over BM=16 tile descriptors (graph-safe). Requires IRON_CUDA_ARCH=
@@ -6524,7 +8088,7 @@ pub fn moe_grouped_gemm(
 const MOE_FP4_SRC: &str = r#"
 #include <cuda_fp16.h>
 
-// UE4M3 codebook (monotonic): e=0 subnormal m/8*2^-7? NO — matches quantize_nvfp4:
+// UE4M3 codebook (monotonic): e=0 subnormal m/8*2^-7? NO, matches quantize_nvfp4:
 // e==0 → (m/8)*0.0078125 (=2^-7), else (1+m/8)*2^(e-7).
 __device__ __forceinline__ float dec_ue4m3(unsigned b){
     int e=(b>>3)&0xF, m=b&7;
@@ -6758,7 +8322,7 @@ extern "C" __global__ void moe_fp4_actq_pack(
     Asc[fbase*32+lane]=sw;
 }
 
-// VARIANT: each warp computes 4 consecutive n8-tiles — A frags loaded once,
+// VARIANT: each warp computes 4 consecutive n8-tiles, A frags loaded once,
 // reused 4x; W streams per-subtile. Cuts A traffic 4x, raises mma density.
 // 16-byte async global->shared copy (per-warp staging; no block syncs).
 __device__ __forceinline__ void butter_cp16(void* sm, const void* gm){
@@ -6778,7 +8342,7 @@ extern "C" __global__ void moe_fp4_grouped_mma_x4(
     // direct global->register W loads left the mma latency-bound (~42 TF);
     // double-buffering the 4 W tiles per warp while the mma consumes the
     // other stage measures 47.9 TF standalone on GB10 (+14%). Each warp owns
-    // its smem slot — per-warp wait_group + syncwarp only, NO __syncthreads
+    // its smem slot, per-warp wait_group + syncwarp only, NO __syncthreads
     // (the cross-warp shared-W variant with block syncs measured SLOWER).
     __shared__ unsigned smW[8][2][256]; // [warp][stage][4 tiles x 64 u32]
     __shared__ unsigned smS[8][2][32];  // [warp][stage][4 tiles x 8 u32]
@@ -6864,7 +8428,7 @@ extern "C" __global__ void moe_fp4_grouped_mma_x4(
     }
 }
 
-// Grouped mma: one warp = (tile, nt). FIXED launch grid — padding tiles
+// Grouped mma: one warp = (tile, nt). FIXED launch grid, padding tiles
 // (gend==0) early-out → graph-safe. out f16 [mt, N] in sorted-row space.
 extern "C" __global__ void moe_fp4_grouped_mma(
     const unsigned* __restrict__ Ap, const unsigned* __restrict__ Asc,
@@ -6935,9 +8499,9 @@ extern "C" __global__ void moe_extend_groups(
 // FP8 e4m3 per-tensor quant. Pass 1 = nvfp4_amax_slab (reused, mode 0).
 // fp8_scale: amax bits -> scale = amax/448 and inv (one thread).
 extern "C" __global__ void fp8_scale(
-    const unsigned* __restrict__ amax_bits, float* __restrict__ sc)
+    const unsigned* __restrict__ amax_bits, float* __restrict__ sc, float clip)
 {
-    float am=__uint_as_float(*amax_bits);
+    float am=__uint_as_float(*amax_bits)*((clip>0.f)?clip:1.f);
     float s=(am>0.f)?(am/448.f):1.f;
     sc[0]=s;        // dequant scale (consumed by the GEMM)
     sc[1]=1.f/s;    // quant scale (consumed by fp8_quant)
@@ -7002,6 +8566,61 @@ extern "C" __global__ void fp8_rowcol_scale_f32(
     for(;e<n;e+=st){ int r=(int)(e/N), c=(int)(e%N); o[e]*=xsc[r]*wsc[c]; }
 }
 
+// Fused block-Hadamard(128) along K + global amax of |rotated| (atomicMax on
+// the float bit-pattern, monotonic for positives). Collapses the separate
+// fwht + amax passes for the per-tensor fp8 proj path. K % 128 == 0.
+extern "C" __global__ void fwht128_amax(
+    const __half* __restrict__ x, __half* __restrict__ y,
+    unsigned* __restrict__ amax, long rows, int K)
+{
+    int nb = K / 128;
+    long bid = (long)blockIdx.x;
+    if (bid >= rows * (long)nb) return;
+    int t = threadIdx.x;
+    __shared__ float s[128];
+    long base = bid * 128;
+    s[t] = __half2float(x[base + t]);
+    __syncthreads();
+    for (int len = 1; len < 128; len <<= 1) {
+        float a = s[t]; float b = s[t ^ len];
+        __syncthreads();
+        s[t] = (t & len) ? (b - a) : (a + b);
+        __syncthreads();
+    }
+    float r = s[t] * 0.08838834764831845f;
+    y[base + t] = __float2half(r);
+    // block-reduce |r| then one atomicMax to the global amax
+    s[t] = fabsf(r);
+    __syncthreads();
+    for (int o = 64; o > 0; o >>= 1) { if (t < o) s[t] = fmaxf(s[t], s[t + o]); __syncthreads(); }
+    if (t == 0) atomicMax(amax, __float_as_uint(s[0]));
+}
+
+// Block Walsh-Hadamard transform (size 128) along the K dim, normalized by
+// 1/sqrt(128). Each CUDA block handles one (row, kblock) of 128 contiguous
+// elems. Orthonormal: rotating both activation and weight along K leaves the
+// GEMM x.Wt unchanged, but spreads per-channel activation outliers so a
+// per-tensor fp8 quant holds quality (QuaRot/Hadamard recipe). K % 128 == 0.
+extern "C" __global__ void fwht128(
+    const __half* __restrict__ x, __half* __restrict__ y, long rows, int K)
+{
+    int nb = K / 128;
+    long bid = (long)blockIdx.x;
+    if (bid >= rows * (long)nb) return;
+    int t = threadIdx.x; // 0..127
+    __shared__ float s[128];
+    long base = bid * 128;
+    s[t] = __half2float(x[base + t]);
+    __syncthreads();
+    for (int len = 1; len < 128; len <<= 1) {
+        float a = s[t]; float b = s[t ^ len];
+        __syncthreads();
+        s[t] = (t & len) ? (b - a) : (a + b);
+        __syncthreads();
+    }
+    y[base + t] = __float2half(s[t] * 0.08838834764831845f); // 1/sqrt(128)
+}
+
 extern "C" __global__ void fp8_quant(
     const __half* __restrict__ x, unsigned char* __restrict__ q,
     const float* __restrict__ sc, long n)
@@ -7030,7 +8649,52 @@ extern "C" __global__ void fp8_quant(
     }
 }
 
-// f32-input variant of lt_fp4_quant — reads the residual-stream f32 tensor
+// Pass-1 of the fused fp8 act path: block-Hadamard(128) along K + global amax,
+// WITHOUT materializing the rotated tensor (no y write). Halves the HBM of the
+// old fwht128_amax (which wrote a full [rows,K] f16 that fp8_quant then re-read).
+extern "C" __global__ void fwht128_amaxonly(
+    const __half* __restrict__ x, unsigned* __restrict__ amax, long rows, int K)
+{
+    int nb = K / 128; long bid = (long)blockIdx.x;
+    if (bid >= rows * (long)nb) return;
+    int t = threadIdx.x; __shared__ float s[128]; long base = bid * 128;
+    s[t] = __half2float(x[base + t]); __syncthreads();
+    for (int len = 1; len < 128; len <<= 1) {
+        float a = s[t]; float b = s[t ^ len]; __syncthreads();
+        s[t] = (t & len) ? (b - a) : (a + b); __syncthreads();
+    }
+    float r = s[t] * 0.08838834764831845f;
+    s[t] = fabsf(r); __syncthreads();
+    for (int o = 64; o > 0; o >>= 1) { if (t < o) s[t] = fmaxf(s[t], s[t + o]); __syncthreads(); }
+    if (t == 0) atomicMax(amax, __float_as_uint(s[0]));
+}
+
+// Pass-2 of the fused fp8 act path: re-rotate x (Hadamard 128) AND quant to e4m3
+// in one kernel reading x directly (no rotated-tensor round-trip). Uses the
+// precomputed scale sc[1]. Same e4m3 encoding as fp8_quant.
+extern "C" __global__ void fwht128_quant(
+    const __half* __restrict__ x, unsigned char* __restrict__ q,
+    const float* __restrict__ sc, long rows, int K)
+{
+    int nb = K / 128; long bid = (long)blockIdx.x;
+    if (bid >= rows * (long)nb) return;
+    int t = threadIdx.x; __shared__ float s[128]; long base = bid * 128;
+    s[t] = __half2float(x[base + t]); __syncthreads();
+    for (int len = 1; len < 128; len <<= 1) {
+        float a = s[t]; float b = s[t ^ len]; __syncthreads();
+        s[t] = (t & len) ? (b - a) : (a + b); __syncthreads();
+    }
+    float v = s[t] * 0.08838834764831845f * sc[1];
+    v = fminf(fmaxf(v, -448.f), 448.f);
+    unsigned sgn=(v<0.f)?0x80u:0u; float a=fabsf(v); unsigned c;
+    if(a<0.0009765625f){ int m=(int)rintf(a*512.f); if(m>7)m=7; c=(unsigned)m; }
+    else { int e; float fr=frexpf(a,&e); int E=e+6; int m=(int)rintf((2.f*fr-1.f)*8.f);
+        if(m>7){m=0;E+=1;} if(E<1){ int ms=(int)rintf(a*512.f); if(ms>7)ms=7; c=(unsigned)ms; }
+        else { if(E>15)E=15; if(E==15&&m>6)m=6; c=(unsigned)((E<<3)|m); } }
+    q[base + t]=(unsigned char)(sgn|c);
+}
+
+// f32-input variant of lt_fp4_quant, reads the residual-stream f32 tensor
 // directly, killing the cast_f32_f16 + f16 intermediate round-trip that
 // preceded every dense-projection quant (f32 -> f16 -> e2m1 became
 // f32 -> e2m1; the e2m1 grid subsumes the f16 rounding).
@@ -7108,7 +8772,7 @@ extern "C" __global__ void nvfp4_gscale(
 }
 
 // fp4_sfa_offsets: device build of the per-group SFA byte offsets from the
-// router offsets — sfa_off[g] = (sum_{j<g} ceil(M_j/128)) * 512 * ceil(K/64).
+// router offsets, sfa_off[g] = (sum_{j<g} ceil(M_j/128)) * 512 * ceil(K/64).
 // Single block, serial prefix (n_groups <= a few hundred).
 extern "C" __global__ void fp4_sfa_offsets(
     const unsigned* __restrict__ off, long long* __restrict__ sfa_off,
@@ -7123,7 +8787,7 @@ extern "C" __global__ void fp4_sfa_offsets(
     }
 }
 
-// fp4_group_alpha_id: identity-expert variant — alpha[g] = gA[0] * gw[g].
+// fp4_group_alpha_id: identity-expert variant, alpha[g] = gA[0] * gw[g].
 extern "C" __global__ void fp4_group_alpha_id(
     const float* __restrict__ gA, const float* __restrict__ gw,
     float* __restrict__ alpha, int n)
@@ -7133,7 +8797,7 @@ extern "C" __global__ void fp4_group_alpha_id(
 }
 
 // fp4_group_alpha: per-group GEMM output scale alpha[g] = gA[0] * gw[eid[g]]
-// (activation per-call global x expert weight global) — folds both per-tensor
+// (activation per-call global x expert weight global), folds both per-tensor
 // globals back into the grouped GEMM epilogue, all device-side.
 extern "C" __global__ void fp4_group_alpha(
     const float* __restrict__ gA, const float* __restrict__ gw,
@@ -7148,7 +8812,7 @@ extern "C" __global__ void fp4_group_alpha(
 // keeping the ue4m3 codes centered in the normal range instead of the
 // subnormal floor (the no-global recipe loses scale precision when block
 // amaxes are small, e.g. Q4-dequanted weights). Effective block scale =
-// dec_ue4m3(sc) * global — the GEMM multiplies global back in via alpha.
+// dec_ue4m3(sc) * global, the GEMM multiplies global back in via alpha.
 extern "C" __global__ void lt_fp4_quant_gs(
     const __half* __restrict__ x, unsigned char* __restrict__ xp,
     unsigned char* __restrict__ sf, const float* __restrict__ gs,
@@ -7353,7 +9017,7 @@ extern "C" __global__ void pad_rows_f16(const __half* src, __half* dst, int k, i
 "#;
 
 /// Extend routed MoE descriptors (st/sw/offsets) with two identity groups
-/// covering all `s` tokens — the shared expert folded into the grouped GEMM.
+/// covering all `s` tokens, the shared expert folded into the grouped GEMM.
 /// Returns (st_ext [mt+2s], sw_ext [mt+2s], off_ext [n_exp+3]).
 pub fn moe_extend_groups(
     dev: &dyn Device, st: &Tensor, sw: &Tensor, off: &Tensor,
@@ -7374,7 +9038,7 @@ pub fn moe_extend_groups(
 }
 
 /// Quantize an f16 `[r, k]` row-major tensor to cuBLASLt block-scaled NVFP4:
-/// returns `(pack, sf)` — packed e2m1 `[r*k/2]` bytes + the swizzled ue4m3
+/// returns `(pack, sf)`, packed e2m1 `[r*k/2]` bytes + the swizzled ue4m3
 /// scale tensor sized `ceil(r/128)*512*ceil((k/16)/4)` bytes (zero-seeded so
 /// padding rows decode to 0). Used for both weights (once, at setup) and
 /// activations (per call). `k % 32 == 0` required.
@@ -7402,11 +9066,11 @@ pub fn lt_fp4_quant(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Result<
 /// e2m1 `[mt*k/2]` bytes (global row-major) + a per-group swizzled ue4m3
 /// scale pool where group g's blob (group-LOCAL rows, padded to 128-row
 /// stripes, zero-seeded) starts at byte `sfa_off[g]`. A per-call activation
-/// GLOBAL (amax/(6·448), dynamic, device-computed — no host sync) centers the
+/// GLOBAL (amax/(6·448), dynamic, device-computed: no host sync) centers the
 /// block scales in the ue4m3 normal range; the GEMM folds it back in via the
 /// per-group alpha (see [`moe_grouped_gemm_cutlass_fp4`]). `g_starts` has
 /// `n_groups+1` entries (`g_starts[n_groups] == mt`). Returns
-/// `(pack, sf, sfa_off, gs)` — `gs` = device `[global, inv_global]` f32 pair.
+/// `(pack, sf, sfa_off, gs)`, `gs` = device `[global, inv_global]` f32 pair.
 pub fn lt_fp4_quant_grouped(
     dev: &dyn Device, x: &Tensor, mt: usize, k: usize, g_starts: &[usize],
 ) -> Result<(Tensor, Tensor, Vec<i64>, Tensor)> {
@@ -7456,7 +9120,7 @@ pub fn lt_fp4_quant_grouped(
 /// block-scaled NVFP4 in the CUTLASS/cuBLASLt canonical layout: per-expert
 /// packed e2m1 (`n*k/2` bytes each, contiguous) + per-expert swizzled ue4m3
 /// scales (`ceil(n/128)*512*ceil(k/64)` bytes each, contiguous, zero-seeded)
-/// + per-expert GLOBALS `gw [n_exp]` f32 (amax/(6·448) — keeps the block
+/// + per-expert GLOBALS `gw [n_exp]` f32 (amax/(6·448), keeps the block
 /// scales in the ue4m3 normal range; the GEMM folds `gw` back in via the
 /// per-group alpha). One quant dispatch per expert so every expert's SF blob
 /// is laid out from local row 0 (an `[n_exp*n, k]` whole-slab quant would
@@ -7489,7 +9153,7 @@ pub fn lt_fp4_quant_slab(
     let pack = Tensor::new(dev.alloc(n_exp * pack_exp)?, vec![n_exp * pack_exp], DType::U32);
     let sf = Tensor::new(dev.alloc_zeroed(n_exp * sf_exp)?, vec![n_exp * sf_exp], DType::U32);
     let nb = (n * kb) as u32;
-    // B8a: routed-expert WEIGHT 4/6 (Four-Over-Six) under NEMOTRON_FP4_46 — free
+    // B8a: routed-expert WEIGHT 4/6 (Four-Over-Six) under NEMOTRON_FP4_46, free
     // (setup-time, covers ~90% of params). Same per-expert global gw[e] (gs[0]).
     let kname = if std::env::var("NEMOTRON_FP4_46").is_ok() { "lt_fp4_quant_gs_46" } else { "lt_fp4_quant_gs" };
     for e in 0..n_exp {
@@ -7506,7 +9170,7 @@ pub fn lt_fp4_quant_slab(
 
 /// Device-descriptor variant of [`lt_fp4_quant_grouped`]: per-group SFA
 /// offsets are computed ON DEVICE from the router offsets (`off_dev`, u32
-/// `[n_groups+1]`) — no host offsets, no uploads, graph-safe. The SFA pool is
+/// `[n_groups+1]`), no host offsets, no uploads, graph-safe. The SFA pool is
 /// sized worst-case (`mt/128 + n_groups` stripes). Returns `(pack, sf, gs)`;
 /// the GEMM run derives the same per-group offsets from `off_dev`.
 pub fn lt_fp4_quant_grouped_dev(
@@ -7566,12 +9230,12 @@ pub fn fp4_group_alpha_id(dev: &dyn Device, gs: &Tensor, gw: &Tensor, alpha: &Te
         [(n as u32).div_ceil(64), 1, 1], [64, 1, 1], 0, false)
 }
 
-/// CUTLASS grouped block-scaled NVFP4 MoE GEMM — `out[t,n](f16) = Σ_k
+/// CUTLASS grouped block-scaled NVFP4 MoE GEMM, `out[t,n](f16) = Σ_k
 /// A[t,k]·W[eid][n,k]` over sorted-token groups with BOTH operands in packed
 /// e2m1 + swizzled ue4m3 block-16 scales. `a_pack`/`a_sf`/`sfa_off`/`a_gs`
 /// from [`lt_fp4_quant_grouped`]; `w_pack`/`w_sf`/`w_gw` from
 /// [`lt_fp4_quant_slab`]. The per-tensor globals are folded back in through
-/// the GEMM's per-group alpha (`gA·gw[eid]`, built device-side — no host
+/// the GEMM's per-group alpha (`gA·gw[eid]`, built device-side: no host
 /// sync). `g_starts[g]..g_starts[g+1]` = group g's token rows;
 /// `expert_ids[g]` selects the weight slab. ONE GEMM launch for all groups.
 /// Returns `out [mt, n]` f16. CUDA + CUTLASS_DIR sm_120a/121a build only.
@@ -7699,6 +9363,54 @@ pub fn w4a8_packw(
 
 /// `sfb_exp_bytes` = per-expert SFB stride in bytes (from `w8a8_packw`).
 #[allow(clippy::too_many_arguments)]
+/// Validated NVFP4 (f16-act) grouped-MoE GEMM (marlin). `a` f16 `[m,K]`, `b` fp4
+/// marlin-tile u32 `[n_exp,K/16,N*2]`, `b_scales` S0E5M3 fp8 (u32-viewed),
+/// `global_scale` f32 `[n_exp]`, `topk_weights` f32 `[m*top_k]`; routing
+/// (`sorted_token_ids`/`expert_ids`/`num_tokens_past_padded`) device i32.
+/// Returns f16 `[m*top_k, N]`. mul_topk_weights + fp32 reduce on.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_marlin_gemm(
+    dev: &dyn Device,
+    a: &Tensor, b: &Tensor, b_scales: &Tensor, global_scale: &Tensor, topk_weights: &Tensor,
+    sorted_token_ids: &Tensor, expert_ids: &Tensor, num_tokens_past_padded: &Tensor,
+    prob_m: usize, prob_n: usize, prob_k: usize, num_experts: usize, top_k: usize,
+    group_size: usize, moe_block: usize, sms: i32,
+) -> Result<Tensor> {
+    let mt = (prob_m * top_k).max(1);
+    let out = Tensor::empty(dev, vec![mt, prob_n.max(1)], DType::F16)?;
+    let num_groups = prob_k / group_size;
+    let ctmp = ((sms as usize) * 4 * moe_block * 256).max(1);
+    let c_tmp = Tensor::new(dev.alloc_zeroed(ctmp * 4)?, vec![ctmp], DType::F32);
+    let wsn = ((sms as usize) * 4).max(1);
+    let ws = Tensor::new(dev.alloc_zeroed(wsn * 4)?, vec![wsn], DType::U32);
+    dev.moe_marlin_gemm(
+        a.buffer.as_ref(), b.buffer.as_ref(), out.buffer.as_ref(), c_tmp.buffer.as_ref(),
+        b_scales.buffer.as_ref(), global_scale.buffer.as_ref(), topk_weights.buffer.as_ref(),
+        sorted_token_ids.buffer.as_ref(), expert_ids.buffer.as_ref(), num_tokens_past_padded.buffer.as_ref(),
+        ws.buffer.as_ref(),
+        moe_block, num_experts, top_k, true, prob_m, prob_n, prob_k, num_groups, group_size, sms, true,
+    )?;
+    Ok(out)
+}
+
+/// Repack one expert's GPTQ-packed `[K/8,N]` u32 weights -> marlin tile `[K/16,N*2]` u32 (device).
+pub fn marlin_repack(dev: &dyn Device, b_q: &Tensor, size_k: usize, size_n: usize, sms: i32, max_shared_mem: i32) -> Result<Tensor> {
+    let out_elems = ((size_k / 16) * (size_n * 2)).max(1);
+    let out = Tensor::new(dev.alloc(out_elems * 4)?, vec![out_elems], DType::U32);
+    dev.marlin_repack(b_q.buffer.as_ref(), out.buffer.as_ref(), size_k, size_n, sms, max_shared_mem)?;
+    Ok(out)
+}
+
+/// On-device marlin routing build from per-expert offsets `off` [n_exp+1] (device i32).
+pub fn marlin_build_routing(dev:&dyn Device, off:&Tensor, n_exp:usize, blk:usize, mt:usize)->Result<(Tensor,Tensor,Tensor)>{
+    let max_blocks = mt/blk + n_exp + 1;
+    let stid=Tensor::new(dev.alloc((max_blocks*blk).max(1)*4)?, vec![(max_blocks*blk).max(1)], DType::U32);
+    let eid=Tensor::new(dev.alloc(max_blocks.max(1)*4)?, vec![max_blocks.max(1)], DType::U32);
+    let ntpp=Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
+    dev.marlin_build_routing(off.buffer.as_ref(), n_exp, blk, mt, stid.buffer.as_ref(), eid.buffer.as_ref(), ntpp.buffer.as_ref())?;
+    Ok((stid,eid,ntpp))
+}
+
 pub fn moe_grouped_gemm_w8a8(
     dev: &dyn Device,
     a_pack: &Tensor, a_sf: &Tensor, sfa_off: &[i64],
@@ -7754,9 +9466,9 @@ pub fn w8a8_packw(
 
 
 /// Quantize an f16 tensor to e4m3 with a dynamic per-tensor scale.
-/// Returns `(q, sc)` — e4m3 bytes `[n]` + a 2-f32 scale buffer
+/// Returns `(q, sc)`, e4m3 bytes `[n]` + a 2-f32 scale buffer
 /// `[dequant_scale, quant_scale]` (the GEMM consumes word 0).
-pub fn fp8_quant(dev: &dyn Device, x: &Tensor, n: usize) -> Result<(Tensor, Tensor)> {
+pub fn fp8_quant(dev: &dyn Device, x: &Tensor, n: usize, clip: f32) -> Result<(Tensor, Tensor)> {
     let i = |v: i32| v.to_le_bytes().to_vec();
     let l = |v: i64| v.to_le_bytes().to_vec();
     let amax = Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
@@ -7769,7 +9481,7 @@ pub fn fp8_quant(dev: &dyn Device, x: &Tensor, n: usize) -> Result<(Tensor, Tens
     dev.dispatch_raw_cuda(
         MOE_FP4_SRC, "moe_fp4.cu", "fp8_scale",
         &[(amax.buffer.as_ref(), 0), (sc.buffer.as_ref(), 0)],
-        &[], [1, 1, 1], [1, 1, 1], 0, false)?;
+        &[clip.to_le_bytes().to_vec()], [1, 1, 1], [1, 1, 1], 0, false)?;
     let q = Tensor::new(dev.alloc(n)?, vec![n], DType::U32);
     dev.dispatch_raw_cuda(
         MOE_FP4_SRC, "moe_fp4.cu", "fp8_quant",
@@ -7777,6 +9489,87 @@ pub fn fp8_quant(dev: &dyn Device, x: &Tensor, n: usize) -> Result<(Tensor, Tens
         &[l(n as i64)],
         [(n as u32).div_ceil(256 * 4).max(1), 1, 1], [256, 1, 1], 0, false)?;
     Ok((q, sc))
+}
+
+/// Fused block-Hadamard(128) along K + global amax. Returns `(rotated [rows,k]
+/// f16, amax [1] u32 bits)` for a subsequent fp8 quant that skips its own amax.
+pub fn fwht128_amax(dev: &dyn Device, x: &Tensor, rows: usize, k: usize) -> Result<(Tensor, Tensor)> {
+    if k % 128 != 0 { return Err(Error::Msg(format!("fwht128_amax: k {k} %128 != 0"))); }
+    let y = Tensor::new(dev.alloc(rows * k * 2)?, vec![rows * k], DType::F16);
+    let amax = Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
+    let nb = (rows * (k / 128)) as u32;
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let l = |v: i64| v.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fwht128_amax",
+        &[(x.buffer.as_ref(), x.offset), (y.buffer.as_ref(), 0), (amax.buffer.as_ref(), 0)],
+        &[l(rows as i64), i(k as i32)],
+        [nb, 1, 1], [128, 1, 1], 0, false)?;
+    Ok((y.reshaped(vec![rows, k]), amax))
+}
+
+/// Per-tensor fp8 quant using a PRECOMPUTED amax (from `fwht128_amax`), with
+/// optional clip. Returns `(q bytes, sc [2] f32)`. Skips the amax pass.
+pub fn fp8_quant_pre(dev: &dyn Device, x: &Tensor, n: usize, amax: &Tensor, clip: f32) -> Result<(Tensor, Tensor)> {
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let l = |v: i64| v.to_le_bytes().to_vec();
+    let sc = Tensor::new(dev.alloc(8)?, vec![2], DType::F32);
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fp8_scale",
+        &[(amax.buffer.as_ref(), 0), (sc.buffer.as_ref(), 0)],
+        &[clip.to_le_bytes().to_vec()], [1, 1, 1], [1, 1, 1], 0, false)?;
+    let q = Tensor::new(dev.alloc(n)?, vec![n], DType::U32);
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fp8_quant",
+        &[(x.buffer.as_ref(), x.offset), (q.buffer.as_ref(), 0), (sc.buffer.as_ref(), 0)],
+        &[l(n as i64)],
+        [(n as u32).div_ceil(256 * 4).max(1), 1, 1], [256, 1, 1], 0, false)?;
+    Ok((q, sc))
+}
+
+/// Fused-path pass 1: block-Hadamard(128) along K + global amax, NO rotated
+/// output (saves the [rows,k] f16 write+read vs `fwht128_amax`). Returns amax bits.
+pub fn fwht128_amaxonly(dev: &dyn Device, x: &Tensor, rows: usize, k: usize) -> Result<Tensor> {
+    if k % 128 != 0 { return Err(Error::Msg(format!("fwht128_amaxonly: k {k} %128 != 0"))); }
+    let amax = Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
+    let nb = (rows * (k / 128)) as u32;
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fwht128_amaxonly",
+        &[(x.buffer.as_ref(), x.offset), (amax.buffer.as_ref(), 0)],
+        &[(rows as i64).to_le_bytes().to_vec(), (k as i32).to_le_bytes().to_vec()],
+        [nb, 1, 1], [128, 1, 1], 0, false)?;
+    Ok(amax)
+}
+
+/// Fused-path pass 2: re-rotate `x` (Hadamard 128 along K) AND quant to e4m3 in
+/// one kernel reading `x` directly (no rotated-tensor round-trip), using a
+/// precomputed amax. Returns `(q bytes, sc [2] f32)`.
+pub fn fwht128_quant_pre(dev: &dyn Device, x: &Tensor, rows: usize, k: usize, amax: &Tensor, clip: f32) -> Result<(Tensor, Tensor)> {
+    if k % 128 != 0 { return Err(Error::Msg(format!("fwht128_quant_pre: k {k} %128 != 0"))); }
+    let sc = Tensor::new(dev.alloc(8)?, vec![2], DType::F32);
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fp8_scale",
+        &[(amax.buffer.as_ref(), 0), (sc.buffer.as_ref(), 0)],
+        &[clip.to_le_bytes().to_vec()], [1, 1, 1], [1, 1, 1], 0, false)?;
+    let n = rows * k;
+    let q = Tensor::new(dev.alloc(n)?, vec![n], DType::U32);
+    let nb = (rows * (k / 128)) as u32;
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fwht128_quant",
+        &[(x.buffer.as_ref(), x.offset), (q.buffer.as_ref(), 0), (sc.buffer.as_ref(), 0)],
+        &[(rows as i64).to_le_bytes().to_vec(), (k as i32).to_le_bytes().to_vec()],
+        [nb, 1, 1], [128, 1, 1], 0, false)?;
+    Ok((q, sc))
+}
+
+/// Block Walsh-Hadamard transform (128) along K of an f16 `[rows, k]` tensor.
+/// k must be a multiple of 128. Orthonormal; used to spread activation outliers
+/// before a per-tensor fp8 quant (and applied identically to the weight offline).
+pub fn fwht128(dev: &dyn Device, x: &Tensor, rows: usize, k: usize) -> Result<Tensor> {
+    if k % 128 != 0 { return Err(Error::Msg(format!("fwht128: k {k} %128 != 0"))); }
+    let y = Tensor::new(dev.alloc(rows * k * 2)?, vec![rows * k], DType::F16);
+    let nb = (rows * (k / 128)) as u32;
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let l = |v: i64| v.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(MOE_FP4_SRC, "moe_fp4.cu", "fwht128",
+        &[(x.buffer.as_ref(), x.offset), (y.buffer.as_ref(), 0)],
+        &[l(rows as i64), i(k as i32)],
+        [nb, 1, 1], [128, 1, 1], 0, false)?;
+    Ok(y.reshaped(vec![rows, k]))
 }
 
 /// FP8 e4m3 dense GEMM with per-tensor scales (vendor-recipe precision for
@@ -7797,7 +9590,7 @@ pub fn gemm_fp8(
 }
 
 /// Per-row e4m3 quant of an f16/f32 `[r,k]` tensor → `(q [r*k] bytes, scale [r] f32)`.
-/// Per-channel (weights, rows=n) / per-token (acts, rows=m) — the quality-
+/// Per-channel (weights, rows=n) / per-token (acts, rows=m), the quality-
 /// preserving FP8 granularity (per-tensor crushed cosine to ~0.94).
 pub fn fp8_quant_perrow(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Result<(Tensor, Tensor)> {
     let i = |v: i32| v.to_le_bytes().to_vec();
@@ -7811,7 +9604,7 @@ pub fn fp8_quant_perrow(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Res
 }
 
 /// FP8 e4m3 GEMM with PER-CHANNEL weight + PER-TOKEN act scales, folded as a
-/// post-pass (`D[r,c] *= xsc[r]·wsc[c]`) — sidesteps cuBLASLt's unsupported
+/// post-pass (`D[r,c] *= xsc[r]·wsc[c]`), sidesteps cuBLASLt's unsupported
 /// OUTER_VEC FP8 path. `x_q`/`x_sc` per-token (rows=m), `w_q`/`w_sc`
 /// per-channel (rows=n). Quality-preserving (cosine >0.98 typical). out[m,n] f32.
 #[allow(clippy::too_many_arguments)]
@@ -7822,7 +9615,7 @@ pub fn gemm_fp8_perchan(
     m: usize, n: usize, k: usize,
 ) -> Result<Tensor> {
     let out = Tensor::empty(dev, vec![m, n], DType::F32)?;
-    // identity per-tensor scale (1.0) — the real per-channel/per-token scales
+    // identity per-tensor scale (1.0), the real per-channel/per-token scales
     // are folded in the post-pass below. D_raw = Wq·Xq in f32.
     let one = scalar_buf(dev, (1.0f32).to_bits())?;
     dev.gemm_fp8(
@@ -7924,7 +9717,7 @@ pub fn lt_fp4_quant_g(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Resul
 
 /// No-global FP4 quant: per-16 ue4m3 block scales absorb the FULL magnitude
 /// (global gs=[1,1]), so the dequant stays ~true-scale and the f16-output GEMM
-/// (out_f32=false) does NOT overflow — fast f16 path AND correct (vs the
+/// (out_f32=false) does NOT overflow, fast f16 path AND correct (vs the
 /// two-level global variant whose globally-normalized raw blows past f16 max).
 pub fn lt_fp4_quant_g_ng(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Result<(Tensor, Tensor, Tensor)> {
     if k % 32 != 0 { return Err(Error::Msg(format!("lt_fp4_quant_g_ng: k {k} %32!=0"))); }
@@ -7955,7 +9748,7 @@ pub fn fp4_dscale(dev: &dyn Device, ga: &Tensor, gw: &Tensor) -> Result<Tensor> 
 
 /// Quantize+fragment-pack MoE expert weights to NVFP4 on device.
 /// `w_f16`: f16 `[n_exp*n, k]` row-major (concatenated experts). Returns
-/// `(wp, wsc, gw)` — fragment codes, scale words, per-expert globals (device).
+/// `(wp, wsc, gw)`, fragment codes, scale words, per-expert globals (device).
 pub fn moe_fp4_pack_weights(
     dev: &dyn Device, w_f16: &Tensor, n_exp: usize, n: usize, k: usize,
 ) -> Result<(Tensor, Tensor, Tensor)> {
@@ -7993,7 +9786,7 @@ pub fn moe_fp4_pack_weights(
 /// Fully-on-device NVFP4 grouped MoE GEMM (W4A4): quantizes the f16 sorted
 /// activations `a [mt,k]` to NVFP4 (dynamic per-call global), packs fragments,
 /// and runs the Blackwell block-scaled mma over BM=16 tile descriptors built
-/// from `offsets` (device `[n_exp+1]`). Fixed launch — graph-safe, no host
+/// from `offsets` (device `[n_exp+1]`). Fixed launch, graph-safe, no host
 /// syncs. Returns `out [mt, n]` f16.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
@@ -8054,7 +9847,7 @@ pub fn moe_fp4_grouped_mma_dev(
           i(if gather_idx.is_some() { 1 } else { 0 })],
         [(warps * 32).div_ceil(256), 1, 1], [256, 1, 1], 0, false)?;
     // grouped mma: grid [maxt, NT/8] × 8 warps/block
-    // x4 variant: 4 n8-tiles per warp (A frags register-reused) — +49% on
+    // x4 variant: 4 n8-tiles per warp (A frags register-reused), +49% on
     // GB10 vs 1 nt/warp (L2-poorer than desktop Blackwell, where x1 wins).
     let warps_per_block = 8u32;
     let ng = ntl.div_ceil(4) as u32;
@@ -8075,7 +9868,7 @@ pub fn moe_fp4_grouped_mma_dev(
 }
 
 /// Fused residual-add + RMS norm: `residual_out = a + b`, `normed_out =
-/// rms_norm(a + b, w)` — one pass instead of an `add` kernel plus a
+/// rms_norm(a + b, w)`, one pass instead of an `add` kernel plus a
 /// `rms_norm` kernel re-reading the sum (the per-layer residual hot path).
 pub fn add_rms_norm(
     dev: &dyn Device, a: &Tensor, b: &Tensor, weight: &Tensor, eps: f32,
@@ -8110,4 +9903,40 @@ pub fn add_rms_norm(
         grid,
     )?;
     Ok((residual, normed))
+}
+
+#[cfg(test)]
+mod marlin_prep_validate {
+    use super::*;
+    use std::fs;
+    fn rf32(p:&str)->Vec<f32>{let b=fs::read(p).unwrap(); b.chunks(4).map(|c|f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect()}
+    #[test]
+    fn marlin_weight_prep_matches_python(){
+        // Reference fixtures come from env, never a hardcoded path; unset -> quiet skip.
+        let Ok(dir)=std::env::var("BUTTER_MARLIN_FIXTURE_DIR") else {
+            println!("[skipped] BUTTER_MARLIN_FIXTURE_DIR unset");
+            return;
+        };
+        let (n,k)=(1856usize,2688usize); let ng=k/16; let kp=k/8;
+        let w0=rf32(&format!("{dir}/W0.bin")); assert_eq!(w0.len(), n*k);
+        let (codes,uesc,global)=quantize_nvfp4(&w0,n,k);
+        // codes[N,kp] -> transpose [kp,N]
+        let mut qw=vec![0u32; kp*n];
+        for r in 0..n { for c in 0..kp { qw[c*n+r]=codes[r*kp+c]; } }
+        let qref=fs::read(format!("{dir}/qweight.bin")).unwrap();
+        let qref0:Vec<u32>=qref[..kp*n*4].chunks(4).map(|c|u32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+        let qm=qw.iter().zip(&qref0).filter(|(a,b)|a==b).count();
+        // scales: dec_ue4m3[N,ng] -> values, transpose [ng,N], s0e5m3
+        let mut sv=vec![0f32; ng*n];
+        for r in 0..n { for g in 0..ng { sv[g*n+r]=dec_ue4m3(uesc[r*ng+g]); } }
+        let s0=marlin_s0e5m3_scales(&sv,ng,n);
+        let bref=fs::read(format!("{dir}/bscales.bin")).unwrap();
+        let bm=s0.iter().zip(&bref[..ng*n]).filter(|(a,b)|a==b).count();
+        let gref=rf32(&format!("{dir}/global.bin"));
+        let grust=global*128.0;
+        eprintln!("QW match {}/{}  BSCALE match {}/{}  global rust {} py {} (ratio {})", qm, kp*n, bm, ng*n, grust, gref[0], grust/gref[0]);
+        assert!(qm==kp*n, "qweight mismatch");
+        assert!(bm>=(ng*n*999/1000), "bscale mismatch");
+        assert!((grust/gref[0]-1.0).abs()<0.02, "global mismatch");
+    }
 }
