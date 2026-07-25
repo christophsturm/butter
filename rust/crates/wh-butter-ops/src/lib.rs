@@ -2790,10 +2790,42 @@ extern "C" __global__ void moe_build_tiles(
     int* order = smem + n_exp; // [n_exp]
     if (desc) {
         for (int e = 0; e < n_exp; e++) { cnt[e] = (int)(offsets[e+1] - offsets[e]); order[e] = e; }
-        for (int i2 = 0; i2 < n_exp; i2++) {
-            int best = i2;
-            for (int j = i2 + 1; j < n_exp; j++) if (cnt[order[j]] > cnt[order[best]]) best = j;
-            if (best != i2) { int tmp = order[i2]; order[i2] = order[best]; order[best] = tmp; }
+        // round7: O(n log n) heapsort replacing the prior O(n^2) selection sort
+        // (moe_build_tiles measured ~1.34ms/call via ncu at n_exp=256, single
+        // thread -- the O(n^2)=65536-compare sort was the dominant cost).
+        // Correctness is insensitive to exact tie-break order here: any
+        // permutation of `order[]` yields identical GEMM output since tiles
+        // write disjoint output regions regardless of emission order (see
+        // moe_q4_grouped_laguna_sched_ab, which A/B-tests exactly this
+        // desc-mode path against the default order on skewed/zero-count
+        // groups and requires bit-exact agreement). Build a max-heap over
+        // order[] keyed by cnt[order[i]], then extract-max repeatedly
+        // (ascending), then reverse in place for descending final order.
+        for (int start = n_exp / 2 - 1; start >= 0; start--) {
+            int root = start;
+            while (true) {
+                int child = 2 * root + 1;
+                if (child >= n_exp) break;
+                if (child + 1 < n_exp && cnt[order[child + 1]] > cnt[order[child]]) child++;
+                if (cnt[order[root]] >= cnt[order[child]]) break;
+                int tmp = order[root]; order[root] = order[child]; order[child] = tmp;
+                root = child;
+            }
+        }
+        for (int end = n_exp - 1; end > 0; end--) {
+            int tmp = order[0]; order[0] = order[end]; order[end] = tmp;
+            int root = 0;
+            while (true) {
+                int child = 2 * root + 1;
+                if (child >= end) break;
+                if (child + 1 < end && cnt[order[child + 1]] > cnt[order[child]]) child++;
+                if (cnt[order[root]] >= cnt[order[child]]) break;
+                tmp = order[root]; order[root] = order[child]; order[child] = tmp;
+                root = child;
+            }
+        }
+        for (int i = 0, j = n_exp - 1; i < j; i++, j--) {
+            int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
         }
     }
     int t = 0;
