@@ -4323,7 +4323,26 @@ pub fn sdpa_multi_tc_varlen(
     let neg: Vec<u8> = (0..nq*sq).flat_map(|_| (-3.4e38f32).to_le_bytes()).collect();
     let m_run = Tensor::new(dev.upload(&neg)?, vec![nq, sq], DType::F32);
 
-    let bk = 2048usize.min(n_kv);
+    // KV block size. Full-attention layers (win==0) keep 2048 (bounds the
+    // scores buffer, see sibling `sdpa_multi_tc`'s doc). Sliding-window
+    // layers (win!=0): the block-skip above only omits blocks with
+    // q_cnt==0 ENTIRELY -- a block that IS touched still pays a full
+    // bk-wide QK^T/PV GEMM + softmax/merge even though the window (512 for
+    // Laguna, far smaller than 2048) only needs a fraction of that width.
+    // Shrinking bk for win!=0 tightens the per-block reachable-range union
+    // (`[kb0, kb0+blk+win)`, see the q_lo/q_cnt derivation below) at the
+    // cost of more loop iterations (more kprep/QK/softmax/merge launches).
+    // BUTTER_LAGUNA_SDPA_WIN_BK overrides the windowed-path block size for
+    // A/B sweeps. Default 1024, NOT the 512 window width itself: measured
+    // bk=512 vs bk=1024 vs bk=2048(orig) on Laguna-S-2.1/GB10 (chunk=1024,
+    // MARLIN+MOEFUSE) -- bk=512 regresses n=1024 prefill -4% (extra
+    // loop/launch overhead from doubling block count outweighs the reduced
+    // overcompute there), while bk=1024 nets +1-1.5% at n=8192/32768 with
+    // no regression anywhere tested. Full-attention layers (win==0) are
+    // never affected by this env var.
+    let win_bk: usize = std::env::var("BUTTER_LAGUNA_SDPA_WIN_BK")
+        .ok().and_then(|v| v.parse().ok()).filter(|&b: &usize| b >= 1).unwrap_or(1024);
+    let bk = if win != 0 { win_bk.min(n_kv) } else { 2048usize.min(n_kv) };
     let scores = Tensor::empty(dev, vec![nq, sq, bk], DType::F16)?;
     let p_blk  = Tensor::empty(dev, vec![nq, sq, bk], DType::F16)?;
     let bm     = Tensor::empty(dev, vec![nq, sq], DType::F32)?;
