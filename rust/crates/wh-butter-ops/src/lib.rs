@@ -2626,7 +2626,7 @@ extern "C" __global__ void moe_q4_grouped_mma(
     __half* __restrict__ Out,
     int N, int K, int band_n)
 {
-    const int BM=64,BN=128,BK=32,NS=16,NKS=2,GS=32,WPR=BK/8,GPR=BK/GS; // BK32 occ-tune (smem 25->12.5KB)
+    const int BM=64,BN=128,BK=32,NS=16,NKS=2,GS=32,WPR=BK/8,GPR=BK/GS,STAGES=3; // BK32 occ-tune (smem 25->12.5KB); STAGES=3 cp.async pipeline depth (deeper latency-hiding, occupancy-neutral -- see moe_q4_grouped_mma's doc)
     // band_n=0 (default): grid=[tile,nblk] with tile fast-varying -> a full
     // tile sweep (crossing experts) happens before the N-block advances.
     // band_n=1 (BUTTER_LAGUNA_SCHED=1): grid=[nblk,tile] with nblk fast-varying ->
@@ -2638,9 +2638,9 @@ extern "C" __global__ void moe_q4_grouped_mma(
     int by = band_n ? blockIdx.x : blockIdx.y;
     int tok0=tok0_arr[bx], gend=gend_arr[bx], eid=eid_arr[bx], n0=by*BN;
     int tid=threadIdx.x,warp=tid>>5,lane=tid&31,gid=lane>>2,tid4=lane&3,wrow=warp*16;
-    __shared__ __half   As[2][BM][BK];
-    __shared__ unsigned Wqs[2][BN][WPR];
-    __shared__ __half   Scs[2][BN][GPR];
+    __shared__ __half   As[3][BM][BK];
+    __shared__ unsigned Wqs[3][BN][WPR];
+    __shared__ __half   Scs[3][BN][GPR];
     float oc[NS][4]; for(int s=0;s<NS;s++){oc[s][0]=oc[s][1]=oc[s][2]=oc[s][3]=0.f;}
     int nchunk=K/BK, WPB=K/32;
     long ebase=(long)eid*N;
@@ -2654,12 +2654,25 @@ extern "C" __global__ void moe_q4_grouped_mma(
     for(int e=tid;e<BN*GPR;e+=128){ int r=e/GPR,g=e%GPR; long sr=ebase+((n0+r<N)?(n0+r):0); \
         Scs[BUF][r][g]=Sc[sr*WPB + kc/32 + g]; } \
     }while(0)
-    LOADC(0,0); asm volatile("cp.async.commit_group;\n"); __syncthreads();
+    // STAGES-deep cp.async software pipeline (was 2). Prologue prefetches
+    // STAGES-1 chunks ahead; each loop iter issues chunk c+STAGES-1's prefetch
+    // then waits until at most STAGES-2 groups remain pending (guaranteeing
+    // chunk c's group, the oldest, is complete) -- generalizes the prior
+    // depth-2 pattern (prologue 1 prefetch, wait_group 1 mid-loop / 0 at tail).
+    for(int i=0;i<STAGES-1 && i<nchunk;i++){ LOADC(i,i); asm volatile("cp.async.commit_group;\n"); }
+    __syncthreads();
     for(int c=0;c<nchunk;c++){
-        if(c+1<nchunk){ LOADC(c+1,(c+1)&1); asm volatile("cp.async.commit_group;\n"); asm volatile("cp.async.wait_group 1;\n"); }
-        else { asm volatile("cp.async.wait_group 0;\n"); }
+        int pf=c+STAGES-1;
+        if(pf<nchunk){
+            LOADC(pf, pf%STAGES); asm volatile("cp.async.commit_group;\n");
+            asm volatile("cp.async.wait_group 2;\n");
+        } else if(c+1<nchunk){
+            asm volatile("cp.async.wait_group 1;\n");
+        } else {
+            asm volatile("cp.async.wait_group 0;\n");
+        }
         __syncthreads();
-        int buf=c&1;
+        int buf=c%STAGES;
         for(int ks=0;ks<NKS;ks++){ int ko=ks*16; int c0=ko+2*tid4;
             int arow = (lane & 7) + ((lane >> 3) & 1) * 8;
             int acol = (lane >> 4) * 8;
