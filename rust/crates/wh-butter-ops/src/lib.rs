@@ -2893,17 +2893,17 @@ const SDPA_TC_KPREP_SRC: &str = r#"
 #include <cuda_fp16.h>
 extern "C" __global__ void sdpa_tc_kprep(
     const void* __restrict__ k_in,   // [nkv, kv_stride, hd]
-    __half*     __restrict__ k_out,  // [nkv, n_kv, hd] f16
-    int nkv, int kv_stride, int n_kv, int hd, int in_f32)
+    __half*     __restrict__ k_out,  // [nkv, blk, hd] f16, THIS BLOCK ONLY
+    int nkv, int kv_stride, int kb0, int blk, int hd, int in_f32)
 {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    long total = (long)nkv * n_kv * hd;
+    long total = (long)nkv * blk * hd;
     if (i >= total) return;
     int d  = (int)(i % hd);
     long t = i / hd;
-    int p  = (int)(t % n_kv);        // kv position
-    int kh = (int)(t / n_kv);        // kv head
-    long si = ((long)kh * kv_stride + p) * hd + d;
+    int p  = (int)(t % blk);         // position within this block
+    int kh = (int)(t / blk);         // kv head
+    long si = ((long)kh * kv_stride + (kb0 + p)) * hd + d;
     float val = in_f32 ? ((const float*)k_in)[si]
                        : __half2float(((const __half*)k_in)[si]);
     k_out[i] = __float2half(val);
@@ -4148,7 +4148,6 @@ pub fn sdpa_multi_tc(
 
     // ── prep buffers (all f16) ──────────────────────────────────────────────
     let qh = Tensor::empty(dev, vec![nq, sq, hd], DType::F16)?;          // [nq,Sq,hd] scaled
-    let kh = Tensor::empty(dev, vec![nkv, n_kv, hd], DType::F16)?;       // [nkv,n_kv,hd]
 
     let i = |x: i32| x.to_le_bytes().to_vec();
     let f = |x: f32| x.to_le_bytes().to_vec();
@@ -4158,10 +4157,6 @@ pub fn sdpa_multi_tc(
         &[(q.buffer.as_ref(), q.offset), (qh.buffer.as_ref(), 0)],
         &[i(sq as i32), i(nq as i32), i(hd as i32), f(scale), i(in_f32)],
         blk256(nq*sq*hd), [256,1,1], 0, false)?;
-    dev.dispatch_raw_cuda(SDPA_TC_KPREP_SRC, "sdpa_tc_kprep.cu", "sdpa_tc_kprep",
-        &[(k.buffer.as_ref(), k.offset), (kh.buffer.as_ref(), 0)],
-        &[i(nkv as i32), i(kv_stride as i32), i(n_kv as i32), i(hd as i32), i(in_f32)],
-        blk256(nkv*n_kv*hd), [256,1,1], 0, false)?;
 
     // ── running FlashAttention state (init via upload: o=0, l=0, m=-inf) ─────
     let o_run = Tensor::new(dev.alloc_zeroed(nq*sq*hd*4)?, vec![nq, sq, hd], DType::F32);
@@ -4178,17 +4173,26 @@ pub fn sdpa_multi_tc(
     let bl     = Tensor::empty(dev, vec![nq, sq], DType::F32)?;
     let o_blk  = Tensor::empty(dev, vec![nq, sq, hd], DType::F16)?;
     let vt     = Tensor::empty(dev, vec![nkv, hd, bk], DType::F16)?;     // per-block V^T
+    let kh     = Tensor::empty(dev, vec![nkv, bk, hd], DType::F16)?;     // per-block K, f16 (was whole-prefix)
 
     let el = 2i64; // f16 bytes
     let mut kb0 = 0usize;
     while kb0 < n_kv {
         let blk = bk.min(n_kv - kb0);
 
+        // ── K prep: cast+copy THIS KV block only → kh[nkv,blk,hd] ───────────
+        // (was one whole-causal-prefix conversion before the loop; see the
+        // PERF FIX note in `sdpa_multi_tc_varlen` below for the rationale.)
+        dev.dispatch_raw_cuda(SDPA_TC_KPREP_SRC, "sdpa_tc_kprep.cu", "sdpa_tc_kprep",
+            &[(k.buffer.as_ref(), k.offset), (kh.buffer.as_ref(), 0)],
+            &[i(nkv as i32), i(kv_stride as i32), i(kb0 as i32), i(blk as i32), i(hd as i32), i(in_f32)],
+            blk256(nkv*blk*hd), [256,1,1], 0, false)?;
+
         // ── QKᵀ: per KV group (16 q-heads share one KV head) ────────────────
         // C[Sq, blk] = Qh[Sq,hd] · Kh_blk[blk,hd]ᵀ ; batch over the hpg q-heads.
         for g in 0..nkv {
             let q_off = g * hpg * sq * hd * 2;             // bytes into qh
-            let k_off = (g * n_kv + kb0) * hd * 2;         // bytes into kh (this block)
+            let k_off = g * blk * hd * 2;                  // bytes into kh (buffer-relative now)
             let s_off = g * hpg * sq * blk * 2;            // bytes into scores
             dev.gemm_strided_batched_off(
                 qh.buffer.as_ref(),     q_off, (sq*hd) as i64 * el,   // X stride = one q-head
@@ -4304,7 +4308,6 @@ pub fn sdpa_multi_tc_varlen(
         other => return Err(Error::Msg(format!("sdpa_multi_tc_varlen: unsupported dtype {other:?}"))) };
 
     let qh = Tensor::empty(dev, vec![nq, sq, hd], DType::F16)?;
-    let kh = Tensor::empty(dev, vec![nkv, n_kv, hd], DType::F16)?;
 
     let i = |x: i32| x.to_le_bytes().to_vec();
     let f = |x: f32| x.to_le_bytes().to_vec();
@@ -4314,10 +4317,6 @@ pub fn sdpa_multi_tc_varlen(
         &[(q.buffer.as_ref(), q.offset), (qh.buffer.as_ref(), 0)],
         &[i(sq as i32), i(nq as i32), i(hd as i32), f(scale), i(in_f32)],
         blk256(nq*sq*hd), [256,1,1], 0, false)?;
-    dev.dispatch_raw_cuda(SDPA_TC_KPREP_SRC, "sdpa_tc_kprep.cu", "sdpa_tc_kprep",
-        &[(k.buffer.as_ref(), k.offset), (kh.buffer.as_ref(), 0)],
-        &[i(nkv as i32), i(kv_stride as i32), i(n_kv as i32), i(hd as i32), i(in_f32)],
-        blk256(nkv*n_kv*hd), [256,1,1], 0, false)?;
 
     let o_run = Tensor::new(dev.alloc_zeroed(nq*sq*hd*4)?, vec![nq, sq, hd], DType::F32);
     let l_run = Tensor::new(dev.alloc_zeroed(nq*sq*4)?, vec![nq, sq], DType::F32);
@@ -4331,6 +4330,26 @@ pub fn sdpa_multi_tc_varlen(
     let bl     = Tensor::empty(dev, vec![nq, sq], DType::F32)?;
     let o_blk  = Tensor::empty(dev, vec![nq, sq, hd], DType::F16)?;
     let vt     = Tensor::empty(dev, vec![nkv, hd, bk], DType::F16)?;
+    // PERF FIX (was `[nkv, n_kv, hd]`, one whole-causal-prefix f32->f16
+    // conversion upfront every call): for sliding-window layers (`win != 0`)
+    // the vast majority of KV blocks have `q_cnt == 0` below (no row in this
+    // chunk can reach them) -- the QKᵀ/PV GEMMs were already correctly
+    // skipped for those blocks, but `kh` was still sized (and fully
+    // converted) to the ENTIRE causal prefix on every prefill chunk, and the
+    // softmax/merge dispatches ran unconditionally per block regardless of
+    // `q_cnt`. For a windowed layer deep into a long prefill (`base` large)
+    // that is an O(base) cost paid by EVERY chunk on every windowed layer
+    // (Laguna: 36 of 48 layers are sliding-window) -- the root cause of this
+    // engine's prefill throughput decaying with sequence length instead of
+    // staying roughly flat. Fix: convert K per-block into a `bk`-sized
+    // rolling buffer (mirroring `vt`/`SDPA_TC_VPREP_SRC`, which already
+    // worked this way), and gate kprep+softmax+merge on the same `q_cnt>0`
+    // check as the GEMMs -- a block no row can reach contributes nothing
+    // either way (softmax would derive `bm=-inf`/`bl=0` for every row via
+    // its own positional mask; `merge`'s `l_b <= 0` early-return already
+    // no-ops on that combination), so skipping all four dispatches together
+    // is bit-identical to running them, just without the wasted work.
+    let kh     = Tensor::empty(dev, vec![nkv, bk, hd], DType::F16)?;
 
     let el = 2i64;
     let mut kb0 = 0usize;
@@ -4372,15 +4391,18 @@ pub fn sdpa_multi_tc_varlen(
         };
         // q_cnt == 0: no row in this chunk can reach this block at all (the
         // derivation above is a superset of the true reachable set, so an
-        // empty computed range proves the true set is also empty). Skip the
-        // QKᵀ/PV GEMMs and vprep entirely; softmax/merge stay unconditional
-        // below (softmax re-derives bm/bl fresh every iteration straight
-        // from the mask, and merge's `l_b <= 0` early-return means it never
-        // reads the skipped o_blk/vt buffers, so this is correctness-safe).
+        // empty computed range proves the true set is also empty). Skip
+        // kprep, the QKᵀ/PV GEMMs, vprep, softmax AND merge entirely (all
+        // four moved inside this same guard -- see the PERF FIX note above
+        // `kh`'s allocation for why this is bit-identical, not just faster).
         if q_cnt > 0 {
+            dev.dispatch_raw_cuda(SDPA_TC_KPREP_SRC, "sdpa_tc_kprep.cu", "sdpa_tc_kprep",
+                &[(k.buffer.as_ref(), k.offset), (kh.buffer.as_ref(), 0)],
+                &[i(nkv as i32), i(kv_stride as i32), i(kb0 as i32), i(blk as i32), i(hd as i32), i(in_f32)],
+                blk256(nkv*blk*hd), [256,1,1], 0, false)?;
             for g in 0..nkv {
                 let q_off = g * hpg * sq * hd * 2 + q_lo * hd * 2;
-                let k_off = (g * n_kv + kb0) * hd * 2;
+                let k_off = g * blk * hd * 2;
                 let s_off = g * hpg * sq * blk * 2 + q_lo * blk * 2;
                 dev.gemm_strided_batched_off(
                     qh.buffer.as_ref(),     q_off, (sq*hd) as i64 * el,
@@ -4388,15 +4410,13 @@ pub fn sdpa_multi_tc_varlen(
                     scores.buffer.as_ref(), s_off, (sq*blk) as i64 * el,
                     q_cnt, blk, hd, hpg, DType::F16)?;
             }
-        }
-        // varlen softmax: causal upper (base+r) AND segment lower (seg_lo[r]).
-        dev.dispatch_raw_cuda(SDPA_TC_SOFTMAX_VARLEN_SRC, "sdpa_tc_softmax_varlen.cu", "sdpa_tc_softmax_varlen",
-            &[(scores.buffer.as_ref(), 0), (p_blk.buffer.as_ref(), 0),
-              (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0),
-              (seg_lo.buffer.as_ref(), seg_lo.offset)],
-            &[i(nq as i32), i(sq as i32), i(blk as i32), i(kb0 as i32), i(base as i32)],
-            [(nq*sq) as u32, 1, 1], [256,1,1], 0, false)?;
-        if q_cnt > 0 {
+            // varlen softmax: causal upper (base+r) AND segment lower (seg_lo[r]).
+            dev.dispatch_raw_cuda(SDPA_TC_SOFTMAX_VARLEN_SRC, "sdpa_tc_softmax_varlen.cu", "sdpa_tc_softmax_varlen",
+                &[(scores.buffer.as_ref(), 0), (p_blk.buffer.as_ref(), 0),
+                  (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0),
+                  (seg_lo.buffer.as_ref(), seg_lo.offset)],
+                &[i(nq as i32), i(sq as i32), i(blk as i32), i(kb0 as i32), i(base as i32)],
+                [(nq*sq) as u32, 1, 1], [256,1,1], 0, false)?;
             dev.dispatch_raw_cuda(SDPA_TC_VPREP_SRC, "sdpa_tc_vprep.cu", "sdpa_tc_vprep",
                 &[(v.buffer.as_ref(), v.offset), (vt.buffer.as_ref(), 0)],
                 &[i(nkv as i32), i(kv_stride as i32), i(hd as i32), i(kb0 as i32), i(blk as i32), i(in_f32)],
@@ -4411,12 +4431,12 @@ pub fn sdpa_multi_tc_varlen(
                     o_blk.buffer.as_ref(), o_off, (sq*hd) as i64 * el,
                     q_cnt, hd, blk, hpg, DType::F16)?;
             }
+            dev.dispatch_raw_cuda(SDPA_TC_MERGE_SRC, "sdpa_tc_merge.cu", "sdpa_tc_merge",
+                &[(o_blk.buffer.as_ref(), 0), (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0),
+                  (o_run.buffer.as_ref(), 0), (m_run.buffer.as_ref(), 0), (l_run.buffer.as_ref(), 0)],
+                &[i(nq as i32), i(sq as i32), i(hd as i32)],
+                [(nq*sq) as u32, 1, 1], [128,1,1], 0, false)?;
         }
-        dev.dispatch_raw_cuda(SDPA_TC_MERGE_SRC, "sdpa_tc_merge.cu", "sdpa_tc_merge",
-            &[(o_blk.buffer.as_ref(), 0), (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0),
-              (o_run.buffer.as_ref(), 0), (m_run.buffer.as_ref(), 0), (l_run.buffer.as_ref(), 0)],
-            &[i(nq as i32), i(sq as i32), i(hd as i32)],
-            [(nq*sq) as u32, 1, 1], [128,1,1], 0, false)?;
         kb0 += blk;
     }
     let out = Tensor::empty(dev, vec![sq, nq, hd], q.dtype)?;
