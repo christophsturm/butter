@@ -2615,8 +2615,33 @@ fn prefill_layer(
     Ok(x2)
 }
 
+/// Size-adaptive default chunk policy for [`prefill`] (used when the
+/// caller passes `chunk == 0`). Empirically measured on GB10/sm_121
+/// (laguna prefill campaign, round 4): a single monolithic chunk
+/// (`chunk == total`) is fastest for `total <= 2048` -- at those sizes
+/// `chunk.min(total)` already collapses to one chunk regardless, so this
+/// is really just "don't force a smaller chunk than necessary" -- but
+/// becomes UNSTABLE and often much SLOWER once `total` exceeds ~2048: the
+/// batched per-layer activation tensors (`[T, hidden]` and friends) stop
+/// fitting comfortably in cache/working-set at very large `T`, and this
+/// hardware's boost clock/allocator behavior under one huge sustained
+/// kernel sequence was measured to regress hard and unpredictably
+/// (single monolithic n=8192 chunk measured between 191 and 364 tok/s
+/// across repeated cold-start runs, vs a stable ~460-540 tok/s with a
+/// fixed 2048 chunk at the same `n`). A fixed 2048-token chunk was
+/// measured (isolated per-size runs, cold GPU each time) to beat BOTH
+/// monolithic AND the previously-standard chunk=1024 at every size from
+/// 2048 through 32768 (+1-15%, largest gains at the sizes where
+/// monolithic was worst). `min(total, 2048)` therefore covers both
+/// regimes with one formula: it IS monolithic chunking for `total <=
+/// 2048` and a fixed 2048 chunk above that.
+pub fn default_prefill_chunk(total: usize) -> usize {
+    total.min(2048).max(1)
+}
+
 /// Batched (multi-token) **prefill**: process the whole `tokens` prompt
-/// `chunk` tokens at a time (default recommendation: 1024), writing every
+/// `chunk` tokens at a time (pass 0 for the adaptive default, see
+/// [`default_prefill_chunk`]), writing every
 /// token's K/V into `kv`/`scratch`, and return the LAST token's next-token
 /// logits, the prefill counterpart of [`decode_step`]'s per-token forward.
 /// Each chunk's `T` rows run through every layer as batched GEMMs
@@ -2637,7 +2662,11 @@ fn prefill_layer(
 ///
 /// `chunk` only bounds how many prompt tokens are embedded/projected/attended
 /// in one forward pass (memory for the batched intermediates scales with
-/// it); correctness is independent of the choice.
+/// it); correctness is independent of the choice. **`chunk == 0` is a
+/// sentinel for "auto"**: picks [`default_prefill_chunk`]'s adaptive policy
+/// instead of a caller-fixed size. Any nonzero value is used verbatim
+/// (existing explicit-override callers, e.g. `BUTTER_LAGUNA_PREFILL_CHUNK`,
+/// are unaffected).
 pub fn prefill(
     dev: &dyn Device,
     model: &LagunaModel,
@@ -2656,7 +2685,7 @@ pub fn prefill(
             "prefill: prompt len {total} exceeds scratch prompt_cap {}", scratch.prompt_cap
         )));
     }
-    let chunk = chunk.max(1);
+    let chunk = if chunk == 0 { default_prefill_chunk(total) } else { chunk.max(1) };
 
     // BUTTER_LAGUNA_MARLIN=1: ONE persistent all-zero `u32` indices buffer,
     // sized to `chunk` (every chunk's row count `t = chunk.min(total-start)`

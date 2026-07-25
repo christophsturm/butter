@@ -1358,13 +1358,15 @@ pub fn argmax_f32_device(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
 /// The SwiGLU MoE path calls this for the gate and up stacks, then applies
 /// the activation elementwise before the down gather. F16 per-block scales.
 ///
-/// TODO(rebrand-merge): blocked — dispatches `iron_moe_gather_q4` via
-/// `wh_iron_std`'s kernel IR, but the pinned `thewafflehaus/iron@dev` kernel
-/// library only ships `iron_moe_gather_q4_relu2/_down/_down_accum` — the
-/// plain (non-relu2) variant this needs is not present upstream yet. Kept as
-/// an always-error stub until that kernel lands in the iron repo.
-pub fn moe_gather_q4(_dev: &dyn Device, _qs: &Tensor, _scales: &Tensor, _x: &Tensor, _idx: &Tensor, _top_k: usize, _inter: usize, _hid: usize) -> Result<Tensor> {
-    Err(Error::Msg("moe_gather_q4: blocked — iron_moe_gather_q4 kernel not yet in thewafflehaus/iron@dev (only _relu2/_down/_down_accum variants exist)".into()))
+pub fn moe_gather_q4(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, idx: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<Tensor> {
+    let k = cached_ir("iron_moe_gather_q4", x.dtype, || { let mut k = wh_iron_std::kernels::moe::moe_gather_q4::iron_moe_gather_q4::kernel_ir_for(x.dtype); k.mode = wh_iron_core::ir::KernelMode::Reduction; k });
+    let out = Tensor::empty(dev, vec![top_k * inter], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    // Default rpt=2: MoE-gather kernels are big + latency-bound; 2 warps/row hides
+    // global-load latency (matches the _relu2/_down siblings' default).
+    let rpt: u32 = std::env::var("BUTTER_MOE_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(2);
+    dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(hid as u32), u(inter as u32), u(rpt)], Grid { grid: [(inter as u32).div_ceil(rpt), top_k as u32, 1], block: [32 * rpt, 1, 1] })?;
+    Ok(out)
 }
 
 /// Batched MoE GATE+UP gather with FUSED inline SwiGLU: reads the SAME
@@ -1374,11 +1376,13 @@ pub fn moe_gather_q4(_dev: &dyn Device, _qs: &Tensor, _scales: &Tensor, _x: &Ten
 /// up stack) plus a host-side elementwise SwiGLU pass with one dispatch.
 /// F16 per-block scales on both `gate_scales` and `up_scales`.
 #[allow(clippy::too_many_arguments)]
-/// TODO(rebrand-merge): blocked — same iron-kernel gap as `moe_gather_q4`
-/// above (`iron_moe_gather_q4_swiglu` not in `thewafflehaus/iron@dev` yet).
-#[allow(clippy::too_many_arguments)]
-pub fn moe_gather_q4_swiglu(_dev: &dyn Device, _gate_qs: &Tensor, _gate_scales: &Tensor, _up_qs: &Tensor, _up_scales: &Tensor, _x: &Tensor, _idx: &Tensor, _top_k: usize, _inter: usize, _hid: usize) -> Result<Tensor> {
-    Err(Error::Msg("moe_gather_q4_swiglu: blocked — iron_moe_gather_q4_swiglu kernel not yet in thewafflehaus/iron@dev".into()))
+pub fn moe_gather_q4_swiglu(dev: &dyn Device, gate_qs: &Tensor, gate_scales: &Tensor, up_qs: &Tensor, up_scales: &Tensor, x: &Tensor, idx: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<Tensor> {
+    let k = cached_ir("iron_moe_gather_q4_swiglu", x.dtype, || { let mut k = wh_iron_std::kernels::moe::moe_gather_q4::iron_moe_gather_q4_swiglu::kernel_ir_for(x.dtype); k.mode = wh_iron_core::ir::KernelMode::Reduction; k });
+    let out = Tensor::empty(dev, vec![top_k * inter], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let rpt: u32 = std::env::var("BUTTER_MOE_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(2);
+    dev.dispatch(&k, &[Binding::Buffer(gate_qs.buffer.clone()), Binding::Buffer(gate_scales.buffer.clone()), Binding::Buffer(up_qs.buffer.clone()), Binding::Buffer(up_scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(hid as u32), u(inter as u32), u(rpt)], Grid { grid: [(inter as u32).div_ceil(rpt), top_k as u32, 1], block: [32 * rpt, 1, 1] })?;
+    Ok(out)
 }
 
 /// Batched MoE down + router-weighted accumulate into `acc[hid]`. `qs` is the
@@ -2626,7 +2630,7 @@ extern "C" __global__ void moe_q4_grouped_mma(
     __half* __restrict__ Out,
     int N, int K, int band_n)
 {
-    const int BM=64,BN=128,BK=32,NS=16,NKS=2,GS=32,WPR=BK/8,GPR=BK/GS; // BK32 occ-tune (smem 25->12.5KB)
+    const int BM=64,BN=128,BK=32,NS=16,NKS=2,GS=32,WPR=BK/8,GPR=BK/GS,STAGES=3; // BK32 occ-tune (smem 25->12.5KB); STAGES=3 cp.async pipeline depth (deeper latency-hiding, occupancy-neutral -- see moe_q4_grouped_mma's doc)
     // band_n=0 (default): grid=[tile,nblk] with tile fast-varying -> a full
     // tile sweep (crossing experts) happens before the N-block advances.
     // band_n=1 (BUTTER_LAGUNA_SCHED=1): grid=[nblk,tile] with nblk fast-varying ->
@@ -2638,9 +2642,9 @@ extern "C" __global__ void moe_q4_grouped_mma(
     int by = band_n ? blockIdx.x : blockIdx.y;
     int tok0=tok0_arr[bx], gend=gend_arr[bx], eid=eid_arr[bx], n0=by*BN;
     int tid=threadIdx.x,warp=tid>>5,lane=tid&31,gid=lane>>2,tid4=lane&3,wrow=warp*16;
-    __shared__ __half   As[2][BM][BK];
-    __shared__ unsigned Wqs[2][BN][WPR];
-    __shared__ __half   Scs[2][BN][GPR];
+    __shared__ __half   As[3][BM][BK];
+    __shared__ unsigned Wqs[3][BN][WPR];
+    __shared__ __half   Scs[3][BN][GPR];
     float oc[NS][4]; for(int s=0;s<NS;s++){oc[s][0]=oc[s][1]=oc[s][2]=oc[s][3]=0.f;}
     int nchunk=K/BK, WPB=K/32;
     long ebase=(long)eid*N;
@@ -2654,12 +2658,25 @@ extern "C" __global__ void moe_q4_grouped_mma(
     for(int e=tid;e<BN*GPR;e+=128){ int r=e/GPR,g=e%GPR; long sr=ebase+((n0+r<N)?(n0+r):0); \
         Scs[BUF][r][g]=Sc[sr*WPB + kc/32 + g]; } \
     }while(0)
-    LOADC(0,0); asm volatile("cp.async.commit_group;\n"); __syncthreads();
+    // STAGES-deep cp.async software pipeline (was 2). Prologue prefetches
+    // STAGES-1 chunks ahead; each loop iter issues chunk c+STAGES-1's prefetch
+    // then waits until at most STAGES-2 groups remain pending (guaranteeing
+    // chunk c's group, the oldest, is complete) -- generalizes the prior
+    // depth-2 pattern (prologue 1 prefetch, wait_group 1 mid-loop / 0 at tail).
+    for(int i=0;i<STAGES-1 && i<nchunk;i++){ LOADC(i,i); asm volatile("cp.async.commit_group;\n"); }
+    __syncthreads();
     for(int c=0;c<nchunk;c++){
-        if(c+1<nchunk){ LOADC(c+1,(c+1)&1); asm volatile("cp.async.commit_group;\n"); asm volatile("cp.async.wait_group 1;\n"); }
-        else { asm volatile("cp.async.wait_group 0;\n"); }
+        int pf=c+STAGES-1;
+        if(pf<nchunk){
+            LOADC(pf, pf%STAGES); asm volatile("cp.async.commit_group;\n");
+            asm volatile("cp.async.wait_group 2;\n");
+        } else if(c+1<nchunk){
+            asm volatile("cp.async.wait_group 1;\n");
+        } else {
+            asm volatile("cp.async.wait_group 0;\n");
+        }
         __syncthreads();
-        int buf=c&1;
+        int buf=c%STAGES;
         for(int ks=0;ks<NKS;ks++){ int ko=ks*16; int c0=ko+2*tid4;
             int arow = (lane & 7) + ((lane >> 3) & 1) * 8;
             int acol = (lane >> 4) * 8;
@@ -2790,10 +2807,42 @@ extern "C" __global__ void moe_build_tiles(
     int* order = smem + n_exp; // [n_exp]
     if (desc) {
         for (int e = 0; e < n_exp; e++) { cnt[e] = (int)(offsets[e+1] - offsets[e]); order[e] = e; }
-        for (int i2 = 0; i2 < n_exp; i2++) {
-            int best = i2;
-            for (int j = i2 + 1; j < n_exp; j++) if (cnt[order[j]] > cnt[order[best]]) best = j;
-            if (best != i2) { int tmp = order[i2]; order[i2] = order[best]; order[best] = tmp; }
+        // round7: O(n log n) heapsort replacing the prior O(n^2) selection sort
+        // (moe_build_tiles measured ~1.34ms/call via ncu at n_exp=256, single
+        // thread -- the O(n^2)=65536-compare sort was the dominant cost).
+        // Correctness is insensitive to exact tie-break order here: any
+        // permutation of `order[]` yields identical GEMM output since tiles
+        // write disjoint output regions regardless of emission order (see
+        // moe_q4_grouped_laguna_sched_ab, which A/B-tests exactly this
+        // desc-mode path against the default order on skewed/zero-count
+        // groups and requires bit-exact agreement). Build a max-heap over
+        // order[] keyed by cnt[order[i]], then extract-max repeatedly
+        // (ascending), then reverse in place for descending final order.
+        for (int start = n_exp / 2 - 1; start >= 0; start--) {
+            int root = start;
+            while (true) {
+                int child = 2 * root + 1;
+                if (child >= n_exp) break;
+                if (child + 1 < n_exp && cnt[order[child + 1]] > cnt[order[child]]) child++;
+                if (cnt[order[root]] >= cnt[order[child]]) break;
+                int tmp = order[root]; order[root] = order[child]; order[child] = tmp;
+                root = child;
+            }
+        }
+        for (int end = n_exp - 1; end > 0; end--) {
+            int tmp = order[0]; order[0] = order[end]; order[end] = tmp;
+            int root = 0;
+            while (true) {
+                int child = 2 * root + 1;
+                if (child >= end) break;
+                if (child + 1 < end && cnt[order[child + 1]] > cnt[order[child]]) child++;
+                if (cnt[order[root]] >= cnt[order[child]]) break;
+                tmp = order[root]; order[root] = order[child]; order[child] = tmp;
+                root = child;
+            }
+        }
+        for (int i = 0, j = n_exp - 1; i < j; i++, j--) {
+            int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
         }
     }
     int t = 0;
@@ -2893,17 +2942,17 @@ const SDPA_TC_KPREP_SRC: &str = r#"
 #include <cuda_fp16.h>
 extern "C" __global__ void sdpa_tc_kprep(
     const void* __restrict__ k_in,   // [nkv, kv_stride, hd]
-    __half*     __restrict__ k_out,  // [nkv, n_kv, hd] f16
-    int nkv, int kv_stride, int n_kv, int hd, int in_f32)
+    __half*     __restrict__ k_out,  // [nkv, blk, hd] f16, THIS BLOCK ONLY
+    int nkv, int kv_stride, int kb0, int blk, int hd, int in_f32)
 {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    long total = (long)nkv * n_kv * hd;
+    long total = (long)nkv * blk * hd;
     if (i >= total) return;
     int d  = (int)(i % hd);
     long t = i / hd;
-    int p  = (int)(t % n_kv);        // kv position
-    int kh = (int)(t / n_kv);        // kv head
-    long si = ((long)kh * kv_stride + p) * hd + d;
+    int p  = (int)(t % blk);         // position within this block
+    int kh = (int)(t / blk);         // kv head
+    long si = ((long)kh * kv_stride + (kb0 + p)) * hd + d;
     float val = in_f32 ? ((const float*)k_in)[si]
                        : __half2float(((const __half*)k_in)[si]);
     k_out[i] = __float2half(val);
@@ -4148,7 +4197,6 @@ pub fn sdpa_multi_tc(
 
     // ── prep buffers (all f16) ──────────────────────────────────────────────
     let qh = Tensor::empty(dev, vec![nq, sq, hd], DType::F16)?;          // [nq,Sq,hd] scaled
-    let kh = Tensor::empty(dev, vec![nkv, n_kv, hd], DType::F16)?;       // [nkv,n_kv,hd]
 
     let i = |x: i32| x.to_le_bytes().to_vec();
     let f = |x: f32| x.to_le_bytes().to_vec();
@@ -4158,10 +4206,6 @@ pub fn sdpa_multi_tc(
         &[(q.buffer.as_ref(), q.offset), (qh.buffer.as_ref(), 0)],
         &[i(sq as i32), i(nq as i32), i(hd as i32), f(scale), i(in_f32)],
         blk256(nq*sq*hd), [256,1,1], 0, false)?;
-    dev.dispatch_raw_cuda(SDPA_TC_KPREP_SRC, "sdpa_tc_kprep.cu", "sdpa_tc_kprep",
-        &[(k.buffer.as_ref(), k.offset), (kh.buffer.as_ref(), 0)],
-        &[i(nkv as i32), i(kv_stride as i32), i(n_kv as i32), i(hd as i32), i(in_f32)],
-        blk256(nkv*n_kv*hd), [256,1,1], 0, false)?;
 
     // ── running FlashAttention state (init via upload: o=0, l=0, m=-inf) ─────
     let o_run = Tensor::new(dev.alloc_zeroed(nq*sq*hd*4)?, vec![nq, sq, hd], DType::F32);
@@ -4178,17 +4222,26 @@ pub fn sdpa_multi_tc(
     let bl     = Tensor::empty(dev, vec![nq, sq], DType::F32)?;
     let o_blk  = Tensor::empty(dev, vec![nq, sq, hd], DType::F16)?;
     let vt     = Tensor::empty(dev, vec![nkv, hd, bk], DType::F16)?;     // per-block V^T
+    let kh     = Tensor::empty(dev, vec![nkv, bk, hd], DType::F16)?;     // per-block K, f16 (was whole-prefix)
 
     let el = 2i64; // f16 bytes
     let mut kb0 = 0usize;
     while kb0 < n_kv {
         let blk = bk.min(n_kv - kb0);
 
+        // ── K prep: cast+copy THIS KV block only → kh[nkv,blk,hd] ───────────
+        // (was one whole-causal-prefix conversion before the loop; see the
+        // PERF FIX note in `sdpa_multi_tc_varlen` below for the rationale.)
+        dev.dispatch_raw_cuda(SDPA_TC_KPREP_SRC, "sdpa_tc_kprep.cu", "sdpa_tc_kprep",
+            &[(k.buffer.as_ref(), k.offset), (kh.buffer.as_ref(), 0)],
+            &[i(nkv as i32), i(kv_stride as i32), i(kb0 as i32), i(blk as i32), i(hd as i32), i(in_f32)],
+            blk256(nkv*blk*hd), [256,1,1], 0, false)?;
+
         // ── QKᵀ: per KV group (16 q-heads share one KV head) ────────────────
         // C[Sq, blk] = Qh[Sq,hd] · Kh_blk[blk,hd]ᵀ ; batch over the hpg q-heads.
         for g in 0..nkv {
             let q_off = g * hpg * sq * hd * 2;             // bytes into qh
-            let k_off = (g * n_kv + kb0) * hd * 2;         // bytes into kh (this block)
+            let k_off = g * blk * hd * 2;                  // bytes into kh (buffer-relative now)
             let s_off = g * hpg * sq * blk * 2;            // bytes into scores
             dev.gemm_strided_batched_off(
                 qh.buffer.as_ref(),     q_off, (sq*hd) as i64 * el,   // X stride = one q-head
@@ -4304,7 +4357,6 @@ pub fn sdpa_multi_tc_varlen(
         other => return Err(Error::Msg(format!("sdpa_multi_tc_varlen: unsupported dtype {other:?}"))) };
 
     let qh = Tensor::empty(dev, vec![nq, sq, hd], DType::F16)?;
-    let kh = Tensor::empty(dev, vec![nkv, n_kv, hd], DType::F16)?;
 
     let i = |x: i32| x.to_le_bytes().to_vec();
     let f = |x: f32| x.to_le_bytes().to_vec();
@@ -4314,23 +4366,58 @@ pub fn sdpa_multi_tc_varlen(
         &[(q.buffer.as_ref(), q.offset), (qh.buffer.as_ref(), 0)],
         &[i(sq as i32), i(nq as i32), i(hd as i32), f(scale), i(in_f32)],
         blk256(nq*sq*hd), [256,1,1], 0, false)?;
-    dev.dispatch_raw_cuda(SDPA_TC_KPREP_SRC, "sdpa_tc_kprep.cu", "sdpa_tc_kprep",
-        &[(k.buffer.as_ref(), k.offset), (kh.buffer.as_ref(), 0)],
-        &[i(nkv as i32), i(kv_stride as i32), i(n_kv as i32), i(hd as i32), i(in_f32)],
-        blk256(nkv*n_kv*hd), [256,1,1], 0, false)?;
 
     let o_run = Tensor::new(dev.alloc_zeroed(nq*sq*hd*4)?, vec![nq, sq, hd], DType::F32);
     let l_run = Tensor::new(dev.alloc_zeroed(nq*sq*4)?, vec![nq, sq], DType::F32);
     let neg: Vec<u8> = (0..nq*sq).flat_map(|_| (-3.4e38f32).to_le_bytes()).collect();
     let m_run = Tensor::new(dev.upload(&neg)?, vec![nq, sq], DType::F32);
 
-    let bk = 2048usize.min(n_kv);
+    // KV block size. Full-attention layers (win==0) keep 2048 (bounds the
+    // scores buffer, see sibling `sdpa_multi_tc`'s doc). Sliding-window
+    // layers (win!=0): the block-skip above only omits blocks with
+    // q_cnt==0 ENTIRELY -- a block that IS touched still pays a full
+    // bk-wide QK^T/PV GEMM + softmax/merge even though the window (512 for
+    // Laguna, far smaller than 2048) only needs a fraction of that width.
+    // Shrinking bk for win!=0 tightens the per-block reachable-range union
+    // (`[kb0, kb0+blk+win)`, see the q_lo/q_cnt derivation below) at the
+    // cost of more loop iterations (more kprep/QK/softmax/merge launches).
+    // BUTTER_LAGUNA_SDPA_WIN_BK overrides the windowed-path block size for
+    // A/B sweeps. Default 1024, NOT the 512 window width itself: measured
+    // bk=512 vs bk=1024 vs bk=2048(orig) on Laguna-S-2.1/GB10 (chunk=1024,
+    // MARLIN+MOEFUSE) -- bk=512 regresses n=1024 prefill -4% (extra
+    // loop/launch overhead from doubling block count outweighs the reduced
+    // overcompute there), while bk=1024 nets +1-1.5% at n=8192/32768 with
+    // no regression anywhere tested. Full-attention layers (win==0) are
+    // never affected by this env var.
+    let win_bk: usize = std::env::var("BUTTER_LAGUNA_SDPA_WIN_BK")
+        .ok().and_then(|v| v.parse().ok()).filter(|&b: &usize| b >= 1).unwrap_or(1024);
+    let bk = if win != 0 { win_bk.min(n_kv) } else { 2048usize.min(n_kv) };
     let scores = Tensor::empty(dev, vec![nq, sq, bk], DType::F16)?;
     let p_blk  = Tensor::empty(dev, vec![nq, sq, bk], DType::F16)?;
     let bm     = Tensor::empty(dev, vec![nq, sq], DType::F32)?;
     let bl     = Tensor::empty(dev, vec![nq, sq], DType::F32)?;
     let o_blk  = Tensor::empty(dev, vec![nq, sq, hd], DType::F16)?;
     let vt     = Tensor::empty(dev, vec![nkv, hd, bk], DType::F16)?;
+    // PERF FIX (was `[nkv, n_kv, hd]`, one whole-causal-prefix f32->f16
+    // conversion upfront every call): for sliding-window layers (`win != 0`)
+    // the vast majority of KV blocks have `q_cnt == 0` below (no row in this
+    // chunk can reach them) -- the QKᵀ/PV GEMMs were already correctly
+    // skipped for those blocks, but `kh` was still sized (and fully
+    // converted) to the ENTIRE causal prefix on every prefill chunk, and the
+    // softmax/merge dispatches ran unconditionally per block regardless of
+    // `q_cnt`. For a windowed layer deep into a long prefill (`base` large)
+    // that is an O(base) cost paid by EVERY chunk on every windowed layer
+    // (Laguna: 36 of 48 layers are sliding-window) -- the root cause of this
+    // engine's prefill throughput decaying with sequence length instead of
+    // staying roughly flat. Fix: convert K per-block into a `bk`-sized
+    // rolling buffer (mirroring `vt`/`SDPA_TC_VPREP_SRC`, which already
+    // worked this way), and gate kprep+softmax+merge on the same `q_cnt>0`
+    // check as the GEMMs -- a block no row can reach contributes nothing
+    // either way (softmax would derive `bm=-inf`/`bl=0` for every row via
+    // its own positional mask; `merge`'s `l_b <= 0` early-return already
+    // no-ops on that combination), so skipping all four dispatches together
+    // is bit-identical to running them, just without the wasted work.
+    let kh     = Tensor::empty(dev, vec![nkv, bk, hd], DType::F16)?;
 
     let el = 2i64;
     let mut kb0 = 0usize;
@@ -4372,15 +4459,18 @@ pub fn sdpa_multi_tc_varlen(
         };
         // q_cnt == 0: no row in this chunk can reach this block at all (the
         // derivation above is a superset of the true reachable set, so an
-        // empty computed range proves the true set is also empty). Skip the
-        // QKᵀ/PV GEMMs and vprep entirely; softmax/merge stay unconditional
-        // below (softmax re-derives bm/bl fresh every iteration straight
-        // from the mask, and merge's `l_b <= 0` early-return means it never
-        // reads the skipped o_blk/vt buffers, so this is correctness-safe).
+        // empty computed range proves the true set is also empty). Skip
+        // kprep, the QKᵀ/PV GEMMs, vprep, softmax AND merge entirely (all
+        // four moved inside this same guard -- see the PERF FIX note above
+        // `kh`'s allocation for why this is bit-identical, not just faster).
         if q_cnt > 0 {
+            dev.dispatch_raw_cuda(SDPA_TC_KPREP_SRC, "sdpa_tc_kprep.cu", "sdpa_tc_kprep",
+                &[(k.buffer.as_ref(), k.offset), (kh.buffer.as_ref(), 0)],
+                &[i(nkv as i32), i(kv_stride as i32), i(kb0 as i32), i(blk as i32), i(hd as i32), i(in_f32)],
+                blk256(nkv*blk*hd), [256,1,1], 0, false)?;
             for g in 0..nkv {
                 let q_off = g * hpg * sq * hd * 2 + q_lo * hd * 2;
-                let k_off = (g * n_kv + kb0) * hd * 2;
+                let k_off = g * blk * hd * 2;
                 let s_off = g * hpg * sq * blk * 2 + q_lo * blk * 2;
                 dev.gemm_strided_batched_off(
                     qh.buffer.as_ref(),     q_off, (sq*hd) as i64 * el,
@@ -4388,15 +4478,13 @@ pub fn sdpa_multi_tc_varlen(
                     scores.buffer.as_ref(), s_off, (sq*blk) as i64 * el,
                     q_cnt, blk, hd, hpg, DType::F16)?;
             }
-        }
-        // varlen softmax: causal upper (base+r) AND segment lower (seg_lo[r]).
-        dev.dispatch_raw_cuda(SDPA_TC_SOFTMAX_VARLEN_SRC, "sdpa_tc_softmax_varlen.cu", "sdpa_tc_softmax_varlen",
-            &[(scores.buffer.as_ref(), 0), (p_blk.buffer.as_ref(), 0),
-              (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0),
-              (seg_lo.buffer.as_ref(), seg_lo.offset)],
-            &[i(nq as i32), i(sq as i32), i(blk as i32), i(kb0 as i32), i(base as i32)],
-            [(nq*sq) as u32, 1, 1], [256,1,1], 0, false)?;
-        if q_cnt > 0 {
+            // varlen softmax: causal upper (base+r) AND segment lower (seg_lo[r]).
+            dev.dispatch_raw_cuda(SDPA_TC_SOFTMAX_VARLEN_SRC, "sdpa_tc_softmax_varlen.cu", "sdpa_tc_softmax_varlen",
+                &[(scores.buffer.as_ref(), 0), (p_blk.buffer.as_ref(), 0),
+                  (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0),
+                  (seg_lo.buffer.as_ref(), seg_lo.offset)],
+                &[i(nq as i32), i(sq as i32), i(blk as i32), i(kb0 as i32), i(base as i32)],
+                [(nq*sq) as u32, 1, 1], [256,1,1], 0, false)?;
             dev.dispatch_raw_cuda(SDPA_TC_VPREP_SRC, "sdpa_tc_vprep.cu", "sdpa_tc_vprep",
                 &[(v.buffer.as_ref(), v.offset), (vt.buffer.as_ref(), 0)],
                 &[i(nkv as i32), i(kv_stride as i32), i(hd as i32), i(kb0 as i32), i(blk as i32), i(in_f32)],
@@ -4411,12 +4499,12 @@ pub fn sdpa_multi_tc_varlen(
                     o_blk.buffer.as_ref(), o_off, (sq*hd) as i64 * el,
                     q_cnt, hd, blk, hpg, DType::F16)?;
             }
+            dev.dispatch_raw_cuda(SDPA_TC_MERGE_SRC, "sdpa_tc_merge.cu", "sdpa_tc_merge",
+                &[(o_blk.buffer.as_ref(), 0), (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0),
+                  (o_run.buffer.as_ref(), 0), (m_run.buffer.as_ref(), 0), (l_run.buffer.as_ref(), 0)],
+                &[i(nq as i32), i(sq as i32), i(hd as i32)],
+                [(nq*sq) as u32, 1, 1], [128,1,1], 0, false)?;
         }
-        dev.dispatch_raw_cuda(SDPA_TC_MERGE_SRC, "sdpa_tc_merge.cu", "sdpa_tc_merge",
-            &[(o_blk.buffer.as_ref(), 0), (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0),
-              (o_run.buffer.as_ref(), 0), (m_run.buffer.as_ref(), 0), (l_run.buffer.as_ref(), 0)],
-            &[i(nq as i32), i(sq as i32), i(hd as i32)],
-            [(nq*sq) as u32, 1, 1], [128,1,1], 0, false)?;
         kb0 += blk;
     }
     let out = Tensor::empty(dev, vec![sq, nq, hd], q.dtype)?;
@@ -6885,19 +6973,45 @@ pub fn mamba_split_conv(
 // CONV_DEVICE prefill path (TODO comment at line ~1543 of modeltests/lib.rs).
 /// RMSNorm with f16 output only. Equivalent to `cast_f32_f16(rms_norm(...))`,
 /// but avoids the intermediate f32 norm tensor and the separate cast launch.
-/// TODO(rebrand-merge): the fast-path fused kernel (`iron_rms_norm_f16out`)
-/// isn't in `thewafflehaus/iron@dev` yet, so this always takes the
-/// `rms_norm` + `cast_f32_f16` fallback below (same numerics, one extra
-/// dispatch) instead of the single-pass fused kernel.
+/// Dispatches the fused `iron_rms_norm_f16out` kernel on the same fast-path
+/// shape restriction as plain `rms_norm`'s fast path (f32 input, n a
+/// multiple of 128, n <= 4096 — the 16-bit vec4 codegen restriction that
+/// forces `rms_norm` onto `iron_rms_norm_wide` for f16/bf16 applies here
+/// too, since this is the same 4-elements/thread codegen); anything outside
+/// that falls back to `rms_norm` + `cast_f32_f16`.
 pub fn rms_norm_f16out(dev: &dyn Device, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+    let n = *x.shape.last().ok_or_else(|| Error::Msg("rms_norm_f16out: scalar input".into()))?;
+    if x.dtype == DType::F32 && n % 128 == 0 && n <= 4096 {
+        let rows = x.elem_count() / n;
+        let out = Tensor::empty(dev, x.shape.clone(), DType::F16)?;
+        let eps_buf = scalar_buf(dev, eps.to_bits())?;
+        let k = cached_ir("iron_rms_norm_f16out", x.dtype, || {
+            let mut k = wh_iron_std::kernels::norm::rms_norm::iron_rms_norm_f16out::kernel_ir_for(x.dtype);
+            k.mode = wh_iron_core::ir::KernelMode::Reduction;
+            k
+        });
+        dev.dispatch(
+            &k,
+            &[
+                Binding::Buffer(x.buffer.clone()),
+                Binding::Buffer(weight.buffer.clone()),
+                Binding::Buffer(out.buffer.clone()),
+                Binding::Buffer(eps_buf),
+                Binding::Scalar((n as u32).to_le_bytes().to_vec()),
+            ],
+            Grid { grid: [rows as u32, 1, 1], block: [(n / 4) as u32, 1, 1] },
+        )?;
+        return Ok(out);
+    }
     let out = rms_norm(dev, x, weight, eps)?;
     cast_f32_f16(dev, &out)
 }
 
-/// TODO(rebrand-merge): the fused kernel (`iron_gated_group_rmsnorm_batched_f16out`)
-/// isn't in `thewafflehaus/iron@dev` yet (only the plain, non-f16out
-/// `iron_gated_group_rmsnorm_batched` is) — always takes the
-/// `gated_group_rmsnorm_batched` + `cast_f32_f16` fallback below.
+/// Fused single-pass variant of `gated_group_rmsnorm_batched` that stores
+/// directly to f16 (skips the intermediate f32 tensor + separate cast
+/// launch). Dispatches `iron_gated_group_rmsnorm_batched_f16out`, same
+/// grid/block scheme as the plain kernel (one threadgroup per (token,
+/// norm-group) pair, 4 elements/thread).
 pub fn gated_group_rmsnorm_batched_f16out(
     dev: &dyn Device,
     y: &Tensor,
@@ -6908,8 +7022,30 @@ pub fn gated_group_rmsnorm_batched_f16out(
     di: usize,
     gs: usize,
 ) -> Result<Tensor> {
-    let out = gated_group_rmsnorm_batched(dev, y, z, w, eps, s, di, gs)?;
-    cast_f32_f16(dev, &out)
+    let ng = di / gs;
+    let kernel = cached_ir("iron_gated_group_rmsnorm_batched_f16out", DType::F32, || {
+        use wh_iron_core::ir::KernelMode;
+        let mut k = wh_iron_std::kernels::ssm::scan::iron_gated_group_rmsnorm_batched_f16out::kernel_ir_for();
+        k.mode = KernelMode::Reduction;
+        k
+    });
+    let out = Tensor::empty(dev, vec![s * di], DType::F16)?;
+    let eps_buf = Tensor::new(scalar_buf(dev, eps.to_bits())?, vec![1], DType::F32);
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(y.buffer.clone()),
+            Binding::Buffer(z.buffer.clone()),
+            Binding::Buffer(w.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            Binding::Buffer(eps_buf.buffer.clone()),
+            u(gs as u32),
+            u(ng as u32),
+        ],
+        Grid { grid: [(s * ng) as u32, 1, 1], block: [(gs / 4) as u32, 1, 1] },
+    )?;
+    Ok(out)
 }
 
 pub fn gated_group_rmsnorm_batched(
@@ -7534,17 +7670,41 @@ using namespace nvcuda;
 //      eliminating __half2float() inside the per-nibble dequant loop.
 //   3. Double-buffered X and WT staging: next tile's loads overlap
 //      current tile's WMMA compute (ping-pong smem slots).
+//   4. Padded smem_WT row stride (128->136 halfwords) to break the
+//      power-of-two bank-conflict alignment: a plain 128-halfword
+//      (256-byte) row stride is an exact multiple of the 32-bank×4-byte
+//      conflict period, so a warp's 32 threads (which vary the ROW index
+//      while the column/bank-determining index stays fixed within an
+//      unrolled dequant iteration) ALL alias the same bank on every
+//      LOAD_WT store — confirmed via `ncu` (l1tex bank-conflict counters
+//      vs wavefront counters): ~18x store-side overhead vs the
+//      conflict-free ideal on this kernel. 136 is the smallest multiple
+//      of 8 (WMMA's row-major `ldm` alignment requirement for __half)
+//      that reduces the conflict: the achievable minimum under that
+//      constraint is a 4-way conflict (down from 32-way); modular
+//      arithmetic (row_wt/2 mod 32) shows 8-alignment forbids getting to
+//      fully conflict-free for this 32-row/128-bank shape. smem_X (the
+//      other bank-conflict offender ncu found, ~3.5x overhead, load-side)
+//      is NOT padded: this device's actual opt-in dynamic-shared-memory
+//      cap is 101376 bytes (queried via
+//      CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 101376,
+//      NOT the ~228KB this comment previously assumed by analogy to a
+//      different GPU) and there is no budget left to also pad X (16384
+//      bytes at the padded WT size already leaves only ~1.5KB of
+//      headroom) without exceeding it and failing `cuFuncSetAttribute`
+//      at launch. Left as a documented follow-up if the tile/accumulator
+//      layout is ever revisited to free up smem headroom.
 //
 // qs layout: Marlin tile-major, same 64-row tiles as moe_w4a16_marlin.
 // A 128-N-tile block straddles two consecutive 64-N Marlin tiles (nt0, nt0+1).
 // 256 threads × 1 u32/tile → both tiles load in a single fully-coalesced pass.
 //
-// smem breakdown (per block):
-//   smem_X [2][128*32] f16 = 16384 B  (double-buffered X)
-//   smem_WT[2][32*128] f16 = 16384 B  (double-buffered W^T, already dequanted)
+// smem breakdown (per block; WT row PADDED to 136 halfwords, X unpadded):
+//   smem_X [2][128*32] f16 = 16384 B  (double-buffered X, unpadded)
+//   smem_WT[2][32*136] f16 = 17408 B  (double-buffered W^T, padded)
 //   smem_SC[128]       f32 =   512 B  (preloaded scales for this K-step)
 //   smem_C [128*128]   f32 = 65536 B  (accumulator)
-//   Total                  = 98816 B  (~96 KB; GB10 has 228 KB/SM)
+//   Total                  = 99840 B  (~97.5 KB; GB10 opt-in cap is 101376 B)
 //
 // n_out % 128 == 0 and k_in % 32 == 0 required.
 extern "C" __global__ void moe_w4a16_marlin128(
@@ -7564,16 +7724,16 @@ extern "C" __global__ void moe_w4a16_marlin128(
     const int warp_m_base = (warp_id >> 2) * 64; // 0 or 64
     const int warp_n_base = (warp_id  & 3) * 32; // 0, 32, 64, or 96
 
-    // smem layout (all offsets in bytes):
+    // smem layout (all offsets in bytes; WT row PADDED to 136, X unpadded):
     //   [0       .. 16384) smem_X [2][128*32] __half
-    //   [16384   .. 32768) smem_WT[2][32*128] __half
-    //   [32768   .. 33280) smem_SC[128]       float
-    //   [33280   .. 98816) smem_C [128*128]   float
+    //   [16384   .. 33792) smem_WT[2][32*136] __half
+    //   [33792   .. 34304) smem_SC[128]       float
+    //   [34304   .. 99840) smem_C [128*128]   float
     extern __shared__ char smem_raw[];
     __half* smem_X  = (__half*)(smem_raw);
     __half* smem_WT = (__half*)(smem_raw + 16384);
-    float*  smem_SC = (float* )(smem_raw + 32768);
-    float*  smem_C  = (float* )(smem_raw + 33280);
+    float*  smem_SC = (float* )(smem_raw + 33792);
+    float*  smem_C  = (float* )(smem_raw + 34304);
 
     const int bpr             = k_in / 32;
     const int n_tiles64       = n_out / 64;
@@ -7623,7 +7783,7 @@ extern "C" __global__ void moe_w4a16_marlin128(
                     int nl = rg * 8 + _i;                                      \
                     unsigned nib = (w0 >> (_i*4)) & 0xf;                      \
                     int qs_val = (int)(nib >= 8u ? nib - 16u : nib);          \
-                    smem_WT[(slot_)*(32*128) + kl*128 + nl] =                 \
+                    smem_WT[(slot_)*(32*136) + kl*136 + nl] =                 \
                         __float2half((float)qs_val * smem_SC[nl]);             \
                 }                                                              \
             }                                                                  \
@@ -7636,7 +7796,7 @@ extern "C" __global__ void moe_w4a16_marlin128(
                     int nl = 64 + rg * 8 + _i;                                \
                     unsigned nib = (w1 >> (_i*4)) & 0xf;                      \
                     int qs_val = (int)(nib >= 8u ? nib - 16u : nib);          \
-                    smem_WT[(slot_)*(32*128) + kl*128 + nl] =                 \
+                    smem_WT[(slot_)*(32*136) + kl*136 + nl] =                 \
                         __float2half((float)qs_val * smem_SC[nl]);             \
                 }                                                              \
             }                                                                  \
@@ -7700,8 +7860,8 @@ extern "C" __global__ void moe_w4a16_marlin128(
                     #pragma unroll
                     for (int ni = 0; ni < 2; ni++) {
                         wmma::load_matrix_sync(b_frag,
-                            smem_WT + buf * (32*128) + k_off * 128 + (warp_n_base + ni*16),
-                            128);
+                            smem_WT + buf * (32*136) + k_off * 136 + (warp_n_base + ni*16),
+                            136);
                         wmma::mma_sync(c_frag[mi][ni], a_frag, b_frag, c_frag[mi][ni]);
                     }
                 }
@@ -7804,8 +7964,12 @@ pub fn moe_w4a16_marlin(
             ],
             [(n_out as u32) / 128, (m_total as u32).div_ceil(128), 1],
             [256, 1, 1],
-            // smem: X_db(16384) + WT_db(16384) + SC(512) + C(65536) = 98816 bytes (~96 KB)
-            98816,
+            // smem: X_db(16384, unpadded) + WT_db(17408, padded 128->136) + SC(512)
+            // + C(65536) = 99840 bytes (~97.5 KB). GB10's opt-in dynamic-smem cap is
+            // 101376 bytes (queried via CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN),
+            // so this is the largest WT padding this device's budget allows without also
+            // shrinking something else; see the kernel doc for the full rationale.
+            99840,
             false,
         )?;
     } else {

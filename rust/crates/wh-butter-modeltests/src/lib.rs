@@ -588,20 +588,27 @@ pub fn verify_laguna(d: &dyn Device, plat: &str) {
     // BUTTER_LAGUNA_PP=<n>: standalone batched-prefill throughput bench over a
     // synthetic n-token prompt (token id sequence i % 50000, any valid ids
     // exercise the same code path; this is a speed bench, not a semantic
-    // eval). BUTTER_LAGUNA_PREFILL_CHUNK overrides the chunk size (default
-    // 1024). Prints "pp tok/s" and returns, no generation, no decode.
+    // eval). BUTTER_LAGUNA_PREFILL_CHUNK overrides the chunk size; default is
+    // 0 == "auto" (laguna::default_prefill_chunk(n), see that fn's doc: a
+    // size-adaptive min(n, 2048) policy, measured round-4 to beat both
+    // monolithic and the old fixed-1024 convention at every size). Prints
+    // "pp tok/s" and returns, no generation, no decode.
     if let Ok(pp_s) = std::env::var("BUTTER_LAGUNA_PP") {
         // Comma-separated sizes bench the whole ladder on ONE model load
         // (the 71G requant load dominates a cycle).
         let sizes: Vec<usize> = pp_s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
         // BUTTER_LAGUNA_PREFILL_CHUNK also accepts a comma list: the harness
         // benches every (size, chunk) combo on the single model load.
+        // Default is `[0]` (auto): `laguna::prefill` resolves 0 into its
+        // own size-adaptive default per call, so different `n` in the same
+        // comma-separated `sizes` list each get their own right-sized
+        // chunk instead of one chunk value forced across all of them.
         let chunks: Vec<usize> = std::env::var("BUTTER_LAGUNA_PREFILL_CHUNK")
             .ok().map(|v| v.split(',').filter_map(|c| c.trim().parse().ok()).collect())
             .filter(|v: &Vec<usize>| !v.is_empty())
-            .unwrap_or_else(|| vec![1024]);
+            .unwrap_or_else(|| vec![0]);
         for &(mut chunk) in chunks.iter() {
-        chunk = chunk.max(1);
+        if chunk != 0 { chunk = chunk.max(1); }
         for &n in sizes.iter().filter(|&&n| n > 0) {
         let synth_tokens: Vec<u32> = (0..n).map(|i| (i % 50000) as u32).collect();
         let Ok(kv_pp) = laguna::LagunaKvCache::new(d, &model.cfg, n + 1) else {
@@ -635,8 +642,16 @@ pub fn verify_laguna(d: &dyn Device, plat: &str) {
                 let dt = t0.elapsed().as_secs_f64();
                 let tps = n as f64 / dt;
                 let mut lb = vec![0u8; model.cfg.vocab * 4];
-                let _ = d.download(logits.buffer.as_ref(), &mut lb); // liveness check on the returned tensor
-                eprintln!("Laguna prefill bench (n={n}, chunk={chunk}, {plat}): {tps:.2} pp tok/s");
+                // Also serves as a cross-chunk-size correctness cross-check: with the
+                // synthetic (i % 50000) token sequence this is deterministic, so running
+                // the SAME n with different chunk values (e.g. auto vs an explicit
+                // override) and comparing this argmax is a quick chunk-invariance sanity
+                // check without needing the separate BUTTER_LAGUNA_PREFILL tokenizer oracle.
+                let _ = d.download(logits.buffer.as_ref(), &mut lb);
+                let lf: Vec<f32> = lb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                let argmax = wh_butter_runtime::argmax(&lf);
+                let eff_chunk = if chunk == 0 { laguna::default_prefill_chunk(n) } else { chunk };
+                eprintln!("Laguna prefill bench (n={n}, chunk={chunk} eff={eff_chunk}, {plat}): {tps:.2} pp tok/s, last-token argmax={argmax}");
                 laguna::prof_report();
             }
             Err(e) => eprintln!("Laguna PP bench: timed prefill failed: {e:?}"),
@@ -774,10 +789,15 @@ pub fn verify_laguna(d: &dyn Device, plat: &str) {
     // correctness gate for the batched-prefill work: the greedy continuation
     // must come out byte-identical to the decode-only path (same prompt,
     // same seed token handed to decode at `pos = tokens.len()`).
-    // BUTTER_LAGUNA_PREFILL_CHUNK overrides the chunk size (default 1024).
+    // BUTTER_LAGUNA_PREFILL_CHUNK overrides the chunk size; default is 0 ==
+    // "auto" (laguna::default_prefill_chunk, see its doc -- a size-adaptive
+    // min(n, 2048) policy). Correctness is chunk-invariant by construction
+    // (see `prefill`'s doc), so this default change carries no correctness
+    // risk; it only changes which chunk size the oracle happens to exercise
+    // when the caller doesn't pin one.
     let prefill_mode = std::env::var("BUTTER_LAGUNA_PREFILL").map(|v| v == "1").unwrap_or(false);
     let prefill_chunk: usize = std::env::var("BUTTER_LAGUNA_PREFILL_CHUNK")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let start_pos = if prefill_mode {
         let Ok(scratch) = laguna::LagunaPrefillScratch::new(d, &model.cfg, tokens.len()) else {
             eprintln!("Laguna: prefill scratch alloc failed, skipping");
