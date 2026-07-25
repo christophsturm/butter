@@ -7573,17 +7573,41 @@ using namespace nvcuda;
 //      eliminating __half2float() inside the per-nibble dequant loop.
 //   3. Double-buffered X and WT staging: next tile's loads overlap
 //      current tile's WMMA compute (ping-pong smem slots).
+//   4. Padded smem_WT row stride (128->136 halfwords) to break the
+//      power-of-two bank-conflict alignment: a plain 128-halfword
+//      (256-byte) row stride is an exact multiple of the 32-bank×4-byte
+//      conflict period, so a warp's 32 threads (which vary the ROW index
+//      while the column/bank-determining index stays fixed within an
+//      unrolled dequant iteration) ALL alias the same bank on every
+//      LOAD_WT store — confirmed via `ncu` (l1tex bank-conflict counters
+//      vs wavefront counters): ~18x store-side overhead vs the
+//      conflict-free ideal on this kernel. 136 is the smallest multiple
+//      of 8 (WMMA's row-major `ldm` alignment requirement for __half)
+//      that reduces the conflict: the achievable minimum under that
+//      constraint is a 4-way conflict (down from 32-way); modular
+//      arithmetic (row_wt/2 mod 32) shows 8-alignment forbids getting to
+//      fully conflict-free for this 32-row/128-bank shape. smem_X (the
+//      other bank-conflict offender ncu found, ~3.5x overhead, load-side)
+//      is NOT padded: this device's actual opt-in dynamic-shared-memory
+//      cap is 101376 bytes (queried via
+//      CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 101376,
+//      NOT the ~228KB this comment previously assumed by analogy to a
+//      different GPU) and there is no budget left to also pad X (16384
+//      bytes at the padded WT size already leaves only ~1.5KB of
+//      headroom) without exceeding it and failing `cuFuncSetAttribute`
+//      at launch. Left as a documented follow-up if the tile/accumulator
+//      layout is ever revisited to free up smem headroom.
 //
 // qs layout: Marlin tile-major, same 64-row tiles as moe_w4a16_marlin.
 // A 128-N-tile block straddles two consecutive 64-N Marlin tiles (nt0, nt0+1).
 // 256 threads × 1 u32/tile → both tiles load in a single fully-coalesced pass.
 //
-// smem breakdown (per block):
-//   smem_X [2][128*32] f16 = 16384 B  (double-buffered X)
-//   smem_WT[2][32*128] f16 = 16384 B  (double-buffered W^T, already dequanted)
+// smem breakdown (per block; WT row PADDED to 136 halfwords, X unpadded):
+//   smem_X [2][128*32] f16 = 16384 B  (double-buffered X, unpadded)
+//   smem_WT[2][32*136] f16 = 17408 B  (double-buffered W^T, padded)
 //   smem_SC[128]       f32 =   512 B  (preloaded scales for this K-step)
 //   smem_C [128*128]   f32 = 65536 B  (accumulator)
-//   Total                  = 98816 B  (~96 KB; GB10 has 228 KB/SM)
+//   Total                  = 99840 B  (~97.5 KB; GB10 opt-in cap is 101376 B)
 //
 // n_out % 128 == 0 and k_in % 32 == 0 required.
 extern "C" __global__ void moe_w4a16_marlin128(
@@ -7603,16 +7627,16 @@ extern "C" __global__ void moe_w4a16_marlin128(
     const int warp_m_base = (warp_id >> 2) * 64; // 0 or 64
     const int warp_n_base = (warp_id  & 3) * 32; // 0, 32, 64, or 96
 
-    // smem layout (all offsets in bytes):
+    // smem layout (all offsets in bytes; WT row PADDED to 136, X unpadded):
     //   [0       .. 16384) smem_X [2][128*32] __half
-    //   [16384   .. 32768) smem_WT[2][32*128] __half
-    //   [32768   .. 33280) smem_SC[128]       float
-    //   [33280   .. 98816) smem_C [128*128]   float
+    //   [16384   .. 33792) smem_WT[2][32*136] __half
+    //   [33792   .. 34304) smem_SC[128]       float
+    //   [34304   .. 99840) smem_C [128*128]   float
     extern __shared__ char smem_raw[];
     __half* smem_X  = (__half*)(smem_raw);
     __half* smem_WT = (__half*)(smem_raw + 16384);
-    float*  smem_SC = (float* )(smem_raw + 32768);
-    float*  smem_C  = (float* )(smem_raw + 33280);
+    float*  smem_SC = (float* )(smem_raw + 33792);
+    float*  smem_C  = (float* )(smem_raw + 34304);
 
     const int bpr             = k_in / 32;
     const int n_tiles64       = n_out / 64;
@@ -7662,7 +7686,7 @@ extern "C" __global__ void moe_w4a16_marlin128(
                     int nl = rg * 8 + _i;                                      \
                     unsigned nib = (w0 >> (_i*4)) & 0xf;                      \
                     int qs_val = (int)(nib >= 8u ? nib - 16u : nib);          \
-                    smem_WT[(slot_)*(32*128) + kl*128 + nl] =                 \
+                    smem_WT[(slot_)*(32*136) + kl*136 + nl] =                 \
                         __float2half((float)qs_val * smem_SC[nl]);             \
                 }                                                              \
             }                                                                  \
@@ -7675,7 +7699,7 @@ extern "C" __global__ void moe_w4a16_marlin128(
                     int nl = 64 + rg * 8 + _i;                                \
                     unsigned nib = (w1 >> (_i*4)) & 0xf;                      \
                     int qs_val = (int)(nib >= 8u ? nib - 16u : nib);          \
-                    smem_WT[(slot_)*(32*128) + kl*128 + nl] =                 \
+                    smem_WT[(slot_)*(32*136) + kl*136 + nl] =                 \
                         __float2half((float)qs_val * smem_SC[nl]);             \
                 }                                                              \
             }                                                                  \
@@ -7739,8 +7763,8 @@ extern "C" __global__ void moe_w4a16_marlin128(
                     #pragma unroll
                     for (int ni = 0; ni < 2; ni++) {
                         wmma::load_matrix_sync(b_frag,
-                            smem_WT + buf * (32*128) + k_off * 128 + (warp_n_base + ni*16),
-                            128);
+                            smem_WT + buf * (32*136) + k_off * 136 + (warp_n_base + ni*16),
+                            136);
                         wmma::mma_sync(c_frag[mi][ni], a_frag, b_frag, c_frag[mi][ni]);
                     }
                 }
@@ -7843,8 +7867,12 @@ pub fn moe_w4a16_marlin(
             ],
             [(n_out as u32) / 128, (m_total as u32).div_ceil(128), 1],
             [256, 1, 1],
-            // smem: X_db(16384) + WT_db(16384) + SC(512) + C(65536) = 98816 bytes (~96 KB)
-            98816,
+            // smem: X_db(16384, unpadded) + WT_db(17408, padded 128->136) + SC(512)
+            // + C(65536) = 99840 bytes (~97.5 KB). GB10's opt-in dynamic-smem cap is
+            // 101376 bytes (queried via CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN),
+            // so this is the largest WT padding this device's budget allows without also
+            // shrinking something else; see the kernel doc for the full rationale.
+            99840,
             false,
         )?;
     } else {
