@@ -1358,13 +1358,15 @@ pub fn argmax_f32_device(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
 /// The SwiGLU MoE path calls this for the gate and up stacks, then applies
 /// the activation elementwise before the down gather. F16 per-block scales.
 ///
-/// TODO(rebrand-merge): blocked — dispatches `iron_moe_gather_q4` via
-/// `wh_iron_std`'s kernel IR, but the pinned `thewafflehaus/iron@dev` kernel
-/// library only ships `iron_moe_gather_q4_relu2/_down/_down_accum` — the
-/// plain (non-relu2) variant this needs is not present upstream yet. Kept as
-/// an always-error stub until that kernel lands in the iron repo.
-pub fn moe_gather_q4(_dev: &dyn Device, _qs: &Tensor, _scales: &Tensor, _x: &Tensor, _idx: &Tensor, _top_k: usize, _inter: usize, _hid: usize) -> Result<Tensor> {
-    Err(Error::Msg("moe_gather_q4: blocked — iron_moe_gather_q4 kernel not yet in thewafflehaus/iron@dev (only _relu2/_down/_down_accum variants exist)".into()))
+pub fn moe_gather_q4(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, idx: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<Tensor> {
+    let k = cached_ir("iron_moe_gather_q4", x.dtype, || { let mut k = wh_iron_std::kernels::moe::moe_gather_q4::iron_moe_gather_q4::kernel_ir_for(x.dtype); k.mode = wh_iron_core::ir::KernelMode::Reduction; k });
+    let out = Tensor::empty(dev, vec![top_k * inter], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    // Default rpt=2: MoE-gather kernels are big + latency-bound; 2 warps/row hides
+    // global-load latency (matches the _relu2/_down siblings' default).
+    let rpt: u32 = std::env::var("BUTTER_MOE_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(2);
+    dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(hid as u32), u(inter as u32), u(rpt)], Grid { grid: [(inter as u32).div_ceil(rpt), top_k as u32, 1], block: [32 * rpt, 1, 1] })?;
+    Ok(out)
 }
 
 /// Batched MoE GATE+UP gather with FUSED inline SwiGLU: reads the SAME
@@ -1374,11 +1376,13 @@ pub fn moe_gather_q4(_dev: &dyn Device, _qs: &Tensor, _scales: &Tensor, _x: &Ten
 /// up stack) plus a host-side elementwise SwiGLU pass with one dispatch.
 /// F16 per-block scales on both `gate_scales` and `up_scales`.
 #[allow(clippy::too_many_arguments)]
-/// TODO(rebrand-merge): blocked — same iron-kernel gap as `moe_gather_q4`
-/// above (`iron_moe_gather_q4_swiglu` not in `thewafflehaus/iron@dev` yet).
-#[allow(clippy::too_many_arguments)]
-pub fn moe_gather_q4_swiglu(_dev: &dyn Device, _gate_qs: &Tensor, _gate_scales: &Tensor, _up_qs: &Tensor, _up_scales: &Tensor, _x: &Tensor, _idx: &Tensor, _top_k: usize, _inter: usize, _hid: usize) -> Result<Tensor> {
-    Err(Error::Msg("moe_gather_q4_swiglu: blocked — iron_moe_gather_q4_swiglu kernel not yet in thewafflehaus/iron@dev".into()))
+pub fn moe_gather_q4_swiglu(dev: &dyn Device, gate_qs: &Tensor, gate_scales: &Tensor, up_qs: &Tensor, up_scales: &Tensor, x: &Tensor, idx: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<Tensor> {
+    let k = cached_ir("iron_moe_gather_q4_swiglu", x.dtype, || { let mut k = wh_iron_std::kernels::moe::moe_gather_q4::iron_moe_gather_q4_swiglu::kernel_ir_for(x.dtype); k.mode = wh_iron_core::ir::KernelMode::Reduction; k });
+    let out = Tensor::empty(dev, vec![top_k * inter], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let rpt: u32 = std::env::var("BUTTER_MOE_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(2);
+    dev.dispatch(&k, &[Binding::Buffer(gate_qs.buffer.clone()), Binding::Buffer(gate_scales.buffer.clone()), Binding::Buffer(up_qs.buffer.clone()), Binding::Buffer(up_scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(hid as u32), u(inter as u32), u(rpt)], Grid { grid: [(inter as u32).div_ceil(rpt), top_k as u32, 1], block: [32 * rpt, 1, 1] })?;
+    Ok(out)
 }
 
 /// Batched MoE down + router-weighted accumulate into `acc[hid]`. `qs` is the
@@ -6969,19 +6973,45 @@ pub fn mamba_split_conv(
 // CONV_DEVICE prefill path (TODO comment at line ~1543 of modeltests/lib.rs).
 /// RMSNorm with f16 output only. Equivalent to `cast_f32_f16(rms_norm(...))`,
 /// but avoids the intermediate f32 norm tensor and the separate cast launch.
-/// TODO(rebrand-merge): the fast-path fused kernel (`iron_rms_norm_f16out`)
-/// isn't in `thewafflehaus/iron@dev` yet, so this always takes the
-/// `rms_norm` + `cast_f32_f16` fallback below (same numerics, one extra
-/// dispatch) instead of the single-pass fused kernel.
+/// Dispatches the fused `iron_rms_norm_f16out` kernel on the same fast-path
+/// shape restriction as plain `rms_norm`'s fast path (f32 input, n a
+/// multiple of 128, n <= 4096 — the 16-bit vec4 codegen restriction that
+/// forces `rms_norm` onto `iron_rms_norm_wide` for f16/bf16 applies here
+/// too, since this is the same 4-elements/thread codegen); anything outside
+/// that falls back to `rms_norm` + `cast_f32_f16`.
 pub fn rms_norm_f16out(dev: &dyn Device, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+    let n = *x.shape.last().ok_or_else(|| Error::Msg("rms_norm_f16out: scalar input".into()))?;
+    if x.dtype == DType::F32 && n % 128 == 0 && n <= 4096 {
+        let rows = x.elem_count() / n;
+        let out = Tensor::empty(dev, x.shape.clone(), DType::F16)?;
+        let eps_buf = scalar_buf(dev, eps.to_bits())?;
+        let k = cached_ir("iron_rms_norm_f16out", x.dtype, || {
+            let mut k = wh_iron_std::kernels::norm::rms_norm::iron_rms_norm_f16out::kernel_ir_for(x.dtype);
+            k.mode = wh_iron_core::ir::KernelMode::Reduction;
+            k
+        });
+        dev.dispatch(
+            &k,
+            &[
+                Binding::Buffer(x.buffer.clone()),
+                Binding::Buffer(weight.buffer.clone()),
+                Binding::Buffer(out.buffer.clone()),
+                Binding::Buffer(eps_buf),
+                Binding::Scalar((n as u32).to_le_bytes().to_vec()),
+            ],
+            Grid { grid: [rows as u32, 1, 1], block: [(n / 4) as u32, 1, 1] },
+        )?;
+        return Ok(out);
+    }
     let out = rms_norm(dev, x, weight, eps)?;
     cast_f32_f16(dev, &out)
 }
 
-/// TODO(rebrand-merge): the fused kernel (`iron_gated_group_rmsnorm_batched_f16out`)
-/// isn't in `thewafflehaus/iron@dev` yet (only the plain, non-f16out
-/// `iron_gated_group_rmsnorm_batched` is) — always takes the
-/// `gated_group_rmsnorm_batched` + `cast_f32_f16` fallback below.
+/// Fused single-pass variant of `gated_group_rmsnorm_batched` that stores
+/// directly to f16 (skips the intermediate f32 tensor + separate cast
+/// launch). Dispatches `iron_gated_group_rmsnorm_batched_f16out`, same
+/// grid/block scheme as the plain kernel (one threadgroup per (token,
+/// norm-group) pair, 4 elements/thread).
 pub fn gated_group_rmsnorm_batched_f16out(
     dev: &dyn Device,
     y: &Tensor,
@@ -6992,8 +7022,30 @@ pub fn gated_group_rmsnorm_batched_f16out(
     di: usize,
     gs: usize,
 ) -> Result<Tensor> {
-    let out = gated_group_rmsnorm_batched(dev, y, z, w, eps, s, di, gs)?;
-    cast_f32_f16(dev, &out)
+    let ng = di / gs;
+    let kernel = cached_ir("iron_gated_group_rmsnorm_batched_f16out", DType::F32, || {
+        use wh_iron_core::ir::KernelMode;
+        let mut k = wh_iron_std::kernels::ssm::scan::iron_gated_group_rmsnorm_batched_f16out::kernel_ir_for();
+        k.mode = KernelMode::Reduction;
+        k
+    });
+    let out = Tensor::empty(dev, vec![s * di], DType::F16)?;
+    let eps_buf = Tensor::new(scalar_buf(dev, eps.to_bits())?, vec![1], DType::F32);
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(y.buffer.clone()),
+            Binding::Buffer(z.buffer.clone()),
+            Binding::Buffer(w.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            Binding::Buffer(eps_buf.buffer.clone()),
+            u(gs as u32),
+            u(ng as u32),
+        ],
+        Grid { grid: [(s * ng) as u32, 1, 1], block: [(gs / 4) as u32, 1, 1] },
+    )?;
+    Ok(out)
 }
 
 pub fn gated_group_rmsnorm_batched(
