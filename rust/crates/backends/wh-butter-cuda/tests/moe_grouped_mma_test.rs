@@ -535,6 +535,142 @@ fn moe_q4_grouped_laguna_sched_ab() {
     eprintln!("moe_q4_grouped_laguna_sched_ab: PASS (default vs BUTTER_LAGUNA_SCHED=1 agree within 1e-3 on skewed groups)");
 }
 
+// Round 14: BUTTER_LAGUNA_MOE_NSPLIT=1 A/B correctness for the
+// warp-count-doubled moe_q4_grouped_mma_nsplit redesign (see
+// MOE_Q4_GROUPED_MMA_NSPLIT_SRC / laguna_moe_nsplit_on in wh-butter-ops).
+// Covers uniform, ragged/uneven non-power-of-two, and zero-count-expert
+// cases per the campaign's "a previously-shipped kernel bug was caught
+// exactly by the zero-count-expert case" lesson. For each case: (1) a
+// loose sanity check of the DEFAULT path's Q4 output against a host f32
+// reference (same tolerance style as moe_q4_grouped_laguna_sched_ab,
+// confirms the Q4 pipeline itself is producing a real signal), then (2)
+// the actual gate: nsplit-vs-default max relative diff on BOTH the
+// host-descriptor (moe_q4_grouped_mma) and fully-on-device-descriptor
+// (moe_q4_grouped_mma_dev) call paths. Both dispatch identical per-tile
+// dequant+mma math (same K-reduction order within a tile, same tile ->
+// output-element mapping, disjoint writes per tile) so nsplit and
+// default should be near bit-exact -- 1e-3 relative is generous
+// headroom, not a quantization-noise budget (mirrors sched_ab's framing).
+fn run_nsplit_ab_case(d: &dyn Device, case: &str, n_exp: usize, k: usize, n: usize, groups: &[(usize, usize)]) {
+    let mut g_starts = vec![0usize];
+    let mut expert_ids = vec![];
+    for &(e, r) in groups { expert_ids.push(e); g_starts.push(g_starts.last().unwrap() + r); }
+    let mt = *g_starts.last().unwrap();
+
+    let a_f = rng(mt * k, 41);
+    let w_f = rng(n_exp * n * k, 43);
+    let up = |v: &[f32], sh: Vec<usize>| -> Tensor {
+        Tensor::new(d.upload(&tb(v)).unwrap(), vec![v.len()], DType::F32).reshaped(sh) };
+    let a_dev = cast_f32_f16(d, &up(&a_f, vec![mt, k])).unwrap().reshaped(vec![mt, k]);
+    let (qs_v, sc_v) = quantize_q4(&w_f, n_exp * n, k);
+    let qs_b: Vec<u8> = qs_v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let qs = Tensor::new(d.upload(&qs_b).unwrap(), vec![qs_v.len()], DType::U32);
+    let sc = cast_f32_f16(d, &up(&sc_v, vec![sc_v.len()])).unwrap();
+
+    // host f32 reference (loose sanity check only, see comment above)
+    let mut exp = vec![0f32; mt * n];
+    for g in 0..groups.len() {
+        let (eid, _) = groups[g];
+        for t in g_starts[g]..g_starts[g + 1] {
+            for nn in 0..n {
+                let mut acc = 0f32;
+                for kk in 0..k { acc += a_f[t * k + kk] * w_f[(eid * n + nn) * k + kk]; }
+                exp[t * n + nn] = acc;
+            }
+        }
+    }
+    if mt > 0 {
+        let sanity_cos = cos(&exp, &dl(d, &cast_f16_f32(d, &moe_q4_grouped_mma(
+            d, &a_dev, &qs, &sc, &g_starts, &expert_ids, n, k).unwrap()).unwrap()));
+        eprintln!("moe_q4_grouped_nsplit_ab[{case}]: sanity cosine (Q4 default vs f32 host ref) = {sanity_cos:.6}");
+        assert!(sanity_cos > 0.99, "[{case}] moe_q4_grouped_mma default path looks broken, cosine {sanity_cos:.6}");
+    }
+
+    let rel_diff = |a: &[f32], b: &[f32]| -> f32 {
+        let mut maxr = 0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let rel = (x - y).abs() / x.abs().max(1e-2);
+            if rel > maxr { maxr = rel; }
+        }
+        maxr
+    };
+
+    // --- host-descriptor path (moe_q4_grouped_mma) ---
+    let out_default = dl(d, &cast_f16_f32(d, &moe_q4_grouped_mma(
+        d, &a_dev, &qs, &sc, &g_starts, &expert_ids, n, k).unwrap()).unwrap());
+    unsafe { std::env::set_var("BUTTER_LAGUNA_MOE_NSPLIT", "1"); }
+    let out_nsplit = dl(d, &cast_f16_f32(d, &moe_q4_grouped_mma(
+        d, &a_dev, &qs, &sc, &g_starts, &expert_ids, n, k).unwrap()).unwrap());
+    unsafe { std::env::remove_var("BUTTER_LAGUNA_MOE_NSPLIT"); }
+    let r_host = rel_diff(&out_default, &out_nsplit);
+    eprintln!("moe_q4_grouped_nsplit_ab[{case}] (host path): nsplit-vs-default max_rel={r_host:.2e}");
+    assert!(r_host < 1e-3, "[{case}] host path: BUTTER_LAGUNA_MOE_NSPLIT=1 vs default max_rel {r_host:.2e} > 1e-3");
+
+    // --- fully-on-device descriptor path (moe_q4_grouped_mma_dev) ---
+    let offs: Vec<u8> = g_starts.iter().flat_map(|&s| (s as u32).to_le_bytes()).collect();
+    let off = Tensor::new(d.upload(&offs).unwrap(), vec![g_starts.len()], DType::U32);
+    let out_dev_default = dl(d, &cast_f16_f32(d, &moe_q4_grouped_mma_dev(
+        d, &a_dev, &qs, &sc, &off, n_exp, mt, n, k).unwrap()).unwrap());
+    unsafe { std::env::set_var("BUTTER_LAGUNA_MOE_NSPLIT", "1"); }
+    let out_dev_nsplit = dl(d, &cast_f16_f32(d, &moe_q4_grouped_mma_dev(
+        d, &a_dev, &qs, &sc, &off, n_exp, mt, n, k).unwrap()).unwrap());
+    unsafe { std::env::remove_var("BUTTER_LAGUNA_MOE_NSPLIT"); }
+    let r_dev = rel_diff(&out_dev_default, &out_dev_nsplit);
+    eprintln!("moe_q4_grouped_nsplit_ab[{case}] (dev path): nsplit-vs-default max_rel={r_dev:.2e}");
+    assert!(r_dev < 1e-3, "[{case}] dev path: BUTTER_LAGUNA_MOE_NSPLIT=1 vs default max_rel {r_dev:.2e} > 1e-3");
+
+    // dev-descriptor builder must also agree with the host-descriptor
+    // builder for both nsplit and default (cross-check, not the main gate).
+    let r_cross_default = rel_diff(&out_default, &out_dev_default);
+    let r_cross_nsplit = rel_diff(&out_nsplit, &out_dev_nsplit);
+    eprintln!("moe_q4_grouped_nsplit_ab[{case}]: host-vs-dev max_rel default={r_cross_default:.2e} nsplit={r_cross_nsplit:.2e}");
+    assert!(r_cross_default < 1e-3 && r_cross_nsplit < 1e-3, "[{case}] host vs dev descriptor builders disagree");
+
+    eprintln!("moe_q4_grouped_nsplit_ab[{case}]: PASS (mt={mt} n_exp={n_exp} N={n} K={k})");
+}
+
+#[test]
+fn moe_q4_grouped_nsplit_ab_uniform() {
+    let Some(d) = CudaDevice::create().expect("cuda") else { eprintln!("no CUDA"); return; };
+    // Uniform: several experts, identical row counts, exercises the common
+    // multi-full-tile (BM=64) case cleanly.
+    run_nsplit_ab_case(d.as_ref(), "uniform", 6, 128, 128, &[(0, 64), (1, 64), (2, 64), (3, 64), (4, 64), (5, 64)]);
+}
+
+#[test]
+fn moe_q4_grouped_nsplit_ab_ragged() {
+    let Some(d) = CudaDevice::create().expect("cuda") else { eprintln!("no CUDA"); return; };
+    // Ragged/uneven, non-power-of-two: mixed group sizes (incl m=1) that
+    // don't divide BM=64 evenly, N/K are the real Nemotron-shape-derived
+    // dense proj dims (multiples of 64 per the kernel's constraint, but
+    // themselves not powers of two), and duplicate-adjacent small groups.
+    let sizes = [1usize, 2, 7, 13, 31, 64, 96, 128, 200, 17, 40, 55, 88, 3, 9, 3];
+    let groups: Vec<(usize, usize)> = sizes.iter().enumerate().map(|(e, &r)| (e, r)).collect();
+    run_nsplit_ab_case(d.as_ref(), "ragged", sizes.len(), 2688, 1856, &groups);
+}
+
+#[test]
+fn moe_q4_grouped_nsplit_ab_zero_count_expert() {
+    let Some(d) = CudaDevice::create().expect("cuda") else { eprintln!("no CUDA"); return; };
+    // Zero-count-expert: several experts selected zero times (empty
+    // groups, exercising the gend=0/padding-tile path), mixed with one
+    // big skewed group. One-group-per-expert-id (distinct sequential
+    // ids matching moe_q4_grouped_mma_dev's offsets[n_exp+1] contract --
+    // it represents the real MoE-routing CSR layout, one contiguous
+    // range per expert index, so it cannot itself express a duplicate
+    // expert id across two separate groups; that's not a gap in this
+    // test, it's the on-device descriptor format's actual contract).
+    // "Duplicate expert id across tiles" is still exercised organically
+    // by every other case here whose groups exceed BM=64 rows: the host
+    // path's own tiling loop (`while t < e { ...eid.push(g's id)...
+    // t += 64 }`) tags MULTIPLE tiles with the same eid for any
+    // >64-row group (e.g. the ragged case's 200-row and 128-row groups,
+    // and this case's own 200-row group below), which is the actual
+    // "duplicate index" scenario this kernel encounters in production.
+    let groups: [(usize, usize); 8] = [(0, 200), (1, 0), (2, 3), (3, 0), (4, 37), (5, 0), (6, 3), (7, 0)];
+    run_nsplit_ab_case(d.as_ref(), "zero_count_expert", 8, 128, 128, &groups);
+}
+
 #[test]
 fn moe_cutlass_f16_bench() {
     let Some(d) = CudaDevice::create().expect("cuda") else { eprintln!("no CUDA"); return; };

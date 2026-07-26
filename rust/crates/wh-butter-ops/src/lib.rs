@@ -2706,6 +2706,132 @@ extern "C" __global__ void moe_q4_grouped_mma(
 }
 "#;
 
+// F-round-14: warp-count-doubled variant of moe_q4_grouped_mma. Round 13
+// scoped this via standalone nvcc (zero GPU cost): splitting the NS=16
+// N-slots across an extra warp axis (4 warps->8 warps, 128->256 threads)
+// halves the per-thread f32 accumulator (oc[16][4]=64 regs -> oc[8][4]=32
+// regs) while leaving BM/BN/the A-tile identical (so A-tile reuse and
+// arithmetic intensity are UNCHANGED -- this is NOT the closed round-9/12
+// "BN/NS shrink", which shrunk the output tile itself and lost -9.6%/-6.5%
+// from doubled A rereads). Under `__launch_bounds__(256,4)` this compiles
+// to 64 registers with ZERO spill (verified via `nvcc -Xptxas -v`,
+// ~/laguna-bench/variant_nsplit_lb4.cu), raising the reg-limited occupancy
+// ceiling from 5 blocks/SM * 4 warps = 20 warps/SM (41.7%) to 4 blocks/SM *
+// 8 warps = 32 warps/SM (66.7%) -- smem (19200B/block, unchanged) still
+// allows 5 blocks/SM so the ceiling here is register-, not smem-, bound.
+// `__launch_bounds__(256,5)` (targeting the smem-implied 5th block) SPILLS
+// (48 regs but 72B stack + 96B spill-store + 88B spill-load per round 13),
+// so (256,4)/64-reg/66.7% is the practical ceiling for this redesign.
+//
+// warp_m = warp>>1 in [0,4) selects the M-row block (same meaning as the
+// baseline's `wrow=warp*16`); warp_n = warp&1 in [0,2) selects which half
+// of the 16 N-slots (s in [warp_n*8, warp_n*8+8)) this warp accumulates.
+// Both warp_n halves of a given warp_m redundantly ldmatrix the SAME
+// shared As[] tile (cheap shared-mem reads, not extra global traffic) so
+// the block's total output tile (BM=64 x BN=128) and A-tile reuse are
+// unchanged vs the baseline. The LOADC cooperative-load distribution loops
+// are pure strided covers (`for e=tid; e<bound; e+=NTHREADS`) so they are
+// correct for any thread count that covers `bound`; NTHREADS=256 here.
+//
+// Gated by `BUTTER_LAGUNA_MOE_NSPLIT=1` (see `laguna_moe_nsplit_on`
+// below), default OFF -- matches every other lever this campaign has
+// gated, byte-identical launch geometry (source/kernel-name/block dim) to
+// before this change when unset.
+const MOE_Q4_GROUPED_MMA_NSPLIT_SRC: &str = r#"
+#include <cuda_fp16.h>
+__device__ __forceinline__ unsigned dq2(unsigned w, int sh, __half sc){
+    unsigned two = (w >> sh) & 0xFFu;
+    unsigned packed = ((((two & 0xf0u) << 12) | (two & 0xfu)) ^ 0x00080008u) | 0x64006400u;
+    __half2 h = *reinterpret_cast<__half2*>(&packed);
+    h = __hmul2(__hsub2(h, __float2half2_rn(1032.0f)), __half2half2(sc));
+    return *reinterpret_cast<unsigned*>(&h);
+}
+#define CPA(SD,SP) asm volatile("cp.async.cg.shared.global [%0],[%1],16,16;\n" :: "r"(SD), "l"(SP))
+extern "C" __global__ void __launch_bounds__(256,4) moe_q4_grouped_mma_nsplit(
+    const __half* __restrict__ A,
+    const unsigned* __restrict__ Qs,
+    const __half* __restrict__ Sc,
+    const int* __restrict__ tok0_arr, const int* __restrict__ eid_arr, const int* __restrict__ gend_arr,
+    __half* __restrict__ Out,
+    int N, int K, int band_n)
+{
+    const int BM=64,BN=128,BK=32,NS_H=8,NKS=2,GS=32,WPR=BK/8,GPR=BK/GS,STAGES=3;
+    const int NTHREADS=256;
+    int bx = band_n ? blockIdx.y : blockIdx.x;
+    int by = band_n ? blockIdx.x : blockIdx.y;
+    int tok0=tok0_arr[bx], gend=gend_arr[bx], eid=eid_arr[bx], n0=by*BN;
+    int tid=threadIdx.x,warp=tid>>5,lane=tid&31,gid=lane>>2,tid4=lane&3;
+    int warp_m = warp >> 1;       // 0..3 : M-row block (same meaning as baseline's warp*16)
+    int warp_n = warp & 1;        // 0..1 : which half of the 16 N-slots
+    int wrow = warp_m*16;
+    int s_lo = warp_n*NS_H;
+    __shared__ __half   As[3][BM][BK];
+    __shared__ unsigned Wqs[3][BN][WPR];
+    __shared__ __half   Scs[3][BN][GPR];
+    float oc[NS_H][4]; for(int s=0;s<NS_H;s++){oc[s][0]=oc[s][1]=oc[s][2]=oc[s][3]=0.f;}
+    int nchunk=K/BK, WPB=K/32;
+    long ebase=(long)eid*N;
+#define LOADC(C,BUF) do{ int kc=(C)*BK; \
+    for(int e=tid;e<BM*(BK/8);e+=NTHREADS){ int r=e/(BK/8),k8=(e%(BK/8))*8; int t=tok0+r; int v=(t<gend); \
+        unsigned sd=(unsigned)__cvta_generic_to_shared(&As[BUF][r][k8]); \
+        const __half* sp=&A[(long)(v?t:tok0)*K + kc + k8]; CPA(sd,sp); } \
+    for(int e=tid;e<BN*WPR/4;e+=NTHREADS){ int f=e*4,r=f/WPR,w0=f%WPR; long wr=ebase+((n0+r<N)?(n0+r):0); \
+        unsigned sd=(unsigned)__cvta_generic_to_shared(&Wqs[BUF][r][w0]); \
+        const unsigned* sp=&Qs[wr*WPB*4 + kc/8 + w0]; CPA(sd,sp); } \
+    for(int e=tid;e<BN*GPR;e+=NTHREADS){ int r=e/GPR,g=e%GPR; long sr=ebase+((n0+r<N)?(n0+r):0); \
+        Scs[BUF][r][g]=Sc[sr*WPB + kc/32 + g]; } \
+    }while(0)
+    for(int i=0;i<STAGES-1 && i<nchunk;i++){ LOADC(i,i); asm volatile("cp.async.commit_group;\n"); }
+    __syncthreads();
+    for(int c=0;c<nchunk;c++){
+        int pf=c+STAGES-1;
+        if(pf<nchunk){
+            LOADC(pf, pf%STAGES); asm volatile("cp.async.commit_group;\n");
+            asm volatile("cp.async.wait_group 2;\n");
+        } else if(c+1<nchunk){
+            asm volatile("cp.async.wait_group 1;\n");
+        } else {
+            asm volatile("cp.async.wait_group 0;\n");
+        }
+        __syncthreads();
+        int buf=c%STAGES;
+        for(int ks=0;ks<NKS;ks++){ int ko=ks*16; int c0=ko+2*tid4;
+            int arow = (lane & 7) + ((lane >> 3) & 1) * 8;
+            int acol = (lane >> 4) * 8;
+            unsigned aaddr = (unsigned)__cvta_generic_to_shared(&As[buf][wrow+arow][ko+acol]);
+            unsigned a0,a1,a2,a3;
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(a0),"=r"(a1),"=r"(a2),"=r"(a3) : "r"(aaddr));
+            #pragma unroll
+            for(int s=0;s<NS_H;s++){ int nrow=(s_lo+s)*8+gid;
+                unsigned wA=Wqs[buf][nrow][c0/8], wB=Wqs[buf][nrow][(c0+8)/8];
+                __half sA=Scs[buf][nrow][c0/GS], sB=Scs[buf][nrow][(c0+8)/GS];
+                unsigned b0=dq2(wA,(c0&7)*4,sA);
+                unsigned b1=dq2(wB,(c0&7)*4,sB);
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+                    :"+f"(oc[s][0]),"+f"(oc[s][1]),"+f"(oc[s][2]),"+f"(oc[s][3])
+                    :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+            }
+        }
+        __syncthreads();
+    }
+    int r0=tok0+wrow+gid, r8=tok0+wrow+gid+8;
+    for(int s=0;s<NS_H;s++){ int col=n0+(s_lo+s)*8+2*tid4;
+        if(r0<gend&&col<N){ Out[(long)r0*N+col]=__float2half(oc[s][0]); Out[(long)r0*N+col+1]=__float2half(oc[s][1]); }
+        if(r8<gend&&col<N){ Out[(long)r8*N+col]=__float2half(oc[s][2]); Out[(long)r8*N+col+1]=__float2half(oc[s][3]); }
+    }
+}
+"#;
+
+// BUTTER_LAGUNA_MOE_NSPLIT=1: A/B switch for the warp-count-doubled
+// moe_q4_grouped_mma_nsplit redesign above. Default OFF = byte-identical
+// launch geometry (source/kernel-name/block dim) to before this change.
+#[inline]
+fn laguna_moe_nsplit_on() -> bool {
+    std::env::var("BUTTER_LAGUNA_MOE_NSPLIT").as_deref() == Ok("1")
+}
+
 // BUTTER_LAGUNA_SCHED=1: A/B switch for the two Laguna prefill CTA-scheduling
 // levers on the Q4 grouped GEMM (see moe_q4_grouped_mma / _dev below). Default
 // off = byte-identical launch geometry to before this change.
@@ -2775,13 +2901,19 @@ pub fn moe_q4_grouped_mma(
     } else {
         [n_mtiles as u32, (n as u32).div_ceil(128), 1]
     };
+    let nsplit = laguna_moe_nsplit_on();
+    let (moe_src, moe_kname, moe_block): (&str, &str, [u32; 3]) = if nsplit {
+        (MOE_Q4_GROUPED_MMA_NSPLIT_SRC, "moe_q4_grouped_mma_nsplit", [256, 1, 1])
+    } else {
+        (MOE_Q4_GROUPED_MMA_SRC, "moe_q4_grouped_mma", [128, 1, 1])
+    };
     dev.dispatch_raw_cuda(
-        MOE_Q4_GROUPED_MMA_SRC, "moe_q4_grouped_mma.cu", "moe_q4_grouped_mma",
+        moe_src, "moe_q4_grouped_mma.cu", moe_kname,
         &[(a.buffer.as_ref(), a.offset), (qs.buffer.as_ref(), qs.offset), (sc.buffer.as_ref(), sc.offset),
           (t0d.buffer.as_ref(), 0), (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
           (out.buffer.as_ref(), 0)],
         &[i(n as i32), i(k as i32), i(band_n as i32)],
-        grid, [128, 1, 1], 0, false)?;
+        grid, moe_block, 0, false)?;
     Ok(out)
 }
 
@@ -2902,13 +3034,19 @@ pub fn moe_q4_grouped_mma_dev(
     } else {
         [maxt as u32, (n as u32).div_ceil(128), 1]
     };
+    let nsplit = laguna_moe_nsplit_on();
+    let (moe_src, moe_kname, moe_block): (&str, &str, [u32; 3]) = if nsplit {
+        (MOE_Q4_GROUPED_MMA_NSPLIT_SRC, "moe_q4_grouped_mma_nsplit", [256, 1, 1])
+    } else {
+        (MOE_Q4_GROUPED_MMA_SRC, "moe_q4_grouped_mma", [128, 1, 1])
+    };
     dev.dispatch_raw_cuda(
-        MOE_Q4_GROUPED_MMA_SRC, "moe_q4_grouped_mma.cu", "moe_q4_grouped_mma",
+        moe_src, "moe_q4_grouped_mma.cu", moe_kname,
         &[(a.buffer.as_ref(), a.offset), (qs.buffer.as_ref(), qs.offset), (sc.buffer.as_ref(), sc.offset),
           (t0d.buffer.as_ref(), 0), (eidd.buffer.as_ref(), 0), (ged.buffer.as_ref(), 0),
           (out.buffer.as_ref(), 0)],
         &[i(n as i32), i(k as i32), i(band_n as i32)],
-        grid, [128, 1, 1], 0, false)?;
+        grid, moe_block, 0, false)?;
     Ok(out)
 }
 
