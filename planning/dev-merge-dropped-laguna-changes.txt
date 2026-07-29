@@ -1,0 +1,42 @@
+# Dev (Laguna) Swift changes superseded by our refactor in the dev-merge reconciliation
+# Recover any of these from origin/dev during the architecture review, e.g.:
+#   git show origin/dev:<path>   |  git checkout origin/dev -- <path>
+
+Sources/ButterCLI/GenerateCommand.swift
+Sources/ButterCLI/ModelsCommand.swift
+Sources/ButterSwift/Audio/AudioPrimitives.swift
+Sources/ButterSwift/Audio/FishS1DACQuantization.swift
+Sources/ButterSwift/DType.swift
+Sources/ButterSwift/Loader/LoadOptions.swift
+Sources/ButterSwift/Models/Text/DeepSeekV4Text.swift
+Sources/ButterSwift/Models/Text/GPTOSSText.swift
+Sources/ButterSwift/Models/Text/LFM2Text.swift
+Sources/ButterSwift/Models/Text/NemotronHText.swift
+Sources/ButterSwift/Models/Text/Qwen2Text.swift
+Sources/ButterSwift/Models/Text/Qwen3Text.swift
+Sources/ButterSwift/Models/Text/Qwen3xText.swift
+Sources/ButterSwift/Ops/Ops.swift
+Sources/ButterSwift/Ops/OpsCoverageNotes.swift
+Sources/ButterSwift/Ops/OpsLogits.swift
+Sources/ButterSwift/Ops/OpsMath.swift
+Sources/ButterSwift/Ops/OpsValidation.swift
+Sources/ButterSwift/Ops/QuantizedOps.swift
+Sources/ButterSwift/Ops/QuantizedOpsValidation.swift
+Tests/ButterTests/Benchmark/MoEBgemmBm64MppTests.swift
+Tests/ButterTests/Loader/GGUFDequantTests.swift
+Tests/ButterTests/Models/InternLM2Tests.swift
+Tests/ButterTests/Models/LFM2Tests.swift
+Tests/ButterTests/Models/LlamaTests.swift
+Tests/ButterTests/Models/NemotronTests.swift
+Tests/ButterTests/Models/Qwen25Tests.swift
+Tests/ButterTests/Models/Qwen2Tests.swift
+Tests/ButterTests/Models/Text/LlamaTextTests.swift
+Tests/ButterTests/Models/Text/MistralTextTests.swift
+Tests/ButterTests/Ops/GatedDeltaPrepChunkTests.swift
+Tests/Helpers/VisionTestHelpers.swift
+Tests/ModelIntegrationTests/Audio/TTS/LlamaTTSIntegrationTests.swift
+Tests/ModelIntegrationTests/Audio/TTS/MarvisIntegrationTests.swift
+Tests/ModelIntegrationTests/Audio/TTS/StyleTTS2IntegrationTests.swift
+Tests/ModelIntegrationTests/ModelKVCacheMatrixIntegrationTests.swift
+Tests/ModelIntegrationTests/Text/Gemma4TextIntegrationTests.swift
+Tests/ModelIntegrationTests/Text/Qwen36TextIntegrationTests.swift
