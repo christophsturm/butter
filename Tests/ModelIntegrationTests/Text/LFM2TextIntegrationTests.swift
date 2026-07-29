@@ -35,7 +35,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "LFM2 Text Integration", .serialized
@@ -178,7 +178,7 @@ struct LFM2TextIntegrationTests {
     // exercises `Model.standaloneChatTemplate` + `generate(messages:)` —
     // feeding a RAW prompt instead degenerates (the model echoes context),
     // which is correct instruct-model behaviour, not a forward bug. Points
-    // at FFAI's own 4-bit stacked-expert conversion
+    // at Butter's own 4-bit stacked-expert conversion
     // (`ekryski/LFM2.5-8B-A1B-4bit`, router + embed full-precision). ~8B
     // params — skipped unless already cached locally.
     @Test("LFM2.5-8B-A1B chat-templated generation produces coherent output")

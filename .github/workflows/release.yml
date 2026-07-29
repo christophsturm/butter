@@ -5,7 +5,7 @@ name: Release
 # creates a `release/<tag>` branch (kept open for hotfixes) and an
 # annotated tag, then publishes a GitHub Release with auto-generated
 # notes. The release publish event then automatically fires
-# notify-docs.yml, which triggers the ffai-website rebuild.
+# notify-docs.yml, which triggers the butter-website rebuild.
 #
 # Usage: GitHub UI → Actions → "Release" → Run workflow.
 #   bump_type:        major / minor / patch
@@ -60,16 +60,16 @@ jobs:
   test:
     if: github.repository_owner == 'thewafflehaus'
     name: Test before tag (Apple Silicon)
-    runs-on: macos-26
+    runs-on: macos-latest
     timeout-minutes: 45
     defaults:
       run:
-        working-directory: FFAI
+        working-directory: Butter
     steps:
-      - name: Checkout FFAI
+      - name: Checkout Butter
         uses: actions/checkout@v6
         with:
-          path: FFAI
+          path: Butter
           fetch-depth: 0   # full history so the release job can do tag math
 
       - name: Checkout sibling iron
@@ -106,9 +106,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: |
-            FFAI/.build
+            Butter/.build
             ~/Library/Caches/org.swift.swiftpm
-          key: spm-${{ runner.os }}-${{ hashFiles('FFAI/Package.swift', 'FFAI/Package.resolved') }}
+          key: spm-${{ runner.os }}-${{ hashFiles('Butter/Package.swift', 'Butter/Package.resolved') }}
           restore-keys: spm-${{ runner.os }}-
 
       - name: Cache HuggingFace model snapshots
@@ -128,14 +128,14 @@ jobs:
 
       - name: Generate kernel artifacts (iron build --emit all)
         working-directory: iron
-        # Build `__iron_runner` (wh-iron-std bin) alongside `iron` and put
+        # Build `__iron_runner` (iron-std bin) alongside `iron` and put
         # it on PATH — `iron build` spawns it by bare name and building only
         # `iron` never builds the sibling runner.
         run: |
           cargo build --release --bin iron --bin __iron_runner
           PATH="$PWD/target/release:$PATH" iron build --emit all \
-            --out ${{ github.workspace }}/FFAI/Sources/IronSwift
-          OUT="${{ github.workspace }}/FFAI/Sources/IronSwift/Generated"
+            --out ${{ github.workspace }}/Butter/Sources/IronSwift
+          OUT="${{ github.workspace }}/Butter/Sources/IronSwift/Generated"
           if [ -f "$OUT/IronKernels.swift" ] && ! head -1 "$OUT/IronKernels.swift" | grep -q swift-format-ignore-file; then
             tmp="$OUT/IronKernels.swift.tmp"
             { printf '// swift-format-ignore-file\n//\n'; cat "$OUT/IronKernels.swift"; } > "$tmp"
@@ -152,11 +152,11 @@ jobs:
         run: swift build -c release --build-tests -Xswiftc -enable-testing
 
       - name: Run unit tests
-        # FFAITests + IronSwiftTests. CI on the merged branch
+        # ButterTests + IronSwiftTests. CI on the merged branch
         # already ran these on the source commit; this is the
         # belt-and-suspenders pass on the exact commit we're about to
         # tag, in release config.
-        run: swift test -c release --skip-build --filter "FFAITests|IronSwiftTests"
+        run: swift test -c release --skip-build --filter "ButterTests|IronSwiftTests"
 
       - name: Run integration tests (serialized — models load one at a time)
         # The real value-add of running tests inside the release
@@ -260,7 +260,7 @@ jobs:
           # IS allowed to fire (the other is `repository_dispatch`), which is
           # why this works while a passive `release: published` listener on
           # notify-docs.yml would not. notify-docs.yml then resolves the
-          # release metadata and dispatches ffai-website's deploy.yml using
+          # release metadata and dispatches butter-website's deploy.yml using
           # WEBSITE_DISPATCH_TOKEN.
           gh workflow run notify-docs.yml --ref main -F tag="$TAG"
           echo "dispatched notify-docs.yml for $TAG"
@@ -273,5 +273,5 @@ jobs:
             echo "- Commit:  \`${{ steps.bump.outputs.commit }}\`"
             echo "- Release: https://github.com/${{ github.repository }}/releases/tag/${{ steps.bump.outputs.tag }}"
             echo ""
-            echo "notify-docs.yml has been dispatched and will rebuild ffai-website against this tag."
+            echo "notify-docs.yml has been dispatched and will rebuild butter-website against this tag."
           } >> "$GITHUB_STEP_SUMMARY"

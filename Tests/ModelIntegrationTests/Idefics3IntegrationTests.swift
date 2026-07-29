@@ -30,7 +30,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "Idefics3 Integration", .serialized,
@@ -81,7 +81,7 @@ struct Idefics3IntegrationTests {
             // Absolute path for local development convenience
             URL(fileURLWithPath: NSHomeDirectory())
                 .appendingPathComponent(
-                    "Development/personal/ai/FFAI/Tests/ModelIntegrationTests/Resources/dog.jpeg"),
+                    "Development/personal/ai/Butter/Tests/ModelIntegrationTests/Resources/dog.jpeg"),
         ]
 
         for url in candidates {

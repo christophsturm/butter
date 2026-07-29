@@ -1,6 +1,6 @@
 # Streaming
 
-Streaming is the primitive in FFAI's generation API; the buffered `Model.generate(...)` is a thin collector over the same stream so there's one source of truth for the prefill + decode loop.
+Streaming is the primitive in Butter's generation API; the buffered `Model.generate(...)` is a thin collector over the same stream so there's one source of truth for the prefill + decode loop.
 
 ```swift
 let stream = model.generateStream(prompt: "Why is the sky blue?")

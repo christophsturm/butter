@@ -22,7 +22,7 @@
 //
 //   Unsloth's "UD-MLX-4bit" recipe is per-tensor dynamic quantization —
 //   different layers ship at different bit-widths inside the same
-//   checkpoint (`mixed_4_8`-style). FFAI's loader DOES handle per-tensor
+//   checkpoint (`mixed_4_8`-style). Butter's loader DOES handle per-tensor
 //   bit-widths via `deriveAffineQuantBits` reading each tensor's shape,
 //   so these checkpoints *should* load, but the path isn't pinned by a
 //   passing integration run yet. Enable + bisect once we're back to
@@ -50,7 +50,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "Qwen3.6 Unsloth UD-MLX mixed-precision Integration", .serialized,
@@ -103,7 +103,7 @@ struct Qwen36UnslothMixedTextIntegrationTests {
     /// the family expectation, and confirm a single forward step
     /// produces finite logits. No coherence assertion — this suite is
     /// about per-tensor-bit-width dispatch correctness, not generation
-    /// quality. The UD-MLX checkpoints exercise FFAI's
+    /// quality. The UD-MLX checkpoints exercise Butter's
     /// `deriveAffineQuantBits` path that derives each tensor's bit-width
     /// from its on-disk shape; per-layer correctness comes from "no
     /// nan / inf logits + the load succeeded" at this layer.

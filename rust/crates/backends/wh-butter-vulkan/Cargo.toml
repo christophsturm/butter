@@ -1,0 +1,40 @@
+[package]
+name = "wh-butter-vulkan"
+description = "Butter Vulkan backend — wraps wh-iron-runtime's VulkanDevice (GlslGenerator -> shaderc -> SPIR-V -> VkPipeline) behind the wh-butter-core Device trait. The portable GPU path for non-CUDA / non-Apple hardware."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wh-butter-core.workspace = true
+wh-iron-core = { workspace = true, optional = true }
+wh-iron-runtime = { workspace = true, optional = true }
+
+[dev-dependencies]
+wh-butter-core.workspace = true
+wh-iron-core.workspace = true
+wh-butter-models.workspace = true
+wh-butter-loader.workspace = true
+wh-butter-runtime.workspace = true
+
+[features]
+# Off by default so macOS / non-Vulkan hosts build the crate as a stub.
+# `--features vulkan` pulls wh-iron-runtime's real Vulkan device.
+vulkan = ["dep:wh-iron-core", "dep:wh-iron-runtime", "wh-iron-runtime/vulkan"]
+
+[[test]]
+name = "vulkan_smoke"
+required-features = ["vulkan"]
+
+[[test]]
+name = "qwen25_gguf_vulkan"
+required-features = ["vulkan"]
+
+[[test]]
+name = "qwen25_first_logit_diag"
+required-features = ["vulkan"]
+
+[[test]]
+name = "qwen25_prefill_coopmat"
+required-features = ["vulkan"]

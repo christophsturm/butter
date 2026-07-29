@@ -27,7 +27,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 private let drafterLocalDir =
     ("~/.cache/ffai/converts/gemma-4-12B-it-assistant-mlx-4bit" as NSString)

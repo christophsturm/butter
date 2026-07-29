@@ -26,7 +26,7 @@ import Metal
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 /// Bench target — the cached `mlx-community/Qwen3.6-35B-A3B-4bit`
 /// MoE checkpoint. Switched off Tom's prior `/Users/tom/models/...`

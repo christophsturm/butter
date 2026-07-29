@@ -1,9 +1,0 @@
-[package]
-name = "ffai-runtime"
-description = "FFAI generation runtime: KV cache, sampler, decode loop. Backend-neutral."
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-
-[dependencies]

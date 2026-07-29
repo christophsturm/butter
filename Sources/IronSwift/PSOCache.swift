@@ -172,7 +172,7 @@ public final class PSOCache: @unchecked Sendable {
     private static func isMppKernel(_ name: String) -> Bool {
         // Opt-out via env var, in case a future kernel name accidentally
         // matches (e.g. an `_mppow_` variant). Default on.
-        if let raw = ProcessInfo.processInfo.environment["FFAI_PSO_LIVE_COMPILE_MPP"],
+        if let raw = ProcessInfo.processInfo.environment["BUTTER_PSO_LIVE_COMPILE_MPP"],
             raw == "0" || raw.lowercased() == "false"
         {
             return false

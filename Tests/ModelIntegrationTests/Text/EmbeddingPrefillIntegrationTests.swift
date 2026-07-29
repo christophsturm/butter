@@ -35,7 +35,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Embedding-Prefill Numerics (batched == per-position)", .serialized)
 struct EmbeddingPrefillIntegrationTests {

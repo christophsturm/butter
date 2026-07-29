@@ -1,18 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/ffai-core",
-    "crates/ffai-ops",
-    "crates/ffai-loader",
-    "crates/ffai-runtime",
-    "crates/ffai-models",
-    "crates/ffai-modeltests",
-    "crates/ffai",
-    "crates/ffai-cli",
-    "crates/ffai-ffi",
-    "crates/backends/ffai-metal",
-    "crates/backends/ffai-cuda",
-    "crates/backends/ffai-vulkan",
+    "crates/wh-butter-core",
+    "crates/wh-butter-ops",
+    "crates/wh-butter-loader",
+    "crates/wh-butter-runtime",
+    "crates/wh-butter-models",
+    "crates/wh-butter-modeltests",
+    "crates/wh-butter",
+    "crates/wh-butter-cli",
+    "crates/wh-butter-ffi",
+    "crates/backends/wh-butter-metal",
+    "crates/backends/wh-butter-cuda",
+    "crates/backends/wh-butter-vulkan",
 ]
 
 [workspace.package]
@@ -20,22 +20,23 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Eric Kryski (@ekryski)", "Tom Turney (@TheTom)"]
-repository = "https://github.com/thewafflehaus/FFAI"
+repository = "https://github.com/thewafflehaus/butter"
 
 [workspace.dependencies]
+rayon = "1"
 # ── engine crates ────────────────────────────────────────────────────
-ffai-core = { path = "crates/ffai-core" }
-ffai-ops = { path = "crates/ffai-ops" }
-ffai-loader = { path = "crates/ffai-loader" }
-ffai-runtime = { path = "crates/ffai-runtime" }
-ffai-models = { path = "crates/ffai-models" }
-ffai = { path = "crates/ffai" }
-ffai-modeltests = { path = "crates/ffai-modeltests" }
+wh-butter-core = { path = "crates/wh-butter-core" }
+wh-butter-ops = { path = "crates/wh-butter-ops" }
+wh-butter-loader = { path = "crates/wh-butter-loader" }
+wh-butter-runtime = { path = "crates/wh-butter-runtime" }
+wh-butter-models = { path = "crates/wh-butter-models" }
+wh-butter = { path = "crates/wh-butter" }
+wh-butter-modeltests = { path = "crates/wh-butter-modeltests" }
 # ── backend crates ───────────────────────────────────────────────────
-ffai-metal = { path = "crates/backends/ffai-metal" }
-ffai-cuda = { path = "crates/backends/ffai-cuda" }
-ffai-vulkan = { path = "crates/backends/ffai-vulkan" }
-# ── shared kernel toolchain (external: the iron cuda/metal repo) ──
+wh-butter-metal = { path = "crates/backends/wh-butter-metal" }
+wh-butter-cuda = { path = "crates/backends/wh-butter-cuda" }
+wh-butter-vulkan = { path = "crates/backends/wh-butter-vulkan" }
+# ── shared kernel toolchain (external: the Iron cuda/metal repo) ──
 # Canonical pointer is the org `dev` branch, so a fresh clone is
 # self-contained. For local co-development against a sibling iron
 # checkout, add a `[patch]` override in your own (uncommitted) config.

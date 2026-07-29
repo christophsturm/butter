@@ -18,7 +18,7 @@
 // compose into coherent generated text on a real checkpoint.
 //
 // Hy3 is a 295B MoE checkpoint (oQ2 weights ≈ 75-92 GB), so this test
-// is gated on a local checkpoint supplied via the `FFAI_HY3_MODEL_PATH`
+// is gated on a local checkpoint supplied via the `BUTTER_HY3_MODEL_PATH`
 // env var rather than an HF download. Skips quietly when unset — no
 // machine-specific default, matching `AuraKLDIntegrationTests`.
 
@@ -26,15 +26,15 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Hy3 Integration", .serialized)
 struct Hy3IntegrationTests {
 
     @Test("load + config basics + generation defaults + greedy generate")
     func loadAndGenerate() async throws {
-        guard let modelPath = ProcessInfo.processInfo.environment["FFAI_HY3_MODEL_PATH"] else {
-            print("[skipped] Hy3IntegrationTests: FFAI_HY3_MODEL_PATH not set")
+        guard let modelPath = ProcessInfo.processInfo.environment["BUTTER_HY3_MODEL_PATH"] else {
+            print("[skipped] Hy3IntegrationTests: BUTTER_HY3_MODEL_PATH not set")
             return
         }
 

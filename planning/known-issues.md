@@ -1,293 +1,140 @@
-# Known Issues
+# Known Issues — to investigate after the model-implementation wave lands
 
-Open bugs + rough notes from the model-family port. Each entry carries
-enough context to pick up cold. Resolved-work history lives in
-`planning/session-plan.md` / `plan.md`, not here.
+Open bugs and rough notes captured during the model-family port. Each entry has enough context that a future session can pick it up cold.
 
-## Qwen3-VL-tower VIDEO path degenerate — surfaced 2026-06-04
+## GPU pin at 100% — long-running
 
-`Qwen35VisionIntegrationTests.videoTextGeneration` (`mlx-community/Qwen3.5-2B-4bit`,
-the Qwen3-VL ViT tower via `Qwen35VL.load`) greedy-decodes **degenerate**
-output on cat.mp4: 200 tokens at only **24 % unique**, stuck emitting
-`<think>` with no content — the cat is never described. The IMAGE path on the
-SAME tower is healthy (54 % unique, correctly describes the dog), and the
-video-token COUNT matches (the splice doesn't throw), so the per-token
-**video FEATURES** are wrong, not the placeholder geometry. Prime suspects:
-the Qwen3 tower's `encode(frames:)` temporal-patch fold (`temporal_patch_size`
-= 2) or the video M-RoPE position assignment. First time the Qwen3-VL-tower
-video path has had integration coverage (the suite previously pointed at the
-wrong model — Qwen3-VL-30B-A3B). Likely also affects
-`Qwen3VisionIntegrationTests.videoTextGeneration` (same tower); the full
-integration bisect will confirm. Debug via an mlx-vlm video-feature parity
-dump (same method that fixed LFM2-VL). NOT a placeholder/count bug.
+**Symptom.** During (some) model loads / runs the GPU pegs at 100 % utilisation and stays there. The machine does NOT freeze — `BUTTER_MAX_COMMAND_BUFFERS` caps the in-flight queue so we don't OOM the GPU — but the pin is real and the application becomes effectively unresponsive on that model.
 
-## GPU LSTM (`iron_lstm`) — context-dependent NaN in the full Kokoro chain
+**Status.** Cause unknown. Could be:
+- A iron kernel with a dispatch shape that never converges (a reduction kernel encoded as `elementwiseGrid`, or an indirect dispatch reading a still-uninitialised threadgroup-count buffer).
+- An Butter-side path that re-encodes the same buffer in a busy loop without checking the prior commit's `status`.
+- A specific kernel emitted by iron that has a per-thread loop parameterised on a stride that goes to zero / negative at certain shapes.
 
-**Symptom.** With the Kokoro front-end wired to run its LSTMs on the GPU
-(`KokoroFrontEndGPU.biLstmGPU` → `Ops.lstm`), the full `synthesize`
-chain produces an all-NaN waveform — first NaN is the `predictor.shared`
-biLSTM output at T≈65. The CPU `KokoroMath.biLSTM` on the **identical**
-input (`dAligned`, range ±2.27) is finite; proven with a side-by-side
-diagnostic (`shGPUnan=true` / `shCPUnan=false`).
+**Next steps when this lands as a priority.**
+1. Reproduce deterministically — capture the exact model + prompt that pins the GPU.
+2. Attach Metal System Trace (Instruments) while the pin is live. The trace shows which command buffer is in flight and which kernel is hung — that tells us iron-side vs Butter-side immediately.
+3. If iron-side: pull the kernel name from the trace, find the dispatch in `Ops.*`, audit the grid / threadgroup shape against the kernel's `## DISPATCH INVARIANTS` block.
+4. If Butter-side: check for a busy-loop that re-encodes the same compute pass without a `cmd.status` guard, or a missing `waitUntilCompleted` that lets the runtime queue grow unbounded.
 
-**Why it's not numerical.** `predictor.shared` weights are bounded
-(absmax ≈ 1.26) and an LSTM cell is mathematically bounded
-(`|c_new| ≤ |c_old| + 1`, gates ∈ [0,1], tanh ∈ [-1,1]) — so a correct
-LSTM **cannot** emit NaN from finite, bounded input. The NaN must be a
-kernel/resource fault (uninitialised threadgroup/buffer read), not
-overflow.
+**Mitigation today.** `BUTTER_MAX_COMMAND_BUFFERS=16` (the production default since the wrong-dispatch GPU-pin post-mortem in `papers/optimizing-kernels-for-apple-m-series-architecture.md`) prevents the runaway queue from OOMing the device — that's why the pin is annoying but not fatal.
 
-**Why it's elusive.** The kernel is correct **in isolation**: two
-regression tests at the real shape (hidden 256 = 8 simdgroups, seqLen 65)
-both pass — `lstmLongSeqHidden256` (plain) and
-`lstmBidirectionalSharedOutput` (the exact `outStride`/`outOffset`/
-`reverse` shared-output pattern `biLstmGPU` uses), each 12–16 repeated
-dispatches, finite + bit-deterministic + matching the CPU oracle. The
-NaN only appears **after the full chain's many prior GPU dispatches**
-(PLBERT 12 layers + bert/text encoders + per-block decoder/generator
-work) — a context/state interaction, possibly iron buffer-pool
-aliasing or a Metal threadgroup-memory hazard that needs that much prior
-GPU traffic to surface. Not reproducible standalone, so not yet bisectable.
+### 2026-05-23 status — post-Phase 6.5 / 7 wave + recent iron churn
 
-**Mitigation in place.** Kokoro's front-end LSTMs (text_encoder /
-durationEncoder / predictor.lstm / shared) run on the **CPU** — negligible
-at L ≤ ~70. Everything matrix-heavy (PLBERT, convs, F0/N AdaIN curves, the
-whole decoder + generator) stays GPU-resident; full GPU chain output is
-then identical to the verified CPU path (energy 75.23).
+**Hypothesis stack (ranked).** The Phase 6.5 (Vision) + Phase 7 (Audio) wave landed 18 commits on `ek/aura-port` without re-running any kernel or integration tests — every sub-agent prompt was "swift build only, don't run swift test on ModelTests". On the iron side, the `Sources/IronSwift/Resources/kernels.metallib` was regenerated 2026-05-23 01:24 against `iron@840d281`. That regen pulled in:
 
-**To re-enable.** Find an isolation repro (replay the exact failing
-`predictor.shared` input+weights captured from a full-chain run; or stress
-hundreds of back-to-back `Ops.lstm` dispatches interleaved with gemm/sdpa
-to churn the buffer pool), then bisect lstm.rs (threadgroup `h`/`c` init +
-barriers — they look correct on inspection) or the FFAI Tensor buffer
-pool. Re-point `biLstmGPU` back to `Ops.lstm` once fixed.
+- **#150** `mt_gated_delta_prep_chunk` — new chunked GDN prep+recurrence kernel.
+- **#149** "remove all hand-written InlineMsl — port the MPP kernels to the coop_tile DSL" — the int4/int8/fp16 spread the user has been working on in another session.
+- **#147** "All the remaining kernels" — large surface, broad.
+- **#144** bm8 MoE BGEMM + dynamic-M qmm + naming standardisation.
 
-## GPU pin — broad vision SDPA pin ELIMINATED; residual d32 + watch item
+Most likely cause: a kernel in #147 or #149 with a dispatch shape that goes pathological at production sizes but isn't caught by the small-N unit tests. The MPP coop_tile DSL port is the highest-suspicion bucket because cooperative-tensor type IDs drift across SDK versions and the DSL refactor reshuffled the lowering path.
 
-**Status (updated 2026-06-05).** The broad GPU pin is **gone.** The
-2026-05-30 iron production-shape work added `(nQuery=576, nQHeads=16)`
-GPU-correctness cells for `iron_sdpa_bidirectional` at d{64,72,80,96} and
-fixed the dispatch-geometry bug, so those dims are now **GPU
-production-safe** (`OpsValidation.sdpaBidirectionalProductionSafeHeadDims
-= {64,72,80,96}`; `sdpaBidirectionalIsProductionSafe(_:)` gates the choice).
-The vision towers that used to pin (GlmOcr, MiniCPM-V, Qwen2/2.5/3-VL,
-Gemma4, SmolVLM2 — all d64–d96) run their bidirectional attention on the
-GPU. (`defaultMaxCommandBufferCount` is 64 since PR #14 / J.7.)
+**Test plan to localise (when the machine has been rebooted and the pin cleared).**
 
-**Residual — the only CPU-guarded bidirectional path:**
-- **d32 — FastViT-HD (FastVLM).** Has a kernel (`sdpaBidirectionalSupportedHeadDims`
-  includes 32) but is **not production-verified**
-  (`sdpaBidirectionalIsProductionSafe(32) == false`), so `VisionEncoderLayer`
-  falls back to the CPU `cpuAttention` path for d32. To close: add an
-  `sdpa_bidirectional_d32_*` production-shape correctness cell in
-  wh-iron-std, then add 32 to `sdpaBidirectionalProductionSafeHeadDims`.
-- **d128** (Pixtral / Mistral3 / GlmOcr full-attention) routes through
-  `Ops.sdpaMulti(causal:false)`, not the bidirectional kernel — unaffected.
+1. **Spot-check unit suite first.** `make test-unit` runs ButterTests + IronSwiftTests at small problem sizes against the real GPU. If it fails, the failing test name pins down the broken kernel immediately. ~3 minutes.
+2. **If unit suite passes, drop in a small integration.** `make test-integration --filter LlamaIntegrationTests` — Llama 3.2 1B exercises the core decode path (RMSNorm, RoPE, SDPA d128, gemv, argmax) without the multi-modal or hybrid kernels. If this pins the GPU, the bug is on a core kernel.
+3. **Bisect by family if step 2 passes.** `make test-integration --filter <Qwen3 | Gemma3 | NemotronH | Jamba | GraniteMoeHybrid | GPTOSS | Pixtral | Mistral3 | Whisper | Marvis>` — pick the families that cover the most distinct kernels (MoE, GDN, SSM, AURA, VLM, audio).
+4. **Once a family pins reliably:**
+   - **Path A — capture in Instruments (Metal System Trace).** Launch the failing test under Instruments → Metal System Trace. The trace shows the in-flight command buffer + its current dispatch. Read off the kernel name. If it's specialised (e.g. `mt_qmm_int4_f16_bm8_*`), that's our suspect.
+   - **Path B — `MTLCaptureManager` Metal frame capture from Butter.** Wrap the suspect dispatch with `MTLCaptureManager.shared()` `.startCapture` / `.stopCapture`. Saves a `.gputrace` you can open in Xcode and step through.
+5. **Localised? Audit the kernel's `## DISPATCH INVARIANTS` block in iron vs the Butter `Ops.*` wrapper that calls it.** Reduction-mode kernel encoded as `elementwiseGrid` is the canonical freeze pattern (see `papers/optimizing-kernels-for-apple-m-series-architecture.md`).
 
-**Watch item (vision + audio).** The validate-or-fall-back guard
-(`sdpaBidirectionalIsProductionSafe`) means a **new, never-benched shape**
-(a tower with an unlisted head_dim, or a much larger `nQuery`) cleanly
-falls to CPU rather than pinning — but that's exactly where a future
-regression would hide, so keep watching new vision/audio attention shapes.
-The old "every dim CPU-guarded, only d72 GPU" state no longer applies.
+**Capturing the pin live (if it can be done without reboot).** It's possible to attach Instruments to an already-pinned process and see which command buffer is in flight — `xcrun xctrace record --template "Metal System Trace" --attach <PID>`. Stop after ~5 seconds; the trace shows the queue depth and the hung dispatch. This is preferable to a reboot+rerun because we get the actual culprit rather than a candidate from rerunning.
 
-## CPU cost remaining on audio encoders + FastVLM (vision now mostly GPU)
+**Live signal at the moment.** The user reports the pin reproduces right now (2026-05-23) after a fresh reboot — i.e. it's not a sticky-from-previous-session situation. Some path the OS goes through on this branch's `kernels.metallib` is enough to trigger it. That makes the kernel-side hypothesis (one of the freshly-regenerated kernels) substantially more likely than an Butter-side busy-loop.
 
-**Status (updated 2026-06-05).** The vision-tower bidirectional attention
-moved back to the GPU at d64–d96 (see the GPU-pin entry), so VLM tests no
-longer saturate CPU on attention. The genuine CPU perf cost that remains:
+## CPU pin — vision / audio models burn all CPU cores
 
-- **Audio encoders (Whisper, Qwen-Omni)** — `AudioEncoder.swift::cpuAttention`
-  runs ~24 blocks of bidirectional attention over ~1500 frames on CPU
-  (~70 GFLOP/utterance); `WhisperIntegrationTests` /
-  `QwenOmniIntegrationTests` can hit the test timeout. Whisper's decoder
-  also re-pays cross-attention CPU cost per token (no cross-side KV cache).
-  These towers are mostly d≥64, so the production-safe `sdpaBidirectional`
-  kernels now exist — the migration is wiring, not a missing kernel.
-- **FastVLM** — d32 FastViT-HD attention is CPU-guarded (see GPU-pin
-  residual) and its depthwise convs run CPU (no `Ops.conv2dDepthwise`).
+**Symptom.** During some integration tests (observed via `mactop`), all CPU cores spike to 100 % while the GPU stays well below saturation. GPU never sitting at 100 % during these runs is the giveaway — work that should be on the GPU is silently running on the CPU instead.
 
-**Next step.** Migrate the audio encoder to `Ops.sdpaBidirectional` and the
-decoder self-attn to `Ops.sdpaMulti(causal:true)` + a precomputed-K/V
-cross-attention dispatch; add the d32 production cell + a depthwise-conv2d
-kernel for FastVLM.
+**Status.** Cause unknown. The vision (Phase 6.5) and audio (Phase 7) model families landed without a CPU-fallback audit, so the suspect surface is anything those pipelines touch where:
 
-## SDPA head-dim + AURA kernel coverage
+- A model op silently falls through to the parallel-CPU `concurrentPerform` core because no GPU wrapper was wired up (e.g. unknown SDPA `head_dim`, missing `Ops.conv2dDepthwise`, a custom audio op).
+- A test or harness allocates / keeps tensors on CPU instead of dispatching to GPU.
+- A test fixture / oracle is running its CPU reference path (parallelised across cores) and we're misreading that as the model itself pinning the CPU.
 
-What's wired vs outstanding (verified 2026-05-28).
+**Live signal.** `mactop` shows full CPU saturation across all cores during some currently-running tests; GPU has not been seen pegged during the same window. Indicates CPU is doing real work the GPU should be doing — or that a test-side CPU oracle dwarfs the GPU dispatch.
 
-**Text decode — `Ops.sdpaDecode`** (`OpsValidation.supportedSdpaHeadDims`):
+**Next steps when this lands as a priority.** Deferred until the current integration-test sweep finishes — that pass will surface more failures and give a fuller picture of which model families need attention. Then:
 
-| head_dim | Status | Notes |
+1. Re-run vision / audio model tests under `mactop` (or `powermetrics --samplers cpu_power,gpu_power`) to confirm the CPU pin reproduces and pin down which families.
+2. For each pinning family, instrument the forward pass to log every op dispatch — find the calls that hit `concurrentPerform` / `cpuFallback` paths instead of `Ops.*` GPU dispatch.
+3. Cross-reference against the FastVLM CPU depthwise-conv outlier in [§ Vision tower SDPA](#vision-tower-sdpa--head_dim-coverage) — likely the same class of gap, just not yet enumerated for the other vision / audio families.
+4. File missing `Ops.*` wrappers as separate iron / Butter follow-ups (kernel exists in iron but no Swift wrapper, or kernel itself missing).
+
+## Vision tower SDPA — head_dim coverage
+
+VLM vision towers run bidirectional multi-head attention; Butter now ships GPU kernels for every head_dim in the cached zoo:
+
+| head_dim | Kernel | Models |
 |---|---|---|
-| 64, 96, 128, 256, 512 | ✅ wired | d96 added this session (Phi-3); d128 generic; d256 two-phase; d512 dedicated |
+| 32  | `Ops.sdpaBidirectional` (d32) | FastVLM (FastViT-HD) |
+| 64  | `Ops.sdpaBidirectional` (d64) | SigLIP-base, CLIP-L, Mistral3, Gemma 4 E2B/E4B, Qwen3-VL 2B/4B |
+| 72  | `Ops.sdpaBidirectional` (d72, ragged) | SigLIP-So400m → Paligemma, Gemma 3 VL, Gemma 4 26B/31B, Idefics3, Qwen3-VL-30B-A3B |
+| 80  | `Ops.sdpaBidirectional` (d80, ragged) | Qwen2.5-VL |
+| 96  | `Ops.sdpaBidirectional` (d96) | Qwen2-VL |
+| 128 | `Ops.sdpaMulti(causal: false)` | Pixtral, Mistral3 Pixtral-base, GlmOcr |
 
-**Sliding-window decode** (`slidingWindowSdpaHeadDims`):
+`Sources/ButterSwift/VisionEncoder.swift::forward` dispatches based on the tower's `headDim`. Unknown head_dims (e.g. d80 at SigLIP-So-400m variants not yet seen) fall back to the parallel CPU `concurrentPerform` core. No tracked head_dim gaps as of 2026-05-24.
 
-| head_dim | Status |
-|---|---|
-| 128 | ✅ |
-| 64, 256, … | ❌ sliding-window only supported at d128 today |
+The remaining known cold-inference outlier is FastVLM at 1024px: its FastViT-HD stem has 256×256×96 + 128×128×192 depthwise convs that still run CPU because no `Ops.conv2dDepthwise(...)` wrapper exists. Tracked as a separate iron follow-up.
 
-**Vision bidirectional — `Ops.sdpaBidirectional`** (`sdpaBidirectionalSupportedHeadDims = {32,64,72,80,96}`):
+## Integration bisect — 2026-05-23/24 first-run findings
 
-| head_dim | Kernel | GPU production-safe? |
-|---|---|---|
-| 64, 72, 80, 96 | ✅ | ✅ verified at production shape (576×16) — `sdpaBidirectionalProductionSafeHeadDims` |
-| 32 | ✅ | ❌ has a kernel but not production-verified → CPU-guarded (FastViT-HD / FastVLM) |
-| 128 | n/a | routed through `Ops.sdpaMulti(causal:false)` (Pixtral, Mistral3, GlmOcr) |
+Per-suite serialised bisect run via `make integration-bisect` (commit `6047340`+) surfacing failures across all 74 integration tests. Fixed during the run:
 
-**AURA KV (Π-rotated quantized cache):**
+- **ChatterboxIntegrationTests** — was failing on `unsupported dtype I64 for tensor "s3gen.speaker_encoder.xvector.block1.tdnnd6. nonlinear2.batchnorm.num_batches_tracked"`. Fixed in commit `af74ce7` by adding `.i64` / `.u64` to `DType` + making `SafeTensorsBundle` skip tensors with unsupported dtypes (Debug log only). Now PASSes in 21s.
 
-- Family wiring: ✅ **universal** — every attention family rotates Q by Π
-  / un-rotates the output (generalised this session).
-- Schemes: ✅ `AURACodebook.supportedBits = {2,3,4,8}`; any `aura{kb}v{vb}`
-  combo (aura4v4 default, aura4v2, aura8v8, …); encode kernels exist for
-  int2/3/4/8.
-- head_dim: ⚠️ **power-of-two only** (factory guard) — works at
-  64/128/256, excludes 96 (Phi-3) / 80.
-- Performance: ❌ decode still uses the dequant B-path; compressed-domain
-  `aura_flash` fast decode is Phase H (H.1/H.2 open in session-plan).
+- **CohereTranscribeIntegrationTests** — HF 404. Original `mlx-community/c4ai-aya-expanse-transcribe-mlx` archived; Cohere re-released as `cohere-transcribe-03-2026`. Fixed in commit `6ad9e73` pointing test at `mlx-community/cohere-transcribe-03-2026-mlx-8bit`.
 
-## Gemma4-31B-4bit degenerate output — likely sampling config, unverified
+Triage queue from same run (root-cause TBD — most look pre-existing):
 
-`mlx-community/gemma-4-31b-it-4bit` (`Gemma4Dense (31B)`) greedy-decodes at
-~10 % diversity while E2B / E4B / 26B-A4B pass. Likely the **same class** as
-the (now-resolved) GPT-OSS-20B case — model default sampling on a RAW prompt
-(flat low-probability tail at temp 1.0 → word-salad), not a kernel/forward
-bug. Re-test with constrained sampling (`min_p 0.05`) or the chat template,
-and add a forward-parity guard vs mlx-lm (like `GPTOSSTextIntegrationTests`
-now has) before assuming a kernel bug.
+- **DeepSeekR1DistillIntegrationTests** — R1-Distill-Llama-8B PASSes; R1-Distill-Qwen-1.5B produces degenerate output (token 15 repeated). Manually verified `mt_add_rms_norm` at hidden=1536 with `maxResidErr=0`, `maxNormedErr=1.4e-6` against CPU reference — fusion is NOT the regressor. Likely a pre- existing Qwen2 (R1-Distill base architecture) issue.
 
-## Qwen3-1.7B-3bit degenerate output — model quality floor, NOT a kernel bug
+- **FastVLMIntegrationTests** — `Swift/ContiguousArrayBuffer.swift: 692: Fatal error: Index out of range` during the `load` test. Crash happens before the GPU-SDPA path runs, so the VLM agent's migration is not the cause. Suspect the SafeTensors-skip change or a pre-existing array index in the FastViT-HD loader.
 
-`Quantized3bitIntegrationTests` fails coherence (19 unique tokens / 200,
-real-but-repetitive). **Confirmed not a kernel bug:** the only int3
-kernels on the path (`dequant_gather_int3`, `dequant_gemv_int3`) pass new
-production-shape GPU-correctness cells (iron `5cca5ac`), and the
-emitted MSL is behaviorally identical before/after the `1522fbd` codegen
-change. Pure 3-bit on a 1.7B model just sits at its greedy quality floor
-— same class as Qwen3.5-0.8B (which relaxed its floor to 0.05) and the
-2-bit test (no coherence assert).
+- **FireRedASR2IntegrationTests** — `Butter/Layers.swift:19: Precondition failed: Linear: weight must be 2D`. Some weight tensor is non-2D where a `Linear` is expected — checkpoint shape vs loader-side reshape mismatch.
 
-**Plan (to rule out false positives).** Migrate the test off the tiny
-1.7B-3bit checkpoint — convert + use **Qwen3.5-2B** quantized so the
-suite asserts real coherence on a model that can actually hold up at low
-bit-width. (Real-usage note: even Qwen3.5-0.8B-4bit is marginal, so
-very-small + very-low-bit is expected to degrade.) Alternative: relax
-the 3-bit floor to the 0.8B precedent. Left failing-on-purpose until
-decided.
+- **FishSpeechIntegrationTests** — `safetensors file not found: models--mlx-community--fish-audio-s2-pro-8bit/snapshots/.../ model.safetensors`. Snapshot directory exists, file is missing — incomplete cache. Needs re-download or upstream check.
 
-## Open integration-test triage (carried, unverified this session)
+- **GLMASRIntegrationTests** — `Ops.swift:1072 Precondition failed: dequantGemv: input 65280 ≠ in_dim 1280`. Caller is feeding the wrong-rank tensor (looks like 51 rows of in_dim=1280 flat). Pre- existing shape bug in the GLMASR encoder/decoder.
 
-Brief — full per-item diagnoses are in `plan.md` / conversation history:
+Bisect continues; this list will be appended-to as more suites complete.
 
-- **DeepSeekR1Distill-Qwen-1.5B** — greedy loop at temp=0; likely a
-  Qwen2-base model property, not a kernel bug (needs mlx-lm baseline
-  compare). R1-Distill-Llama-8B passes.
-- **FastVLM** — 4-bit vision tower unsupported in `loadPW2D`; test points
-  at the bf16 checkpoint.
-- **FireRedASR2** — non-2D weight where a `Linear` is expected (depthwise
-  axis pick at load).
-- **GLMASR** — audio adapter feeds quantized weights into `Ops.gemm`
-  without dequant.
-- **FishSpeech** — codec Conv1d (dilated/transposed) still CPU until
-  iron kernels land.
+## Audio model CPU bottlenecks — Whisper + QwenOmni timeout
 
-## Quantization — mixed-precision + format gaps
+**Symptom.** `WhisperIntegrationTests` and `QwenOmniIntegrationTests` both hit the 900 s `gtimeout` cap during the integration bisect; the log captures only the build banner — the test process was SIGKILL'd before any test boundary was reported.
 
-2-bit affine + per-tensor `QuantSpec` shipped (Phase E): `bits ∈
-{2,3,4,5,6,8}` load + `ffai convert --bits/--embedding-bits/--lm-head-bits
-/--vision-bits`; the loader derives each tensor's width from its packed
-shape. Remaining gaps:
+**Root cause — shared audio-encoder CPU attention.** Both families route through `Sources/ButterSwift/AudioEncoder.swift::cpuAttention` (line ~165). The Whisper-style encoder runs N encoder blocks (24 for Whisper-large-v3 / Qwen2.5-Omni) of multi-head bidirectional attention over `nAudioCtx = 1500` frames; each block performs `O(nFrames² · nHeads · headDim)` work on the CPU via `DispatchQueue.concurrentPerform`. With 1500² · 20 · 64 ≈ 2.9 G FLOPs per layer × 24 layers ≈ 70 G FLOPs of pure CPU work per `encodeAudio` call. That dominates the wall clock and pegs all cores (matches the broader CPU-pin symptom in [§ CPU pin](#cpu-pin--vision--audio-models-burn-all-cpu-cores)). The Q/K/V projections + LayerNorm + GELU + final GEMM are already on GPU; only the SDPA-equivalent attention core falls back to CPU.
 
-- **Config-advertised mixed-precision** (`mixed_3_6`, Unsloth UD recipes)
-  — shape-derived loading works; needs verification on real checkpoints.
-  `Qwen36UnslothMixedTextIntegrationTests` exists, gated by
-  `IntegrationGroupGating.enableMixedPrecisionSuites` (default off) — flip
-  + bisect.
-- **Per-LAYER bit budgets** — `ffai convert` can't yet drive a
-  layer-by-layer recipe (per-role only); loader-side per-tensor dispatch
-  already supports arbitrary widths.
-- **String-typed `bits`** — `dolphin-2.9.3-qwen2-*-2bit` ship `"bits":"2"`
-  (string); `ModelConfig` parser expects Int → silently drops the quant
-  path.
-- **GGUF** — no parser (Phase 10).
+**Whisper additional site — decoder.** `Sources/ButterSwift/Models/Whisper.swift::cpuAttention` (line ~424) runs the SAME CPU multi-head attention for the **decoder's self- AND cross-attention**, once per generated token. `generateTranscript` then loops `decoderLogits` for up to 224 tokens. The cross-attention K/V is recomputed against the full 1500-frame audio every step (no KV cache on the cross side), so each generated token re-pays a `nQuery · nKV · headDim` matmul that should be a single GPU SDPA dispatch. Whisper's transcribe test pays the encoder cost once + the decoder cost ≈ 224 times.
 
-## iron `test_mel_spectrogram` / `test_mel_spectrogram_magnitude` [f16] — flaky GPU correctness cell
+**QwenOmni site.** `QwenOmniModel.encodeAudio` (Sources/ButterSwift/Models/QwenOmni.swift:163) calls into the same shared `AudioEncoder`, so it inherits the encoder-side bottleneck. QwenOmni has no decoder cpuAttention of its own (it splices feature tokens into the Qwen3 text backbone, which is already on GPU). So the expected wall-clock improvement after migration is proportional to the time spent in the audio tower alone — but for a multi-second input that's still tens of seconds of pure CPU at the encoder.
 
-**Symptom.** The iron `kernel_tests_harness` umbrella intermittently
-fails one of the two f16 Mel `#[test_kernel]`s (which one, and the delta,
-vary run-to-run — e.g. `max|Δ|≈16` then `≈8`), so `make test` is
-flaky-red. Reproduces on **clean `dev`** with none of our kernels present —
-**pre-existing, not ours**, and macOS-gated so it does not run on
-iron's Linux CI.
+**Migration needed.** Replace both `cpuAttention` cores (`AudioEncoder.swift::cpuAttention` and `Whisper.swift::cpuAttention`) with `Ops.sdpaBidirectional` (encoder) and `Ops.sdpaMulti(causal: true)` (decoder self-attn, already cached) + a cross-attention GPU dispatch. Whisper's head_dim is 64 (small) / 80 (medium) / 80 (large-v3) — all already covered by [§ Vision tower SDPA](#vision-tower-sdpa--head_dim-coverage). The cross-attention path also needs a precomputed-K/V variant: encoder K/V should be projected once per utterance, then reused for every decoder step (eliminates the per-token K/V recompute). Mirrors the VLM splice pattern.
 
-**Why.** The Mel kernels accumulate the DFT in f32, but the **f16 inputs**
-of a near-tonal test sine leave most bins at the log-floor, where `log`
-amplifies tiny magnitude differences; the flakiness points at a too-tight
-f16 tolerance and/or an under-padded test audio buffer (the frame walk reads
-past the buffer on the last frames → nondeterministic). It does **not**
-affect FFAI: the Gemma4 audio front-end uses the **f32** Mel path (validated
-to 4.4e-4 vs the feature-extractor oracle + a coherent audio→text decode).
+**Status.** Diagnosed only; not in scope for the current bisect pass. Tracked here so the audio-tower migration can pick this up as the unified "audio CPU-attention → GPU SDPA" port.
 
-**Next step (upstream iron):** loosen the f16 Mel tolerance to the
-log-floor regime, switch the test signal to broadband noise, or pad the test
-audio to `(n_frames-1)*hop + n_fft`.
+## Quantization — missing 2-bit support + mixed-precision schemes
 
-## Qwen3-VL image→text degenerate — non-square native-resolution grid
+**Gap.** Butter's quantized weight surface (`QuantizedLinear` / `QuantizedEmbedding` + the `int4` / `int8` Iron kernels) covers the symmetric per-group `affineQuantized` cases we ship today: `bits ∈ {3, 4, 5, 6, 8}`. The integration matrix (`Tests/ModelTests/Quantized{3,4,5,6,8}bitIntegrationTests.swift`) exercises each, and all five passed in the 2026-05-24 bisect.
 
-Qwen3-VL loads + runs and **video→text is coherent** (validates the GPU
-`Ops.patchUnfoldQwen` multi-frame path), but **image→text still
-degenerates**: `Qwen3 runForward`/`unfoldPatches` + the position-embedding /
-M-RoPE / merger assume one square `gridSide`, while the native-resolution
-image processor produces non-square grids. The GPU `patch_unfold_qwen`
-kernel already supports non-square; the surrounding geometry does not.
-Tracked under the smart_resize native-resolution work (`updated-architecture-overview.md`
-§13 M1; the in-progress Qwen×4 processor task). (The earlier
-`Ops.gather: unsupported dtype u32` load crash on this family is RESOLVED —
-commit `14f127d` injects the top-level `quantization` into the re-wrapped
-text config.)
+What's NOT covered yet:
 
-## Orphaned GPU kernels still awaiting a consumer
+1. **2-bit quantization.** No kernel variant, no `QuantizedLinear` path. `mlx-community` ships 2-bit conversions of several models (Qwen 3 32B, Llama 3 70B, etc.) that we can't load. Need:
+   - `dequant_gemv_int2_{f16,bf16}` and `mt_qmm_int2_*` kernels in iron (mirror the int4 codegen — same per-group `(scale, bias)` layout, just 2 bits per index).
+   - `Ops.dequantGemv` + `Ops.qmm` dispatch table extended with `bits == 2` cases.
+   - `QuantizedLinear` accepts `bits == 2` (currently the validator rejects it).
+   - `Tests/ModelTests/Quantized2bitIntegrationTests.swift` mirroring the existing pattern.
 
-`Ops.frameDiffLuma` (video luma frame-diff motion gate) has a iron
-kernel + FFAI Ops wrapper + unit test but **no model call site**: it is
-infrastructure for the planned real-time video loop (iron
-`multi-modal-support.md` §7c / K7) — a cheap motion gate that skips
-near-static frames before the vision tower. No model currently decodes
-multi-frame video through such a gate, so wiring it is net-new feature work
-(threshold + which frames to skip), not a mechanical swap. Left until the
-real-time video pipeline lands. `Ops.patchEmbed` (fused unfold+embed) is
-functionally superseded for Gemma4 by `Ops.im2colPatchInterleaved` + the
-existing `Ops.gemm`.
+2. **Mixed-precision (per-tensor-class) quantization.** Some `mlx-community` checkpoints quantize each weight class at a different bit-width — e.g. attention projections at int4, MLP gate/up/down at int3, embeddings at int8, lm_head at int6. These are advertised as `mixed_3_6`, `mixed_4_8` etc. in the model card. The current loader (`AnyLinear.load(...)`) assumes a single uniform `bits` value from the config's `quantization` block; it can't decode a heterogeneous scheme.
 
-## Tokenizers — InternLM2Tokenizer not registered
+Sketch: extend the config decoder to recognise per-key bit-widths (probably a `quantization.weight_specs` dict in the config), thread the per-tensor `bits` through `loadLinear` / `loadEmbedding`, and let each call pick the matching kernel variant. No new kernels required — every selected bit-width already has one (modulo gap (1) for int2).
 
-Loading InternLM2 logs `InternLM2Tokenizer is not registered, falling
-back to BPE`. Low priority — the BPE fallback decodes coherently; only
-special-token / chat-template edges are at risk. Fix: register
-`InternLM2Tokenizer` against the SentencePiece/BPE handler where
-`LlamaTokenizer` / `Qwen2Tokenizer` etc. are mapped. Surfaced 2026-05-28
-with the InternLM2 loader work.
+**Why it matters.** 2-bit is the only path to fit the 70B-class dense models (Llama 3 70B, Qwen 3 70B) in a single Apple Silicon device's wired memory; mixed-precision is what the better `mlx-community` conversions are starting to ship (preserves quality on the attention projections + lm_head while keeping the MLP slim). Without these we can't load 30-40 % of the recent zoo.
 
-## Downloader — Xet-backed HF repos 404 (`ffai download` / `convert` / `Model.load`)
+**Test bar.** When implemented:
+- `make test-unit` must add a 2-bit dequant_gemv GPU correctness test mirroring the existing int4/int8 ones, against a CPU reference.
+- `Quantized2bitIntegrationTests` + `MixedPrecisionIntegrationTests` added to the bisect runner.
 
-Surfaced 2026-05-29 adding `LiquidAI/LFM2.5-8B-A1B`. Its `model.safetensors`
-is **Xet-backed** (resolve redirects to `cas-bridge.xethub.hf.co`,
-`x-xet-hash` header); FFAI's runtime downloader (the `swift-huggingface`
-/ `swift-transformers` `HubClient.downloadSnapshot` path in
-`ModelDownloader.swift`) does not follow the Xet CAS redirect and fails
-with `Status 404: Entry not found`. HF has been migrating new repos to
-Xet by default, so this blocks `ffai download`, `ffai convert <repo>`
-(its `ModelLocator.resolve`), **and** `Model.load` on any Xet repo —
-including the `ekryski/*` conversions we upload (new uploads are
-Xet-backed too). **Workaround in use:** download via the `hf` CLI (native
-`hf_xet` support) into the HF cache, then point `ffai convert` at the
-local snapshot dir and pre-cache uploaded repos with `hf download` before
-the integration test loads them (`Model.load` hits cache, skips the
-network path). **Real fix (open):** `Package.swift` already bumps
-`swift-transformers` 1.3.0 → 1.3.3 (uncommitted, likely a prior Xet-fix
-attempt — resolve was still 1.3.2); confirm whether 1.3.3+ adds Xet
-support (or wire `hf_xet` / the CAS redirect into the download path),
-then drop the pre-cache workaround.

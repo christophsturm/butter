@@ -1,6 +1,6 @@
-# FFAI — Architecture
+# Butter — Architecture
 
-This document is a **visual** reference for how FFAI works end-to-end: how Metal kernels are generated, how kernels are loaded into the process, how a model is downloaded and bound to GPU memory, and how a single inference token flows through the system.
+This document is a **visual** reference for how Butter works end-to-end: how Metal kernels are generated, how kernels are loaded into the process, how a model is downloaded and bound to GPU memory, and how a single inference token flows through the system.
 
 For the *what we're building and when* see [`plan.md`](plan.md).
 
@@ -24,8 +24,8 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
   │              │ proc-macro expansion → IR                     │
   │              ▼                                               │
   │   ┌──────────────────────────┐                               │
-  │   │  wh-iron-core          │   SSA IR (Kernel, Op,         │
-  │   │  wh-iron-codegen       │   Block, ConstExpr, …)        │
+  │   │  iron-core          │   SSA IR (Kernel, Op,         │
+  │   │  iron-codegen       │   Block, ConstExpr, …)        │
   │   │                          │                               │
   │   │  6-pass pipeline:        │                               │
   │   │  TypeCheck → ConstFold   │                               │
@@ -40,7 +40,7 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
                       ▼
   ┌──────────────────────────────────────────────────────────────┐
   │  iron build --emit all --out Sources/IronSwift          │
-  │  (wh-iron-cli, dev sibling repo)                           │
+  │  (iron-cli, dev sibling repo)                           │
   │                                                              │
   │  Walks the inventory of `BenchSpec`-registered kernels,      │
   │  for each (kernel × dtype):                                  │
@@ -54,7 +54,7 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
   │   xcrun -sdk macosx metal -c   *.metal → *.air               │
   │   xcrun -sdk macosx metallib   *.air   → kernels.metallib    │
   │                                                              │
-  │  Emit logic lives in wh-iron-codegen::emit so other        │
+  │  Emit logic lives in iron-codegen::emit so other        │
   │  tooling (build scripts, future SPM plugins) can consume     │
   │  it without going through the CLI binary.                    │
   └───────────────────┬──────────────────────────────────────────┘
@@ -82,14 +82,14 @@ Runs once per build (or whenever a Rust `#[kernel]` definition changes). Produce
 - Kernel changes never require Swift source edits — the wrappers and metallib are regenerated.
 - The `.metal` files are checked in (per `.gitignore` policy: optional; default is regenerate). This makes diffs reviewable and lets contributors inspect what got generated without running cargo.
 - All compilation happens at build time. **Zero runtime JIT.**
-- Kernel sources in wh-iron-std are split into `crates/wh-iron-std/src/mlx/` (each kernel has an MLX side-by-side comparison via `iron bench` + `check_equiv`) and `crates/wh-iron-std/src/ffai/` (model-specific kernels with no MLX upstream counterpart at the pinned `MLX_COMMIT`; correctness validated by FFAI integration tests against real models). Kernels graduate from `ffai/` to `mlx/` when an MLX counterpart ships upstream or someone wires a hand-written runner. The `iron build --emit all` pipeline is agnostic — both folders feed the same `kernels.metallib` + `manifest.json` + `IronKernels.swift` outputs.
-- **No CPU interpreter.** The `iron-interp` crate was dropped in upstream PRs #16 / #17. Correctness verification now runs through three layers on the Apple Silicon GPU: (1) per-kernel `<kernel>_gpu_correctness.rs` tests under `crates/wh-iron-std/tests/` comparing against a naive CPU reference in fp32 (pattern from PR #35); (2) MLX side-by-side via `iron bench` + `check_equiv` for `mlx/` kernels with an upstream counterpart; (3) FFAI integration tests on real models for `ffai/` kernels. Codegen-side text diffs are caught by `insta` MSL golden snapshots under `crates/wh-iron-codegen/tests/snapshots/` (PR #25).
+- Kernel sources in iron-std are split into `crates/iron-std/src/mlx/` (each kernel has an MLX side-by-side comparison via `iron bench` + `check_equiv`) and `crates/iron-std/src/butter/` (model-specific kernels with no MLX upstream counterpart at the pinned `MLX_COMMIT`; correctness validated by Butter integration tests against real models). Kernels graduate from `butter/` to `mlx/` when an MLX counterpart ships upstream or someone wires a hand-written runner. The `iron build --emit all` pipeline is agnostic — both folders feed the same `kernels.metallib` + `manifest.json` + `IronKernels.swift` outputs.
+- **No CPU interpreter.** The `iron-interp` crate was dropped in upstream PRs #16 / #17. Correctness verification now runs through three layers on the Apple Silicon GPU: (1) per-kernel `<kernel>_gpu_correctness.rs` tests under `crates/iron-std/tests/` comparing against a naive CPU reference in fp32 (pattern from PR #35); (2) MLX side-by-side via `iron bench` + `check_equiv` for `mlx/` kernels with an upstream counterpart; (3) Butter integration tests on real models for `butter/` kernels. Codegen-side text diffs are caught by `insta` MSL golden snapshots under `crates/iron-codegen/tests/snapshots/` (PR #25).
 
 ---
 
 ## 2. Process startup (kernel loading)
 
-Happens once when the FFAI process launches.
+Happens once when the Butter process launches.
 
 ```
                           PROCESS STARTUP
@@ -149,7 +149,7 @@ Models are organized into **family files** (one per major architectural lineage:
                        MODEL FILE LAYOUT
                        ─────────────────
 
-  Sources/FFAI/Models/
+  Sources/ButterSwift/Models/
    ├─ Llama.swift          (Llama 3.x: 1B, 3B, 8B, 70B)
    ├─ Qwen35.swift          (Qwen3.5 dense+hybrid+MoE+VL+Omni)
    ├─ Mistral.swift        (Mistral 7B, Mixtral 8x7B/8x22B)
@@ -744,13 +744,13 @@ The per-token decode shown above is **Mode 1: Eager**. It's what we ship in Phas
 
 **Lessons from a prior ICB experiment in mlx-swift-lm**
 
-A previous attempt at ICB + argument buffers in mlx-swift-lm didn't yield the expected throughput win. Two takeaways inform the FFAI design:
+A previous attempt at ICB + argument buffers in mlx-swift-lm didn't yield the expected throughput win. Two takeaways inform the Butter design:
 
-1. **Per-token state must be ping-ponged (or triple-buffered).** The per-token arg buffer (activation pool slots, KV length, RNG state) is updated by the CPU *while* the GPU is still reading the previous token's arg buffer. Without distinct buffers for token N, N+1, N+2, the CPU stalls or the GPU reads stale data. FFAI's `.argumentBuffers` and `.icb` modes triple-buffer the per-token arg buffer by construction.
+1. **Per-token state must be ping-ponged (or triple-buffered).** The per-token arg buffer (activation pool slots, KV length, RNG state) is updated by the CPU *while* the GPU is still reading the previous token's arg buffer. Without distinct buffers for token N, N+1, N+2, the CPU stalls or the GPU reads stale data. Butter's `.argumentBuffers` and `.icb` modes triple-buffer the per-token arg buffer by construction.
 
-2. **Dispatch optimization is a smaller lever than memory bandwidth.** The mlx-swift-lm experiment cut command-buffer build time significantly but token throughput barely moved — because GPU memory bandwidth, not CPU dispatch, was the actual bottleneck on the hot path. This is why FFAI's bigger optimization lever is **fused kernels** (one activation read, multiple ops happen in registers/threadgroup memory) rather than dispatch mode upgrades.
+2. **Dispatch optimization is a smaller lever than memory bandwidth.** The mlx-swift-lm experiment cut command-buffer build time significantly but token throughput barely moved — because GPU memory bandwidth, not CPU dispatch, was the actual bottleneck on the hot path. This is why Butter's bigger optimization lever is **fused kernels** (one activation read, multiple ops happen in registers/threadgroup memory) rather than dispatch mode upgrades.
 
-3. **The 4-repo interface change cost was a separate killer.** Adding argument buffers to MLX kernels meant changing kernel signatures across mlx → mlx-c → mlx-swift → mlx-swift-lm. In FFAI a kernel signature change is a Rust edit + cargo rebuild. The complexity cost of dispatch mode upgrades drops by an order of magnitude.
+3. **The 4-repo interface change cost was a separate killer.** Adding argument buffers to MLX kernels meant changing kernel signatures across mlx → mlx-c → mlx-swift → mlx-swift-lm. In Butter a kernel signature change is a Rust edit + cargo rebuild. The complexity cost of dispatch mode upgrades drops by an order of magnitude.
 
 **How we keep all three options open from Phase 2:**
 
@@ -767,7 +767,7 @@ A previous attempt at ICB + argument buffers in mlx-swift-lm didn't yield the ex
 
 In MLX/mlx-swift-lm, sampling reads the full logits vector to CPU every token (~60-200KB), runs argmax/top-k/top-p in Swift, and returns the next token id. That's a mandatory CPU↔GPU sync per token, plus the actual memory transfer.
 
-FFAI runs sampling on the GPU as a final kernel in the per-token command buffer:
+Butter runs sampling on the GPU as a final kernel in the per-token command buffer:
 
 ```
    ┌─────────────────────────────────────────────────────────┐
@@ -788,7 +788,7 @@ FFAI runs sampling on the GPU as a final kernel in the per-token command buffer:
    Swift advances the loop with next_token
 ```
 
-✅ **Shipped.** `Ops.softmaxCategoricalSample(...)` (Sources/FFAI/Ops/Ops.swift) and `Ops.argmax(...)` run inside the per-token command buffer; the only CPU↔GPU readback is the 4-byte chosen-token id. The legacy CPU-readback path (`forwardCPUSample`) is kept behind a debug flag for repro / comparison but is not on the hot path. `GenerationParameters.temperature` / `topP` / `topK` / `minP` all dispatch through GPU kernels.
+✅ **Shipped.** `Ops.softmaxCategoricalSample(...)` (Sources/ButterSwift/Ops/Ops.swift) and `Ops.argmax(...)` run inside the per-token command buffer; the only CPU↔GPU readback is the 4-byte chosen-token id. The legacy CPU-readback path (`forwardCPUSample`) is kept behind a debug flag for repro / comparison but is not on the hot path. `GenerationParameters.temperature` / `topP` / `topK` / `minP` all dispatch through GPU kernels.
 
 ---
 
@@ -976,7 +976,7 @@ The throughput win comes from amortising one verifier forward over multiple acce
 
 ## 5. Where this differs from MLX
 
-| Concern | MLX path | FFAI path |
+| Concern | MLX path | Butter path |
 |---|---|---|
 | Kernel source | MSL string passed to `metal_kernel()` | Rust `#[kernel]` → MSL at build time |
 | Compilation | JIT on first call (~1-2ms) | Pre-compiled into `.metallib`, only PSO specialization at runtime (~100-500µs once per fn-const combo) |
@@ -995,11 +995,11 @@ The throughput win comes from amortising one verifier forward over multiple acce
 
 ```
   ┌─────────────────────────────────────────────────────────┐
-  │  app / FFAICLI                                          │
+  │  app / ButterCLI                                          │
   └────────────────────┬────────────────────────────────────┘
                        │ calls
   ┌────────────────────▼────────────────────────────────────┐
-  │  FFAI                                                   │
+  │  Butter                                                   │
   │                                                         │
   │  Core text path                                         │
   │   Tensor • Module • Linear • Embedding • RMSNorm •      │
@@ -1050,10 +1050,10 @@ The throughput win comes from amortising one verifier forward over multiple acce
   │  iron (Rust workspace, sibling repo)                │
   │  Generates kernels.metallib + manifest + Swift wrappers  │
   │  via the `iron build --emit all --out <dir>` CLI command │
-  │  (wh-iron-cli).                                        │
+  │  (iron-cli).                                        │
   └──────────────────────────────────────────────────────────┘
 ```
 
 **Runtime dependencies:** Metal framework, swift-huggingface, swift-transformers. That's it.
 
-**Build-time dependencies:** add Xcode (for `xcrun metal`), a Rust toolchain (for `iron`), and the iron sibling repo checkout until the `iron` binary ships via Homebrew.
+**Build-time dependencies:** add Xcode (for `xcrun metal`), a Rust toolchain (for `tile`), and the iron sibling repo checkout until the `iron` binary ships via Homebrew.

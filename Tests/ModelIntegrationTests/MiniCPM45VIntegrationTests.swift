@@ -19,7 +19,7 @@
 // ONCE (static memoized Task) and runs a per-capability inference pass —
 // modeled on `MiniCPM46VIntegrationTests` / `MiniCPM45OmniIntegrationTests`.
 //
-// Runs against the FFAI 4-bit conversion, referenced LOCALLY from the
+// Runs against the Butter 4-bit conversion, referenced LOCALLY from the
 // `ffai convert` output cache (`~/.cache/ffai/converts/…`). There is no
 // mlx-community 4-bit of MiniCPM-V-4.5, so quantize the `openbmb/MiniCPM-V-4_5`
 // bf16 base once:
@@ -32,7 +32,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "MiniCPM-V 4.5 Integration", .serialized,

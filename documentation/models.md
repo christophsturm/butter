@@ -1,10 +1,11 @@
 # Supported Models
 
-FFAI runs every family below directly from HuggingFace through one entry
-point — `Model.load("org/repo")` — for every kind (text, VL, STT, TTS,
-STS, VAD, omni). The `ffai models` CLI lists the verified repo IDs per
-family; pass any other mlx-format conversion of a supported architecture
-and the loader picks it up via the single `ModelRegistry` table.
+Butter runs every family below directly from HuggingFace through
+`Model.load("org/repo")` (or `AudioModel.load(...)` / `VADModel.load(...)`
+for the non-text-decoder contracts). The `butter models` CLI lists the
+verified repo IDs per family; pass any other mlx-format conversion of a
+supported architecture and the loader picks it up via
+`ModelRegistry.dispatchAndLoad`.
 
 This page is the canonical landing for:
 
@@ -15,12 +16,12 @@ This page is the canonical landing for:
 For porting a new architecture, see
 [developing/adding-a-model.md](developing/adding-a-model.md). For the
 per-family Swift type prefix and source layout, see the
-`Sources/FFAI/Models/<X>.swift` family roots.
+`Sources/ButterSwift/Models/<X>.swift` family roots.
 
 ## Supported families
 
 The Sizes column lists the parameter scales we ship in the CLI catalog
-(`ffai models`); the Quants column lists the bit-widths we know are
+(`butter models`); the Quants column lists the bit-widths we know are
 published. Any 3 / 4 / 5 / 6 / 8-bit mlx affine conversion of a listed
 architecture also loads.
 
@@ -38,7 +39,6 @@ contract), **STS** (speech-to-speech).
 | **Gemma 3 VL** | VL | `gemma3` (+ `vision_config`) | 4B / 12B / 27B | bf16 / 8 / 6 / 4 | SigLIP ViT + multi-modal projector + Gemma 3 backbone. |
 | **Gemma 4** | MoE-Text | `gemma4`, `gemma4_text` | E2B / E4B / 26B-A4B / 31B | bf16 / 8 / 6 / 4 / mxfp4 | Sliding (256-wide) + global (512-wide) SDPA, ProportionalRoPE, Per-Layer Embeddings, MoE on 26B-A4B. |
 | **Gemma 4 VL** | VL | `gemma4` (+ `vision_config`) | E2B / E4B / 26B-A4B / 31B | bf16 / 8 / 6 / 4 / mxfp4 | Bespoke Gemma 4 ViT (multi-dim RoPE, attention pool) + Gemma 4 backbone. |
-| **Gemma 4 Omni** | Omni | `gemma4_unified` (+ vision/audio embedder) | 12B | bf16 / 8 / 6 / 4 | **Encoder-free.** Raw 48×48 image patches (LN → Linear → LN → 2D pos-emb → pos-norm → embedder) + raw 16 kHz / 640-sample audio frames (RMSNorm + Linear) + per-frame video project straight into the Gemma 4 backbone — no ViT / Conformer encoder. Multimodal projectors stay bf16 through `ffai convert` (default `--vision-bits` / `--audio-bits`). Drafter `gemma4_unified_assistant` loads + quantizes but generation (EAGLE spec-decode) is Phase 8.7. |
 | **GPT-OSS** | MoE-Text | `gpt_oss` | 20B / 120B | MXFP4-Q8 / mxfp4-bf16 / 4 | 32-expert top-4 MoE, learned per-head attention sinks, alternating sliding / full attention, mixed-precision (MXFP4 experts). |
 | **Granite 3** | Text | `granite` | 2B / 8B | fp16 / 8 / 6 / 4 | IBM Granite v3 dense — Llama-shaped GQA backbone (reuses Llama loader). |
 | **Granite 4** | Hybrid-Text | `granitemoehybrid` | 350M / 1B / micro / tiny / small | bf16 / 8 / 6 / 4 | Stack-interleaved Mamba 2 / attention + dense or block-sparse MoE FFN (top-K SwiGLU + shared expert). No RoPE. |
@@ -83,21 +83,18 @@ contract), **STS** (speech-to-speech).
 
 ### Audio dispatch
 
-The audio families load through the same `Model.load` and single
-[`ModelRegistry`](../Sources/FFAI/Loader/ModelRegistry.swift) as every
-other kind, but they don't conform to `LanguageModel` (a pure text-in /
-text-out causal decoder). STT is audio-in / text-out, TTS is text-in /
-audio-out: each conforms to a modality protocol
-([`Transcribing`](../Sources/FFAI/ModelType/ModelEngine.swift) /
-`Synthesizing`) and is registered as a directory-loaded `ModelEntry` (in
-[`ModelRegistryAudio.swift`](../Sources/FFAI/Loader/ModelRegistryAudio.swift))
-that reports the audio [`Capability`](../Sources/FFAI/Capability.swift) set.
+The audio families do **not** route through `ModelRegistry` /
+`LanguageModel` — those describe a pure text-in / text-out causal
+decoder. STT is audio-in / text-out, TTS is text-in / audio-out. They
+load through [`AudioModelRegistry`](../Sources/ButterSwift/CLI/AudioModelRegistry.swift)
+which inspects `config.json`, picks the family, and reports the audio
+[`Capability`](../Sources/ButterSwift/Capability.swift) set.
 
 Whisper, Kokoro and Qwen-Omni share the
-[`AudioEncoder`](../Sources/FFAI/AudioEncoder.swift) module (Whisper-style
+[`AudioEncoder`](../Sources/ButterSwift/AudioEncoder.swift) module (Whisper-style
 conv stem + bidirectional transformer) and the
-[`AudioPreprocessing`](../Sources/FFAI/AudioPreprocessing.swift) front-end
-(log-Mel STFT framing). The three FFAI audio kernels — `mel_spectrogram`,
+[`AudioPreprocessing`](../Sources/ButterSwift/AudioPreprocessing.swift) front-end
+(log-Mel STFT framing). The three Butter audio kernels — `mel_spectrogram`,
 `audio_conv1d`, `vocoder_istft` — are wrapped by `Ops.melSpectrogram`,
 `Ops.audioConv1d`, `Ops.vocoderISTFT`. SenseVoice carries its own
 Kaldi-style FBANK + LFR front-end and a depthwise FSMN memory block on
@@ -106,12 +103,11 @@ the CPU path.
 ### VAD dispatch
 
 VAD models have a third contract — audio waveform in, per-frame
-speech-probability stream out. They load through the same `Model.load`
-(routed by `model_type` to a `.vad` `ModelEntry`); the engine conforms to
-[`Detecting`](../Sources/FFAI/ModelType/ModelEngine.swift) and
-`Model.detect(_:)` returns `[DetectionEvent]`. The underlying family still
-exposes its native `detect(audio:sampleRate:)` returning a
-[`VADOutput`](../Sources/FFAI/VADOutput.swift).
+speech-probability stream out. They load through
+[`VADModelRegistry`](../Sources/ButterSwift/CLI/VADModelRegistry.swift) which
+exposes `loadFromDirectory` / `fromPretrained` and a
+`detect(audio:sampleRate:)` returning a
+[`VADOutput`](../Sources/ButterSwift/VADOutput.swift).
 
 | Family | `model_type` | Notes |
 |---|---|---|
@@ -126,7 +122,7 @@ recognised by the registry; full loaders are follow-on ports.
 Codecs (encoder + quantizer + decoder) turn a waveform into discrete
 codes and back; autoregressive TTS families (Orpheus / LlamaTTS, Marvis,
 …) emit codes that a codec renders to audio. They live under
-[`Sources/FFAI/Models/Audio/`](../Sources/FFAI/Models/Audio) — see the
+[`Sources/ButterSwift/Models/Audio/`](../Sources/ButterSwift/Models/Audio) — see the
 codec table in [audio.md](audio.md) for SNAC, EnCodec, Mimi, Descript
 DAC, Vocos, BigVGAN, DACVAE.
 
@@ -174,7 +170,7 @@ let model = try await Model.load("mlx-community/Qwen3-14B-4bit")
 ```
 
 The loader resolves the snapshot, parses `config.json`, picks the right
-family via the `ModelRegistry` table and builds the variant. If
+family via `ModelRegistry.dispatchAndLoad` and builds the variant. If
 the architecture isn't in the registry yet, you get a
 `ModelError.unsupportedArchitecture(...)`.
 

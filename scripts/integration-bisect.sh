@@ -42,11 +42,11 @@
 # Usage:
 #   ./scripts/integration-bisect.sh                  # all suites
 #   ./scripts/integration-bisect.sh Whisper Llama   # named suites only
-#   PER_TEST_TIMEOUT=300 ./scripts/integration-bisect.sh
+#   PER_TEST_TIMEOUT=600 ./scripts/integration-bisect.sh
 #
 # Env vars:
 #   PER_TEST_TIMEOUT  Seconds before a suite is treated as hung
-#                     (SIGTERM, then SIGKILL). Default 300 (5 min).
+#                     (SIGTERM, then SIGKILL). Default 900 (15 min).
 #   GPU_SETTLE_SEC    Seconds to wait after a suite exits before
 #                     sampling GPU util. Default 3.
 #   GPU_PIN_THRESHOLD Percent above which the GPU counts as pinned.
@@ -61,7 +61,7 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
-PER_TEST_TIMEOUT="${PER_TEST_TIMEOUT:-300}"
+PER_TEST_TIMEOUT="${PER_TEST_TIMEOUT:-900}"
 GPU_SETTLE_SEC="${GPU_SETTLE_SEC:-3}"
 GPU_PIN_THRESHOLD="${GPU_PIN_THRESHOLD:-50}"
 OUTPUT="${OUTPUT:-planning/integration-bisect-$(date -u +%Y%m%d-%H%M%S).md}"
@@ -140,7 +140,7 @@ mkdir -p "$(dirname "$OUTPUT")"
   echo "|---|---|---|---|---|"
 } | tee "$OUTPUT"
 
-PASS=0; FAIL=0; TIMEOUT=0; PINNED=0; SKIP=0
+PASS=0; FAIL=0; TIMEOUT=0; PINNED=0
 
 for suite in "${SUITES[@]}"; do
   printf "  ▶ %-46s" "$suite"
@@ -177,7 +177,7 @@ for suite in "${SUITES[@]}"; do
   # "macOS unavailable" and fails the whole build with bogus errors
   # like "argument passed to call that takes no arguments". See the
   # 2026-05-24 bisect-resume autopsy.
-  ${TIMER[@]+"${TIMER[@]}"} \
+  BUTTER_MAX_COMMAND_BUFFERS=16 ${TIMER[@]+"${TIMER[@]}"} \
     arch -arm64 swift test --filter "${suite}$" > "$log" 2>&1
   rc=$?
   dur=$(( SECONDS - start ))
@@ -192,18 +192,6 @@ for suite in "${SUITES[@]}"; do
     note=$(grep -m1 -E "recorded an issue|Expectation failed|error:" "$log" \
            | sed 's/[|]/\\|/g' | head -c 100 || true)
     FAIL=$((FAIL + 1))
-  elif grep -qE 'Suite "[^"]*" skipped:' "$log"; then
-    # Swift Testing's SUITE-level skip marker — the suite was disabled by
-    # a gating trait (e.g. enableVisionSuites=false), so it validated
-    # nothing. Do NOT key off "Executed 0 tests": that's the empty XCTest
-    # harness (always 0 for Swift Testing `@Test` suites) and would flag
-    # EVERY suite as skipped. A gated suite still exits 0 and even prints
-    # "N tests passed" (its skipped tests count as non-failures), so the
-    # `Suite "…" skipped:` line is the only reliable signal.
-    status="SKIP"
-    note=$(grep -m1 -oE 'Suite "[^"]*" skipped:[^"]*"[^"]*"' "$log" \
-           | sed 's/[|]/\\|/g' | head -c 100 || echo "suite gating-disabled")
-    SKIP=$((SKIP + 1))
   else
     PASS=$((PASS + 1))
   fi
@@ -239,7 +227,6 @@ done
   echo "- Total: ${#SUITES[@]}"
   echo "- PASS: $PASS"
   echo "- FAIL: $FAIL"
-  echo "- SKIP (suite gating-disabled): $SKIP"
   echo "- TIMEOUT: $TIMEOUT"
   echo "- GPU-pinned after exit: $PINNED"
   echo

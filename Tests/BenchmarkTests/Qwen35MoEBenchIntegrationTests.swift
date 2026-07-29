@@ -25,7 +25,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 /// Bench target — the cached `mlx-community/Qwen3.5-35B-A3B-4bit`
 /// MoE checkpoint. Switched off Tom's prior `/Users/tom/...` hard-coded

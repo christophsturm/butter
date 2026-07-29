@@ -29,7 +29,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 /// Local-cache predicate — this suite never downloads (the audio + vision
 /// paths pull a multi-GB snapshot). The `gemma-4-e2b-it-4bit` snapshot must
@@ -296,7 +296,7 @@ struct Gemma4IntegrationTests {
 
     // MARK: - numeric mlx-vlm oracle tests (fixture-gated)
 
-    /// Vision tower vs the mlx-vlm `embed_vision` oracle: feed FFAI's
+    /// Vision tower vs the mlx-vlm `embed_vision` oracle: feed Butter's
     /// `encode` the EXACT preprocessed pixels mlx-vlm produced for the dog
     /// fixture (`[3, 672, 912]` → 42×57 grid → 266 soft tokens) and compare
     /// the `[266, 1536]` soft tokens. Isolates the tower from preprocessing.
@@ -325,7 +325,7 @@ struct Gemma4IntegrationTests {
         let soft = vlm.visionEncoder.encode(image: pixT)
         let got = soft.toFloatArray()
         let oracle = readF32(embedPath)
-        print("FFAI soft \(soft.shape), oracle count \(oracle.count)")
+        print("Butter soft \(soft.shape), oracle count \(oracle.count)")
         #expect(
             soft.shape == [266, 1536],
             "expected [266,1536] soft tokens, got \(soft.shape)")

@@ -1,0 +1,23 @@
+[package]
+name = "wh-butter-metal"
+description = "Butter Metal backend — wraps wh-iron-runtime's Context (MSL JIT + dispatch) behind the wh-butter-core Device trait. Runs the shared Rust models on Apple GPUs (incl. iOS)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+wh-butter-core.workspace = true
+# wh-iron-runtime's Context is the public Metal dispatch face. Builds on
+# every platform (Metal code is target_os=macos-gated inside; has_gpu()=false
+# elsewhere), so no feature gating needed here.
+wh-iron-runtime.workspace = true
+wh-iron-core.workspace = true
+
+[dev-dependencies]
+wh-butter-modeltests.workspace = true
+wh-butter-ops.workspace = true
+wh-butter-models.workspace = true
+wh-butter-loader.workspace = true
+wh-butter-runtime.workspace = true

@@ -41,7 +41,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "Chatterbox Integration", .serialized,
@@ -96,7 +96,7 @@ struct ChatterboxIntegrationTests {
             }
         } catch let error as ChatterboxError {
             // Staged port: the T3 + S3Gen + HiFi-GAN pipeline is not wired,
-            // so the stream MUST finish by throwing the descriptive FFAI
+            // so the stream MUST finish by throwing the descriptive Butter
             // error rather than emitting incorrect audio.
             threwNotWired = true
             #expect(

@@ -38,7 +38,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Paligemma Integration", .serialized)
 struct PaligemmaIntegrationTests {

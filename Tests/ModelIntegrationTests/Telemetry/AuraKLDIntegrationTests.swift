@@ -26,7 +26,7 @@
 // and lower the `mean_kld` vs the baseline AURA scheme.
 //
 // Gated on a local AURA-compatible checkpoint supplied via the
-// `FFAI_AURA_KLD_MODEL_PATH` env var (Qwen3-0.6B-4bit is the smallest
+// `BUTTER_AURA_KLD_MODEL_PATH` env var (Qwen3-0.6B-4bit is the smallest
 // model that runs the gate end-to-end on a dev box). No
 // machine-specific default — when the env var is unset or the path
 // doesn't exist, every test prints a skip line and returns 0, matching
@@ -36,11 +36,11 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 private let qwen3LocalPath =
-    ProcessInfo.processInfo.environment["FFAI_AURA_KLD_MODEL_PATH"]
-    ?? "<FFAI_AURA_KLD_MODEL_PATH unset>"
+    ProcessInfo.processInfo.environment["BUTTER_AURA_KLD_MODEL_PATH"]
+    ?? "<BUTTER_AURA_KLD_MODEL_PATH unset>"
 
 @Suite("AURA KL-divergence regression gate", .serialized)
 struct AuraKLDIntegrationTests {

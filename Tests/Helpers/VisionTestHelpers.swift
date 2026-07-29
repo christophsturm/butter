@@ -28,7 +28,7 @@
 // `catVideoFirstFrame()` for single-frame VLM tests, `catVideoFrames(
 // maxFrames:)` for multi-frame `encode(frames:)` integration tests.
 
-import FFAI
+import ButterSwift
 import Foundation
 import Testing
 

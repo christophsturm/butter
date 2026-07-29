@@ -28,7 +28,7 @@
 // the local HF cache. As of writing no `mlx-community` conversion has
 // shipped — `nvidia/Llama-3.1-Nemotron-Nano-VL-8B-V1` is the only
 // public Nemotron-VL and it ships as a raw PyTorch remote-code
-// checkpoint that does not match FFAI's `text_config.model_type ==
+// checkpoint that does not match Butter's `text_config.model_type ==
 // nemotron_h` layout. When an mlx-style conversion is cached, the
 // suite auto-enables; until then each test exits early. No code
 // change needed when a checkpoint lands — drop the snapshot into the
@@ -38,7 +38,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "NemotronH Integration", .serialized,

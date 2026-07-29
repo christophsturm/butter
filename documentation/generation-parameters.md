@@ -42,7 +42,7 @@ print(model.defaultGenerationParameters.topK)          // 20     (Qwen 3)
 print(model.defaultGenerationParameters.prefillStepSize) // 1024
 ```
 
-Current values (pulled from each family's `defaultGenerationParameters` literal in `Sources/FFAI/Models/`):
+Current values (pulled from each family's `defaultGenerationParameters` literal in `Sources/ButterSwift/Models/`):
 
 | Family | `maxTokens` | `prefillStepSize` | `temperature` | `topP` | `topK` | `repPenalty` |
 |---|---|---|---|---|---|---|
@@ -67,7 +67,7 @@ Current values (pulled from each family's `defaultGenerationParameters` literal 
 | `Paligemma` (VL) | 256 | 512 | 0.0 | 1.0 | 0 | 1.0 |
 | `SmolVLM2` (VL) | 256 | 1024 | 0.0 | 1.0 | 0 | 1.0 |
 
-`minP` is `0.0` for every family today (a deliberate opt-in); CLI / API callers can pass it explicitly. The GPT-OSS `reasoningLevel` defaults to `.none`. For any family not listed, read its variant struct in `Sources/FFAI/Models/Text/<F>Text.swift` (or the `Models/<F>.swift` root for VL orchestrators) — or run `ffai inspect <repo>` to dump the resolved values. The Llama / Qwen 3 defaults match mlx-swift-lm's per-family `GenerationParameters` baseline and `defaultPrefillStepSize` for the same architectures. Audio families don't ship `GenerationParameters` (they're not text generators); STT / TTS / VAD configuration lives on their own modality-specific options surface. When porting a new family, declare its defaults — see [developing/adding-a-model.md § Step 4: family defaults](developing/adding-a-model.md#step-4--declare-family-defaults).
+`minP` is `0.0` for every family today (a deliberate opt-in); CLI / API callers can pass it explicitly. The GPT-OSS `reasoningLevel` defaults to `.none`. For any family not listed, read its variant struct in `Sources/ButterSwift/Models/Text/<F>Text.swift` (or the `Models/<F>.swift` root for VL orchestrators) — or run `butter inspect <repo>` to dump the resolved values. The Llama / Qwen 3 defaults match mlx-swift-lm's per-family `GenerationParameters` baseline and `defaultPrefillStepSize` for the same architectures. Audio families don't ship `GenerationParameters` (they're not text generators); STT / TTS / VAD configuration lives on their own modality-specific options surface. When porting a new family, declare its defaults — see [developing/adding-a-model.md § Step 4: family defaults](developing/adding-a-model.md#step-4--declare-family-defaults).
 
 ## Three ways to call `generate`
 
@@ -113,18 +113,18 @@ Each CLI flag overrides only its corresponding `GenerationParameters` field; eve
 ```bash
 # Family defaults — Qwen 3 ships temperature=0.6 / top-p=0.95 / top-k=20.
 # Routes through the CPU sample path (non-greedy):
-ffai --model mlx-community/Qwen3-1.7B-4bit --prompt "Hello"
+butter --model mlx-community/Qwen3-1.7B-4bit --prompt "Hello"
 
 # Greedy fast path (GPU argmax, 4-byte readback per token, no sampling):
-ffai --model mlx-community/Qwen3-1.7B-4bit --prompt "Hello" \
+butter --model mlx-community/Qwen3-1.7B-4bit --prompt "Hello" \
      --temperature 0 --max-tokens 64
 
 # Seeded non-greedy — reproducible run-to-run:
-ffai --model mlx-community/Qwen3-1.7B-4bit --prompt "Hello" \
+butter --model mlx-community/Qwen3-1.7B-4bit --prompt "Hello" \
      --temperature 0.7 --top-p 0.9 --seed 42 --max-tokens 64
 
 # Full sampling pipeline:
-ffai --model mlx-community/Qwen3-1.7B-4bit --prompt "Hello" \
+butter --model mlx-community/Qwen3-1.7B-4bit --prompt "Hello" \
      --temperature 0.8 --top-k 40 --top-p 0.95 --min-p 0.05 \
      --repetition-penalty 1.05 --seed 12345
 ```

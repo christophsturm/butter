@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// End-to-end test: download FFAI's own 2-bit Qwen3.5-0.8B conversion
-// (`ekryski/Qwen3.5-0.8B-2bit`, produced via `ffai convert --bits 2
+// End-to-end test: download Butter's own 2-bit Qwen3.5-0.8B conversion
+// (`ekryski/Qwen3.5-0.8B-2bit`, produced via `butter convert --bits 2
 // --quantize-embeddings`) and exercise the dequant_gemv_int2 +
 // dequant_gather_int2 + iron_qmm_mma_int2 kernels end-to-end through the
 // Qwen3.5-VL loader and centered-RMSNorm fold path.
@@ -41,7 +41,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Qwen3.5-VL 2-bit Integration", .serialized)
 struct Quantized2bitIntegrationTests {

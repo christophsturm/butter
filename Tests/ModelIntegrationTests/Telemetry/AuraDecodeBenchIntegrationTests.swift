@@ -38,9 +38,9 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
-/// Model path **must** be supplied via the `FFAI_AURA_BENCH_MODEL_PATH`
+/// Model path **must** be supplied via the `BUTTER_AURA_BENCH_MODEL_PATH`
 /// env var. There is no machine-specific default — the prior hardcoded
 /// `/Users/tom/models/...` was a footgun for anyone else running the
 /// suite. When the env var is unset OR the path doesn't exist, every
@@ -51,15 +51,15 @@ import Testing
 /// review): Qwen3-1.7B-4bit or Qwen3.5-2B-4bit / Qwen3-4B-4bit so the
 /// measurement isn't anchored to a single small-model variance regime.
 private let qwen3LocalPath: String? =
-    ProcessInfo.processInfo.environment["FFAI_AURA_BENCH_MODEL_PATH"]
+    ProcessInfo.processInfo.environment["BUTTER_AURA_BENCH_MODEL_PATH"]
 
-/// KV sweep set, overridable via `FFAI_AURA_BENCH_KV_LENGTHS`
+/// KV sweep set, overridable via `BUTTER_AURA_BENCH_KV_LENGTHS`
 /// (comma-separated). Defaults to {256, 1024, 4096} so `blockSizeSweep`
 /// crosses the threshold where bs=64 vs bs=128 stops mattering and the
 /// long-context regime starts to dominate. Longer points (e.g. 16384)
 /// can be opted into via the env var when a larger model is loaded.
 private let benchKVLengths: [Int] = {
-    if let s = ProcessInfo.processInfo.environment["FFAI_AURA_BENCH_KV_LENGTHS"] {
+    if let s = ProcessInfo.processInfo.environment["BUTTER_AURA_BENCH_KV_LENGTHS"] {
         let parsed = s.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
         if !parsed.isEmpty { return parsed }
     }
@@ -72,7 +72,7 @@ private let benchKVLengths: [Int] = {
 /// never a failure.
 private func benchModelPath(_ testName: String) -> String? {
     guard let p = qwen3LocalPath else {
-        print("\(testName) skipped: FFAI_AURA_BENCH_MODEL_PATH env var not set")
+        print("\(testName) skipped: BUTTER_AURA_BENCH_MODEL_PATH env var not set")
         return nil
     }
     guard FileManager.default.fileExists(atPath: p) else {
@@ -96,7 +96,7 @@ struct AuraDecodeBenchIntegrationTests {
     /// Decode-tps bench at a fixed KV length. `decodePath` selects
     /// compressed flash vs dequant-mirror. `modelPath` is the on-disk
     /// model directory (passed from each test entry-point so a missing
-    /// `FFAI_AURA_BENCH_MODEL_PATH` skips quietly instead of crashing
+    /// `BUTTER_AURA_BENCH_MODEL_PATH` skips quietly instead of crashing
     /// here). Returns the median tps over `nRuns` warmed runs of
     /// `nSteps` decode tokens each.
     private func runDecodeTpsBench(
@@ -243,10 +243,10 @@ struct AuraDecodeBenchIntegrationTests {
         // it on test return, so a long-running sweep produces zero
         // visible output for tens of minutes. Mirror every cell line to
         // a side-channel file (env-overridable) so progress is tail-able
-        // in real time: `tail -f $FFAI_AURA_BENCH_LOG`.
+        // in real time: `tail -f $BUTTER_AURA_BENCH_LOG`.
         let logPath =
-            ProcessInfo.processInfo.environment["FFAI_AURA_BENCH_LOG"]
-                ?? "/tmp/ffai-aura-bench.log"
+            ProcessInfo.processInfo.environment["BUTTER_AURA_BENCH_LOG"]
+                ?? "/tmp/butter-aura-bench.log"
         let logURL = URL(fileURLWithPath: logPath)
         func emit(_ line: String) {
             print(line)

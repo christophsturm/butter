@@ -1,14 +1,14 @@
 # Adding a Model
 
-How to port a new architecture into FFAI. Both in-tree families (`Llama`, `Qwen3`) were added with this flow; copy whichever is structurally closest to your target.
+How to port a new architecture into Butter. Both in-tree families (`Llama`, `Qwen3`) were added with this flow; copy whichever is structurally closest to your target.
 
 ## File layout
 
-`Sources/FFAI/Models/` mirrors the user-facing modality grouping:
+`Sources/ButterSwift/Models/` mirrors the user-facing modality grouping:
 
 ```text
 Models/
-├── <Family>.swift            ← family root: interface + error + routing (multi-capability families)
+├── <Family>.swift            ← family root (VL/multi-modal orchestrators only)
 ├── Text/<F>Text.swift        ← text inference (or <F>.swift for text-only families)
 ├── Vision/<F>Vision.swift    ← image + video tower (one per VL family)
 ├── Audio/STT/<F>.swift       ← speech-to-text
@@ -31,31 +31,16 @@ Models/
 
 The `Vision` / `Text` / `<Sub>` suffix on per-modality files is a SwiftPM constraint: object files are named by basename only, so `Text/<F>.swift` and `Vision/<F>.swift` would collide on `.o` output.
 
-For shared building blocks: cross-family helpers (e.g. the GEMM K-tile padding, patch-embed reshape) live in [`Vision/VisionTowerOps.swift`](../../Sources/FFAI/Models/Vision/VisionTowerOps.swift) as module-internal top-level functions. MoE routing + per-expert dispatch live in [`MoELayer.swift`](../../Sources/FFAI/ModelLayers/MoELayer.swift) so optimisations (expert co-location, SSD streaming) land in one place.
+For shared building blocks: cross-family helpers (e.g. the GEMM K-tile padding, patch-embed reshape) live in [`Vision/VisionTowerOps.swift`](../../Sources/ButterSwift/Models/Vision/VisionTowerOps.swift) as module-internal top-level functions. MoE routing + per-expert dispatch live in [`MoELayer.swift`](../../Sources/ButterSwift/Models/MoELayer.swift) so optimisations (expert co-location, SSD streaming) land in one place.
 
 ## Decide if it's a new family or a new variant
 
 A **family** is a major architectural lineage. A **variant** is a shape inside a family.
 
-- **New family.** A different family file. Examples: Mistral, Phi, Gemma, Mamba, GPT-OSS — none of these share Llama's exact attention shape. New file under the appropriate folder (`Text/`, `Vision/`, `Audio/<sub>/`, or `Models/` root for a VL orchestrator), registered as a `ModelEntry` row in the `ModelRegistry` table (see Step 5).
+- **New family.** A different family file. Examples: Mistral, Phi, Gemma, Mamba, GPT-OSS — none of these share Llama's exact attention shape. New file under the appropriate folder (`Text/`, `Vision/`, `Audio/<sub>/`, or `Models/` root for a VL orchestrator), registered in `ModelRegistry.dispatchAndLoad`.
 - **New variant.** Same family file, new struct conforming to the family's `Variant` protocol. Examples: `Qwen35Dense` alongside `Qwen3Dense`, `Qwen35MoE`, `Qwen35VL` — they go in `Models/Text/Qwen3xText.swift` and dispatch in `Qwen35.variant(for:)`.
 
 The convention is **one file per family per folder, not per variant**. A family file with five variant structs is fine; five files for one family is not.
-
-## The family-root contract
-
-Every family has ONE **root** that is the entry point: it defines the family's core interface, owns the error type, and routes to the back-end stacks. Each capability the family exposes is a **variant** (or orchestrator) that loads only the text / vision / audio components it needs, and **declares its own `availableCapabilities` and `defaultGenerationParameters`** (extending or overriding the family baseline). Components live in the per-modality files, never in the root:
-
-- **Root** (`Models/<F>.swift`, or `Text/<F>.swift` for a text-only family):
-  - `enum <F>` — `modelTypes` / `architectures` + `variant(for:)` (text-variant dispatch) + any cross-cutting detection it owns (e.g. `isOmni`).
-  - `protocol <F>Variant` — `availableCapabilities`, `defaultGenerationParameters`, `loadModel(...) -> <F>Model`.
-  - `enum <F>Error` — ONE unified family error (not a per-capability error type).
-  - A `typealias <F>Model = <Engine>` when the family reuses a shared engine (e.g. `Qwen2Model = LlamaModel`).
-- **Text component** (`Text/<F>Text.swift`): the concrete `<F>Variant` struct(s) — e.g. `<F>Dense`, `<F>MoE` — each declaring its capabilities + generation defaults and loading the text engine.
-- **Vision component** (`Vision/<F>Vision.swift`): the VL orchestrator enum (`<F>VL`) + the tower internals. The orchestrator declares `availableCapabilities` (`+ .imageIn`, `.videoIn`) and `defaultGenerationParameters`, loads the text backbone **through the family's text variant**, and splices via `VisionModel`.
-- **Audio / omni component** (`Audio/<sub>/<F>Audio.swift` or a shared omni engine): same shape — declare capabilities, load the audio tower + text backbone.
-
-The root never contains a tower body; it routes. Worked example: the **Qwen 2** family — `Models/Qwen2.swift` (root: `Qwen2` enum + `Qwen2Variant` + `Qwen2Error` + `isOmni`), `Text/Qwen2Text.swift` (`Qwen2Dense`, text-only caps + dense gen defaults), `Vision/Qwen2Vision.swift` (`Qwen2VL` orchestrator + tower), and Qwen2.5-Omni reusing the shared `QwenOmniModel`. `Qwen3` and `Granite4` follow the identical shape.
 
 ## Step 1 — read the reference
 
@@ -74,7 +59,7 @@ What you want from the reference:
 
 ## Step 2 — confirm the kernel coverage
 
-Open `Sources/FFAI/Ops.swift` and verify every op the forward pass needs exists. Most modern LLMs reuse the existing kernel set:
+Open `Sources/ButterSwift/Ops.swift` and verify every op the forward pass needs exists. Most modern LLMs reuse the existing kernel set:
 
 - `gather` (embedding lookup)
 - `rms_norm` + `multiRowRMSNorm`
@@ -90,7 +75,7 @@ If your model needs something new (attention sinks, fused MoE, sliding-window ma
 
 ## Step 3 — write the family file
 
-Copy `Sources/FFAI/Models/Text/LlamaText.swift` as a template. Structure:
+Copy `Sources/ButterSwift/Models/Text/Llama.swift` as a template. Structure:
 
 ```swift
 public enum <Family> {
@@ -137,13 +122,12 @@ Key invariants the implementation must preserve:
 
 ## Step 4 — declare family defaults
 
-Each variant struct carries a static `defaultGenerationParameters: GenerationParameters` that captures the sampling + length values that family ships with. The `Model` instance threads this through as `model.defaultGenerationParameters`, and `Model.generate(prompt:parameters:)` falls back to it when the caller passes `nil`. This is what the user gets when they do `ffai --model <repo>` with no sampling flags.
+Each variant struct carries a static `defaultGenerationParameters: GenerationParameters` that captures the sampling + length values that family ships with. The `Model` instance threads this through as `model.defaultGenerationParameters`, and `Model.generate(prompt:parameters:)` falls back to it when the caller passes `nil`. This is what the user gets when they do `butter --model <repo>` with no sampling flags.
 
-**REQUIRED — pull the recommended sampling parameters from the model's ORIGINAL model card** (the HuggingFace card / official docs for the family), NOT a generic placeholder. Most modern instruct/reasoning models publish a specific recipe (e.g. LFM2 `temperature=0.3, min_p=0.15, repetition_penalty=1.05`; Qwen3 thinking `temperature=0.6, top_p=0.95, top_k=20, min_p=0`; Gemma `temperature=1.0, top_p=0.95, top_k=64`). Use those exact values. **Do NOT default to greedy (`temperature: 0`)** — sampling is live (`Generate.driveGeneration` has greedy-GPU / gpu-categorical / cpu-sample paths), and many models (Qwen3, LFM2.5) degenerate into repetition loops under greedy decoding. If a card publishes thinking vs non-thinking recipes, pick the general-purpose thinking default and note the alternative in a comment. Only models where greedy is *architecturally required* (e.g. Nemotron-Labs-Diffusion self-speculation, lossless only at temperature 0) may default to greedy — and must say so in the comment.
+Pull the values from the reference implementation. mlx-swift-lm's `Libraries/MLXLLM/Models/<Family>.swift` declares `defaultPrefillStepSize`; per-checkpoint sampling defaults live in `LLMRegistry`. Pull representative-checkpoint values for each variant. Reasonable starting points if the reference is silent:
 
-If the card genuinely publishes no recommendation (rare — usually base-only checkpoints), fall back to a sensible non-greedy default (`temperature: 0.7, top_p: 0.9`, plus `repetition_penalty: 1.1–1.2` for base SSMs, which loop without it) and cite that it's a fallback.
-
-- `prefillStepSize: 1024` — dense attention models. Bump to `4096` for pure-attention models with long contexts (Gemma 4), `2048` for GPT-OSS, `256` for SSM/hybrid families (avoids the per-token SSM bottleneck).
+- `temperature: 0.6`, `topP: 1.0`, `topK: 0` — matches mlx-swift-lm's baseline `GenerationParameters.init` for text-only LLMs.
+- `prefillStepSize: 1024` — dense attention models. Bump to `4096` for pure-attention models with long contexts (Gemma 4, Mistral) per mlx-swift-lm's per-family override pattern.
 - `maxTokens: 256` — sane default; users override per call.
 
 Example:
@@ -168,92 +152,46 @@ public struct <Family>Dense: <Family>Variant {
 }
 ```
 
-All sampling fields are honored by the decode path today (greedy when `temperature == 0`, GPU categorical / CPU top-k/top-p/min-p/repetition otherwise). See [generation-parameters.md](../generation-parameters.md) for the full field table.
-
-A paired unit test in `Tests/FFAITests/Models/Text/<Family>TextTests.swift` MUST assert the exact card values (so a future edit can't silently regress them):
-
-```swift
-@Test("<Family> default generation parameters match the <source> card")
-func defaultGenerationParameters() {
-    let p = <Family>Variant.defaultGenerationParameters
-    #expect(p.temperature == <card value>)
-    #expect(p.topP == <card value>)
-    #expect(p.topK == <card value>)
-}
-```
+Sampling fields are no-ops on the greedy decode path until Phase 5 — declare them anyway so per-family defaults don't churn when GPU sampling kernels land. See [generation-parameters.md](../generation-parameters.md) for the full field table.
 
 ## Step 5 — register the family
 
-Registering a family = adding **one `ModelEntry` row** to the single
-`ModelRegistry` table. There is no if-chain to edit; the loader finds the first
-entry whose `matches(_:)` claims the config. An entry carries everything needed
-to RECOGNISE the checkpoint, LOAD it, and LIST it in `ffai models` — the table
-is the one source of truth for both the loader and the catalog.
-
-**Text / VL family** — add to `textEntries` (or `visionEntries`) in
-`Sources/FFAI/Loader/ModelRegistryTable.swift`. The `load` closure takes the
-pre-built, residency-pinned weights and returns a `ModelRegistry.Loaded`:
+In `Sources/ButterSwift/Model.swift`, `ModelRegistry.dispatchAndLoad`:
 
 ```swift
-ModelEntry(
-    family: "<Family>", kind: .llm,
-    summary: "One-line catalog blurb.",
-    repos: ["org/example-4bit"],
-    modelTypes: <Family>.modelTypes, architectures: <Family>.architectures,
-    load: { c, w, o, d in
-        let variant = try <Family>.variant(for: c)
-        let engine = try variant.loadModel(config: c, weights: w, options: o, device: d)
-        return Loaded(
-            engine: engine,
-            defaultGenerationParameters: variant.defaultGenerationParameters,
-            availableCapabilities: variant.availableCapabilities)
-    }),
+if let arch = config.architecture, <Family>.architectures.contains(arch) {
+    return try load<Family>(config: config, weights: weights,
+                            options: options, device: device)
+}
+if let mt = config.modelType, <Family>.modelTypes.contains(mt) {
+    return try load<Family>(config: config, weights: weights,
+                            options: options, device: device)
+}
 ```
 
-Entry order is precedence (first match wins) — put a family with a more
-specific marker before a generic one (e.g. MiniCPM5's name-marker `sniff`
-before the generic Llama arch). Families not identifiable by
-`model_type` / `architecture` alone supply a `sniff: { <Family>.handles($0) }`
-closure.
-
-**Audio / VAD family** (STT / TTS / STS / VAD / omni) — add to `audioEntries`
-in `Sources/FFAI/Loader/ModelRegistryAudio.swift`. These load from the snapshot
-directory (they build their own weight bundle, sometimes async, and attach
-their own tokenizer), so they set `loadFromDirectory` instead of `load`, plus
-the family's `capabilities` and `kind`:
+And a `load<Family>` helper that delegates to the variant's `loadModel` and returns a `ModelRegistry.Loaded` carrying both the engine and the variant's `defaultGenerationParameters`:
 
 ```swift
-ModelEntry(
-    family: "<Family>", kind: .tts,
-    summary: "One-line catalog blurb.",
-    repos: ["org/example"],
-    capabilities: Capability.textToSpeech,
-    sniff: { <Family>Model.handles($0) },
-    loadFromDirectory: { dir, _, _, dev in
-        let m = try await <Family>Model.load(directory: dir, device: dev)
-        return await audioLoaded(m, Capability.textToSpeech, directory: dir)
-    }),
+public static func load<Family>(...) throws -> Loaded {
+    let variant = try <Family>.variant(for: config)
+    let engine = try variant.loadModel(...)
+    return Loaded(engine: engine,
+                  defaultGenerationParameters: variant.defaultGenerationParameters)
+}
 ```
-
-Then conform the engine to its modality protocol in
-`Sources/FFAI/ModelType/EngineConformances.swift` — `Transcribing` (STT),
-`Synthesizing` (TTS), `SpeechTransforming` (STS), or `Detecting` (VAD). STT/TTS
-conformances are one-line markers (the families already conform to the
-`StreamingTranscriber` / `StreamingSynthesizer` contracts the protocols
-refine); `Model.transcribe` / `synthesize` / `detect` then work for free.
 
 ## Step 6 — verify correctness
 
-FFAI does **not** pin correctness with golden fixtures. There is no Python dependency in the test loop. Correctness comes from two layers:
+Butter does **not** pin correctness with golden fixtures. There is no Python dependency in the test loop. Correctness comes from two layers:
 
 - **Per-kernel GPU correctness** — every non-trivial kernel lands with a iron-side `<kernel>_gpu_correctness` test comparing the GPU result against a naive CPU oracle in fp32 (see iron's `docs/testing.md`). This is the tight numerical signal. If your family needed a new kernel, that test ships in the same commit on the iron side.
-- **Per-family coherence** — the FFAI integration test (Step 8) loads a real checkpoint, greedy-decodes, and asserts the model produces coherent text. The contract is "the pipeline produces coherent output", not bit-parity with mlx-lm / mlx-vlm — cross-implementation token parity proved to be a measure of rounding-mode alignment, not correctness, and was dropped.
+- **Per-family coherence** — the Butter integration test (Step 8) loads a real checkpoint, greedy-decodes, and asserts the model produces coherent text. The contract is "the pipeline produces coherent output", not bit-parity with mlx-lm / mlx-vlm — cross-implementation token parity proved to be a measure of rounding-mode alignment, not correctness, and was dropped.
 
 ## Step 7 — wire inspect hooks
 
-`ffai inspect` is the first command every dev reaches for when a new model produces broken output. **REQUIRED — every family file calls the shared `InspectTap` utility (`Sources/FFAI/Telemetry/InspectTap.swift`) at layer boundaries inside `<Family>Model.forward(...)`** so the `--layer-trace` diagnostic surface works uniformly. A family that skips this is a silent no-op under `--layer-trace` (the gap that hid the LFM2.5 triage), so it is part of the definition of done.
+`butter inspect` is the first command every dev reaches for when a new model produces broken output. Every family file calls the shared `InspectTap` utility (`Sources/ButterSwift/Inspect/InspectTap.swift`) at layer boundaries inside `<Family>Model.forward(...)` so the `--layer-trace` diagnostic surface works uniformly across families.
 
-The pattern, lifted from `LlamaModel.forward` (the canonical reference — `Sources/FFAI/Models/Text/LlamaText.swift`):
+The pattern, lifted from `LlamaModel.forward` (the canonical reference — `Sources/ButterSwift/Models/Text/Llama.swift`):
 
 ```swift
 public func forward(tokenId: Int, position: Int,
@@ -262,7 +200,7 @@ public func forward(tokenId: Int, position: Int,
     // 1. Pick up the env-driven tap state. Cached at the first
     //    call site so subsequent forwards pay a static-load cost
     //    only — no per-token env-dict allocation. No-op when
-    //    FFAI_INSPECT isn't set.
+    //    BUTTER_INSPECT isn't set.
     let tap = InspectTap.fromEnvironment
 
     // 2. When taps are active, route work onto a *private* cmdbuf
@@ -312,43 +250,32 @@ public func forward(tokenId: Int, position: Int,
 }
 ```
 
-The `<Family>Layer.forward(...)` stays clean — no taps inside the layer's hot path. That's deliberate: layer-boundary taps localise *which* layer is failing in two `ffai inspect --layer-trace` runs. For inside-layer triage (which op in layer N produced the NaN), drop temporary fine-grained `tap.dumpLayerBoundary(...)` calls between ops as you debug, then remove them before merging. The canonical worked example (a single GELU NaN inside layer 1's MLP that the standardized boundary tap localised in seconds once `ffai inspect --layer-trace --trace-layers 0,1,2,3,4` was the first thing the dev ran) is documented in the Gemma 3 coherence investigation that lived in `papers/` during that fix.
+The `<Family>Layer.forward(...)` stays clean — no taps inside the layer's hot path. That's deliberate: layer-boundary taps localise *which* layer is failing in two `butter inspect --layer-trace` runs. For inside-layer triage (which op in layer N produced the NaN), drop temporary fine-grained `tap.dumpLayerBoundary(...)` calls between ops as you debug, then remove them before merging. The canonical worked example (a single GELU NaN inside layer 1's MLP that the standardized boundary tap localised in seconds once `butter inspect --layer-trace --trace-layers 0,1,2,3,4` was the first thing the dev ran) is documented in the Gemma 3 coherence investigation that lived in `papers/` during that fix.
 
 **Required:** every new family file MUST follow this pattern. The `InspectSmokeTests` integration test (Tests/ModelIntegrationTests/) asserts the inspect path runs end-to-end against a representative model from each family; that test will fail loudly if a family file forgets to wire `InspectTap` calls.
 
 ## Step 8 — add the integration test
 
-Every family gets one flat file, `Tests/ModelIntegrationTests/<Family>IntegrationTests.swift`. It loads the smallest published checkpoint through `ModelLoadLock.shared` (serializes the multi-GB load across suites) and asserts `expectCoherentOutput(...)` — a token-count floor, no degenerate repeat run, minimum token diversity. A checkpoint that can't be fetched (offline, gated repo) prints a skip line and **passes**.
-
-**REQUIRED — generate with the model's own `defaultGenerationParameters`, NOT greedy.** The whole point is to exercise the recipe a real user gets — the live sampling path (temperature / top-p / min-p / repetition penalty), which is exactly where bugs like the LFM2.5 repetition loop surface. Override only `maxTokens` (cost) and `seed` (reproducibility). `expectCoherentOutput` is diversity-based, so it's robust to sampling variance. **Instruct / reasoning models** (those that ship a chat template) MUST generate via `generate(messages:)` so the template is applied — a raw prompt to an instruct model degenerates and is not a real test.
+Every family gets one flat file, `Tests/ModelIntegrationTests/<Family>IntegrationTests.swift`. It loads the smallest published checkpoint through `ModelLoadLock.shared` (serializes the multi-GB load across suites), greedy-decodes, and asserts `expectCoherentOutput(...)` — a token-count floor, no degenerate repeat run, minimum token diversity. A checkpoint that can't be fetched (offline, gated repo) prints a skip line and **passes**:
 
 ```swift
 @Suite("<Family> integration", .serialized)
 struct <Family>IntegrationTests {
-    @Test("load + default-params generate produces coherent output")
+    @Test("load + greedy generate produces coherent output")
     func loadAndGenerate() async throws {
         let m: Model
         do { m = try await ModelLoadLock.shared.loadSerially {
                  try await Model.load("<smallest-published-repo>") } }
         catch { print("skipped: \(error)"); return }
-        // Model-card defaults (NOT greedy); seed + maxTokens for a cheap,
-        // reproducible run.
-        let params = m.defaultGenerationParameters.with {
-            $0.maxTokens = 200
-            $0.seed = 42
-        }
-        // Base/completion model: raw prompt.
-        let r = try await m.generate(prompt: "The capital of France is", parameters: params)
-        // Instruct/reasoning model (has a chat template): use messages.
-        // let r = try await m.generate(
-        //     messages: [ChatMessage(role: .user, content: "What is the capital of France?")],
-        //     parameters: params)
+        let r = try await m.generate(
+            prompt: "Once upon a time",
+            parameters: GenerationParameters(maxTokens: 64, temperature: 0))
         expectCoherentOutput(r.generatedTokens, label: "<Family>")
     }
 }
 ```
 
-Determinism is covered separately by the cross-cutting `DeterminismSmokeTests` (which deliberately uses `temperature: 0`). Per-family integration tests should NOT use greedy. See [testing.md](testing.md) for the full integration-test story, the cross-cutting suites, and the env-gated heavy checkpoints.
+Determinism: temp = 0 greedy decode is bit-exact run-to-run on the same machine — the cross-cutting `DeterminismSmokeTests` covers that contract. See [testing.md](testing.md) for the full integration-test story, the cross-cutting suites, and the env-gated heavy checkpoints.
 
 ## Step 9 — wire into CI
 

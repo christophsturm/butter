@@ -6,8 +6,8 @@
 #
 # Covers:
 #   - make build      (~10-15 s when the kernel cache is warm)
-#   - make test-unit  (~2 min — FFAITests + IronSwiftTests at the
-#                      production cap, the IronLibrary code default)
+#   - make test-unit  (~2 min — ButterTests + IronSwiftTests at the
+#                      production cap, BUTTER_MAX_COMMAND_BUFFERS=16)
 #
 # NOT run here (too slow or environment-specific):
 #   - make test-integration  — multi-GB checkpoint downloads + per-family

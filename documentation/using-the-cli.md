@@ -1,14 +1,14 @@
 # Using the CLI
 
-The `ffai` executable is a SwiftPM product, not a Homebrew formula — there's no global install step. After cloning the repo, build it with `swift build` and invoke it through SwiftPM (`swift run ffai …`), the built binary path, or by symlinking onto `PATH`.
+The `butter` executable is a SwiftPM product, not a Homebrew formula — there's no global install step. After cloning the repo, build it with `swift build` and invoke it through SwiftPM (`swift run butter …`), the built binary path, or by symlinking onto `PATH`.
 
 ## Build
 
 ```bash
-git clone https://github.com/thewafflehaus/FFAI
-cd FFAI
+git clone https://github.com/thewafflehaus/butter
+cd Butter
 
-swift build -c release        # binary lands at .build/release/ffai
+swift build -c release        # binary lands at .build/release/butter
 ```
 
 Use `-c debug` (the SwiftPM default) for faster compile + slower run; `-c release` for the inference numbers you'd quote.
@@ -19,129 +19,34 @@ Pick one of three invocations — they're equivalent, just trade-offs on ergonom
 
 ```bash
 # (a) Via SwiftPM — no setup, recompiles if the source changed.
-swift run -c release ffai generate -m mlx-community/Qwen3.5-0.8B-MLX-4bit -p "Once upon a time"
+swift run -c release butter generate -m mlx-community/Qwen3.5-0.8B-MLX-4bit -p "Once upon a time"
 
 # (b) Direct binary path — no recompile check, fastest start-up.
-.build/release/ffai generate -m mlx-community/Qwen3.5-0.8B-MLX-4bit -p "Once upon a time"
+.build/release/butter generate -m mlx-community/Qwen3.5-0.8B-MLX-4bit -p "Once upon a time"
 
-# (c) Symlink onto PATH (one-time) so plain `ffai …` works from anywhere.
-ln -s "$PWD/.build/release/ffai" /usr/local/bin/ffai
-ffai generate -m mlx-community/Qwen3.5-0.8B-MLX-4bit -p "Once upon a time"
+# (c) Symlink onto PATH (one-time) so plain `butter …` works from anywhere.
+ln -s "$PWD/.build/release/butter" /usr/local/bin/butter
+butter generate -m mlx-community/Qwen3.5-0.8B-MLX-4bit -p "Once upon a time"
 ```
 
-`generate` is the default subcommand and `generate text` is its default in turn, so a bare prompt flows straight through: `ffai "Once upon a time" -m …` is equivalent to `ffai generate text "Once upon a time" -m …`. The prompt is positional for `generate text`; the `-m / --model` flag works at every level.
-
-**Instruct / reasoning models need `--mode chat`.** By default `generate` feeds the prompt verbatim (`--mode raw`), which suits base / completion models. Instruct and reasoning models (e.g. `LFM2.5`, most `-Instruct` checkpoints) are trained on a chat template and degenerate on raw input — pass `--mode chat` to wrap the prompt as a user turn and render it through the model's chat template (loaded from `tokenizer_config.json` *or* a standalone `chat_template.jinja`):
-
-```bash
-ffai generate -m ekryski/LFM2.5-8B-A1B-4bit --mode chat -p "What is the capital of France?"
-```
-
-(The Nemotron-Diffusion decode-algorithm selector, formerly `--mode`, is now `--decode-mode ar|diffusion|self-spec`.)
+`generate` is the default subcommand, so the `-m / -p` flags can be passed directly to `butter` (`butter -m … -p …` is equivalent to `butter generate -m … -p …`).
 
 ## Subcommands
 
 | Subcommand | One-liner | More |
 |---|---|---|
-| `generate` (default) | Stream a prompt's continuation to stdout. Has one input-modality subcommand each: `text` (default), `image`, `video`, `audio`. | [§ `generate`](#generate--text--image--video--audio--text) |
-| `transcribe` | Stream a transcript from an audio file (speech-to-text). | [§ `transcribe` / `speak`](#transcribe--speak--speech) |
-| `speak` | Synthesize speech from text to a `.wav` file (text-to-speech). | [§ `transcribe` / `speak`](#transcribe--speak--speech) |
-| `models` | List every supported model family with copy-paste example repo IDs (bf16 / 8-bit / 4-bit). | `ffai models` |
-| `inspect` | Load a model and dump architecture + tokenization + top-K logits for a fixed probe prompt. The first thing to reach for when a new model produces broken output. | `ffai inspect --help` |
-| `download` | Pre-fetch one or more HuggingFace checkpoints into the local cache — no model load, no GPU work. | [§ `download`](#download--pre-fetch-checkpoints-into-the-cache) |
-| `convert` | Quantize a bf16/fp16 HuggingFace checkpoint to MLX 4-bit affine format using FFAI's own GPU kernels — no Python / mlx-lm dependency. Optionally upload to HF. | [§ `convert`](#convert--quantize-a-checkpoint-to-mlx-affine-format) |
+| `generate` (default) | Stream a single prompt's continuation to stdout. | `butter generate --help` |
+| `models` | List every supported model family with copy-paste example repo IDs (bf16 / 8-bit / 4-bit). | `butter models` |
+| `inspect` | Load a model and dump architecture + tokenization + top-K logits for a fixed probe prompt. The first thing to reach for when a new model produces broken output. | `butter inspect --help` |
+| `convert` | Quantize a bf16/fp16 HuggingFace checkpoint to MLX 4-bit affine format using Butter's own GPU kernels — no Python / mlx-lm dependency. Optionally upload to HF. | [§ `convert`](#convert--quantize-a-checkpoint-to-mlx-4-bit) |
 | `bench` | Run a benchmark method against a model, append to a per-day report. | [benchmarking.md](benchmarking.md) |
-
-### `generate` — text / image / video / audio → text
-
-`generate` is a command group with one subcommand per input modality. All
-of them stream to stdout by default (streaming is the primary route) and
-share the same model / sampling / KV-cache flags; pass `--no-streaming` to
-buffer and print once.
-
-```bash
-# text (default subcommand — the prompt is positional)
-ffai generate text "Explain RoPE in one sentence." -m mlx-community/Qwen3-4B-4bit
-ffai generate text "Explain RoPE." -m <instruct-model> --mode chat   # chat-template models
-
-# image + prompt → text
-ffai generate image dog.jpg -m mlx-community/Qwen3-VL-4B-Instruct-4bit \
-    --prompt "What breed is this dog?"
-
-# video + prompt → text (samples up to --max-frames frames)
-ffai generate video clip.mp4 -m mlx-community/Qwen3-VL-4B-Instruct-4bit \
-    --max-frames 8 --prompt "Summarize what happens."
-
-# audio + prompt → text (omni models that declare audioIn)
-ffai generate audio speech.wav -m <omni-model> --prompt "Transcribe and summarize."
-```
-
-The media subcommands take the file as a positional argument and the
-instruction as `--prompt` (each has a sensible default, e.g. "Describe this
-image."). The prompt is built generically from the model's chat template
-with the media-placeholder run spliced in ahead of the question, so any VLM
-/ omni family that declares the matching capability (`imageIn` / `videoIn` /
-`audioIn`) works without per-family flags. For the highest-fidelity
-per-family prompt framing, the integration tests remain the reference.
-
-| Flag (all `generate` subcommands) | Default | Meaning |
-|---|---|---|
-| `-m` / `--model` | `unsloth/Llama-3.2-1B` | HF repo id or local path. |
-| `--max-tokens` | family default | Cap on generated tokens. |
-| `--no-streaming` | streaming on | Buffer and print once at the end. |
-| `--stats` | off | Print the `[STATS]` block after the run. |
-| `--temperature` / `--top-k` / `--top-p` / `--min-p` / `--repetition-penalty` / `--seed` | family default | Sampling overrides. |
-| `--kv-cache` / `--kv-window-size` / `--kv-window-keep` / `--aura-decode-path` | `raw` | KV-cache scheme + sliding-window eviction (see [observability.md](observability.md)). |
-| `--max-frames` (video only) | `8` | Frames sampled from the video. |
-| `--prompt` (image/video/audio) | per-modality default | Instruction about the media. |
-
-### `transcribe` / `speak` — speech
-
-`transcribe` runs a speech-to-text model and streams the transcript as it
-decodes; `speak` runs a text-to-speech model and writes a `.wav`, streaming
-the synthesis segment-by-segment. Both stream by default.
-
-```bash
-# speech → text (streams the transcript incrementally)
-ffai transcribe meeting.wav -m mlx-community/granite-4.0-1b-speech-5bit
-
-# text → speech (writes out.wav; Soprano synthesizes straight from text)
-ffai speak "The quick brown fox." --out out.wav
-ffai speak "The quick brown fox." -m mlx-community/Soprano-80M-4bit --out out.wav
-```
-
-| Flag | Applies to | Meaning |
-|---|---|---|
-| `<file>` / `<text>` (positional) | both | Input audio file (`transcribe`) or text to speak (`speak`). |
-| `-m` / `--model` | both | HF repo id or local path to an STT / TTS checkpoint. |
-| `--no-streaming` | both | Buffer instead of streaming (`transcribe` prints once; `speak` writes once). |
-| `--max-new-tokens` | `transcribe` | Decode cap (STT). |
-| `--voice` | `speak` | Speaker/voice id for multi-speaker TTS models (ignored by single-speaker models). |
-| `--out` | `speak` | Output `.wav` path (default `out.wav`). |
-
-Under the hood every STT model exposes `transcribeStream` and every TTS
-model exposes `synthesizeStream`, so the buffered and streamed paths share
-one decode loop (see [streaming.md](streaming.md)).
-
-**TTS input formats vary by family.** `speak` defaults to **Soprano**, which
-synthesizes directly from raw text (BPE → LM → Vocos). Two caveats worth
-knowing when choosing `-m`:
-
-- **Phoneme-input models** (Kokoro, StyleTTS2) expect a phonemized **IPA**
-  string, not raw English — FFAI bundles no grapheme-to-phoneme step, so
-  `speak` with raw text errors with a clear "needs phonemized input"
-  message. Pass IPA, or use a text-native model.
-- **Staged-port models** (several codec/diffusion TTS families) declare the
-  streaming surface but their synthesis isn't wired yet; `speak` surfaces a
-  typed "not wired" error rather than emitting silence. The model still
-  *streams* — there's just nothing to synthesize until the port lands.
 
 ### `models` — what can I run?
 
-`ffai models` prints every supported architecture family grouped by kind (dense / MoE / SSM-GDN hybrid / diffusion), each with a one-line summary and a few example HuggingFace repo IDs you can paste straight into `generate` or `bench`:
+`butter models` prints every supported architecture family grouped by kind (dense / MoE / SSM-GDN hybrid / diffusion), each with a one-line summary and a few example HuggingFace repo IDs you can paste straight into `generate` or `bench`:
 
 ```bash
-ffai models
+butter models
 # ── Dense text ──────────────────────────────────────
 #   Qwen 3  [qwen3]
 #     Qwen 3 dense — per-head q/k RMSNorm before RoPE.
@@ -155,7 +60,7 @@ The example IDs include bf16, 8-bit, and 4-bit conversions where published. Any 
 
 ### `inspect` — model bring-up diagnostic
 
-When a new model checkpoint isn't producing coherent text, run `ffai inspect <repo>` before anything else. The output is structured in six sections:
+When a new model checkpoint isn't producing coherent text, run `butter inspect <repo>` before anything else. The output is structured in six sections:
 
 1. **Architecture** — family + dtype + every shape the loader inferred from `config.json` (hidden / nLayers / nHeads / nKVHeads / head_dim / vocab / max_position_embeddings). Tells you instantly whether the loader parsed the right config.
 2. **Capabilities** — what the family declares it can do vs what `LoadOptions` enabled.
@@ -174,7 +79,7 @@ When a new model checkpoint isn't producing coherent text, run `ffai inspect <re
 6. **Top-K next-token logits** — runs prefill and prints the K most-likely continuations of the probe prompt. NaN logits get flagged with a debug-checklist hint; values are model-comparable (e.g. for `Once upon a time, in a quiet` you want to see `" village"`, `" little"`, `" forest"`, `" valley"`, not `"<pad>"`).
 
 ```bash
-ffai inspect -m mlx-community/gemma-3-1b-it-bf16 -p "Once upon a time, in a quiet"
+butter inspect -m mlx-community/gemma-3-1b-it-bf16 -p "Once upon a time, in a quiet"
 # → top-5: " village" +34.0, " little" +31.25, " valley" +29.88, …
 ```
 
@@ -182,10 +87,10 @@ Pair with `--debug` (per-subsystem trace dump) and `--profiling 1` (wallclock br
 
 #### `--layer-trace` — per-layer intermediate-value dumps
 
-For deeper triage when the top-K logits come back NaN / corrupted, add `--layer-trace` and (optionally) `--trace-layers N,M,...` to print min/max/nan/inf/first-4 statistics at every layer boundary during prefill. Each model's `forward(...)` calls `InspectTap` (`Sources/FFAI/Inspect/InspectTap.swift`) at the layer-out boundary, so the trace is uniform across families:
+For deeper triage when the top-K logits come back NaN / corrupted, add `--layer-trace` and (optionally) `--trace-layers N,M,...` to print min/max/nan/inf/first-4 statistics at every layer boundary during prefill. Each model's `forward(...)` calls `InspectTap` (`Sources/ButterSwift/Inspect/InspectTap.swift`) at the layer-out boundary, so the trace is uniform across families:
 
 ```bash
-ffai inspect -m <broken-model> --layer-trace --trace-layers 0,1,5,15
+butter inspect -m <broken-model> --layer-trace --trace-layers 0,1,5,15
 # [L0 layer_out] n=1152 min=-1.52 max=+1.55 nan=0 inf=0 first=[...]
 # [L1 layer_out] n=1152 min=— max=— nan=1152 inf=0 first=[nan, nan, …]
 # ↑ Layer 1's output is all NaN — the bug is in layer 1's forward.
@@ -195,73 +100,11 @@ This is the diagnostic that found the Gemma 3 bf16 GELU NaN in two runs (one to 
 
 Common cross-cutting flags (`--stats`, `--debug`, `--profiling`) are documented in [observability.md](observability.md).
 
-### `download` — pre-fetch checkpoints into the cache
-
-`ffai download <repo-id> [...]` pulls one or more HuggingFace repos into the local snapshot cache **without loading the model**. No weights are mapped into Metal buffers, no GPU dispatch fires, no prewarm forward pass runs — it's network + disk only. The cache layout is byte-identical to what `Model.load(...)` uses, so a subsequent `ffai generate / inspect / bench` on the same repo skips straight to load.
-
-The runtime loader will also lazy-download on first use; this command is the explicit cache-warm primitive for the common cases where lazy is the wrong tool:
-
-- Pre-fetching every checkpoint your integration tests touch before kicking off a long suite run, so a single suite's wall clock isn't dominated by a multi-GB cold download.
-- Provisioning a CI / batch box where you want to fail fast at setup time if a repo is gated or 404, not three hours into the run.
-- Mirroring a known-good set of checkpoints to an external SSD via `--cache /Volumes/...` so later runs use the SSD even when `$HF_HOME` points at the system disk.
-
-```bash
-# Single repo, default revision (main).
-ffai download mlx-community/Qwen3-1.7B-4bit
-
-# Multiple repos in one invocation — each gets its own progress block.
-ffai download \
-    mlx-community/Llama-3.2-1B-Instruct-4bit \
-    mlx-community/Qwen3-1.7B-4bit \
-    mlx-community/Qwen3.5-0.8B-MLX-4bit
-
-# Override the revision (branch / tag / commit hash).
-ffai download --revision dev mlx-community/Qwen3.5-0.8B-MLX-4bit
-
-# Point the cache at an external SSD (otherwise uses $HF_HOME, then
-# ~/.cache/huggingface/hub).
-ffai download --cache /Volumes/Scratch/hf mlx-community/Qwen3-1.7B-4bit
-
-# Drain a long list even if some repos fail — exit non-zero at the end
-# if any individual download failed.
-ffai download --continue-on-error \
-    mlx-community/Qwen3-1.7B-4bit \
-    mlx-community/known-gated-repo \
-    mlx-community/Llama-3.2-1B-Instruct-4bit
-
-# Verify a snapshot is already on disk without hitting the network.
-# Succeeds only if every file the index lists is present locally.
-ffai download --local-files-only mlx-community/Qwen3-1.7B-4bit
-```
-
-#### Flags
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `<repo-ids>` (positional) | — | One or more HuggingFace repo ids (`org/name`). Local paths aren't accepted here — for a model already on disk, just point `Model.load(...)` / `ffai generate -m <path>` at it directly. |
-| `--revision` | `"main"` | Git revision (branch / tag / commit) to download. |
-| `--cache` | — | Cache root override. Default discovery order: `$HF_HOME` then `~/.cache/huggingface/hub/`. See [quickstart.md § Custom model cache path](quickstart.md#custom-model-cache-path). |
-| `--continue-on-error` | off | When a single repo fails, log the failure and keep going through the rest of the batch. Without this flag the command stops at the first failure. Returns non-zero exit when any individual download failed. |
-| `--local-files-only` | off | Don't hit the network — succeed only if the snapshot is already on disk. Useful for verifying a cache without pulling. |
-
-#### Exit codes
-
-| Code | Meaning |
-|---|---|
-| 0 | Every repo downloaded (or was already cached). |
-| 1 | At least one repo failed and either `--continue-on-error` was off (stopped at first failure) or all repos drained with at least one failure. |
-| 2 | Validation error — no repo ids passed. |
-
-#### See also
-
-- The Swift API equivalent — `ModelDownloader.download(id:revision:matching:localFilesOnly:progressHandler:)` — is covered in [quickstart.md § Pre-fetching without loading (`ModelDownloader`)](quickstart.md#pre-fetching-without-loading-modeldownloader).
-- Phase I in `planning/session-plan.md` tracks the future move of this subcommand under a `ffai model download` namespace alongside `ffai model {list, add, remove, search}`.
-
 ### `convert` — quantize a checkpoint to MLX affine format
 
-`ffai convert` quantizes a bf16/fp16 HuggingFace checkpoint to MLX affine-quantized format (the same `.weight` + `.scales` + `.biases` triplet layout that `mlx-community/*-4bit` checkpoints use) and writes the result as a drop-in directory `Model.load(...)` can consume. The quantize work runs through FFAI's own `QuantizedOps.quantizeAffine` GPU kernel — there is **no dependency on Python, `mlx-lm`, or `mlx-vlm`** at conversion time.
+`butter convert` quantizes a bf16/fp16 HuggingFace checkpoint to MLX affine-quantized format (the same `.weight` + `.scales` + `.biases` triplet layout that `mlx-community/*-4bit` checkpoints use) and writes the result as a drop-in directory `Model.load(...)` can consume. The quantize work runs through Butter's own `QuantizedOps.quantizeAffine` GPU kernel — there is **no dependency on Python, `mlx-lm`, or `mlx-vlm`** at conversion time.
 
-Specs are **per-tensor-class**. The main `--bits` flag controls the attention + MLP linear projections (the bulk of the model); `--embedding-bits`, `--lm-head-bits`, `--vision-bits`, `--router-bits`, and `--expert-bits` independently override the spec for those specific roles. Each spec accepts any of:
+Specs are **per-tensor-class**. The main `--bits` flag controls the attention + MLP linear projections (the bulk of the model); `--embedding-bits`, `--lm-head-bits`, and `--vision-bits` independently override the spec for those specific roles. Each spec accepts any of:
 
 | Value | Effect |
 |---|---|
@@ -271,45 +114,31 @@ Specs are **per-tensor-class**. The main `--bits` flag controls the attention + 
 
 The `--*-bits` overrides are optional — omit one and that tensor keeps its source dtype (the mlx-lm convention for embeddings / lm_head / vision tower).
 
-**MoE models** get two extra controls. By default routers (the `feed_forward.gate` / `*.router` / `router.proj` projection) stay **full-precision** — quantizing the gate risks flipping top-k expert selection for negligible memory saving — and `--router-bits` opts them in. Experts default to `--bits`; `--expert-bits fp16`/`bf16` leaves them full-precision (experts hold most of a MoE's weight mass, so this is the big size/quality dial). `--expert-layout` chooses how experts are written (see below).
-
-Two source expert layouts are recognized. **Per-expert** checkpoints (Mixtral / LFM2 / DeepSeek) ship one tensor per expert (`experts.<e>.{w1,w3,w2}.weight`); these are gathered into the stacked `switch_mlp.{gate,up,down}_proj` layout. **Pre-stacked 3D** checkpoints (diffusion-gemma) ship the whole expert set fused into rank-3 tensors — `experts.gate_up_proj` `[E, 2·moe, hidden]` + `experts.down_proj` `[E, hidden, moe]`. By default (**`--expert-layout fused`**) these are quantized **in place** under their original names — the standard mlx layout, so FFAI loads our output and existing `mlx-community` uploads through one path, and the fused `gate_up` is split *after* the expert-gather matmul (a single `iron_moe_gather_qmm` of the `[E, 2·moe, hidden]` weight) rather than on disk. Pass **`--expert-layout stacked`** to instead split the fused `gate_up` on its output axis into `switch_mlp.gate_proj` (first half of the rows) + `up_proj` (second half) and rename to FFAI's switch_mlp convention; `--expert-layout per-expert` keeps per-expert sources as-is.
-
 ```bash
 # Pull a bf16 repo, quantize to 4-bit, drop the result in
-# ~/.cache/ffai/converts/HuggingFaceTB--SmolLM2-360M-Instruct-4bit/.
-ffai convert HuggingFaceTB/SmolLM2-360M-Instruct
+# ~/.cache/butter/converts/HuggingFaceTB--SmolLM2-360M-Instruct-4bit/.
+butter convert HuggingFaceTB/SmolLM2-360M-Instruct
 
 # Convert + upload to a HF repo you control (requires `hf` CLI
 # authenticated — `hf auth login`).
-ffai convert HuggingFaceTB/SmolLM2-360M-Instruct \
+butter convert HuggingFaceTB/SmolLM2-360M-Instruct \
     --upload-repo ekryski/SmolLM2-360M-Instruct-4bit
 
 # Convert a model already on disk (e.g. a local fine-tune).
-ffai convert /path/to/my-finetune --output /path/to/my-finetune-4bit
+butter convert /path/to/my-finetune --output /path/to/my-finetune-4bit
 
 # 3-bit, 5-bit, 6-bit — odd-width byte-stream packing.
-ffai convert mlx-community/gemma-3-1b-it-bf16 --bits 3
-ffai convert mlx-community/gemma-3-1b-it-bf16 --bits 6
+butter convert mlx-community/gemma-3-1b-it-bf16 --bits 3
+butter convert mlx-community/gemma-3-1b-it-bf16 --bits 6
 
 # Mixed precision: text + embeddings at 4-bit, untied lm_head at 8-bit.
-ffai convert <repo> --bits 4 --embedding-bits 4 --lm-head-bits 8
+butter convert <repo> --bits 4 --embedding-bits 4 --lm-head-bits 8
 
 # Pure downcast — no quantization, just publish the bf16 model as fp16.
-ffai convert <repo> --bits fp16
+butter convert <repo> --bits fp16
 
 # Mixed bit-widths + downcast: 3-bit text body, fp16 vision tower.
-ffai convert <vlm> --bits 3 --embedding-bits 3 --vision-bits fp16
-
-# MoE: 4-bit body + experts, router left full-precision (default),
-# experts written stacked (default) for fused dispatch.
-ffai convert LiquidAI/LFM2.5-8B-A1B --bits 4
-
-# MoE: keep experts full-precision, quantize only the dense body to 4-bit.
-ffai convert <moe> --bits 4 --expert-bits bf16
-
-# MoE: preserve the source per-expert tensor layout instead of stacking.
-ffai convert <moe> --bits 4 --expert-layout per-expert
+butter convert <vlm> --bits 3 --embedding-bits 3 --vision-bits fp16
 ```
 
 End-to-end on the SmolLM2-360M case: download → quantize → write → upload measures at **~1.4 seconds**.
@@ -320,42 +149,37 @@ End-to-end on the SmolLM2-360M case: download → quantize → write → upload 
 |---|---|---|
 | `<source>` (positional) | — | HF repo id (`org/repo`) or local directory path. Local paths must start with `/`, `./`, `../`, or `~`. |
 | `-b` / `--bits` | `4` | Spec for the **main linear projections** (q/k/v/o, gate/up/down, MoE experts). Accepts `2` / `3` / `4` / `5` / `6` / `8` (affine bit-widths) or `fp16` / `bf16` (pure downcast). |
-| `--output` | `~/.cache/ffai/converts/<safe-name>-<spec>` | Destination directory. `<spec>` is the `--bits` label (`4bit`, `fp16`, etc.). Created if missing; overwrites if present. |
+| `--output` | `~/.cache/butter/converts/<safe-name>-<spec>` | Destination directory. `<spec>` is the `--bits` label (`4bit`, `fp16`, etc.). Created if missing; overwrites if present. |
 | `--upload-repo` | — | After convert, shell out to `hf upload <repo> <output-dir>`. Requires the `hf` CLI authenticated with write access to `<repo>`. The local output is kept regardless of upload outcome. |
 | `--embedding-bits` | — (skip) | Spec for the token embedding table — same accepted values as `--bits`. Omit to keep `embed_tokens.weight` in its source dtype (mlx-lm convention). |
 | `--lm-head-bits` | — (skip) | Spec for `lm_head.weight` when the checkpoint ships an untied head. Same accepted values as `--bits`. Tied-embedding models reuse the embedding triplet, so this knob only matters for untied heads (Qwen 3.6, some Gemma). |
-| `--vision-bits` | — (skip) | Spec for vision-tower weights (matches `.visual.*` / `vision_tower.*` / `vision_model.*` prefixes). Same accepted values as `--bits`. Default keeps the tower in its source dtype because FFAI's VL towers (Qwen 3-VL / 3.5-VL, Pixtral, SigLIP, Idefics3, MiniCPM-V, FastVLM) consume plain `Linear`, not `QuantizedLinear` — set a quantized value only when wiring a new tower that supports it; `fp16` / `bf16` are always safe. |
-| `--router-bits` | — (skip → full precision) | Spec for MoE router gates (`.gate` / `.router` / `router.proj` projections). Same accepted values as `--bits`. Default keeps routers full-precision (quantizing the gate risks flipping top-k expert selection for negligible memory saving); set e.g. `8` to mirror an upstream conversion that quantized the gate. |
-| `--expert-bits` | — (inherit `--bits`) | Spec for MoE expert projections. Same accepted values as `--bits`. Omit to inherit `--bits`; set `fp16` / `bf16` to leave experts full-precision (the big size/quality dial — experts hold most of a MoE's weight mass). |
-| `--expert-layout` | `fused` | How MoE experts are written. `fused` (default) preserves a fused 3D source (`experts.gate_up_proj` / `experts.down_proj`) by quantizing it in place under its original name — standard mlx layout; per-expert sources fall back to `stacked`. `stacked` gathers/splits everything into `switch_mlp.{gate,up,down}_proj` `[E, out, …]` (FFAI `QuantizedSwitchLinear`). `per-expert` keeps `experts.<e>.<proj>`. |
+| `--vision-bits` | — (skip) | Spec for vision-tower weights (matches `.visual.*` / `vision_tower.*` / `vision_model.*` prefixes). Same accepted values as `--bits`. Default keeps the tower in its source dtype because Butter's VL towers (Qwen 3-VL / 3.5-VL, Pixtral, SigLIP, Idefics3, MiniCPM-V, FastVLM) consume plain `Linear`, not `QuantizedLinear` — set a quantized value only when wiring a new tower that supports it; `fp16` / `bf16` are always safe. |
 | `--revision` | `main` | HF revision (branch / tag / commit) to download. |
 
-Per-tensor mixing is loader-friendly: FFAI's `loadLinear` / `loadEmbedding` derive each weight's bit-width from its saved shape via `deriveAffineQuantBits`, so a checkpoint with 4-bit linears + 8-bit lm_head + fp16 vision loads correctly without per-tensor entries in `config.json`. The top-level `quantization.bits` written to `config.json` records `--bits`'s bit-width when it's quantized; a pure-downcast conversion writes no `quantization` block at all.
+Per-tensor mixing is loader-friendly: Butter's `loadLinear` / `loadEmbedding` derive each weight's bit-width from its saved shape via `deriveAffineQuantBits`, so a checkpoint with 4-bit linears + 8-bit lm_head + fp16 vision loads correctly without per-tensor entries in `config.json`. The top-level `quantization.bits` written to `config.json` records `--bits`'s bit-width when it's quantized; a pure-downcast conversion writes no `quantization` block at all.
 
 #### What gets quantized / downcast / copied through
 
 - **Affine-quantized** (`--bits N` or `--*-bits N`): every 2D weight matrix whose name ends in `.weight` whose last dim divides `64` (the group_size constraint) AND satisfies `inDim * bits % 32 == 0` (the bit-stream alignment). Role routing (`embed_tokens.weight`, `lm_head.weight`, vision-tower prefixes) picks the per-tensor bit-width from the `--*-bits` overrides; everything else uses `--bits`. The triplet `name.weight` (packed u32) + `name.scales` + `name.biases` is written to the output. Storage size is `numel * bits / 32` u32 words — `numel / 16` for 2-bit, `numel / 8` for 4-bit, `numel * 3 / 32` for 3-bit, etc.
-- **MoE experts** (`--expert-bits`, default inherits `--bits`): each expert's `[out, in]` slice is quantized like any other linear and concatenated along a leading expert axis into an `[E, out, …]` triplet. Works from either source layout. With the default `--expert-layout fused`, a fused 3D `experts.gate_up_proj` / `down_proj` source is quantized **in place** under its original name (`experts.gate_up_proj.{weight,scales,biases}`); with `--expert-layout stacked`, per-expert (`experts.<e>.{w1,w3,w2}.weight`) sources gather, and a fused `gate_up` is split into `switch_mlp.gate_proj` + `up_proj` first. The same `inDim` divisibility constraints apply per slice; `--expert-bits bf16` writes the raw `[E, out, in]` stack instead.
-- **Sharding**: when the quantized output exceeds ~5 GB it's split across `model-0000i-of-0000N.safetensors` shards + a `model.safetensors.index.json` weight-map (the HF/mlx-community convention) — better upload/download resumability and lower writer RAM. Smaller outputs stay a single `model.safetensors` (no index).
 - **Downcast** (`--bits fp16` / `--bits bf16` or a `--*-bits` analog): the tensor ships as a single weight in the target dtype, no triplet. Norms still pass through unchanged in their source dtype — they're numerically critical and the kernel-side RMSNorm doesn't gain anything from re-encoding.
 - **Copied unchanged**: 1D norms, conv1d kernels, biases, RoPE `inv_freq` tables, anything that isn't a Linear-shaped 2D weight. Also: any tensor whose role has no `--*-bits` override (embeddings / lm_head / vision tower default to skip).
 - **Patched**: `config.json` gets `quantization` (mlx-lm convention) and `quantization_config` (transformers convention) blocks added, both with `{bits, group_size: 64, mode: "affine"}`. Other config keys are preserved. Non-finite numbers (Python `json.allow_nan=True` artifacts — e.g. NemotronH's `time_step_limit: [0.0, Infinity]`) are sanitized to JSON-legal sentinels (`1e308` / `NSNull`) so `JSONSerialization` can re-encode the dict.
 - **Copied alongside**: `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, `chat_template.jinja`, `tokenizer.model`, `vocab.txt`, `merges.txt`, and any other top-level `*.json` / `*.txt` file in the source. HF Hub snapshot directories store these as relative symlinks into a `blobs/` store — the convert resolves the symlinks before copying so the destination is self-contained.
 
-#### When `ffai convert` succeeds where `mlx_lm.convert` / `mlx_vlm.convert` fails
+#### When `butter convert` succeeds where `mlx_lm.convert` / `mlx_vlm.convert` fails
 
-`mlx-lm` and `mlx-vlm` import the source model via `AutoConfig` / `AutoModel`, which triggers Python's full transformers + custom `modeling_*.py` import chain for the family. That fails for several architectures FFAI loads natively:
+`mlx-lm` and `mlx-vlm` import the source model via `AutoConfig` / `AutoModel`, which triggers Python's full transformers + custom `modeling_*.py` import chain for the family. That fails for several architectures Butter loads natively:
 
-| Model | mlx-lm error | `ffai convert` |
+| Model | mlx-lm error | `butter convert` |
 |---|---|---|
 | Soprano-1.1-80M | `Model type 'soprano' not supported` | ✅ — `ekryski/Soprano-1.1-80M-4bit` |
 | Nemotron-H-4B-Base-8K | Mamba GQA `q_proj.weight` shape `(3072, 3072)` vs `(4096, 3072)` | ✅ — `ekryski/Nemotron-H-4B-Base-8K-4bit` |
 | FastVLM-0.5B (Apple) | metaclass conflict on FastVLM's custom `LlavaQwen2ForCausalLM` | ✅ — `ekryski/FastVLM-0.5B-4bit` |
 
-The reason: `ffai convert` doesn't load the upstream model code. It reads weight tensors out of safetensors, classifies them by shape, and quantizes via the same GPU kernel FFAI uses at inference. If FFAI can *load* a checkpoint, it can also *convert* it.
+The reason: `butter convert` doesn't load the upstream model code. It reads weight tensors out of safetensors, classifies them by shape, and quantizes via the same GPU kernel Butter uses at inference. If Butter can *load* a checkpoint, it can also *convert* it.
 
 ## See also
 
 - [Quick start](quickstart.md) — the 5-line library equivalent.
-- [Benchmarking](benchmarking.md) — `ffai bench --method <name>`, KLD comparisons, per-day report shape.
-- [Installation](installation.md) — adding FFAI to your own SwiftPM package (no CLI required).
+- [Benchmarking](benchmarking.md) — `butter bench --method <name>`, KLD comparisons, per-day report shape.
+- [Installation](installation.md) — adding Butter to your own SwiftPM package (no CLI required).

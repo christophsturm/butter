@@ -1,5 +1,5 @@
 <!--
-Read CONTRIBUTING.md before opening this PR: https://github.com/thewafflehaus/FFAI/blob/main/CONTRIBUTING.md
+Read CONTRIBUTING.md before opening this PR: https://github.com/thewafflehaus/butter/blob/main/CONTRIBUTING.md
 
 PRs without a linked, discussed issue will be closed. -->
 
@@ -41,7 +41,7 @@ subsystem. Skip mechanical things (whitespace, lint). -->
 <!-- How you verified this works. Required for behavior changes. -->
 
 - [ ] `make test` passes locally
-- [ ] Added/updated tests in `Tests/FFAITests/` or `Tests/ModelTests/`
+- [ ] Added/updated tests in `Tests/ButterTests/` or `Tests/ModelTests/`
 - [ ] Manual verification (describe below)
 
 <details>

@@ -1,6 +1,6 @@
-# FFAI — Rust engine
+# Butter — Rust engine
 
-The cross-platform half of FFAI. One Rust core behind a single `Device`
+The cross-platform half of Butter. One Rust core behind a single `Device`
 trait; backends (CUDA, Vulkan, ROCm, Metal) are independent crates picked at
 build time by cargo feature.
 
@@ -16,33 +16,33 @@ build time by cargo feature.
 ```
 rust/
   crates/
-    ffai-core/        Device trait, Tensor, DType, Binding — the one seam
-    ffai-ops/         semantic ops (rms_norm, matmul, …) → Kernel → dispatch
-    ffai-models/      model forward passes (ported from swift Models/, validated against it)
-    ffai-loader/      GGUF / SafeTensors / HF
-    ffai-runtime/     KV cache, sampler, decode loop
-    ffai/             umbrella: backend selection + device enumeration
-    ffai-cli/         `ffai` binary
+    wh-butter-core/        Device trait, Tensor, DType, Binding — the one seam
+    wh-butter-ops/         semantic ops (rms_norm, matmul, …) → Kernel → dispatch
+    wh-butter-models/      model forward passes (ported from swift Models/, validated against it)
+    wh-butter-loader/      GGUF / SafeTensors / HF
+    wh-butter-runtime/     KV cache, sampler, decode loop
+    wh-butter/          umbrella: backend selection + device enumeration
+    wh-butter-cli/         `butter` binary
     backends/
-      ffai-cuda/      wraps iron-runtime CudaDevice (NVRTC → PTX → driver)
-      ffai-metal/     metal-rs (cross-validation on Mac; Swift is primary on Apple)
-      ffai-vulkan/    SPIR-V (portable; pending iron SPIR-V target)
+      wh-butter-cuda/      wraps wh-iron-runtime CudaDevice (NVRTC → PTX → driver)
+      wh-butter-metal/     metal-rs (cross-validation on Mac; Swift is primary on Apple)
+      wh-butter-vulkan/    SPIR-V (portable; pending iron SPIR-V target)
 ```
 
 ## Build
 
 ```sh
 # Mac dev box (default = metal stub)
-cargo run -p ffai-cli
+cargo run -p wh-butter-cli
 
 # CUDA host (e.g. the GB10 / DGX Spark)
-cargo run -p ffai-cli --no-default-features --features cuda
+cargo run -p wh-butter-cli --no-default-features --features cuda
 ```
 
 ## How sharing works
 
-The boundary is exactly two things: the **`Device` trait** (`ffai-core`) and
-the **op→kernel dispatch** (`ffai-ops`). Everything above them — models,
+The boundary is exactly two things: the **`Device` trait** (`wh-butter-core`) and
+the **op→kernel dispatch** (`wh-butter-ops`). Everything above them — models,
 loaders, KV cache, sampler — is plain Rust that never names a GPU API, so it
 runs on every backend unchanged. Everything below is a thin `Device` impl.
 Kernels are already shared by iron.

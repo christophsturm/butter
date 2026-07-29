@@ -21,8 +21,8 @@
 //      that the Metal compiler refused to instantiate).
 //
 // Does NOT verify per-kernel numerical correctness — that lives in
-//   - FFAI's per-Op tests (Tests/FFAITests/Ops*Tests.swift), which
-//     exercise every wrapper FFAI actually calls via the Ops layer;
+//   - Butter's per-Op tests (Tests/ButterTests/Ops*Tests.swift), which
+//     exercise every wrapper Butter actually calls via the Ops layer;
 //   - iron's `iron bench` (MLX side-by-side for kernels under
 //     `wh-iron-std/src/mlx/`);
 //   - per-family wrapper tests (Tests/IronSwiftTests/<Kernel>Tests.swift),
@@ -33,7 +33,7 @@
 // codegen / build-pipeline changes that fail to compile a specific
 // kernel into a usable PSO.  PR #19 shipped 37 kernels with empty
 // bodies via a `macro_rules!` regression; this smoke would have flagged
-// the empty-body kernels at metallib-load time before FFAI's higher-level
+// the empty-body kernels at metallib-load time before Butter's higher-level
 // tests caught the runtime symptom.
 
 import Foundation

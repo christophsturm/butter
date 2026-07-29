@@ -32,7 +32,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "SmolVLM2 Integration", .serialized,
@@ -115,7 +115,7 @@ struct SmolVLM2IntegrationTests {
             .appendingPathComponent("Fixtures")
             .appendingPathComponent("dog.jpeg")
             ?? URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Development/personal/ai/FFAI/Tests/Fixtures/dog.jpeg")
+            .appendingPathComponent("Development/personal/ai/Butter/Tests/Fixtures/dog.jpeg")
 
         guard FileManager.default.fileExists(atPath: fixturesURL.path),
             let ciImage = CIImage(contentsOf: fixturesURL)

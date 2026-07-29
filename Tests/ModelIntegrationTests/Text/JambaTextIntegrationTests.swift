@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Slow integration test: downloads (or hits cache) the smallest
-// FFAI-runnable Jamba checkpoint and runs end-to-end greedy generation.
+// Butter-runnable Jamba checkpoint and runs end-to-end greedy generation.
 // Skipped automatically if the network or checkpoint isn't available.
 //
 // Jamba (AI21) is a stack-interleaved hybrid — a `layers_block_type`
@@ -41,7 +41,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "Jamba Integration", .serialized

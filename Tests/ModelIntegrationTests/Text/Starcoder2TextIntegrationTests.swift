@@ -23,7 +23,7 @@
 //
 // Routes through the dedicated `Starcoder2.variant(for:)` →
 // `Starcoder2Dense.loadModel` path; the loader landed in
-// `Sources/FFAI/Models/Text/Starcoder2Text.swift`. Prior to that
+// `Sources/Butter/Models/Text/Starcoder2Text.swift`. Prior to that
 // dedicated loader, the test surfaced a misleading
 // `Llama: required config field missing` error because Starcoder2
 // was misrouted through `llamaCompatibleArchs` in
@@ -33,7 +33,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Starcoder2 Integration", .serialized)
 struct Starcoder2TextIntegrationTests {

@@ -1,6 +1,6 @@
 # Observability — `--stats`, `--debug`, `--profiling`
 
-Three CLI flags to introspect what FFAI is doing per token. The underlying types live in [`Sources/FFAI/Stats/`](../Sources/FFAI/Stats/) and are usable from your own code without going through the CLI.
+Three CLI flags to introspect what Butter is doing per token. The underlying types live in [`Sources/ButterSwift/Stats/`](../Sources/ButterSwift/Stats/) and are usable from your own code without going through the CLI.
 
 This page covers `--stats` today; `--debug` and `--profiling` land in follow-up commits and are described under [Coming next](#coming-next).
 
@@ -9,7 +9,7 @@ This page covers `--stats` today; `--debug` and `--profiling` land in follow-up 
 Prints a `[STATS]` block after generation completes. Always-on instrumentation: a `PhaseMemoryTracker` samples `MTLDevice.currentAllocatedSize` at every token boundary (cost: one property read per token, ~sub-µs). The fields and shape are deliberately portable to / from mlx-swift-lm's bench-row schema so analysis tooling stays compatible.
 
 ```bash
-ffai --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time" --stats
+butter --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time" --stats
 ```
 
 ```
@@ -90,7 +90,7 @@ let ppl = Perplexity.compute(model: model,
 print(ppl.perplexity)   // exp(-mean log p(token | prefix))
 ```
 
-All perplexity math runs in **fp32** — bf16's 7 mantissa bits can't represent the partial `Σ exp(x_i − max_x)` over a 128–152K vocab without losing precision in the third decimal of perplexity, which is exactly the resolution we need for distinguishing quantization tiers. fp32 costs ~1µs per token; only matters offline. Header in [`Stats/Perplexity.swift`](../Sources/FFAI/Stats/Perplexity.swift) has the longer rationale.
+All perplexity math runs in **fp32** — bf16's 7 mantissa bits can't represent the partial `Σ exp(x_i − max_x)` over a 128–152K vocab without losing precision in the third decimal of perplexity, which is exactly the resolution we need for distinguishing quantization tiers. fp32 costs ~1µs per token; only matters offline. Header in [`Stats/Perplexity.swift`](../Sources/ButterSwift/Stats/Perplexity.swift) has the longer rationale.
 
 The bench harness's `--method wikitext2` runs this over the WikiText-2 corpus and writes the resulting `genPerplexity` into the report row.
 
@@ -125,7 +125,7 @@ Models that emit reasoning segments (Qwen 3 / DeepSeek-R1 ChatML, GPT-OSS Harmon
 | `model_type` contains `gemma3` / `gemma4` | `.gemmaChannel` | 🚧 TODO — scanner reaches for the `<channel\|reasoning\|>` / `<channel\|final\|>` markers; format is detected today but `splitGemmaChannel` returns `nil`. |
 | Otherwise | `.none` | Whole generation counts as gen. |
 
-For models that don't emit thinking markers, the split is silently omitted. See [`Stats/ThinkingSplit.swift`](../Sources/FFAI/Stats/ThinkingSplit.swift) for the per-format scanners. Wiring the two TODO scanners is tracked in [`planning/session-plan.md`](../planning/session-plan.md).
+For models that don't emit thinking markers, the split is silently omitted. See [`Stats/ThinkingSplit.swift`](../Sources/ButterSwift/Stats/ThinkingSplit.swift) for the per-format scanners. Wiring the two TODO scanners is tracked in [`planning/session-plan.md`](../planning/session-plan.md).
 
 Per-segment perplexity is `nil` from `generate(...)` alone — the bench harness will run perplexity over each segment separately when it lands. For now you can do it yourself:
 
@@ -155,18 +155,18 @@ When those modes land, uncomment the fields, populate them in `Generate.swift`, 
 Gates verbose log output to **stderr**, tagged by subsystem. Off by default. The CLI flag flips the global gate; the same gate is controllable via env vars so other entry points (Xcode test runs, your own Swift code) can opt in without editing source.
 
 ```bash
-ffai --debug --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Hi" 2>debug.log
+butter --debug --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Hi" 2>debug.log
 ```
 
 Sample output (heavily abbreviated):
 
 ```
-[ffai:load] Model.load id-or-path=mlx-community/Qwen3.5-0.8B-MLX-4bit
-[ffai:loader] resolved snapshot dir: /Users/.../snapshots/abcd…
-[ffai:load] config: arch=LlamaForCausalLM model_type=llama hidden=2048 layers=16
-[ffai:generate] begin prefill: 5 tokens, maxTokens=64
-[ffai:generate] prefill done in 0.082s (60.7 tok/s)
-[ffai:generate] decode done: 64 tokens in 1.000s (64.0 tok/s)
+[butter:load] Model.load id-or-path=mlx-community/Qwen3.5-0.8B-MLX-4bit
+[butter:loader] resolved snapshot dir: /Users/.../snapshots/abcd…
+[butter:load] config: arch=LlamaForCausalLM model_type=llama hidden=2048 layers=16
+[butter:generate] begin prefill: 5 tokens, maxTokens=64
+[butter:generate] prefill done in 0.082s (60.7 tok/s)
+[butter:generate] decode done: 64 tokens in 1.000s (64.0 tok/s)
 ```
 
 ### Per-subsystem gates
@@ -175,15 +175,15 @@ Sample output (heavily abbreviated):
 
 | Env var | Subsystem | What it logs |
 |---|---|---|
-| `FFAI_DEBUG=1` | (all) | Global gate; every subsystem on. |
-| `FFAI_DEBUG_LOADER=1` | `loader` | `ModelLocator` / `ModelDownloader` snapshot resolution + cache hits. |
-| `FFAI_DEBUG_LOAD=1` | `load` | `Model.load` + family loaders, config decode. |
-| `FFAI_DEBUG_GENERATE=1` | `generate` | Prefill + decode loop boundaries, per-call timing summary. |
-| `FFAI_DEBUG_SAMPLING=1` | `sampling` | Sampling decisions — greedy-GPU / GPU-categorical / CPU-sample path choice + the resulting token. |
-| `FFAI_DEBUG_KVCACHE=1` | `kvcache` | KV cache append + slice events. |
-| `FFAI_DEBUG_KERNELS=1` | `kernels` | Per-kernel dispatch chatter — very loud, opt-in only. |
-| `FFAI_DEBUG_DISPATCH=1` | `dispatch` | Per-`MTLCommandBuffer` commit / wait. |
-| `FFAI_DEBUG_BENCH=1` | `bench` | `BenchRunner` method dispatch + sub-phase timing. |
+| `BUTTER_DEBUG=1` | (all) | Global gate; every subsystem on. |
+| `BUTTER_DEBUG_LOADER=1` | `loader` | `ModelLocator` / `ModelDownloader` snapshot resolution + cache hits. |
+| `BUTTER_DEBUG_LOAD=1` | `load` | `Model.load` + family loaders, config decode. |
+| `BUTTER_DEBUG_GENERATE=1` | `generate` | Prefill + decode loop boundaries, per-call timing summary. |
+| `BUTTER_DEBUG_SAMPLING=1` | `sampling` | Sampling decisions — greedy-GPU / GPU-categorical / CPU-sample path choice + the resulting token. |
+| `BUTTER_DEBUG_KVCACHE=1` | `kvcache` | KV cache append + slice events. |
+| `BUTTER_DEBUG_KERNELS=1` | `kernels` | Per-kernel dispatch chatter — very loud, opt-in only. |
+| `BUTTER_DEBUG_DISPATCH=1` | `dispatch` | Per-`MTLCommandBuffer` commit / wait. |
+| `BUTTER_DEBUG_BENCH=1` | `bench` | `BenchRunner` method dispatch + sub-phase timing. |
 
 The closure passed to `Debug.log(...)` is `@autoclosure` — when the subsystem is off, the message string isn't built and the call is near-free. Safe to leave instrumentation in hot paths.
 
@@ -196,7 +196,7 @@ Debug.log(.kvcache, "append k+v at pos \(pos), live bytes=\(caches.totalBytesInU
 Three levels. `0` is the default (off, zero overhead anywhere).
 
 ```bash
-ffai --profiling 1 --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Hi"
+butter --profiling 1 --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Hi"
 ```
 
 ### Level 1 — wallclock breakdown
@@ -215,16 +215,16 @@ Captures wallclock durations at every phase boundary (`model_load`, `prewarm`, `
 
 ### Level 2 — level 1 + `os_signpost` intervals
 
-Wraps each phase + the inner decode-step loop in [`OSSignposter`](https://developer.apple.com/documentation/os/ossignposter) intervals under subsystem `ai.ffai`, capturable by Instruments (*Profile → Logging → os_signpost*) or `xctrace record`.
+Wraps each phase + the inner decode-step loop in [`OSSignposter`](https://developer.apple.com/documentation/os/ossignposter) intervals under subsystem `ai.butter`, capturable by Instruments (*Profile → Logging → os_signpost*) or `xctrace record`.
 
 **Zero overhead when no tracer is attached** — `OSSignposter` checks a flag at the start of each `beginInterval(...)` and bails before constructing any state. ~40 ns per call when nobody's listening.
 
 ```bash
 xctrace record --template 'os_signpost' --launch -- \
-    .build/release/ffai --profiling 2 --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Hi"
+    .build/release/butter --profiling 2 --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Hi"
 ```
 
-The recorded trace shows FFAI's `prefill`, `decode_step`, `prewarm`, `model_load` spans on the same timeline as Apple's Metal subsystem spans (`com.apple.Metal`). Each Metal kernel dispatch shows up automatically there — no need to wrap individual kernels on our side. Use Instruments' Metal System Trace template to drill into GPU vs CPU time per phase.
+The recorded trace shows Butter's `prefill`, `decode_step`, `prewarm`, `model_load` spans on the same timeline as Apple's Metal subsystem spans (`com.apple.Metal`). Each Metal kernel dispatch shows up automatically there — no need to wrap individual kernels on our side. Use Instruments' Metal System Trace template to drill into GPU vs CPU time per phase.
 
 ### Pattern for new call sites
 
@@ -249,7 +249,7 @@ let result = Profile.time("custom_phase") {
 Profile.event("first_decode_token")
 ```
 
-The top-level CLI sets `Profile.shared.level` once before any FFAI work runs; the same global is used by the bench subcommand so trace recordings line up across `ffai generate` and `ffai bench`.
+The top-level CLI sets `Profile.shared.level` once before any Butter work runs; the same global is used by the bench subcommand so trace recordings line up across `butter generate` and `butter bench`.
 
 ### Programmatic access
 

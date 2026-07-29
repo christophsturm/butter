@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // End-to-end validation of the incrementally-grown KV cache. The
-// per-cache unit tests in `Tests/FFAITests/KVCache/KVCacheTests.swift`
+// per-cache unit tests in `Tests/ButterTests/KVCache/KVCacheTests.swift`
 // prove the realloc + strided-copy preserves data in isolation; this
 // test proves a REAL model stays coherent when the cache grows
 // repeatedly DURING decode — i.e. that SDPA reads the freshly-grown
@@ -33,7 +33,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "KV Cache Growth Integration", .serialized

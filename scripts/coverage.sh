@@ -18,7 +18,7 @@
 # Run unit tests with coverage and print a summary.
 # Excludes generated code, .build, and Tests themselves from the report.
 #
-# Scope is intentionally limited to the unit suite (FFAITests +
+# Scope is intentionally limited to the unit suite (ButterTests +
 # IronSwiftTests). ModelIntegrationTests download multi-GB HuggingFace
 # snapshots + do real end-to-end inference, which:
 #   (a) takes tens of minutes per run
@@ -32,11 +32,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 echo "Running unit tests with coverage enabled..."
-# --no-parallel: same reliability fix as `make test-unit`. The GPU
-# correctness tests flake under concurrent command-buffer submission, so
-# serialize the Swift Testing run (`--num-workers 1` is an XCTest no-op
-# for Swift Testing).
-swift test --no-parallel --enable-code-coverage --filter "FFAITests|IronSwiftTests"
+swift test --enable-code-coverage --filter "ButterTests|IronSwiftTests"
 
 BIN_PATH=$(swift build --show-bin-path)
 PROF_DATA="$BIN_PATH/codecov/default.profdata"

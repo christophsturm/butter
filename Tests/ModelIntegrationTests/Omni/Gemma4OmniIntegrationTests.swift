@@ -29,7 +29,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 /// Local `ffai convert` output, then the published HF repo.
 let gemma4OmniLocalDir =

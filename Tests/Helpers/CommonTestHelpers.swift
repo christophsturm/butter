@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Test-bundle-wide helpers shared by FFAITests + ModelIntegrationTests.
+// Test-bundle-wide helpers shared by ButterTests + ModelIntegrationTests.
 //
 // `Tests/Helpers/` is its own SwiftPM target (see Package.swift) so it
 // can be a dependency of both test targets without source duplication.
-// Helpers only touch FFAI's public API — no `@testable` import.
+// Helpers only touch Butter's public API — no `@testable` import.
 
-import FFAI
+import ButterSwift
 import Foundation
 import Metal
 

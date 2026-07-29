@@ -17,7 +17,7 @@
 // FAILS the suite — `loadKokoro()` is `throws` and the checkpoint is a
 // hard requirement, not a "skip if missing".
 //
-// Kokoro-82M is the published checkpoint; FFAI's Phase 7 contribution
+// Kokoro-82M is the published checkpoint; Butter's Phase 7 contribution
 // is the iSTFTNet vocoder (Ops.vocoderISTFT). This suite verifies the
 // model loads, the vocoder constructs from the checkpoint config, and a
 // synthesized waveform is non-degenerate (finite, non-silent).
@@ -32,7 +32,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "Kokoro Integration", .serialized,

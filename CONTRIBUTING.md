@@ -1,6 +1,6 @@
-# Contributing to FFAI
+# Contributing to Butter
 
-Thanks for your interest. FFAI is a small, focused project — these guidelines keep contributions coherent and the maintainer queue sane.
+Thanks for your interest. Butter is a small, focused project — these guidelines keep contributions coherent and the maintainer queue sane.
 
 **TL;DR:**
 - Open an issue **before** opening a PR.

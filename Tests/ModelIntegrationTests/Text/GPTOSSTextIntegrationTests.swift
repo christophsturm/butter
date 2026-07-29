@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Slow integration test: loads the smallest FFAI-runnable GPT-OSS-20B
+// Slow integration test: loads the smallest Butter-runnable GPT-OSS-20B
 // checkpoint (a 4-bit / MXFP4-quantized tag) and runs end-to-end greedy
 // generation. Skipped automatically if no checkpoint is cached.
 //
@@ -30,7 +30,7 @@
 //   3. Bias-corrected q/k/v/o projections (`attention_bias`).
 //
 // The MoE experts ship MXFP4-quantized; the loader transcodes them to
-// FFAI's affine-int4 format at load time (see GPTOSSMoE.swift).
+// Butter's affine-int4 format at load time (see GPTOSSMoE.swift).
 //
 // `loan-star/gpt-oss-20b-mlx-4Bit` (~11 GB) is the target — it fits
 // in the dev box's memory budget. The transcode reorders the logit tail
@@ -41,17 +41,17 @@
 // our own published checkpoint; one canonical target keeps the
 // suite consistent with the rest of the integration coverage.)
 //
-// GPT-OSS-20B is FFAI's heaviest integration target — a debug-build
+// GPT-OSS-20B is Butter's heaviest integration target — a debug-build
 // greedy decode of a ~20B MoE runs for minutes. Ungated: like every
 // text model suite it runs unconditionally via the bisect (no
-// `FFAI_BUILD_MACHINE` / group flag). Run it alone if you want to avoid
+// `BUTTER_BUILD_MACHINE` / group flag). Run it alone if you want to avoid
 // the wall-clock cost: `./scripts/integration-bisect.sh GPTOSS`.
 
 import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("GPTOSS Integration", .serialized)
 struct GPTOSSTextIntegrationTests {
@@ -117,7 +117,7 @@ struct GPTOSSTextIntegrationTests {
         // ── Forward correctness vs mlx-lm reference ───────────────────
         // The hard correctness guard: the SAME checkpoint in mlx-lm
         // predicts " the" (id 290, logit ~13.5) as the next token after
-        // this prompt, with top-3 [290, 261, 1665]. FFAI's forward must
+        // this prompt, with top-3 [290, 261, 1665]. Butter's forward must
         // agree — the MXFP4→affine-int4 transcode reorders the logit tail
         // slightly, but the argmax is stable. (A prior "degenerate output"
         // report turned out to be sampling config, NOT a forward bug:

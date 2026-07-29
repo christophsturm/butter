@@ -18,7 +18,7 @@
 // A load failure FAILS the suite — `loadQwenOmni()` is `throws` and the
 // checkpoint is a hard requirement, not a "skip if missing".
 //
-// Qwen2.5-Omni-3B is the smallest published Omni checkpoint. FFAI's
+// Qwen2.5-Omni-3B is the smallest published Omni checkpoint. Butter's
 // Phase 7 contribution is the audio-in path; the vision path is the
 // separate Qwen-VL port. This suite verifies the audio tower loads and
 // encodes a waveform (synthetic + real speech) into finite,
@@ -28,7 +28,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "QwenOmni Integration", .serialized,

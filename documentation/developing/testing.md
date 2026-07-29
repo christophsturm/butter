@@ -1,13 +1,13 @@
 # Testing
 
-FFAI tests in three layers — kernel-wrapper correctness, Swift unit tests, and per-model integration tests — using **Swift Testing** (`@Suite` / `@Test` / `#expect`), not XCTest. CI gates on ≥ 80 % line coverage of the Swift surface plus a green integration sweep.
+Butter tests in three layers — kernel-wrapper correctness, Swift unit tests, and per-model integration tests — using **Swift Testing** (`@Suite` / `@Test` / `#expect`), not XCTest. CI gates on ≥ 80 % line coverage of the Swift surface plus a green integration sweep.
 
 ## Running tests
 
 **Go through `make` — do not run bare `swift test`.** Each `ModelIntegrationTests` suite downloads a multi-GB checkpoint; an unconstrained parallel run loads several at once and OOMs the box (and can pin the GPU). The `make` targets cap parallelism correctly.
 
 ```bash
-make test-unit          # FFAITests + IronSwiftTests — fast, parallel-safe
+make test-unit          # ButterTests + IronSwiftTests — fast, parallel-safe
 make test-integration   # ModelIntegrationTests — serialized (--num-workers 1)
 make test               # both in sequence — the full local CI gate
 make coverage           # unit-suite line coverage (≥ 80 %)
@@ -36,7 +36,7 @@ Tests/
                             correctness vs a CPU reference across
                             fp32 / fp16 / bf16. Plus
                             KernelManifestSmokeTests.
-  FFAITests/                Mirrors Sources/FFAI/ — every source file
+  ButterTests/                Mirrors Sources/ButterSwift/ — every source file
                             has a sibling test. Audio/, Benchmark/,
                             Generation/, KVCache/, Loader/, Models/,
                             Ops/, Stats/, Telemetry/, Vision/ are the
@@ -54,7 +54,7 @@ Tests/
                             clips, … shared via the helpers).
 ```
 
-There are **no golden fixtures**. Cross-implementation token-parity vs mlx-lm proved to be a measure of rounding-mode alignment, not correctness — it was dropped. Numerical correctness now comes from the iron-side per-kernel GPU-correctness tests (compared to a naive CPU oracle); the FFAI integration tests assert that the model *pipeline* produces coherent text.
+There are **no golden fixtures**. Cross-implementation token-parity vs mlx-lm proved to be a measure of rounding-mode alignment, not correctness — it was dropped. Numerical correctness now comes from the iron-side per-kernel GPU-correctness tests (compared to a naive CPU oracle); the Butter integration tests assert that the model *pipeline* produces coherent text.
 
 ## Integration testing
 
@@ -65,7 +65,7 @@ Cross-cutting suites:
 - `ModelKVCacheMatrixIntegrationTests` — the model family × weight bitwidth × KV-cache scheme cross-product.
 - `Quantized{3,4,5,6,8}bitIntegrationTests` — the weight-bitwidth ladder.
 - `ModelDeterminismIntegrationTests` — temp = 0 greedy decode is stable across runs.
-- `ModelInspectionIntegrationTests` — `ffai inspect` end-to-end against a representative model from each family (verifies every family wired its `InspectTap` hooks).
+- `ModelInspectionIntegrationTests` — `butter inspect` end-to-end against a representative model from each family (verifies every family wired its `InspectTap` hooks).
 - `SlidingWindowIntegrationTests` — sliding-window KV eviction composes correctly across cache schemes.
 
 ### Not every model runs by default — env-gated tests
@@ -74,16 +74,16 @@ The largest checkpoints are too heavy (or too slow) for the routine gate, so the
 
 | Env var | Unlocks |
 |---|---|
-| `FFAI_BUILD_MACHINE` | The heavy generation checks — `GPTOSSIntegrationTests` (~20B MoE), the Gemma 4 31B / 26B-A4B decode in `Gemma4TextIntegrationTests` (load + shape checks still run unconditionally), and every non-smallest cell of `ModelKVCacheMatrixIntegrationTests`. Intended for a dedicated build machine. |
-| `FFAI_MATRIX_FAMILY=<family>` | Restricts `ModelKVCacheMatrixIntegrationTests` to one family's row (e.g. `FFAI_MATRIX_FAMILY=Gemma4`) — fast targeted re-runs. |
+| `BUTTER_BUILD_MACHINE` | The heavy generation checks — `GPTOSSIntegrationTests` (~20B MoE), the Gemma 4 31B / 26B-A4B decode in `Gemma4TextIntegrationTests` (load + shape checks still run unconditionally), and every non-smallest cell of `ModelKVCacheMatrixIntegrationTests`. Intended for a dedicated build machine. |
+| `BUTTER_MATRIX_FAMILY=<family>` | Restricts `ModelKVCacheMatrixIntegrationTests` to one family's row (e.g. `BUTTER_MATRIX_FAMILY=Gemma4`) — fast targeted re-runs. |
 
 ```bash
 # Run the whole matrix incl. env-gated cells, on a build machine:
-FFAI_BUILD_MACHINE=1 swift test --parallel --num-workers 1 \
+BUTTER_BUILD_MACHINE=1 swift test --parallel --num-workers 1 \
     --filter ModelKVCacheMatrixIntegrationTests
 
 # Re-run just the Llama row of the matrix:
-FFAI_MATRIX_FAMILY=Llama swift test --parallel --num-workers 1 \
+BUTTER_MATRIX_FAMILY=Llama swift test --parallel --num-workers 1 \
     --filter ModelKVCacheMatrixIntegrationTests
 ```
 
@@ -93,7 +93,7 @@ The default `make test-integration` runs only the always-on cells: the smallest 
 
 ```swift
 import Testing
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Ops.add")
 struct OpsAddTests {
@@ -111,7 +111,7 @@ A model integration test loads through `ModelLoadLock.shared` (serializes the mu
 
 ```swift
 import Testing
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Qwen3 Text Integration", .serialized)
 struct Qwen3TextIntegrationTests {

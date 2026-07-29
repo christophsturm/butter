@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 # setup-dev.sh
-# One-time development environment setup for FFAI.
+# One-time development environment setup for Butter.
 # Verifies toolchains, resolves dependencies, runs first build.
 #
 #   ./scripts/setup-dev.sh
@@ -36,7 +36,7 @@ warn() { echo -e "${YELLOW}  ⚠${NC}  $1"; }
 fail() { echo -e "${RED}  ✗${NC} $1"; exit 1; }
 
 echo ""
-echo "Setting up FFAI development environment..."
+echo "Setting up Butter development environment..."
 echo ""
 
 # ─────────────────────────────────────────────

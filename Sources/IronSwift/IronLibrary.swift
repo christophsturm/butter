@@ -78,11 +78,11 @@ public final class IronLibrary: @unchecked Sendable {
     ///     cmdbufs from many callers, not one large cmdbuf from one
     ///     caller.
     ///
-    /// Override at runtime via the `FFAI_MAX_COMMAND_BUFFERS` env var
+    /// Override at runtime via the `BUTTER_MAX_COMMAND_BUFFERS` env var
     /// (positive integer). Useful when triaging perf-vs-stability
     /// tradeoffs without rebuilding.
     public static let defaultMaxCommandBufferCount: Int = {
-        if let raw = ProcessInfo.processInfo.environment["FFAI_MAX_COMMAND_BUFFERS"],
+        if let raw = ProcessInfo.processInfo.environment["BUTTER_MAX_COMMAND_BUFFERS"],
             let parsed = Int(raw), parsed > 0
         {
             return parsed
@@ -90,7 +90,7 @@ public final class IronLibrary: @unchecked Sendable {
         // 128 covers deep stacks (Hy3 = 80 layers) that fire one cmdbuf
         // per layer without mid-stack wait. 64 was a 2-3% Qwen prefill
         // win vs 16, but stalls Hy3 decode after layer 64. Override via
-        // FFAI_MAX_COMMAND_BUFFERS for triage.
+        // BUTTER_MAX_COMMAND_BUFFERS for triage.
         return 128
     }()
 
@@ -111,12 +111,12 @@ public final class IronLibrary: @unchecked Sendable {
         // Cap in-flight cmdbuf count to apply backpressure at the Metal
         // layer. See `defaultMaxCommandBufferCount` for the rationale.
         let cap = Self.defaultMaxCommandBufferCount
-        // Emit at process startup so we can verify FFAI_MAX_COMMAND_BUFFERS
+        // Emit at process startup so we can verify BUTTER_MAX_COMMAND_BUFFERS
         // is actually being honored. Cheap (one line on stderr per process).
         // Remove once the freeze diagnostic settles.
         FileHandle.standardError.write(
             Data(
-                "[IronLibrary] maxCommandBufferCount=\(cap) (FFAI_MAX_COMMAND_BUFFERS=\(ProcessInfo.processInfo.environment["FFAI_MAX_COMMAND_BUFFERS"] ?? "\(Self.defaultMaxCommandBufferCount)"))\n"
+                "[IronLibrary] maxCommandBufferCount=\(cap) (BUTTER_MAX_COMMAND_BUFFERS=\(ProcessInfo.processInfo.environment["BUTTER_MAX_COMMAND_BUFFERS"] ?? "\(Self.defaultMaxCommandBufferCount)"))\n"
                     .utf8
             ))
         guard

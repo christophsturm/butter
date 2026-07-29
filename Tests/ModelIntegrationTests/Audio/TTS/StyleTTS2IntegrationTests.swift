@@ -22,7 +22,7 @@
 //
 // The full acoustic synthesize() path requires the ALBERT + prosody predictor
 // + KittenDecoder forward pass — operators (batched GEMM, multi-head attention,
-// 1-D conv, BiLSTM) not yet in FFAI's Ops set. The placeholder path verifies
+// 1-D conv, BiLSTM) not yet in Butter's Ops set. The placeholder path verifies
 // load + config without running the acoustic stack. See
 // StyleTTS2Error.acousticFrontEndNotWired.
 //
@@ -33,7 +33,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "StyleTTS2 Integration", .serialized,
@@ -199,7 +199,7 @@ struct StyleTTS2IntegrationTests {
             return
         }
 
-        // StyleTTS2 synthesizes from PHONEMES, FFAI bundles no G2P, and the
+        // StyleTTS2 synthesizes from PHONEMES, Butter bundles no G2P, and the
         // acoustic front-end isn't wired in this build. So the streaming
         // text path must finish with a clear error and yield NO audio —
         // not silence, not garbage.

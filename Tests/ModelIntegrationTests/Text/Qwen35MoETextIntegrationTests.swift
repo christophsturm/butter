@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Slow integration test: downloads (or hits cache) the smallest
-// FFAI-runnable Qwen3.5 MoE checkpoint and runs end-to-end greedy
+// Butter-runnable Qwen3.5 MoE checkpoint and runs end-to-end greedy
 // generation. Mirrors `Qwen35TextIntegrationTests` (dense GDN
 // hybrid) — same engine (`m.qwen35`), same canonical 4-core shape;
 // only the MoE feed-forward path is exercised end-to-end here.
@@ -36,7 +36,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "Qwen3.5 MoE Text Integration", .serialized

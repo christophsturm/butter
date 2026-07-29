@@ -28,7 +28,7 @@
 
 import Foundation
 
-@testable import FFAI
+@testable import ButterSwift
 
 /// Greedy-decode after an image prefill: take the argmax of the prefill's
 /// last-position `lastLogits` as the first token, then `forwardSample` one

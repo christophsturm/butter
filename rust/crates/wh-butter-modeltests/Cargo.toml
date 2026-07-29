@@ -1,0 +1,16 @@
+[package]
+name = "wh-butter-modeltests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Shared, backend-agnostic model forwards + HF-reference verification. Each
+# `verify_*(dev: &dyn Device)` is written ONCE here and called by the thin
+# per-backend test wrappers in wh-butter-metal/wh-butter-cuda — so a model's logic
+# exists in exactly one place instead of a Metal test + a sed'd CUDA twin.
+[dependencies]
+wh-butter-core.workspace = true
+wh-butter-ops.workspace = true
+wh-butter-loader.workspace = true
+wh-butter-models.workspace = true
+wh-butter-runtime.workspace = true

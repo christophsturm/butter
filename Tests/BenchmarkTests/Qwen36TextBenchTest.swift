@@ -40,7 +40,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 /// Local-cache predicate — bench suite is also disabled if the
 /// Qwen3.6-A3B 4-bit MoE checkpoint isn't already cached. Computed
@@ -71,7 +71,7 @@ struct Qwen36TextBenchTest {
 
     @Test("Qwen3.6-35B-A3B bench — short prefill + decode steady-state")
     func benchShort() async throws {
-        // FFAI's Qwen35 model does single-token forward steps for both
+        // Butter's Qwen35 model does single-token forward steps for both
         // prefill and decode (no batched prefill on this branch), so a
         // 4K/32K prefill takes prohibitively long. A 32-token prompt +
         // 32 decode steps is enough to see steady-state decode tps

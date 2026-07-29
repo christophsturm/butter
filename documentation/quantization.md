@@ -1,6 +1,6 @@
 # Quantization
 
-FFAI supports the **mlx-format** affine group-quantized weight layout at every bit width MLX itself ships, plus 2-bit: **2** / 3 / 4 / 5 / 6 / 8.
+Butter supports the **mlx-format** affine group-quantized weight layout at every bit width MLX itself ships, plus 2-bit: **2** / 3 / 4 / 5 / 6 / 8.
 
 This is **weight-only** quantization — it shrinks the on-disk + on-GPU footprint of the model and (usually) speeds up decode by lowering memory-bandwidth pressure. It's a different axis from **[KV cache quantization](kv-cache.md)**, which compresses the attention K/V tensors at runtime (the affine 4/8-bit and AURA compressed KV caches both ship today).
 
@@ -83,39 +83,39 @@ The loader reads `config.json`, sees `quantization.bits = 4`, and routes the lin
 
 ## MXFP4
 
-GPT-OSS-20B publishes its MoE experts **MXFP4**-quantized (Microscaling FP4 with FP8-block scales) while the attention / router / embedding / lm_head tensors stay mlx affine-quantized. FFAI handles this via a load-time **transcode** path ([`GPTOSSMoE.swift`](../Sources/FFAI/Models/GPTOSSMoE.swift)): the MXFP4 experts are converted to FFAI's affine-int4 format at load, so the decode kernels are the same `dequant_gemv_4` path the rest of the model uses — no separate MXFP4 inference kernel. `nvfp4` is not handled.
+GPT-OSS-20B publishes its MoE experts **MXFP4**-quantized (Microscaling FP4 with FP8-block scales) while the attention / router / embedding / lm_head tensors stay mlx affine-quantized. Butter handles this via a load-time **transcode** path ([`GPTOSSMoE.swift`](../Sources/ButterSwift/Models/GPTOSSMoE.swift)): the MXFP4 experts are converted to Butter's affine-int4 format at load, so the decode kernels are the same `dequant_gemv_4` path the rest of the model uses — no separate MXFP4 inference kernel. `nvfp4` is not handled.
 
 ## Per-tensor mixed-bit conversions
 
-`ffai convert` writes per-tensor-class specs in a single pass. Each role accepts an affine bit-width (`2` / `3` / `4` / `5` / `6` / `8`) or a pure downcast (`fp16` / `bf16`):
+`butter convert` writes per-tensor-class specs in a single pass. Each role accepts an affine bit-width (`2` / `3` / `4` / `5` / `6` / `8`) or a pure downcast (`fp16` / `bf16`):
 
 ```bash
 # 4-bit linears + 4-bit embedding + 8-bit untied lm_head + bf16 vision tower:
-ffai convert <repo> --bits 4 --embedding-bits 4 --lm-head-bits 8
+butter convert <repo> --bits 4 --embedding-bits 4 --lm-head-bits 8
 
 # 2-bit text path + 2-bit embedding, vision stays bf16 (default):
-ffai convert <repo> --bits 2 --embedding-bits 2
+butter convert <repo> --bits 2 --embedding-bits 2
 
 # 3 / 5 / 6-bit are first-class — odd-width byte-stream packing.
-ffai convert <repo> --bits 5 --embedding-bits 6 --lm-head-bits 8
+butter convert <repo> --bits 5 --embedding-bits 6 --lm-head-bits 8
 
 # Pure downcast — no quantization, publish as fp16 (typical for
 # downstream platforms that prefer fp16 over bf16).
-ffai convert <repo> --bits fp16
+butter convert <repo> --bits fp16
 
 # Mixed: 3-bit body, fp16 vision tower (vision stays callable
 # through plain Linear; the rest runs through QuantizedLinear).
-ffai convert <vlm> --bits 3 --embedding-bits 3 --vision-bits fp16
+butter convert <vlm> --bits 3 --embedding-bits 3 --vision-bits fp16
 ```
 
 The loader's per-tensor bit-width detection (`deriveAffineQuantBits`) handles the resulting mixed layout without per-tensor entries in `config.json` — each `name.weight` / `name.scales` / `name.biases` triplet's shape determines its bit-width at load time, and any non-triplet tensor's dtype comes from the safetensors header. The top-level `quantization.bits` written into `config.json` records the `--bits` value when it's quantized; a pure-downcast conversion writes no `quantization` block at all. See [`using-the-cli.md` → `convert`](using-the-cli.md#convert--quantize-a-checkpoint-to-mlx-affine-format) for the full flag table.
 
-Vision-tower quantization is intentionally off by default (`--vision-bits` omitted). FFAI's VL towers — Qwen 3-VL / 3.5-VL, Pixtral, SigLIP, Idefics3, MiniCPM-V, FastVLM — all run plain `Linear`, not `QuantizedLinear`, so a quantized tower would crash the loader. Set `--vision-bits` to a quantized value only when wiring a new VL tower that consumes `QuantizedLinear`; `--vision-bits fp16` / `bf16` are always safe (the tower stays plain `Linear`).
+Vision-tower quantization is intentionally off by default (`--vision-bits` omitted). Butter's VL towers — Qwen 3-VL / 3.5-VL, Pixtral, SigLIP, Idefics3, MiniCPM-V, FastVLM — all run plain `Linear`, not `QuantizedLinear`, so a quantized tower would crash the loader. Set `--vision-bits` to a quantized value only when wiring a new VL tower that consumes `QuantizedLinear`; `--vision-bits fp16` / `bf16` are always safe (the tower stays plain `Linear`).
 
 ## What's not supported (yet)
 
 - **GGUF** quantizations (`Q4_K_M`, `Q5_K_M`, `Q8_0`, …) — different binary layout, different per-block scales, different tensor naming. Planned: a per-arch name mapper alongside the GGUF reader. Not currently scheduled.
-- **Native mxfp4 / nvfp4 inference** — FFAI transcodes GPT-OSS's MXFP4 experts to affine-int4 at load (see above). A native MXFP4-scale-layout decode kernel — keeping the FP8-block scales rather than transcoding — is not implemented. `nvfp4` is not handled at all.
+- **Native mxfp4 / nvfp4 inference** — Butter transcodes GPT-OSS's MXFP4 experts to affine-int4 at load (see above). A native MXFP4-scale-layout decode kernel — keeping the FP8-block scales rather than transcoding — is not implemented. `nvfp4` is not handled at all.
 - **Per-layer (not just per-role) bit budgets** — the per-tensor-class flags cover the common case (text vs embedding vs lm_head vs vision tower). True per-layer recipes — e.g. "first 4 attention layers at 2-bit, rest at 4-bit" — need a config file format and are planned alongside the autotuner.
 
 ## See also

@@ -15,7 +15,7 @@
 // Model × KV-cache × weight-bitwidth integration matrix.
 //
 // This is the comprehensive cross-product coverage test: every model
-// family FFAI supports, at every published weight quantization, under
+// family Butter supports, at every published weight quantization, under
 // every KV-cache compression scheme that family's engine supports.
 // Each cell loads a real checkpoint, greedy-decodes, and asserts the
 // output is coherent (`expectCoherentOutput`).
@@ -26,8 +26,8 @@
 // GB of checkpoints and takes hours — and several large variants (35B-A3B
 // MoE, 31B Gemma 4, 120B-class) may not fit a given box. The only switch
 // is the `enableKVCacheMatrixSuite` group flag (off by default); when it
-// is on, EVERY cell runs — there is no `FFAI_BUILD_MACHINE` env gate.
-// Scope a partial run with `FFAI_MATRIX_FAMILY=<family>` or the bisect's
+// is on, EVERY cell runs — there is no `BUTTER_BUILD_MACHINE` env gate.
+// Scope a partial run with `BUTTER_MATRIX_FAMILY=<family>` or the bisect's
 // single-suite mode. `alwaysRun` now only *documents* the smallest
 // checkpoint per family ("smallest model, all KV combos") — it no longer
 // gates anything.
@@ -35,10 +35,10 @@
 // A cell whose checkpoint can't be fetched (offline, gated repo, repo
 // renamed) fails the cell — load errors propagate to the test runner.
 // So only enable the suite on a machine that has (or can fetch) the
-// checkpoints, or scope it with `FFAI_MATRIX_FAMILY`.
+// checkpoints, or scope it with `BUTTER_MATRIX_FAMILY`.
 //
-// Set `FFAI_MATRIX_FAMILY=<family>` to run just one row (e.g.
-// `FFAI_MATRIX_FAMILY=Gemma4`) — useful for targeted re-runs.
+// Set `BUTTER_MATRIX_FAMILY=<family>` to run just one row (e.g.
+// `BUTTER_MATRIX_FAMILY=Gemma4`) — useful for targeted re-runs.
 //
 // ─── This file subsumes the old KVCacheSchemeIntegrationTests ─────────
 //
@@ -56,7 +56,7 @@
 // that single outlier inflates the range across 64 dims and the other
 // 63 collapse onto 1-2 levels → degenerate decode ("a time, a time").
 // Measured mean-abs reconstruction error on outlier-containing K
-// (Tests/FFAITests/KVCacheTests.swift `affineInt4GroupSizeErrorCurve`):
+// (Tests/ButterTests/KVCacheTests.swift `affineInt4GroupSizeErrorCurve`):
 //   gs64 → 0.079   gs32 → 0.046   gs16 → 0.027   (int8 gs64 → 0.005)
 // groupSize=16 is the smallest power-of-two divisor of headDim=128 and
 // the first that restores coherent output. Same outlier-domination
@@ -84,7 +84,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 // ─── Matrix axes ──────────────────────────────────────────────────────
 
@@ -126,18 +126,18 @@ enum MatrixCatalog {
     /// stays tractable; `expectCoherentOutput` needs only a handful.
     static let maxTokens = 200
 
-    /// Optional family filter — when `FFAI_MATRIX_FAMILY` is set, only
+    /// Optional family filter — when `BUTTER_MATRIX_FAMILY` is set, only
     /// cells whose `family` matches (case-insensitive) run; every other
     /// cell skips. Lets a build machine re-run a single row
-    /// (`FFAI_MATRIX_FAMILY=Gemma4`) without the whole sweep, and keeps
+    /// (`BUTTER_MATRIX_FAMILY=Gemma4`) without the whole sweep, and keeps
     /// targeted verification cheap. `nil` → no filter, normal gating.
     static let familyFilter: String? =
-        ProcessInfo.processInfo.environment["FFAI_MATRIX_FAMILY"]
+        ProcessInfo.processInfo.environment["BUTTER_MATRIX_FAMILY"]
         .map { $0.lowercased() }
 
     // ── KV-cache scheme sets ──────────────────────────────────────────
 
-    /// Every KV-cache scheme FFAI exposes. `affine4` pinned to
+    /// Every KV-cache scheme Butter exposes. `affine4` pinned to
     /// groupSize 16 (see header); `affine8` to 64.
     static let allKVSchemes: [KVCacheKind] = [
         .raw,
@@ -176,7 +176,7 @@ enum MatrixCatalog {
 
     // ── The model list ────────────────────────────────────────────────
     //
-    // One `alwaysRun` checkpoint per family (the smallest FFAI can
+    // One `alwaysRun` checkpoint per family (the smallest Butter can
     // run end-to-end) plus larger checkpoints + the weight-bitwidth
     // ladder. All cells run when the suite is enabled. IDs marked
     // `unverified` should be confirmed before a full run — a wrong id
@@ -335,20 +335,20 @@ struct ModelKVCacheMatrixIntegrationTests {
 
     @Test("matrix cell decodes coherent output", arguments: MatrixCatalog.cases)
     func decodeMatrixCell(_ cell: MatrixCase) async throws {
-        // Family filter (FFAI_MATRIX_FAMILY) — when set, only the named
+        // Family filter (BUTTER_MATRIX_FAMILY) — when set, only the named
         // family's cells run. Anything outside the filter is gated off
         // for this run; `#require` surfaces that explicitly instead of
         // silently passing.
         if let only = MatrixCatalog.familyFilter {
             try #require(
                 cell.model.family.lowercased() == only,
-                "matrix cell gated by FFAI_MATRIX_FAMILY=\(only): \(cell.label)")
+                "matrix cell gated by BUTTER_MATRIX_FAMILY=\(only): \(cell.label)")
         }
 
         // No env-var gate: every matrix cell runs when the suite is
         // enabled (the `enableKVCacheMatrixSuite` group flag is the only
         // switch). The full model × KV-scheme matrix is large — scope a
-        // run with `FFAI_MATRIX_FAMILY` or the bisect's single-suite mode.
+        // run with `BUTTER_MATRIX_FAMILY` or the bisect's single-suite mode.
 
         // Load under the cell's KV-cache scheme. Load failures fail the
         // cell — a missing checkpoint is a real failure, not a silent

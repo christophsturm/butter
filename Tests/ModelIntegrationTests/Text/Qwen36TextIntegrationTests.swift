@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Slow integration test: downloads (or hits cache) the smallest
-// FFAI-runnable Qwen3.6 dense checkpoint and runs end-to-end greedy
+// Butter-runnable Qwen3.6 dense checkpoint and runs end-to-end greedy
 // generation. Mirrors Qwen35TextIntegrationTests.swift — Qwen3.6
 // ships under the same `qwen3_5*` model_type strings and reuses the
 // Qwen3.5 GDN-hybrid engine wholesale (`m.qwen35`), so the test
@@ -34,7 +34,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "Qwen3.6 Text Integration", .serialized

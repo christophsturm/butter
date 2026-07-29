@@ -17,9 +17,9 @@
 // the embedded vocab. Focused on the loader (`GGUFTensorBundle`), not on
 // any one model family.
 //
-// Skipped by default. Set `$FFAI_GGUF_PATH` to any GGUF checkpoint dir
+// Skipped by default. Set `$BUTTER_GGUF_PATH` to any GGUF checkpoint dir
 // (a small one is ideal — these tests only exercise the parser + dequant
-// pipeline). Falls back to the DSv4-Flash path (`$FFAI_DSV4_GGUF_PATH` /
+// pipeline). Falls back to the DSv4-Flash path (`$BUTTER_DSV4_GGUF_PATH` /
 // `~/models/deepseek-v4-flash`) when set, so it doubles as DSv4 coverage
 // where that large file is staged.
 
@@ -27,7 +27,7 @@ import Foundation
 import Testing
 import Tokenizers
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("GGUF loader integration", .serialized)
 struct GGUFLoaderTests {
@@ -35,8 +35,8 @@ struct GGUFLoaderTests {
     private var modelPath: String? {
         let env = ProcessInfo.processInfo.environment
         let candidate =
-            env["FFAI_GGUF_PATH"]
-            ?? env["FFAI_DSV4_GGUF_PATH"]
+            env["BUTTER_GGUF_PATH"]
+            ?? env["BUTTER_DSV4_GGUF_PATH"]
             ?? NSString("~/models/deepseek-v4-flash").expandingTildeInPath
         guard FileManager.default.fileExists(atPath: candidate) else { return nil }
         return candidate
@@ -44,7 +44,7 @@ struct GGUFLoaderTests {
 
     private func open() throws -> GGUFTensorBundle? {
         guard let dir = modelPath else {
-            print("GGUFLoaderTests: skipping (no GGUF at FFAI_GGUF_PATH / FFAI_DSV4_GGUF_PATH)")
+            print("GGUFLoaderTests: skipping (no GGUF at BUTTER_GGUF_PATH / BUTTER_DSV4_GGUF_PATH)")
             return nil
         }
         return try GGUFTensorBundle(directory: URL(fileURLWithPath: dir))

@@ -1,4 +1,4 @@
-# Developing in FFAI
+# Developing in Butter
 
 Repo layout, the `make` workflow, and how to regenerate kernels.
 
@@ -6,9 +6,9 @@ Repo layout, the `make` workflow, and how to regenerate kernels.
 
 ```bash
 cd ~/Development
-git clone https://github.com/thewafflehaus/FFAI
+git clone https://github.com/thewafflehaus/butter
 git clone https://github.com/thewafflehaus/iron     # sibling repo, required
-cd FFAI
+cd Butter
 make setup-dev      # wraps ./scripts/setup-dev.sh
 make install-hooks  # point core.hooksPath at scripts/hooks/
 ```
@@ -30,15 +30,15 @@ Then resolves SPM deps and runs `make build` to produce `kernels.metallib`.
 
 ```
 Sources/
-  FFAI/                    User-facing library
+  Butter/                    User-facing library
   IronSwift/          Pre-compiled kernels + dispatch wrappers
     Resources/             kernels.metallib + manifest.json (generated)
     Generated/             IronKernels.swift (generated)
-  FFAICLI/                 ffai executable
+  ButterCLI/                 butter executable
 
 Tests/
   IronSwiftTests/     One file per kernel
-  FFAITests/               Tensor, Module, KVCache, Sampling, ...
+  ButterTests/               Tensor, Module, KVCache, Sampling, ...
   ModelIntegrationTests/              Per-family integration tests — load,
                            greedy-decode, assert coherent output
 
@@ -64,7 +64,7 @@ make build              # regenerate kernels + swift build (debug)
 make build-release      # regenerate kernels + swift build -c release
 make regenerate-kernels # run `iron build --emit all` only
 make test               # regenerate kernels + swift test (unit + integration)
-make test-unit          # FFAITests + IronSwiftTests only (fast)
+make test-unit          # ButterTests + IronSwiftTests only (fast)
 make test-integration   # ModelIntegrationTests only (multi-GB downloads)
 make coverage           # swift test --enable-code-coverage + summary
 make format             # swift-format the repo in place
@@ -112,21 +112,21 @@ Phrase summary lines as `Test results — 7/7` rather than `Tests: 7/7` to dodge
                                                     Resources/manifest.json
                                                     Generated/IronKernels.swift
                                                                   ↓
-                                                    Sources/FFAI/Ops.swift uses
+                                                    Sources/ButterSwift/Ops.swift uses
                                                     the generated typed wrappers
 ```
 
 `make regenerate-kernels` runs `cargo run --release --bin tile -- emit --out Sources/IronSwift` from the sibling iron repo. Cargo runs from the iron dir so its `rust-toolchain.toml` (nightly, 2024 edition) is honored. Eventually the `iron` binary will ship via Homebrew so this won't need a iron checkout — only kernel authors will need the repo.
 
-The generated artifacts are checked into the FFAI repo so end-user SPM consumers don't need Cargo or the iron checkout.
+The generated artifacts are checked into the Butter repo so end-user SPM consumers don't need Cargo or the iron checkout.
 
 ## Writing a new kernel
 
 Kernels are Rust functions in iron, not Swift. The flow:
 
-1. Add a `#[kernel]` Rust function to `crates/wh-iron-std/src/ops/<file>.rs` in the iron sibling repo.
+1. Add a `#[kernel]` Rust function to `crates/iron-std/src/ops/<file>.rs` in the iron sibling repo.
 2. Annotate it with `#[bench_kernel(op="…", subop="…", class=…, …)]` so the registry picks it up. For kernels without an MLX-comparable bench, submit a hand-rolled `BenchSpec` with `shapes: &[]` and the right `kernel_mode: Some(KernelMode::…)` instead.
-3. `make regenerate-kernels` from the FFAI repo — picks up the new kernel, regenerates `kernels.metallib` + `IronKernels.swift`.
+3. `make regenerate-kernels` from the Butter repo — picks up the new kernel, regenerates `kernels.metallib` + `IronKernels.swift`.
 4. Add a thin `Ops.swift` wrapper if the typed `IronKernels` signature isn't ergonomic enough for callers.
 5. Add a `Tests/IronSwiftTests/` test against fixed inputs / outputs.
 
@@ -134,8 +134,8 @@ Kernels are Rust functions in iron, not Swift. The flow:
 
 See [adding-a-model.md](adding-a-model.md) for the full walk-through. TL;DR:
 
-1. New `Sources/FFAI/Models/<Family>.swift` with a `<Family>` enum declaring `modelTypes` + `architectures`, a `<Family>Variant` protocol, and one or more variant structs.
-2. Register the family as a `ModelEntry` row in the `ModelRegistry` table (`Loader/ModelRegistryTable.swift`, or `ModelRegistryAudio.swift` for audio).
+1. New `Sources/ButterSwift/Models/<Family>.swift` with a `<Family>` enum declaring `modelTypes` + `architectures`, a `<Family>Variant` protocol, and one or more variant structs.
+2. Register the family in `Sources/ButterSwift/Model.swift` → `ModelRegistry.dispatchAndLoad`.
 3. Add `Tests/ModelIntegrationTests/<Family>IntegrationTests.swift` — load the smallest published checkpoint, greedy-decode, and assert `expectCoherentOutput(...)`.
 
 ## Testing
@@ -146,13 +146,13 @@ See [testing.md](testing.md) for running tests, the `expectCoherentOutput` integ
 
 - **Swift formatting** — `swift-format` per `.swift-format`. CI gates on `make format-check`.
 - **Comments** — sparing. Lead with WHY, not WHAT. The Tensor/Module/Layer naming carries the WHAT.
-- **No mocking the GPU.** Every test runs real Metal dispatches on the CI runner (Apple Silicon). Numerical correctness comes from the iron-side per-kernel GPU-correctness tests (vs a naive CPU oracle); FFAI integration tests assert the model pipeline produces coherent text. There are no golden fixtures.
+- **No mocking the GPU.** Every test runs real Metal dispatches on the CI runner (Apple Silicon). Numerical correctness comes from the iron-side per-kernel GPU-correctness tests (vs a naive CPU oracle); Butter integration tests assert the model pipeline produces coherent text. There are no golden fixtures.
 - **No unused / speculative code.** Build only what the active phase needs. Future-phase fields go into `LoadOptions` with a comment pointer to the phase, not stubs in the call path.
 
 ## Common pitfalls
 
 - **Forgot the iron checkout.** `make regenerate-kernels` will fail with `iron not found at ../iron`. Clone it.
-- **Used Cargo from the FFAI repo.** Will fail with edition=2024 errors. Always `cd iron && cargo run …` (the Makefile does this for you).
+- **Used Cargo from the Butter repo.** Will fail with edition=2024 errors. Always `cd iron && cargo run …` (the Makefile does this for you).
 - **Hit the page-alignment crash** when adding a new tensor loader. `MTLBuffer.bytesNoCopy` requires page-aligned (16KiB) pointers; per- tensor offsets aren't aligned. Use `device.makeBuffer(bytes:length:)` instead — the existing SafeTensors path already does.
 - **Sendable warnings on Metal types.** `MTLBuffer` / `MTLDevice` aren't `Sendable`. Wrap holders in `@unchecked Sendable` rather than fighting the compiler.
 

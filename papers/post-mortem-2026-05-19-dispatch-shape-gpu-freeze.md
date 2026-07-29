@@ -1,6 +1,6 @@
 # Post-mortem: wrong-dispatch-shape GPU freeze (2026-05-18 / 2026-05-19)
 
-**Authors:** Eric Kryski **Hardware:** Apple Silicon (M-series) **Software:** [FFAI](https://github.com/ekryski/FFAI) + sibling [iron](https://github.com/thewafflehaus/iron) **Date:** 2026-05-19 **Severity:** P0 — full WindowServer freeze, lost work session, ~1 day of debugging **Status:** Mitigated; layered prevention landed (this document, [FFAI/CLAUDE.md](../CLAUDE.md), kernel headers, GPU correctness tests). Underlying class still possible; iron-side dispatch validator queued.
+**Authors:** Eric Kryski **Hardware:** Apple Silicon (M-series) **Software:** [Butter](https://github.com/thewafflehaus/butter) + sibling [iron](https://github.com/thewafflehaus/iron) **Date:** 2026-05-19 **Severity:** P0 — full WindowServer freeze, lost work session, ~1 day of debugging **Status:** Mitigated; layered prevention landed (this document, [Butter/CLAUDE.md](../CLAUDE.md), kernel headers, GPU correctness tests). Underlying class still possible; iron-side dispatch validator queued.
 
 ---
 
@@ -20,7 +20,7 @@ This post-mortem documents the technical failure mode, the blast radius (why a t
 |---|---|
 | ~T-8 h | `make test-unit` parallel run on a clean checkout. Multiple test bundles dispatch Metal kernels concurrently. WindowServer GPU share drops near zero. |
 | ~T-7 h | First system freeze. Hard power-cycle required. Initial hypothesis: command-queue depth saturation under parallel test load. |
-| T-6 h → T-2 h | Layered mitigations: cap `MTLCommandQueue.maxCommandBufferCount`, single-flight PSO compile, autoreleasepool around every `runAndWait`, `ModelLoadLock` actor for cross-suite model loads, suite-level `.serialized` traits, `FFAI_MAX_COMMAND_BUFFERS=1` env override. All of these reduce probability of recurrence but do not address the root cause — they make the bad dispatch less likely to be reached, not less broken. |
+| T-6 h → T-2 h | Layered mitigations: cap `MTLCommandQueue.maxCommandBufferCount`, single-flight PSO compile, autoreleasepool around every `runAndWait`, `ModelLoadLock` actor for cross-suite model loads, suite-level `.serialized` traits, `BUTTER_MAX_COMMAND_BUFFERS=1` env override. All of these reduce probability of recurrence but do not address the root cause — they make the bad dispatch less likely to be reached, not less broken. |
 | T-2 h | Targeted bisect: `.disabled("bisect")` trait applied to all `OpsTests` methods; tests re-enabled one at a time. |
 | T-1 h | `sdpaDecode f32 — single position attends to itself` identified as the bad actor. Test pins GPU at 100%, never completes. |
 | T0 | Root cause located: `Ops.sdpaDecode` wrapper used the elementwise sizing helper for a reduction-mode kernel. Test invoked it with `head_dim = 4`, dispatching 4 threads to a kernel that requires 1024. |
@@ -32,7 +32,7 @@ This post-mortem documents the technical failure mode, the blast radius (why a t
 
 ## 2. The kernel
 
-The kernel under investigation is `iron_sdpa_decode` from [`iron/crates/crates/wh-iron-std/src/kernels/sdpa/sdpa_decode.rs`](https://github.com/thewafflehaus/iron/blob/dev/crates/crates/wh-iron-std/src/kernels/sdpa/sdpa_decode.rs). It's the production single-token SDPA decode for FFAI — a reduction-mode kernel with strict dispatch invariants:
+The kernel under investigation is `iron_sdpa_decode` from [`iron/crates/iron-std/src/butter/sdpa_decode.rs`](https://github.com/0xClandestine/metaltile/blob/dev/crates/iron-std/src/butter/sdpa_decode.rs). It's the production single-token SDPA decode for Butter — a reduction-mode kernel with strict dispatch invariants:
 
 - **`head_dim == 128`.** One threadgroup is laid out as 32 simdgroups × 32 lanes, and each lane owns 4 consecutive Q/K/V elements (128 / 32 = 4). Loads index by `lane * 4 + {0..3}`, unconditionally.
 - **One threadgroup per Q head.** `tgid_x = q_head`. Grid in the threadgroup dimension is `n_q_heads`.
@@ -128,7 +128,7 @@ There's a structural asymmetry in how dispatch shape is established for our kern
 
 > The author of the test / bench / inspection writes the dispatch geometry by hand, knowing the kernel's invariants. The grid and threadgroup come from a constant in the same file as the kernel. **It is structurally impossible for these surfaces to dispatch a malformed launch** — you'd have to type the wrong numbers, and the kernel author won't.
 
-**Consumer-side dispatch surface** — the `Ops` wrapper layer in `FFAI/Sources/FFAI/Ops.swift`:
+**Consumer-side dispatch surface** — the `Ops` wrapper layer in `Butter/Sources/ButterSwift/Ops.swift`:
 
 > The wrapper accepts caller-supplied dimensions and synthesizes the dispatch geometry. The wrapper author may or may not have read the kernel header. The caller (a model file, a unit test) certainly hasn't. **There is no structural barrier between caller input and the kernel's PSO** — only what the wrapper checks.
 
@@ -144,11 +144,11 @@ This bug had multiple test layers that you might expect to have caught it, and d
 
 | Test layer | What it catches | Why it missed this |
 |---|---|---|
-| **Metaltile DSL unit tests** (`cargo test`, `crates/wh-iron-codegen/tests/`) | Codegen pass correctness, MSL snapshot drift, trybuild error paths | Validates the kernel compiles to correct MSL. Has nothing to do with how the kernel is dispatched. |
-| **Metaltile GPU correctness tests** (`crates/wh-iron-std/tests/<kernel>_gpu_correctness.rs`) | Algorithm correctness on real Metal device against a CPU naive reference | Dispatches the kernel with the correct, author-written grid + threadgroup. The wrapper's bad dispatch never enters this layer. |
+| **Iron DSL unit tests** (`cargo test`, `crates/iron-codegen/tests/`) | Codegen pass correctness, MSL snapshot drift, trybuild error paths | Validates the kernel compiles to correct MSL. Has nothing to do with how the kernel is dispatched. |
+| **Iron GPU correctness tests** (`crates/iron-std/tests/<kernel>_gpu_correctness.rs`) | Algorithm correctness on real Metal device against a CPU naive reference | Dispatches the kernel with the correct, author-written grid + threadgroup. The wrapper's bad dispatch never enters this layer. |
 | **MLX side-by-side via `iron bench`** | Numerical parity vs the MLX reference implementation | Same — bench dispatch comes from the kernel's own `BenchSpec`, never from a caller. |
-| **FFAI per-Op tests** (`Tests/FFAITests/OpsTests.swift`) | The `Ops.<fn>` Swift API, including its dispatch path | Should have caught this. The test we wrote happened to use a tiny `head_dim = 4` that triggered the bug, so the test itself was the trigger — but with no kernel-side guard and no wrapper-side precondition, the bug manifested as an infinite loop rather than a visible test failure. |
-| **FFAI per-model integration tests** (`Tests/ModelTests/<Family>IntegrationTests.swift`) | End-to-end coherent output from real models | Real models use `head_dim = 128` always — the kernel's required value — so the wrapper's bad sizing for `head_dim = 4` was never exercised. Production code never hit it. The Op test that hit it was, in effect, the canary. |
+| **Butter per-Op tests** (`Tests/ButterTests/OpsTests.swift`) | The `Ops.<fn>` Swift API, including its dispatch path | Should have caught this. The test we wrote happened to use a tiny `head_dim = 4` that triggered the bug, so the test itself was the trigger — but with no kernel-side guard and no wrapper-side precondition, the bug manifested as an infinite loop rather than a visible test failure. |
+| **Butter per-model integration tests** (`Tests/ModelTests/<Family>IntegrationTests.swift`) | End-to-end coherent output from real models | Real models use `head_dim = 128` always — the kernel's required value — so the wrapper's bad sizing for `head_dim = 4` was never exercised. Production code never hit it. The Op test that hit it was, in effect, the canary. |
 
 So the bug was reachable only from an `Ops` test that passed degenerate dimensions — and once reached, it manifested as an infinite loop instead of a comparison failure. The test layer that *could* have caught it (`OpsTests`) was the layer that triggered it. With no guard upstream, the trigger was indistinguishable from a system crash.
 
@@ -297,7 +297,7 @@ Every `Ops` wrapper around a reduction-mode kernel now encodes the kernel's TPG,
 
 The remaining reduction-mode wrappers (`gemv`, `dequantGemv`, `argmax`, `softmaxCategoricalSample`) were audited and verified to already pass kernel-matching dispatch shapes (`tg = 256` matching the kernel's declared `tpg`); they need no change but were added to the test matrix.
 
-The pattern is documented in [`FFAI/CLAUDE.md`](../CLAUDE.md) as required reading for new wrappers.
+The pattern is documented in [`Butter/CLAUDE.md`](../CLAUDE.md) as required reading for new wrappers.
 
 ### Layer 2 — Kernel-header `DISPATCH INVARIANTS` blocks (source of truth)
 
@@ -316,21 +316,21 @@ Every iron kernel with strict dispatch invariants now carries a structured `## D
 
 This is the single source of truth the wrappers cite in their preconditions. Updates here propagate to the wrapper via the next CLAUDE.md-described wrapper review.
 
-### Layer 3 — Metaltile GPU correctness tests (algorithm validation)
+### Layer 3 — Iron GPU correctness tests (algorithm validation)
 
 The three kernels in question — `rms_norm`, `sdpa_decode`, `aura_encode` — each now have a paired `<kernel>_gpu_correctness.rs` test that dispatches on the real Metal device with the kernel's design TPG, compares against a naive CPU reference, and asserts agreement within tolerance. These do not directly prevent the wrapper bug (they dispatch with correct shape), but they pin the kernel's correct behavior so that future codegen changes can't silently regress it.
 
 ### Layer 4 — Documented audit cadence (process)
 
-[FFAI/CLAUDE.md](../CLAUDE.md) now requires that every new `Ops` wrapper around a reduction-mode kernel cite the kernel's `DISPATCH INVARIANTS` block and encode each invariant as a `precondition` before any dispatch work. The review checklist includes:
+[Butter/CLAUDE.md](../CLAUDE.md) now requires that every new `Ops` wrapper around a reduction-mode kernel cite the kernel's `DISPATCH INVARIANTS` block and encode each invariant as a `precondition` before any dispatch work. The review checklist includes:
 
 1. Is the underlying kernel reduction-mode (uses `simd_*`, `threadgroup_alloc`, or `KernelMode::Reduction`)?
 2. If yes, does the wrapper assert each invariant from the kernel's `DISPATCH INVARIANTS` block?
 3. Is the dispatch geometry computed from the invariants, not from `elementwiseGrid`?
 
-### Layer 5 — Metaltile runtime dispatch validator (deferred, the real fix)
+### Layer 5 — Iron runtime dispatch validator (deferred, the real fix)
 
-The structural fix is to lift the invariant check into iron itself. Each `BenchSpec` would declare its required TPG (and any shape-dependent constraints) as data; `Context::dispatch_with_grid` and the codegen-emitted Swift wrappers would assert grid/tg compliance before launching. This makes the invariant impossible to violate from any consumer, not just FFAI.
+The structural fix is to lift the invariant check into iron itself. Each `BenchSpec` would declare its required TPG (and any shape-dependent constraints) as data; `Context::dispatch_with_grid` and the codegen-emitted Swift wrappers would assert grid/tg compliance before launching. This makes the invariant impossible to violate from any consumer, not just Butter.
 
 It's deferred because the design has tradeoffs — some constraints depend on constexpr values (`head_dim` for `sdpa_decode`), others on dynamic dimensions (`n` for `rms_norm`) — and we want one cohesive design, not several ad-hoc additions. Filed as a iron-side follow-up.
 
@@ -354,13 +354,13 @@ It's deferred because the design has tradeoffs — some constraints depend on co
 
 - ✅ Wrapper preconditions added to `rmsNorm` / `rmsNormRows` / `sdpaDecode` / `auraEncode`.
 - ✅ Audit of all remaining `Ops` wrappers; no further wrapper bugs found.
-- ✅ `DISPATCH INVARIANTS` blocks added to `mlx/rms_norm.rs` and `ffai/aura_encode.rs` kernel headers (`ffai/sdpa_decode.rs` already had one).
-- ✅ Required reading section added to [`FFAI/CLAUDE.md`](../CLAUDE.md).
+- ✅ `DISPATCH INVARIANTS` blocks added to `mlx/rms_norm.rs` and `butter/aura_encode.rs` kernel headers (`butter/sdpa_decode.rs` already had one).
+- ✅ Required reading section added to [`Butter/CLAUDE.md`](../CLAUDE.md).
 - ✅ GPU correctness tests landed for `rms_norm`, `aura_encode` (matching the pre-existing `sdpa_decode_gpu_correctness.rs` pattern).
 - ✅ Kernel-side OOB guards in `mlx/rms_norm.rs` (iron `4b21136`). Lanes with `col + 3 >= n` clamp their load index to row[0..3], mask their `partial_ssq` contribution to 0 (so `reduce_sum` stays correct), and skip their stores. Belt-and-braces against wrong-TPG dispatch; the wrapper preconditions are still the front line.
 - 📋 **Deferred:** iron runtime dispatch validator. Filed as a follow-up; design needs care (constexpr-dependent vs dynamic constraints, error path).
 
-The first seven are the prevention in place today. The remaining deferred item is structural — once it lands, the invariant becomes impossible to violate from any consumer of iron's emitted Swift wrappers (not just FFAI).
+The first seven are the prevention in place today. The remaining deferred item is structural — once it lands, the invariant becomes impossible to violate from any consumer of iron's emitted Swift wrappers (not just Butter).
 
 ## 14. Follow-up findings discovered while landing the fixes
 
@@ -368,6 +368,6 @@ This is the section we add as later layers of the same investigation surface rel
 
 **`aura_encode` codegen signedness bug (iron `18c34c0`).** The `#[kernel]` body parser lowered `(uint + bits).cast::<i32>() - 32i32 > 0i32` to MSL `int v = (int)(uint+4) - 32; bool b = v > 0u;` — the `0i32` literal got demoted to `0u` in the comparison. C/MSL int-to-uint promotion made `-28` reinterpret as `~4e9`, so the cross-word-spill branch fired for every thread regardless of bit-width. Symptom: low nibbles of words `[word_idx+1 ..]` polluted with the previous thread's quantization index. Caught by the `aura_encode_gpu_correctness` test from the Phase A defensive coverage pass — the test was originally mine and looked like a wrong-test-expectation until the diff pattern (0x7 OR'd with 0x8 = 0xF) showed the kernel was systematically miscomputing low nibbles. **Lesson:** GPU correctness tests against a naive CPU reference catch entire classes of codegen bugs that no amount of wrapper precondition would have detected.
 
-**Grid3D over-dispatch in tests (iron `ec9d170` test file fixes).** Several `*_gpu_correctness.rs` tests I authored during Phase A dispatched `grid_groups=[N, 1, 1]` with `tg=[N, 1, 1]` = N² threads instead of N. For Grid3D mode `program_id<i>()` lowers to `thread_position_in_grid.[xyz]`, so `dispatch_with_grid([N,1,1], [N,1,1])` spawns N×N threads, most of them garbage. The `conv1d` test caught it cleanly: illegitimate threads' OOB reads (returning 0) raced against legitimate writes of `x[d]` to `state[2*nC+d]`, and the max state diff was exactly `max(x)` magnitude. Same pattern silently "passed" `kv_cache_update` (Metal clamps OOB writes) and `aura_dequant_rotated` (kernel's internal `if d < dim` guard). **Lesson:** the two semantically-different dispatch shapes (Reduction = grid in threadgroups, Grid3D = grid in threads) have to be documented as loudly as the TPG invariants. Now added to `FFAI/CLAUDE.md` §"Wrapping kernels in FFAI" and to `papers/optimizing-kernels-for-apple-m-series-architecture.md` §5.2.
+**Grid3D over-dispatch in tests (iron `ec9d170` test file fixes).** Several `*_gpu_correctness.rs` tests I authored during Phase A dispatched `grid_groups=[N, 1, 1]` with `tg=[N, 1, 1]` = N² threads instead of N. For Grid3D mode `program_id<i>()` lowers to `thread_position_in_grid.[xyz]`, so `dispatch_with_grid([N,1,1], [N,1,1])` spawns N×N threads, most of them garbage. The `conv1d` test caught it cleanly: illegitimate threads' OOB reads (returning 0) raced against legitimate writes of `x[d]` to `state[2*nC+d]`, and the max state diff was exactly `max(x)` magnitude. Same pattern silently "passed" `kv_cache_update` (Metal clamps OOB writes) and `aura_dequant_rotated` (kernel's internal `if d < dim` guard). **Lesson:** the two semantically-different dispatch shapes (Reduction = grid in threadgroups, Grid3D = grid in threads) have to be documented as loudly as the TPG invariants. Now added to `Butter/CLAUDE.md` §"Wrapping kernels in Butter" and to `papers/optimizing-kernels-for-apple-m-series-architecture.md` §5.2.
 
 **Llama 3.2 1B's `head_dim=64` was producing wrong attention output silently (iron `b6edc9b`).** The original `iron_sdpa_decode` was hard-coded to `head_dim=128` (4 elements per lane). The wrapper's `elementwiseGrid` dispatch was already wrong for head_dim=64 — 4 threadgroups of 256 threads instead of 1 threadgroup of 1024 — but `expectCoherentOutput` was lenient enough that Llama 3.2 1B's integration test passed with subtly-wrong attention. Phase B's OpsValidation precondition correctly trapped the wrong dispatch and flagged the gap; we shipped the head_dim=64 kernel specialization (`iron_sdpa_decode_d64`) to actually fix the underlying bug rather than just relax the precondition. **Lesson:** loose integration tests (coherent output ≠ correct numerics) can hide real kernel bugs for the entire history of a model variant's support. Per-kernel GPU correctness tests catch what coherent-output tests can't.

@@ -35,7 +35,7 @@ import TestHelpers
 import Testing
 import Tokenizers
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "GLMASR Integration", .serialized,

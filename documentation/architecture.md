@@ -1,12 +1,12 @@
 # Architecture
 
-FFAI is three layers, all in this repo except `iron` (a sibling Rust crate). The longer-form diagrams live in [`planning/architecture.md`](../planning/architecture.md); this page covers the user-facing model — what each layer is responsible for and how a single token moves through the stack.
+Butter is three layers, all in this repo except `iron` (a sibling Rust crate). The longer-form diagrams live in [`planning/architecture.md`](../planning/architecture.md); this page covers the user-facing model — what each layer is responsible for and how a single token moves through the stack.
 
 ## The three layers
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  FFAI (Swift)                                           │
+│  Butter (Swift)                                           │
 │   • Tensor (MTLBuffer-backed)                           │
 │   • Module / Linear / Embedding / RMSNorm               │
 │   • Model definitions (Llama, Qwen, …)                  │
@@ -24,7 +24,7 @@ FFAI is three layers, all in this repo except `iron` (a sibling Rust crate). The
 ┌────────────────────────▼────────────────────────────────┐
 │  iron (Rust, sibling repo)                         │
 │   • #[kernel] DSL → IR → MSL                            │
-│   • `iron build --emit all` (wh-iron-cli) produces:               │
+│   • `iron build --emit all` (iron-cli) produces:               │
 │       kernels.metallib   (compiled by xcrun metal)      │
 │       manifest.json      (kernel metadata)              │
 │       IronKernels.swift  (typed wrappers)          │
@@ -33,13 +33,13 @@ FFAI is three layers, all in this repo except `iron` (a sibling Rust crate). The
 
 ### `iron` (Rust)
 
-A `#[kernel]` proc-macro lowers a small Rust DSL into an IR; the codegen back-end emits Metal Shading Language. Authoring lives here: new kernels are Rust `pub fn`s in `crates/wh-iron-std/src/ops/`, annotated with `#[bench_kernel(...)]` so the registry picks them up. End users never touch Rust — they consume the artifacts shipped in `Sources/IronSwift/Resources/`.
+A `#[kernel]` proc-macro lowers a small Rust DSL into an IR; the codegen back-end emits Metal Shading Language. Authoring lives here: new kernels are Rust `pub fn`s in `crates/iron-std/src/ops/`, annotated with `#[bench_kernel(...)]` so the registry picks them up. End users never touch Rust — they consume the artifacts shipped in `Sources/IronSwift/Resources/`.
 
 ### `IronSwift`
 
 A thin Swift wrapper that loads `kernels.metallib` once (`IronLibrary.shared`), maintains a PSO cache keyed on `(name, MTLFunctionConstantValues)`, and exposes one typed function per kernel via the generated `IronKernels.swift`. Function-constant specialization lets us produce a single MSL source that spans dtype/shape variants — at PSO instantiation time the constants get baked into the pipeline.
 
-### `FFAI`
+### `Butter`
 
 The user-facing layer:
 
@@ -73,7 +73,7 @@ The user-facing layer:
                                                                   a pre-compiled metallib
 ```
 
-Kernel regeneration is `make regenerate-kernels` (which `make build` runs automatically). End users adding FFAI as a SwiftPM dep don't run this — they consume the metallib that ships in the package.
+Kernel regeneration is `make regenerate-kernels` (which `make build` runs automatically). End users adding Butter as a SwiftPM dep don't run this — they consume the metallib that ships in the package.
 
 ## A single token, end-to-end
 
@@ -130,54 +130,23 @@ A `Model` has two `Capability` sets:
 
 Disabled modalities skip weight allocation entirely — the vision encoder of a 9B VL model is ~600MB you don't pay for if you only need text. The infrastructure has been in place since Phase 2; the vision-language and audio families now exercise it end-to-end.
 
-## One registry, one `Model`, every modality
-
-`Model.load(id)` is the single entry point for **every** kind — LLM, VLM, OCR, omni, STT, TTS, STS, VAD. It decodes `config.json`, asks the one `ModelRegistry` table which family claims it, and returns one generic `Model`. There is no separate audio or VAD loader.
-
-- **`ModelKind`** is the catalog label (`llm`/`vlm`/`ocr`/`omni`/`stt`/`tts`/`sts`/`vad`) the registry files each family under. It drives the `ffai models` catalog and `Model.generate` dispatch — it is *not* a substitute for `Capability` (the fine-grained runtime truth).
-- **`ModelEntry`** is one registry row: how to RECOGNISE a checkpoint (`model_type` / `architecture` / a `sniff` closure), how to LOAD it (a config+weights `load` for text/VL, or a directory `loadFromDirectory` for audio/VAD), and how to LIST it (`summary` / `repos` / `capabilities`). The table is the single source of truth for both the loader and the catalog.
-- **`Model.engine`** is type-erased to `any ModelEngine`. The modality protocols refine it: `LanguageModel: TextEngine` (text forward surface), `Transcribing` (STT), `Synthesizing` (TTS), `SpeechTransforming` (STS), `Detecting` (VAD). A family conforms to one or several (omni → `TextEngine` + `Transcribing`) — protocol composition, because the modality taxonomy is overlapping sets, not a tree.
-- **`Model.generate(_ : ModelInput)`** and **`generateStream(_:)`** are the generic surface; `ModelInput` / `ModelOutput` / `ModelOutputChunk` are modality-tagged enums. Typed convenience — `generate(messages:)`, `transcribe`, `synthesize`, `detect` — wraps the generic path and throws `ModelError.unsupportedInput` on a kind mismatch.
-
-Routing precedence (in `ModelRegistry.entry(for:)`): a vision-language checkpoint goes to the VL tier first (Gemma 4's VL/omni conversions carry a top-level `audio_config`, so VL must win over the audio sniffs); a VL config with no VL handler falls through to the audio tier (Qwen-Omni carries a `vision_config` but loads as audio); otherwise the audio tier's specific structural sniffs win over the generic text-architecture match (an Orpheus checkpoint is a `LlamaForCausalLM` but a TTS model), then the text tier.
-
 ## File layout
 
 ```
 Sources/
-  FFAI/                     User-facing library
+  Butter/                     User-facing library
     Tensor.swift            MTLBuffer + shape/dtype/strides
     BufferPool.swift        Per-token activation slab allocator
     DType.swift             Supported tensor dtypes
     Module.swift            Parameter discovery protocol
-    ModelLayers/            Linear / Embedding / RMSNorm / LayerNorm /
-                            MoELayer / DecoderLayer / VisionEncoderLayer /
-                            AudioEncoderLayer
+    Layers.swift            Linear / Embedding / RMSNorm / etc.
     Capability.swift        .textIn / .imageIn / .videoIn / .audioIn / .textOut / .audioOut
-    ModelKind.swift         catalog kind: llm/vlm/ocr/omni/stt/tts/sts/vad
-    Model.swift             one generic Model wrapper for every kind
-    ModelType/              engine protocol-composition layer + unified I/O
-      ModelEngine.swift     ModelEngine marker + TextEngine / Transcribing /
-                            Synthesizing / SpeechTransforming / Detecting
-      ModelIO.swift         ModelInput / ModelOutput / ModelOutputChunk
-      ModelInference.swift  Model.generate(_:) / generateStream(_:) + typed
-                            transcribe / synthesize / detect convenience
-      EngineConformances.swift  audio/VAD families → modality protocols
-    LanguageModel.swift     text-engine protocol (: TextEngine); ~40 families
-    VisionModel.swift       VL orchestrator (composed, not a protocol)
-    AudioModel.swift        legacy TTS protocol (synthesize); superseded by
-                            the ModelType/ Synthesizing protocol
-    FFAI.swift              Public umbrella + version
-    Loader/                 Model.load (one entry, every kind), ModelConfig,
-                            ModelLocator, ModelDownloader, Device, and the
-                            single ModelRegistry table —
-                            ModelRegistry.swift (dispatch + Loaded),
-                            ModelRegistryTable.swift (vision + text tiers),
-                            ModelRegistryAudio.swift (audio/VAD tier,
-                            directory-loaded), ModelEntry.swift (one row),
-                            RegistryQueries.swift (routing-query helpers)
-    Converter/              ffai convert: ConvertDriver, SafeTensorsWriter,
-                            QuantSpec
+    LanguageModel.swift     Protocol implemented by text-family models
+    VisionModel.swift       Protocol implemented by VL orchestrators
+    AudioModel.swift        Protocol implemented by audio families
+    Butter.swift              Public umbrella + version
+    Loader/                 Model.load, ModelConfig, ModelLocator,
+                            ModelDownloader, ModelRegistry, Device, …
     Ops/                    Public GPU op wrappers (Ops.swift,
                             OpsValidation.swift, QuantizedOps.swift, …)
     KVCache/                Raw / affine / AURA caches, eviction policy,
@@ -187,8 +156,8 @@ Sources/
     Stats/                  GenerationStats, Perplexity, ThinkingSplit
     Telemetry/              Debug / Profile + signposts
     Benchmark/              Bench, IndirectDispatch, MemoryStats, …
-    CLI/                    `ffai` subcommands (also linked into the
-                            FFAICLI executable target)
+    CLI/                    `butter` subcommands (also linked into the
+                            ButterCLI executable target)
     Models/
       <Family>.swift        family root (main interface, dispatch
                             entry point for VL/multi-modal orchestrators)
@@ -210,11 +179,11 @@ Sources/
     Resources/              kernels.metallib + manifest.json
     Generated/              IronKernels.swift (typed wrappers)
 
-  FFAICLI/                  ffai executable entry point
+  ButterCLI/                  butter executable entry point
 
 Tests/
   IronSwiftTests/      One file per kernel + KernelManifestSmokeTests
-  FFAITests/                Offline unit tests — mirror Sources/FFAI/
+  ButterTests/                Offline unit tests — mirror Sources/ButterSwift/
                             layout (Generation/, KVCache/, Ops/, Stats/, …)
   ModelIntegrationTests/    Per-family end-to-end checkpoint downloads,
                             grouped by modality (Text/, Audio/Omni/,

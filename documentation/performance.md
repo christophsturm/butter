@@ -81,8 +81,8 @@ swift test --filter PerfTests           # just perf
 For a manual sanity check:
 
 ```bash
-ffai --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time" --max-tokens 64
-ffai --model mlx-community/Qwen3-4B-4bit --prompt "Once upon a time" --max-tokens 64
+butter --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time" --max-tokens 64
+butter --model mlx-community/Qwen3-4B-4bit --prompt "Once upon a time" --max-tokens 64
 ```
 
 The CLI prints `prompt: N tokens (Xs prefill)` + `generated: N tokens in Ys (Z tok/s)` at the end of each run.

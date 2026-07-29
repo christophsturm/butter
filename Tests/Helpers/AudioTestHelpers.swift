@@ -30,7 +30,7 @@
 // (each picks a single canonical HF repo id and lets `ModelLocator`
 // download / cache-hit) — see the per-suite `loadXYZ()` helpers.
 
-import FFAI
+import ButterSwift
 import Foundation
 import Testing
 

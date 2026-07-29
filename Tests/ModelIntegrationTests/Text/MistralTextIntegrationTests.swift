@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Slow integration test for Mistral 7B Instruct. Mistral 7B uses the
-// Llama 3 architecture verbatim, so the FFAI engine returned is a
+// Llama 3 architecture verbatim, so the Butter engine returned is a
 // `Llama3Model`; this test just confirms that the dispatch path through
 // the Mistral family enum loads the checkpoint and decodes coherent
 // output.
@@ -24,7 +24,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "Mistral Integration", .serialized

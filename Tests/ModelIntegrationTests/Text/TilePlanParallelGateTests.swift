@@ -15,10 +15,10 @@
 // F-85 parallelized tile-plan builder e2e gate - sweeps the batched
 // forwardMany prefill path across the T ladder (512/1024/2048/4096/
 // 16384/32768), reporting median tok/s per T. Reads
-// FFAI_MOE_PARALLEL_PLAN from the process environment ONCE (same as
+// BUTTER_MOE_PARALLEL_PLAN from the process environment ONCE (same as
 // production `MoELayer` init) and runs ONE config per invocation - run
 // this test TWICE, once with the default environment (parallel ON) and
-// once with FFAI_MOE_PARALLEL_PLAN=0 set BEFORE `swift test` starts, to
+// once with BUTTER_MOE_PARALLEL_PLAN=0 set BEFORE `swift test` starts, to
 // compare. A single process loading the SAME config twice (to A/B
 // within one run) was tried and rejected: the second `Model.load` call
 // started before the first model's Metal-resident buffers had actually
@@ -27,7 +27,7 @@
 // separate process launches (this file's actual shape) guarantees full
 // OS-level reclamation between configs - matches the established
 // per-config-process convention already used for other F-85 gates
-// (e.g. `FFAI_MOE_COUNTING_SORT=0 swift test --filter ...`).
+// (e.g. `BUTTER_MOE_COUNTING_SORT=0 swift test --filter ...`).
 //
 // GATE_LADDER_MAX_T caps the ladder to `targetT <= GATE_LADDER_MAX_T`
 // for incremental validation before committing wall-clock/memory to
@@ -38,7 +38,7 @@ import Metal
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 private let gateLocalPath = "/Users/tom/models/Qwen3.6-35B-A3B-4bit"
 private let gateCheckpointAvailable =
@@ -94,10 +94,10 @@ struct TilePlanParallelGateTests {
 
     @Test("F-85 parallel tile-plan builder - e2e prefill ladder (one config per process)")
     func tilePlanParallelGateLadder() async throws {
-        let parallelPlanEnvRaw = ProcessInfo.processInfo.environment["FFAI_MOE_PARALLEL_PLAN"]
+        let parallelPlanEnvRaw = ProcessInfo.processInfo.environment["BUTTER_MOE_PARALLEL_PLAN"]
         let label =
             parallelPlanEnvRaw == "0"
-            ? "single-threadgroup(FFAI_MOE_PARALLEL_PLAN=0)" : "parallel(default)"
+            ? "single-threadgroup(BUTTER_MOE_PARALLEL_PLAN=0)" : "parallel(default)"
         print("=== \(label) ===")
 
         var optsBuilder = LoadOptions()

@@ -41,7 +41,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite(
     "EchoTTS Integration", .serialized,
@@ -96,7 +96,7 @@ struct EchoTTSIntegrationTests {
             }
         } catch let error as EchoTTSError {
             // Staged port: the diffusion forward pass is not wired, so the
-            // stream MUST finish by throwing the descriptive FFAI error
+            // stream MUST finish by throwing the descriptive Butter error
             // rather than emitting incorrect audio.
             threwNotWired = true
             #expect(

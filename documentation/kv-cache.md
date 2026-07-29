@@ -1,6 +1,6 @@
 # KV Cache
 
-The KV cache holds per-layer K and V tensors so subsequent decode steps don't re-compute attention over the entire prefix. FFAI ships raw fp16/bf16, affine-quantized, and AURA-compressed attention caches today — plus recurrent SSM/GDN state caches for the hybrid families and a sliding-window eviction policy that composes with all of them.
+The KV cache holds per-layer K and V tensors so subsequent decode steps don't re-compute attention over the entire prefix. Butter ships raw fp16/bf16, affine-quantized, and AURA-compressed attention caches today — plus recurrent SSM/GDN state caches for the hybrid families and a sliding-window eviction policy that composes with all of them.
 
 ## What's supported today
 
@@ -131,7 +131,7 @@ let model = try await Model.load(
 Or via the CLI:
 
 ```bash
-ffai --model mlx-community/Qwen3-1.7B-4bit --prompt "..." --kv-cache affine8
+butter --model mlx-community/Qwen3-1.7B-4bit --prompt "..." --kv-cache affine8
 ```
 
 ### How `AffineQuantizedKVCache` works
@@ -176,7 +176,7 @@ let model = try await Model.load(
 ```
 
 ```bash
-ffai --model mlx-community/Qwen3-1.7B-bf16 \
+butter --model mlx-community/Qwen3-1.7B-bf16 \
      --kv-cache aura4v2 \
      --kv-window-size 2048 \
      --kv-window-keep 4 \

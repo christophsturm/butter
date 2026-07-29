@@ -24,7 +24,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("DeepSeek R1 Distill Integration", .serialized)
 struct DeepSeekR1DistillTextIntegrationTests {

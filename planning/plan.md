@@ -1,4 +1,4 @@
-# FFAI — Phased Implementation Plan
+# Butter — Phased Implementation Plan
 
 > For the visual end-to-end architecture (build pipeline, model
 > loading, inference dispatch loop) see
@@ -15,9 +15,9 @@
 
 Three layers, all in this repo except iron (sibling Rust repo, already forked at `~/Development/personal/ai/iron`):
 
-1. **iron** (Rust) — `#[kernel]` DSL, IR, MSL codegen. Ships a `iron` CLI (`wh-iron-cli`) whose `emit` subcommand produces `kernels.metallib`, `manifest.json`, and `IronKernels.swift`. Historical note: Phase 0 originally wired a standalone `iron-emit` bin for this; that pipeline was rehomed into `wh-iron-codegen::emit` + the `iron build --emit all` subcommand when upstream consolidated the build/bench/test commands under one CLI.
+1. **iron** (Rust) — `#[kernel]` DSL, IR, MSL codegen. Ships a `iron` CLI (`iron-cli`) whose `emit` subcommand produces `kernels.metallib`, `manifest.json`, and `IronKernels.swift`. Historical note: Phase 0 originally wired a standalone `iron-emit` bin for this; that pipeline was rehomed into `iron-codegen::emit` + the `iron build --emit all` subcommand when upstream consolidated the build/bench/test commands under one CLI.
 2. **IronSwift** (Swift, in this repo at `Sources/IronSwift/`) — loads the pre-compiled `.metallib`, manages a PSO cache with function constants, exposes typed Swift wrappers per kernel.
-3. **FFAI** (Swift, in this repo at `Sources/FFAI/`) — `Tensor` abstraction over `MTLBuffer`, module/parameter system, model definitions, SafeTensors loading, KV cache, sampling, generate loop.
+3. **Butter** (Swift, in this repo at `Sources/ButterSwift/`) — `Tensor` abstraction over `MTLBuffer`, module/parameter system, model definitions, SafeTensors loading, KV cache, sampling, generate loop.
 
 No JIT compilation at runtime. No Rust at runtime. No `MLX*` imports.
 
@@ -28,26 +28,26 @@ No JIT compilation at runtime. No Rust at runtime. No `MLX*` imports.
 | Decision | Choice |
 |---|---|
 | Approach | Option B: build-time metallib emission, pure-Swift runtime |
-| Swift package location | Inside FFAI (Sources/IronSwift) |
+| Swift package location | Inside Butter (Sources/IronSwift) |
 | Kernel author flow | Rust `#[kernel]` → `make regenerate-kernels` runs `iron build --emit all --out Sources/IronSwift` (an SPM build plugin would automate this if the `iron` binary ships via Homebrew) |
 | Authoring DSL | Rust (iron). Swift macro frontend deferred indefinitely; iron IR is serde-serializable so this stays open. |
 | MTLBuffer access | Direct (we own the tensor type, no MLXArray middle-man) |
 | Testing | 100% line coverage target. Every kernel, every Swift function, every model layer gets unit tests. CI gates on coverage + correctness. |
-| ANE / CoreML backend | Deferred to v0.3+. Add a `mil/` codegen sibling to `msl/` in wh-iron-codegen when it's time. |
+| ANE / CoreML backend | Deferred to v0.3+. Add a `mil/` codegen sibling to `msl/` in iron-codegen when it's time. |
 
 ---
 
 ## Quality bar
 
-**Test coverage: ≥ 80 % line coverage on FFAI + IronSwift Swift code (was 100 % aspirational; the realised gate is the 80 % ratchet in ci.yml).** Measured via `swift test --enable-code-coverage` driven through `make coverage` / `scripts/coverage.sh` (matches ci.yml). CI fails any PR that drops coverage below the ratchet. Every phase adds tests alongside code, not after.
+**Test coverage: ≥ 80 % line coverage on Butter + IronSwift Swift code (was 100 % aspirational; the realised gate is the 80 % ratchet in ci.yml).** Measured via `swift test --enable-code-coverage` driven through `make coverage` / `scripts/coverage.sh` (matches ci.yml). CI fails any PR that drops coverage below the ratchet. Every phase adds tests alongside code, not after.
 
 **What the quality bar means here:**
 
 - Every public function: at least one happy-path test
 - Every branch in business logic: at least one test per side
-- Every kernel in iron: a paired GPU correctness test under `crates/wh-iron-std/tests/<kernel>_gpu_correctness.rs` comparing against a naive CPU reference (pattern from [TheTom PR #35](https://github.com/thewafflehaus/iron/pull/35)), **plus** an MLX side-by-side check when the kernel has an upstream counterpart (kernels under `wh-iron-std/src/mlx/`, via `iron bench`
-  + `check_equiv`), **plus** an FFAI integration test that exercises the kernel on a real model (kernels under `wh-iron-std/src/ffai/` where there's no MLX upstream counterpart). The `iron-interp` CPU interpreter crate is gone (dropped in PRs #16 / #17); GPU correctness + MLX side-by-side are the two correctness paths now.
-- Every codegen emit path: `insta` MSL golden snapshot under `crates/wh-iron-codegen/tests/msl_snapshots.rs` (pattern from [PR #25](https://github.com/thewafflehaus/iron/pull/25)).
+- Every kernel in iron: a paired GPU correctness test under `crates/iron-std/tests/<kernel>_gpu_correctness.rs` comparing against a naive CPU reference (pattern from [TheTom PR #35](https://github.com/0xClandestine/metaltile/pull/35)), **plus** an MLX side-by-side check when the kernel has an upstream counterpart (kernels under `iron-std/src/mlx/`, via `iron bench`
+  + `check_equiv`), **plus** an Butter integration test that exercises the kernel on a real model (kernels under `iron-std/src/butter/` where there's no MLX upstream counterpart). The `iron-interp` CPU interpreter crate is gone (dropped in PRs #16 / #17); GPU correctness + MLX side-by-side are the two correctness paths now.
+- Every codegen emit path: `insta` MSL golden snapshot under `crates/iron-codegen/tests/msl_snapshots.rs` (pattern from [PR #25](https://github.com/0xClandestine/metaltile/pull/25)).
 - Every model: token-by-token determinism test against a reference for at least one prompt + seed combination
 
 **What it doesn't mean:**
@@ -67,7 +67,7 @@ After Phase 6.5 (Vision) and Phase 7 (Audio) landed, this is the honest list of 
 2. **Sliding-window SDPA full-attention fall-through** — `Ops.sdpaDecode` passes `sink_end = 0`, `window_start = 0` even when the cache is sliding-window. 4×–8× decode tax at 16K–32K context. Closed by Phase 6.1.
 3. **VLM cold inference on Idefics3 / PaliGemma / GlmOcr / FastVLM** — vision-tower attention + depthwise conv run on parallelised CPU, not GPU. Minutes-per-first-image at 1024px on FastVLM. Closed by Phase 6.5b.
 4. **AURA persistent K/V mirror** — Stage 1a snapshots a full `[maxSeq, kvHeads, headDim]` mirror per layer. Closed by Phase 6.3 Stage 1b (compressed-domain `aura_flash` as default decode path).
-5. **GPU 100% pin (unknown root cause, cannot reproduce anymore)** — deferred per user; needs a Metal System Trace to localise. Mitigation: `FFAI_MAX_COMMAND_BUFFERS=16` caps the queue so it stays annoying-but-survivable.
+5. **GPU 100% pin (unknown root cause, cannot reproduce anymore)** — deferred per user; needs a Metal System Trace to localise. Mitigation: `BUTTER_MAX_COMMAND_BUFFERS=16` caps the queue so it stays annoying-but-survivable.
 6. **Per-token `commit + wait` + 4-byte readback** [#93] — partially shipped under Phase C #6 (1-cmdbuf default path); full GPU-resident decode is a Phase 9 dispatch-mode win.
 7. **FishSpeech Conv1d on CPU** — codec ports run dilated / transposed Conv1d in Swift until the iron kernels land. Synthesise path produces a waveform but slowly.
 8. **Marvis Mimi codec — not wired** — `MarvisModel` frame-generates but `mimiDecoder` is nil. Hook in `Audio/Mimi.swift`.
@@ -84,14 +84,14 @@ After Phase 6.5 (Vision) and Phase 7 (Audio) landed, this is the honest list of 
 
 ```
 iron/
-  crates/wh-iron-codegen/tests/msl_snapshots.rs   # insta MSL goldens
-  crates/wh-iron-codegen/tests/snapshots/         # .snap files
-  crates/wh-iron-std/tests/<kernel>_gpu_correctness.rs  # one per non-trivial kernel
+  crates/iron-codegen/tests/msl_snapshots.rs   # insta MSL goldens
+  crates/iron-codegen/tests/snapshots/         # .snap files
+  crates/iron-std/tests/<kernel>_gpu_correctness.rs  # one per non-trivial kernel
   crates/iron/tests/error/*.rs                 # trybuild compile-fail fixtures
 
-FFAI/
+Butter/
   Tests/IronSwiftTests/   # PSO manifest + per-kernel Swift wrapper smoke
-  Tests/FFAITests/             # Tensor, Module, Linear, KVCache, Sampling, … (parallel-safe)
+  Tests/ButterTests/             # Tensor, Module, Linear, KVCache, Sampling, … (parallel-safe)
   Tests/ModelIntegrationTests/ # one folder per model — forward-pass determinism
                                # vs mlx-lm / mlx-vlm golden fixture (serialized)
 ```
@@ -128,53 +128,11 @@ Full API surface lands in **Phase 2** (with only `.textIn`/`.textOut` exercised)
 | Format | What | Status |
 |---|---|---|
 | **safetensors** (fp16/bf16) | HF default. Header (JSON) + raw tensor bytes. mmap-friendly. | ✅ shipped |
-| **mlx-format** (quantized safetensors, **2/3/4/5/6/8-bit** affine) | Same file format; mlx-community quant layout (weight + scale + bias per group). 2-bit added Phase E (`dequant_gemv_int2` + `dequant_gather_int2` + `iron_qmm_mma_int2` in iron; `Ops.dequantGemv` / `dequantGather` / `dispatchQmmMma` dispatch arms in FFAI). | ✅ shipped |
-| **mixed per-role quantization** (`ffai convert --bits / --embedding-bits / --lm-head-bits / --vision-bits / --router-bits / --expert-bits`) | Each role independently takes any of `2 / 3 / 4 / 5 / 6 / 8 / fp16 / bf16` via `QuantSpec`. Loader's per-tensor `deriveAffineQuantBits` reads each width from saved shape — no per-tensor `config.json` entries needed. MoE routers stay full-precision by default (`--router-bits` opts in); experts default to `--bits` (`--expert-bits fp16/bf16` leaves them raw). | ✅ shipped |
-| **MoE expert layout** (`ffai convert --expert-layout stacked\|per-expert`) | `stacked` (default) gathers per-expert `experts.<e>.{w1,w3,w2}` into one `switch_mlp.{gate,up,down}_proj` tensor `[E, out, …]` (mlx-lm `QuantizedSwitchLinear` layout → fused expert-indexed dispatch); `per-expert` preserves source tensors. Built on the `ConvertDriver` `ConversionStep` plan seam. | ✅ shipped |
-| **mixed per-LAYER quantization** | Different layers in the same role at different bit-widths (e.g. first 4 attention layers at 2-bit, rest at 4-bit). Needs a recipe-file format and per-layer dispatch — separate from per-role. | 🚧 planned (see § "Targeted & mixed quantization" below) |
-| **targeted per-expert / ablation quantization** | Compress specific experts differently from others, or drop experts entirely (ablation). Extends the `ConversionStep` plan. | 🚧 planned (see § "Targeted & mixed quantization" below) |
+| **mlx-format** (quantized safetensors, **2/3/4/5/6/8-bit** affine) | Same file format; mlx-community quant layout (weight + scale + bias per group). 2-bit added Phase E (`dequant_gemv_int2` + `dequant_gather_int2` + `mt_qmm_mma_int2` in iron; `Ops.dequantGemv` / `dequantGather` / `dispatchQmmMma` dispatch arms in Butter). | ✅ shipped |
+| **mixed per-role quantization** (`butter convert --bits / --embedding-bits / --lm-head-bits / --vision-bits`) | Each role independently takes any of `2 / 3 / 4 / 5 / 6 / 8 / fp16 / bf16` via `QuantSpec`. Loader's per-tensor `deriveAffineQuantBits` reads each width from saved shape — no per-tensor `config.json` entries needed. | ✅ shipped |
+| **mixed per-LAYER quantization** | Different layers in the same role at different bit-widths (e.g. first 4 attention layers at 2-bit, rest at 4-bit). Needs a recipe-file format and per-layer dispatch — separate from per-role. | 🚧 planned (see `session-plan.md`) |
 | **gguf** | llama.cpp single-file format, embeds quant + tokenizer + per-arch name mapping. | 🚧 planned (see `session-plan.md`) |
 | **onnx** | Graph format, embedded weights. Wrong fit — would need a graph executor. | ❌ skipped (doesn't align with static-kernel approach) |
-
----
-
-## Targeted & mixed quantization (planned)
-
-**Shipped today (the foundation):** per-role specs (`--bits / --embedding-bits / --lm-head-bits / --vision-bits / --router-bits / --expert-bits`), the `stacked` vs `per-expert` MoE layout, and the loader's per-tensor `deriveAffineQuantBits` (reads each width from the saved shape — so arbitrary mixed-width checkpoints already *load* with no per-tensor `config.json`). The gap is purely the **convert-side recipe**: a way to drive per-layer / per-expert / per-weight widths and ablation. All of the below extends the **`ConvertDriver.ConversionStep` plan seam** (`buildPlan` emits richer steps; the executors stay stable) — no loader changes needed for anything the shape can express.
-
-### 1. Recipe file format
-A `--recipe recipe.json` (or `.toml`) driving the planner. Resolution order per tensor: explicit recipe rule → per-role flag → `--bits` default. Sketch:
-```json
-{
-  "default": { "bits": 4 },
-  "rules": [
-    { "match": "model.layers.{0..3}.self_attn.*", "bits": 2 },
-    { "match": "*.embed_tokens", "bits": 8 },
-    { "match": "*.feed_forward.experts.*", "bits": 4, "layout": "stacked" },
-    { "match": "model.layers.{0..1}.feed_forward.experts.{0,5,9}", "bits": 8 },
-    { "match": "model.layers.*.feed_forward.experts.{12..19}", "action": "ablate" }
-  ]
-}
-```
-`match` is a glob with `{a,b}` set + `{lo..hi}` range expansion over the source keys; first matching rule wins. Validate every rule resolves to ≥1 tensor (warn on dead rules), and that ablation leaves the router consistent (see §3).
-
-### 2. Per-expert differential compression
-The stacked path already quantizes each expert independently before concatenating, so **per-expert widths are nearly free**: a new `ConversionStep.stackExpertsTargeted(outBase, [(expertKey, QuantSpec)])` lets each expert carry its own spec. The only constraint: a single stacked tensor can't mix bit-widths in one buffer (the kernel reads one `bits` per tensor). Two resolutions:
-- **Uniform-within-stack (simple):** all experts in a `switch_mlp.<proj>` share one width; differential compression is per-(layer,proj) not per-expert. Covers "later layers' experts at lower precision."
-- **Per-expert true mixing (full):** fall back to `per-expert` layout for any (layer,proj) whose experts disagree on width, so each expert is its own `QuantizedLinear` (already supported by the loader). The planner picks layout per group: stacked when uniform, per-expert when mixed. Recommended default.
-
-### 3. Expert ablation (dropping experts)
-Drop a subset of experts entirely (structured pruning). Requires coordinated edits:
-- **Weights:** omit the ablated experts from the stack → `switch_mlp.<proj>` becomes `[E', out, …]` with `E' < num_experts`.
-- **Router:** slice the `feed_forward.gate` rows to the kept experts → `[E', hidden]`, and rewrite `num_experts` (+ `num_experts_per_tok` clamp) + any `expert_bias` `[E']` in the output `config.json`.
-- **Selection policy:** by explicit index list, or by a usage signal (router-logit mass / activation-frequency profiled over a calibration set — heavy-hitter experts kept). The calibration profiler is the real work here; the weight/router/config surgery is mechanical.
-- **Invariant:** `num_experts_per_tok ≤ E'`. Tests: an ablated checkpoint loads, routes only over kept experts, and stays coherent above a diversity floor.
-
-### 4. Per-weight / sub-tensor targeting
-The far end: different group sizes or outlier-preserving schemes (KIVI/AWQ-style salient-channel carve-outs) within a single weight. Out of scope for the affine path; revisit if a non-uniform scheme lands in iron. Tracked here only so the recipe format reserves room (`"scheme": "affine" | "awq" | …`).
-
-### Build order
-(1) recipe parser + glob matcher + planner wiring (drives §1 + uniform-within-stack §2); (2) per-expert true-mixing layout auto-selection (§2 full); (3) ablation weight/router/config surgery with an explicit index list; (4) calibration profiler for usage-based ablation + salient-channel selection. Each step is independently shippable and testable against the existing `ConvertDriverTests` synthetic-checkpoint harness.
 
 ---
 
@@ -204,8 +162,8 @@ Three CPU-side dispatch strategies, selectable per-load via `LoadOptions.dispatc
   - Shells out to `xcrun -sdk macosx metal` and `xcrun metallib` to build `kernels.metallib`
   - Writes `manifest.json` with per-kernel metadata (name, params with dtype/shape kind, function constants, default grid/threadgroup rule)
   - Generates `IronKernels.swift` with one strongly-typed func per kernel (function-constant specialization keyed in PSO cache)
-- FFAI `Package.swift`
-  - Targets: `IronSwift`, `FFAI`, `FFAITests`
+- Butter `Package.swift`
+  - Targets: `IronSwift`, `Butter`, `ButterTests`
   - `make regenerate-kernels` runs `iron build --emit all` against the local iron checkout before each build
   - Resources: `kernels.metallib`, `manifest.json` bundled into `IronSwift`
 - `Sources/IronSwift/`
@@ -213,20 +171,20 @@ Three CPU-side dispatch strategies, selectable per-load via `LoadOptions.dispatc
   - `PSOCache.swift` — keyed by `(name, MTLFunctionConstantValues)`
   - `Resources/` — generated artifacts
   - `Generated/IronKernels.swift` — generated typed wrappers
-- `Sources/FFAI/` gains the **model download/cache plumbing** (no inference yet, just file fetching):
+- `Sources/ButterSwift/` gains the **model download/cache plumbing** (no inference yet, just file fetching):
   - `ModelDownloader.swift` — thin wrapper over `swift-huggingface`'s `HubClient.downloadSnapshot(of:revision:matching:)`. Caches in the standard `~/.cache/huggingface/hub/` location, supports glob patterns (e.g. `["*.safetensors", "*.json", "*.jinja"]`), resumes partial downloads, returns a local directory URL.
   - `ModelLocator.swift` — accepts either a HF repo ID (`"meta-llama/Llama-3.2-1B"`) or a local path. Resolves to a local directory.
   - `TokenizerLoader.swift` — thin wrapper over `swift-transformers`'s `AutoTokenizer.from(pretrained:)`, sourced from the resolved directory.
   - `ModelConfig.swift` — decodes `config.json` (architecture name, hidden_size, num_layers, etc.) into a typed Swift struct
 - `Tests/IronSwiftTests/` — round-trip test for `vector_add` and `rms_norm` against fixed inputs/outputs
-- `Tests/FFAITests/ModelDownloaderTests.swift` — download `config.json` only from a known small HF repo (e.g. `meta-llama/Llama-3.2-1B`), verify cache hit on second call, verify pattern filter excludes weight files, verify offline fallback when cache exists
+- `Tests/ButterTests/ModelDownloaderTests.swift` — download `config.json` only from a known small HF repo (e.g. `meta-llama/Llama-3.2-1B`), verify cache hit on second call, verify pattern filter excludes weight files, verify offline fallback when cache exists
 - **Test infrastructure:**
   - `swift test --enable-code-coverage` wired up
   - Coverage threshold enforced in CI (start at 100% for the small Phase 0 surface; subsequent phases maintain it)
   - `scripts/coverage.sh` to print local coverage summary
 - **CI:**
-  - `.github/workflows/ci.yml` — Apple Silicon runner. Runs `swift test --enable-code-coverage --filter "FFAITests|IronSwiftTests"` (unit suite only; mirrors `make test-unit`). Uploads coverage report, fails on coverage drop. Integration tests are deliberately excluded from PR CI — they download multi-GB HF snapshots and OOM the 7 GB runner; release.yml runs them right before tagging.
-  - `.github/workflows/release.yml` — Apple Silicon runner. Runs both `swift test … --filter "FFAITests|IronSwiftTests"` and `swift test … --filter "ModelIntegrationTests" --parallel --num-workers 1` (matches `make test-integration`) right before cutting a release.
+  - `.github/workflows/ci.yml` — Apple Silicon runner. Runs `swift test --enable-code-coverage --filter "ButterTests|IronSwiftTests"` (unit suite only; mirrors `make test-unit`). Uploads coverage report, fails on coverage drop. Integration tests are deliberately excluded from PR CI — they download multi-GB HF snapshots and OOM the 7 GB runner; release.yml runs them right before tagging.
+  - `.github/workflows/release.yml` — Apple Silicon runner. Runs both `swift test … --filter "ButterTests|IronSwiftTests"` and `swift test … --filter "ModelIntegrationTests" --parallel --num-workers 1` (matches `make test-integration`) right before cutting a release.
   - `.github/workflows/auto-label.yml` — conventional-commit PR labeling (adapted from mlx-swift-lm)
   - `.github/release.yml` — release notes categorization
   - `.github/pull_request_template.md` — adapted from mlx-swift-lm
@@ -237,7 +195,7 @@ Three CPU-side dispatch strategies, selectable per-load via `LoadOptions.dispatc
   - `Makefile` — common targets: `build`, `build-release`, `test`, `test-unit`, `test-integration`, `clean`, `regenerate-kernels`, `coverage`, `format`, `format-check`, `docs`. The `test-unit` / `test-integration` split mirrors `.github/workflows/{ci,release}.yml` — integration tests are gated to `--parallel --num-workers 1` so only one HuggingFace snapshot is GPU-resident at a time.
   - `.swift-format` — copied verbatim from mlx-swift-lm
   - `.pre-commit-config.yaml` — copied verbatim
-  - `.spi.yml` — Swift Package Index docs config, FFAI targets
+  - `.spi.yml` — Swift Package Index docs config, Butter targets
   - `.gitignore` — already in place
   - `LICENSE` — Apache-2.0
 - **Testing reference convention (decided up front):**
@@ -282,18 +240,18 @@ Three CPU-side dispatch strategies, selectable per-load via `LoadOptions.dispatc
 
 **Deliverables:**
 
-- All above registered in the iron kernel registry that `iron emit` walks
+- All above registered in the iron kernel registry that `tile emit` walks
 - Each gets a generated Swift wrapper
-- `Sources/FFAI/` gains:
+- `Sources/ButterSwift/` gains:
   - `Device.swift` — MTLDevice + MTLCommandQueue singleton
   - `Tensor.swift` — `MTLBuffer` + shape + dtype + strides + byte offset
   - `BufferPool.swift` — slab allocator for activation tensors
   - Bare-minimum `Module` protocol with named parameter discovery
 - **Tests (mandatory, ship with code):**
   - One test file per kernel in `Tests/IronSwiftTests/`, covering fp32 + fp16 + bf16 dtypes, edge shapes, and numerical accuracy vs a Swift CPU reference (or fixed reference vectors)
-  - `Tests/FFAITests/TensorTests.swift` — shape, dtype, stride, slice, reshape correctness
-  - `Tests/FFAITests/BufferPoolTests.swift` — alloc/free, fragmentation, reuse semantics
-  - `Tests/FFAITests/ModuleTests.swift` — parameter discovery on nested modules
+  - `Tests/ButterTests/TensorTests.swift` — shape, dtype, stride, slice, reshape correctness
+  - `Tests/ButterTests/BufferPoolTests.swift` — alloc/free, fragmentation, reuse semantics
+  - `Tests/ButterTests/ModuleTests.swift` — parameter discovery on nested modules
   - 100% line coverage maintained
 
 **Done when:** A hand-built Llama-shaped layer (RMSNorm → QKV → RoPE → SDPA → out-proj → RMSNorm → gate/up/down → residual) runs end-to-end on randomly-initialized weights and produces stable outputs. Numerical accuracy verified against a golden fixture (captured from mlx-lm, see Phase 0 testing reference convention). All tests pass, coverage at threshold.
@@ -308,27 +266,27 @@ Three CPU-side dispatch strategies, selectable per-load via `LoadOptions.dispatc
 
 **Deliverables:**
 
-- `Sources/FFAI/SafeTensors.swift` — SafeTensors loader → `[String: Tensor]` (memory-mapped where possible)
-- `Sources/FFAI/Module.swift` — full Module/parameter system, weight loading via key-path mapping
-- `Sources/FFAI/Linear.swift`, `Embedding.swift`, `RMSNorm.swift` — basic layer types calling IronSwift kernels
+- `Sources/ButterSwift/SafeTensors.swift` — SafeTensors loader → `[String: Tensor]` (memory-mapped where possible)
+- `Sources/ButterSwift/Module.swift` — full Module/parameter system, weight loading via key-path mapping
+- `Sources/ButterSwift/Linear.swift`, `Embedding.swift`, `RMSNorm.swift` — basic layer types calling IronSwift kernels
 - **Model API (capability + lifecycle infrastructure)** — even though Phase 2 only exercises text-in/text-out, the API surface lands now:
-  - `Sources/FFAI/Capability.swift` — Capability enum
-  - `Sources/FFAI/LoadOptions.swift` — capability set, kvCache kind, precision, lazyCapabilities flag
-  - `Sources/FFAI/ModelLifecycle.swift` — `ModelLifecycleState`, `ModelLifecycleEvent`, `LoadProgress`
-  - `Sources/FFAI/ModelFamily.swift` — protocol for family files
-  - `Sources/FFAI/Model.swift` — concrete `Model` class with `events: AsyncStream<ModelLifecycleEvent>`, `enable(_:)`, `disable(_:)`, `prewarm()`
-  - `Sources/FFAI/ModelRegistry.swift` — config.architectures / config.model_type → `ModelFamily.Type` lookup
-- `Sources/FFAI/Models/Llama.swift` — first family file. Uses the protocol+per-variant convention even with one variant (`LlamaDense`) so the pattern is established
-- `Sources/FFAI/KVCache.swift` — fp16/bf16 raw cache, append + slice
-- `Sources/FFAI/Sampling.swift` — argmax, top-k, top-p, temperature
-- `Sources/FFAI/Generate.swift` — generate loop, prefill + decode
-- `Sources/FFAICLI/main.swift` — CLI: `ffai --model <id-or-path> --prompt "…"` (uses Phase 0's `ModelDownloader` + `TokenizerLoader`; no new HF code)
+  - `Sources/ButterSwift/Capability.swift` — Capability enum
+  - `Sources/ButterSwift/LoadOptions.swift` — capability set, kvCache kind, precision, lazyCapabilities flag
+  - `Sources/ButterSwift/ModelLifecycle.swift` — `ModelLifecycleState`, `ModelLifecycleEvent`, `LoadProgress`
+  - `Sources/ButterSwift/ModelFamily.swift` — protocol for family files
+  - `Sources/ButterSwift/Model.swift` — concrete `Model` class with `events: AsyncStream<ModelLifecycleEvent>`, `enable(_:)`, `disable(_:)`, `prewarm()`
+  - `Sources/ButterSwift/ModelRegistry.swift` — config.architectures / config.model_type → `ModelFamily.Type` lookup
+- `Sources/ButterSwift/Models/Llama.swift` — first family file. Uses the protocol+per-variant convention even with one variant (`LlamaDense`) so the pattern is established
+- `Sources/ButterSwift/KVCache.swift` — fp16/bf16 raw cache, append + slice
+- `Sources/ButterSwift/Sampling.swift` — argmax, top-k, top-p, temperature
+- `Sources/ButterSwift/Generate.swift` — generate loop, prefill + decode
+- `Sources/ButterCLI/main.swift` — CLI: `butter --model <id-or-path> --prompt "…"` (uses Phase 0's `ModelDownloader` + `TokenizerLoader`; no new HF code)
 - **Tests:**
-  - `Tests/FFAITests/SafeTensorsTests.swift` — load + roundtrip a small synthetic file
-  - `Tests/FFAITests/SamplingTests.swift` — argmax/top-k/top-p with fixed seeds
-  - `Tests/FFAITests/KVCacheTests.swift` — append, slice, eviction
-  - `Tests/FFAITests/ModelLifecycleTests.swift` — state machine transitions (idle → downloading → loading → loaded → ready, plus error paths from each), AsyncStream event ordering
-  - `Tests/FFAITests/CapabilityTests.swift` — load with subset of capabilities, verify others not loaded; `enable` / `disable` round-trip (uses a synthetic model since Llama is text-only)
+  - `Tests/ButterTests/SafeTensorsTests.swift` — load + roundtrip a small synthetic file
+  - `Tests/ButterTests/SamplingTests.swift` — argmax/top-k/top-p with fixed seeds
+  - `Tests/ButterTests/KVCacheTests.swift` — append, slice, eviction
+  - `Tests/ButterTests/ModelLifecycleTests.swift` — state machine transitions (idle → downloading → loading → loaded → ready, plus error paths from each), AsyncStream event ordering
+  - `Tests/ButterTests/CapabilityTests.swift` — load with subset of capabilities, verify others not loaded; `enable` / `disable` round-trip (uses a synthetic model since Llama is text-only)
   - `Tests/ModelIntegrationTests/Llama/LlamaForwardTests.swift` — randomly-initialized layer numerical match vs golden fixture (captured from mlx-lm)
   - `Tests/ModelIntegrationTests/Llama/LlamaGenerateTests.swift` — token-by-token determinism on a real Llama 3.2 1B checkpoint with a fixed prompt and seed (small reference fixture committed to repo, or downloaded via test setup script)
   - 100% line coverage maintained
@@ -341,16 +299,16 @@ Copy and adapt (do NOT preserve git history; treat as new code):
 - Sampling code (top-k, top-p logic) from `Libraries/MLXLMCommon/Sampling.swift` or equivalent
 - KV cache slice/append patterns from `Libraries/MLXLMCommon/KVCache.swift` (drop the MLX dependency)
 - Generate loop from `Libraries/MLXLMCommon/Generate.swift`
-- `Libraries/MLXLLM/Models/Llama.swift` as a structural template — rewrite all `MLXArray` ops as FFAI `Tensor` ops calling IronSwift kernels
+- `Libraries/MLXLLM/Models/Llama.swift` as a structural template — rewrite all `MLXArray` ops as Butter `Tensor` ops calling IronSwift kernels
 
 Do NOT copy:
 
 - All 56 model architectures (one is enough for Phase 2)
 - VLM / Embedders
-- AURA / state-replay (Phase 5d/5e — TurboQuant in mlx-swift-lm was renamed to AURA in FFAI)
+- AURA / state-replay (Phase 5d/5e — TurboQuant in mlx-swift-lm was renamed to AURA in Butter)
 - Quantization (Phase 3)
 
-**Done when:** `ffai --model llama-3.2-1B --prompt "Hello"` produces coherent text on M-series, token-by-token output matches a reference implementation for a fixed seed, and tokens/sec is measured and recorded as baseline.
+**Done when:** `butter --model llama-3.2-1B --prompt "Hello"` produces coherent text on M-series, token-by-token output matches a reference implementation for a fixed seed, and tokens/sec is measured and recorded as baseline.
 
 ---
 
@@ -362,7 +320,7 @@ Do NOT copy:
 
 **Deliverables:**
 
-- `Sources/FFAI/Models/Qwen3.swift` — second family file. Adds `Qwen3Dense` variant. Sets the precedent for the protocol + per-variant struct pattern (later variants — `Qwen35HybridDense`, `Qwen35MoE`, `Qwen35VL`, `Qwen35Omni` — land in their respective phases).
+- `Sources/ButterSwift/Models/Qwen3.swift` — second family file. Adds `Qwen3Dense` variant. Sets the precedent for the protocol + per-variant struct pattern (later variants — `Qwen35HybridDense`, `Qwen35MoE`, `Qwen35VL`, `Qwen35Omni` — land in their respective phases).
 - Any tokenizer/config quirks for Qwen3 (different chat template, vocab size, etc.) — handled by the family's Variant detection
 - Updated `ModelRegistry` entries for Qwen3 model_type strings
 - **Tests:**
@@ -370,7 +328,7 @@ Do NOT copy:
   - `Tests/ModelIntegrationTests/Qwen3/Qwen3GenerateTests.swift` — token-by-token determinism
   - 100% line coverage maintained
 
-**Done when:** `ffai --model qwen3-4B --prompt "…"` generates coherent text and matches a reference implementation token-by-token for a fixed seed.
+**Done when:** `butter --model qwen3-4B --prompt "…"` generates coherent text and matches a reference implementation token-by-token for a fixed seed.
 
 **Philosophy from this point on:** core kernels and Tensor/Module infrastructure are stable. Adding a new model = porting its forward-pass shape from mlx-swift-lm and wiring it to existing kernels. New *model-specific* kernels (e.g. attention sinks for GPT-OSS, fused MoE expert kernels, GDN steps, AURA codecs) get added to the iron DSL as needed — driven by which model we want to support next, not speculatively.
 
@@ -387,11 +345,11 @@ Do NOT copy:
 - `rms_norm_quantized_gemv` (fused — matches MLX's perf trick)
 - `batched_qkv_qgemv` (fused QKV from RMSNormed input)
 
-**FFAI changes:**
+**Butter changes:**
 
 - `QuantizedLinear` layer
 - Weight loading path that recognizes **mlx-format** pre-quantized safetensors (mlx-community layout: weight + scale + zero per group, MLX naming conventions). Same file format as plain safetensors, just different *contents*. Detect at load time, route to quantized GEMV kernels.
-- `Sources/FFAI/SafeTensors.swift` extended with mlx-format detection
+- `Sources/ButterSwift/SafeTensors.swift` extended with mlx-format detection
 - Memory savings verified
 
 **Done when:** A 4-bit quantized Llama runs and produces same-quality output as the fp16 baseline at significantly lower memory + faster decode.
@@ -434,7 +392,7 @@ Do NOT copy:
 
 ## Phase 5 — Advanced kernels (sampling, AURA, GDN, SSM)
 
-**Goal:** Port the high-value custom kernels currently in mlx-swift-lm plus close the user-visible sampling gap. The custom kernels were the original motivator for this project — the 4-repo dance to ship a new AURA variant (TurboQuant in mlx-swift-lm, renamed to AURA in FFAI) is the pain we're eliminating.
+**Goal:** Port the high-value custom kernels currently in mlx-swift-lm plus close the user-visible sampling gap. The custom kernels were the original motivator for this project — the 4-repo dance to ship a new AURA variant (TurboQuant in mlx-swift-lm, renamed to AURA in Butter) is the pain we're eliminating.
 
 Phase 5 is now sub-divided since the full scope is many sessions. Each sub-phase ships independently with its own commit + verification.
 
@@ -442,14 +400,14 @@ Phase 5 is now sub-divided since the full scope is many sessions. Each sub-phase
 
 CPU sampling pipeline (temperature, top-K, top-P, min-P, repetition penalty, seeded reproducible RNG) wired through `GenerationParameters` + CLI flags. Greedy stays on the GPU argmax fast path; non-greedy reads logits to CPU once per token and runs the pipeline there. ~30% decode-tok/s tax vs greedy.
 
-Done: `feat(phase-5): CPU sampling pipeline (...)` — [`Sources/FFAI/Sampling.swift`](../Sources/FFAI/Sampling.swift) + `Sources/FFAI/Generate.swift` + `Sources/FFAICLI/GenerateCommand.swift`
-+ `Tests/FFAITests/SamplingTests.swift` + sampling sections in `documentation/generation-parameters.md`. Verified end-to-end against `mlx-community/Qwen3-1.7B-4bit`: greedy deterministic at ~53 tok/s; seeded non-greedy reproducible at ~36 tok/s.
+Done: `feat(phase-5): CPU sampling pipeline (...)` — [`Sources/ButterSwift/Sampling.swift`](../Sources/ButterSwift/Sampling.swift) + `Sources/ButterSwift/Generate.swift` + `Sources/ButterCLI/GenerateCommand.swift`
++ `Tests/ButterTests/SamplingTests.swift` + sampling sections in `documentation/generation-parameters.md`. Verified end-to-end against `mlx-community/Qwen3-1.7B-4bit`: greedy deterministic at ~53 tok/s; seeded non-greedy reproducible at ~36 tok/s.
 
 ### Phase 5b — GPU softmax + categorical sample kernel ✅ SHIPPED
 
 One fused iron kernel: `softmax_categorical_sample` — cooperative 256-thread reduction (max + sum-exp) followed by a single-threaded inverse-CDF walk. Used by the Generate decode loop's `gpu-categorical` path for the pure-temperature case (T > 0, no top-K / top-P / min-P / rep-penalty). Logits stay on GPU; only the chosen token id (4 bytes) flows back. Top-K / top-P / min-P / rep-penalty kernels deferred — those need a sort or radix-select kernel which is a separate follow-up.
 
-Done: iron `feat(phase-5b): softmax_categorical_sample kernel` on the `ek/sampling-kernels` branch (commit `e663118`); FFAI `feat(phase-5b): GPU softmax+categorical sample path for pure-temperature decoding` on main (commit `507095a`). Verified end-to-end against `mlx-community/Qwen3-1.7B-4bit` with synthetic correctness sweeps at vocab=4, 32, and 152K (model-shaped).
+Done: iron `feat(phase-5b): softmax_categorical_sample kernel` on the `ek/sampling-kernels` branch (commit `e663118`); Butter `feat(phase-5b): GPU softmax+categorical sample path for pure-temperature decoding` on main (commit `507095a`). Verified end-to-end against `mlx-community/Qwen3-1.7B-4bit` with synthetic correctness sweeps at vocab=4, 32, and 152K (model-shaped).
 
 **Follow-ups not yet done:**
 
@@ -464,9 +422,9 @@ int8 affine group-quantization with a shared working buffer pair across all laye
 Shipped:
 
 - iron `ek/sampling-kernels` (commit 87ecbd3): two new kernels — `quantize_kv_int8` (one thread per group; find min/max, derive scale+bias, pack 4 int8 per uint32) and `bulk_dequant_kv_int8` (one thread per output element; reads packed weights + scales + biases, writes fp16/bf16 directly into the SDPA-ready layout)
-- FFAI `main` (commit 5109b9b): `KVCacheProtocol` extracted from the existing `KVCache`; new `AffineQuantizedKVCache` conformance; `LoadOptions.kvCache = .affineQuantized(bits:groupSize:)`; `--kv-cache affine8` CLI flag; `LlamaModel` + `Qwen3Model` carry `kvCacheKind` and switch on it in `makeLayerCaches(...)`. All layers built in one `makeLayerCaches` call share a single pair of working buffers (Metal hazard tracking serialises the buffer reuse across layers within a cmdbuf — that's the architectural unlock that makes the memory savings real vs per-layer working buffers).
+- Butter `main` (commit 5109b9b): `KVCacheProtocol` extracted from the existing `KVCache`; new `AffineQuantizedKVCache` conformance; `LoadOptions.kvCache = .affineQuantized(bits:groupSize:)`; `--kv-cache affine8` CLI flag; `LlamaModel` + `Qwen3Model` carry `kvCacheKind` and switch on it in `makeLayerCaches(...)`. All layers built in one `makeLayerCaches` call share a single pair of working buffers (Metal hazard tracking serialises the buffer reuse across layers within a cmdbuf — that's the architectural unlock that makes the memory savings real vs per-layer working buffers).
 
-4-bit shipped: iron commit `67ab7a3` (quantize_kv_int4 + bulk_dequant_kv_int4 kernels) + FFAI commit `31589b4`. Activate via `LoadOptions.kvCache = .affineQuantized(bits: 4, groupSize: 32)` or CLI `--kv-cache affine4`. Measured ~70% KV memory savings vs raw on Qwen3 1.7B at maxSeq=40960 (4.38 GB → 1.37 GB) with no further tok/s tax beyond `affine8`. Uses group_size=32 default — group_size=64 at 4-bit loses too much discriminative power and decode degenerates.
+4-bit shipped: iron commit `67ab7a3` (quantize_kv_int4 + bulk_dequant_kv_int4 kernels) + Butter commit `31589b4`. Activate via `LoadOptions.kvCache = .affineQuantized(bits: 4, groupSize: 32)` or CLI `--kv-cache affine4`. Measured ~70% KV memory savings vs raw on Qwen3 1.7B at maxSeq=40960 (4.38 GB → 1.37 GB) with no further tok/s tax beyond `affine8`. Uses group_size=32 default — group_size=64 at 4-bit loses too much discriminative power and decode degenerates.
 
 Follow-ups not yet done:
 
@@ -475,34 +433,34 @@ Follow-ups not yet done:
 
 ### Phase 5d — AURA compressed-domain attention ✅ Part 1 (correctness) SHIPPED
 
-TurboQuant codec ported from mlx-swift-lm, **renamed AURA** in FFAI (kernels, env vars, CLI flags, docs all use `aura*`). Schemes are `aura{kb}v{vb}` (K-side / V-side bit widths); symmetric aliases `aura3` / `aura4` / `aura6` / `aura8`, asymmetric `aura8v4`, `aura4v2`, `aura3v2`. CLI: `--kv-cache aura4v2`. Codec lineage + design rationale: `papers/aura-compression-algorithm.md`.
+TurboQuant codec ported from mlx-swift-lm, **renamed AURA** in Butter (kernels, env vars, CLI flags, docs all use `aura*`). Schemes are `aura{kb}v{vb}` (K-side / V-side bit widths); symmetric aliases `aura3` / `aura4` / `aura6` / `aura8`, asymmetric `aura8v4`, `aura4v2`, `aura3v2`. CLI: `--kv-cache aura4v2`. Codec lineage + design rationale: `papers/aura-compression-algorithm.md`.
 
 **5d.A — iron DSL prerequisites ✅** — `simd_shuffle_xor` / `simd_broadcast`, atomic ops on threadgroup memory, the persistent state-buffer convention. All landed in `iron`.
 
-**5d.B — AURA kernels ✅** — `aura_encode`, `aura_dequant_rotated`, `aura_score`, `aura_value`, `aura_flash_p1`, `aura_flash_pass2` under `crates/wh-iron-std/src/ffai/`, bits ∈ {2,3,4,6,8}.
+**5d.B — AURA kernels ✅** — `aura_encode`, `aura_dequant_rotated`, `aura_score`, `aura_value`, `aura_flash_p1`, `aura_flash_pass2` under `crates/iron-std/src/butter/`, bits ∈ {2,3,4,6,8}.
 
-**5d.C — FFAI integration ✅** — `AURAQuantizedKVCache` (`KVCacheProtocol`, per-layer compressed K/V, per-layer eviction), `LoadOptions.kvCache = .auraQuantized(scheme:)`, the `--kv-cache` flag + aliases, `Llama` / `Qwen3` `makeLayerCaches` wiring.
+**5d.C — Butter integration ✅** — `AURAQuantizedKVCache` (`KVCacheProtocol`, per-layer compressed K/V, per-layer eviction), `LoadOptions.kvCache = .auraQuantized(scheme:)`, the `--kv-cache` flag + aliases, `Llama` / `Qwen3` `makeLayerCaches` wiring.
 
 **5d.D — per-layer SRHT rotation (Stage 1a) ✅** — `Ops.auraRotatePerHead`, a per-layer SRHT rotation Π, Q rotated post-RoPE + the attention output un-rotated in the model forward. The "coherent-then-collapse around token 50" bug was a dequant-kernel stride mismatch — `aura_dequant_rotated` keyed per-head offsets off its `tokens` constexpr instead of the buffer's `maxSeq` stride; fixed by passing an explicit `cacheStride`. All four recipes (`aura4v4` / `aura4v2` / `aura8v4` / `aura8v8`) now produce coherent text on Qwen3-1.7B; `aura8v8` is near-lossless vs raw bf16.
 
-**5d.E — kernel test coverage ✅** — per-kernel GPU correctness tests (naive-CPU oracle) for every AURA kernel, including the non-identity SRHT rotation path; FFAI-side codec round-trip tests.
+**5d.E — kernel test coverage ✅** — per-kernel GPU correctness tests (naive-CPU oracle) for every AURA kernel, including the non-identity SRHT rotation path; Butter-side codec round-trip tests.
 
-**Audit finding — do not re-litigate.** FFAI's `AURACodebook` is byte-identical to the working mlx-swift-lm reference, and that reference produces coherent Qwen3 output with `useBias: false`. The earlier "codebook recalibration / DC-bias correction needed" hypothesis was **refuted** — DC-bias is a GPT-OSS-only feature (`RMSNorm → Linear(bias=True)` projections), not a Qwen3 requirement.
+**Audit finding — do not re-litigate.** Butter's `AURACodebook` is byte-identical to the working mlx-swift-lm reference, and that reference produces coherent Qwen3 output with `useBias: false`. The earlier "codebook recalibration / DC-bias correction needed" hypothesis was **refuted** — DC-bias is a GPT-OSS-only feature (`RMSNorm → Linear(bias=True)` projections), not a Qwen3 requirement.
 
-**AURA performance — deferred to Phase 6.3.** FFAI currently runs AURA through a dequant-then-`sdpaDecode` path with a persistent working buffer. Compressed-domain attention (`aura_flash_p1/p2`), two separate K/V codecs, two-phase prefill, the W_o offline fold, strided-output encode, and the cache-layout flip are all perf / architecture work — **correctness does not depend on any of them**. Picked up after the rest of Phase 5 + Phase 6 — full scope in Phase 6.3 below.
+**AURA performance — deferred to Phase 6.3.** Butter currently runs AURA through a dequant-then-`sdpaDecode` path with a persistent working buffer. Compressed-domain attention (`aura_flash_p1/p2`), two separate K/V codecs, two-phase prefill, the W_o offline fold, strided-output encode, and the cache-layout flip are all perf / architecture work — **correctness does not depend on any of them**. Picked up after the rest of Phase 5 + Phase 6 — full scope in Phase 6.3 below.
 
 ### Phase 5e — SSM / GDN hybrid models ✅ SHIPPED
 
 Unlocks Qwen 3.5 (GDN + attention), Mamba 2 families (NemotronH, GraniteMoeHybrid, FalconH1).
 
-**Foundation shipped** (iron `ek/sampling-kernels` 1224890 + FFAI main f58a801):
+**Foundation shipped** (iron `ek/sampling-kernels` 1224890 + Butter main f58a801):
 
 - `ssm_step` kernel — Mamba 2 selective-scan single-token decode. Per-head A, shared B/C, fp32 recurrent state h `[nHeads, stateDim, headDim]`. One thread per (head, channel). Registered for f32/f16/bf16.
 - `Ops.ssmStep(...)` Swift wrapper.
 - `SSMStateCache` class — per-layer recurrent state holder. O(1) memory per layer (state size doesn't grow with seq length — selective scan compresses history into fixed-size state).
-- 6 correctness tests in `Tests/FFAITests/SSMStateCacheTests.swift`: cache plumbing (3) + single-step kernel vs CPU reference + 12-step recurrence (catches per-step drift) + bf16-input variant. All pass.
+- 6 correctness tests in `Tests/ButterTests/SSMStateCacheTests.swift`: cache plumbing (3) + single-step kernel vs CPU reference + 12-step recurrence (catches per-step drift) + bf16-input variant. All pass.
 
-**1D depthwise causal conv shipped** (iron a9f6787 + FFAI ad04737):
+**1D depthwise causal conv shipped** (iron a9f6787 + Butter ad04737):
 
 - `conv1d_causal_step` kernel — Mamba 2 input-projection conv in streaming-decode form. One thread per channel; state shifts in-place after compute.
 - `Ops.conv1dCausalStep(...)` Swift wrapper.
@@ -526,7 +484,7 @@ Both Mamba 2 building blocks (`ssm_step` + `conv1d_causal_step`) + both caches (
 
 **Shipped — Phase 5e complete.** The forward / decode path for all five hybrid families landed, each with a coherent-output integration test:
 
-- **GDN forward kernel** — `iron_gated_delta_step` (recurrence `S_t = g_t·S_{t-1} + β_t·k_t·(v_t − k_tᵀ·S_{t-1})ᵀ`, fp32 state)
+- **GDN forward kernel** — `mt_gated_delta_step` (recurrence `S_t = g_t·S_{t-1} + β_t·k_t·(v_t − k_tᵀ·S_{t-1})ᵀ`, fp32 state)
   + `Ops.gatedDeltaStep` + `GDNStateCache` (forward-only, mirrors `SSMStateCache`).
 - **MoE inference infrastructure** — `MoERouter` + `MoELayer` (top-K router + per-expert SwiGLU dispatch).
 - **Per-layer mixer scaffolding** — the `DecoderLayer` protocol + `StatelessLayerCache`, driving a heterogeneous `[any DecoderLayer]` decode loop.
@@ -546,10 +504,10 @@ Both Mamba 2 building blocks (`ssm_step` + `conv1d_causal_step`) + both caches (
 - `aura_flash_sdpa_v` extension: attention-sinks fold via numerically-stable softmax `max(scores)` clamping + dequant.
 - Hybrid sliding-FP16 layer policy (GPT-OSS-20B): full-attention layers stay on `AURAQuantizedKVCache(useBias: true)`; sliding-window layers cap at 128 tokens and stay raw FP16 (~1.5 MB total).
 
-**FFAI changes:**
+**Butter changes:**
 
-- `Sources/FFAI/SlidingWindowMask.swift` — symbolic mask helper.
-- `Sources/FFAI/Models/GPTOSS.swift` — family file with the alternating layer schedule + sinks parameter + bias-correcting K/V projections.
+- `Sources/ButterSwift/SlidingWindowMask.swift` — symbolic mask helper.
+- `Sources/ButterSwift/Models/GPTOSS.swift` — family file with the alternating layer schedule + sinks parameter + bias-correcting K/V projections.
 - `LoadOptions.kvCache = .auraQuantized(scheme:, sinks: true)` plumbing.
 - `documentation/kv-cache.md`, `documentation/models.md` updated.
 
@@ -577,7 +535,7 @@ Shipped: Mistral, Phi, Gemma 3, Gemma 4 (`Gemma4Dense` / `Gemma4E` / `Gemma4MoE`
 
 Each model gets:
 
-- Family file in `Sources/FFAI/Models/`.
+- Family file in `Sources/ButterSwift/Models/`.
 - Registry entry in `ModelRegistry`.
 - `Tests/ModelIntegrationTests/<Family>IntegrationTests.swift` downloading from mlx-community + asserting coherent output.
 - Doc row updates in `documentation/models.md`, `documentation/capabilities.md`, `documentation/quantization.md`.
@@ -588,7 +546,7 @@ Each model gets:
 
 The original plan was to thread `sink_end` + `window_start` (iron PR #50's `iron_sdpa_decode` head_dim=128 constexprs) through `Ops.sdpaDecode` so the kernel could skip the stale K/V slot range `[sink_end, window_start)` at the loop-bound level.
 
-**Audit finding:** the kernel fast path only delivers a speedup when the cache layout has *stale slots* — i.e. linear-grow-with-skip, where positions beyond the window stay in the buffer but should be masked out of attention. FFAI's sliding-window cache uses **rotating-eviction** instead (`KVEviction.window(maxSize:keep:)` in `KVCacheEviction.swift`): when the buffer fills, the oldest non-sink slot is overwritten by the next append. Every slot in `[0, length)` is a live K/V vector we want to attend. The kernel's skip range is always empty for our cache; threading `sinkEnd`/`windowStart` would be a no-op.
+**Audit finding:** the kernel fast path only delivers a speedup when the cache layout has *stale slots* — i.e. linear-grow-with-skip, where positions beyond the window stay in the buffer but should be masked out of attention. Butter's sliding-window cache uses **rotating-eviction** instead (`KVEviction.window(maxSize:keep:)` in `KVCacheEviction.swift`): when the buffer fills, the oldest non-sink slot is overwritten by the next append. Every slot in `[0, length)` is a live K/V vector we want to attend. The kernel's skip range is always empty for our cache; threading `sinkEnd`/`windowStart` would be a no-op.
 
 Compounding factor: the two sliding-window consumers in tree don't qualify anyway — **GPT-OSS uses `head_dim = 64`** and **Gemma 3 / 4 use `head_dim = 256`**; the kernel fast path only exists on the head_dim=128 variant.
 
@@ -603,7 +561,7 @@ Decision: drop the "Phase 6.1" milestone from the active plan, leave the rescope
 
 ## Phase 6.2 — AURA MSL snapshot tests
 
-Add `insta` MSL snapshot fixtures for the AURA kernels under `crates/wh-iron-codegen/tests/msl_snapshots.rs` (the iron PR #25 pattern). Pins the emitted MSL so any codegen change to an AURA emit path surfaces as a reviewable text diff.
+Add `insta` MSL snapshot fixtures for the AURA kernels under `crates/iron-codegen/tests/msl_snapshots.rs` (the iron PR #25 pattern). Pins the emitted MSL so any codegen change to an AURA emit path surfaces as a reviewable text diff.
 
 ---
 
@@ -618,7 +576,7 @@ Deferred from Phase 5d. **Correctness does not depend on any of this** — it is
 - Compressed-domain attention via `aura_flash_p1` / `aura_flash_pass2` as the **default** decode path — drop the persistent `sharedWorkingK/V` mirror buffers.
 - Opt-in B-path — short-lived per-layer dequant buffer + `sdpaDecode` for callers with the memory headroom who want matrix-engine SDPA. The dequant buffer must be tight-scoped (one layer's worth resident at a time, not a persistent `maxSeq`-sized mirror).
 - W_o offline fold — replaces Stage 1a's runtime output un-rotation.
-- Norm correction — keep FFAI's always-applied `‖x‖/‖recon‖`; revisit only via an A/B test (PPL/KLD + speed) vs the reference's raw-norm WHT path.
+- Norm correction — keep Butter's always-applied `‖x‖/‖recon‖`; revisit only via an A/B test (PPL/KLD + speed) vs the reference's raw-norm WHT path.
 
 **Stage 3 — encode + layout perf.**
 
@@ -638,10 +596,10 @@ Make `Profile` injectable instead of a `.shared` singleton — each `Model.gener
 **16 VL families landed**, well past the original plan scope. Shipped: Qwen 2-VL (`Qwen2VL.swift`), Qwen 2.5-VL (`Qwen25VL.swift`), Qwen 3-VL (`Qwen3VL.swift`), Qwen 3-VL-MoE (`Qwen3VLMoe.swift`), Gemma 3-VL (`Gemma3VL.swift`), Gemma 4-VL (`Gemma4VL.swift`), LFM2-VL (`LFM2VL.swift`), MiniCPM-V 4.6 (`MiniCPMV.swift`), NemotronVL (`NemotronVL.swift`), SmolVLM2 (`SmolVLM2.swift`), Pixtral (`Pixtral.swift` — Mistral 2D-RoPE ViT), Mistral 3 (`Mistral3.swift`), FastVLM (`FastVLM.swift` — Apple FastViTHD), GlmOcr (`GlmOcr.swift`), Idefics3 (`Idefics3.swift`), Paligemma (`Paligemma.swift`).
 
 Phase 6.5 deliverables ✅ on disk:
-- `Sources/FFAI/VisionEncoder.swift` (with parallelised CPU bidirectional `cpuAttention` — fix for the original VLM "image hang").
-- `Sources/FFAI/ImagePreprocessing.swift` (resize / normalize / patchify + CHW conversion).
+- `Sources/ButterSwift/VisionEncoder.swift` (with parallelised CPU bidirectional `cpuAttention` — fix for the original VLM "image hang").
+- `Sources/ButterSwift/ImagePreprocessing.swift` (resize / normalize / patchify + CHW conversion).
 - `Tests/ModelIntegrationTests/VLMTestSupport.swift` with `dogImageCHW(targetSize:)` / `dogImageCHWNormalized(targetSize:normalization:)` / `expectMentionsDog(...)`.
-- Metaltile kernels: `conv2d`, `patch_embed`, `audio_conv1d`, `rope_2d`.
+- Iron kernels: `conv2d`, `patch_embed`, `audio_conv1d`, `rope_2d`.
 - Every VL family ships with a `<Family>IntegrationTests.swift` asserting "dog" in the caption of `dog.jpeg`. **The tests are written but most have not yet been run against a cached checkpoint** — see session-plan testing gaps.
 
 **Phase 6.5b deferred follow-up (perf):** Idefics3, PaliGemma, GlmOcr, and FastVLM still run their vision-tower attention + depthwise conv on CPU (parallelised but not GPU). FastVLM cold inference at 1024px is the loudest signal. Slot a GPU vision-attention kernel + depthwise conv2d port under 6.5b before Phase 8 starts.
@@ -657,10 +615,10 @@ Original 6.5 goal text preserved for context below.
 - Vision-specific RoPE 2D positional embedding.
 - Cross-modal token splice helper (CPU-fine; image tokens interleaved with text tokens).
 
-**FFAI changes:**
+**Butter changes:**
 
-- `Sources/FFAI/VisionEncoder.swift` module type (declared in Phase 2 for the capability API; lit up here).
-- `Sources/FFAI/ImagePreprocessing.swift` — resize / normalize / patchify (CPU initially; Metal later if it shows up in profiles).
+- `Sources/ButterSwift/VisionEncoder.swift` module type (declared in Phase 2 for the capability API; lit up here).
+- `Sources/ButterSwift/ImagePreprocessing.swift` — resize / normalize / patchify (CPU initially; Metal later if it shows up in profiles).
 - Family-level VL variants in their existing family files:
   - `Qwen3.swift` → `Qwen25VL` and `Qwen35VL`.
   - `Qwen35.swift` → `Qwen35VL` + `Qwen35VLMoE`.
@@ -694,7 +652,7 @@ Original 6.5 goal text preserved for context below.
 
 **Why this exists.** Phase 6.5 shipped 16 VL families, but four of them — Idefics3, PaliGemma, GlmOcr, FastVLM — still ran their vision-tower attention + depthwise conv on CPU (parallelised via `DispatchQueue.concurrentPerform`, but not GPU). FastVLM cold inference at 1024px was flagged at minutes per first-image in the agent return notes; the others had similar tails.
 
-The Phase 6.5 vision encoder reused FFAI's `VisionEncoder` for any VL family whose tower is a standard ViT + LayerNorm + GELU stack. The four CPU-bound stragglers each ship a custom tower:
+The Phase 6.5 vision encoder reused Butter's `VisionEncoder` for any VL family whose tower is a standard ViT + LayerNorm + GELU stack. The four CPU-bound stragglers each ship a custom tower:
 - **Idefics3** — bidirectional pre-norm SigLIP-ish with pixel-shuffle connector; CPU bidirectional attention in `Idefics3VisionEncoder`.
 - **PaliGemma** — SigLIP variant; CPU bidirectional in `PaligemmaModel`'s embedded vision branch.
 - **GlmOcr** — dynamic-resolution ViT; CPU bidirectional in `GlmOcrVisionBlock`.
@@ -704,7 +662,7 @@ The Phase 6.5 vision encoder reused FFAI's `VisionEncoder` for any VL family who
 - New iron kernel(s):
   - `conv2d_depthwise_{kh}_{kw}_{stride}` (fp16 / bf16) — depthwise pass via direct sliding-window MAC; no im2col blow-up.
   - Vision bidirectional attention (no causal mask, no KV cache) — likely a thin variant of `sdpa_decode` or `sdpa_decode_batched_prefill` with the mask disabled, exposed as `Ops.sdpaBidirectional(...)`.
-- FFAI:
+- Butter:
   - `Ops.conv2dDepthwise(...)` wrapper.
   - Migrate each custom tower's CPU attention to `Ops.sdpaBidirectional`.
   - Migrate FastVLM ConvFFN depthwise to `Ops.conv2dDepthwise`.
@@ -738,10 +696,10 @@ The same shape applies to Qwen 3, Mistral, Phi, Gemma 3 / 4 dense. Hybrid famili
 
 Original phase text preserved below.
 
-Today FFAI prefills a prompt one token per dispatch (`Generate.swift` — `prefillStepSize` is a no-op placeholder). Batch the prompt into chunks so prefill processes N tokens per forward — a large TTFT win on long prompts.
+Today Butter prefills a prompt one token per dispatch (`Generate.swift` — `prefillStepSize` is a no-op placeholder). Batch the prompt into chunks so prefill processes N tokens per forward — a large TTFT win on long prompts.
 
 - Drive a multi-token forward — `forwardMulti(tokenIds:positions: caches:)` — over a chunk of prompt tokens.
-- Chunk attention uses the existing `ffai/sdpa_decode_batched_prefill` iron kernel; the KV-cache append writes the whole chunk's K/V in one shot.
+- Chunk attention uses the existing `butter/sdpa_decode_batched_prefill` iron kernel; the KV-cache append writes the whole chunk's K/V in one shot.
 - Honor `GenerationParameters.prefillStepSize` (Gemma 4's 4096-token prefill chunk becomes a real path, not a placeholder).
 - Hybrid families: chunked prefill for the attention layers; the SSM/GDN recurrent layers still step per token (their recurrence is inherently sequential) until the deferred chunked-scan kernels land.
 
@@ -764,12 +722,12 @@ Shipped families:
 - **STS / audio enhancement** (new `Capability.speechToSpeech`): `DeepFilterNet.swift`, `MossFormer2SE.swift`, `SAMAudio.swift` (audio segmentation).
 - **Codecs:** `BigVGAN.swift`, `Vocos.swift`, `DACVAE.swift`, `DescriptDAC.swift`, `Encodec.swift`, `Mimi.swift`, `SNAC.swift`, `FishS1DAC.swift`.
 - **Infrastructure:** `AudioEncoder.swift` (with parallelised `cpuAttention` — Whisper transcribe fix), `AudioPreprocessing.swift` (mel + framing + log10 / Slaney variants), `AudioGenerationModel` protocol + `AudioGenerationParameters` + `AudioGenerationError`, shared `AudioFixtures.swift` (clean_001.wav fixture + `resolveCheckpoint(mlxAudioSlugs:repoIds:)`).
-- **Kernels (iron `ffai/`):** `mel_spectrogram`, `audio_conv1d`.
+- **Kernels (iron `butter/`):** `mel_spectrogram`, `audio_conv1d`.
 
 Same testing-gap caveat as Phase 6.5: every family ships an assertive integration test, but most have not yet been run against a cached checkpoint. The first `make test-integration --filter <Family>` pass will surface any remaining bugs.
 
 Codec follow-ups:
-- Marvis Mimi-decoder wiring — `MarvisModel.mimiDecoder` is nil; hook the existing `Sources/FFAI/Audio/Mimi.swift` in.
+- Marvis Mimi-decoder wiring — `MarvisModel.mimiDecoder` is nil; hook the existing `Sources/ButterSwift/Audio/Mimi.swift` in.
 - FishSpeech end-to-end — codec wired, integration test still asserts the staged path because dilated/transposed Conv1d primitives haven't landed. Switch the assertion once those kernels ship.
 
 Original 7 goal text preserved below for context.
@@ -782,13 +740,13 @@ Audio modality is interleaved with vision rather than deferred: Whisper STT + Qw
 - `audio_conv1d_{kh}_{stride}` — wide-stride 1D conv for STT patch embedding.
 - Reuse the existing SDPA / RMSNorm / RoPE for transformer stacks.
 
-**FFAI changes:**
+**Butter changes:**
 
-- `Sources/FFAI/AudioEncoder.swift` module type.
-- `Sources/FFAI/AudioPreprocessing.swift` — Mel computation + framing.
-- `Sources/FFAI/Models/Whisper.swift` — Whisper family (tiny → large-v3) STT.
-- `Sources/FFAI/Models/Kokoro.swift` and/or `Bark.swift` (TTS). Pick whichever has the cleaner mlx-audio-swift reference; can ship one and queue the other.
-- `Sources/FFAI/Models/QwenOmni.swift` — Qwen3.5-Omni (text + vision + audio). Uses `Capability.audioIn`, `.audioOut`.
+- `Sources/ButterSwift/AudioEncoder.swift` module type.
+- `Sources/ButterSwift/AudioPreprocessing.swift` — Mel computation + framing.
+- `Sources/ButterSwift/Models/Whisper.swift` — Whisper family (tiny → large-v3) STT.
+- `Sources/ButterSwift/Models/Kokoro.swift` and/or `Bark.swift` (TTS). Pick whichever has the cleaner mlx-audio-swift reference; can ship one and queue the other.
+- `Sources/ButterSwift/Models/QwenOmni.swift` — Qwen3.5-Omni (text + vision + audio). Uses `Capability.audioIn`, `.audioOut`.
 - `Capability.audioIn` + `.audioOut` exercised end-to-end.
 
 **Tests:**
@@ -812,7 +770,7 @@ Each sub-phase = one or more PRs + integration test + doc update. Sub-phases lan
 
 - `NGramSpeculativeTokenIterator` port from `Libraries/MLXLMCommon/NgramSpeculativeDecoding.swift`.
 - `NGramLookup` multi-size hash, min-hits filter, fallback.
-- `ngramRouteDecision()` eligibility predicate + env-var defaults (`FFAI_NGRAM_ENABLED`, `ngramSize`, `maxNgramDraftTokens`).
+- `ngramRouteDecision()` eligibility predicate + env-var defaults (`BUTTER_NGRAM_ENABLED`, `ngramSize`, `maxNgramDraftTokens`).
 - Auto-disengage on regressive regimes.
 
 ### 8.2 — Prefix KV cache (spec 017 — all phases incl. L2 disk)
@@ -820,7 +778,7 @@ Each sub-phase = one or more PRs + integration test + doc update. Sub-phases lan
 - `PrefixKVCache` + `PrefixKey` + LRU + stats.
 - Per-class `serialise()` / `hydrate(from:)` on every shipped cache: `KVCache`, `AffineQuantizedKVCache`, `AURAQuantizedKVCache` (incl. compressed-mode), `SSMStateCache`, `GDNStateCache`, `Mamba2LayerCache`.
 - `LastAssistantOpenerPolicy` for Qwen / Gemma / GPT-OSS chat templates.
-- L2 disk persistence (opt-in `FFAI_PREFIX_CACHE_DISK=1`) at `~/.cache/ffai/prefix/`.
+- L2 disk persistence (opt-in `BUTTER_PREFIX_CACHE_DISK=1`) at `~/.cache/butter/prefix/`.
 - `generate(...)` wraps a stream that snapshots post-prefill.
 - Integration test verifies warm-turn TTFT speedup.
 
@@ -866,18 +824,6 @@ Each sub-phase = one or more PRs + integration test + doc update. Sub-phases lan
   Drafter implementation is the remaining work.
 - **Variant B**: companion EAGLE-style assistant draft +
   `AssistantDraftRegistry`.
-- **Gemma 4 Omni drafter** (`gemma4_unified_assistant`,
-  `google/gemma-4-12B-it-assistant`) — wire it into the spec-decode path.
-  The checkpoint is already loaded + quantized + registered (the typed
-  `Gemma4OmniDrafter.load(...)`; `ModelRegistry` raises
-  `draftModelNotGeneratable` so it never runs as a standalone generator;
-  it's listed under "Gemma 4 Omni Drafter" in `ffai models`). Remaining
-  work is the EAGLE draft loop conditioned on the **Gemma 4 Omni 12B**
-  target: the target-hidden fusion (`pre_projection`, 2·3840→1024), the
-  centroid head (`centroids`, 1024→2048 + top-32 `centroid_intermediate_top_k`),
-  `post_projection`/`masked_embedding`, `shared_kv_states` reuse from the
-  target's KV cache (`num_kv_shared_layers=4`), a `Drafter` /
-  `SpeculativeVerifier` implementation, and a `--draft-model` CLI flag.
 
 ### 8.8 — Tree attention (spec 014, phase 1: K=2 root branches)
 
@@ -940,38 +886,14 @@ Each sub-phase = one or more PRs + integration test + doc update. Sub-phases lan
 
 - Renamed from TurboFlash. Per-simdgroup bit-unpack reuse + bf16 V accumulator + headDim-aware tile autotune + bias-aware kernel.
 
-### 8.24 — Advanced KV-cache retention / eviction policies
-
-Builds on `KVEviction.window(maxSize:keep:)` (today `keep:0` everywhere) + the sink/precision work in `session-plan.md` H.7. Increasing complexity:
-
-- **Model-aware `keep` default (StreamingLLM, Xiao 2023).** Default `keep=4` for **user-imposed fixed windows on non-learned-sink models** (capping a full-attention model's KV at a fixed window for long-context memory). MUST stay `keep:0` for (a) GPT-OSS — its learned `self_attn.sinks` substitutes for token sinks — and (b) native sliding-window layers trained without pinned sinks (Gemma 2/3/4), where pinning deviates from training. **Cannot be a global `KVEviction.window` enum-default flip:** the eviction tests use `.window(maxSize: 2/4)` and the `keep < maxSize` precondition would trip; must be applied model-aware at the cache-construction honor point. First bench target: **Qwen3.6 + fixed window + `aura4` over escalating context** (ties to H.4); tweak `keep` and measure PPL/coherence.
-- **First-N + last-M retention on an *unbounded* cache** — pinned prefix (sinks) + recent suffix, drop/compress a middle band. New eviction mode (the current ring does prefix + contiguous recent only).
-- **Content-aware / heavy-hitter retention (H2O; adjacent to 8.10 DuoAttention).** Retain by accumulated attention mass, not recency. Breaks the contiguous `[0,length)` ring the SDPA kernels assume → needs per-token metadata + a non-contiguous retention set (or a gather before SDPA).
-- **Special-token pinning** — never-evict chat-template structural tokens + known high-acceptance speculative-decode anchor tokens, by token-id, independent of position.
-
-Composes with the precision-preservation lever (keep sink/recent tokens full-precision under quant) in H.7.
-
-### 8.25 — Spec-decode × cache reconciliation + Nemotron mode ergonomics
-
-Audit (2026-05-28) surfaced gaps between the spec-decode rollback infra (`CacheSnapshot`, J.2) and the compressed/windowed cache layer. Several **shipped 2026-05-29**:
-
-- ✅ **Quantized-cache rollback (SHIPPED).** `CacheSnapshot` now rolls back raw + `AffineQuantizedKVCache` + `AURAQuantizedKVCache` through the cheap length-rewind path (all three expose `length`/`absolutePosition`/`truncate` via `KVCacheProtocol`) — no buffer copy needed for `.unbounded`. AURA's `atomic_or` encode got a high-water-mark zero-on-rewrite fix so a `truncate` + re-append yields correct dequant. Spec-decode + KV compression are no longer mutually exclusive (for unbounded caches). `Qwen35GDNLayerCache` renamed → `GDNLayerCache`.
-- ✅ **Generic spec-decode driver + Nemotron mode ergonomics (SHIPPED).** `SpecDecode.generateGreedy` takes `any SpeculativeVerifier` (not `Qwen35Model`). `DiffusionMode` + unified `Model.generate(prompt:mode:diffusionParameters:)` default to `.selfSpeculative` (or `LoadOptions.diffusionMode`); an AR driver makes all three modes return `DiffusionResult`.
-- ❌ **Window-eviction rollback (STILL OPEN — the remaining gap).** The `.kv` snapshot is `length`-metadata only — correct for `.unbounded` and for a windowed draft that does NOT wrap the ring, but once the ring fills, a draft append *rotates*, overwriting a slot that still holds needed earlier K/V; a length-rewind restores the counters, not the clobbered slot. Design:
-  - **Gate on wrap.** If `length + γ ≤ maxSize` the draft can't wrap → the cheap length-rewind is correct; stay on the fast path.
-  - **On wrap, snapshot only the ≤γ clobbered slots** (γ = speculative block length, ~4–16, **independent of window size**) — their K/V (raw) or packed+norms / weights+scales+biases (quantized) — plus the full `KVEvictionState` (length + absolutePosition + ring position; for AURA also the high-water mark). On reject, blit those slots back + restore the eviction state.
-  - **A full-buffer snapshot does NOT generalize.** It's a tempting simple special case only when `maxSize` is small (128–1024 slots). At a 32k / 64k / 128k window the compressed buffer is hundreds of MB per layer, so a per-step full copy would dwarf the decode — exactly the case the per-slot (≤γ) approach handles, since its cost scales with the draft, not the window.
-  - New `CacheSnapshot` case `.windowed(slots:evictionState:)`; keep the length-only `.kv` case for `.unbounded` + non-wrapping windowed drafts. Test: fill past `maxSize` so the ring wraps, snapshot → wrapping draft → restore → assert exact recovery.
-- ⚠️ **Diffusion is raw + fully preallocated TODAY (hard-errors on quant/window, shipped 2026-05-29) — but quantized KV is feasible, not impossible.** The diffusion forward attends with `Ops.sdpa(k: cache.kBuffer, v: cache.vBuffer, …)` reading the **raw** fp16 buffer directly, and `writeTimestepOnGPU` stages the in-flight block into **fixed future scratch slots** `[length, length+blockLength)` overwritten each denoise step (random-access, not append → needs preallocation, breaks under window eviction + incremental growth). `makeLayerCaches` now precondition-fails (clear error) instead of silently downgrading. **`ffai inspect` (2026-05-29) confirms no architectural barrier:** ordinary GQA (head_dim 128, 32 q / 8 kv heads, bf16 — the shape we already quantize on Qwen/Llama; 128 satisfies affine4 + aura4), and the raw cache is **832 MB @ 8192 ctx → ~200 MB with aura4**. The enhancement (session-plan H.10): **(a)** AR mode = a dequant-SDPA branch in `forwardTokens` (easy); **(b)** diffusion/self-spec = a **hybrid** that quantizes the *committed prefix* (where the 832 MB lives) and keeps the tiny transient scratch block raw, attending over `dequant(prefix) ++ raw scratch`. Non-trivial cache-API + kernel work, distinct from the generalized append-based spec-decode above — but a real route, not a dead end.
-
 ---
 
 ## Phase 9 — Performance / dispatch modes / autotuner
 
 - **Argument-buffer dispatch mode** (Mode 2 in `architecture.md §4a`).
 - **ICB dispatch mode** (Mode 3).
-- **Metaltile autotuner** — grid search over `(tile_dims, threads, unroll, simd_matrix, async_copy)`. Persist to `~/.cache/iron/tuning_cache.json`. CI: nightly autotune on a reference machine; commit results.
-- **Metaltile housekeeping** —
+- **Iron autotuner** — grid search over `(tile_dims, threads, unroll, simd_matrix, async_copy)`. Persist to `~/.cache/iron/tuning_cache.json`. CI: nightly autotune on a reference machine; commit results.
+- **Iron housekeeping** —
   - Runtime dispatch-shape validator: reject degenerate threadgroup geometry (the < 32-threads-per-group freeze class) before the dispatch reaches the GPU.
   - Codegen i32-signedness preservation through lowering (signed operands currently widen to unsigned in some paths).
   - Fix the flaky `matches_cpu_reference_f16_chained_resident_gqa` GPU correctness test.
@@ -982,20 +904,20 @@ Audit (2026-05-28) surfaced gaps between the spec-decode rollback infra (`CacheS
 
 ## Phase 10 — Polish
 
-- **`ffai convert` v1** ✅ SHIPPED — Swift-native MLX 4-bit affine quantizer (`Sources/FFAI/{SafeTensorsWriter,ConvertDriver}.swift` + `Sources/FFAICLI/ConvertCommand.swift`, commit `d3b67c5`). Accepts HF repo id or local path, reads source safetensors, dispatches `QuantizedOps.quantizeAffine` per Linear- shaped 2D weight, writes the `.weight` / `.scales` / `.biases` triplet to a fresh safetensors file, patches `config.json` with the `quantization` + `quantization_config` blocks, copies tokenizer + aux files (symlink-resolved), and optionally uploads via the `hf` CLI. Closes the gap that blocked Soprano-1.1, Nemotron-H, and FastVLM — `mlx-lm` / `mlx-vlm` fail those because they import the model's custom `modeling_*.py` chain; `ffai convert` reads raw safetensors only.
+- **`butter convert` v1** ✅ SHIPPED — Swift-native MLX 4-bit affine quantizer (`Sources/ButterSwift/{SafeTensorsWriter,ConvertDriver}.swift` + `Sources/ButterCLI/ConvertCommand.swift`, commit `d3b67c5`). Accepts HF repo id or local path, reads source safetensors, dispatches `QuantizedOps.quantizeAffine` per Linear- shaped 2D weight, writes the `.weight` / `.scales` / `.biases` triplet to a fresh safetensors file, patches `config.json` with the `quantization` + `quantization_config` blocks, copies tokenizer + aux files (symlink-resolved), and optionally uploads via the `hf` CLI. Closes the gap that blocked Soprano-1.1, Nemotron-H, and FastVLM — `mlx-lm` / `mlx-vlm` fail those because they import the model's custom `modeling_*.py` chain; `butter convert` reads raw safetensors only.
 
-- **`ffai convert` v2 — format + precision coverage**
-  - **Mixed-precision recipes.** The FFAI loader already supports per-tensor bit-width via the `affineBits` map (see Phase 5c). Expose this through `ffai convert`:
+- **`butter convert` v2 — format + precision coverage**
+  - **Mixed-precision recipes.** The Butter loader already supports per-tensor bit-width via the `affineBits` map (see Phase 5c). Expose this through `butter convert`:
       - `--bits-embed 8 --bits-linear 4 --bits-lm-head 8` — per-role overrides for the three common cases.
       - `--recipe {mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6}` — mlx-lm-compatible recipes that bucket tensors by sensitivity (attention vs MLP, first/last layers, etc.).
       - Custom recipe file (`--recipe-file <path>`) — JSON map from tensor-name glob to bit-width.
-  - **GGUF read.** Add `Sources/FFAI/GGUFReader.swift` — parse the GGUF v3 header + the K-quant blocks (Q4_K_M, Q5_K_M, Q6_K, Q8_0, Q4_0, Q5_0). For each K-quant block, dequantize to bf16 in a scratch buffer, then re-quantize through `QuantizedOps.quantizeAffine` to the FFAI mlx-4bit layout. Pairs with the existing **gguf format support** row below — Phase 10 "load GGUF directly" lands as `ffai convert <gguf-file> -o <mlx-4bit-dir>` first, then a direct GGUF→model loader once we confirm there's user demand for skipping the conversion.
-  - **GGUF write.** Inverse of the read path — emit a single-file `model.gguf` with the FFAI affine weights → Q4_K_M / Q5_K_M / Q8_0 conversion. Lets FFAI act as a bridge to llama.cpp consumers.
+  - **GGUF read.** Add `Sources/ButterSwift/GGUFReader.swift` — parse the GGUF v3 header + the K-quant blocks (Q4_K_M, Q5_K_M, Q6_K, Q8_0, Q4_0, Q5_0). For each K-quant block, dequantize to bf16 in a scratch buffer, then re-quantize through `QuantizedOps.quantizeAffine` to the Butter mlx-4bit layout. Pairs with the existing **gguf format support** row below — Phase 10 "load GGUF directly" lands as `butter convert <gguf-file> -o <mlx-4bit-dir>` first, then a direct GGUF→model loader once we confirm there's user demand for skipping the conversion.
+  - **GGUF write.** Inverse of the read path — emit a single-file `model.gguf` with the Butter affine weights → Q4_K_M / Q5_K_M / Q8_0 conversion. Lets Butter act as a bridge to llama.cpp consumers.
   - **Streaming convert.** Today `SafeTensorsWriter` buffers every quantized tensor in RAM before flushing. For 30B+ models this overflows. Add a streaming mode that opens the output file once, writes a placeholder header, appends each tensor's bytes as soon as the quantize kernel returns, and back-patches the header at the end. Optionally shard into `model-00001-of-N.safetensors` when the total exceeds a configurable size (5 GB default — matches HF's chunking convention).
-  - **Source coverage.** Today `ffai convert` accepts local paths and HF repo ids. v2 adds: (a) a `--source-url <url>` path that pulls a raw safetensors URL (S3, GitHub Releases, etc.) without a repo wrapper, useful for un-published fine-tunes; (b) a direct path to a single `.safetensors` file (not a directory) that auto-discovers the matching `config.json` / tokenizer files from the same directory.
+  - **Source coverage.** Today `butter convert` accepts local paths and HF repo ids. v2 adds: (a) a `--source-url <url>` path that pulls a raw safetensors URL (S3, GitHub Releases, etc.) without a repo wrapper, useful for un-published fine-tunes; (b) a direct path to a single `.safetensors` file (not a directory) that auto-discovers the matching `config.json` / tokenizer files from the same directory.
   - **VLM-aware skip lists.** Several VLM checkpoints (Qwen 2.5-VL, LFM2-VL, etc.) ship a `skip_vision: true` quantization hint — the vision tower stays bf16 while only the text backbone gets quantized. Honor that flag in `ConvertDriver` and add `--skip-vision` / `--quantize-vision` overrides.
 
-- **gguf format support** — per-architecture name mapper. Single-file format from llama.cpp, embeds quantization (Q4_K_M, Q5_K_M, Q8_0, etc.) and tokenizer. Worth doing if community gguf quants are valuable to users; skip if all target checkpoints are mlx-format or safetensors. The `ffai convert` v2 GGUF read/write paths above give us the per-block dequant arithmetic; loading GGUF directly is just wiring that into the `Model.load` dispatch instead of routing through a convert step.
+- **gguf format support** — per-architecture name mapper. Single-file format from llama.cpp, embeds quantization (Q4_K_M, Q5_K_M, Q8_0, etc.) and tokenizer. Worth doing if community gguf quants are valuable to users; skip if all target checkpoints are mlx-format or safetensors. The `butter convert` v2 GGUF read/write paths above give us the per-block dequant arithmetic; loading GGUF directly is just wiring that into the `Model.load` dispatch instead of routing through a convert step.
 
 - **Distribution** — Homebrew formula for the `iron` binary, SPM consumer instructions.
 - **Benchmarks** — full sweep vs MLX baseline across the model zoo.
@@ -1018,6 +940,6 @@ If any of these bets break, the plan changes. Stage commits so we can roll back 
 ## Open questions to settle before Phase 0 implementation
 
 1. SPM build plugin can shell out to arbitrary commands (`cargo`)? Or do we need a pre-build Makefile step?
-2. Where does iron live for FFAI to consume — sibling path dependency (current), git submodule, or eventually a published Rust crate?
+2. Where does iron live for Butter to consume — sibling path dependency (current), git submodule, or eventually a published Rust crate?
 3. metallib per-arch (arm64 only, or universal)? Per-Metal-version (separate metallib for Metal 3.0 vs 3.1+ for native bf16)?
 4. Manifest.json schema versioning strategy — how do we evolve it without breaking the generated Swift?

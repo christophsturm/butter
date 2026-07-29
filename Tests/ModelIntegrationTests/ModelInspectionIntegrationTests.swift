@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Integration tests covering the `ffai inspect` path end-to-end
+// Integration tests covering the `butter inspect` path end-to-end
 // against a small locally-cached model — asserts the diagnostic
 // surface doesn't crash on a working architecture. Doesn't pin the
 // exact output (top-K logits / token-id sequence aren't stable
@@ -27,7 +27,7 @@ import Foundation
 import TestHelpers
 import Testing
 
-@testable import FFAI
+@testable import ButterSwift
 
 @Suite("Model Inspection Integration", .serialized)
 struct ModelInspectionIntegrationTests {
