@@ -378,6 +378,12 @@ public final class SafeTensorsBundle: @unchecked Sendable {
         index["\(base).scales"] != nil && index["\(base).biases"] != nil
     }
 
+    /// NVFP4 / MXFP4 layout: weight + scales (u8), no affine biases.
+    public func isNvfp4(_ base: String) -> Bool {
+        index["\(base).weight"] != nil && index["\(base).scales"] != nil
+            && index["\(base).biases"] == nil
+    }
+
     public struct QuantizedTriplet: Sendable {
         public let weight: Tensor
         public let scales: Tensor
