@@ -78,6 +78,16 @@ enum LagunaNvfp4Fuse {
             != "0"
     }
 
+    /// T28: nine-slot merged MoE dispatch, one threadgroup family owns all
+    /// 8 routed + 1 shared expert slots (geometry only, no residual fold,
+    /// see T28 README notes). Replaces the routed SwiGLU dispatch plus
+    /// separate shared SwiGLU/down dispatches plus the final acc+shared
+    /// add with two dispatches (swiglu, down+reduce). Default ON when
+    /// eligible; escape `BUTTER_LAGUNA_NINE_SLOT=0`.
+    static var nineSlotEnabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_NINE_SLOT"] != "0"
+    }
+
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]
     private static let lock = NSLock()
 
@@ -410,6 +420,10 @@ enum LagunaNvfp4Fuse {
             buffer: wBuf, offset: 0, shape: [2 * mid, packs], dtype: .u32)
         let scales = Tensor(
             buffer: sBuf, offset: 0, shape: [2 * mid, groups], dtype: .u8)
+        // Fused [gate; up] bank replaces two separate NVFP4 linears for
+        // the shared-expert SwiGLU path and is read on every forward
+        // pass; pin it like any other persistent weight buffer.
+        device.markWeightsResident([wBuf, sBuf])
         return (weight, scales, gate.global)
     }
 
@@ -1183,6 +1197,369 @@ enum LagunaNvfp4Fuse {
         enc.dispatchThreadgroups(
             MTLSize(width: 512, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    // MARK: - T28 nine-slot merged MoE dispatch (routed + shared, one family)
+
+    /// Same per-row arithmetic as `routedSwigluSrc` (routed slots) and
+    /// `sharedSwigluSrc` (shared slot, slot index 8): both already share the
+    /// identical `iron_nvfp4_qdot_16` fast bitpath + `bfloat(g*sig*u)`
+    /// rounding, so this is a dispatch-count merge, not a numerics change.
+    /// Tile-major, TG=64 (2 SGs, matches both source kernels): 9 slots × 128
+    /// tiles = 1152 threadgroups. A 1-row-per-SIMD/256-TG layout was tried
+    /// and regressed, so this keeps the 2-row-per-SIMD/1152-TG shape.
+    private static let nineSlotSwigluSrc = header + """
+    kernel void laguna_nine_slot_nvfp4_swiglu_qmv_bf16(
+        device const bfloat *input [[buffer(0)]],
+        device const uint *gate_weight [[buffer(1)]],
+        device const uchar *gate_scales [[buffer(2)]],
+        device const uint *up_weight [[buffer(3)]],
+        device const uchar *up_scales [[buffer(4)]],
+        device const uint *indices [[buffer(5)]],
+        device const uint *shared_weight [[buffer(6)]],
+        device const uchar *shared_scales [[buffer(7)]],
+        device bfloat *activated_0 [[buffer(8)]],
+        device bfloat *activated_1 [[buffer(9)]],
+        device bfloat *activated_2 [[buffer(10)]],
+        device bfloat *activated_3 [[buffer(11)]],
+        device bfloat *activated_4 [[buffer(12)]],
+        device bfloat *activated_5 [[buffer(13)]],
+        device bfloat *activated_6 [[buffer(14)]],
+        device bfloat *activated_7 [[buffer(15)]],
+        device bfloat *shared_activated [[buffer(16)]],
+        constant float &global_scale [[buffer(17)]],
+        constant float &shared_global_scale [[buffer(18)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        uint sgid [[simdgroup_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]]
+    ) {
+        constexpr uint input_width = 2048u;
+        constexpr uint output_width = 512u;
+        constexpr uint packed_row_bytes = 1024u;   // 2048/2
+        constexpr uint scale_row_bytes = 128u;     // 2048/16
+        constexpr uint packed_expert_bytes = output_width * packed_row_bytes;
+        constexpr uint scale_expert_bytes = output_width * scale_row_bytes;
+        constexpr uint block_width = 512u;
+        constexpr uint values_per_lane = 16u;
+        constexpr uint routed_experts = 8u;
+        constexpr uint slots = routed_experts + 1u;
+
+        uint expert_slot = tgid % slots;
+        uint tile = tgid / slots;
+        bool is_routed = expert_slot < routed_experts;
+        uint first_row = tile * 4u + sgid * 2u;
+
+        const device uchar* g_wbase;
+        const device uchar* u_wbase;
+        const device uchar* g_sbase;
+        const device uchar* u_sbase;
+        float scale_mul;
+        uint up_extra_rows;
+        if (is_routed) {
+            uint expert = indices[expert_slot];
+            g_wbase = (const device uchar*)gate_weight + expert * packed_expert_bytes;
+            u_wbase = (const device uchar*)up_weight + expert * packed_expert_bytes;
+            g_sbase = gate_scales + expert * scale_expert_bytes;
+            u_sbase = up_scales + expert * scale_expert_bytes;
+            scale_mul = global_scale;
+            up_extra_rows = 0u;
+        } else {
+            // Fused [gate(512); up(512)] row-concatenated bank (LagunaNvfp4Fuse.fuseGateUp).
+            g_wbase = (const device uchar*)shared_weight;
+            u_wbase = (const device uchar*)shared_weight;
+            g_sbase = shared_scales;
+            u_sbase = shared_scales;
+            scale_mul = shared_global_scale;
+            up_extra_rows = output_width;
+        }
+
+        thread float gate_result[2] = {0.f, 0.f};
+        thread float up_result[2] = {0.f, 0.f};
+        thread float input_values[values_per_lane];
+
+        for (uint block = 0; block < input_width; block += block_width) {
+            const device vec<bfloat, 4>* input_vectors =
+                (const device vec<bfloat, 4>*)(
+                    input + block + lane * values_per_lane);
+            for (uint i = 0; i < values_per_lane / 4u; ++i) {
+                const vec<bfloat, 4> values = input_vectors[i];
+                input_values[4u * i] = float(values[0]);
+                input_values[4u * i + 1u] = float(values[1]);
+                input_values[4u * i + 2u] = float(values[2]);
+                input_values[4u * i + 3u] = float(values[3]);
+            }
+            for (uint row = 0; row < 2u; ++row) {
+                uint out_row = first_row + row;
+                uint up_row = out_row + up_extra_rows;
+                const device uchar* gate_w =
+                    g_wbase + out_row * packed_row_bytes + block / 2u + lane * 8u;
+                const device uchar* up_w =
+                    u_wbase + up_row * packed_row_bytes + block / 2u + lane * 8u;
+                const device uchar* gate_s =
+                    g_sbase + out_row * scale_row_bytes + block / 16u + lane;
+                const device uchar* up_s =
+                    u_sbase + up_row * scale_row_bytes + block / 16u + lane;
+                float gs = iron_nvfp4_e4m3_scale(gate_s[0]) * scale_mul;
+                float us = iron_nvfp4_e4m3_scale(up_s[0]) * scale_mul;
+                gate_result[row] += iron_nvfp4_qdot_16(gate_w, input_values, gs);
+                up_result[row] += iron_nvfp4_qdot_16(up_w, input_values, us);
+            }
+        }
+
+        device bfloat* activated;
+        switch (expert_slot) {
+            case 0u: activated = activated_0; break;
+            case 1u: activated = activated_1; break;
+            case 2u: activated = activated_2; break;
+            case 3u: activated = activated_3; break;
+            case 4u: activated = activated_4; break;
+            case 5u: activated = activated_5; break;
+            case 6u: activated = activated_6; break;
+            case 7u: activated = activated_7; break;
+            default: activated = shared_activated; break;
+        }
+
+        for (uint row = 0; row < 2u; ++row) {
+            gate_result[row] = simd_sum(gate_result[row]);
+            up_result[row] = simd_sum(up_result[row]);
+            if (lane == 0u) {
+                float g = gate_result[row];
+                float u = up_result[row];
+                float sig = 1.f / (1.f + metal::exp(-g));
+                activated[first_row + row] = bfloat(g * sig * u);
+            }
+        }
+    }
+    """
+
+    /// Fused nine-slot (8 routed + 1 shared) gate+up QMV + SwiGLU. Replaces
+    /// the routed `moeRoutedSwigluQmv` dispatch plus the separate shared
+    /// gate/up/swiglu chain. `sharedWeight`/`sharedScales` are the fused
+    /// [gate;up] bank from `fuseGateUp`.
+    static func moeNineSlotSwigluQmv(
+        input: Tensor,
+        gateWeight: Tensor, gateScales: Tensor,
+        upWeight: Tensor, upScales: Tensor,
+        expertIndices: Tensor,
+        routedOutputs: [Tensor],
+        sharedWeight: Tensor, sharedScales: Tensor,
+        sharedOutput: Tensor,
+        global: Float, sharedGlobal: Float,
+        on cmd: MTLCommandBuffer, device: Device
+    ) {
+        precondition(routedOutputs.count == 8)
+        precondition(input.dtype == .bf16 && input.elementCount == 2048)
+        precondition(expertIndices.dtype == .u32 && expertIndices.elementCount == 8)
+        precondition(sharedOutput.dtype == .bf16 && sharedOutput.elementCount == 512)
+
+        let mtl = device.mtlDevice
+        let p = pso(
+            "laguna_nine_slot_nvfp4_swiglu_qmv_bf16",
+            source: nineSlotSwigluSrc, device: mtl)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(gateWeight.buffer, offset: gateWeight.offset, index: 1)
+        enc.setBuffer(gateScales.buffer, offset: gateScales.offset, index: 2)
+        enc.setBuffer(upWeight.buffer, offset: upWeight.offset, index: 3)
+        enc.setBuffer(upScales.buffer, offset: upScales.offset, index: 4)
+        enc.setBuffer(expertIndices.buffer, offset: expertIndices.offset, index: 5)
+        enc.setBuffer(sharedWeight.buffer, offset: sharedWeight.offset, index: 6)
+        enc.setBuffer(sharedScales.buffer, offset: sharedScales.offset, index: 7)
+        for i in 0 ..< 8 {
+            enc.setBuffer(routedOutputs[i].buffer, offset: routedOutputs[i].offset, index: 8 + i)
+        }
+        enc.setBuffer(sharedOutput.buffer, offset: sharedOutput.offset, index: 16)
+        var g = global
+        var sg = sharedGlobal
+        enc.setBytes(&g, length: 4, index: 17)
+        enc.setBytes(&sg, length: 4, index: 18)
+        // 9 slots × 128 tiles, TPG=64 (2 SGs × 32): 2-row-per-SIMD geometry,
+        // see the dispatch-shape note on `nineSlotSwigluSrc` above.
+        enc.dispatchThreadgroups(
+            MTLSize(width: 9 * 128, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// Nine-slot down QMV + weighted reduce. Routed slots (0-7) weighted by
+    /// `slotWeights`/`indices` exactly as `moeRoutedDownReduce`; the shared
+    /// slot (8) uses a dedicated weight bank (no expert gather) and is added
+    /// unconditionally (implicit weight 1.0, no router gate), the same
+    /// accumulation ORDER as the stock path (routed weighted-sum first, then
+    /// `+ shared`), so this reduction is expected to match the stock
+    /// `moeRoutedDownReduce` + `Ops.add(acc, sharedOut)` chain's rounding
+    /// trajectory row-for-row (not claimed byte-identical against the
+    /// *shared* leg specifically, since the shared leg's own dequant-GEMV
+    /// numerics differ, see T28 README).
+    private static let nineSlotDownReduceSrc = header + """
+    kernel void laguna_nine_slot_nvfp4_down_reduce_bf16(
+        device const bfloat *mid_0 [[buffer(0)]],
+        device const bfloat *mid_1 [[buffer(1)]],
+        device const bfloat *mid_2 [[buffer(2)]],
+        device const bfloat *mid_3 [[buffer(3)]],
+        device const bfloat *mid_4 [[buffer(4)]],
+        device const bfloat *mid_5 [[buffer(5)]],
+        device const bfloat *mid_6 [[buffer(6)]],
+        device const bfloat *mid_7 [[buffer(7)]],
+        device const bfloat *shared_mid [[buffer(8)]],
+        device const uint *indices [[buffer(9)]],
+        device const bfloat *slot_weights [[buffer(10)]],
+        device const uint *down_weight [[buffer(11)]],
+        device const uchar *down_scales [[buffer(12)]],
+        device const uint *shared_down_weight [[buffer(13)]],
+        device const uchar *shared_down_scales [[buffer(14)]],
+        device bfloat *output [[buffer(15)]],
+        constant float &global_scale [[buffer(16)]],
+        constant float &shared_global_scale [[buffer(17)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        uint simd_lane [[thread_index_in_simdgroup]],
+        uint simd_group [[simdgroup_index_in_threadgroup]]
+    ) {
+        constexpr uint input_width = 512u;
+        constexpr uint routed_experts = 8u;
+        constexpr uint slots = routed_experts + 1u;
+        constexpr uint outputs_per_simd = 4u;
+        constexpr uint values_per_lane = 16u;
+        constexpr uint n_packs = input_width / 8u;       // 64
+        constexpr uint n_blocks = input_width / 16u;     // 32
+        constexpr uint packs_per_block = 16u / 8u;       // 2
+        constexpr uint out_dim = 2048u;
+
+        uint expert_slot = simd_group;  // 0..8
+        uint lane = simd_lane;          // 0..31
+        uint first_row = tgid * outputs_per_simd;
+        if (expert_slot >= slots || first_row >= out_dim) return;
+        bool is_routed = expert_slot < routed_experts;
+
+        const device bfloat* expert_input;
+        switch (expert_slot) {
+            case 0u: expert_input = mid_0; break;
+            case 1u: expert_input = mid_1; break;
+            case 2u: expert_input = mid_2; break;
+            case 3u: expert_input = mid_3; break;
+            case 4u: expert_input = mid_4; break;
+            case 5u: expert_input = mid_5; break;
+            case 6u: expert_input = mid_6; break;
+            case 7u: expert_input = mid_7; break;
+            default: expert_input = shared_mid; break;
+        }
+
+        const device uint* wbase;
+        const device uchar* sbase;
+        float scale_mul;
+        uint exp_base_packs;
+        uint exp_base_blocks;
+        if (is_routed) {
+            uint expert = indices[expert_slot];
+            wbase = down_weight;
+            sbase = down_scales;
+            exp_base_packs = expert * out_dim * n_packs;
+            exp_base_blocks = expert * out_dim * n_blocks;
+            scale_mul = global_scale;
+        } else {
+            wbase = shared_down_weight;
+            sbase = shared_down_scales;
+            exp_base_packs = 0u;
+            exp_base_blocks = 0u;
+            scale_mul = shared_global_scale;
+        }
+
+        thread float input_values[values_per_lane];
+        {
+            const device vec<bfloat, 4>* input_vectors =
+                (const device vec<bfloat, 4>*)(
+                    expert_input + lane * values_per_lane);
+            for (uint i = 0; i < values_per_lane / 4u; ++i) {
+                const vec<bfloat, 4> values = input_vectors[i];
+                input_values[4u * i] = float(values[0]);
+                input_values[4u * i + 1u] = float(values[1]);
+                input_values[4u * i + 2u] = float(values[2]);
+                input_values[4u * i + 3u] = float(values[3]);
+            }
+        }
+
+        uint pack_base = lane * packs_per_block;
+        uint blk = pack_base / packs_per_block;
+        thread float result[outputs_per_simd] = {0.f, 0.f, 0.f, 0.f};
+        for (uint row = 0; row < outputs_per_simd; ++row) {
+            uint output_row = first_row + row;
+            uint row_pack_off = exp_base_packs + output_row * n_packs + pack_base;
+            uint row_block_off = exp_base_blocks + output_row * n_blocks + blk;
+            float scale =
+                iron_nvfp4_e4m3_scale(sbase[row_block_off]) * scale_mul;
+            const device uchar* wbytes =
+                (const device uchar*)(wbase + row_pack_off);
+            result[row] = iron_nvfp4_qdot_16(wbytes, input_values, scale);
+            result[row] = simd_sum(result[row]);
+        }
+
+        threadgroup bfloat expert_outputs[slots * outputs_per_simd];
+        if (lane == 0u) {
+            for (uint row = 0; row < outputs_per_simd; ++row) {
+                expert_outputs[expert_slot * outputs_per_simd + row] = bfloat(result[row]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (expert_slot == 0u && lane < outputs_per_simd) {
+            bfloat total = bfloat(0.0f);
+            for (uint slot = 0u; slot < routed_experts; ++slot) {
+                bfloat route_weight = slot_weights[slot];
+                bfloat product = bfloat(
+                    float(expert_outputs[slot * outputs_per_simd + lane])
+                    * float(route_weight));
+                total = bfloat(float(product) + float(total));
+            }
+            // Shared expert: unconditional add, implicit weight 1.0.
+            total = bfloat(
+                float(total)
+                + float(expert_outputs[routed_experts * outputs_per_simd + lane]));
+            output[first_row + lane] = total;
+        }
+    }
+    """
+
+    /// Nine-slot down QMV + weighted reduce (routed + shared, one dispatch).
+    static func moeNineSlotDownReduce(
+        mids: [Tensor], sharedMid: Tensor,
+        expertIndices: Tensor, slotWeights: Tensor,
+        downWeight: Tensor, downScales: Tensor,
+        sharedDownWeight: Tensor, sharedDownScales: Tensor,
+        output: Tensor,
+        global: Float, sharedGlobal: Float,
+        on cmd: MTLCommandBuffer, device: Device
+    ) {
+        precondition(mids.count == 8)
+        precondition(sharedMid.dtype == .bf16 && sharedMid.elementCount == 512)
+        precondition(output.dtype == .bf16 && output.elementCount == 2048)
+
+        let mtl = device.mtlDevice
+        let p = pso(
+            "laguna_nine_slot_nvfp4_down_reduce_bf16",
+            source: nineSlotDownReduceSrc, device: mtl)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(p)
+        for i in 0 ..< 8 {
+            enc.setBuffer(mids[i].buffer, offset: mids[i].offset, index: i)
+        }
+        enc.setBuffer(sharedMid.buffer, offset: sharedMid.offset, index: 8)
+        enc.setBuffer(expertIndices.buffer, offset: expertIndices.offset, index: 9)
+        enc.setBuffer(slotWeights.buffer, offset: slotWeights.offset, index: 10)
+        enc.setBuffer(downWeight.buffer, offset: downWeight.offset, index: 11)
+        enc.setBuffer(downScales.buffer, offset: downScales.offset, index: 12)
+        enc.setBuffer(sharedDownWeight.buffer, offset: sharedDownWeight.offset, index: 13)
+        enc.setBuffer(sharedDownScales.buffer, offset: sharedDownScales.offset, index: 14)
+        enc.setBuffer(output.buffer, offset: output.offset, index: 15)
+        var g = global
+        var sg = sharedGlobal
+        enc.setBytes(&g, length: 4, index: 16)
+        enc.setBytes(&sg, length: 4, index: 17)
+        // 512 tiles × 4 rows = 2048; TPG=288 (9 SGs × 32 lanes)
+        enc.dispatchThreadgroups(
+            MTLSize(width: 512, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 288, height: 1, depth: 1))
         enc.endEncoding()
     }
 }

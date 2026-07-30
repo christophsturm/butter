@@ -388,6 +388,15 @@ public final class MoELayer: Module, DecoderLayer {
 
     public let router: MoERouter
     public let hidden: Int
+    /// T27 Stage 2: pre-transposed router weight for the steel MMA GEMM
+    /// fast path (`LagunaSteelGemm`). The router GEMM (`gate.callMany`
+    /// in `decodeManyNvfp4`'s prefill route phase) is plain BF16
+    /// (`[nExperts, hidden]`, e.g. `[256, 2048]` on Laguna XS, both
+    /// %64==0) and rode the naive `Ops.gemm` path until now, same class
+    /// of gap T26 found in attention's Q/K/V/O projections. `nil` when
+    /// `gate` isn't a plain bf16 Linear (falls back automatically via
+    /// `LagunaSteelGemm.eligible`). See benchmarks/laguna-xs/README.md T27.
+    let gateWeightT: Tensor?
 
     /// Stacked-expert weight handles for the batched gather BGEMM fast
     /// path. When set, `decode` dispatches `iron_moe_gather_qmm_mma_int4_bm16`
@@ -566,6 +575,14 @@ public final class MoELayer: Module, DecoderLayer {
     private var fusedSharedGateUpScales: Tensor?
     private var fusedSharedGateUpGlobal: Float = 1.0
     private var fusedSharedGateUpAttempted = false
+    /// T28 nine-slot merged MoE dispatch (routed + shared expert in one
+    /// threadgroup family). Cached eligibility + raw shared-down NVFP4
+    /// fields (mirrors `ensureFusedSharedGateUp`'s lazy-attempt pattern).
+    private var nineSlotAttempted = false
+    private var nineSlotSharedDownWeight: Tensor?
+    private var nineSlotSharedDownScales: Tensor?
+    private var nineSlotSharedDownGlobal: Float = 1.0
+    private var sharedMidScratch: Tensor?
     /// Layer index in the stack (for late-layer MPP f32 promote). `-1` = unknown.
     public let layerIndex: Int
     /// Prefill NVFP4 MoE matmul scratches (grow-only; avoids per-layer
@@ -736,7 +753,9 @@ public final class MoELayer: Module, DecoderLayer {
         stackedInt4Experts: StackedInt4Experts? = nil,
         stackedNvfp4Experts: StackedNvfp4Experts? = nil,
         expertBiasGPU: Tensor? = nil,
-        layerIndex: Int = -1
+        layerIndex: Int = -1,
+        dtype: DType = .bf16,
+        device: Device = .shared
     ) {
         precondition(
             gateProj.count == router.nExperts,
@@ -761,6 +780,7 @@ public final class MoELayer: Module, DecoderLayer {
         self.sharedDownProj = sharedDownProj
         self.router = router
         self.hidden = hidden
+        self.gateWeightT = LagunaSteelGemm.weightT(gate, dtype: dtype, device: device)
         if let s = stackedInt4Experts {
             precondition(
                 s.numExperts == router.nExperts,
@@ -1212,18 +1232,50 @@ public final class MoELayer: Module, DecoderLayer {
     /// IMPORTANT: this commits the passed `cmd` (the router needs the
     /// gate logits on the CPU). The host model must obtain a fresh
     /// command buffer afterwards. See the file header.
+    /// `DecoderLayer` conformance: exact 4-arg signature required for
+    /// protocol witness matching (a defaulted 5th parameter does NOT
+    /// satisfy the protocol requirement, so `decodeWithPrecomputedLogits`
+    /// below is a separate entry point, not an overload of this one).
     public func decode(
+        _ h: Tensor, position: Int,
+        cache: any LayerCacheProtocol,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        decodeImpl(
+            h, position: position, cache: cache,
+            cmd: cmd, device: device, precomputedLogits: nil)
+    }
+
+    /// T28 lever 2: when the caller already computed the router logits (the
+    /// residual+RMSNorm+router fold in `LagunaLayer.forward` reuses the
+    /// normed row it just staged in threadgroup memory to also run the
+    /// router GEMV, see `LagunaResidualRmsRouterFuse`), call this instead
+    /// of `decode` to skip the redundant `gate(h, on: cmd)` dispatch.
+    public func decodeWithPrecomputedLogits(
+        _ h: Tensor, position: Int,
+        cache: any LayerCacheProtocol,
+        cmd: MTLCommandBuffer, device: Device,
+        precomputedLogits: Tensor
+    ) -> Tensor {
+        decodeImpl(
+            h, position: position, cache: cache,
+            cmd: cmd, device: device, precomputedLogits: precomputedLogits)
+    }
+
+    private func decodeImpl(
         _ h: Tensor, position _: Int,
         cache _: any LayerCacheProtocol,
-        cmd: MTLCommandBuffer, device: Device
+        cmd: MTLCommandBuffer, device: Device,
+        precomputedLogits: Tensor?
     ) -> Tensor {
         return Profile.signpost("moe.decode") { () -> Tensor in
         precondition(
             h.elementCount == hidden,
             "MoELayer.decode: input has \(h.elementCount) elements, expected hidden \(hidden)")
 
-        // ── 1. Gate gemv on the caller's command buffer ──────────────
-        let logitsTensor = gate(h, on: cmd)
+        // ── 1. Gate gemv on the caller's command buffer (skipped when the
+        //      caller already fused it into the residual+RMSNorm dispatch).
+        let logitsTensor = precomputedLogits ?? gate(h, on: cmd)
 
         // ── 2a. GPU MoE router fast path ──────────────────────────────
         // When `BUTTER_MOE_GPU_ROUTER=1` (default ON) AND the layer has
@@ -2158,7 +2210,30 @@ public final class MoELayer: Module, DecoderLayer {
         let mTotal = t * topK
         let moeIntermediate = stacked.moeIntermediate
         let dtBytes = dt.byteSize
-        let work = useDevicePlan ? cmd : device.makeCommandBuffer()
+        var work = useDevicePlan ? cmd : device.makeCommandBuffer()
+        // T25 diagnosis: split one MoE layer's prefill wall-clock into
+        // route / sort / gate+up-GEMM / down-GEMM / tail(unpermute+shared)
+        // phases via forced commit+wait checkpoints. Diagnostic-only:
+        // serializes the layer (like BUTTER_LAGUNA_TIMING's prefDepth=1)
+        // and is off by default (zero behavior change when unset).
+        // See benchmarks/laguna-xs/README.md T25.
+        let moePhaseTiming =
+            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_MOE_PHASE_TIMING"] == "1"
+        var moePhaseTimes: [(String, Double)] = []
+        var moePhaseT0 = CFAbsoluteTimeGetCurrent()
+        func moePhaseCheckpoint(_ label: String) {
+            guard moePhaseTiming else { return }
+            if work.status != .committed && work.status != .completed
+                && work.status != .error
+            {
+                work.commit()
+            }
+            work.waitUntilCompleted()
+            let ms = (CFAbsoluteTimeGetCurrent() - moePhaseT0) * 1000
+            moePhaseTimes.append((label, ms))
+            work = device.makeCommandBuffer()
+            moePhaseT0 = CFAbsoluteTimeGetCurrent()
+        }
         let hRows = hFlat.reshaped(to: [t, hidden])
         if prefOutFlatScratch == nil
             || prefOutFlatScratch!.dtype != dt
@@ -2190,8 +2265,30 @@ public final class MoELayer: Module, DecoderLayer {
             ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER"] == "1"
         let useSerialPathB =
             ProcessInfo.processInfo.environment["BUTTER_NVFP4_SERIAL_PATHB"] == "1"
+        // "pre" isolates whatever attention/norm work the caller already
+        // encoded onto this same command buffer before MoE started (this
+        // is the FIRST checkpoint of the layer's CB, so it is NOT free;
+        // don't misread a later "route" bucket as router-only cost unless
+        // this checkpoint exists to soak up the backlog).
+        moePhaseCheckpoint("pre")
         if !useGather {
-            let logitsAll = gate.callMany(hRows, t: t, on: work, device: device)
+            // T27 Stage 2: steel MMA GEMM fast path for the router
+            // projection (hidden -> nExperts, both %64==0 on Laguna XS:
+            // 2048 / 256), same naive-`Ops.gemm`-to-steel swap T26 did
+            // for attention's Q/K/V/O. Falls back to `gate.callMany`
+            // automatically when ineligible (non-bf16, non-64-aligned
+            // shapes, or BUTTER_LAGUNA_ATTN_STEEL_GEMM=0).
+            let logitsAll: Tensor
+            if let gateWeightT,
+                LagunaSteelGemm.eligible(
+                    t: t, outDim: router.nExperts, inDim: hidden, dtype: hRows.dtype)
+            {
+                logitsAll = LagunaSteelGemm.callMany(
+                    input: hRows, weightT: gateWeightT, t: t, outDim: router.nExperts,
+                    inDim: hidden, on: work, device: device)
+            } else {
+                logitsAll = gate.callMany(hRows, t: t, on: work, device: device)
+            }
             if useSerialPathB || expertBiasGPU == nil || expertBiasGPU!.dtype != dt
                 || topK != 8
             {
@@ -2321,6 +2418,7 @@ public final class MoELayer: Module, DecoderLayer {
                         scale, shape: [mTotal], dtype: dt, device: device)
                     _ = Ops.mul(weightsTok, scaleVec, on: work, into: weightsTok)
                 }
+                moePhaseCheckpoint("route")
 
                 // Expert GEMVs / QMM:
                 //   • Expert-group dense QMM (default T≥4): sort by expert, one
@@ -2438,6 +2536,7 @@ public final class MoELayer: Module, DecoderLayer {
                     sortedSource = st
                     sortedInvPerm = ip
                 }
+                moePhaseCheckpoint("sort")
                 if useExpertGroupQmm,
                     let se = sortedExperts, let st = sortedSource
                 {
@@ -2808,6 +2907,7 @@ public final class MoELayer: Module, DecoderLayer {
                             }
                             // In-place SwiGLU into gateF (skip separate mid buffer).
                             _ = Ops.swiglu(gate: gateF, up: upF, on: work, into: gateF)
+                            moePhaseCheckpoint("gateup")
                             Ops.nvfp4MoeGatherBm16(
                                 input: gateF, weight: stacked.downWeight,
                                 scales: stacked.downScales, indices: expIds,
@@ -2815,6 +2915,7 @@ public final class MoELayer: Module, DecoderLayer {
                                 blockSize: stacked.blockSize, global: stacked.global,
                                 on: work, into: downF)
                             Ops.castF32ToBf16(downF, into: downOut, on: work)
+                            moePhaseCheckpoint("down")
                         } else if useFusedGateUp {
                             // Native bf16 fused gate+up (x_rows, no materialise).
                             Ops.nvfp4MoeGatherBm16GateUp(
@@ -2829,6 +2930,7 @@ public final class MoELayer: Module, DecoderLayer {
                                 on: work)
                             let inner = Ops.swiglu(
                                 gate: gateOut, up: upOut, on: work, into: gateOut)
+                            moePhaseCheckpoint("gateup")
                             Ops.nvfp4MoeGatherBm16(
                                 input: inner, weight: stacked.downWeight,
                                 scales: stacked.downScales, indices: expIds,
@@ -2836,6 +2938,7 @@ public final class MoELayer: Module, DecoderLayer {
                                 blockSize: stacked.blockSize, global: stacked.global,
                                 preferNativeBf16: useNativeBf16Mpp,
                                 on: work, into: downOut)
+                            moePhaseCheckpoint("down")
                         } else {
                             // Materialise gather + concurrent pair (BM16 or BM64)
                             // / serial fallback.
@@ -2870,6 +2973,7 @@ public final class MoELayer: Module, DecoderLayer {
                             }
                             let inner = Ops.swiglu(
                                 gate: gateOut, up: upOut, on: work, into: gateOut)
+                            moePhaseCheckpoint("gateup")
                             Ops.nvfp4MoeGatherBm16(
                                 input: inner, weight: stacked.downWeight,
                                 scales: stacked.downScales, indices: expIds,
@@ -2877,6 +2981,7 @@ public final class MoELayer: Module, DecoderLayer {
                                 blockSize: stacked.blockSize, global: stacked.global,
                                 preferNativeBf16: useNativeBf16Mpp,
                                 on: work, into: downOut)
+                            moePhaseCheckpoint("down")
                         }
                     } else {
                         // Non-MPP gather QMM (token order).
@@ -3045,6 +3150,17 @@ public final class MoELayer: Module, DecoderLayer {
                         }
                     }
                 }
+            }
+            moePhaseCheckpoint("tail")
+            if moePhaseTiming, !moePhaseTimes.isEmpty {
+                let total = moePhaseTimes.reduce(0.0) { $0 + $1.1 }
+                let parts = moePhaseTimes.map {
+                    "\($0.0)=\(String(format: "%.2f", $0.1))ms"
+                }.joined(separator: " ")
+                fputs(
+                    "[laguna-moe-phase] L\(String(format: "%02d", layerIndex)) "
+                        + "total=\(String(format: "%.2f", total))ms \(parts)\n",
+                    stderr)
             }
             if commitAtEnd, !useDevicePlan,
                 work.status != .committed && work.status != .completed
@@ -3907,6 +4023,24 @@ public final class MoELayer: Module, DecoderLayer {
                 Tensor.empty(shape: [hidden], dtype: h.dtype, device: device))
         }
 
+        // T28: nine-slot merged dispatch (routed + shared in one threadgroup
+        // family) replaces the whole shared-expert dual-queue/single-queue
+        // chain below plus the routed swiglu/down-reduce branches further
+        // down. Only engages for the exact Laguna XS Path B shape (same
+        // guard as `lagunaHot` below) and when the shared expert is
+        // NVFP4-backed with a fuseGateUp-compatible gate/up pair. Escape
+        // `BUTTER_LAGUNA_NINE_SLOT=0`.
+        if LagunaNvfp4Fuse.nineSlotEnabled,
+            h.dtype == .bf16, stacked.moeIntermediate == 512, hidden == 2048,
+            topK == 8, stacked.blockSize == 16,
+            let nineSlot = ensureNineSlotShared(device: device)
+        {
+            return decodeNineSlot(
+                h: h, logitsTensor: logitsTensor, stacked: stacked,
+                expertBiasGPU: expertBiasGPU, shared: nineSlot,
+                cmd: cmd, device: device)
+        }
+
         // Shared expert depends only on h (not routing). Two schedules:
         //   dual-queue (BUTTER_LAGUNA_DUAL_QUEUE!=0, default ON historically):
         //     queue-B CB + event pair — overlaps router/experts, but costs
@@ -4217,6 +4351,109 @@ public final class MoELayer: Module, DecoderLayer {
             // Single-queue early path: shared already encoded above.
             return Ops.add(acc, sOut, on: cmd)
         }
+        return acc
+    }
+
+    /// T28 nine-slot dispatch: cached raw shared-expert NVFP4 fields (fused
+    /// [gate;up] bank + standalone down bank).
+    private struct NineSlotShared {
+        let fusedWeight: Tensor
+        let fusedScales: Tensor
+        let fusedGlobal: Float
+        let downWeight: Tensor
+        let downScales: Tensor
+        let downGlobal: Float
+    }
+
+    /// Lazy-attempt build of the nine-slot shared-expert fields (fused
+    /// gate/up bank via `ensureFusedSharedGateUp` + raw down bank). Mirrors
+    /// `ensureFusedSharedGateUp`'s single-attempt-then-cache pattern; returns
+    /// nil (permanently, for this layer instance) if the shared expert isn't
+    /// NVFP4-backed or its shapes don't match the fuseGateUp precondition.
+    private func ensureNineSlotShared(device: Device) -> NineSlotShared? {
+        if let fw = fusedSharedGateUpWeight, let fs = fusedSharedGateUpScales,
+            let dw = nineSlotSharedDownWeight, let ds = nineSlotSharedDownScales
+        {
+            return NineSlotShared(
+                fusedWeight: fw, fusedScales: fs, fusedGlobal: fusedSharedGateUpGlobal,
+                downWeight: dw, downScales: ds, downGlobal: nineSlotSharedDownGlobal)
+        }
+        if nineSlotAttempted { return nil }
+        nineSlotAttempted = true
+        guard let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj,
+            let (fw, fs, fg) = ensureFusedSharedGateUp(gate: sg, up: su, device: device),
+            let dLinear = sd.inner as? Nvfp4Linear,
+            dLinear.outDim == hidden, dLinear.inDim == 512
+        else { return nil }
+        nineSlotSharedDownWeight = dLinear.weight
+        nineSlotSharedDownScales = dLinear.scales
+        nineSlotSharedDownGlobal = dLinear.global
+        return NineSlotShared(
+            fusedWeight: fw, fusedScales: fs, fusedGlobal: fg,
+            downWeight: dLinear.weight, downScales: dLinear.scales,
+            downGlobal: dLinear.global)
+    }
+
+    /// T28 nine-slot merged MoE decode: router (unchanged) + one fused
+    /// routed+shared SwiGLU dispatch + one fused routed+shared down-reduce
+    /// dispatch. Returns the combined (routed + shared) MoE output directly,
+    /// with no separate `Ops.add(acc, sharedOut)`, since the down-reduce
+    /// kernel already folds the shared leg into its weighted-sum accumulator.
+    private func decodeNineSlot(
+        h: Tensor, logitsTensor: Tensor,
+        stacked: StackedNvfp4Experts, expertBiasGPU: Tensor,
+        shared: NineSlotShared,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let topK = router.topK
+        let nExperts = router.nExperts
+        let scoreDt = h.dtype
+
+        let unbiased = Ops.sigmoid(logitsTensor, on: cmd, into: unbiasedScoreScratch!)
+        let biased = Ops.add(unbiased, expertBiasGPU, on: cmd, into: biasedScoreScratch!)
+        Ops.moeRouterTopKBiased(
+            scoreBiased: biased, scoreUnbiased: unbiased,
+            indicesOut: routerIndicesScratch!,
+            weightsOut: routerWeightsScratch!,
+            nExperts: nExperts, k: topK, on: cmd)
+        let scale = router.routedScalingFactor
+        if scale != 1.0 {
+            if pathBScaleVecScratch == nil
+                || pathBScaleVecScratch!.dtype != scoreDt
+                || pathBScaleVecScratch!.elementCount != topK
+            {
+                pathBScaleVecScratch = Tensor.filled(
+                    scale, shape: [topK], dtype: scoreDt, device: device)
+            }
+            _ = Ops.mul(
+                routerWeightsScratch!, pathBScaleVecScratch!, on: cmd,
+                into: routerWeightsScratch!)
+        }
+
+        if sharedMidScratch == nil || sharedMidScratch!.dtype != h.dtype {
+            sharedMidScratch = Tensor.empty(shape: [512], dtype: h.dtype, device: device)
+        }
+        let inners = Array(expertInnerScratches.prefix(topK))
+        LagunaNvfp4Fuse.moeNineSlotSwigluQmv(
+            input: h,
+            gateWeight: stacked.gateWeight, gateScales: stacked.gateScales,
+            upWeight: stacked.upWeight, upScales: stacked.upScales,
+            expertIndices: routerIndicesScratch!,
+            routedOutputs: inners,
+            sharedWeight: shared.fusedWeight, sharedScales: shared.fusedScales,
+            sharedOutput: sharedMidScratch!,
+            global: stacked.global, sharedGlobal: shared.fusedGlobal,
+            on: cmd, device: device)
+
+        let acc = accumulatorScratch!
+        LagunaNvfp4Fuse.moeNineSlotDownReduce(
+            mids: inners, sharedMid: sharedMidScratch!,
+            expertIndices: routerIndicesScratch!, slotWeights: routerWeightsScratch!,
+            downWeight: stacked.downWeight, downScales: stacked.downScales,
+            sharedDownWeight: shared.downWeight, sharedDownScales: shared.downScales,
+            output: acc,
+            global: stacked.global, sharedGlobal: shared.downGlobal,
+            on: cmd, device: device)
         return acc
     }
 

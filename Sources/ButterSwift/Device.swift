@@ -337,6 +337,12 @@ public final class Device: @unchecked Sendable {
             do {
                 let set = try mtlDevice.makeResidencySet(descriptor: descriptor)
                 commandQueue.addResidencySet(set)
+                // MoE gate‖up / Hy3 dual-stream dispatches submit on the
+                // secondary queue too (`makeCommandBufferB`) and touch
+                // the same weight buffers; without this the driver
+                // still per-allocation-validates every commandQueueB
+                // encode even though the primary queue is fully pinned.
+                commandQueueB.addResidencySet(set)
                 weightResidencySet = set
             } catch {
                 // Driver refused to create the set; fall back to default

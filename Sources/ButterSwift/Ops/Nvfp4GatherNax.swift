@@ -24,6 +24,167 @@ extension Ops {
         return true
     }
 
+    /// Opt-in TRUE BK=64 NAX-class gather (T22 stage A/B, see
+    /// `benchmarks/laguna-xs/README.md`). Independent of `GATHER_NAX`
+    /// (checked first when set): two contiguous 64×32 half-blocks staged
+    /// per 64-wide K tile under one barrier pair, vs the BK=32 spike's one
+    /// block per 32-wide K tile under two barrier pairs, the same matmul
+    /// call order/accumulation, half the barrier count.
+    /// Requires: `BUTTER_NVFP4_GATHER_NAX64=1`, mTotal≥64, nOut%64==0, kIn%64==0.
+    public static func nvfp4MoeGatherPrefersNax64(
+        mTotal: Int, nOut: Int, kIn: Int
+    ) -> Bool {
+        let env = ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX64"]
+        guard env == "1" || env?.lowercased() == "true" else { return false }
+        guard mTotal >= 64, nOut % 64 == 0, kIn % 64 == 0 else { return false }
+        return true
+    }
+
+    /// Dispatch true-BK64 NAX-class NVFP4 gather QMM (live-compiled MPP body).
+    /// Caller must ensure `nvfp4MoeGatherPrefersNax64` (or equivalent shape checks).
+    public static func nvfp4MoeGatherNax64(
+        input: Tensor, weight: Tensor, scales: Tensor, indices: Tensor,
+        mTotal: Int, nOut: Int, kIn: Int,
+        blockSize: Int = 16, global: Float = 1.0,
+        preferNativeBf16: Bool = false,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(weight.dtype == .u32 && scales.dtype == .u8)
+        precondition(indices.dtype == .u32 && indices.elementCount == mTotal)
+        precondition(input.elementCount == mTotal * kIn)
+        precondition(out.elementCount == mTotal * nOut)
+        precondition(nOut % 64 == 0 && kIn % 64 == 0)
+
+        // Same late-layer half overflow escape as BM64/NAX: promote bf16 →
+        // f32 MPP unless early-layer preferNativeBf16 / force flag.
+        let forceBf16Mpp =
+            preferNativeBf16
+            || ProcessInfo.processInfo.environment["BUTTER_NVFP4_MPP_BF16"] == "1"
+        if input.dtype == .bf16 && !forceBf16Mpp {
+            let xTag = "nvfp4_nax64_xf_\(kIn)x\(nOut)"
+            let oTag = "nvfp4_nax64_outf_\(kIn)x\(nOut)"
+            let xBytes = mTotal * kIn * 4
+            let oBytes = mTotal * nOut * 4
+            let xBuf = Device.shared.intermediateScratch(tag: xTag, minBytes: xBytes)
+            let oBuf = Device.shared.intermediateScratch(tag: oTag, minBytes: oBytes)
+            let xF = Tensor(buffer: xBuf, offset: 0, shape: input.shape, dtype: .f32)
+            let outF = Tensor(buffer: oBuf, offset: 0, shape: out.shape, dtype: .f32)
+            Ops.castToF32(input, into: xF, on: cmd)
+            nvfp4MoeGatherNax64(
+                input: xF, weight: weight, scales: scales, indices: indices,
+                mTotal: mTotal, nOut: nOut, kIn: kIn,
+                blockSize: blockSize, global: global,
+                on: cmd, into: outF)
+            castF32ToBf16(outF, into: out, on: cmd)
+            return
+        }
+
+        guard let psoName: String = {
+            switch input.dtype {
+            case .f32: return "butter_nvfp4_gather_qmm_rhs_nax64_mpp_f32"
+            case .bf16: return "butter_nvfp4_gather_qmm_rhs_nax64_mpp_bf16"
+            default: return nil
+            }
+        }() else {
+            fatalError("nvfp4MoeGatherNax64: unsupported dtype \(input.dtype)")
+        }
+        let grid = MTLSize(
+            width: nOut / 64,
+            height: (mTotal + 63) / 64,
+            depth: 1)
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        var m = UInt32(mTotal), n = UInt32(nOut), k = UInt32(kIn)
+        var b = UInt32(blockSize), g = global
+        if ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX_VERBOSE"] == "1" {
+            struct Once { nonisolated(unsafe) static var printed = false }
+            if !Once.printed {
+                Once.printed = true
+                fputs(
+                    "nvfp4MoeGatherNax64 LIVE: \(psoName) "
+                        + "m=\(mTotal) n=\(nOut) k=\(kIn)\n",
+                    stderr)
+            }
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(weight.buffer, offset: weight.offset, index: 1)
+        enc.setBuffer(scales.buffer, offset: scales.offset, index: 2)
+        enc.setBuffer(indices.buffer, offset: indices.offset, index: 3)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 4)
+        enc.setBytes(&m, length: 4, index: 5)
+        enc.setBytes(&n, length: 4, index: 6)
+        enc.setBytes(&k, length: 4, index: 7)
+        enc.setBytes(&b, length: 4, index: 8)
+        enc.setBytes(&g, length: 4, index: 9)
+        enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+    }
+
+    /// Concurrent gate+up pair on the true-BK64 NAX-class gather kernel.
+    public static func nvfp4MoeGatherNax64Pair(
+        input: Tensor,
+        weight0: Tensor, scales0: Tensor, out0: Tensor,
+        weight1: Tensor, scales1: Tensor, out1: Tensor,
+        indices: Tensor,
+        mTotal: Int, nOut: Int, kIn: Int,
+        blockSize: Int = 16, global: Float = 1.0,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(input.dtype == out0.dtype && input.dtype == out1.dtype)
+        precondition(nOut % 64 == 0 && kIn % 64 == 0)
+        guard let psoName: String = {
+            switch input.dtype {
+            case .f32: return "butter_nvfp4_gather_qmm_rhs_nax64_mpp_f32"
+            case .bf16: return "butter_nvfp4_gather_qmm_rhs_nax64_mpp_bf16"
+            default: return nil
+            }
+        }() else {
+            // Unsupported dtype (e.g. f16): fall back to serial NAX64 calls.
+            nvfp4MoeGatherNax64(
+                input: input, weight: weight0, scales: scales0, indices: indices,
+                mTotal: mTotal, nOut: nOut, kIn: kIn,
+                blockSize: blockSize, global: global, on: cmd, into: out0)
+            nvfp4MoeGatherNax64(
+                input: input, weight: weight1, scales: scales1, indices: indices,
+                mTotal: mTotal, nOut: nOut, kIn: kIn,
+                blockSize: blockSize, global: global, on: cmd, into: out1)
+            return
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
+        else { return }
+        enc.setComputePipelineState(pso)
+        var mTotalU = UInt32(mTotal)
+        var nOutU = UInt32(nOut)
+        var kInU = UInt32(kIn)
+        var blockU = UInt32(blockSize)
+        var globalV = global
+        let grid = MTLSize(
+            width: nOut / 64,
+            height: (mTotal + 63) / 64,
+            depth: 1)
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(weight0.buffer, offset: weight0.offset, index: 1)
+        enc.setBuffer(scales0.buffer, offset: scales0.offset, index: 2)
+        enc.setBuffer(indices.buffer, offset: indices.offset, index: 3)
+        enc.setBuffer(out0.buffer, offset: out0.offset, index: 4)
+        enc.setBytes(&mTotalU, length: 4, index: 5)
+        enc.setBytes(&nOutU, length: 4, index: 6)
+        enc.setBytes(&kInU, length: 4, index: 7)
+        enc.setBytes(&blockU, length: 4, index: 8)
+        enc.setBytes(&globalV, length: 4, index: 9)
+        enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+        enc.setBuffer(weight1.buffer, offset: weight1.offset, index: 1)
+        enc.setBuffer(scales1.buffer, offset: scales1.offset, index: 2)
+        enc.setBuffer(out1.buffer, offset: out1.offset, index: 4)
+        enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+    }
+
     /// Dispatch NAX-class NVFP4 gather QMM (live-compiled MPP body).
     /// Caller must ensure `nvfp4MoeGatherPrefersNax` (or equivalent shape checks).
     public static func nvfp4MoeGatherNax(
