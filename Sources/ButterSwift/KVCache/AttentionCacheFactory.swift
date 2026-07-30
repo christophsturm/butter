@@ -112,10 +112,20 @@ func makeAttentionScratch(
         return AttentionCacheScratch(
             sharedK: Tensor.empty(shape: [nKVHeads, contextLength, headDim], dtype: dtype, device: device),
             sharedV: Tensor.empty(shape: [nKVHeads, contextLength, headDim], dtype: dtype, device: device),
-            kCodebook: auraConstantTensor(AURACodebook.centroids(dim: headDim, bits: scheme.keyBits), device),
-            kBoundaries: auraConstantTensor(AURACodebook.boundaries(dim: headDim, bits: scheme.keyBits), device),
-            vCodebook: auraConstantTensor(AURACodebook.centroids(dim: headDim, bits: scheme.valueBits), device),
-            vBoundaries: auraConstantTensor(AURACodebook.boundaries(dim: headDim, bits: scheme.valueBits), device))
+            // Codebook + boundaries must land in the cache's activation dtype:
+            // post-iron #226 the aura encode/decode kernels take `Tensor<T>`
+            // for both, and `AURAQuantizedKVCache` asserts dtype parity. The
+            // dtype-aware builders do the Lloyd-Max-precise Float→dtype host
+            // conversion (the old `auraConstantTensor` hardcoded f32, which
+            // tripped the parity precondition on every f16/bf16 AURA cache).
+            kCodebook: AURACodebook.centroidsTensor(
+                dim: headDim, bits: scheme.keyBits, dtype: dtype, device: device),
+            kBoundaries: AURACodebook.boundariesTensor(
+                dim: headDim, bits: scheme.keyBits, dtype: dtype, device: device),
+            vCodebook: AURACodebook.centroidsTensor(
+                dim: headDim, bits: scheme.valueBits, dtype: dtype, device: device),
+            vBoundaries: AURACodebook.boundariesTensor(
+                dim: headDim, bits: scheme.valueBits, dtype: dtype, device: device))
     }
 }
 
@@ -282,12 +292,6 @@ func attentionCacheGeometrySupports(kind: KVCacheKind, headDim: Int) -> Bool {
     case .auraQuantized:
         return headDim > 0 && headDim & (headDim - 1) == 0
     }
-}
-
-private func auraConstantTensor(_ data: [Float], _ device: Device) -> Tensor {
-    let t = Tensor.empty(shape: [data.count], dtype: .f32, device: device)
-    t.copyIn(from: data)
-    return t
 }
 
 private func warnCacheFallback(_ scheme: String, reason: String) {
