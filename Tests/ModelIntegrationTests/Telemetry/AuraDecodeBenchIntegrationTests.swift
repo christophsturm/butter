@@ -116,7 +116,7 @@ struct AuraDecodeBenchIntegrationTests {
 
         // Build a token sequence long enough to seed the cache to
         // `kvLength` positions before the timed decode begins.
-        let promptTokens = m.tokenizer.encode(text: Self.samplePrompt)
+        let promptTokens = m.textTokenizer.encode(text: Self.samplePrompt)
         precondition(
             kvLength >= promptTokens.count,
             "kvLength \(kvLength) must be ≥ promptTokens.count \(promptTokens.count)")
@@ -319,7 +319,7 @@ struct AuraDecodeBenchIntegrationTests {
         // (allocated lazily inside `prepareForAttention`).
         let packedBytesAllocated = auraFirst.bytesAllocated
         let mirrorBytesIfAlloc =
-            auraFirst.nKVHeads * auraFirst.maxSeq * auraFirst.headDim * 2  // bf16
+            auraFirst.nKVHeads * auraFirst.capacity * auraFirst.headDim * 2  // bf16
         let savingsRatio = Double(mirrorBytesIfAlloc) / Double(packedBytesAllocated)
         print(
             "[aura4v4 cache layout @ maxSeq=4096] "

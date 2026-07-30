@@ -50,13 +50,13 @@ public protocol QualityScorable {
 // primitives the metrics need.
 extension Model: QualityScorable {
     public func makeScoringCaches(device: Device) -> [any LayerCacheProtocol] {
-        engine.makeLayerCaches(maxSeq: nil, device: device)
+        textEngine.makeLayerCaches(maxSeq: nil, device: device)
     }
 
     public func scoringForward(
         tokenId: Int, position: Int,
         caches: [any LayerCacheProtocol], device: Device
     ) -> Tensor {
-        engine.forward(tokenId: tokenId, position: position, caches: caches, device: device)
+        textEngine.forward(tokenId: tokenId, position: position, caches: caches, device: device)
     }
 }

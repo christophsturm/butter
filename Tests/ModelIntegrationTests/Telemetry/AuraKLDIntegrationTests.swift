@@ -68,9 +68,9 @@ struct AuraKLDIntegrationTests {
             try await Model.load(qwen3LocalPath, options: opts)
         }
         print("loadSmoke: loaded. engine type=\(type(of: m.engine))")
-        let caches = m.engine.makeLayerCaches(maxSeq: 256)
+        let caches = m.textEngine.makeLayerCaches(maxSeq: 256)
         print("loadSmoke: caches=\(caches.count)")
-        let logits = m.engine.forward(tokenId: 0, position: 0, caches: caches)
+        let logits = m.textEngine.forward(tokenId: 0, position: 0, caches: caches)
         print("loadSmoke: vocab=\(logits.elementCount)")
         let firstFew = Array(logits.toFloatArray().prefix(5))
         print("loadSmoke: first-5-logits=\(firstFew)")
@@ -296,7 +296,7 @@ struct AuraKLDIntegrationTests {
         let m = try await ModelLoadLock.shared.loadSerially {
             try await Model.load(qwen3LocalPath, options: opts)
         }
-        let tokens = m.tokenizer.encode(text: Self.samplePrompt)
+        let tokens = m.textTokenizer.encode(text: Self.samplePrompt)
         guard let engine = m.qwen3 else {
             throw NSError(
                 domain: "AuraKLDIntegrationTests", code: -1,

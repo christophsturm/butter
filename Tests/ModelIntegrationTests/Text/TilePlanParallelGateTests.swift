@@ -110,7 +110,7 @@ struct TilePlanParallelGateTests {
 
         let seed =
             "The history of the printing press began when European craftsmen of the 15th century combined movable metal type with oil based ink screw presses paper to mass produce printed books pamphlets and broadsheets revolutionising communication"
-        let seedEncoded = m.tokenizer.encode(text: seed)
+        let seedEncoded = m.textTokenizer.encode(text: seed)
 
         for point in Self.ladder {
             var encoded = seedEncoded

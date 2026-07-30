@@ -90,20 +90,20 @@ public enum NIAH {
         maxAnswerTokens: Int = 24,
         device: Device = .shared
     ) -> Result {
-        let maxSeq = model.engine.maxSeq
+        let maxSeq = model.textEngine.maxContextWindow
         let lengths =
             contextLengths
             .map { Swift.min($0, maxSeq) }
             .filter { $0 > 0 }
             .reduce(into: [Int]()) { acc, l in if !acc.contains(l) { acc.append(l) } }
 
-        let fillerTokens = model.tokenizer.encode(text: fillerSentence)
-        let needleTokens = model.tokenizer.encode(text: " " + needle.fact + " ")
-        let questionTokens = model.tokenizer.encode(
+        let fillerTokens = model.textTokenizer.encode(text: fillerSentence)
+        let needleTokens = model.textTokenizer.encode(text: " " + needle.fact + " ")
+        let questionTokens = model.textTokenizer.encode(
             text: "\n\nQuestion: " + needle.question + "\nAnswer:")
         let bos: Int? =
-            (model.engine.requiresLeadingBOS)
-            ? (model.tokenizer.bosTokenId ?? model.config.bosTokenId) : nil
+            (model.textEngine.requiresLeadingBOS)
+            ? (model.textTokenizer.bosTokenId ?? model.config.bosTokenId) : nil
 
         var trials: [Trial] = []
         for length in lengths {
@@ -226,8 +226,7 @@ public protocol EOSProviding {
 
 extension Model: Tokenizing {
     public func decodeTokens(_ tokens: [Int]) -> String {
-        tokenizer.decode(tokens: tokens, skipSpecialTokens: true)
-    }
+        tokenizer?.decode(tokens: tokens, skipSpecialTokens: true) ?? ""    }
 }
 
 extension Model: EOSProviding {

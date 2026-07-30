@@ -310,7 +310,7 @@ extension Model {
             // Capturing path: route through full logits so we can read the
             // chosen token's probability. Only taken when the flag is on.
             if capturePPL {
-                let logits = engine.forward(tokenId: t, position: i, caches: caches)
+                let logits = textEngine.forward(tokenId: t, position: i, caches: caches)
                 let chosen: Int
                 switch path {
                 case .greedyGPU:

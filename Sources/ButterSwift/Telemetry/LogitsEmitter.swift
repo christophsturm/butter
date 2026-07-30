@@ -38,7 +38,7 @@ public enum LogitsEmitter {
     /// the default Qwen3 maxSeq is 256K and allocating that much KV
     /// for a 64-token corpus wastes seconds + several GB.
     public static func emit(
-        model: any LanguageModel, tokenIds: [Int],
+        model: any TextGenerating, tokenIds: [Int],
         maxSeq: Int? = nil,
         device: Device = .shared
     ) -> [[Float]] {

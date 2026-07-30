@@ -110,8 +110,8 @@ struct GenerateTextCommand: AsyncParsableCommand {
             // Mirror driveGeneration's chunk loop so this exercises the exact
             // prefill path (forwardMulti in prefillStepSize chunks), not the
             // per-token forward the verbose flag uses.
-            let promptTokens = m.tokenizer.encode(text: prompt)
-            let caches = m.engine.makeLayerCaches()
+            let promptTokens = m.textTokenizer.encode(text: prompt)
+            let caches = m.textEngine.makeLayerCaches()
             // Resolve chunk size through the SAME chain as the real generate
             // path (Generate.swift): env override, then the family/param-level
             // override, then the engine default. Skipping the middle link here
@@ -123,14 +123,14 @@ struct GenerateTextCommand: AsyncParsableCommand {
                 1,
                 ProcessInfo.processInfo.environment["BUTTER_PREFILL_STEP"].flatMap(Int.init)
                     ?? m.defaultGenerationParameters.prefillStepSize
-                    ?? m.engine.defaultPrefillStepSize)
+                    ?? m.textEngine.defaultPrefillStepSize)
             var pos = 0
             var lastLogits: Tensor?
             while pos < promptTokens.count {
                 let end = min(pos + chunkSize, promptTokens.count)
                 let chunk = Array(promptTokens[pos ..< end])
                 let cmd = Device.shared.makeCommandBuffer()
-                lastLogits = m.engine.forwardMulti(
+                lastLogits = m.textEngine.forwardMulti(
                     tokenIds: chunk, startingAt: pos,
                     caches: caches, on: cmd, device: Device.shared)
                 cmd.commit()

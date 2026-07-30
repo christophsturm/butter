@@ -192,8 +192,8 @@ public struct BenchRunner {
         // first scored token has a real left-context anchor. Idempotent —
         // skip when the tokenizer already emitted one or the family is not
         // BOS-critical.
-        if model.engine.requiresLeadingBOS,
-            let bos = model.tokenizer.bosTokenId ?? model.config.bosTokenId,
+        if model.textEngine.requiresLeadingBOS,
+            let bos = model.textTokenizer.bosTokenId ?? model.config.bosTokenId,
             tokens.first != bos
         {
             tokens.insert(bos, at: 0)
@@ -289,11 +289,11 @@ public struct BenchRunner {
         }
         print("  \(result.summaryLine)")
 
-        let weightsBytes = model.engine.parameters().reduce(0) { $0 + $1.1.byteCount }
+        let weightsBytes = model.textEngine.parameters().reduce(0) { $0 + $1.1.byteCount }
         let stats = GenerationStats(
             promptTokens: result.trials.map(\.contextTokens).max() ?? 0,
             generatedTokens: 0,
-            contextSize: model.engine.maxSeq,
+            contextSize: model.textEngine.maxContextWindow,
             prefillTimeS: 0, decodeTimeS: 0, timeToFirstTokenMs: 0,
             steadyTokensPerSecond: nil,
             baselineGPUBytes: memTracker.baseline.gpuBytes,

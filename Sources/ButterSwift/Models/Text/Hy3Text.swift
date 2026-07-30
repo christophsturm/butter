@@ -2139,7 +2139,7 @@ final class Hy3MoELayer: Hy3LayerProtocol {
 
 // ─── Model ───────────────────────────────────────────────────────────
 
-public final class Hy3Model: LanguageModel {
+public final class Hy3Model: TextGenerating {
     public let embedTokens: AnyEmbedding
     let layers: [any Hy3LayerProtocol]
     public let finalNorm: RMSNorm
@@ -2147,6 +2147,8 @@ public final class Hy3Model: LanguageModel {
 
     public let hidden, nLayers, nHeads, nKVHeads, headDim, vocab, maxSeq: Int
     public let dtype: DType
+    /// `TextGenerating`'s context ceiling — Hy3 stores it internally as `maxSeq`.
+    public var maxContextWindow: Int { maxSeq }
     /// One-shot flag: MoE decode scratches allocated for all layers.
     private var decodeScratchesReady = false
     /// Persistent residual buffer for single-token decode (avoids

@@ -48,12 +48,12 @@ struct Hy3IntegrationTests {
         // actually advertises so this doesn't false-fail on a
         // scaled-down test fixture.
         let expectedLayers = m.config.numLayers ?? 80
-        #expect(m.engine.nLayers == expectedLayers)
+        #expect(m.textEngine.nLayers == expectedLayers)
         if let hidden = m.config.hiddenSize {
-            #expect(m.engine.hidden == hidden)
+            #expect(m.textEngine.hidden == hidden)
         }
         if let vocab = m.config.vocabSize {
-            #expect(m.engine.vocab == vocab)
+            #expect(m.textEngine.vocab == vocab)
         }
         let hy3 = m.engine as? Hy3Model
         #expect(hy3 != nil, "expected Hy3Model engine")
