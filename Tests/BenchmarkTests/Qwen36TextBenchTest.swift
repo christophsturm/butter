@@ -44,7 +44,7 @@ import Testing
 
 /// Local-cache predicate — bench suite is also disabled if the
 /// Qwen3.6-A3B 4-bit MoE checkpoint isn't already cached. Computed
-/// against the HF cache hub layout; pre-download via `ffai download`
+/// against the HF cache hub layout; pre-download via `butter download`
 /// if the bench flag is on and the cache is empty.
 private let qwen36CacheAvailable: Bool = {
     let cache =
@@ -66,7 +66,7 @@ struct Qwen36TextBenchTest {
     /// MoE checkpoint. Switching to the HF identifier (vs the earlier
     /// hard-coded `/Users/.../Qwen3.6-35B-A3B-4bit` local path) means
     /// the suite runs against the same checkpoint on any developer's
-    /// machine once they've fetched it via `ffai download`.
+    /// machine once they've fetched it via `butter download`.
     private static let modelId = "mlx-community/Qwen3.6-35B-A3B-4bit"
 
     @Test("Qwen3.6-35B-A3B bench — short prefill + decode steady-state")

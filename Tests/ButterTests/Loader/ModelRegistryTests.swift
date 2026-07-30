@@ -175,7 +175,7 @@ struct ModelRegistryTests {
                 for: cfg(architecture: "NotAFamily", modelType: "alien")) == nil)
     }
 
-    // ─── Catalog (single source for `ffai models`) ───────────────────
+    // ─── Catalog (single source for `butter models`) ───────────────────
 
     @Test("catalog covers every implemented kind, each non-empty")
     func catalogCoversImplementedKinds() {

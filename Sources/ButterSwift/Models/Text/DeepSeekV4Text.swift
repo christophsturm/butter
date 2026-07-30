@@ -56,7 +56,7 @@
 //   stochastic) via 20 Sinkhorn-Knopp iterations. Folded into
 //   weights at LOAD time, not per token — no runtime kernel needed.
 // • **Clamped SwiGLU** — `swiglu_limit=10.0` applied to every MoE
-//   expert MLP. The Step-3 `mt_clamped_swiglu` kernel is the
+//   expert MLP. The Step-3 `iron_clamped_swiglu` kernel is the
 //   drop-in here.
 // • **MTP head** — `num_nextn_predict_layers=1`. Carries the same
 //   per-layer block shape as the main stack but its output flows
@@ -1393,7 +1393,7 @@ extension DeepSeekV4Model {
         // ── Sync-free GPU routing fast path ──
         // Once the resident expert pools for this layer are built (the
         // first token fills them via the CPU path below), route entirely
-        // on the GPU: top-K + weights via mt_dsv4_router_topk, raw→slot
+        // on the GPU: top-K + weights via iron_moe_router_topk_biased, raw→slot
         // remap, then the gather dispatches — NO per-layer
         // waitUntilCompleted. Removes 43 CPU↔GPU round-trips/token.
         // Correct when the routed experts are all pool-resident (always,

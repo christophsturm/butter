@@ -385,7 +385,7 @@ public final class Qwen3TTSBaseModel: @unchecked Sendable {
 
     /// Streaming text→waveform synthesis (`StreamingSynthesizer`
     /// conformance). Yields the synthesized waveform as `Tensor` chunks so
-    /// `ffai speak` can drive Qwen3TTSBase through the same uniform path as
+    /// `butter speak` can drive Qwen3TTSBase through the same uniform path as
     /// every other TTS model.
     ///
     /// ## Granularity — SINGLE yield

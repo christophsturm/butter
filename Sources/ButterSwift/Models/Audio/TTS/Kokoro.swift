@@ -402,7 +402,7 @@ public final class KokoroModel: @unchecked Sendable {
     }
 
     /// Streaming text→audio synthesis (the `StreamingSynthesizer`
-    /// contract the `ffai speak` CLI drives).
+    /// contract the `butter speak` CLI drives).
     ///
     /// **Kokoro consumes phonemes, not graphemes**, and Butter ships no
     /// bundled grapheme-to-phoneme (G2P) front-end. So `text` must already

@@ -1249,7 +1249,7 @@ public final class Granite4Model: TextGenerating {
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
 
         // `InspectTap` is a no-op unless BUTTER_INSPECT is set (single bool
-        // compare per boundary); under `ffai inspect --layer-trace` it
+        // compare per boundary); under `butter inspect --layer-trace` it
         // prints per-layer min/max/nan/inf + first values, committing the
         // work buffer to make `h` resident before each readback — which
         // composes with the committing-layer discipline below.

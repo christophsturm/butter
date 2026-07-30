@@ -32,7 +32,7 @@ import Testing
 /// MoE checkpoint. Switched off Tom's prior `/Users/tom/models/...`
 /// hard-coded local path so the suite runs against the same
 /// checkpoint on any developer's machine once they've fetched it via
-/// `ffai download`. Matches the same identifier the sibling
+/// `butter download`. Matches the same identifier the sibling
 /// `Qwen36TextBenchTest` + `Qwen35MoEBenchIntegrationTests` use.
 private let qwen36SpecModelId = "mlx-community/Qwen3.6-35B-A3B-4bit"
 

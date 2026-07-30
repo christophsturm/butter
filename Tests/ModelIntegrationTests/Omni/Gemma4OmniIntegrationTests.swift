@@ -23,7 +23,7 @@
 // 640-sample audio frames, per-frame video) straight into the Gemma4Dense
 // text backbone via lightweight RMSNorm+Linear embedders — no ViT /
 // Conformer encoder. Resolves the published `ekryski/gemma-4-12B-it-mlx-4bit`
-// conversion, preferring a local `ffai convert` output dir when present.
+// conversion, preferring a local `butter convert` output dir when present.
 
 import Foundation
 import TestHelpers
@@ -31,9 +31,9 @@ import Testing
 
 @testable import ButterSwift
 
-/// Local `ffai convert` output, then the published HF repo.
+/// Local `butter convert` output, then the published HF repo.
 let gemma4OmniLocalDir =
-    ("~/.cache/ffai/converts/gemma-4-12B-it-mlx-4bit" as NSString)
+    ("~/.cache/butter/converts/gemma-4-12B-it-mlx-4bit" as NSString)
     .expandingTildeInPath
 let gemma4OmniHFCache =
     ("~/.cache/huggingface/hub/models--ekryski--gemma-4-12B-it-mlx-4bit"
@@ -53,7 +53,7 @@ let gemma4OmniCacheAvailable: Bool =
     "Gemma4 Omni Integration", .serialized,
     .enabled(
         if: IntegrationGroupGating.enableOmniSuites && gemma4OmniCacheAvailable,
-        "Gemma 4 Omni suite: needs the omni-suite group enabled and the omni 4-bit checkpoint cached (or a local `ffai convert` output dir).")
+        "Gemma 4 Omni suite: needs the omni-suite group enabled and the omni 4-bit checkpoint cached (or a local `butter convert` output dir).")
 )
 struct Gemma4OmniIntegrationTests {
 

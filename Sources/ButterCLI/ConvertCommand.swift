@@ -197,7 +197,7 @@ struct ConvertCommand: AsyncParsableCommand {
         opts.expertSpec = expertBits
         // The driver emits a README.md (HF model card) only when
         // sourceID is set; pass the user-supplied source verbatim so
-        // the card's `base_model:` field and the example `ffai convert`
+        // the card's `base_model:` field and the example `butter convert`
         // command match what the user typed. Same goes for
         // `uploadRepo` — it appears in the example command when set
         // so the reader can reproduce the upload step.

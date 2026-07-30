@@ -649,7 +649,7 @@ public final class StyleTTS2Model: @unchecked Sendable {
     // ─── Streaming synthesis (StreamingSynthesizer) ───────────────────
 
     /// Streaming text→audio synthesis (the `StreamingSynthesizer`
-    /// contract the `ffai speak` CLI drives).
+    /// contract the `butter speak` CLI drives).
     ///
     /// StyleTTS2 / KittenTTS synthesize from *phonemes*, and on top of
     /// that this build's acoustic front-end (ALBERT + prosody predictor +

@@ -30,7 +30,7 @@ import Testing
 /// Bench target — the cached `mlx-community/Qwen3.5-35B-A3B-4bit`
 /// MoE checkpoint. Switched off Tom's prior `/Users/tom/...` hard-coded
 /// local path so the suite runs against the same checkpoint on any
-/// developer's machine once they've fetched it via `ffai download`.
+/// developer's machine once they've fetched it via `butter download`.
 private let qwen35MoEModelId = "mlx-community/Qwen3.5-35B-A3B-4bit"
 
 /// Local-cache predicate — bench is also disabled if the checkpoint

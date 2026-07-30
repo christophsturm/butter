@@ -14,14 +14,14 @@
 //
 // Integration test for the Gemma 4 Omni EAGLE drafter
 // (`gemma4_unified_assistant`). The drafter loads + quantizes + lists in
-// `ffai models`, but CANNOT generate standalone (it drafts from the target's
+// `butter models`, but CANNOT generate standalone (it drafts from the target's
 // hidden state), so the dispatcher rejects standalone generation. The
 // end-to-end EAGLE speculative-decode loop is Phase 8.7.
 //
 // `google/gemma-4-12B-it-assistant` is a GATED HuggingFace repo (separate
 // approval from the omni 12B). Until access is granted + the conversion is
 // hosted, this suite is skipped (and passes) — flip on by caching either the
-// local `ffai convert` output or `ekryski/gemma-4-12B-it-assistant-mlx-4bit`.
+// local `butter convert` output or `ekryski/gemma-4-12B-it-assistant-mlx-4bit`.
 
 import Foundation
 import TestHelpers
@@ -30,7 +30,7 @@ import Testing
 @testable import ButterSwift
 
 private let drafterLocalDir =
-    ("~/.cache/ffai/converts/gemma-4-12B-it-assistant-mlx-4bit" as NSString)
+    ("~/.cache/butter/converts/gemma-4-12B-it-assistant-mlx-4bit" as NSString)
     .expandingTildeInPath
 private let drafterHFCache =
     ("~/.cache/huggingface/hub/models--ekryski--gemma-4-12B-it-assistant-mlx-4bit"
@@ -81,7 +81,7 @@ struct Gemma4DraftIntegrationTests {
         func hasSuffix(_ s: String) -> Bool { keys.contains { $0.hasSuffix(s) } }
         // The EAGLE fusion: pre_projection (2·backbone_hidden -> hidden) consumes
         // the target's hidden state; post_projection (hidden -> backbone_hidden)
-        // feeds it back. Both must survive `ffai convert`.
+        // feeds it back. Both must survive `butter convert`.
         #expect(hasSuffix("pre_projection.weight"), "pre_projection dropped by convert")
         #expect(hasSuffix("post_projection.weight"), "post_projection dropped by convert")
     }
