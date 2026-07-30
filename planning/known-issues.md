@@ -76,23 +76,12 @@ Bisect continues; this list will be appended-to as more suites complete.
 
 **Status.** Diagnosed only; not in scope for the current bisect pass. Tracked here so the audio-tower migration can pick this up as the unified "audio CPU-attention → GPU SDPA" port.
 
-## AURA spec-decode rollback — stale atomic_or bits after truncate + re-append
-
-**Symptom.** `AURAQuantizedKVCacheTests.truncateReappendMatchesClean` fails: after a spec-decode `truncate` (rolling back a rejected speculative draft) and re-appending the accepted continuation, the re-decoded AURA slots come back as garbage (`maxErr ≈ 2e38` vs the `< 1e-3` a clean rollback yields). The other AURA cache tests (append / decode round-trips) pass, so the codebook + encode/decode path is sound in general — the bug is specific to the re-write-after-truncate case.
-
-**Status.** Surfaced 2026-07-29, the first time the unit-test target compiled on `ek/fix-all-the-things-dev-merge` (it was blocked by the reconciliation fossils until then, so this test had never run here). The Swift-side zero-on-rewrite guard in `AURAQuantizedKVCache.appendOnGPU` (zero `packed[pos]` when `pos < highWaterSlot`) *looks* correct, so the leak is likely in the `zeroPackedSlot` GPU dispatch or the regenerated AURA encode kernel's `atomic_or` semantics. Not yet determined whether it is purely pre-existing or an interaction with the iron-dev kernel regen.
-
-**Impact.** Spec-decode (draft-then-verify) with AURA-compressed KV caches only. Non-spec-decode AURA generation is unaffected (those cache tests pass). AURA is opt-in.
-
-**Next steps** (defer into the AURA / `AttentionCacheFactory` work):
-1. Confirm `zeroPackedSlot` actually clears the slot on the GPU — audit its dispatch shape / kernel.
-2. Check whether the current iron AURA encode kernel still `atomic_or`-accumulates (vs overwrite); if the semantics changed in the regen, the Swift zero-on-rewrite may be redundant or mistimed.
-3. Compare against `origin/dev`'s behavior to localize pre-existing vs regen-introduced.
-
 ## Resolved (2026-07-29)
 
 Closed out during the `ek/fix-all-the-things-dev-merge` reconciliation review. Kept as a short record so the investigation isn't re-opened from scratch.
 
 - **GPU pin at 100% (long-running).** The 2026-05 investigation (a freshly-regenerated MPP/coop-tile kernel with a pathological dispatch shape at production sizes) is no longer relevant on the current branch and has been dropped. `BUTTER_MAX_COMMAND_BUFFERS=16` remains the production default. If a GPU pin resurfaces, re-open with a fresh Metal System Trace capture rather than the stale hypothesis stack.
+
+- **AURA spec-decode rollback (`truncateReappendMatchesClean`).** Not a cache bug. In isolation the truncate + re-append path is exact (`maxErr = 0`); the `2e38` garbage only appeared in the full `make test-unit` run. Root cause: Swift Testing runs suites in parallel by default, and this exact-equality test shares `Device.shared` GPU scratch with concurrently-running suites — a neighbour's dispatch stomps its scratch mid-read. The test's own comment already assumed "the serialized `make test-unit` gate," but the Makefile never passed `--no-parallel`. Fixed by serializing `test-unit` (`test-stress` stays the uncapped-parallelism canary). Verified: 1795 tests / 234 suites green. Follow-up worth considering in the Ops layer: the `Ops.*` shared scratch slabs are not safe for concurrent GPU tests doing exact comparisons — either per-call scratch or a GPU-work lock would let `test-unit` parallelize again. Also noted: the AURA encode kernel `store`s `packed_out` (overwrite), it does not global-`atomic_or`, so the `highWaterSlot` zero-on-rewrite guard in `AURAQuantizedKVCache` is defensive/redundant for correctness — a candidate cleanup for the AURA pass.
 
 - **Quantization — 2-bit + mixed-precision.** Both shipped. 2-bit is live end-to-end: `iron_dequant_gemv_int2_{f32,f16,bf16}`, `iron_dequant_gather_int2_*`, and `iron_qmm_mma_int2_*` kernels are emitted by iron and dispatched from `Sources/ButterSwift/Ops/Ops.swift`; the roadmap lists 2/3/4/5/6/8-bit as shipped. Mixed-precision (per-tensor-class bit-width) is implemented via `Sources/ButterSwift/Converter/QuantSpec.swift` + `ConvertDriver.swift` (per-role `--bits` / `--embedding-bits` / `--lm-head-bits` / `--vision-bits` overrides) and per-tensor bit-width derivation on load. Test coverage tracked with the quant integration matrix.

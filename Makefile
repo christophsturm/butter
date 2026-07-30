@@ -133,8 +133,14 @@ bench: regenerate-kernels ## run `butter bench` in release (quality benches requ
 test: regenerate-kernels test-unit test-integration ## run unit then integration test suites
 
 .PHONY: test-unit
-test-unit: regenerate-kernels ## unit + Metal tests at production cap (BUTTER_MAX_COMMAND_BUFFERS=16)
-	BUTTER_MAX_COMMAND_BUFFERS=16 swift test --filter "ButterTests|IronSwiftTests"
+test-unit: regenerate-kernels ## unit + Metal tests at production cap (BUTTER_MAX_COMMAND_BUFFERS=16), serialized
+	@# --no-parallel: this is the SERIALIZED correctness gate. Several Metal
+	@# tests do exact-equality comparisons against a reference computed on the
+	@# same GPU, and the Ops layer shares Device.shared scratch slabs — running
+	@# suites concurrently lets one test's dispatch stomp another's scratch mid
+	@# read (e.g. AURAQuantizedKVCache rollback saw maxErr 2e38 under parallel
+	@# execution, 0 serialized). `test-stress` is the uncapped-parallelism canary.
+	BUTTER_MAX_COMMAND_BUFFERS=16 swift test --no-parallel --filter "ButterTests|IronSwiftTests"
 
 .PHONY: test-integration
 test-integration: regenerate-kernels ## end-to-end model tests; production cap + ModelLoadLock; matches release.yml
