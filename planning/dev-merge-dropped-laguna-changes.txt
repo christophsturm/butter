@@ -40,3 +40,52 @@ Tests/ModelIntegrationTests/Audio/TTS/StyleTTS2IntegrationTests.swift
 Tests/ModelIntegrationTests/ModelKVCacheMatrixIntegrationTests.swift
 Tests/ModelIntegrationTests/Text/Gemma4TextIntegrationTests.swift
 Tests/ModelIntegrationTests/Text/Qwen36TextIntegrationTests.swift
+
+# ─────────────────────────────────────────────────────────────────────
+# TRIAGE RESULT (2026-07-29) — all files above diffed vs origin/dev.
+# Verdict: only ONE genuine dropped capability. Everything else is either
+# byte-identical, a pure naming fossil (wh-iron-std / mt_→iron_ / Butter /
+# LanguageModel), or ALREADY-COVERED by our refactor (usually equal-or-richer:
+# the Ops monolith→Ops*.swift split is a superset; the TTS/InternLM2/Qwen2
+# tests add coverage dev lacks; GPTOSS uses in-kernel sdpaDecodeSink; the
+# Gemma4/Qwen36 integration cases moved to Gemma4IntegrationTests /
+# BenchmarkTests). No action needed on those.
+#
+# RECOVER (1): AURA auto-asymmetric KV-cache scheme — dormant in our branch.
+#   `AURAScheme.autoAsymmetric` + the `BUTTER_AURA_AUTO_ASYM=1` opt-in still
+#   exist, but NO production caller applies the policy (only AURACodebookTests
+#   references it). Dev applied it in each model's makeLayerCaches
+#   (LlamaText/Qwen3Text) before building codebooks. Default-OFF, so nothing is
+#   actively wrong — the env flag is just inert.
+#   Clean port (defer into the AttentionCacheFactory architecture work):
+#     1. Thread `nHeads` into AttentionCacheFactory.makeAttention{Caches,Scratch,
+#        Cache} (it currently only receives nKVHeads, so it can't compute
+#        gqaFactor = nHeads / nKVHeads).
+#     2. In the .auraQuantized(scheme) branch, resolve the effective scheme:
+#        AURAScheme.autoAsymmetricOptedIn ? AURAScheme.autoAsymmetric(
+#          requested: scheme, gqaFactor: nHeads / max(nKVHeads,1)) : scheme
+#     3. Pass nHeads at each family's makeLayerCaches call site (25 of them) —
+#        fixes every AURA-capable family at once (vs dev's Llama+Qwen3 only).
+#     4. Add a factory-level assertion to AURACodebookTests that an opted-in
+#        high-GQA build yields keyBits == 8.
+#   Touches the KV-cache factory + 25 call sites, so best folded into the
+#   planned factory/architecture pass rather than done standalone.
+#
+# VERIFY (3, low priority — confirm intent, no confirmed lost work):
+#   - ModelKVCacheMatrixIntegrationTests: ours gates the whole suite behind
+#     `enableKVCacheMatrixSuite` (off by default); dev auto-ran the smallest
+#     checkpoint per family. Confirm default `make test-integration` still
+#     exercises ≥1 cell per KV scheme, or affine/AURA cache paths get no
+#     default regression coverage.
+#   - NemotronTests + Nemotron.swift: dev added a unified `enum Nemotron` root
+#     (union of every variant) with tests; ours has none. Confirm registry
+#     dispatch doesn't need it.
+#   - ModelsCommand → ModelRegistryTable: catalog correctly consolidated, but
+#     example repo IDs dropped ~570→~80 (more families, fewer concrete
+#     targets). Confirm the trimmed list is intentional.
+#
+# NOTE: triage also surfaced (separately, NOT in the list above) 8 files that
+# did not compile against the refactored ModelEngine/TextGenerating interface
+# (Telemetry/NIAH, LogitsEmitter, QualityScorable, Hy3Text, BenchRunner,
+# Generate, GenerateCommand). Fixed 2026-07-29 — see the "reconciliation
+# fossils" commit.

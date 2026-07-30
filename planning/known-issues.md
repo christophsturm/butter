@@ -2,47 +2,7 @@
 
 Open bugs and rough notes captured during the model-family port. Each entry has enough context that a future session can pick it up cold.
 
-## GPU pin at 100% — long-running
-
-**Symptom.** During (some) model loads / runs the GPU pegs at 100 % utilisation and stays there. The machine does NOT freeze — `BUTTER_MAX_COMMAND_BUFFERS` caps the in-flight queue so we don't OOM the GPU — but the pin is real and the application becomes effectively unresponsive on that model.
-
-**Status.** Cause unknown. Could be:
-- A iron kernel with a dispatch shape that never converges (a reduction kernel encoded as `elementwiseGrid`, or an indirect dispatch reading a still-uninitialised threadgroup-count buffer).
-- An Butter-side path that re-encodes the same buffer in a busy loop without checking the prior commit's `status`.
-- A specific kernel emitted by iron that has a per-thread loop parameterised on a stride that goes to zero / negative at certain shapes.
-
-**Next steps when this lands as a priority.**
-1. Reproduce deterministically — capture the exact model + prompt that pins the GPU.
-2. Attach Metal System Trace (Instruments) while the pin is live. The trace shows which command buffer is in flight and which kernel is hung — that tells us iron-side vs Butter-side immediately.
-3. If iron-side: pull the kernel name from the trace, find the dispatch in `Ops.*`, audit the grid / threadgroup shape against the kernel's `## DISPATCH INVARIANTS` block.
-4. If Butter-side: check for a busy-loop that re-encodes the same compute pass without a `cmd.status` guard, or a missing `waitUntilCompleted` that lets the runtime queue grow unbounded.
-
-**Mitigation today.** `BUTTER_MAX_COMMAND_BUFFERS=16` (the production default since the wrong-dispatch GPU-pin post-mortem in `papers/optimizing-kernels-for-apple-m-series-architecture.md`) prevents the runaway queue from OOMing the device — that's why the pin is annoying but not fatal.
-
-### 2026-05-23 status — post-Phase 6.5 / 7 wave + recent iron churn
-
-**Hypothesis stack (ranked).** The Phase 6.5 (Vision) + Phase 7 (Audio) wave landed 18 commits on `ek/aura-port` without re-running any kernel or integration tests — every sub-agent prompt was "swift build only, don't run swift test on ModelTests". On the iron side, the `Sources/IronSwift/Resources/kernels.metallib` was regenerated 2026-05-23 01:24 against `iron@840d281`. That regen pulled in:
-
-- **#150** `mt_gated_delta_prep_chunk` — new chunked GDN prep+recurrence kernel.
-- **#149** "remove all hand-written InlineMsl — port the MPP kernels to the coop_tile DSL" — the int4/int8/fp16 spread the user has been working on in another session.
-- **#147** "All the remaining kernels" — large surface, broad.
-- **#144** bm8 MoE BGEMM + dynamic-M qmm + naming standardisation.
-
-Most likely cause: a kernel in #147 or #149 with a dispatch shape that goes pathological at production sizes but isn't caught by the small-N unit tests. The MPP coop_tile DSL port is the highest-suspicion bucket because cooperative-tensor type IDs drift across SDK versions and the DSL refactor reshuffled the lowering path.
-
-**Test plan to localise (when the machine has been rebooted and the pin cleared).**
-
-1. **Spot-check unit suite first.** `make test-unit` runs ButterTests + IronSwiftTests at small problem sizes against the real GPU. If it fails, the failing test name pins down the broken kernel immediately. ~3 minutes.
-2. **If unit suite passes, drop in a small integration.** `make test-integration --filter LlamaIntegrationTests` — Llama 3.2 1B exercises the core decode path (RMSNorm, RoPE, SDPA d128, gemv, argmax) without the multi-modal or hybrid kernels. If this pins the GPU, the bug is on a core kernel.
-3. **Bisect by family if step 2 passes.** `make test-integration --filter <Qwen3 | Gemma3 | NemotronH | Jamba | GraniteMoeHybrid | GPTOSS | Pixtral | Mistral3 | Whisper | Marvis>` — pick the families that cover the most distinct kernels (MoE, GDN, SSM, AURA, VLM, audio).
-4. **Once a family pins reliably:**
-   - **Path A — capture in Instruments (Metal System Trace).** Launch the failing test under Instruments → Metal System Trace. The trace shows the in-flight command buffer + its current dispatch. Read off the kernel name. If it's specialised (e.g. `mt_qmm_int4_f16_bm8_*`), that's our suspect.
-   - **Path B — `MTLCaptureManager` Metal frame capture from Butter.** Wrap the suspect dispatch with `MTLCaptureManager.shared()` `.startCapture` / `.stopCapture`. Saves a `.gputrace` you can open in Xcode and step through.
-5. **Localised? Audit the kernel's `## DISPATCH INVARIANTS` block in iron vs the Butter `Ops.*` wrapper that calls it.** Reduction-mode kernel encoded as `elementwiseGrid` is the canonical freeze pattern (see `papers/optimizing-kernels-for-apple-m-series-architecture.md`).
-
-**Capturing the pin live (if it can be done without reboot).** It's possible to attach Instruments to an already-pinned process and see which command buffer is in flight — `xcrun xctrace record --template "Metal System Trace" --attach <PID>`. Stop after ~5 seconds; the trace shows the queue depth and the hung dispatch. This is preferable to a reboot+rerun because we get the actual culprit rather than a candidate from rerunning.
-
-**Live signal at the moment.** The user reports the pin reproduces right now (2026-05-23) after a fresh reboot — i.e. it's not a sticky-from-previous-session situation. Some path the OS goes through on this branch's `kernels.metallib` is enough to trigger it. That makes the kernel-side hypothesis (one of the freshly-regenerated kernels) substantially more likely than an Butter-side busy-loop.
+> **Revalidation note (2026-07-29).** The entries below were captured during the 2026-05 model-family port and predate the `ek/fix-all-the-things-dev-merge` reconciliation (Butter rename + Laguna engine). Two have since been resolved and moved to [§ Resolved](#resolved-2026-07-29): the **GPU-pin-at-100%** investigation and the **quantization 2-bit + mixed-precision gap**. The remaining entries (CPU pin, audio CPU-attention, integration-bisect failures) still need re-validation against the current branch before they're actioned — kernel names, line numbers, and symptoms may have shifted with the reconciliation.
 
 ## CPU pin — vision / audio models burn all CPU cores
 
@@ -88,9 +48,9 @@ Per-suite serialised bisect run via `make integration-bisect` (commit `6047340`+
 
 - **CohereTranscribeIntegrationTests** — HF 404. Original `mlx-community/c4ai-aya-expanse-transcribe-mlx` archived; Cohere re-released as `cohere-transcribe-03-2026`. Fixed in commit `6ad9e73` pointing test at `mlx-community/cohere-transcribe-03-2026-mlx-8bit`.
 
-Triage queue from same run (root-cause TBD — most look pre-existing):
+Triage queue from same run (root-cause TBD — most look pre-existing; **all need re-validation against the current branch**):
 
-- **DeepSeekR1DistillIntegrationTests** — R1-Distill-Llama-8B PASSes; R1-Distill-Qwen-1.5B produces degenerate output (token 15 repeated). Manually verified `mt_add_rms_norm` at hidden=1536 with `maxResidErr=0`, `maxNormedErr=1.4e-6` against CPU reference — fusion is NOT the regressor. Likely a pre- existing Qwen2 (R1-Distill base architecture) issue.
+- **DeepSeekR1DistillIntegrationTests** — R1-Distill-Llama-8B PASSes; R1-Distill-Qwen-1.5B produces degenerate output (token 15 repeated). Manually verified `iron_add_rms_norm` at hidden=1536 with `maxResidErr=0`, `maxNormedErr=1.4e-6` against CPU reference — fusion is NOT the regressor. Likely a pre-existing Qwen2 (R1-Distill base architecture) issue.
 
 - **FastVLMIntegrationTests** — `Swift/ContiguousArrayBuffer.swift: 692: Fatal error: Index out of range` during the `load` test. Crash happens before the GPU-SDPA path runs, so the VLM agent's migration is not the cause. Suspect the SafeTensors-skip change or a pre-existing array index in the FastViT-HD loader.
 
@@ -98,7 +58,7 @@ Triage queue from same run (root-cause TBD — most look pre-existing):
 
 - **FishSpeechIntegrationTests** — `safetensors file not found: models--mlx-community--fish-audio-s2-pro-8bit/snapshots/.../ model.safetensors`. Snapshot directory exists, file is missing — incomplete cache. Needs re-download or upstream check.
 
-- **GLMASRIntegrationTests** — `Ops.swift:1072 Precondition failed: dequantGemv: input 65280 ≠ in_dim 1280`. Caller is feeding the wrong-rank tensor (looks like 51 rows of in_dim=1280 flat). Pre- existing shape bug in the GLMASR encoder/decoder.
+- **GLMASRIntegrationTests** — `Ops.swift:1072 Precondition failed: dequantGemv: input 65280 ≠ in_dim 1280`. Caller is feeding the wrong-rank tensor (looks like 51 rows of in_dim=1280 flat). Pre-existing shape bug in the GLMASR encoder/decoder.
 
 Bisect continues; this list will be appended-to as more suites complete.
 
@@ -116,25 +76,23 @@ Bisect continues; this list will be appended-to as more suites complete.
 
 **Status.** Diagnosed only; not in scope for the current bisect pass. Tracked here so the audio-tower migration can pick this up as the unified "audio CPU-attention → GPU SDPA" port.
 
-## Quantization — missing 2-bit support + mixed-precision schemes
+## AURA spec-decode rollback — stale atomic_or bits after truncate + re-append
 
-**Gap.** Butter's quantized weight surface (`QuantizedLinear` / `QuantizedEmbedding` + the `int4` / `int8` Iron kernels) covers the symmetric per-group `affineQuantized` cases we ship today: `bits ∈ {3, 4, 5, 6, 8}`. The integration matrix (`Tests/ModelTests/Quantized{3,4,5,6,8}bitIntegrationTests.swift`) exercises each, and all five passed in the 2026-05-24 bisect.
+**Symptom.** `AURAQuantizedKVCacheTests.truncateReappendMatchesClean` fails: after a spec-decode `truncate` (rolling back a rejected speculative draft) and re-appending the accepted continuation, the re-decoded AURA slots come back as garbage (`maxErr ≈ 2e38` vs the `< 1e-3` a clean rollback yields). The other AURA cache tests (append / decode round-trips) pass, so the codebook + encode/decode path is sound in general — the bug is specific to the re-write-after-truncate case.
 
-What's NOT covered yet:
+**Status.** Surfaced 2026-07-29, the first time the unit-test target compiled on `ek/fix-all-the-things-dev-merge` (it was blocked by the reconciliation fossils until then, so this test had never run here). The Swift-side zero-on-rewrite guard in `AURAQuantizedKVCache.appendOnGPU` (zero `packed[pos]` when `pos < highWaterSlot`) *looks* correct, so the leak is likely in the `zeroPackedSlot` GPU dispatch or the regenerated AURA encode kernel's `atomic_or` semantics. Not yet determined whether it is purely pre-existing or an interaction with the iron-dev kernel regen.
 
-1. **2-bit quantization.** No kernel variant, no `QuantizedLinear` path. `mlx-community` ships 2-bit conversions of several models (Qwen 3 32B, Llama 3 70B, etc.) that we can't load. Need:
-   - `dequant_gemv_int2_{f16,bf16}` and `mt_qmm_int2_*` kernels in iron (mirror the int4 codegen — same per-group `(scale, bias)` layout, just 2 bits per index).
-   - `Ops.dequantGemv` + `Ops.qmm` dispatch table extended with `bits == 2` cases.
-   - `QuantizedLinear` accepts `bits == 2` (currently the validator rejects it).
-   - `Tests/ModelTests/Quantized2bitIntegrationTests.swift` mirroring the existing pattern.
+**Impact.** Spec-decode (draft-then-verify) with AURA-compressed KV caches only. Non-spec-decode AURA generation is unaffected (those cache tests pass). AURA is opt-in.
 
-2. **Mixed-precision (per-tensor-class) quantization.** Some `mlx-community` checkpoints quantize each weight class at a different bit-width — e.g. attention projections at int4, MLP gate/up/down at int3, embeddings at int8, lm_head at int6. These are advertised as `mixed_3_6`, `mixed_4_8` etc. in the model card. The current loader (`AnyLinear.load(...)`) assumes a single uniform `bits` value from the config's `quantization` block; it can't decode a heterogeneous scheme.
+**Next steps** (defer into the AURA / `AttentionCacheFactory` work):
+1. Confirm `zeroPackedSlot` actually clears the slot on the GPU — audit its dispatch shape / kernel.
+2. Check whether the current iron AURA encode kernel still `atomic_or`-accumulates (vs overwrite); if the semantics changed in the regen, the Swift zero-on-rewrite may be redundant or mistimed.
+3. Compare against `origin/dev`'s behavior to localize pre-existing vs regen-introduced.
 
-Sketch: extend the config decoder to recognise per-key bit-widths (probably a `quantization.weight_specs` dict in the config), thread the per-tensor `bits` through `loadLinear` / `loadEmbedding`, and let each call pick the matching kernel variant. No new kernels required — every selected bit-width already has one (modulo gap (1) for int2).
+## Resolved (2026-07-29)
 
-**Why it matters.** 2-bit is the only path to fit the 70B-class dense models (Llama 3 70B, Qwen 3 70B) in a single Apple Silicon device's wired memory; mixed-precision is what the better `mlx-community` conversions are starting to ship (preserves quality on the attention projections + lm_head while keeping the MLP slim). Without these we can't load 30-40 % of the recent zoo.
+Closed out during the `ek/fix-all-the-things-dev-merge` reconciliation review. Kept as a short record so the investigation isn't re-opened from scratch.
 
-**Test bar.** When implemented:
-- `make test-unit` must add a 2-bit dequant_gemv GPU correctness test mirroring the existing int4/int8 ones, against a CPU reference.
-- `Quantized2bitIntegrationTests` + `MixedPrecisionIntegrationTests` added to the bisect runner.
+- **GPU pin at 100% (long-running).** The 2026-05 investigation (a freshly-regenerated MPP/coop-tile kernel with a pathological dispatch shape at production sizes) is no longer relevant on the current branch and has been dropped. `BUTTER_MAX_COMMAND_BUFFERS=16` remains the production default. If a GPU pin resurfaces, re-open with a fresh Metal System Trace capture rather than the stale hypothesis stack.
 
+- **Quantization — 2-bit + mixed-precision.** Both shipped. 2-bit is live end-to-end: `iron_dequant_gemv_int2_{f32,f16,bf16}`, `iron_dequant_gather_int2_*`, and `iron_qmm_mma_int2_*` kernels are emitted by iron and dispatched from `Sources/ButterSwift/Ops/Ops.swift`; the roadmap lists 2/3/4/5/6/8-bit as shipped. Mixed-precision (per-tensor-class bit-width) is implemented via `Sources/ButterSwift/Converter/QuantSpec.swift` + `ConvertDriver.swift` (per-role `--bits` / `--embedding-bits` / `--lm-head-bits` / `--vision-bits` overrides) and per-tensor bit-width derivation on load. Test coverage tracked with the quant integration matrix.
