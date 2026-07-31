@@ -80,7 +80,10 @@ public enum VisionLanguageArchitectures {
         if let arch = config.architecture, architectures.contains(arch) {
             return true
         }
-        if config.nested("vision_config") != nil {
+        // Some text-only mlx conversions ship an empty `vision_config: {}`
+        // (e.g. mlx-community Laguna XS). Only treat a non-empty nested
+        // block as VL signal.
+        if let vc = config.nested("vision_config"), !vc.isEmpty {
             return true
         }
         // VL-only model_types — none of these have a text-only
@@ -771,6 +774,17 @@ public enum ModelRegistry {
                 config: config, weights: weights,
                 options: options, device: device)
         }
+
+        // Laguna (poolside) — hybrid iSWA + sigmoid-bias MoE. Config-driven
+        // for S-2.1 and XS-2.1. Routes through its own family file.
+        if Laguna.architectures.contains(config.architecture ?? "")
+            || Laguna.modelTypes.contains(config.modelType ?? "")
+        {
+            return try loadLaguna(
+                config: config, weights: weights,
+                options: options, device: device)
+        }
+
         throw ModelError.unsupportedArchitecture(
             config.architecture ?? config.modelType ?? "<unknown>"
         )
@@ -915,6 +929,22 @@ public enum ModelRegistry {
             engine: engine,
             defaultGenerationParameters: variant.defaultGenerationParameters)
     }
+
+
+    public static func loadLaguna(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try Laguna.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(
+            engine: engine,
+            defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
+
 
     public static func loadGranite4(
         config: ModelConfig, weights: SafeTensorsBundle,

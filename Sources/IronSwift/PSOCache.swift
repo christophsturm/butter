@@ -118,7 +118,9 @@ public final class PSOCache: @unchecked Sendable {
         let function: MTLFunction
         if Self.isMppKernel(name) {
             function = try liveCompileMppFunction(name)
-        } else if let fn = library.library.makeFunction(name: name) {
+        } else if let fn = library.makeFunction(name: name) {
+            // Prefer kernels_extra.metallib overlays (fast qdot eidx, laguna
+            // Path B fuses) over the iron main metallib of the same name.
             function = fn
         } else {
             throw PSOCacheError.kernelNotFound(name)
@@ -136,7 +138,7 @@ public final class PSOCache: @unchecked Sendable {
             // not apply (and on CI the metallib is built by the same toolchain
             // that runs the tests, so there is no header skew to begin with).
             guard Self.isMppKernel(name),
-                let aot = library.library.makeFunction(name: name)
+                let aot = library.makeFunction(name: name)
             else {
                 throw PSOCacheError.psoCompileFailed(name, error)
             }

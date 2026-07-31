@@ -1,0 +1,573 @@
+// Copyright 2026 Tom Turney (@TheTom)
+//
+// Laguna prefill SDPA: optional `sdpaPrefillMma` path (Hy3-style) via
+// bf16→f16 cast + compact KV. Opt-in: BUTTER_LAGUNA_SDPA_PREFILL_MMA=1
+// (default ON when nRows≥32 and nRows%32==0 for full-attn / unwindowed).
+// Escape: BUTTER_LAGUNA_SDPA_PREFILL_MMA=0
+//
+// Decode QK-norm + plain RoPE fuse for sliding layers (T=1):
+//   BUTTER_LAGUNA_FUSED_QK_NORM_ROPE != "0" (DEFAULT ON). Escape `=0`.
+// Port of mlxfast DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE — one TG per head,
+// one simdgroup, no threadgroup barrier (simd_sum already broadcasts).
+
+import Foundation
+import Metal
+import IronSwift
+
+enum LagunaSdpa {
+    static var prefillMmaEnabled: Bool {
+        let env = ProcessInfo.processInfo.environment["BUTTER_LAGUNA_SDPA_PREFILL_MMA"]
+        if env == "0" { return false }
+        if env == "1" { return true }
+        return true  // default ON when shapes allow
+    }
+
+    nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]
+    private static let lock = NSLock()
+
+    private static func pso(_ name: String, source: String, device: MTLDevice)
+        -> MTLComputePipelineState
+    {
+        lock.lock(); defer { lock.unlock() }
+        if let p = psoCache[name] { return p }
+        let lib = try! device.makeLibrary(source: source, options: MTLCompileOptions())
+        let fn = lib.makeFunction(name: name)!
+        let p = try! device.makeComputePipelineState(function: fn)
+        psoCache[name] = p
+        return p
+    }
+
+    private static let compactSrc = """
+    #include <metal_stdlib>
+    using namespace metal;
+    // Compact strided bf16 KV [nKV, maxSeq, D] → packed f16 [nKV, kLen, D].
+    kernel void laguna_compact_kv_bf16_to_f16(
+        device const bfloat *src [[buffer(0)]],
+        device half *dst [[buffer(1)]],
+        constant uint &n_kv [[buffer(2)]],
+        constant uint &max_seq [[buffer(3)]],
+        constant uint &k_len [[buffer(4)]],
+        constant uint &head_dim [[buffer(5)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        uint h = gid.x;
+        uint td = gid.y;
+        if (h >= n_kv || td >= k_len * head_dim) return;
+        uint t = td / head_dim;
+        uint d = td % head_dim;
+        uint srcIdx = ((h * max_seq) + t) * head_dim + d;
+        uint dstIdx = ((h * k_len) + t) * head_dim + d;
+        dst[dstIdx] = half(float(src[srcIdx]));
+    }
+    """
+
+    private static let castF16ToBf16Src = """
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void laguna_cast_f16_to_bf16(
+        device const half *inp [[buffer(0)]],
+        device bfloat *out [[buffer(1)]],
+        uint i [[thread_position_in_grid]]
+    ) {
+        out[i] = bfloat(float(inp[i]));
+    }
+    """
+
+    static func compactKvBf16ToF16(
+        src: Tensor, nKV: Int, maxSeq: Int, kLen: Int, headDim: Int,
+        on cmd: MTLCommandBuffer, device: Device, into out: Tensor? = nil,
+        encoder: MTLComputeCommandEncoder? = nil
+    ) -> Tensor {
+        precondition(src.dtype == .bf16 && kLen > 0 && kLen <= maxSeq)
+        let result = out ?? Tensor.empty(shape: [nKV, kLen, headDim], dtype: .f16, device: device)
+        let p = pso(
+            "laguna_compact_kv_bf16_to_f16", source: compactSrc, device: device.mtlDevice)
+        let owns = encoder == nil
+        guard let enc = encoder ?? cmd.makeComputeCommandEncoder() else { return result }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(src.buffer, offset: src.offset, index: 0)
+        enc.setBuffer(result.buffer, offset: result.offset, index: 1)
+        var nKVU = UInt32(nKV), maxU = UInt32(maxSeq), kU = UInt32(kLen), dU = UInt32(headDim)
+        enc.setBytes(&nKVU, length: 4, index: 2)
+        enc.setBytes(&maxU, length: 4, index: 3)
+        enc.setBytes(&kU, length: 4, index: 4)
+        enc.setBytes(&dU, length: 4, index: 5)
+        let td = kLen * headDim
+        enc.dispatchThreads(
+            MTLSize(width: nKV, height: td, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1, height: min(td, 256), depth: 1))
+        if owns { enc.endEncoding() }
+        return result
+    }
+
+    /// Ring of scratch slots so prefill layer-pipe (depth 4) does not
+    /// overwrite an in-flight layer's SDPA temps.
+    private static let scratchRing = 8
+    nonisolated(unsafe) private static var scratchSlot: Int = 0
+    private static let scratchSlotLock = NSLock()
+
+    private static func nextSlot() -> Int {
+        scratchSlotLock.lock()
+        let s = scratchSlot
+        scratchSlot = (scratchSlot + 1) % scratchRing
+        scratchSlotLock.unlock()
+        return s
+    }
+
+    /// Grow-only scratch via Device.intermediateScratch (ring-tagged).
+    private static func scratch(
+        tag: String, shape: [Int], dtype: DType, device: Device, slot: Int
+    ) -> Tensor {
+        let n = shape.reduce(1, *)
+        let bytes = n * dtype.byteSize
+        let buf = device.intermediateScratch(
+            tag: "\(tag)_s\(slot)", minBytes: bytes)
+        return Tensor(buffer: buf, offset: 0, shape: shape, dtype: dtype)
+    }
+
+    static func castF16ToBf16(
+        _ input: Tensor, into out: Tensor, on cmd: MTLCommandBuffer, device: Device
+    ) {
+        precondition(input.dtype == .f16 && out.dtype == .bf16)
+        precondition(input.elementCount == out.elementCount)
+        let n = input.elementCount
+        let p = pso(
+            "laguna_cast_f16_to_bf16", source: castF16ToBf16Src, device: device.mtlDevice)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 1)
+        enc.dispatchThreads(
+            MTLSize(width: n, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(n, 256), height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// Causal prefill SDPA via `sdpaPrefillMma` (f16 MMA). Returns bf16
+    /// `[nRows, nHeads*headDim]`. headDim=128, nRows≥32. Pads Q/K to next
+    /// multiple of 32 when needed (pad queries discarded after).
+    static func prefillMmaBf16(
+        qTHD: Tensor,  // [nRows, nHeads, headDim] bf16
+        cacheK: Tensor, cacheV: Tensor,
+        nRows: Int, position: Int,
+        nHeads: Int, nKVHeads: Int, headDim: Int,
+        maxSeq: Int, scale: Float,
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor? {
+        guard prefillMmaEnabled,
+            qTHD.dtype == .bf16,
+            headDim == 128,
+            nRows >= 32
+        else { return nil }
+
+        // Pad T up to next BQ=32 tile (kernel requirement).
+        let tPad = ((nRows + 31) / 32) * 32
+        let kReal = position + nRows
+        let kPad = position + tPad
+        precondition(kReal <= maxSeq && kPad <= maxSeq + 32)  // pad may exceed cache
+        // If pad would need K beyond maxSeq, fall back (rare at ctx clamp).
+        if kPad > maxSeq { return nil }
+
+        let qElems = nRows * nHeads * headDim
+        let qPadElems = tPad * nHeads * headDim
+        let slot = nextSlot()
+
+        // Scratch temps (ring of 8 — safe under prefill pipe depth 4).
+        let qPadBf = scratch(
+            tag: "laguna_sdpa_qpad_bf", shape: [tPad, nHeads, headDim],
+            dtype: .bf16, device: device, slot: slot)
+        let qF16 = scratch(
+            tag: "laguna_sdpa_qf16", shape: [tPad, nHeads, headDim],
+            dtype: .f16, device: device, slot: slot)
+        let qHTD = scratch(
+            tag: "laguna_sdpa_qhtd", shape: [nHeads, tPad, headDim],
+            dtype: .f16, device: device, slot: slot)
+        let outHTD = scratch(
+            tag: "laguna_sdpa_outhtd", shape: [nHeads, tPad, headDim],
+            dtype: .f16, device: device, slot: slot)
+        let outTHD = scratch(
+            tag: "laguna_sdpa_outthd", shape: [tPad, nHeads, headDim],
+            dtype: .f16, device: device, slot: slot)
+        // Owned output — must not share ring (caller holds across layers).
+        let outBf = Tensor.empty(
+            shape: [nRows, nHeads * headDim], dtype: .bf16, device: device)
+        let kPacked = scratch(
+            tag: "laguna_sdpa_kpack", shape: [nKVHeads, kPad, headDim],
+            dtype: .f16, device: device, slot: slot)
+        let vPacked = scratch(
+            tag: "laguna_sdpa_vpack", shape: [nKVHeads, kPad, headDim],
+            dtype: .f16, device: device, slot: slot)
+
+        // Q pad: copy real rows, zero pad tail.
+        if let blit = cmd.makeBlitCommandEncoder() {
+            blit.copy(
+                from: qTHD.buffer, sourceOffset: qTHD.offset,
+                to: qPadBf.buffer, destinationOffset: qPadBf.offset,
+                size: qElems * 2)
+            if tPad > nRows {
+                let padOff = qPadBf.offset + qElems * 2
+                blit.fill(
+                    buffer: qPadBf.buffer,
+                    range: padOff ..< (padOff + (qPadElems - qElems) * 2),
+                    value: 0)
+            }
+            blit.endEncoding()
+        }
+
+        // Q: bf16 [Tpad,H,D] → f16 → transpose → [H,Tpad,D]
+        _ = Ops.castBf16ToF16(
+            qPadBf.reshaped(to: [qPadElems]),
+            into: qF16.reshaped(to: [qPadElems]), on: cmd)
+        _ = Ops.transposeTHD_f16(qF16, t: tPad, h: nHeads, d: headDim, on: cmd, into: qHTD)
+
+        // K/V: concurrent compact (common path kPad==kReal).
+        if kPad == kReal {
+            if let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) {
+                _ = compactKvBf16ToF16(
+                    src: cacheK, nKV: nKVHeads, maxSeq: maxSeq, kLen: kReal,
+                    headDim: headDim, on: cmd, device: device, into: kPacked, encoder: enc)
+                _ = compactKvBf16ToF16(
+                    src: cacheV, nKV: nKVHeads, maxSeq: maxSeq, kLen: kReal,
+                    headDim: headDim, on: cmd, device: device, into: vPacked, encoder: enc)
+                enc.endEncoding()
+            } else {
+                _ = compactKvBf16ToF16(
+                    src: cacheK, nKV: nKVHeads, maxSeq: maxSeq, kLen: kReal,
+                    headDim: headDim, on: cmd, device: device, into: kPacked)
+                _ = compactKvBf16ToF16(
+                    src: cacheV, nKV: nKVHeads, maxSeq: maxSeq, kLen: kReal,
+                    headDim: headDim, on: cmd, device: device, into: vPacked)
+            }
+        } else {
+            let kRealPacked = scratch(
+                tag: "laguna_sdpa_kreal", shape: [nKVHeads, kReal, headDim],
+                dtype: .f16, device: device, slot: slot)
+            let vRealPacked = scratch(
+                tag: "laguna_sdpa_vreal", shape: [nKVHeads, kReal, headDim],
+                dtype: .f16, device: device, slot: slot)
+            if let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) {
+                _ = compactKvBf16ToF16(
+                    src: cacheK, nKV: nKVHeads, maxSeq: maxSeq, kLen: kReal,
+                    headDim: headDim, on: cmd, device: device, into: kRealPacked, encoder: enc)
+                _ = compactKvBf16ToF16(
+                    src: cacheV, nKV: nKVHeads, maxSeq: maxSeq, kLen: kReal,
+                    headDim: headDim, on: cmd, device: device, into: vRealPacked, encoder: enc)
+                enc.endEncoding()
+            }
+            if let blit = cmd.makeBlitCommandEncoder() {
+                let padBytes = nKVHeads * kPad * headDim * 2
+                blit.fill(
+                    buffer: kPacked.buffer,
+                    range: kPacked.offset ..< (kPacked.offset + padBytes), value: 0)
+                blit.fill(
+                    buffer: vPacked.buffer,
+                    range: vPacked.offset ..< (vPacked.offset + padBytes), value: 0)
+                for h in 0 ..< nKVHeads {
+                    let kSrcOff = kRealPacked.offset + h * kReal * headDim * 2
+                    let vSrcOff = vRealPacked.offset + h * kReal * headDim * 2
+                    let kDstOff = kPacked.offset + h * kPad * headDim * 2
+                    let vDstOff = vPacked.offset + h * kPad * headDim * 2
+                    let nBytes = kReal * headDim * 2
+                    blit.copy(
+                        from: kRealPacked.buffer, sourceOffset: kSrcOff,
+                        to: kPacked.buffer, destinationOffset: kDstOff, size: nBytes)
+                    blit.copy(
+                        from: vRealPacked.buffer, sourceOffset: vSrcOff,
+                        to: vPacked.buffer, destinationOffset: vDstOff, size: nBytes)
+                }
+                blit.endEncoding()
+            }
+        }
+
+        _ = Ops.sdpaPrefillMma(
+            q: qHTD, k: kPacked, v: vPacked,
+            nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+            qLen: tPad, kLen: kPad, scale: scale, on: cmd, into: outHTD)
+
+        _ = Ops.transposeHTD_f16(outHTD, t: tPad, h: nHeads, d: headDim, on: cmd, into: outTHD)
+
+        // Cast only the real T rows back to bf16.
+        let realOutF16 = Tensor(
+            buffer: outTHD.buffer, offset: outTHD.offset,
+            shape: [nRows * nHeads * headDim], dtype: .f16)
+        castF16ToBf16(
+            realOutF16,
+            into: outBf.reshaped(to: [nRows * nHeads * headDim]),
+            on: cmd, device: device)
+        return outBf
+    }
+}
+
+// ─── Decode fused QK RMSNorm + plain RoPE (sliding layers, T=1) ──────
+//
+// Replaces four stock dispatches (q RMSNorm, k RMSNorm, RoPE q, RoPE k)
+// with one TG-per-head kernel. Mirrors mlxfast `laguna_sliding_qk_norm_rope`
+// (head_dim=128, full rotary, rotate-half pairs p ↔ p+64):
+//   • RMSNorm: 4 elements/lane, simd_sum SSQ, local rsqrt — NO barrier
+//     (simd_sum already returns the total to every lane).
+//   • Norm rounding matches iron_rms_norm: bfloat((x * inv) * w).
+//   • RoPE matches iron_rope_banded with RoPEScaling.none: inv_freq =
+//     exp2((-p) * log2(theta) / 64), pair layout [p, p+64].
+// Escape: BUTTER_LAGUNA_FUSED_QK_NORM_ROPE=0.
+
+enum LagunaFusedQKNormRoPE {
+    /// Default ON (`!= "0"`). Set `BUTTER_LAGUNA_FUSED_QK_NORM_ROPE=0` to ablate.
+    static var enabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_FUSED_QK_NORM_ROPE"] != "0"
+    }
+
+    /// Sliding-layer decode only: full rotary, head_dim 128, bf16/f16.
+    static func canFuse(
+        isSliding: Bool, rotaryDim: Int, headDim: Int, dtype: DType
+    ) -> Bool {
+        enabled
+            && isSliding
+            && rotaryDim == headDim
+            && headDim == 128
+            && (dtype == .bf16 || dtype == .f16)
+    }
+
+    nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]
+    private static let lock = NSLock()
+
+    private static func pso(_ name: String, source: String, device: MTLDevice)
+        -> MTLComputePipelineState
+    {
+        lock.lock(); defer { lock.unlock() }
+        if let p = psoCache[name] { return p }
+        let lib = try! device.makeLibrary(source: source, options: MTLCompileOptions())
+        let fn = lib.makeFunction(name: name)!
+        let p = try! device.makeComputePipelineState(function: fn)
+        psoCache[name] = p
+        return p
+    }
+
+    private static let bf16Src = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    // One threadgroup (32 lanes = 1 simdgroup) per Q or K head.
+    // head 0..n_q_heads-1 → Q; head n_q_heads.. → K.
+    kernel void laguna_sliding_qk_norm_rope_bf16_128(
+        device const bfloat *raw_q [[buffer(0)]],
+        device const bfloat *raw_k [[buffer(1)]],
+        device const bfloat *q_weight [[buffer(2)]],
+        device const bfloat *k_weight [[buffer(3)]],
+        device bfloat *out_q [[buffer(4)]],
+        device bfloat *out_k [[buffer(5)]],
+        constant uint &n_q_heads [[buffer(6)]],
+        constant uint &position [[buffer(7)]],
+        constant float &theta_base [[buffer(8)]],
+        constant float &eps [[buffer(9)]],
+        uint head [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]
+    ) {
+        constexpr uint head_dim = 128u;
+        constexpr uint half_dim = 64u;
+
+        const device bfloat *input;
+        const device bfloat *weight;
+        device bfloat *output;
+        if (head < n_q_heads) {
+            input = raw_q + head * head_dim;
+            weight = q_weight;
+            output = out_q + head * head_dim;
+        } else {
+            uint kh = head - n_q_heads;
+            input = raw_k + kh * head_dim;
+            weight = k_weight;
+            output = out_k + kh * head_dim;
+        }
+
+        // 4 contiguous elements per lane (128 / 32).
+        uint base = lane * 4u;
+        float x[4];
+        float sum = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            x[i] = float(input[base + i]);
+            sum += x[i] * x[i];
+        }
+        // simd_sum returns the total to every lane — no threadgroup barrier.
+        sum = simd_sum(sum);
+        float inv_rms = rsqrt(sum / float(head_dim) + eps);
+
+        // Iron-order intermediate: bfloat((x * inv) * w), then back to f32
+        // so RoPE sees the same rounding stock rmsNorm → rope would.
+        thread bfloat normalized[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            float wi = float(weight[base + i]);
+            normalized[i] = bfloat((x[i] * inv_rms) * wi);
+        }
+
+        // Partner of pair p lives at p+64 → 16 lanes away (64/4).
+        thread float paired[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16u);
+        }
+
+        // Lower 16 lanes own all 64 pairs; write both halves.
+        if (lane < 16u) {
+            float log_theta = log2(theta_base);
+            float half_f = float(half_dim);
+            float pos_f = float(position);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4u; ++i) {
+                uint pair = base + i;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                // iron_rope_banded inv_freq with RoPEScaling.none (scale=1):
+                // inv = exp2((-pair) * log2(theta) / half_dim)
+                float inv_freq = exp2(((-float(pair)) * log_theta) / half_f);
+                float th = pos_f * inv_freq;
+                float c = cos(th);
+                float s = sin(th);
+                output[pair] = bfloat(first * c - second * s);
+                output[pair + half_dim] = bfloat(first * s + second * c);
+            }
+        }
+    }
+    """
+
+    private static let f16Src = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    kernel void laguna_sliding_qk_norm_rope_f16_128(
+        device const half *raw_q [[buffer(0)]],
+        device const half *raw_k [[buffer(1)]],
+        device const half *q_weight [[buffer(2)]],
+        device const half *k_weight [[buffer(3)]],
+        device half *out_q [[buffer(4)]],
+        device half *out_k [[buffer(5)]],
+        constant uint &n_q_heads [[buffer(6)]],
+        constant uint &position [[buffer(7)]],
+        constant float &theta_base [[buffer(8)]],
+        constant float &eps [[buffer(9)]],
+        uint head [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]
+    ) {
+        constexpr uint head_dim = 128u;
+        constexpr uint half_dim = 64u;
+
+        const device half *input;
+        const device half *weight;
+        device half *output;
+        if (head < n_q_heads) {
+            input = raw_q + head * head_dim;
+            weight = q_weight;
+            output = out_q + head * head_dim;
+        } else {
+            uint kh = head - n_q_heads;
+            input = raw_k + kh * head_dim;
+            weight = k_weight;
+            output = out_k + kh * head_dim;
+        }
+
+        uint base = lane * 4u;
+        float x[4];
+        float sum = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            x[i] = float(input[base + i]);
+            sum += x[i] * x[i];
+        }
+        sum = simd_sum(sum);
+        float inv_rms = rsqrt(sum / float(head_dim) + eps);
+
+        thread half normalized[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            float wi = float(weight[base + i]);
+            normalized[i] = half((x[i] * inv_rms) * wi);
+        }
+
+        thread float paired[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16u);
+        }
+
+        if (lane < 16u) {
+            float log_theta = log2(theta_base);
+            float half_f = float(half_dim);
+            float pos_f = float(position);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4u; ++i) {
+                uint pair = base + i;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                float inv_freq = exp2(((-float(pair)) * log_theta) / half_f);
+                float th = pos_f * inv_freq;
+                float c = cos(th);
+                float s = sin(th);
+                output[pair] = half(first * c - second * s);
+                output[pair + half_dim] = half(first * s + second * c);
+            }
+        }
+    }
+    """
+
+    /// Fused per-head Q/K RMSNorm + plain RoPE for sliding decode (T=1).
+    /// Writes flat `[nQHeads·128]` / `[nKVHeads·128]` outputs.
+    @discardableResult
+    static func apply(
+        rawQ: Tensor, rawK: Tensor,
+        qWeight: Tensor, kWeight: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        position: Int, thetaBase: Float, eps: Float,
+        on cmd: MTLCommandBuffer, device: Device,
+        intoQ: Tensor? = nil, intoK: Tensor? = nil
+    ) -> (q: Tensor, k: Tensor) {
+        precondition(headDim == 128)
+        precondition(rawQ.elementCount == nQHeads * headDim)
+        precondition(rawK.elementCount == nKVHeads * headDim)
+        precondition(qWeight.elementCount == headDim && kWeight.elementCount == headDim)
+        precondition(rawQ.dtype == qWeight.dtype && rawK.dtype == kWeight.dtype)
+        precondition(rawQ.dtype == rawK.dtype)
+
+        let qOut = intoQ ?? Tensor.empty(
+            shape: [nQHeads * headDim], dtype: rawQ.dtype, device: device)
+        let kOut = intoK ?? Tensor.empty(
+            shape: [nKVHeads * headDim], dtype: rawK.dtype, device: device)
+        precondition(qOut.elementCount == nQHeads * headDim)
+        precondition(kOut.elementCount == nKVHeads * headDim)
+
+        let (name, source): (String, String)
+        switch rawQ.dtype {
+        case .bf16:
+            (name, source) = (
+                "laguna_sliding_qk_norm_rope_bf16_128", bf16Src)
+        case .f16:
+            (name, source) = (
+                "laguna_sliding_qk_norm_rope_f16_128", f16Src)
+        default:
+            fatalError("LagunaFusedQKNormRoPE: unsupported dtype \(rawQ.dtype)")
+        }
+
+        let p = pso(name, source: source, device: device.mtlDevice)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return (qOut, kOut) }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(rawQ.buffer, offset: rawQ.offset, index: 0)
+        enc.setBuffer(rawK.buffer, offset: rawK.offset, index: 1)
+        enc.setBuffer(qWeight.buffer, offset: qWeight.offset, index: 2)
+        enc.setBuffer(kWeight.buffer, offset: kWeight.offset, index: 3)
+        enc.setBuffer(qOut.buffer, offset: qOut.offset, index: 4)
+        enc.setBuffer(kOut.buffer, offset: kOut.offset, index: 5)
+        var nQU = UInt32(nQHeads)
+        var posU = UInt32(position)
+        var theta = thetaBase
+        var epsV = eps
+        enc.setBytes(&nQU, length: 4, index: 6)
+        enc.setBytes(&posU, length: 4, index: 7)
+        enc.setBytes(&theta, length: 4, index: 8)
+        enc.setBytes(&epsV, length: 4, index: 9)
+        enc.dispatchThreadgroups(
+            MTLSize(width: nQHeads + nKVHeads, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.endEncoding()
+        return (qOut, kOut)
+    }
+}

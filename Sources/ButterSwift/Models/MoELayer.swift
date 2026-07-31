@@ -445,6 +445,45 @@ public final class MoELayer: Module, DecoderLayer {
     }
     public let stackedInt4Experts: StackedInt4Experts?
 
+    /// Stacked NVFP4 experts (Laguna board quant). Scales are u8 E4M3,
+    /// blockSize 16, optional global scale (default 1.0).
+    public struct StackedNvfp4Experts: Sendable {
+        public let gateWeight: Tensor  // [E, mid, hidden/8] u32
+        public let gateScales: Tensor  // [E, mid, hidden/16] u8
+        public let upWeight: Tensor
+        public let upScales: Tensor
+        public let downWeight: Tensor  // [E, hidden, mid/8] u32
+        public let downScales: Tensor
+        public let numExperts: Int
+        public let moeIntermediate: Int
+        public let hidden: Int
+        public let blockSize: Int
+        public let global: Float
+        public let dtype: DType  // activation dtype
+
+        public init(
+            gateWeight: Tensor, gateScales: Tensor,
+            upWeight: Tensor, upScales: Tensor,
+            downWeight: Tensor, downScales: Tensor,
+            numExperts: Int, moeIntermediate: Int, hidden: Int,
+            blockSize: Int = 16, global: Float = 1.0, dtype: DType
+        ) {
+            self.gateWeight = gateWeight
+            self.gateScales = gateScales
+            self.upWeight = upWeight
+            self.upScales = upScales
+            self.downWeight = downWeight
+            self.downScales = downScales
+            self.numExperts = numExperts
+            self.moeIntermediate = moeIntermediate
+            self.hidden = hidden
+            self.blockSize = blockSize
+            self.global = global
+            self.dtype = dtype
+        }
+    }
+    public let stackedNvfp4Experts: StackedNvfp4Experts?
+
     /// Env-flag cache — read once at init so the decode loop doesn't
     /// pay 3 × `ProcessInfo.processInfo.environment[...]` dictionary
     /// lookups per MoE layer per token. At Qwen3.6-A3B that's 120
@@ -518,6 +557,42 @@ public final class MoELayer: Module, DecoderLayer {
     /// and the scalarFMAChain8.
     private var routerIndicesScratch: Tensor?
     private var routerWeightsScratch: Tensor?
+    /// Path B (sigmoid+bias) score scratches — `[nExperts]`.
+    private var unbiasedScoreScratch: Tensor?
+    private var biasedScoreScratch: Tensor?
+    private var pathBScaleVecScratch: Tensor?
+    /// Optional row-concat [gate; up] NVFP4 banks for fused shared SwiGLU.
+    private var fusedSharedGateUpWeight: Tensor?
+    private var fusedSharedGateUpScales: Tensor?
+    private var fusedSharedGateUpGlobal: Float = 1.0
+    private var fusedSharedGateUpAttempted = false
+    /// Layer index in the stack (for late-layer MPP f32 promote). `-1` = unknown.
+    public let layerIndex: Int
+    /// Prefill NVFP4 MoE matmul scratches (grow-only; avoids per-layer
+    /// Tensor.empty of gate/up/down/out for every MoE layer × every chunk).
+    private var prefGateOutScratch: Tensor?
+    private var prefUpOutScratch: Tensor?
+    private var prefDownOutScratch: Tensor?
+    private var prefOutFlatScratch: Tensor?
+    /// Prefill router / sort-plan scratches (grow-only).
+    private var prefUnbiasedScratch: Tensor?
+    private var prefBiasedScratch: Tensor?
+    private var prefIndicesTokScratch: Tensor?
+    private var prefWeightsTokScratch: Tensor?
+    private var prefSortedExpertsScratch: Tensor?
+    private var prefSortedSourceScratch: Tensor?
+    private var prefInvPermScratch: Tensor?
+    /// Token-order gather source ids: src[r·k+s] = r (cached by mTotal).
+    private var prefTokenOrderSrcScratch: Tensor?
+    private var prefTokenOrderSrcMTotal: Int = 0
+    /// Prefill shared-expert scratches (grow-only): fused gate‖up, mid, down.
+    private var prefSharedGuScratch: Tensor?
+    private var prefSharedGateScratch: Tensor?
+    private var prefSharedUpScratch: Tensor?
+    private var prefSharedMidScratch: Tensor?
+    private var prefSharedDownScratch: Tensor?
+    /// Optional GPU-resident expert bias for Path B (same dtype as acts).
+    public let expertBiasGPU: Tensor?
 
     /// F-85 tile-pairing plan buffers (see `useCoopPaired` in
     /// `decodeMany`) - allocated ONCE, lazily, on this instance's first
@@ -658,7 +733,10 @@ public final class MoELayer: Module, DecoderLayer {
         sharedUpProj: AnyLinear? = nil,
         sharedDownProj: AnyLinear? = nil,
         router: MoERouter, hidden: Int,
-        stackedInt4Experts: StackedInt4Experts? = nil
+        stackedInt4Experts: StackedInt4Experts? = nil,
+        stackedNvfp4Experts: StackedNvfp4Experts? = nil,
+        expertBiasGPU: Tensor? = nil,
+        layerIndex: Int = -1
     ) {
         precondition(
             gateProj.count == router.nExperts,
@@ -697,6 +775,19 @@ public final class MoELayer: Module, DecoderLayer {
             )
         }
         self.stackedInt4Experts = stackedInt4Experts
+        if let s = stackedNvfp4Experts {
+            precondition(s.numExperts == router.nExperts)
+            precondition(s.hidden == hidden)
+        }
+        self.stackedNvfp4Experts = stackedNvfp4Experts
+        self.layerIndex = layerIndex
+        if let bias = expertBiasGPU {
+            precondition(
+                bias.elementCount == router.nExperts,
+                "MoELayer: expertBiasGPU has \(bias.elementCount) entries, "
+                    + "router expects \(router.nExperts)")
+        }
+        self.expertBiasGPU = expertBiasGPU
         let env = ProcessInfo.processInfo.environment
         self.enableBGEMM = env["BUTTER_MOE_BGEMM"] != nil
         self.useBm8Env = env["BUTTER_MOE_BGEMM_BM8"] != nil
@@ -944,14 +1035,41 @@ public final class MoELayer: Module, DecoderLayer {
     public func parameters() -> [(String, Tensor)] {
         var out: [(String, Tensor)] = []
         for (k, v) in gate.parameters() { out.append(("gate.\(k)", v)) }
-        for (e, proj) in gateProj.enumerated() {
-            for (k, v) in proj.parameters() { out.append(("experts.\(e).gate_proj.\(k)", v)) }
-        }
-        for (e, proj) in upProj.enumerated() {
-            for (k, v) in proj.parameters() { out.append(("experts.\(e).up_proj.\(k)", v)) }
-        }
-        for (e, proj) in downProj.enumerated() {
-            for (k, v) in proj.parameters() { out.append(("experts.\(e).down_proj.\(k)", v)) }
+        // Prefer stacked banks when present (NVFP4 / int4 Path B) — the
+        // per-expert arrays may be shared stubs and would under/over-count.
+        if let s = stackedNvfp4Experts {
+            out.append(("switch_mlp.gate_proj.weight", s.gateWeight))
+            out.append(("switch_mlp.gate_proj.scales", s.gateScales))
+            out.append(("switch_mlp.up_proj.weight", s.upWeight))
+            out.append(("switch_mlp.up_proj.scales", s.upScales))
+            out.append(("switch_mlp.down_proj.weight", s.downWeight))
+            out.append(("switch_mlp.down_proj.scales", s.downScales))
+        } else if let s = stackedInt4Experts {
+            out.append(("switch_mlp.gate_proj.weight", s.gateWeight))
+            out.append(("switch_mlp.gate_proj.scales", s.gateScales))
+            out.append(("switch_mlp.gate_proj.biases", s.gateBiases))
+            out.append(("switch_mlp.up_proj.weight", s.upWeight))
+            out.append(("switch_mlp.up_proj.scales", s.upScales))
+            out.append(("switch_mlp.up_proj.biases", s.upBiases))
+            out.append(("switch_mlp.down_proj.weight", s.downWeight))
+            out.append(("switch_mlp.down_proj.scales", s.downScales))
+            out.append(("switch_mlp.down_proj.biases", s.downBiases))
+        } else {
+            for (e, proj) in gateProj.enumerated() {
+                for (k, v) in proj.parameters() {
+                    out.append(("experts.\(e).gate_proj.\(k)", v))
+                }
+            }
+            for (e, proj) in upProj.enumerated() {
+                for (k, v) in proj.parameters() {
+                    out.append(("experts.\(e).up_proj.\(k)", v))
+                }
+            }
+            for (e, proj) in downProj.enumerated() {
+                for (k, v) in proj.parameters() {
+                    out.append(("experts.\(e).down_proj.\(k)", v))
+                }
+            }
         }
         if let sg = sharedGateProj {
             for (k, v) in sg.parameters() { out.append(("shared_expert.gate_proj.\(k)", v)) }
@@ -1129,6 +1247,27 @@ public final class MoELayer: Module, DecoderLayer {
                 stacked: stacked, cmd: cmd, device: device)
         }
 
+        // Path B (Laguna / Hy3-style): sigmoid + bias top-k on GPU.
+        if self.gpuRouterEnabled,
+            router.gatingMode == .sigmoidBiasedTopK,
+            let biasGPU = expertBiasGPU,
+            biasGPU.dtype == h.dtype,
+            router.topK == 8
+        {
+            if let nv = stackedNvfp4Experts, nv.dtype == h.dtype {
+                return decodeGPUPathBNvfp4(
+                    h: h, logitsTensor: logitsTensor,
+                    stacked: nv, expertBiasGPU: biasGPU,
+                    cmd: cmd, device: device)
+            }
+            if let stacked = stackedInt4Experts, stacked.dtype == h.dtype {
+                return decodeGPUPathB(
+                    h: h, logitsTensor: logitsTensor,
+                    stacked: stacked, expertBiasGPU: biasGPU,
+                    cmd: cmd, device: device)
+            }
+        }
+
         // ── 2. Commit + wait so the router can read the logits ───────
         // The decode path batches a token onto one command buffer; the
         // router needs a CPU sync point. Commit here, then run the
@@ -1218,6 +1357,26 @@ public final class MoELayer: Module, DecoderLayer {
 
         let dt = hFlat.dtype
 
+        // NVFP4 quality prefill: skip host/device sort plan entirely and
+        // run token-order Path B (batched gate + per-token experts).
+        // Gather remains behind BUTTER_NVFP4_GATHER=1.
+        // NAX-class spike is Ops-level only (BUTTER_NVFP4_GATHER_NAX=1) and
+        // rides the default Path-B MPP gather — do NOT force the experimental
+        // useGather branch (that skips default MPP entirely).
+        if let nv = stackedNvfp4Experts, nv.dtype == dt,
+            ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER"] != "1"
+        {
+            return decodeManyNvfp4(
+                hFlat: hFlat, t: t, stacked: nv,
+                gatherIdx: nil, sortedExperts: nil,
+                invPerm: nil, weightsTok: nil,
+                routings: [], sortedExpertsHost: [],
+                sourceTokensHost: [], invPermHost: [],
+                weightsTokenOrderHost: [],
+                cmd: cmd, device: device, commitAtEnd: commitAtEnd,
+                useDevicePlan: true)
+        }
+
         // ── 1. Gate gemv batched on caller's cmd ─────────────────────────
         let hRows = hFlat.reshaped(to: [t, hidden])
         let gateLogitsAll = gate.callMany(hRows, t: t, on: cmd, device: device)
@@ -1233,12 +1392,9 @@ public final class MoELayer: Module, DecoderLayer {
         // weights for the host-side sort plan.
         let nExperts = router.nExperts
         let topK = router.topK
-        // Token-order device plan (DEVPLAN2, default on): the GPU router
-        // writes indices+weights; we run the expert GEMMs in token order
-        // (no expert sort), so no readback / waitUntilCompleted / host sort.
-        // Same predicate as `prefillChainsOnCallerCmd` — callers use it to
-        // decide `commitAtEnd`, so the two must never drift.
-        let useDevPlan2 = prefillChainsOnCallerCmd
+        // Token-order device plan (DEVPLAN2): GPU softmax router + no host
+        // sort. Only valid under the softmax topK=8 envelope — sigmoid+bias
+        // (Laguna / Hy3 Path B) stays on the host concurrent route path.
         var d2Indices: Tensor? = nil
         var d2Source: Tensor? = nil
         var d2InvPerm: Tensor? = nil
@@ -1252,6 +1408,14 @@ public final class MoELayer: Module, DecoderLayer {
             && router.normTopKProb
             && router.expertBias == nil
             && router.topK == 8
+        // Laguna / Hy3 Path B: GPU sigmoid+bias top-k (then host sort plan).
+        let usePathBGPURouter =
+            self.gpuRouterEnabled
+            && router.gatingMode == .sigmoidBiasedTopK
+            && expertBiasGPU != nil
+            && expertBiasGPU!.dtype == gateLogitsAll.dtype
+            && router.topK == 8
+        let useDevPlan2 = prefillChainsOnCallerCmd && useGPURouter
         if useDevPlan2 {
             let mTot = t * topK
             let indicesBuf = Tensor.empty(shape: [t, topK], dtype: .u32, device: device)
@@ -1302,6 +1466,47 @@ public final class MoELayer: Module, DecoderLayer {
                 let wts = Array(weightsHost[base ..< (base + topK)])
                 routings[r] = MoERouter.Routing(indices: idxs, weights: wts)
             }
+        } else if usePathBGPURouter, let biasGPU = expertBiasGPU {
+            // Device Path B plan (Hy3-style): sigmoid+bias → top-k → sort plan
+            // on GPU, no host logit/index readback. Sets d2* for gather.
+            let mTot = t * topK
+            let scoreDt = gateLogitsAll.dtype
+            let flatN = t * nExperts
+            let unbiased = Tensor.empty(shape: [flatN], dtype: scoreDt, device: device)
+            let biased = Tensor.empty(shape: [flatN], dtype: scoreDt, device: device)
+            Ops.moeSigmoidBiasRows(
+                logits: gateLogitsAll.reshaped(to: [flatN]),
+                bias: biasGPU,
+                unbiased: unbiased, biased: biased,
+                tRows: t, nExperts: nExperts, on: cmd)
+            let indicesBuf = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
+            let weightsBuf = Tensor.empty(shape: [mTot], dtype: scoreDt, device: device)
+            Ops.moeRouterTopKBiasedMany(
+                scoreBiased: biased, scoreUnbiased: unbiased,
+                indicesOut: indicesBuf, weightsOut: weightsBuf,
+                t: t, nExperts: nExperts, k: topK, on: cmd)
+            let scale = router.routedScalingFactor
+            if scale != 1.0 {
+                let scaleVec = Tensor.filled(
+                    scale, shape: [mTot], dtype: scoreDt, device: device)
+                _ = Ops.mul(weightsBuf, scaleVec, on: cmd, into: weightsBuf)
+            }
+            let se = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
+            let st = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
+            let ip = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
+            if self.sortPlanCountingEnabled {
+                Ops.moeSortPlanCounting(
+                    topkIds: indicesBuf, sortedExperts: se, sourceTokens: st, invPerm: ip,
+                    mTotal: mTot, k: topK, nExperts: nExperts, blockSize: 256, on: cmd)
+            } else {
+                Ops.moeSortPlan(
+                    topkIds: indicesBuf, sortedExperts: se, sourceTokens: st, invPerm: ip,
+                    mTotal: mTot, k: topK, on: cmd)
+            }
+            d2Source = st
+            d2InvPerm = ip
+            d2Indices = se
+            d2Weights = weightsBuf  // token-order weights (pre-sort)
         } else {
             cmd.commit()
             cmd.waitUntilCompleted()
@@ -1368,7 +1573,18 @@ public final class MoELayer: Module, DecoderLayer {
         }
         }  // end if d2Indices == nil (host sort)
 
-        // ── 5. Fall back to per-token decode if no stacked-int4 weights ──
+        // ── 5. NVFP4 stacked gather, else int4, else per-token decode ──
+        if let nv = stackedNvfp4Experts, nv.dtype == dt {
+            return decodeManyNvfp4(
+                hFlat: hFlat, t: t, stacked: nv,
+                gatherIdx: d2Source, sortedExperts: d2Indices,
+                invPerm: d2InvPerm, weightsTok: d2Weights,
+                routings: routings, sortedExpertsHost: sortedExpertsHost,
+                sourceTokensHost: sourceTokensHost, invPermHost: invPermHost,
+                weightsTokenOrderHost: weightsTokenOrderHost,
+                cmd: cmd, device: device, commitAtEnd: commitAtEnd,
+                useDevicePlan: d2Indices != nil)
+        }
         guard let stacked = stackedInt4Experts, stacked.dtype == dt else {
             let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
             let dtBytes = dt.byteSize
@@ -1395,8 +1611,10 @@ public final class MoELayer: Module, DecoderLayer {
         }
 
         // ── 6. Work cmd for the rest of the layer ────────────────────────
-        // DEVPLAN2 reuses `cmd`; host-router paths already committed it.
-        let work = useDevPlan2 ? cmd : device.makeCommandBuffer()
+        // Device plans (softmax DEVPLAN2 or Path B d2*) reuse `cmd`;
+        // host-router paths already committed it.
+        let useDevicePlan = useDevPlan2 || d2Indices != nil
+        let work = useDevicePlan ? cmd : device.makeCommandBuffer()
         let moeIntermediate = stacked.moeIntermediate
         let groupSize = stacked.groupSize
 
@@ -1485,7 +1703,14 @@ public final class MoELayer: Module, DecoderLayer {
         // need a Swift port of `build_tile_plan` this pass didn't need
         // for the measured prefill path. bm64/bm8 opt-ins also take
         // priority when set - tileplan only replaces the bm16 default.
-        let useTilePlan = useDevPlan2 && !useBm64 && !useBm8 && self.tilePlanEnabled
+        // Tileplan needs device-sorted experts (d2Indices) + no host wait.
+        // Path B (sigmoid) device plan is quality-broken with tileplan on
+        // Laguna affine4 — keep bm16 gather for Path B; softmax DEVPLAN2
+        // keeps tileplan when enabled.
+        let pathBDevicePlan = usePathBGPURouter && d2Indices != nil
+        let useTilePlan =
+            useDevicePlan && !pathBDevicePlan && !useBm64 && !useBm8
+            && self.tilePlanEnabled
         // F-85 coop-core MoE gather GEMM (BM=32 tile plan over
         // `iron_moe_gather_qmm_coop`, see `coopEnabled`). Only takes over
         // from the bm16 tileplan default when the coop core's shape
@@ -1908,6 +2133,1239 @@ public final class MoELayer: Module, DecoderLayer {
         return outFlat
     }
 
+    /// Prefill MoE for stacked NVFP4 (board quant).
+    ///
+    /// **Default (quality):** token-order Path B — one batched `gate.callMany`,
+    /// then per-token `decodeGPUPathBNvfp4` (same math as decode). Shared
+    /// Path B scratches are reused serially on one CB (Metal orders
+    /// sequential encoders). This is the only multi-token path proven
+    /// Paris-clean so far.
+    ///
+    /// **Experimental:** `BUTTER_NVFP4_GATHER=1` → sorted expert-indexed /
+    /// MPP gather (still quality-broken; keep for A/B only).
+    private func decodeManyNvfp4(
+        hFlat: Tensor, t: Int, stacked: StackedNvfp4Experts,
+        gatherIdx: Tensor?, sortedExperts: Tensor?,
+        invPerm: Tensor?, weightsTok: Tensor?,
+        routings: [MoERouter.Routing],
+        sortedExpertsHost: [UInt32], sourceTokensHost: [UInt32],
+        invPermHost: [UInt32], weightsTokenOrderHost: [Float],
+        cmd: MTLCommandBuffer, device: Device,
+        commitAtEnd: Bool, useDevicePlan: Bool
+    ) -> Tensor {
+        let dt = hFlat.dtype
+        let topK = router.topK
+        let mTotal = t * topK
+        let moeIntermediate = stacked.moeIntermediate
+        let dtBytes = dt.byteSize
+        let work = useDevicePlan ? cmd : device.makeCommandBuffer()
+        let hRows = hFlat.reshaped(to: [t, hidden])
+        if prefOutFlatScratch == nil
+            || prefOutFlatScratch!.dtype != dt
+            || prefOutFlatScratch!.elementCount < t * hidden
+        {
+            prefOutFlatScratch = Tensor.empty(
+                shape: [t * hidden], dtype: dt, device: device)
+        }
+        let outFlat = Tensor(
+            buffer: prefOutFlatScratch!.buffer,
+            offset: prefOutFlatScratch!.offset,
+            shape: [t * hidden], dtype: dt)
+
+        // ── Quality path: token-order concurrent Path B ──────────────
+        // Same math as decodeGPUPathBNvfp4, but:
+        //   • one gate GEMM for all T
+        //   • GPU sigmoid+bias top-k many
+        //   • concurrent expert-indexed GEMV over T·topK slots (token order)
+        //   • per-token weighted sum (no sort / unpermute)
+        //   • shared expert via batched QMM
+        // Default: concurrent token-order Path B (quality matches serial
+        // cos≈1.0 after FMA+per-token shared; QMM shared / unpermute were
+        // the quality bugs). Escape serial: BUTTER_NVFP4_SERIAL_PATHB=1
+        // Experimental sorted gather: BUTTER_NVFP4_GATHER=1
+        // Note: default Path B (this `!useGather` branch) already hosts MPP
+        // gather for T≥4. BUTTER_NVFP4_GATHER_NAX=1 only swaps the MPP body
+        // via Ops.nvfp4MoeGatherPrefersNax — leave useGather alone.
+        let useGather =
+            ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER"] == "1"
+        let useSerialPathB =
+            ProcessInfo.processInfo.environment["BUTTER_NVFP4_SERIAL_PATHB"] == "1"
+        if !useGather {
+            let logitsAll = gate.callMany(hRows, t: t, on: work, device: device)
+            if useSerialPathB || expertBiasGPU == nil || expertBiasGPU!.dtype != dt
+                || topK != 8
+            {
+                if let biasGPU = expertBiasGPU, biasGPU.dtype == dt, topK == 8 {
+                    for r in 0 ..< t {
+                        let hRow = Tensor(
+                            buffer: hFlat.buffer,
+                            offset: hFlat.offset + r * hidden * dtBytes,
+                            shape: [hidden], dtype: dt)
+                        let logRow = Tensor(
+                            buffer: logitsAll.buffer,
+                            offset: logitsAll.offset + r * router.nExperts * dtBytes,
+                            shape: [router.nExperts], dtype: dt)
+                        let rowOut = decodeGPUPathBNvfp4(
+                            h: hRow, logitsTensor: logRow,
+                            stacked: stacked, expertBiasGPU: biasGPU,
+                            cmd: work, device: device)
+                        let outRow = Tensor(
+                            buffer: outFlat.buffer,
+                            offset: outFlat.offset + r * hidden * dtBytes,
+                            shape: [hidden], dtype: dt)
+                        Ops.copy(rowOut, into: outRow, on: work)
+                    }
+                } else {
+                    for r in 0 ..< t {
+                        let hRow = Tensor(
+                            buffer: hFlat.buffer,
+                            offset: hFlat.offset + r * hidden * dtBytes,
+                            shape: [hidden], dtype: dt)
+                        let rowOut = decode(
+                            hRow, position: 0,
+                            cache: StatelessLayerCache(),
+                            cmd: work, device: device)
+                        let outRow = Tensor(
+                            buffer: outFlat.buffer,
+                            offset: outFlat.offset + r * hidden * dtBytes,
+                            shape: [hidden], dtype: dt)
+                        Ops.copy(rowOut, into: outRow, on: work)
+                    }
+                }
+            } else if let biasGPU = expertBiasGPU {
+                // Token-order concurrent Path B (quality target = serial).
+                // Kick dual-queue shared ASAP (depends only on hRows) so it
+                // overlaps router + sort + MPP. Filled later into outFlat.
+                var prefillSharedOut: Tensor?
+                var prefillSharedDone: UInt64?
+                let dualPrefillEarly =
+                    ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DUAL_QUEUE"]
+                        != "0"
+                    && ProcessInfo.processInfo.environment["BUTTER_NVFP4_NO_SHARED"]
+                        == nil
+                    && ProcessInfo.processInfo.environment["BUTTER_NVFP4_SHARED_QMM"]
+                        != "0"
+                    && sharedGateProj != nil
+                if dualPrefillEarly,
+                    let sg = sharedGateProj, let su = sharedUpProj,
+                    let sd = sharedDownProj
+                {
+                    let cmdB = device.makeCommandBufferB()
+                    let vStart = device.nextSyncValue()
+                    work.encodeSignalEvent(device.syncEvent, value: vStart)
+                    cmdB.encodeWaitForEvent(device.syncEvent, value: vStart)
+                    if let sOut = prefillSharedExpertNvfp4(
+                        hRows: hRows, t: t, gate: sg, up: su, down: sd,
+                        dtype: dt, on: cmdB, device: device)
+                    {
+                        prefillSharedOut = sOut
+                        let vDone = device.nextSyncValue()
+                        cmdB.encodeSignalEvent(device.syncEvent, value: vDone)
+                        cmdB.commit()
+                        prefillSharedDone = vDone
+                    }
+                }
+
+                let nExperts = router.nExperts
+                let flatN = t * nExperts
+                if prefUnbiasedScratch == nil
+                    || prefUnbiasedScratch!.dtype != dt
+                    || prefUnbiasedScratch!.elementCount < flatN
+                {
+                    prefUnbiasedScratch = Tensor.empty(
+                        shape: [flatN], dtype: dt, device: device)
+                    prefBiasedScratch = Tensor.empty(
+                        shape: [flatN], dtype: dt, device: device)
+                }
+                let unbiased = Tensor(
+                    buffer: prefUnbiasedScratch!.buffer,
+                    offset: prefUnbiasedScratch!.offset,
+                    shape: [flatN], dtype: dt)
+                let biased = Tensor(
+                    buffer: prefBiasedScratch!.buffer,
+                    offset: prefBiasedScratch!.offset,
+                    shape: [flatN], dtype: dt)
+                Ops.moeSigmoidBiasRows(
+                    logits: logitsAll.reshaped(to: [flatN]),
+                    bias: biasGPU,
+                    unbiased: unbiased, biased: biased,
+                    tRows: t, nExperts: nExperts, on: work)
+                if prefIndicesTokScratch == nil
+                    || prefIndicesTokScratch!.elementCount < mTotal
+                {
+                    prefIndicesTokScratch = Tensor.empty(
+                        shape: [mTotal], dtype: .u32, device: device)
+                }
+                if prefWeightsTokScratch == nil
+                    || prefWeightsTokScratch!.dtype != dt
+                    || prefWeightsTokScratch!.elementCount < mTotal
+                {
+                    prefWeightsTokScratch = Tensor.empty(
+                        shape: [mTotal], dtype: dt, device: device)
+                }
+                let indicesTok = Tensor(
+                    buffer: prefIndicesTokScratch!.buffer,
+                    offset: prefIndicesTokScratch!.offset,
+                    shape: [mTotal], dtype: .u32)
+                let weightsTok = Tensor(
+                    buffer: prefWeightsTokScratch!.buffer,
+                    offset: prefWeightsTokScratch!.offset,
+                    shape: [mTotal], dtype: dt)
+                Ops.moeRouterTopKBiasedMany(
+                    scoreBiased: biased, scoreUnbiased: unbiased,
+                    indicesOut: indicesTok, weightsOut: weightsTok,
+                    t: t, nExperts: nExperts, k: topK, on: work)
+                let scale = router.routedScalingFactor
+                if scale != 1.0 {
+                    let scaleVec = Tensor.filled(
+                        scale, shape: [mTotal], dtype: dt, device: device)
+                    _ = Ops.mul(weightsTok, scaleVec, on: work, into: weightsTok)
+                }
+
+                // Expert GEMVs / QMM:
+                //   • Expert-group dense QMM (default T≥4): sort by expert, one
+                //     nvfp4Qmm per expert run → shares weight loads across tokens.
+                //     Big prefill BW win vs concurrent GEMV (reloads every slot).
+                //   • Concurrent expert-indexed GEMV (default T<4 / decode).
+                //   • Non-MPP gather QMM: BUTTER_NVFP4_USE_GATHER_QMM=1
+                //   • MPP gather: BUTTER_NVFP4_USE_GATHER_MPP=1 (still all-NaN).
+                // Escape group QMM: BUTTER_NVFP4_EXPERT_GROUP_QMM=0
+                // Grow-only prefill matmul scratches (per MoELayer instance).
+                let midNeed = mTotal * moeIntermediate
+                let hidNeed = mTotal * hidden
+                if prefGateOutScratch == nil
+                    || prefGateOutScratch!.dtype != dt
+                    || prefGateOutScratch!.elementCount < midNeed
+                {
+                    prefGateOutScratch = Tensor.empty(
+                        shape: [mTotal, moeIntermediate], dtype: dt, device: device)
+                    prefUpOutScratch = Tensor.empty(
+                        shape: [mTotal, moeIntermediate], dtype: dt, device: device)
+                }
+                if prefDownOutScratch == nil
+                    || prefDownOutScratch!.dtype != dt
+                    || prefDownOutScratch!.elementCount < hidNeed
+                {
+                    prefDownOutScratch = Tensor.empty(
+                        shape: [mTotal, hidden], dtype: dt, device: device)
+                }
+                let gateOut = Tensor(
+                    buffer: prefGateOutScratch!.buffer,
+                    offset: prefGateOutScratch!.offset,
+                    shape: [mTotal, moeIntermediate], dtype: dt)
+                let upOut = Tensor(
+                    buffer: prefUpOutScratch!.buffer,
+                    offset: prefUpOutScratch!.offset,
+                    shape: [mTotal, moeIntermediate], dtype: dt)
+                let downOut = Tensor(
+                    buffer: prefDownOutScratch!.buffer,
+                    offset: prefDownOutScratch!.offset,
+                    shape: [mTotal, hidden], dtype: dt)
+                // Prefill MoE matmul (quality-gated):
+                //   • MPP gather default ON for T>=4 (f32-promoted bf16 path).
+                //     Escape: BUTTER_NVFP4_USE_GATHER_MPP=0
+                //   • Non-MPP gather QMM: BUTTER_NVFP4_USE_GATHER_QMM=1
+                //   • Expert-group dense QMM: BUTTER_NVFP4_EXPERT_GROUP_QMM=1
+                //   • Concurrent eidx: T<4 or MPP disabled
+                let useGatherQmm =
+                    ProcessInfo.processInfo.environment["BUTTER_NVFP4_USE_GATHER_QMM"] == "1"
+                let mppEnv =
+                    ProcessInfo.processInfo.environment["BUTTER_NVFP4_USE_GATHER_MPP"]
+                // GATHER_NAX rides default MPP; force MPP on even for T<4.
+                let naxOn =
+                    ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX"] == "1"
+                    || ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX"]?
+                        .lowercased() == "true"
+                let useGatherMpp =
+                    !useGatherQmm
+                    && mppEnv != "0"
+                    && (naxOn || mppEnv == "1" || t >= 4)
+                let useExpertGroupQmm =
+                    !useGatherQmm && !useGatherMpp
+                    && ProcessInfo.processInfo.environment["BUTTER_NVFP4_EXPERT_GROUP_QMM"]
+                        == "1"
+                // Sorted plan for group QMM / MPP.
+                var sortedExperts: Tensor? = nil
+                var sortedSource: Tensor? = nil
+                var sortedInvPerm: Tensor? = nil
+                // Sort when MPP, expert-group, or gather-QMM with SORT=1.
+                let sortGather =
+                    ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_SORT"] == "1"
+                if useGatherMpp || useExpertGroupQmm
+                    || (useGatherQmm && sortGather)
+                {
+                    if prefSortedExpertsScratch == nil
+                        || prefSortedExpertsScratch!.elementCount < mTotal
+                    {
+                        prefSortedExpertsScratch = Tensor.empty(
+                            shape: [mTotal], dtype: .u32, device: device)
+                        prefSortedSourceScratch = Tensor.empty(
+                            shape: [mTotal], dtype: .u32, device: device)
+                        prefInvPermScratch = Tensor.empty(
+                            shape: [mTotal], dtype: .u32, device: device)
+                    }
+                    let se = Tensor(
+                        buffer: prefSortedExpertsScratch!.buffer,
+                        offset: prefSortedExpertsScratch!.offset,
+                        shape: [mTotal], dtype: .u32)
+                    let st = Tensor(
+                        buffer: prefSortedSourceScratch!.buffer,
+                        offset: prefSortedSourceScratch!.offset,
+                        shape: [mTotal], dtype: .u32)
+                    let ip = Tensor(
+                        buffer: prefInvPermScratch!.buffer,
+                        offset: prefInvPermScratch!.offset,
+                        shape: [mTotal], dtype: .u32)
+                    // MPP path: always classic sort (counting-sort has been
+                    // correlated with full-model NaNs; smoke with classic is
+                    // cos=1). Escape: BUTTER_MOE_COUNTING_SORT=1 forces count.
+                    let useCounting =
+                        !useGatherMpp && self.sortPlanCountingEnabled
+                        || (useGatherMpp
+                            && ProcessInfo.processInfo.environment[
+                                "BUTTER_MOE_COUNTING_SORT"] == "1")
+                    if useCounting {
+                        Ops.moeSortPlanCounting(
+                            topkIds: indicesTok, sortedExperts: se, sourceTokens: st,
+                            invPerm: ip, mTotal: mTotal, k: topK, nExperts: nExperts,
+                            blockSize: 256, on: work)
+                    } else {
+                        Ops.moeSortPlan(
+                            topkIds: indicesTok, sortedExperts: se, sourceTokens: st,
+                            invPerm: ip, mTotal: mTotal, k: topK, on: work)
+                    }
+                    sortedExperts = se
+                    sortedSource = st
+                    sortedInvPerm = ip
+                }
+                if useExpertGroupQmm,
+                    let se = sortedExperts, let st = sortedSource
+                {
+                    // Expert-group dense QMM dual-CB pipe:
+                    //   work  : router + sort (already encoded) — NO gather yet
+                    //   wait  : host segment scan needs sorted expert ids only
+                    //   qmmCmd: gather + concurrent gate/up/down NAX/reduction
+                    //           QMM (nvfp4QmmMany) + unpermute + shared add
+                    //
+                    // Moving gather after the wait keeps sort-only latency on
+                    // the host fence and pipelines gather→QMM on one CB with
+                    // no mid-layer GPU bubble. Dual-queue shared (kicked
+                    // earlier on queue B) overlaps the wait; we consume it
+                    // via syncEvent instead of re-running shared on qmmCmd
+                    // (avoids racing prefShared* scratches).
+                    //
+                    // Escape / A-B: BUTTER_NVFP4_EXPERT_GROUP_ASYNC=0 restores
+                    // the old gather-before-wait ordering (same math).
+                    // Default = async pipe ON whenever expert-group is on.
+                    let asyncPipe =
+                        ProcessInfo.processInfo.environment[
+                            "BUTTER_NVFP4_EXPERT_GROUP_ASYNC"] != "0"
+
+                    let xGathered: Tensor
+                    if asyncPipe {
+                        // Sort only on `work`; gather lands on qmmCmd below.
+                        if work.status != .committed && work.status != .completed
+                            && work.status != .error
+                        {
+                            work.commit()
+                        }
+                        work.waitUntilCompleted()
+                        xGathered = Tensor.empty(
+                            shape: [mTotal, hidden], dtype: dt, device: device)
+                    } else {
+                        // Legacy: gather before fence (extra GPU work under wait).
+                        xGathered = Ops.gather(
+                            table: hRows, tokenIds: st, on: work)
+                        if work.status != .committed && work.status != .completed
+                            && work.status != .error
+                        {
+                            work.commit()
+                        }
+                        work.waitUntilCompleted()
+                    }
+
+                    // Host run-length encode over sorted expert ids → segments.
+                    let expertIdsHost = se.toArray(as: UInt32.self)
+                    var segStarts: [Int] = []
+                    var segMs: [Int] = []
+                    var segExperts: [Int] = []
+                    var segStart = 0
+                    while segStart < mTotal {
+                        let e = Int(expertIdsHost[segStart])
+                        var segEnd = segStart + 1
+                        while segEnd < mTotal && Int(expertIdsHost[segEnd]) == e {
+                            segEnd += 1
+                        }
+                        segStarts.append(segStart)
+                        segMs.append(segEnd - segStart)
+                        segExperts.append(e)
+                        segStart = segEnd
+                    }
+                    let nSeg = segStarts.count
+
+                    // Fresh CB: gather (async pipe) + all expert QMMs concurrent.
+                    let qmmCmd = device.makeCommandBuffer()
+                    if asyncPipe {
+                        _ = Ops.gather(
+                            table: hRows, tokenIds: st, on: qmmCmd,
+                            into: xGathered)
+                    }
+
+                    var gW: [Tensor] = [], gS: [Tensor] = [], gIn: [Tensor] = []
+                    var gOut: [Tensor] = [], gM: [Int] = []
+                    var uW: [Tensor] = [], uS: [Tensor] = [], uIn: [Tensor] = []
+                    var uOut: [Tensor] = [], uM: [Int] = []
+                    gW.reserveCapacity(nSeg); gS.reserveCapacity(nSeg)
+                    gIn.reserveCapacity(nSeg); gOut.reserveCapacity(nSeg)
+                    gM.reserveCapacity(nSeg)
+                    uW.reserveCapacity(nSeg); uS.reserveCapacity(nSeg)
+                    uIn.reserveCapacity(nSeg); uOut.reserveCapacity(nSeg)
+                    uM.reserveCapacity(nSeg)
+                    for i in 0 ..< nSeg {
+                        let e = segExperts[i]
+                        let mSeg = segMs[i]
+                        let s0 = segStarts[i]
+                        let xSeg = xGathered.slicedRows(start: s0, count: mSeg)
+                        gW.append(
+                            stacked.gateWeight.slicedRows(start: e, count: 1)
+                                .reshaped(to: [moeIntermediate, hidden / 8]))
+                        gS.append(
+                            stacked.gateScales.slicedRows(start: e, count: 1)
+                                .reshaped(to: [moeIntermediate, hidden / 16]))
+                        gIn.append(xSeg)
+                        gOut.append(gateOut.slicedRows(start: s0, count: mSeg))
+                        gM.append(mSeg)
+                        uW.append(
+                            stacked.upWeight.slicedRows(start: e, count: 1)
+                                .reshaped(to: [moeIntermediate, hidden / 8]))
+                        uS.append(
+                            stacked.upScales.slicedRows(start: e, count: 1)
+                                .reshaped(to: [moeIntermediate, hidden / 16]))
+                        uIn.append(xSeg)
+                        uOut.append(upOut.slicedRows(start: s0, count: mSeg))
+                        uM.append(mSeg)
+                    }
+                    // Gate + up concurrent; per-segment NAX when m%32==0.
+                    Ops.nvfp4QmmMany(
+                        weights: gW + uW, scales: gS + uS,
+                        inputs: gIn + uIn, outputs: gOut + uOut,
+                        ms: gM + uM,
+                        blockSize: stacked.blockSize, global: stacked.global,
+                        on: qmmCmd)
+                    let inner = Ops.swiglu(
+                        gate: gateOut, up: upOut, on: qmmCmd, into: gateOut)
+                    var dW: [Tensor] = [], dS: [Tensor] = [], dIn: [Tensor] = []
+                    var dOut: [Tensor] = [], dM: [Int] = []
+                    dW.reserveCapacity(nSeg); dS.reserveCapacity(nSeg)
+                    dIn.reserveCapacity(nSeg); dOut.reserveCapacity(nSeg)
+                    dM.reserveCapacity(nSeg)
+                    for i in 0 ..< nSeg {
+                        let e = segExperts[i]
+                        let mSeg = segMs[i]
+                        let s0 = segStarts[i]
+                        dW.append(
+                            stacked.downWeight.slicedRows(start: e, count: 1)
+                                .reshaped(to: [hidden, moeIntermediate / 8]))
+                        dS.append(
+                            stacked.downScales.slicedRows(start: e, count: 1)
+                                .reshaped(to: [hidden, moeIntermediate / 16]))
+                        dIn.append(inner.slicedRows(start: s0, count: mSeg))
+                        dOut.append(downOut.slicedRows(start: s0, count: mSeg))
+                        dM.append(mSeg)
+                    }
+                    Ops.nvfp4QmmMany(
+                        weights: dW, scales: dS, inputs: dIn, outputs: dOut,
+                        ms: dM,
+                        blockSize: stacked.blockSize, global: stacked.global,
+                        on: qmmCmd)
+                    // Weighted sum stays on qmmCmd (sorted → unpermute).
+                    if let inv = sortedInvPerm {
+                        // Zero outFlat so any unpermute gap is 0 not NaN garbage.
+                        if let blit = qmmCmd.makeBlitCommandEncoder() {
+                            let o0 = outFlat.offset
+                            let o1 = o0 + outFlat.elementCount * dtBytes
+                            blit.fill(buffer: outFlat.buffer, range: o0 ..< o1, value: 0)
+                            blit.endEncoding()
+                        }
+                        Ops.moeUnpermute(
+                            expertOutputs: downOut, invPerm: inv,
+                            topKWeights: weightsTok, into: outFlat,
+                            nRows: t, hidden: hidden, k: topK, on: qmmCmd)
+                    }
+                    // Shared expert: prefer dual-queue result (overlaps wait).
+                    if let done = prefillSharedDone, let sOut = prefillSharedOut {
+                        qmmCmd.encodeWaitForEvent(device.syncEvent, value: done)
+                        _ = Ops.add(outFlat, sOut, on: qmmCmd, into: outFlat)
+                    } else if ProcessInfo.processInfo.environment["BUTTER_NVFP4_NO_SHARED"]
+                        == nil,
+                        let sg = sharedGateProj, let su = sharedUpProj,
+                        let sd = sharedDownProj
+                    {
+                        let useSharedQmm =
+                            ProcessInfo.processInfo.environment["BUTTER_NVFP4_SHARED_QMM"]
+                            != "0"
+                        if useSharedQmm,
+                            let shared = prefillSharedExpertNvfp4(
+                                hRows: hRows, t: t, gate: sg, up: su, down: sd,
+                                dtype: dt, on: qmmCmd, device: device)
+                        {
+                            _ = Ops.add(outFlat, shared, on: qmmCmd, into: outFlat)
+                        } else if !useSharedQmm {
+                            for r in 0 ..< t {
+                                let hRow = Tensor(
+                                    buffer: hFlat.buffer,
+                                    offset: hFlat.offset + r * hidden * dtBytes,
+                                    shape: [hidden], dtype: dt)
+                                let shared = swiGLU(
+                                    hRow, gateProj: sg, upProj: su, downProj: sd,
+                                    on: qmmCmd)
+                                let outRow = Tensor(
+                                    buffer: outFlat.buffer,
+                                    offset: outFlat.offset + r * hidden * dtBytes,
+                                    shape: [hidden], dtype: dt)
+                                _ = Ops.add(outRow, shared, on: qmmCmd, into: outRow)
+                            }
+                        }
+                    }
+                    if qmmCmd.status != .committed
+                        && qmmCmd.status != .completed && qmmCmd.status != .error
+                    {
+                        qmmCmd.commit()
+                    }
+                    return outFlat
+                }
+                if useGatherQmm || useGatherMpp {
+                    let srcTok: Tensor
+                    let expIds: Tensor
+                    if let st = sortedSource, let se = sortedExperts {
+                        srcTok = st
+                        expIds = se
+                    } else {
+                        // Token-order: x row = h[token]. Cache host fill by mTotal.
+                        if prefTokenOrderSrcScratch == nil
+                            || prefTokenOrderSrcMTotal != mTotal
+                            || prefTokenOrderSrcScratch!.elementCount < mTotal
+                        {
+                            var srcHost = [UInt32](repeating: 0, count: mTotal)
+                            for r in 0 ..< t {
+                                for s in 0 ..< topK {
+                                    srcHost[r * topK + s] = UInt32(r)
+                                }
+                            }
+                            let src = Tensor.empty(
+                                shape: [mTotal], dtype: .u32, device: device)
+                            src.copyIn(from: srcHost)
+                            prefTokenOrderSrcScratch = src
+                            prefTokenOrderSrcMTotal = mTotal
+                        }
+                        srcTok = Tensor(
+                            buffer: prefTokenOrderSrcScratch!.buffer,
+                            offset: prefTokenOrderSrcScratch!.offset,
+                            shape: [mTotal], dtype: .u32)
+                        expIds = indicesTok
+                    }
+                    // Decide MPP dtype early so f32 path can fuse gather+cast
+                    // (skip materializing bf16 xGathered).
+                    let forceAllBf16 =
+                        ProcessInfo.processInfo.environment["BUTTER_NVFP4_MPP_BF16"]
+                        == "1"
+                    let bf16MaxLayer =
+                        Int(
+                            ProcessInfo.processInfo.environment[
+                                "BUTTER_NVFP4_MPP_BF16_MAX_LAYER"] ?? "")
+                        ?? 36
+                    let useNativeBf16Mpp =
+                        forceAllBf16
+                        || (layerIndex >= 0 && layerIndex <= bf16MaxLayer
+                            && bf16MaxLayer >= 0)
+                    let noSharedCast =
+                        ProcessInfo.processInfo.environment[
+                            "BUTTER_NVFP4_MPP_NO_SHARED_CAST"] == "1"
+                    let useF32Promote =
+                        useGatherMpp && dt == .bf16 && !useNativeBf16Mpp && !noSharedCast
+
+                    // Fused gate+up MPP (default BM16): x_rows + shared X load.
+                    // Escape: BUTTER_NVFP4_MPP_FUSED_GATEUP=0
+                    // When BM64 is opted in (`BUTTER_NVFP4_MOE_BM64=1` /
+                    // `BUTTER_NVFP4_GATHER_BM=64`) skip fused BM16 gateup so
+                    // gate+up also take the BM64 concurrent pair — otherwise
+                    // only down used BM64 and the opt-in looked "slower"
+                    // while barely covering 1/3 of the matmul traffic.
+                    let wantBm64GateUp = Ops.nvfp4MoeGatherPrefersBm64(
+                        mTotal: mTotal, nOut: moeIntermediate, kIn: hidden)
+                    let useFusedGateUp =
+                        !wantBm64GateUp
+                        && ProcessInfo.processInfo.environment[
+                            "BUTTER_NVFP4_MPP_FUSED_GATEUP"] != "0"
+                    let xGathered: Tensor
+                    if useF32Promote || (useGatherMpp && useFusedGateUp) {
+                        // Fused paths read hRows via x_rows / gatherCast.
+                        xGathered = hRows
+                    } else {
+                        // Materialise [mTotal, kIn] once for gate+up pair
+                        // (BM64 concurrent or non-fused BM16 / non-MPP).
+                        // Grow-only scratch — bare Ops.gather was Tensor.empty
+                        // every MoE layer (driver thrash under swap).
+                        let xBytes = mTotal * hidden * dtBytes
+                        let xBuf = device.intermediateScratch(
+                            tag: "laguna_mpp_x_gathered", minBytes: xBytes)
+                        let gathered = Tensor(
+                            buffer: xBuf, offset: 0,
+                            shape: [mTotal, hidden], dtype: dt)
+                        _ = Ops.gather(
+                            table: hRows, tokenIds: srcTok, on: work,
+                            into: gathered)
+                        xGathered = gathered
+                    }
+                    if useGatherMpp {
+                        // Zero outs only when the active M-tile leaves a
+                        // partial last row (kernel masks writes but defensive
+                        // for partial-tile quality). Full tiles overwrite
+                        // every output element — skip 3 blit fills × 39 layers.
+                        // BM64 tile height 64; BM16 height 16.
+                        let tileM = wantBm64GateUp ? 64 : 16
+                        if mTotal % tileM != 0, let blit = work.makeBlitCommandEncoder() {
+                            let g0 = gateOut.offset
+                            let g1 = g0 + gateOut.elementCount * dtBytes
+                            let u0 = upOut.offset
+                            let u1 = u0 + upOut.elementCount * dtBytes
+                            let d0 = downOut.offset
+                            let d1 = d0 + downOut.elementCount * dtBytes
+                            blit.fill(buffer: gateOut.buffer, range: g0 ..< g1, value: 0)
+                            blit.fill(buffer: upOut.buffer, range: u0 ..< u1, value: 0)
+                            blit.fill(buffer: downOut.buffer, range: d0 ..< d1, value: 0)
+                            blit.endEncoding()
+                        }
+                        // Dual-queue shared already kicked earlier (overlaps
+                        // router+sort+MPP).
+                        // Late-layer half coop overflow: bf16 MPP NaNs from
+                        // ~L38 when |h| grows. Early layers stay on native
+                        // bf16 MPP (faster). Threshold:
+                        //   BUTTER_NVFP4_MPP_BF16_MAX_LAYER (default 36)
+                        // Force all-bf16: BUTTER_NVFP4_MPP_BF16=1
+                        // Force all-f32:  BUTTER_NVFP4_MPP_BF16_MAX_LAYER=-1
+                        // f32 promote path only when NOT using native bf16 MPP.
+                        if useF32Promote {
+                            let midBytes = mTotal * moeIntermediate * 4
+                            let downBytes = mTotal * hidden * 4
+                            let gBuf = device.intermediateScratch(
+                                tag: "laguna_mpp_gate_f32", minBytes: midBytes)
+                            let uBuf = device.intermediateScratch(
+                                tag: "laguna_mpp_up_f32", minBytes: midBytes)
+                            let dBuf = device.intermediateScratch(
+                                tag: "laguna_mpp_down_f32", minBytes: downBytes)
+                            let gateF = Tensor(
+                                buffer: gBuf, offset: 0,
+                                shape: [mTotal, moeIntermediate], dtype: .f32)
+                            let upF = Tensor(
+                                buffer: uBuf, offset: 0,
+                                shape: [mTotal, moeIntermediate], dtype: .f32)
+                            let downF = Tensor(
+                                buffer: dBuf, offset: 0,
+                                shape: [mTotal, hidden], dtype: .f32)
+                            if useFusedGateUp {
+                                // Cast only [T, H] then fused gate+up via x_rows.
+                                let hFBytes = t * hidden * 4
+                                let hFBuf = device.intermediateScratch(
+                                    tag: "laguna_mpp_h_f32", minBytes: hFBytes)
+                                let hF = Tensor(
+                                    buffer: hFBuf, offset: 0,
+                                    shape: [t, hidden], dtype: .f32)
+                                Ops.castToF32(hRows, into: hF, on: work)
+                                Ops.nvfp4MoeGatherBm16GateUp(
+                                    input: hF, xRows: srcTok,
+                                    weightGate: stacked.gateWeight,
+                                    scalesGate: stacked.gateScales, outGate: gateF,
+                                    weightUp: stacked.upWeight,
+                                    scalesUp: stacked.upScales, outUp: upF,
+                                    indices: expIds,
+                                    mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                                    blockSize: stacked.blockSize, global: stacked.global,
+                                    on: work)
+                            } else {
+                                let xBytes = mTotal * hidden * 4
+                                let xBuf = device.intermediateScratch(
+                                    tag: "laguna_mpp_x_f32", minBytes: xBytes)
+                                let xF = Tensor(
+                                    buffer: xBuf, offset: 0,
+                                    shape: [mTotal, hidden], dtype: .f32)
+                                Ops.gatherCastBf16ToF32(
+                                    table: hRows, tokenIds: srcTok,
+                                    mTotal: mTotal, hidden: hidden,
+                                    on: work, into: xF)
+                                // Concurrent gate+up; BM64 when env opts in
+                                // (grid/TPG match iron BM64 contract).
+                                Ops.nvfp4MoeGatherBm16Pair(
+                                    input: xF,
+                                    weight0: stacked.gateWeight,
+                                    scales0: stacked.gateScales, out0: gateF,
+                                    weight1: stacked.upWeight,
+                                    scales1: stacked.upScales, out1: upF,
+                                    indices: expIds,
+                                    mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                                    blockSize: stacked.blockSize, global: stacked.global,
+                                    on: work)
+                            }
+                            // In-place SwiGLU into gateF (skip separate mid buffer).
+                            _ = Ops.swiglu(gate: gateF, up: upF, on: work, into: gateF)
+                            Ops.nvfp4MoeGatherBm16(
+                                input: gateF, weight: stacked.downWeight,
+                                scales: stacked.downScales, indices: expIds,
+                                mTotal: mTotal, nOut: hidden, kIn: moeIntermediate,
+                                blockSize: stacked.blockSize, global: stacked.global,
+                                on: work, into: downF)
+                            Ops.castF32ToBf16(downF, into: downOut, on: work)
+                        } else if useFusedGateUp {
+                            // Native bf16 fused gate+up (x_rows, no materialise).
+                            Ops.nvfp4MoeGatherBm16GateUp(
+                                input: hRows, xRows: srcTok,
+                                weightGate: stacked.gateWeight,
+                                scalesGate: stacked.gateScales, outGate: gateOut,
+                                weightUp: stacked.upWeight,
+                                scalesUp: stacked.upScales, outUp: upOut,
+                                indices: expIds,
+                                mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                                blockSize: stacked.blockSize, global: stacked.global,
+                                on: work)
+                            let inner = Ops.swiglu(
+                                gate: gateOut, up: upOut, on: work, into: gateOut)
+                            Ops.nvfp4MoeGatherBm16(
+                                input: inner, weight: stacked.downWeight,
+                                scales: stacked.downScales, indices: expIds,
+                                mTotal: mTotal, nOut: hidden, kIn: moeIntermediate,
+                                blockSize: stacked.blockSize, global: stacked.global,
+                                preferNativeBf16: useNativeBf16Mpp,
+                                on: work, into: downOut)
+                        } else {
+                            // Materialise gather + concurrent pair (BM16 or BM64)
+                            // / serial fallback.
+                            if ProcessInfo.processInfo.environment[
+                                    "BUTTER_NVFP4_MPP_SERIAL_GATEUP"] != "1"
+                            {
+                                Ops.nvfp4MoeGatherBm16Pair(
+                                    input: xGathered,
+                                    weight0: stacked.gateWeight,
+                                    scales0: stacked.gateScales, out0: gateOut,
+                                    weight1: stacked.upWeight,
+                                    scales1: stacked.upScales, out1: upOut,
+                                    indices: expIds,
+                                    mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                                    blockSize: stacked.blockSize, global: stacked.global,
+                                    on: work)
+                            } else {
+                                Ops.nvfp4MoeGatherBm16(
+                                    input: xGathered, weight: stacked.gateWeight,
+                                    scales: stacked.gateScales, indices: expIds,
+                                    mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                                    blockSize: stacked.blockSize, global: stacked.global,
+                                    preferNativeBf16: useNativeBf16Mpp,
+                                    on: work, into: gateOut)
+                                Ops.nvfp4MoeGatherBm16(
+                                    input: xGathered, weight: stacked.upWeight,
+                                    scales: stacked.upScales, indices: expIds,
+                                    mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                                    blockSize: stacked.blockSize, global: stacked.global,
+                                    preferNativeBf16: useNativeBf16Mpp,
+                                    on: work, into: upOut)
+                            }
+                            let inner = Ops.swiglu(
+                                gate: gateOut, up: upOut, on: work, into: gateOut)
+                            Ops.nvfp4MoeGatherBm16(
+                                input: inner, weight: stacked.downWeight,
+                                scales: stacked.downScales, indices: expIds,
+                                mTotal: mTotal, nOut: hidden, kIn: moeIntermediate,
+                                blockSize: stacked.blockSize, global: stacked.global,
+                                preferNativeBf16: useNativeBf16Mpp,
+                                on: work, into: downOut)
+                        }
+                    } else {
+                        // Non-MPP gather QMM (token order).
+                        Ops.nvfp4GatherQmm(
+                            weight: stacked.gateWeight, scales: stacked.gateScales,
+                            input: xGathered, expertIds: expIds,
+                            mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                            blockSize: stacked.blockSize, global: stacked.global,
+                            on: work, into: gateOut)
+                        Ops.nvfp4GatherQmm(
+                            weight: stacked.upWeight, scales: stacked.upScales,
+                            input: xGathered, expertIds: expIds,
+                            mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                            blockSize: stacked.blockSize, global: stacked.global,
+                            on: work, into: upOut)
+                        let inner = Ops.swiglu(
+                            gate: gateOut, up: upOut, on: work, into: gateOut)
+                        Ops.nvfp4GatherQmm(
+                            weight: stacked.downWeight, scales: stacked.downScales,
+                            input: inner, expertIds: expIds,
+                            mTotal: mTotal, nOut: hidden, kIn: moeIntermediate,
+                            blockSize: stacked.blockSize, global: stacked.global,
+                            on: work, into: downOut)
+                    }
+                } else {
+                    var gW: [Tensor] = [], gS: [Tensor] = [], gIn: [Tensor] = []
+                    var gIdx: [Tensor] = [], gOut: [Tensor] = []
+                    var uW: [Tensor] = [], uS: [Tensor] = [], uIn: [Tensor] = []
+                    var uIdx: [Tensor] = [], uOut: [Tensor] = []
+                    gW.reserveCapacity(mTotal); gS.reserveCapacity(mTotal)
+                    gIn.reserveCapacity(mTotal); gIdx.reserveCapacity(mTotal)
+                    gOut.reserveCapacity(mTotal)
+                    uW.reserveCapacity(mTotal); uS.reserveCapacity(mTotal)
+                    uIn.reserveCapacity(mTotal); uIdx.reserveCapacity(mTotal)
+                    uOut.reserveCapacity(mTotal)
+                    for r in 0 ..< t {
+                        let hRow = Tensor(
+                            buffer: hFlat.buffer,
+                            offset: hFlat.offset + r * hidden * dtBytes,
+                            shape: [hidden], dtype: dt)
+                        for s in 0 ..< topK {
+                            let slot = r * topK + s
+                            let eIdx = Tensor(
+                                buffer: indicesTok.buffer,
+                                offset: indicesTok.offset + slot * 4,
+                                shape: [1], dtype: .u32)
+                            let gRow = Tensor(
+                                buffer: gateOut.buffer,
+                                offset: gateOut.offset + slot * moeIntermediate * dtBytes,
+                                shape: [moeIntermediate], dtype: dt)
+                            let uRow = Tensor(
+                                buffer: upOut.buffer,
+                                offset: upOut.offset + slot * moeIntermediate * dtBytes,
+                                shape: [moeIntermediate], dtype: dt)
+                            gW.append(stacked.gateWeight); gS.append(stacked.gateScales)
+                            gIn.append(hRow); gIdx.append(eIdx); gOut.append(gRow)
+                            uW.append(stacked.upWeight); uS.append(stacked.upScales)
+                            uIn.append(hRow); uIdx.append(eIdx); uOut.append(uRow)
+                        }
+                    }
+                    Ops.nvfp4DequantGemvExpertIndexedMany(
+                        weightsStacked: gW + uW, scalesStacked: gS + uS,
+                        inputs: gIn + uIn, expertIndices: gIdx + uIdx,
+                        outputs: gOut + uOut,
+                        blockSize: stacked.blockSize, global: stacked.global, on: work)
+                    let innerFlat = Ops.swiglu(
+                        gate: gateOut.reshaped(to: [mTotal * moeIntermediate]),
+                        up: upOut.reshaped(to: [mTotal * moeIntermediate]),
+                        on: work)
+                    var dW: [Tensor] = [], dS: [Tensor] = [], dIn: [Tensor] = []
+                    var dIdx: [Tensor] = [], dOut: [Tensor] = []
+                    for slot in 0 ..< mTotal {
+                        let inRow = Tensor(
+                            buffer: innerFlat.buffer,
+                            offset: innerFlat.offset + slot * moeIntermediate * dtBytes,
+                            shape: [moeIntermediate], dtype: dt)
+                        let eIdx = Tensor(
+                            buffer: indicesTok.buffer,
+                            offset: indicesTok.offset + slot * 4,
+                            shape: [1], dtype: .u32)
+                        let oRow = Tensor(
+                            buffer: downOut.buffer,
+                            offset: downOut.offset + slot * hidden * dtBytes,
+                            shape: [hidden], dtype: dt)
+                        dW.append(stacked.downWeight); dS.append(stacked.downScales)
+                        dIn.append(inRow); dIdx.append(eIdx); dOut.append(oRow)
+                    }
+                    Ops.nvfp4DequantGemvExpertIndexedMany(
+                        weightsStacked: dW, scalesStacked: dS,
+                        inputs: dIn, expertIndices: dIdx, outputs: dOut,
+                        blockSize: stacked.blockSize, global: stacked.global, on: work)
+                }
+
+                // Weighted sum: FMA when outputs are token-order; unpermute
+                // when expert-sorted (MPP path).
+                if let inv = sortedInvPerm {
+                    // Zero outFlat so any unpermute gap is 0 not NaN garbage.
+                    // GPU blit (not host memset) — avoids CPU↔GPU sync on
+                    // shared storage mid-cmdbuf under swap pressure.
+                    if let blit = work.makeBlitCommandEncoder() {
+                        let o0 = outFlat.offset
+                        let o1 = o0 + outFlat.elementCount * dtBytes
+                        blit.fill(buffer: outFlat.buffer, range: o0 ..< o1, value: 0)
+                        blit.endEncoding()
+                    }
+                    Ops.moeUnpermute(
+                        expertOutputs: downOut, invPerm: inv,
+                        topKWeights: weightsTok, into: outFlat,
+                        nRows: t, hidden: hidden, k: topK, on: work)
+                } else {
+                    for r in 0 ..< t {
+                        var scalars: [Tensor] = []
+                        var values: [Tensor] = []
+                        scalars.reserveCapacity(topK)
+                        values.reserveCapacity(topK)
+                        for s in 0 ..< topK {
+                            let slot = r * topK + s
+                            scalars.append(
+                                Tensor(
+                                    buffer: weightsTok.buffer,
+                                    offset: weightsTok.offset + slot * dtBytes,
+                                    shape: [1], dtype: dt))
+                            values.append(
+                                Tensor(
+                                    buffer: downOut.buffer,
+                                    offset: downOut.offset + slot * hidden * dtBytes,
+                                    shape: [hidden], dtype: dt))
+                        }
+                        let acc = Tensor(
+                            buffer: outFlat.buffer,
+                            offset: outFlat.offset + r * hidden * dtBytes,
+                            shape: [hidden], dtype: dt)
+                        Ops.scalarFMAChain8(
+                            scalars: scalars, values: values, out: acc, on: work)
+                    }
+                }
+
+                // Shared expert: dual-queue (MPP path) or batched QMM on `work`.
+                if let done = prefillSharedDone, let sOut = prefillSharedOut {
+                    work.encodeWaitForEvent(device.syncEvent, value: done)
+                    _ = Ops.add(outFlat, sOut, on: work, into: outFlat)
+                } else if ProcessInfo.processInfo.environment["BUTTER_NVFP4_NO_SHARED"] == nil,
+                    let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj
+                {
+                    let useSharedQmm =
+                        ProcessInfo.processInfo.environment["BUTTER_NVFP4_SHARED_QMM"] != "0"
+                    if useSharedQmm,
+                        let shared = prefillSharedExpertNvfp4(
+                            hRows: hRows, t: t, gate: sg, up: su, down: sd,
+                            dtype: dt, on: work, device: device)
+                    {
+                        _ = Ops.add(outFlat, shared, on: work, into: outFlat)
+                    } else if !useSharedQmm {
+                        for r in 0 ..< t {
+                            let hRow = Tensor(
+                                buffer: hFlat.buffer,
+                                offset: hFlat.offset + r * hidden * dtBytes,
+                                shape: [hidden], dtype: dt)
+                            let shared = swiGLU(
+                                hRow, gateProj: sg, upProj: su, downProj: sd, on: work)
+                            let outRow = Tensor(
+                                buffer: outFlat.buffer,
+                                offset: outFlat.offset + r * hidden * dtBytes,
+                                shape: [hidden], dtype: dt)
+                            _ = Ops.add(outRow, shared, on: work, into: outRow)
+                        }
+                    }
+                }
+            }
+            if commitAtEnd, !useDevicePlan,
+                work.status != .committed && work.status != .completed
+                    && work.status != .error
+            {
+                work.commit()
+            }
+            return outFlat
+        }
+
+        // ── Experimental gather / sorted eidx (A/B only) ─────────────
+        let useGatherQmm =
+            ProcessInfo.processInfo.environment["BUTTER_NVFP4_USE_GATHER_QMM"] == "1"
+        let gatherIdxTensor: Tensor
+        let indices: Tensor
+        if let se = sortedExperts, let gi = gatherIdx {
+            gatherIdxTensor = gi
+            indices = se
+        } else {
+            let gatherIdxBuf = device.makeBuffer(length: mTotal * 4)
+            sourceTokensHost.withUnsafeBytes {
+                _ = memcpy(gatherIdxBuf.contents(), $0.baseAddress!, mTotal * 4)
+            }
+            gatherIdxTensor = Tensor(
+                buffer: gatherIdxBuf, offset: 0, shape: [mTotal], dtype: .u32)
+            let expertIdsBuf = device.makeBuffer(length: mTotal * 4)
+            sortedExpertsHost.withUnsafeBytes {
+                _ = memcpy(expertIdsBuf.contents(), $0.baseAddress!, mTotal * 4)
+            }
+            indices = Tensor(
+                buffer: expertIdsBuf, offset: 0, shape: [mTotal], dtype: .u32)
+        }
+
+        let xGathered = Ops.gather(table: hRows, tokenIds: gatherIdxTensor, on: work)
+        let gateOut = Tensor.empty(
+            shape: [mTotal, moeIntermediate], dtype: dt, device: device)
+        let upOut = Tensor.empty(
+            shape: [mTotal, moeIntermediate], dtype: dt, device: device)
+        let downOut = Tensor.empty(shape: [mTotal, hidden], dtype: dt, device: device)
+
+        if useGatherQmm {
+            Ops.nvfp4MoeGatherBm16(
+                input: xGathered, weight: stacked.gateWeight, scales: stacked.gateScales,
+                indices: indices, mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                blockSize: stacked.blockSize, global: stacked.global,
+                on: work, into: gateOut)
+            Ops.nvfp4MoeGatherBm16(
+                input: xGathered, weight: stacked.upWeight, scales: stacked.upScales,
+                indices: indices, mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                blockSize: stacked.blockSize, global: stacked.global,
+                on: work, into: upOut)
+            let inner = Ops.swiglu(gate: gateOut, up: upOut, on: work, into: gateOut)
+            Ops.nvfp4MoeGatherBm16(
+                input: inner, weight: stacked.downWeight, scales: stacked.downScales,
+                indices: indices, mTotal: mTotal, nOut: hidden, kIn: moeIntermediate,
+                blockSize: stacked.blockSize, global: stacked.global,
+                on: work, into: downOut)
+        } else {
+            var gW: [Tensor] = [], gS: [Tensor] = [], gIn: [Tensor] = []
+            var gIdx: [Tensor] = [], gOut: [Tensor] = []
+            var uW: [Tensor] = [], uS: [Tensor] = [], uIn: [Tensor] = []
+            var uIdx: [Tensor] = [], uOut: [Tensor] = []
+            for r in 0 ..< mTotal {
+                let xRow = Tensor(
+                    buffer: xGathered.buffer,
+                    offset: xGathered.offset + r * hidden * dtBytes,
+                    shape: [hidden], dtype: dt)
+                let eIdx = Tensor(
+                    buffer: indices.buffer, offset: indices.offset + r * 4,
+                    shape: [1], dtype: .u32)
+                let gRow = Tensor(
+                    buffer: gateOut.buffer,
+                    offset: gateOut.offset + r * moeIntermediate * dtBytes,
+                    shape: [moeIntermediate], dtype: dt)
+                let uRow = Tensor(
+                    buffer: upOut.buffer,
+                    offset: upOut.offset + r * moeIntermediate * dtBytes,
+                    shape: [moeIntermediate], dtype: dt)
+                gW.append(stacked.gateWeight); gS.append(stacked.gateScales)
+                gIn.append(xRow); gIdx.append(eIdx); gOut.append(gRow)
+                uW.append(stacked.upWeight); uS.append(stacked.upScales)
+                uIn.append(xRow); uIdx.append(eIdx); uOut.append(uRow)
+            }
+            Ops.nvfp4DequantGemvExpertIndexedMany(
+                weightsStacked: gW + uW, scalesStacked: gS + uS,
+                inputs: gIn + uIn, expertIndices: gIdx + uIdx,
+                outputs: gOut + uOut,
+                blockSize: stacked.blockSize, global: stacked.global, on: work)
+            let innerFlat = Ops.swiglu(
+                gate: gateOut.reshaped(to: [mTotal * moeIntermediate]),
+                up: upOut.reshaped(to: [mTotal * moeIntermediate]),
+                on: work)
+            var dW: [Tensor] = [], dS: [Tensor] = [], dIn: [Tensor] = []
+            var dIdx: [Tensor] = [], dOut: [Tensor] = []
+            for r in 0 ..< mTotal {
+                let inRow = Tensor(
+                    buffer: innerFlat.buffer,
+                    offset: innerFlat.offset + r * moeIntermediate * dtBytes,
+                    shape: [moeIntermediate], dtype: dt)
+                let eIdx = Tensor(
+                    buffer: indices.buffer, offset: indices.offset + r * 4,
+                    shape: [1], dtype: .u32)
+                let oRow = Tensor(
+                    buffer: downOut.buffer,
+                    offset: downOut.offset + r * hidden * dtBytes,
+                    shape: [hidden], dtype: dt)
+                dW.append(stacked.downWeight); dS.append(stacked.downScales)
+                dIn.append(inRow); dIdx.append(eIdx); dOut.append(oRow)
+            }
+            Ops.nvfp4DequantGemvExpertIndexedMany(
+                weightsStacked: dW, scalesStacked: dS,
+                inputs: dIn, expertIndices: dIdx, outputs: dOut,
+                blockSize: stacked.blockSize, global: stacked.global, on: work)
+        }
+
+        let invPermTensor: Tensor
+        let weightsTensor: Tensor
+        if let ip = invPerm, let wt = weightsTok, wt.dtype == dt {
+            invPermTensor = ip
+            weightsTensor = wt
+        } else {
+            let invPermBuf = device.makeBuffer(length: mTotal * 4)
+            invPermHost.withUnsafeBytes {
+                _ = memcpy(invPermBuf.contents(), $0.baseAddress!, mTotal * 4)
+            }
+            invPermTensor = Tensor(
+                buffer: invPermBuf, offset: 0, shape: [mTotal], dtype: .u32)
+            let wt = Tensor.empty(shape: [mTotal], dtype: dt, device: device)
+            switch dt {
+            case .f32: wt.copyIn(from: weightsTokenOrderHost)
+            case .bf16:
+                wt.copyIn(from: weightsTokenOrderHost.map { v -> UInt16 in
+                    let bits = v.bitPattern
+                    let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
+                    return UInt16(rounded >> 16)
+                })
+            case .f16: wt.copyIn(from: weightsTokenOrderHost.map { Float16($0) })
+            default: fatalError("decodeManyNvfp4: bad dtype")
+            }
+            weightsTensor = wt
+        }
+        Ops.moeUnpermute(
+            expertOutputs: downOut, invPerm: invPermTensor,
+            topKWeights: weightsTensor, into: outFlat,
+            nRows: t, hidden: hidden, k: topK, on: work)
+
+        if ProcessInfo.processInfo.environment["BUTTER_NVFP4_NO_SHARED"] == nil,
+            let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj,
+            let shared = prefillSharedExpertNvfp4(
+                hRows: hRows, t: t, gate: sg, up: su, down: sd,
+                dtype: dt, on: work, device: device)
+        {
+            _ = Ops.add(outFlat, shared, on: work, into: outFlat)
+        }
+        if commitAtEnd { work.commit() }
+        return outFlat
+    }
+
+    /// Prefill shared expert via NVFP4 QMM with grow-only scratches.
+    /// Default: fused iron gate+up QMM on [gate;up] bank + interleaved SwiGLU
+    /// + down QMM. Escape fused: `BUTTER_LAGUNA_SHARED_PREFILL_FUSED_GATEUP=0`
+    /// (falls back to concurrent gate+up QMM). Returns `[t * hidden]`.
+    private func prefillSharedExpertNvfp4(
+        hRows: Tensor, t: Int,
+        gate sg: AnyLinear, up su: AnyLinear, down sd: AnyLinear,
+        dtype dt: DType,
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor? {
+        let gn = sg.inner as? Nvfp4Linear
+        let un = su.inner as? Nvfp4Linear
+        let dn = sd.inner as? Nvfp4Linear
+        let mid: Int
+        if let gn, let un, gn.outDim == un.outDim {
+            mid = gn.outDim
+        } else {
+            // Unknown dims — allocate via callMany (no scratch).
+            let g = sg.callMany(hRows, t: t, on: cmd, device: device)
+            let u = su.callMany(hRows, t: t, on: cmd, device: device)
+            let sharedInner = Ops.swiglu(
+                gate: g.reshaped(to: [g.elementCount]),
+                up: u.reshaped(to: [u.elementCount]),
+                on: cmd, into: u.reshaped(to: [u.elementCount]))
+            let m = sharedInner.elementCount / t
+            return sd.callMany(
+                sharedInner.reshaped(to: [t, m]), t: t, on: cmd, device: device
+            ).reshaped(to: [t * hidden])
+        }
+        let guNeed = t * mid * 2
+        let midNeed = t * mid
+        let downNeed = t * hidden
+        if prefSharedMidScratch == nil
+            || prefSharedMidScratch!.dtype != dt
+            || prefSharedMidScratch!.elementCount < midNeed
+        {
+            prefSharedMidScratch = Tensor.empty(
+                shape: [t, mid], dtype: dt, device: device)
+        }
+        if prefSharedDownScratch == nil
+            || prefSharedDownScratch!.dtype != dt
+            || prefSharedDownScratch!.elementCount < downNeed
+        {
+            prefSharedDownScratch = Tensor.empty(
+                shape: [t, hidden], dtype: dt, device: device)
+        }
+        let midOut = Tensor(
+            buffer: prefSharedMidScratch!.buffer,
+            offset: prefSharedMidScratch!.offset,
+            shape: [t, mid], dtype: dt)
+        let downOut = Tensor(
+            buffer: prefSharedDownScratch!.buffer,
+            offset: prefSharedDownScratch!.offset,
+            shape: [t, hidden], dtype: dt)
+
+        let useFused =
+            LagunaNvfp4Fuse.sharedPrefillFusedGateUpEnabled
+            && gn != nil && un != nil
+            && gn!.inDim == un!.inDim
+            && ensureFusedSharedGateUp(gate: sg, up: su, device: device) != nil
+
+        if useFused,
+            let (fw, fs, fg) = ensureFusedSharedGateUp(
+                gate: sg, up: su, device: device),
+            let dn
+        {
+            if prefSharedGuScratch == nil
+                || prefSharedGuScratch!.dtype != dt
+                || prefSharedGuScratch!.elementCount < guNeed
+            {
+                prefSharedGuScratch = Tensor.empty(
+                    shape: [t, mid * 2], dtype: dt, device: device)
+            }
+            let gu = Tensor(
+                buffer: prefSharedGuScratch!.buffer,
+                offset: prefSharedGuScratch!.offset,
+                shape: [t, mid * 2], dtype: dt)
+            _ = Ops.nvfp4Qmm(
+                weight: fw, scales: fs, input: hRows,
+                m: t, blockSize: gn!.blockSize, global: fg,
+                on: cmd, into: gu)
+            LagunaNvfp4Fuse.swigluGateUpInterleaved(
+                gu: gu, mid: mid, on: cmd, device: device, into: midOut)
+            _ = Ops.nvfp4Qmm(
+                weight: dn.weight, scales: dn.scales, input: midOut,
+                m: t, blockSize: dn.blockSize, global: dn.global,
+                on: cmd, into: downOut)
+            return downOut.reshaped(to: [t * hidden])
+        }
+
+        // Concurrent (or serial callMany) gate+up into scratches.
+        if prefSharedGateScratch == nil
+            || prefSharedGateScratch!.dtype != dt
+            || prefSharedGateScratch!.elementCount < midNeed
+        {
+            prefSharedGateScratch = Tensor.empty(
+                shape: [t, mid], dtype: dt, device: device)
+            prefSharedUpScratch = Tensor.empty(
+                shape: [t, mid], dtype: dt, device: device)
+        }
+        let gOut = Tensor(
+            buffer: prefSharedGateScratch!.buffer,
+            offset: prefSharedGateScratch!.offset,
+            shape: [t, mid], dtype: dt)
+        let uOut = Tensor(
+            buffer: prefSharedUpScratch!.buffer,
+            offset: prefSharedUpScratch!.offset,
+            shape: [t, mid], dtype: dt)
+        if let gn, let un, gn.inDim == un.inDim, gn.outDim == un.outDim {
+            Ops.nvfp4QmmMany(
+                weights: [gn.weight, un.weight],
+                scales: [gn.scales, un.scales],
+                inputs: [hRows, hRows],
+                outputs: [gOut, uOut],
+                ms: [t, t],
+                blockSize: gn.blockSize, global: gn.global,
+                on: cmd)
+        } else if let gn, let un {
+            // Prefer nvfp4Qmm(+into) over callMany(+into) — AnyLinear path
+            // has no `into:` and overload resolution can fail mid-rebase.
+            _ = Ops.nvfp4Qmm(
+                weight: gn.weight, scales: gn.scales, input: hRows,
+                m: t, blockSize: gn.blockSize, global: gn.global,
+                on: cmd, into: gOut)
+            _ = Ops.nvfp4Qmm(
+                weight: un.weight, scales: un.scales, input: hRows,
+                m: t, blockSize: un.blockSize, global: un.global,
+                on: cmd, into: uOut)
+        } else {
+            // Non-NVFP4 shared (shouldn't hit on Laguna board path).
+            let g = sg.callMany(hRows, t: t, on: cmd, device: device)
+            let u = su.callMany(hRows, t: t, on: cmd, device: device)
+            let midFlat = midOut.reshaped(to: [midNeed])
+            let sharedInner = Ops.swiglu(
+                gate: g.reshaped(to: [g.elementCount]),
+                up: u.reshaped(to: [u.elementCount]),
+                on: cmd, into: midFlat)
+            let d = sd.callMany(
+                sharedInner.reshaped(to: [t, mid]), t: t, on: cmd, device: device)
+            Ops.copy(d.reshaped(to: [t * hidden]), into: downOut.reshaped(to: [t * hidden]),
+                on: cmd)
+            return downOut.reshaped(to: [t * hidden])
+        }
+        let midFlat = midOut.reshaped(to: [midNeed])
+        let sharedInner = Ops.swiglu(
+            gate: gOut.reshaped(to: [midNeed]),
+            up: uOut.reshaped(to: [midNeed]),
+            on: cmd, into: midFlat)
+        if let dn {
+            _ = Ops.nvfp4Qmm(
+                weight: dn.weight, scales: dn.scales,
+                input: sharedInner.reshaped(to: [t, mid]),
+                m: t, blockSize: dn.blockSize, global: dn.global,
+                on: cmd, into: downOut)
+        } else {
+            let d = sd.callMany(
+                sharedInner.reshaped(to: [t, mid]), t: t, on: cmd, device: device)
+            Ops.copy(d.reshaped(to: [t * hidden]), into: downOut.reshaped(to: [t * hidden]),
+                on: cmd)
+        }
+        return downOut.reshaped(to: [t * hidden])
+    }
+
     /// Batched gather BGEMM fast path. T=1 decode: `mTotal = topK`. Each
     /// row of the gathered batch holds the same `[hidden]` activation
     /// vector but is paired with a different expert id via `indices`.
@@ -2093,6 +3551,692 @@ public final class MoELayer: Module, DecoderLayer {
         let u = upProj(x, on: cmd)
         let inner = Ops.swiglu(gate: g, up: u, on: cmd)
         return downProj(inner, on: cmd)
+    }
+
+    /// Path B decode: GPU sigmoid+bias top-k (indices/weights), then the
+    /// **same** per-expert SwiGLU path as the host router (gateProj[id]).
+    /// Expert-indexed stacked GEMV is not quality-locked for Laguna affine4
+    /// yet — host experts keep tokens correct while we still skip the
+    /// Path B decode (Laguna / Hy3 sigmoid+bias top-k).
+    ///
+    /// Modes via `BUTTER_LAGUNA_PATHB`:
+    /// - unset / `1` / `full` (default): GPU router + int4 expert-indexed
+    ///   GEMV (no host router sync). Requires model-loop CB fencing
+    ///   (LagunaModel.forward pipelines depth-1 waits).
+    /// - `hybrid`: GPU router → host sync → QuantizedLinear experts.
+    /// - `0` handled by caller (does not enter this function).
+    private func decodeGPUPathB(
+        h: Tensor, logitsTensor: Tensor,
+        stacked: StackedInt4Experts,
+        expertBiasGPU: Tensor,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let mode = (ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PATHB"] ?? "full")
+            .lowercased()
+        if mode == "hybrid" {
+            return decodeGPUPathBHybrid(
+                h: h, logitsTensor: logitsTensor,
+                expertBiasGPU: expertBiasGPU, cmd: cmd, device: device)
+        }
+        // `full`, `1`, or anything else → expert-indexed.
+        return decodeGPUPathBFull(
+            h: h, logitsTensor: logitsTensor, stacked: stacked,
+            expertBiasGPU: expertBiasGPU, cmd: cmd, device: device)
+    }
+
+    /// Quality Path B: GPU sigmoid+bias top-k, one sync, host experts.
+    private func decodeGPUPathBHybrid(
+        h: Tensor, logitsTensor: Tensor,
+        expertBiasGPU: Tensor,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let topK = router.topK
+        let nExperts = router.nExperts
+        let scoreDt = h.dtype
+
+        if routerIndicesScratch == nil || routerIndicesScratch!.elementCount != topK {
+            routerIndicesScratch = Tensor.empty(shape: [topK], dtype: .u32, device: device)
+            routerWeightsScratch = Tensor.empty(shape: [topK], dtype: scoreDt, device: device)
+        }
+        if unbiasedScoreScratch == nil
+            || unbiasedScoreScratch!.elementCount != nExperts
+            || unbiasedScoreScratch!.dtype != scoreDt
+        {
+            unbiasedScoreScratch = Tensor.empty(shape: [nExperts], dtype: scoreDt, device: device)
+            biasedScoreScratch = Tensor.empty(shape: [nExperts], dtype: scoreDt, device: device)
+        }
+
+        let unbiased = Ops.sigmoid(logitsTensor, on: cmd, into: unbiasedScoreScratch!)
+        let biased = Ops.add(unbiased, expertBiasGPU, on: cmd, into: biasedScoreScratch!)
+        Ops.moeRouterTopKBiased(
+            scoreBiased: biased, scoreUnbiased: unbiased,
+            indicesOut: routerIndicesScratch!,
+            weightsOut: routerWeightsScratch!,
+            nExperts: nExperts, k: topK, on: cmd)
+
+        let scale = router.routedScalingFactor
+        if scale != 1.0 {
+            if pathBScaleVecScratch == nil
+                || pathBScaleVecScratch!.dtype != scoreDt
+                || pathBScaleVecScratch!.elementCount != topK
+            {
+                pathBScaleVecScratch = Tensor.filled(
+                    scale, shape: [topK], dtype: scoreDt, device: device)
+            }
+            _ = Ops.mul(
+                routerWeightsScratch!, pathBScaleVecScratch!, on: cmd,
+                into: routerWeightsScratch!)
+        }
+
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let indicesHost: [UInt32] = routerIndicesScratch!.toArray(as: UInt32.self)
+        let weightsHost: [Float] = routerWeightsScratch!.toFloatArray()
+        precondition(indicesHost.count == topK && weightsHost.count == topK)
+
+        let work = device.makeCommandBuffer()
+        var accumulator: Tensor?
+        for slot in 0 ..< topK {
+            let expertId = Int(indicesHost[slot])
+            precondition(expertId >= 0 && expertId < gateProj.count)
+            let weightTensor = Tensor.filled(
+                weightsHost[slot], shape: [hidden], dtype: h.dtype, device: device)
+            let expertOut = swiGLU(
+                h,
+                gateProj: gateProj[expertId],
+                upProj: upProj[expertId],
+                downProj: downProj[expertId],
+                on: work)
+            let scaled = Ops.mul(expertOut, weightTensor, on: work)
+            accumulator = accumulator.map { Ops.add($0, scaled, on: work) } ?? scaled
+        }
+        if let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj {
+            let sharedOut = swiGLU(h, gateProj: sg, upProj: su, downProj: sd, on: work)
+            accumulator = accumulator.map { Ops.add($0, sharedOut, on: work) } ?? sharedOut
+        }
+        let result = accumulator!
+        work.commit()
+        return result
+    }
+
+    /// Full GPU Path B (expert-indexed). Experimental — quality not yet
+    /// gated for Laguna affine4.
+    private func decodeGPUPathBFull(
+        h: Tensor, logitsTensor: Tensor,
+        stacked: StackedInt4Experts,
+        expertBiasGPU: Tensor,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let topK = router.topK
+        let nExperts = router.nExperts
+        let scoreDt = h.dtype
+        precondition(topK == 8, "decodeGPUPathBFull: topK must be 8")
+
+        if routerIndicesScratch == nil || routerIndicesScratch!.elementCount != topK {
+            routerIndicesScratch = Tensor.empty(shape: [topK], dtype: .u32, device: device)
+            routerWeightsScratch = Tensor.empty(shape: [topK], dtype: scoreDt, device: device)
+        }
+        if unbiasedScoreScratch == nil
+            || unbiasedScoreScratch!.elementCount != nExperts
+            || unbiasedScoreScratch!.dtype != scoreDt
+        {
+            unbiasedScoreScratch = Tensor.empty(shape: [nExperts], dtype: scoreDt, device: device)
+            biasedScoreScratch = Tensor.empty(shape: [nExperts], dtype: scoreDt, device: device)
+        }
+        if accumulatorScratch == nil
+            || accumulatorScratch!.dtype != h.dtype
+            || accumulatorScratch!.elementCount != hidden
+        {
+            accumulatorScratch = Tensor.empty(shape: [hidden], dtype: h.dtype, device: device)
+        }
+        let outDim = stacked.moeIntermediate
+        while expertGScratches.count < topK {
+            expertGScratches.append(
+                Tensor.empty(shape: [outDim], dtype: h.dtype, device: device))
+            expertUScratches.append(
+                Tensor.empty(shape: [outDim], dtype: h.dtype, device: device))
+            expertInnerScratches.append(
+                Tensor.empty(shape: [outDim], dtype: h.dtype, device: device))
+            expertOutScratches.append(
+                Tensor.empty(shape: [hidden], dtype: h.dtype, device: device))
+        }
+
+        let unbiased = Ops.sigmoid(logitsTensor, on: cmd, into: unbiasedScoreScratch!)
+        let biased = Ops.add(unbiased, expertBiasGPU, on: cmd, into: biasedScoreScratch!)
+        Ops.moeRouterTopKBiased(
+            scoreBiased: biased, scoreUnbiased: unbiased,
+            indicesOut: routerIndicesScratch!,
+            weightsOut: routerWeightsScratch!,
+            nExperts: nExperts, k: topK, on: cmd)
+
+        let scale = router.routedScalingFactor
+        if scale != 1.0 {
+            if pathBScaleVecScratch == nil
+                || pathBScaleVecScratch!.dtype != scoreDt
+                || pathBScaleVecScratch!.elementCount != topK
+            {
+                pathBScaleVecScratch = Tensor.filled(
+                    scale, shape: [topK], dtype: scoreDt, device: device)
+            }
+            _ = Ops.mul(
+                routerWeightsScratch!, pathBScaleVecScratch!, on: cmd,
+                into: routerWeightsScratch!)
+        }
+
+        var expertIdxScratches: [Tensor] = []
+        expertIdxScratches.reserveCapacity(topK)
+        for slot in 0 ..< topK {
+            expertIdxScratches.append(
+                Tensor(
+                    buffer: routerIndicesScratch!.buffer,
+                    offset: routerIndicesScratch!.offset + slot * 4,
+                    shape: [1], dtype: .u32))
+        }
+
+        var ws: [Tensor] = []
+        var ss: [Tensor] = []
+        var bs: [Tensor] = []
+        var ins: [Tensor] = []
+        var idxs: [Tensor] = []
+        var outs0: [Tensor] = []
+        ws.reserveCapacity(topK * 2)
+        ss.reserveCapacity(topK * 2)
+        bs.reserveCapacity(topK * 2)
+        ins.reserveCapacity(topK * 2)
+        idxs.reserveCapacity(topK * 2)
+        outs0.reserveCapacity(topK * 2)
+        for slot in 0 ..< topK {
+            ws.append(stacked.gateWeight)
+            ss.append(stacked.gateScales)
+            bs.append(stacked.gateBiases)
+            ins.append(h)
+            idxs.append(expertIdxScratches[slot])
+            outs0.append(expertGScratches[slot])
+            ws.append(stacked.upWeight)
+            ss.append(stacked.upScales)
+            bs.append(stacked.upBiases)
+            ins.append(h)
+            idxs.append(expertIdxScratches[slot])
+            outs0.append(expertUScratches[slot])
+        }
+        Ops.dequantGemvInt4ExpertIndexedMany(
+            weightsStacked: ws, scalesStacked: ss, biasesStacked: bs,
+            inputs: ins, expertIndices: idxs, outputs: outs0,
+            groupSize: stacked.groupSize, on: cmd)
+
+        // Dual-queue shared expert (Hy3-style): run full shared SwiGLU on
+        // queue B concurrent with routed experts on `cmd`. Escape:
+        // BUTTER_LAGUNA_DUAL_QUEUE=0.
+        let dualQueue =
+            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DUAL_QUEUE"] != "0"
+            && sharedGateProj != nil && sharedUpProj != nil && sharedDownProj != nil
+        var sharedOut: Tensor?
+        var sharedDone: UInt64?
+        if dualQueue,
+            let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj
+        {
+            let cmdB = device.makeCommandBufferB()
+            let vStart = device.nextSyncValue()
+            cmd.encodeSignalEvent(device.syncEvent, value: vStart)
+            cmdB.encodeWaitForEvent(device.syncEvent, value: vStart)
+            let sGate = sg(h, on: cmdB)
+            let sUp = su(h, on: cmdB)
+            let sInner = Ops.swiglu(gate: sGate, up: sUp, on: cmdB)
+            sharedOut = sd(sInner, on: cmdB)
+            let vDone = device.nextSyncValue()
+            cmdB.encodeSignalEvent(device.syncEvent, value: vDone)
+            cmdB.commit()
+            sharedDone = vDone
+        }
+
+        let gs = Array(expertGScratches.prefix(topK))
+        let us = Array(expertUScratches.prefix(topK))
+        let acc = accumulatorScratch!
+
+        // Fused swiglu+down+weighted-sum when mid≤768 and gs=64 (Laguna OK).
+        // Escape: BUTTER_LAGUNA_PATHB_FUSED=0 → 3-dispatch chain.
+        let useFused =
+            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PATHB_FUSED"] != "0"
+            && stacked.moeIntermediate <= 768 && stacked.groupSize == 64
+        if useFused {
+            Ops.moeDownSwigluAccumInt4Chain8(
+                gates: gs, ups: us,
+                expertIndices: routerIndicesScratch!,
+                slotWeights: routerWeightsScratch!,
+                weightsStacked: stacked.downWeight,
+                scalesStacked: stacked.downScales,
+                biasesStacked: stacked.downBiases,
+                output: acc,
+                inDim: stacked.moeIntermediate,
+                outDim: hidden,
+                groupSize: stacked.groupSize,
+                on: cmd)
+        } else {
+            let inners = Array(expertInnerScratches.prefix(topK))
+            Ops.swigluMany(gates: gs, ups: us, outs: inners, on: cmd)
+            var dws: [Tensor] = []
+            var dss: [Tensor] = []
+            var dbs: [Tensor] = []
+            var dins: [Tensor] = []
+            var didxs: [Tensor] = []
+            var douts: [Tensor] = []
+            dws.reserveCapacity(topK)
+            dss.reserveCapacity(topK)
+            dbs.reserveCapacity(topK)
+            dins.reserveCapacity(topK)
+            didxs.reserveCapacity(topK)
+            douts.reserveCapacity(topK)
+            for slot in 0 ..< topK {
+                dws.append(stacked.downWeight)
+                dss.append(stacked.downScales)
+                dbs.append(stacked.downBiases)
+                dins.append(expertInnerScratches[slot])
+                didxs.append(expertIdxScratches[slot])
+                douts.append(expertOutScratches[slot])
+            }
+            Ops.dequantGemvInt4ExpertIndexedMany(
+                weightsStacked: dws, scalesStacked: dss, biasesStacked: dbs,
+                inputs: dins, expertIndices: didxs, outputs: douts,
+                groupSize: stacked.groupSize, on: cmd)
+            var scalars: [Tensor] = []
+            scalars.reserveCapacity(topK)
+            let wBytes = h.dtype.byteSize
+            for slot in 0 ..< topK {
+                scalars.append(
+                    Tensor(
+                        buffer: routerWeightsScratch!.buffer,
+                        offset: routerWeightsScratch!.offset + slot * wBytes,
+                        shape: [1], dtype: h.dtype))
+            }
+            Ops.scalarFMAChain8(
+                scalars: scalars,
+                values: Array(expertOutScratches.prefix(topK)),
+                out: acc, on: cmd)
+        }
+
+        if let done = sharedDone, let sOut = sharedOut {
+            cmd.encodeWaitForEvent(device.syncEvent, value: done)
+            return Ops.add(acc, sOut, on: cmd)
+        }
+        if let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj {
+            let shared = swiGLU(h, gateProj: sg, upProj: su, downProj: sd, on: cmd)
+            return Ops.add(acc, shared, on: cmd)
+        }
+        return acc
+    }
+
+    /// Path B full with stacked NVFP4 experts (board quant).
+    private func decodeGPUPathBNvfp4(
+        h: Tensor, logitsTensor: Tensor,
+        stacked: StackedNvfp4Experts,
+        expertBiasGPU: Tensor,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let topK = router.topK
+        let nExperts = router.nExperts
+        let scoreDt = h.dtype
+        precondition(topK == 8)
+
+        if routerIndicesScratch == nil || routerIndicesScratch!.elementCount != topK {
+            routerIndicesScratch = Tensor.empty(shape: [topK], dtype: .u32, device: device)
+            routerWeightsScratch = Tensor.empty(shape: [topK], dtype: scoreDt, device: device)
+        }
+        if unbiasedScoreScratch == nil
+            || unbiasedScoreScratch!.elementCount != nExperts
+            || unbiasedScoreScratch!.dtype != scoreDt
+        {
+            unbiasedScoreScratch = Tensor.empty(shape: [nExperts], dtype: scoreDt, device: device)
+            biasedScoreScratch = Tensor.empty(shape: [nExperts], dtype: scoreDt, device: device)
+        }
+        if accumulatorScratch == nil
+            || accumulatorScratch!.dtype != h.dtype
+            || accumulatorScratch!.elementCount != hidden
+        {
+            accumulatorScratch = Tensor.empty(shape: [hidden], dtype: h.dtype, device: device)
+        }
+        let outDim = stacked.moeIntermediate
+        while expertGScratches.count < topK {
+            expertGScratches.append(
+                Tensor.empty(shape: [outDim], dtype: h.dtype, device: device))
+            expertUScratches.append(
+                Tensor.empty(shape: [outDim], dtype: h.dtype, device: device))
+            expertInnerScratches.append(
+                Tensor.empty(shape: [outDim], dtype: h.dtype, device: device))
+            expertOutScratches.append(
+                Tensor.empty(shape: [hidden], dtype: h.dtype, device: device))
+        }
+
+        // Shared expert depends only on h (not routing). Two schedules:
+        //   dual-queue (BUTTER_LAGUNA_DUAL_QUEUE!=0, default ON historically):
+        //     queue-B CB + event pair — overlaps router/experts, but costs
+        //     ~1 CB + 2 events per MoE layer (~39/token). Can hurt under
+        //     host thrash / deep pipe (already many main CBs in flight).
+        //   single-queue early (default when DUAL_QUEUE=0): encode shared
+        //     first on `cmd` so Metal can overlap independent dispatches
+        //     with router+experts without cross-queue events.
+        let dualQueue =
+            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DUAL_QUEUE"] != "0"
+            && sharedGateProj != nil
+        var sharedOut: Tensor?
+        var sharedDone: UInt64?
+        if let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj {
+            if dualQueue {
+                let cmdB = device.makeCommandBufferB()
+                let vStart = device.nextSyncValue()
+                cmd.encodeSignalEvent(device.syncEvent, value: vStart)
+                cmdB.encodeWaitForEvent(device.syncEvent, value: vStart)
+                let sInner: Tensor
+                if LagunaNvfp4Fuse.sharedSwigluEnabled,
+                    let (fw, fs, fg) = ensureFusedSharedGateUp(
+                        gate: sg, up: su, device: device)
+                {
+                    sInner = LagunaNvfp4Fuse.sharedSwigluQmv(
+                        input: h, fusedWeight: fw, fusedScales: fs,
+                        global: fg, on: cmdB, device: device)
+                } else {
+                    let sGate = sg(h, on: cmdB)
+                    let sUp = su(h, on: cmdB)
+                    sInner = Ops.swiglu(gate: sGate, up: sUp, on: cmdB)
+                }
+                sharedOut = sd(sInner, on: cmdB)
+                let vDone = device.nextSyncValue()
+                cmdB.encodeSignalEvent(device.syncEvent, value: vDone)
+                cmdB.commit()
+                sharedDone = vDone
+            } else {
+                // Early on main queue (before router) — no events.
+                let sInner: Tensor
+                if LagunaNvfp4Fuse.sharedSwigluEnabled,
+                    let (fw, fs, fg) = ensureFusedSharedGateUp(
+                        gate: sg, up: su, device: device)
+                {
+                    sInner = LagunaNvfp4Fuse.sharedSwigluQmv(
+                        input: h, fusedWeight: fw, fusedScales: fs,
+                        global: fg, on: cmd, device: device)
+                } else {
+                    let sGate = sg(h, on: cmd)
+                    let sUp = su(h, on: cmd)
+                    sInner = Ops.swiglu(gate: sGate, up: sUp, on: cmd)
+                }
+                sharedOut = sd(sInner, on: cmd)
+            }
+        }
+
+        let unbiased = Ops.sigmoid(logitsTensor, on: cmd, into: unbiasedScoreScratch!)
+        let biased = Ops.add(unbiased, expertBiasGPU, on: cmd, into: biasedScoreScratch!)
+        Ops.moeRouterTopKBiased(
+            scoreBiased: biased, scoreUnbiased: unbiased,
+            indicesOut: routerIndicesScratch!,
+            weightsOut: routerWeightsScratch!,
+            nExperts: nExperts, k: topK, on: cmd)
+        let scale = router.routedScalingFactor
+        if scale != 1.0 {
+            if pathBScaleVecScratch == nil
+                || pathBScaleVecScratch!.dtype != scoreDt
+                || pathBScaleVecScratch!.elementCount != topK
+            {
+                pathBScaleVecScratch = Tensor.filled(
+                    scale, shape: [topK], dtype: scoreDt, device: device)
+            }
+            _ = Ops.mul(
+                routerWeightsScratch!, pathBScaleVecScratch!, on: cmd,
+                into: routerWeightsScratch!)
+        }
+
+        var expertIdxScratches: [Tensor] = []
+        expertIdxScratches.reserveCapacity(topK)
+        for slot in 0 ..< topK {
+            expertIdxScratches.append(
+                Tensor(
+                    buffer: routerIndicesScratch!.buffer,
+                    offset: routerIndicesScratch!.offset + slot * 4,
+                    shape: [1], dtype: .u32))
+        }
+
+        let acc = accumulatorScratch!
+        let canFuse =
+            h.dtype == .bf16
+            && stacked.moeIntermediate <= 768
+            && stacked.blockSize == 16
+
+        // Gate+up path (Laguna mid=512, hidden=2048, topK=8, bf16):
+        //   ROUTED_SWIGLU (default ON) — one QMV+SwiGLU over 8 experts
+        //   GATEUP_FUSE=1 — older per-row concurrent fuse
+        //   else — concurrent iron eidx gate/up + swigluMany
+        // Down path:
+        //   DOWN_REDUCE (default ON) — concurrent 8-slot down+weighted reduce
+        //   FUSED=1 serial chain8 (slow) | SLOT_FUSE=1 | stock eidx+FMA
+        let lagunaHot =
+            canFuse
+            && h.dtype == .bf16
+            && stacked.moeIntermediate == 512
+            && hidden == 2048
+            && topK == 8
+        let useRoutedSwiglu =
+            lagunaHot && LagunaNvfp4Fuse.pathBRoutedSwigluEnabled
+        let useGateUpFuse =
+            canFuse && !useRoutedSwiglu && LagunaNvfp4Fuse.pathBGateUpFuseEnabled
+        let useDownReduce =
+            lagunaHot && LagunaNvfp4Fuse.pathBDownReduceEnabled
+
+        let mids: [Tensor]
+        if useRoutedSwiglu {
+            let inners = Array(expertInnerScratches.prefix(topK))
+            LagunaNvfp4Fuse.moeRoutedSwigluQmv(
+                input: h,
+                gateWeight: stacked.gateWeight,
+                gateScales: stacked.gateScales,
+                upWeight: stacked.upWeight,
+                upScales: stacked.upScales,
+                expertIndices: routerIndicesScratch!,
+                outputs: inners,
+                global: stacked.global,
+                on: cmd, device: device)
+            mids = inners
+        } else if useGateUpFuse {
+            let inners = Array(expertInnerScratches.prefix(topK))
+            LagunaNvfp4Fuse.moeGateUpSwigluMany(
+                gateWeight: stacked.gateWeight,
+                gateScales: stacked.gateScales,
+                upWeight: stacked.upWeight,
+                upScales: stacked.upScales,
+                input: h,
+                expertIndices: expertIdxScratches,
+                outputs: inners,
+                inDim: hidden,
+                outDim: stacked.moeIntermediate,
+                blockSize: stacked.blockSize,
+                global: stacked.global,
+                on: cmd, device: device)
+            mids = inners
+        } else if canFuse && LagunaNvfp4Fuse.pathBDownFusedEnabled {
+            // Serial chain8 needs separate gate/up buffers; emit them now.
+            var ws: [Tensor] = []
+            var ss: [Tensor] = []
+            var ins: [Tensor] = []
+            var idxs: [Tensor] = []
+            var outs0: [Tensor] = []
+            for slot in 0 ..< topK {
+                ws.append(stacked.gateWeight); ss.append(stacked.gateScales)
+                ins.append(h); idxs.append(expertIdxScratches[slot])
+                outs0.append(expertGScratches[slot])
+                ws.append(stacked.upWeight); ss.append(stacked.upScales)
+                ins.append(h); idxs.append(expertIdxScratches[slot])
+                outs0.append(expertUScratches[slot])
+            }
+            Ops.nvfp4DequantGemvExpertIndexedMany(
+                weightsStacked: ws, scalesStacked: ss,
+                inputs: ins, expertIndices: idxs, outputs: outs0,
+                blockSize: stacked.blockSize, global: stacked.global, on: cmd)
+            mids = []  // unused — chain8 consumes G/U directly
+        } else if canFuse && LagunaNvfp4Fuse.pathBSlotFuseEnabled {
+            var ws: [Tensor] = []
+            var ss: [Tensor] = []
+            var ins: [Tensor] = []
+            var idxs: [Tensor] = []
+            var outs0: [Tensor] = []
+            for slot in 0 ..< topK {
+                ws.append(stacked.gateWeight); ss.append(stacked.gateScales)
+                ins.append(h); idxs.append(expertIdxScratches[slot])
+                outs0.append(expertGScratches[slot])
+                ws.append(stacked.upWeight); ss.append(stacked.upScales)
+                ins.append(h); idxs.append(expertIdxScratches[slot])
+                outs0.append(expertUScratches[slot])
+            }
+            Ops.nvfp4DequantGemvExpertIndexedMany(
+                weightsStacked: ws, scalesStacked: ss,
+                inputs: ins, expertIndices: idxs, outputs: outs0,
+                blockSize: stacked.blockSize, global: stacked.global, on: cmd)
+            mids = []  // unused — slot fuse consumes G/U
+        } else {
+            var ws: [Tensor] = []
+            var ss: [Tensor] = []
+            var ins: [Tensor] = []
+            var idxs: [Tensor] = []
+            var outs0: [Tensor] = []
+            for slot in 0 ..< topK {
+                ws.append(stacked.gateWeight); ss.append(stacked.gateScales)
+                ins.append(h); idxs.append(expertIdxScratches[slot])
+                outs0.append(expertGScratches[slot])
+                ws.append(stacked.upWeight); ss.append(stacked.upScales)
+                ins.append(h); idxs.append(expertIdxScratches[slot])
+                outs0.append(expertUScratches[slot])
+            }
+            Ops.nvfp4DequantGemvExpertIndexedMany(
+                weightsStacked: ws, scalesStacked: ss,
+                inputs: ins, expertIndices: idxs, outputs: outs0,
+                blockSize: stacked.blockSize, global: stacked.global, on: cmd)
+            let gs = Array(expertGScratches.prefix(topK))
+            let us = Array(expertUScratches.prefix(topK))
+            let inners = Array(expertInnerScratches.prefix(topK))
+            Ops.swigluMany(gates: gs, ups: us, outs: inners, on: cmd)
+            mids = inners
+        }
+
+        if canFuse && LagunaNvfp4Fuse.pathBDownFusedEnabled
+            && !useRoutedSwiglu && !useGateUpFuse
+        {
+            // Serial chain8 needs separate gate/up buffers.
+            let gs = Array(expertGScratches.prefix(topK))
+            let us = Array(expertUScratches.prefix(topK))
+            LagunaNvfp4Fuse.moeDownSwigluAccumChain8(
+                gates: gs, ups: us,
+                expertIndices: routerIndicesScratch!,
+                slotWeights: routerWeightsScratch!,
+                downWeight: stacked.downWeight,
+                downScales: stacked.downScales,
+                output: acc,
+                inDim: stacked.moeIntermediate,
+                outDim: hidden,
+                blockSize: stacked.blockSize,
+                global: stacked.global,
+                on: cmd, device: device)
+        } else if canFuse && LagunaNvfp4Fuse.pathBSlotFuseEnabled
+            && !useRoutedSwiglu && !useGateUpFuse
+        {
+            let gs = Array(expertGScratches.prefix(topK))
+            let us = Array(expertUScratches.prefix(topK))
+            var douts: [Tensor] = []
+            for slot in 0 ..< topK { douts.append(expertOutScratches[slot]) }
+            LagunaNvfp4Fuse.moeSlotSwigluDownMany(
+                gates: gs, ups: us,
+                expertIndices: expertIdxScratches,
+                downWeight: stacked.downWeight,
+                downScales: stacked.downScales,
+                outputs: douts,
+                inDim: stacked.moeIntermediate,
+                outDim: hidden,
+                blockSize: stacked.blockSize,
+                global: stacked.global,
+                on: cmd, device: device)
+            var scalars: [Tensor] = []
+            let wBytes = h.dtype.byteSize
+            for slot in 0 ..< topK {
+                scalars.append(
+                    Tensor(
+                        buffer: routerWeightsScratch!.buffer,
+                        offset: routerWeightsScratch!.offset + slot * wBytes,
+                        shape: [1], dtype: h.dtype))
+            }
+            Ops.scalarFMAChain8(
+                scalars: scalars,
+                values: Array(expertOutScratches.prefix(topK)),
+                out: acc, on: cmd)
+        } else if useDownReduce && !mids.isEmpty {
+            // mlxfast FUSED_ROUTED_DOWN_REDUCE: one concurrent 8-slot
+            // down QMV + BF16 weighted reduce → acc.
+            LagunaNvfp4Fuse.moeRoutedDownReduce(
+                mids: mids,
+                expertIndices: routerIndicesScratch!,
+                slotWeights: routerWeightsScratch!,
+                downWeight: stacked.downWeight,
+                downScales: stacked.downScales,
+                output: acc,
+                global: stacked.global,
+                on: cmd, device: device)
+        } else {
+            // Stock: concurrent eidx down + scalarFMAChain8.
+            precondition(!mids.isEmpty, "decodeGPUPathBNvfp4: missing mids")
+            var dws: [Tensor] = []
+            var dss: [Tensor] = []
+            var dins: [Tensor] = []
+            var didxs: [Tensor] = []
+            var douts: [Tensor] = []
+            for slot in 0 ..< topK {
+                dws.append(stacked.downWeight)
+                dss.append(stacked.downScales)
+                dins.append(mids[slot])
+                didxs.append(expertIdxScratches[slot])
+                douts.append(expertOutScratches[slot])
+            }
+            Ops.nvfp4DequantGemvExpertIndexedMany(
+                weightsStacked: dws, scalesStacked: dss,
+                inputs: dins, expertIndices: didxs, outputs: douts,
+                blockSize: stacked.blockSize, global: stacked.global, on: cmd)
+            var scalars: [Tensor] = []
+            let wBytes = h.dtype.byteSize
+            for slot in 0 ..< topK {
+                scalars.append(
+                    Tensor(
+                        buffer: routerWeightsScratch!.buffer,
+                        offset: routerWeightsScratch!.offset + slot * wBytes,
+                        shape: [1], dtype: h.dtype))
+            }
+            Ops.scalarFMAChain8(
+                scalars: scalars,
+                values: Array(expertOutScratches.prefix(topK)),
+                out: acc, on: cmd)
+        }
+
+        if let done = sharedDone, let sOut = sharedOut {
+            cmd.encodeWaitForEvent(device.syncEvent, value: done)
+            return Ops.add(acc, sOut, on: cmd)
+        }
+        if let sOut = sharedOut {
+            // Single-queue early path: shared already encoded above.
+            return Ops.add(acc, sOut, on: cmd)
+        }
+        return acc
+    }
+
+    /// Lazy build of fused shared [gate; up] NVFP4 banks (once per layer).
+    private func ensureFusedSharedGateUp(
+        gate: AnyLinear, up: AnyLinear, device: Device
+    ) -> (Tensor, Tensor, Float)? {
+        if let w = fusedSharedGateUpWeight, let s = fusedSharedGateUpScales {
+            return (w, s, fusedSharedGateUpGlobal)
+        }
+        if fusedSharedGateUpAttempted { return nil }
+        fusedSharedGateUpAttempted = true
+        guard let g = gate.inner as? Nvfp4Linear,
+            let u = up.inner as? Nvfp4Linear,
+            let fused = LagunaNvfp4Fuse.fuseGateUp(gate: g, up: u, device: device)
+        else { return nil }
+        fusedSharedGateUpWeight = fused.weight
+        fusedSharedGateUpScales = fused.scales
+        fusedSharedGateUpGlobal = fused.global
+        return fused
     }
 
     /// GPU MoE router decode path. Replaces the

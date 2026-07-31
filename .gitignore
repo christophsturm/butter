@@ -10,6 +10,9 @@ Package.resolved
 # Ignore everything in Generated/ except .gitkeep so the directory
 # survives a fresh clone before iron-emit runs.
 Sources/IronSwift/Resources/kernels.metallib
+# Overlay metallib (Path B fuses + fast NVFP4 eidx qdot) — rebuilt by
+# scripts/link-extra-metals.sh after iron emit; sources in kernel_overlays/.
+Sources/IronSwift/Resources/kernels_extra.metallib
 Sources/IronSwift/Resources/manifest.json
 Sources/IronSwift/Resources/kernels/
 Sources/IronSwift/Generated/*

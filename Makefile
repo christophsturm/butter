@@ -77,6 +77,16 @@ regenerate-kernels: ## run `iron build --emit` to regenerate metallib + Swift wr
 	    tmp="$$gen.tmp"; \
 	    { printf '// swift-format-ignore-file\n//\n'; cat "$$gen"; } > "$$tmp" && mv "$$tmp" "$$gen"; \
 	  fi
+	@$(MAKE) link-extra-metals
+
+# ─── Extra metals (butter/laguna hand-written + fast-qdot overlays) ───
+# iron build only links its own emitted .metal into kernels.metallib.
+# Path B fuse kernels + the fast half-bitpath NVFP4 eidx overlays live under
+# Resources/kernel_overlays/ and are re-applied + re-linked here so decode
+# Path B does not live-compile soft Metal.
+.PHONY: link-extra-metals
+link-extra-metals: ## re-apply kernel_overlays + re-link kernels.metallib
+	@./scripts/link-extra-metals.sh
 
 # ─── Bench ────────────────────────────────────────────────────────────
 # Quality benches (wikitext2 perplexity / KLD, NIAH retrieval) forced-decode

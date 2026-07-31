@@ -2883,7 +2883,17 @@ public enum Ops {
         var outDimV = UInt32(outDim)
         var groupSizeV = UInt32(groupSize)
         let pso = PSOCache.shared.pipelineState(for: psoName)
-        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        // Concurrent default: gate‖up and multi-expert gemvs write distinct
+        // outs (Hy3 int2 path). Serial escape: BUTTER_MOE_SERIAL_EXPERT_GEMV=1.
+        let useConcurrent =
+            ProcessInfo.processInfo.environment["BUTTER_MOE_SERIAL_EXPERT_GEMV"] == nil
+        let enc: MTLComputeCommandEncoder?
+        if useConcurrent {
+            enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
+        } else {
+            enc = cmd.makeComputeCommandEncoder()
+        }
+        guard let enc else { return }
         enc.setComputePipelineState(pso)
         // Shared constexprs (kernel buffer indices 6, 7, 8) set once.
         enc.setBytes(&inDimV, length: 4, index: 6)
