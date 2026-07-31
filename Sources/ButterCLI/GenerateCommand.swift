@@ -353,6 +353,25 @@ struct GenerateCommand: AsyncParsableCommand {
         if Profile.shared.level >= .wallclock {
             print(Profile.shared.phases.formatted())
         }
+        // T39: BUTTER_LAGUNA_DECODE_KERNEL_TIMING=1 per-kernel decode probe.
+        // This run's own `--stats` tok/s is NOT the real anchor: forcing a
+        // commit+wait at every checkpoint inflates it (same class of
+        // inflation T26/T31 already flagged for prefill's forced-sync phase
+        // timing). Pass the real (separately-measured, plain --stats,
+        // timing OFF) decode tok/s via BUTTER_LAGUNA_DECODE_REAL_TOKS for
+        // the share-projection column; omit it to see raw forced-sync
+        // numbers only.
+        if LagunaDecodeKernelTiming.enabled {
+            let realUsPerToken: Double?
+            if let realToks = ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DECODE_REAL_TOKS"]
+                .flatMap(Double.init), realToks > 0
+            {
+                realUsPerToken = 1_000_000.0 / realToks
+            } else {
+                realUsPerToken = nil
+            }
+            LagunaDecodeKernelTiming.report(realUsPerToken: realUsPerToken)
+        }
     }
 
     /// Drive generation either by consuming the stream chunk-by-chunk

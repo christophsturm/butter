@@ -64,8 +64,14 @@ public final class Device: @unchecked Sendable {
         self.syncEvent = ev
     }
 
+    /// Second-queue counterpart to `makeCommandBuffer()`: same
+    /// `Device.unretainedCommandBuffersEnabled` gate.
     public func makeCommandBufferB() -> MTLCommandBuffer {
-        guard let cb = commandQueueB.makeCommandBuffer() else {
+        let cb: MTLCommandBuffer? =
+            Self.unretainedCommandBuffersEnabled
+            ? commandQueueB.makeCommandBufferWithUnretainedReferences()
+            : commandQueueB.makeCommandBuffer()
+        guard let cb else {
             fatalError("Device.makeCommandBufferB() returned nil")
         }
         return cb
@@ -309,9 +315,49 @@ public final class Device: @unchecked Sendable {
         return b
     }
 
-    /// Make a new MTLCommandBuffer.
+    /// T21 hygiene: hot decode/prefill command buffers can skip Metal's
+    /// automatic retain of every resource referenced by an encoded
+    /// command (`makeCommandBufferWithUnretainedReferences`), removing a
+    /// per-`setBuffer`/`setTexture` bookkeeping cost the driver otherwise
+    /// pays on every dispatch. This is safe ONLY for resources whose
+    /// lifetime is independently guaranteed past GPU completion: weight
+    /// buffers and KV/state-cache buffers (pinned in the weight
+    /// `MTLResidencySet`, which itself holds a strong reference, see
+    /// `markWeightsResident`), scratch-slab slices (backed by a
+    /// persistent `Device`-owned buffer), and `scalarBuffer`/
+    /// `intermediateScratch`-cached buffers.
+    ///
+    /// MANDATORY-AUDIT finding (see the T21 hygiene PR description for
+    /// the full table): several hot decode/prefill call sites still
+    /// allocated ad-hoc per-call `MTLBuffer`s (raw
+    /// `device.makeBuffer(length:)`, not scratch/residency/cache-backed)
+    /// whose only keep-alive was the command buffer's automatic
+    /// retention. The clearest, highest-traffic case:
+    /// `MoELayer.decodeMany`/`decodeManyNvfp4`'s gather-index / expert-id
+    /// / inverse-permutation buffers, committed WITHOUT a synchronous
+    /// wait (`commitAtEnd`, chained across MoE layers), is now pooled
+    /// (see `MoELayer.gatherRoutingBuffers`/`invPermRoutingBuffer`) and
+    /// safe either way. Several per-model `Text/*.swift` helper buffers
+    /// threaded through similarly chained, commit-without-wait pipelines
+    /// have NOT been individually verified pool-clean: flipping this
+    /// switch on globally before that follow-up lands would be a silent
+    /// use-after-free landmine, not a perf win. Defaults OFF; set
+    /// `BUTTER_UNRETAINED_CB=1` to opt in once a given workload's hot
+    /// path is confirmed pool-clean.
+    public static let unretainedCommandBuffersEnabled: Bool = {
+        ProcessInfo.processInfo.environment["BUTTER_UNRETAINED_CB"] == "1"
+    }()
+
+    /// Make a new MTLCommandBuffer. Routes through
+    /// `makeCommandBufferWithUnretainedReferences()` when
+    /// `Device.unretainedCommandBuffersEnabled`; see that property's
+    /// doc for the safety precondition and why it defaults off.
     public func makeCommandBuffer() -> MTLCommandBuffer {
-        guard let cb = commandQueue.makeCommandBuffer() else {
+        let cb: MTLCommandBuffer? =
+            Self.unretainedCommandBuffersEnabled
+            ? commandQueue.makeCommandBufferWithUnretainedReferences()
+            : commandQueue.makeCommandBuffer()
+        guard let cb else {
             fatalError("Device.makeCommandBuffer() returned nil")
         }
         return cb
@@ -356,6 +402,27 @@ public final class Device: @unchecked Sendable {
             set.addAllocation(buf)
         }
         set.commit()
+        set.requestResidency()
+    }
+
+    /// T21 hygiene: re-requests residency for the EXISTING weight
+    /// `MTLResidencySet` without adding new allocations:
+    /// `requestResidency()` re-touches the whole set in one driver call,
+    /// not per-allocation, so this is cheap. `markWeightsResident` only
+    /// calls `requestResidency()` when growing the set (once at load,
+    /// then again at each KV/state-cache allocation); nothing re-touches
+    /// it once caches stop growing for the lifetime of the process. Under
+    /// memory pressure the OS can page a resident set back out between
+    /// `generate()` calls (a long-idle chat session, or another process
+    /// squeezing this one); `Model.driveGeneration` calls this at the top
+    /// of every generate call to re-pin weights before the token loop
+    /// starts. No-op if the set was never created (weights not yet
+    /// loaded) or if `BUTTER_NO_RESIDENCY_SET=1`.
+    public func refreshWeightResidency() {
+        guard #available(macOS 15.0, iOS 18.0, *) else { return }
+        residencyLock.lock()
+        defer { residencyLock.unlock() }
+        guard let set = weightResidencySet as? MTLResidencySet else { return }
         set.requestResidency()
     }
 }

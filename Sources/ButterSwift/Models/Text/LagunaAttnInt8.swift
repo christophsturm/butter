@@ -47,6 +47,70 @@ enum LagunaAttnInt8 {
         ProcessInfo.processInfo.environment["BUTTER_LAGUNA_ATTN_INT8"] != "0"
     }
 
+    /// T32 task 2: fold the per-head gate-product-softplus multiply into
+    /// this bank's own QMV as an activation prologue (see `qmvGated`
+    /// below), instead of a separate `LagunaGatedOProjFuse` dispatch
+    /// feeding this QMV unchanged. T32 shipped this default OFF (its own
+    /// wall-clock A/B read flat, "quality-first, no default change for a
+    /// noise-level win"). T39's per-kernel GPU-time probe found the
+    /// unfused two-dispatch chain (`LagunaGatedOProjFuse` fuse +
+    /// `qmv`, what runs when this is OFF) is the single largest GPU-time
+    /// consumer in decode (~35% of measured GPU-busy work, ahead of the
+    /// QKV bank QMV and every MoE kernel); re-flipped default ON here;
+    /// see benchmarks/laguna-xs/README.md T39. Set
+    /// `BUTTER_LAGUNA_INT8_OPROJ_GATED=0` to restore the T32-default
+    /// separate-dispatch (T24 kernel 1) chain. Only takes effect where
+    /// `enabled` (this bank) already holds.
+    static var gatedEnabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_INT8_OPROJ_GATED"] != "0"
+    }
+
+    /// `qmvGated` dispatch geometry, v2 vs the original T32 kernel.
+    /// Default ON (v2). The v1 body (`qmvGatedV1` below, same source as
+    /// the kernel this file shipped with before this change) recomputed
+    /// softplus per lane per k-block and read the packed weight a
+    /// 32-bit word at a time; v2 precomputes one softplus per head into
+    /// a threadgroup gate table (barrier once, then a pure table read
+    /// per k-block), widens the per-lane slice to `values_per_thread =
+    /// 8` over a `block_size = 256` stride, rounds the gated activation
+    /// through bf16 at the same point the unfused gate-product kernel
+    /// would, and reads packed weight bytes as scalar `uint8_t` instead
+    /// of unpacking a `uint32` word.
+    ///
+    /// DEFAULT OFF (w2-integration cycle 3 finding, unrelated to any
+    /// cycle-3 branch's own diff): v2 was landed in cycle 2 default ON
+    /// but had never actually run through a real multi-step decode loop
+    /// end to end: its Metal kernel failed to COMPILE on this
+    /// toolchain (32023.883) until a cycle-3 signature fix (paired
+    /// `uint3`/`uint` grid-position attributes, see the qmvGatedV2Src
+    /// kernel doc), so only synthetic single-shape unit tests
+    /// (LagunaOProjQmvV2Tests) had ever exercised it. Once unblocked,
+    /// real decode traffic surfaced a repetition-collapse bug:
+    /// `butter generate --model ~/models/laguna-xs-2.1-nvfp4 --prompt
+    /// "What is the capital of France?" --max-tokens 48 --temperature 0`
+    /// with the classic per-token decode loop (BUTTER_GPU_TOKEN_LOOP=0)
+    /// degenerates into repeating "The capital of France is Paris.\n"
+    /// six times instead of the canonical coherent continuation. Root
+    /// cause NOT isolated despite targeted A/B testing: confirmed NOT
+    /// the Ops.argmax GPU kernel (reproduces via the CPU-sample path,
+    /// BUTTER_GREEDY_GPU_ARGMAX=0, which never touches it), NOT the
+    /// multi-CB layer pipeline (reproduces with BUTTER_LAGUNA_LAYER_PIPE=0),
+    /// NOT generic KV-cache code (v1 runs the identical cache code
+    /// correctly for the same 48 tokens). The bug requires BOTH v2 AND
+    /// the classic Int-token decode call path: the new GPU-resident
+    /// token-loop path (`LanguageModel.forward(tokenIdBuffer:...)`,
+    /// GpuTokenLoop.swift) calls the exact same shared
+    /// `forwardFromTokenTensor` body yet does not trigger it, which is
+    /// unexplained (see benchmarks/laguna-xs/README.md T42 for the
+    /// full isolation matrix). Quality bar: a kernel that can silently
+    /// collapse decode into repetition is not shippable regardless of
+    /// its speed, so this defaults OFF until root-caused. Set
+    /// `BUTTER_LAGUNA_QMV_V2=1` to opt back in for further
+    /// investigation; the kernel and its tests are kept, not removed.
+    static var qmvV2Enabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_QMV_V2"] == "1"
+    }
+
     static let groupSize = 32
 
     /// One group-32 affine INT8 side layout: `packed` is `[outDim,
@@ -276,6 +340,354 @@ enum LagunaAttnInt8 {
             outDim: totalOut, inDim: first.inDim)
     }
 
+    // T32 task 2: gate-folded variant of `qmvSrc` for the o_proj bank
+    // specifically. `LagunaGatedOProjFuse`'s T24 kernel 1 already folds
+    // `softplus(gate_logits) * attention_output` into one dispatch feeding
+    // this bank's QMV unchanged (kernel 1); this kernel goes one step
+    // further and folds THAT gate-product into this QMV's own activation
+    // load, removing kernel 1's dispatch too. `packsPerHead` (== headDim/4,
+    // a runtime uniform, not baked in) tells each lane which per-head gate
+    // logit its 4-wide `x` load belongs to (`headDim` a multiple of 4 in
+    // every model this bank targets, Laguna XS headDim=128). Softplus is
+    // the identical numerically-stable form as `LagunaGatedOProjFuse`'s
+    // kernel 1 (`max(x,0) + log(1+exp(-|x|))`), recomputed per lane per
+    // 32-pack block (== once per head, ~nHeads times/lane total) rather
+    // than materializing a `[nHeads]` scratch: cheap relative to the GEMV
+    // itself. `xs` (the affine zero-point term's activation sum) uses the
+    // GATED x values, matching what stock `qmv` would see if fed an
+    // already-gated row.
+    private static let qmvGatedSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void laguna_attn_qmv_int8_g32_gated_bf16(
+            const device uint *w [[buffer(0)]],
+            const device bfloat *scales [[buffer(1)]],
+            const device bfloat *biases [[buffer(2)]],
+            const device bfloat *x [[buffer(3)]],
+            const device bfloat *gate_logits [[buffer(4)]],
+            device bfloat *out [[buffer(5)]],
+            constant uint &inDim [[buffer(6)]],
+            constant uint &outDim [[buffer(7)]],
+            constant uint &packsPerHead [[buffer(8)]],
+            uint3 tgid [[threadgroup_position_in_grid]],
+            uint lane [[thread_index_in_simdgroup]],
+            uint sg [[simdgroup_index_in_threadgroup]])
+        {
+            constexpr uint GROUP = 32;
+            constexpr uint ROWS_PER_SG = 4;
+            uint packsPerRow = inDim / 4;
+            uint groupsPerRow = inDim / GROUP;
+            uint rowBase = tgid.x * (2u * ROWS_PER_SG) + sg * ROWS_PER_SG;
+
+            float acc[ROWS_PER_SG] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+            for (uint block = 0; block < packsPerRow; block += 32u) {
+                uint packIdx = block + lane;
+                if (packIdx < packsPerRow) {
+                    uint xBase = packIdx * 4u;
+                    bfloat4 xv = *((const device bfloat4 *)(x + xBase));
+                    uint head = packIdx / packsPerHead;
+                    float gl = float(gate_logits[head]);
+                    bool pos = gl > 0.0f;
+                    float ax = pos ? gl : (0.0f - gl);
+                    float gate = (pos ? gl : 0.0f) + log(1.0f + exp(0.0f - ax));
+                    float x0 = float(xv[0]) * gate;
+                    float x1 = float(xv[1]) * gate;
+                    float x2 = float(xv[2]) * gate;
+                    float x3 = float(xv[3]) * gate;
+                    float xs = x0 + x1 + x2 + x3;
+                    uint g = xBase / GROUP;
+                    for (uint r = 0; r < ROWS_PER_SG; ++r) {
+                        uint row = rowBase + r;
+                        if (row < outDim) {
+                            uint p = w[row * packsPerRow + packIdx];
+                            float s = float(scales[row * groupsPerRow + g]);
+                            float b = float(biases[row * groupsPerRow + g]);
+                            float c0 = float(p & 0xFFu);
+                            float c1 = float((p >> 8u) & 0xFFu);
+                            float c2 = float((p >> 16u) & 0xFFu);
+                            float c3 = float((p >> 24u) & 0xFFu);
+                            float qd = c0 * x0 + c1 * x1 + c2 * x2 + c3 * x3;
+                            acc[r] += s * qd + b * xs;
+                        }
+                    }
+                }
+            }
+
+            for (uint r = 0; r < ROWS_PER_SG; ++r) {
+                float total = simd_sum(acc[r]);
+                if (lane == 0) {
+                    uint row = rowBase + r;
+                    if (row < outDim) {
+                        out[row] = bfloat(total);
+                    }
+                }
+            }
+        }
+        """
+
+    // v2 of the gated o_proj QMV: same 64-thread / 2-simdgroup / 4-row
+    // tile as v1 above, but the inner loop is reshaped around
+    // `values_per_thread = 8` over a `block_size = 256` stride (one
+    // lane advances 8 input columns per k-block instead of one packed
+    // 4-wide word), and the per-head softplus gate is computed ONCE
+    // per threadgroup into `gate_table` rather than recomputed by every
+    // lane on every k-block. The gated activation is rounded through
+    // bf16 at the exact point `LagunaGatedOProjFuse.applyGateProductSoftplus`
+    // would round it (`float(bfloat(float(x) * gate))`), so feeding this
+    // kernel is bit-identical to running that gate-product kernel first
+    // and then a plain (ungated) affine QMV over the result. The block's
+    // activation sum (`sum`, the zero-point/bias term) is computed once
+    // per block and shared across all 4 rows in the simdgroup, same as
+    // v1. Packed weight bytes are read scalar (`uint8_t`), not unpacked
+    // a `uint32` word at a time: a wider per-lane weight load measured
+    // as a net loss on this GPU in earlier work despite a local win, so
+    // this port deliberately keeps the load scalar. `headDim` is a
+    // runtime uniform (not baked per head-count like a specialized
+    // kernel would), so head lookup is `column / headDim` rather than a
+    // compile-time shift; requires `inDim` a multiple of `block_size`
+    // (256), checked by the caller guard below. Every current Laguna
+    // shape (`heads * headDim` with `headDim == 128`) satisfies this,
+    // and `qmvGatedV2` declines cleanly (falls back to v1) when it
+    // doesn't.
+    private static let qmvGatedV2Src = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void laguna_attn_qmv_int8_g32_gated_v2_bf16(
+            const device uint8_t *w [[buffer(0)]],
+            const device bfloat *scales [[buffer(1)]],
+            const device bfloat *biases [[buffer(2)]],
+            const device bfloat *x [[buffer(3)]],
+            const device bfloat *gate_logits [[buffer(4)]],
+            device bfloat *out [[buffer(5)]],
+            constant uint &inDim [[buffer(6)]],
+            constant uint &outDim [[buffer(7)]],
+            constant uint &headDim [[buffer(8)]],
+            constant uint &heads [[buffer(9)]],
+            threadgroup float *gate_table [[threadgroup(0)]],
+            uint3 tgid [[threadgroup_position_in_grid]],
+            uint3 lid3 [[thread_position_in_threadgroup]],
+            uint simd_lid [[thread_index_in_simdgroup]],
+            uint simd_gid [[simdgroup_index_in_threadgroup]])
+        {
+            constexpr uint GROUP = 32;
+            constexpr uint ROWS_PER_SG = 4;
+            constexpr uint VALUES_PER_THREAD = 8;
+            constexpr uint BLOCK_SIZE = 256;   // VALUES_PER_THREAD * SIMD_SIZE(32)
+            constexpr uint SCALE_STEP = GROUP / VALUES_PER_THREAD;
+            uint groupsPerRow = inDim / GROUP;
+
+            // One softplus per head, computed once into threadgroup memory
+            // at the same rounding point the unfused gate-product kernel
+            // uses. Strided over `heads` so this holds for any head count
+            // relative to the fixed 64-thread threadgroup width.
+            for (uint h = lid3.x; h < heads; h += 64) {
+                // Numerically-stable softplus, same op stream/order as
+                // iron_softplus_bf16 and the separate-dispatch gate-product
+                // kernel, so the fused path stays byte-compatible with the
+                // two-dispatch chain it replaces.
+                float x = float(gate_logits[h]);
+                bool pos = x > 0.0f;
+                float negx = 0.0f - x;
+                float ax = pos ? x : negx;
+                float e = exp(0.0f - ax);
+                float lg = log(1.0f + e);
+                gate_table[h] = float(bfloat((pos ? x : 0.0f) + lg));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            uint rowBase = tgid.x * (2u * ROWS_PER_SG) + simd_gid * ROWS_PER_SG;
+
+            const device uint8_t *ws = w + rowBase * inDim + simd_lid * VALUES_PER_THREAD;
+            const device bfloat *sc = scales + rowBase * groupsPerRow + simd_lid / SCALE_STEP;
+            const device bfloat *bs = biases + rowBase * groupsPerRow + simd_lid / SCALE_STEP;
+            const device bfloat *xp = x + simd_lid * VALUES_PER_THREAD;
+
+            thread float x_thread[VALUES_PER_THREAD];
+            float result[ROWS_PER_SG] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+            uint column = simd_lid * VALUES_PER_THREAD;
+            for (uint k = 0; k < inDim; k += BLOCK_SIZE) {
+                float gate = gate_table[column / headDim];
+                float sum = 0.0f;
+                for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
+                    float value = float(bfloat(float(xp[i]) * gate));
+                    sum += value;
+                    x_thread[i] = value;
+                }
+
+                for (uint row = 0; row < ROWS_PER_SG; ++row) {
+                    uint outRow = rowBase + row;
+                    if (outRow < outDim) {
+                        const device uint8_t *wl = ws + row * inDim;
+                        float scale = float(sc[row * groupsPerRow]);
+                        float bias = float(bs[row * groupsPerRow]);
+                        float accum = 0.0f;
+                        for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
+                            accum += x_thread[i] * float(wl[i]);
+                        }
+                        result[row] += scale * accum + sum * bias;
+                    }
+                }
+
+                ws += BLOCK_SIZE;
+                sc += BLOCK_SIZE / GROUP;
+                bs += BLOCK_SIZE / GROUP;
+                xp += BLOCK_SIZE;
+                column += BLOCK_SIZE;
+            }
+
+            for (uint row = 0; row < ROWS_PER_SG; ++row) {
+                float total = simd_sum(result[row]);
+                if (simd_lid == 0) {
+                    uint outRow = rowBase + row;
+                    if (outRow < outDim) {
+                        out[outRow] = bfloat(total);
+                    }
+                }
+            }
+        }
+        """
+
+    /// Shape/dtype guard shared by `qmvGatedV1` and `qmvGatedV2`
+    /// (everything except `gatedEnabled`, which only the public
+    /// `qmvGated` entry point checks). The v1/v2 functions are exposed
+    /// so tests can dispatch either kernel directly regardless of the
+    /// environment flag.
+    private static func gatedShapesValid(
+        input: Tensor, gateLogits: Tensor, bank: Bank, heads: Int, headDim: Int, out: Tensor
+    ) -> Bool {
+        input.dtype == .bf16 && gateLogits.dtype == .bf16 && out.dtype == .bf16
+            && input.elementCount == bank.inDim
+            && gateLogits.elementCount == heads
+            && out.elementCount == bank.outDim
+            && bank.inDim == heads * headDim
+            && headDim % 4 == 0
+    }
+
+    /// Fused gate-product-softplus + o_proj INT8 QMV, v1 kernel (see
+    /// `qmvGatedV2Src` for the v2 body this file now dispatches by
+    /// default). `gateLogits` is the RAW per-head gate logit
+    /// (pre-softplus), same input
+    /// `LagunaGatedOProjFuse.applyGateProductSoftplus` takes. Declines
+    /// (returns `false`, `into` left untouched) unless every
+    /// shape/dtype precondition holds.
+    static func qmvGatedV1(
+        input: Tensor, gateLogits: Tensor, bank: Bank,
+        heads: Int, headDim: Int,
+        on cmd: MTLCommandBuffer, device: Device, into out: Tensor
+    ) -> Bool {
+        guard gatedShapesValid(
+            input: input, gateLogits: gateLogits, bank: bank, heads: heads, headDim: headDim,
+            out: out)
+        else { return false }
+
+        let packsPerHead = headDim / 4
+        let p = pso(
+            "laguna_attn_qmv_int8_g32_gated_bf16", source: qmvGatedSrc,
+            device: device.mtlDevice)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return false }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(bank.packed.buffer, offset: bank.packed.offset, index: 0)
+        enc.setBuffer(bank.scales.buffer, offset: bank.scales.offset, index: 1)
+        enc.setBuffer(bank.biases.buffer, offset: bank.biases.offset, index: 2)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 3)
+        enc.setBuffer(gateLogits.buffer, offset: gateLogits.offset, index: 4)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 5)
+        var inDimV = UInt32(bank.inDim)
+        var outDimV = UInt32(bank.outDim)
+        var packsPerHeadV = UInt32(packsPerHead)
+        enc.setBytes(&inDimV, length: 4, index: 6)
+        enc.setBytes(&outDimV, length: 4, index: 7)
+        enc.setBytes(&packsPerHeadV, length: 4, index: 8)
+        let rowsPerTG = 8
+        let tiles = (bank.outDim + rowsPerTG - 1) / rowsPerTG
+        enc.dispatchThreadgroups(
+            MTLSize(width: tiles, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.endEncoding()
+        return true
+    }
+
+    /// Fused gate-product-softplus + o_proj INT8 QMV, v2 kernel (default
+    /// path, see `qmvGatedV2Src` header comment for the design). Same
+    /// contract as `qmvGatedV1`, plus an additional decline: `bank.inDim`
+    /// must be a multiple of 256 (the kernel's `block_size`), since the
+    /// per-lane 8-wide stride assumes full blocks and does not carry a
+    /// partial-block tail path the way `qmv`/`qmvGatedV1`'s 32-wide
+    /// per-pack loop does.
+    static func qmvGatedV2(
+        input: Tensor, gateLogits: Tensor, bank: Bank,
+        heads: Int, headDim: Int,
+        on cmd: MTLCommandBuffer, device: Device, into out: Tensor
+    ) -> Bool {
+        guard gatedShapesValid(
+            input: input, gateLogits: gateLogits, bank: bank, heads: heads, headDim: headDim,
+            out: out),
+            bank.inDim % 256 == 0
+        else { return false }
+
+        let p = pso(
+            "laguna_attn_qmv_int8_g32_gated_v2_bf16", source: qmvGatedV2Src,
+            device: device.mtlDevice)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return false }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(bank.packed.buffer, offset: bank.packed.offset, index: 0)
+        enc.setBuffer(bank.scales.buffer, offset: bank.scales.offset, index: 1)
+        enc.setBuffer(bank.biases.buffer, offset: bank.biases.offset, index: 2)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 3)
+        enc.setBuffer(gateLogits.buffer, offset: gateLogits.offset, index: 4)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 5)
+        var inDimV = UInt32(bank.inDim)
+        var outDimV = UInt32(bank.outDim)
+        var headDimV = UInt32(headDim)
+        var headsV = UInt32(heads)
+        enc.setBytes(&inDimV, length: 4, index: 6)
+        enc.setBytes(&outDimV, length: 4, index: 7)
+        enc.setBytes(&headDimV, length: 4, index: 8)
+        enc.setBytes(&headsV, length: 4, index: 9)
+        enc.setThreadgroupMemoryLength(heads * MemoryLayout<Float>.stride, index: 0)
+        let rowsPerTG = 8
+        let tiles = (bank.outDim + rowsPerTG - 1) / rowsPerTG
+        enc.dispatchThreadgroups(
+            MTLSize(width: tiles, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.endEncoding()
+        return true
+    }
+
+    /// Fused gate-product-softplus + o_proj INT8 QMV in one dispatch.
+    /// `gateLogits` is the RAW per-head gate logit (pre-softplus), same
+    /// input `LagunaGatedOProjFuse.applyGateProductSoftplus` takes.
+    /// Declines (returns `false`, `into` left untouched) unless
+    /// `gatedEnabled` and every shape/dtype precondition holds; caller
+    /// falls back to the separate-dispatch (T24 kernel 1) chain feeding
+    /// stock `qmv`. Dispatches `qmvGatedV2` by default
+    /// (`BUTTER_LAGUNA_QMV_V2=0` selects `qmvGatedV1` instead); if v2 is
+    /// selected but declines on shape (the `inDim % 256` guard), falls
+    /// through to v1 rather than surfacing the outer two-dispatch chain.
+    /// v1 has no such restriction.
+    static func qmvGated(
+        input: Tensor, gateLogits: Tensor, bank: Bank,
+        heads: Int, headDim: Int,
+        on cmd: MTLCommandBuffer, device: Device, into out: Tensor
+    ) -> Bool {
+        guard gatedEnabled else { return false }
+        if qmvV2Enabled {
+            if qmvGatedV2(
+                input: input, gateLogits: gateLogits, bank: bank, heads: heads, headDim: headDim,
+                on: cmd, device: device, into: out)
+            {
+                return true
+            }
+        }
+        return qmvGatedV1(
+            input: input, gateLogits: gateLogits, bank: bank, heads: heads, headDim: headDim,
+            on: cmd, device: device, into: out)
+    }
+
     /// Single-token (`x = [inDim]` bf16) batched QMV over `bank`,
     /// writing `[bank.outDim]` bf16 into `out`.
     static func qmv(
@@ -311,4 +723,211 @@ enum LagunaAttnInt8 {
             enc.endEncoding()
         }
     }
+
+// `qmvNormFolded` further folds the block's input RMSNorm into the QKV
+// bank's own QMV (escape: `BUTTER_LAGUNA_QKV_NORMFOLD=0`); see its doc
+// comment and `normQmvSrc` for the fold's exactness argument.
+    /// Default ON; set `BUTTER_LAGUNA_QKV_NORMFOLD=0` to restore the
+    /// separate `inputNorm` + `qmv` chain. Only takes effect where
+    /// `enabled` (this bank) already holds.
+    static var normFoldEnabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_QKV_NORMFOLD"] != "0"
+    }
+
+    // Norm-folded variant of `qmvSrc`: folds the block's input RMSNorm
+    // into this bank's own QMV so the attention head reads one dispatch
+    // instead of two. Takes the PRE-norm `residual` (the layer's `h`)
+    // plus the norm weight instead of an already-normalized `x`.
+    //
+    // NO GRID-WIDE REDUCTION IS NEEDED. Every threadgroup already reads
+    // the whole `inDim`-wide row for its own K loop below, so each one
+    // re-derives the row's mean square privately: the redundancy is one
+    // small re-read (4-8 KB) and one `inDim`-element reduction against
+    // the multi-MB weight-bank traffic the K loop already does.
+    //
+    // EXACTNESS. `Ops.rmsNorm`'s fast path (`dispatchRmsNorm`, `n <= 4096`
+    // and a multiple of 128) dispatches `iron_rms_norm_bf16` at
+    // `TPG = inDim/4` real threads: each thread owns 4 elements, folds a
+    // per-thread sum-of-squares, and the codegen's threadgroup-scope
+    // `reduce_sum` (see `ffai-kernels-codegen/src/msl/reduce.rs`) combines
+    // it in three phases: per-simdgroup `simd_sum`, lane 0 of each
+    // simdgroup stores to a 32-slot threadgroup array, then simdgroup 0
+    // re-`simd_sum`s those slots (zero-padded past `n_simd`). This bank's
+    // threadgroup is fixed at 64 real threads (2 simdgroups) regardless of
+    // `inDim`, so it CANNOT just run that dispatch geometry directly. It
+    // emulates it instead: real thread `lid` (simdgroup `sg`, lane `lane`)
+    // stands in for `virtualPerThread = (inDim/128) / 2` virtual
+    // simdgroups `vsg = sg + 2*j`, each contributing exactly the same
+    // per-thread sum-of-squares and `simd_sum` a real 64-lane-threadgroup
+    // dispatch of `iron_rms_norm_bf16` would compute for that vsg, same
+    // values, same lane order, so the phase-1/2/3 combine and the final
+    // `rsqrt(ssq/inDim + eps)` land bit-identical. `metal::rsqrt` (not
+    // `precise::rsqrt`; `iron_rms_norm_bf16` doesn't use the precise
+    // variant either, see `unary_intrinsic` in
+    // `ffai-kernels-codegen/src/backend.rs`).
+    //
+    // The K loop then recomputes each lane's normalized values inline
+    // from `residual`/`norm_weight` (both L1-resident after the reduction
+    // pass) instead of staging a normalized row to threadgroup memory:
+    // measured a large loss for the staged variant on the sibling
+    // norm+affine-QKV prototype (extra threadgroup memory caps resident
+    // threadgroups per core); inline recompute costs one extra multiply
+    // per lane per K-loop iteration and keeps threadgroup memory at the
+    // ~132 bytes the reduction itself needs. Matches
+    // `iron_rms_norm_bf16`'s own rounding: `bfloat(x * rms * w)`, ONE
+    // round to bf16 (not two, unlike a naive
+    // `w * bfloat(x * inv_mean)` staged reconstruction).
+    private static let normQmvSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void laguna_attn_norm_qmv_int8_g32_bf16(
+            const device uint *w [[buffer(0)]],
+            const device bfloat *scales [[buffer(1)]],
+            const device bfloat *biases [[buffer(2)]],
+            const device bfloat *residual [[buffer(3)]],
+            const device bfloat *norm_weight [[buffer(4)]],
+            device bfloat *out [[buffer(5)]],
+            constant uint &inDim [[buffer(6)]],
+            constant uint &outDim [[buffer(7)]],
+            constant float &eps [[buffer(8)]],
+            uint3 tgid [[threadgroup_position_in_grid]],
+            uint lane [[thread_index_in_simdgroup]],
+            uint sg [[simdgroup_index_in_threadgroup]])
+        {
+            constexpr uint GROUP = 32;
+            constexpr uint ROWS_PER_SG = 4;
+            constexpr uint REAL_SIMDGROUPS = 2;
+            uint packsPerRow = inDim / 4;
+            uint groupsPerRow = inDim / GROUP;
+            uint rowBase = tgid.x * (2u * ROWS_PER_SG) + sg * ROWS_PER_SG;
+
+            // --- rms reduction: 64 real lanes emulate the inDim/4 virtual
+            // lanes `iron_rms_norm_bf16` would dispatch, `virtualPerThread`
+            // virtual simdgroups at a time per real simdgroup. ---
+            threadgroup float partial_sg[32];
+            uint nSimdVirtual = inDim / 128u;
+            uint virtualPerThread = nSimdVirtual / REAL_SIMDGROUPS;
+
+            for (uint j = 0; j < virtualPerThread; ++j) {
+                uint vsg = sg + REAL_SIMDGROUPS * j;
+                uint base = (vsg * 32u + lane) * 4u;
+                float x0 = float(residual[base]);
+                float x1 = float(residual[base + 1u]);
+                float x2 = float(residual[base + 2u]);
+                float x3 = float(residual[base + 3u]);
+                float partial = x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3;
+                float sv = simd_sum(partial);
+                if (lane == 0) {
+                    partial_sg[vsg] = sv;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            threadgroup float tg_ssq[1];
+            if (sg == 0) {
+                float wv = lane < nSimdVirtual ? partial_sg[lane] : 0.0f;
+                float total = simd_sum(wv);
+                if (lane == 0) {
+                    tg_ssq[0] = total;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float rms = rsqrt(tg_ssq[0] / float(inDim) + eps);
+
+            // --- affine_qmv over the inline-recomputed normalized row ---
+            float acc[ROWS_PER_SG] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+            for (uint block = 0; block < packsPerRow; block += 32u) {
+                uint packIdx = block + lane;
+                if (packIdx < packsPerRow) {
+                    uint xBase = packIdx * 4u;
+                    float x0 = float(bfloat(
+                        float(residual[xBase]) * rms * float(norm_weight[xBase])));
+                    float x1 = float(bfloat(
+                        float(residual[xBase + 1u]) * rms * float(norm_weight[xBase + 1u])));
+                    float x2 = float(bfloat(
+                        float(residual[xBase + 2u]) * rms * float(norm_weight[xBase + 2u])));
+                    float x3 = float(bfloat(
+                        float(residual[xBase + 3u]) * rms * float(norm_weight[xBase + 3u])));
+                    float xs = x0 + x1 + x2 + x3;
+                    uint g = xBase / GROUP;
+                    for (uint r = 0; r < ROWS_PER_SG; ++r) {
+                        uint row = rowBase + r;
+                        if (row < outDim) {
+                            uint p = w[row * packsPerRow + packIdx];
+                            float s = float(scales[row * groupsPerRow + g]);
+                            float b = float(biases[row * groupsPerRow + g]);
+                            float c0 = float(p & 0xFFu);
+                            float c1 = float((p >> 8u) & 0xFFu);
+                            float c2 = float((p >> 16u) & 0xFFu);
+                            float c3 = float((p >> 24u) & 0xFFu);
+                            float qd = c0 * x0 + c1 * x1 + c2 * x2 + c3 * x3;
+                            acc[r] += s * qd + b * xs;
+                        }
+                    }
+                }
+            }
+
+            for (uint r = 0; r < ROWS_PER_SG; ++r) {
+                float total = simd_sum(acc[r]);
+                if (lane == 0) {
+                    uint row = rowBase + r;
+                    if (row < outDim) {
+                        out[row] = bfloat(total);
+                    }
+                }
+            }
+        }
+        """
+
+    /// Norm-folded batched QKV(+gate) QMV: folds `Ops.rmsNorm`'s fast-path
+    /// reduction into this bank's own dispatch (see `normQmvSrc` above for
+    /// the exactness argument). `residual` is the PRE-norm block input
+    /// (`h`), not an already-normalized row. Declines (returns `false`,
+    /// `out` left untouched) unless `normFoldEnabled` and every
+    /// shape/dtype/alignment precondition holds; caller then falls back to
+    /// the standalone `inputNorm` + `qmv` chain.
+    static func qmvNormFolded(
+        residual: Tensor, normWeight: Tensor, eps: Float, bank: Bank,
+        on cmd: MTLCommandBuffer, device: Device, into out: Tensor
+    ) -> Bool {
+        guard normFoldEnabled,
+            residual.dtype == .bf16, normWeight.dtype == .bf16, out.dtype == .bf16,
+            residual.elementCount == bank.inDim,
+            normWeight.elementCount == bank.inDim,
+            out.elementCount == bank.outDim,
+            // Matches `dispatchRmsNorm`'s fast-path envelope (`n <= 4096`,
+            // `n % 128 == 0`) plus this kernel's own alignment: 64 real
+            // lanes (2 simdgroups) must divide the virtual simdgroup count
+            // (`inDim / 128`) evenly, i.e. `inDim` a multiple of 256.
+            bank.inDim <= 4096, bank.inDim.isMultiple(of: 256)
+        else { return false }
+
+        let p = pso(
+            "laguna_attn_norm_qmv_int8_g32_bf16", source: normQmvSrc, device: device.mtlDevice)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return false }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(bank.packed.buffer, offset: bank.packed.offset, index: 0)
+        enc.setBuffer(bank.scales.buffer, offset: bank.scales.offset, index: 1)
+        enc.setBuffer(bank.biases.buffer, offset: bank.biases.offset, index: 2)
+        enc.setBuffer(residual.buffer, offset: residual.offset, index: 3)
+        enc.setBuffer(normWeight.buffer, offset: normWeight.offset, index: 4)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 5)
+        var inDimV = UInt32(bank.inDim)
+        var outDimV = UInt32(bank.outDim)
+        var epsV = eps
+        enc.setBytes(&inDimV, length: 4, index: 6)
+        enc.setBytes(&outDimV, length: 4, index: 7)
+        enc.setBytes(&epsV, length: 4, index: 8)
+        let rowsPerTG = 8
+        let tiles = (bank.outDim + rowsPerTG - 1) / rowsPerTG
+        enc.dispatchThreadgroups(
+            MTLSize(width: tiles, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.endEncoding()
+        return true
+    }
+
 }

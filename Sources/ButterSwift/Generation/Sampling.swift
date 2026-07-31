@@ -72,7 +72,25 @@ public enum Sampling {
         rng: inout some RandomNumberGenerator,
         tokenHistory: [Int] = []
     ) -> Int {
-        var values = decodeF32(logits)
+        sample(
+            values: decodeF32(logits), parameters: parameters,
+            rng: &rng, tokenHistory: tokenHistory)
+    }
+
+    /// Same pipeline as `sample(_:parameters:rng:tokenHistory:)` but
+    /// takes already-decoded f32 values directly, skipping the Tensor
+    /// round-trip. Used by `Generate.swift`'s
+    /// `BUTTER_LMHEAD_PRUNE_SAMPLE_CANDIDATES=1` path (T40 follow-up),
+    /// which needs to feed pre-masked values (non-candidate rows forced to
+    /// `-infinity` by `LagunaLmHeadPrune.maskNonCandidates`) through the
+    /// same top-K/top-P/min-P/softmax pipeline.
+    public static func sample(
+        values rawValues: [Float],
+        parameters: GenerationParameters,
+        rng: inout some RandomNumberGenerator,
+        tokenHistory: [Int] = []
+    ) -> Int {
+        var values = rawValues
         let vocab = values.count
 
         // (1) Repetition penalty

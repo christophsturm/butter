@@ -59,6 +59,223 @@ enum LagunaLmHeadPrune {
         ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LMHEAD_DIAG"] == "1"
     }
 
+    /// T40 follow-up opt-in: when a token routes through CPU sampling (see
+    /// `SamplingMode` below), keep the certified prune's cheap GPU pass
+    /// instead of falling back to the full unpruned lm_head, and restrict
+    /// the CPU sampling distribution to the certified candidate set
+    /// instead. DEFAULT OFF -- `samplingMode(...)` returns `.exactFullVocab`
+    /// for CPU-sampled tokens unless this is set. See `maskNonCandidates`
+    /// for the statistical justification and its excluded-mass bound.
+    static var candidateRestrictedSamplingEnabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LMHEAD_PRUNE_SAMPLE_CANDIDATES"] == "1"
+    }
+
+    // ── T40 follow-up: sampling-path awareness ─────────────────────────
+    //
+    // The certificate above only protects the ARGMAX identity: every
+    // non-candidate row is provably below the true max (see the
+    // SELECTION step in the header comment), so greedy decode and the
+    // fused-GPU categorical/argmax kernels -- which only ever consume the
+    // WINNING logit's identity -- are unaffected by which rows got the
+    // coarse approximation. CPU sampling (`Sampling.swift`, the
+    // `cpuSample` path in `Generate.swift`) is different: temperature > 0
+    // runs a full softmax over every row's *value*, and repetition
+    // penalty rescales arbitrary rows before argmax/sampling even sees
+    // them. Feeding either of those the coarse-approximated non-candidate
+    // rows as if they were exact logits produces the wrong distribution
+    // (README T40 follow-up). This section gives the CPU sampling path a
+    // way to know (a) whether it must fall back to the full unpruned
+    // lm_head for this token, and (b) when the certified candidate set
+    // can safely stand in for the full vocab instead.
+
+    /// Which strategy a single decode token's lm_head chain should use.
+    enum SamplingMode: Equatable {
+        /// Certified two-pass prune, unrestricted. Non-candidate rows
+        /// carry the coarse MXFP8 approximation. Correct whenever only
+        /// the argmax identity matters (greedy decode, GPU categorical
+        /// sampling, and -- per `samplingMode(...)` below -- CPU
+        /// sampling at temperature 0 with no repetition penalty, since
+        /// that path also reduces to a plain argmax).
+        case pruneCertified
+        /// Full BF16 GEMV, every row exact. Required whenever CPU
+        /// sampling reads more than the winning logit's identity.
+        case exactFullVocab
+        /// Opt-in: keep the certified prune's cheap GPU pass, but
+        /// restrict the CPU sampling distribution to the certified
+        /// candidate set and renormalize over just those rows (see
+        /// `maskNonCandidates(...)`).
+        case pruneCandidateRestricted
+    }
+
+    /// Pure decision, no GPU/Metal dependency -- exercised directly by
+    /// `Tests/ButterTests/Generation/LmHeadSamplingPathTests.swift`.
+    /// Mirrors (and is the source of truth for) the routing
+    /// `Generate.swift`'s `sampleNext` applies before calling
+    /// `engine.forward(...)` on the `cpuSample` path.
+    ///
+    /// - `temperature == 0 && repetitionPenalty == 1.0`: this is a plain
+    ///   argmax regardless of which code path reaches it (the GPU fast
+    ///   path, or the legacy CPU `Sampling.sample` short-circuit -- see
+    ///   that function's "Greedy short-circuit" step, which runs before
+    ///   temperature scaling and returns `argmaxOf` directly). Keep the
+    ///   certified prune.
+    /// - `repetitionPenalty != 1.0`: repetition penalty rescales
+    ///   arbitrary rows' logits *before* argmax/sampling runs (Sampling
+    ///   step 1), independent of logit magnitude. The certificate was
+    ///   only checked against the UNPENALIZED logits, so a penalty can
+    ///   promote a row the coarse pass never vetted above the true max.
+    ///   Forces `exactFullVocab` unconditionally -- the opt-in flag does
+    ///   NOT override this (see `maskNonCandidates` doc: its soundness
+    ///   argument is stated purely in terms of unpenalized logits).
+    /// - `temperature > 0`, no repetition penalty: default
+    ///   `exactFullVocab` (correct, costs the prune's win); opt-in
+    ///   `pruneCandidateRestricted` when
+    ///   `BUTTER_LMHEAD_PRUNE_SAMPLE_CANDIDATES=1`.
+    static func samplingMode(
+        temperature: Float,
+        repetitionPenalty: Float,
+        candidateRestrictedSamplingEnabled: Bool =
+            LagunaLmHeadPrune.candidateRestrictedSamplingEnabled
+    ) -> SamplingMode {
+        guard temperature > 0 || repetitionPenalty != 1.0 else {
+            return .pruneCertified
+        }
+        guard repetitionPenalty == 1.0 else {
+            return .exactFullVocab
+        }
+        return candidateRestrictedSamplingEnabled ? .pruneCandidateRestricted : .exactFullVocab
+    }
+
+    /// T40 follow-up: per-token override the generation driver sets immediately
+    /// before calling `engine.forward(...)` on the `cpuSample` path, and
+    /// restores to `.pruneCertified` immediately after (see
+    /// `Generate.swift`'s `sampleNext`). Read once at the top of
+    /// `lagunaFinalNormLmHead`'s prune-selection branch.
+    ///
+    /// A static context var rather than a `LanguageModel.forward(...)`
+    /// parameter: `forward` is a protocol requirement every text family
+    /// implements (Gemma, Qwen3, Llama, Mamba2, ...), not just Laguna;
+    /// threading a Laguna-only concern through that shared signature
+    /// would touch every conformer for a flag only one family's lm_head
+    /// chain reads. This mirrors `LagunaDecodeKernelTiming`'s existing
+    /// `beginToken`/`endToken` pattern for the same reason: decode is a
+    /// strictly sequential, one-token-in-flight host loop (`sampleNext`
+    /// calls `engine.forward` synchronously and nothing else touches the
+    /// GPU concurrently with it), so a plain static is sound here
+    /// without extra synchronization -- the same assumption
+    /// `LagunaDecodeKernelTiming` already relies on.
+    ///
+    /// DEFAULT `.pruneCertified`: any call site that never sets this
+    /// (tests, `butter bench`, the greedy/gpu-categorical fast paths)
+    /// gets the certified-safe default, unchanged from behavior before
+    /// this follow-up.
+    nonisolated(unsafe) static var currentSamplingMode: SamplingMode = .pruneCertified
+
+    /// T40 follow-up candidate-restricted support: the f32 `coarse`/`delta`
+    /// certificate arrays and threshold scalar the two-pass kernels
+    /// already compute, stashed by `logits(...)` on every call
+    /// (regardless of `currentSamplingMode` -- retaining three Tensor
+    /// handles is free; only reading them back to CPU costs anything).
+    ///
+    /// `Generate.swift` reads this ONLY after `engine.forward(...)` has
+    /// returned for that same token, i.e. after the command buffer
+    /// wrapping `logits(...)`'s dispatches has committed and
+    /// `waitUntilCompleted()` returned -- at that point the GPU has
+    /// finished writing these buffers and nothing else has been queued
+    /// since (lm_head is the last op in a token's forward pass), so the
+    /// values are stable to read. This is a narrower safety window than
+    /// the `diagEnabled` probe's completion-handler read above (which is
+    /// why that probe needs its own dedicated non-pooled buffer): here
+    /// the read is synchronous and immediate, not deferred to a
+    /// completion handler, so the shared scratch allocator backing
+    /// `Tensor.empty` is not at risk of having been recycled out from
+    /// under it yet. Callers should still defensively check the vocab
+    /// size matches before trusting a stale value across model/family
+    /// boundaries (e.g. a previous generation call on a different,
+    /// non-Laguna model in the same process never touches this var, so
+    /// it would otherwise carry an unrelated Laguna vocab size forward).
+    nonisolated(unsafe) private(set) static var lastCandidateCertificate:
+        (coarse: Tensor, delta: Tensor, thr: Tensor)?
+
+    /// Clears `lastCandidateCertificate`. `Generate.swift` calls this
+    /// once at the start of each `driveGeneration` call so a stale
+    /// certificate from a previous generation (possibly on a different,
+    /// non-Laguna model in the same process) can never be mistaken for
+    /// this generation's.
+    static func resetCandidateCertificate() {
+        lastCandidateCertificate = nil
+    }
+
+    /// Restricts `assembled` (the prune's bf16 output: exact on
+    /// candidate rows, coarse-approximated elsewhere) to just the
+    /// certified candidate set by forcing every non-candidate row to
+    /// `-infinity`, then hands the result to the existing
+    /// `Sampling.sample(values:...)` pipeline unchanged. `-infinity`
+    /// softmaxes to exactly zero probability, so the remaining
+    /// candidates renormalize to sum to 1 automatically -- softmax
+    /// already IS the renormalization step "restrict + renormalize"
+    /// asks for; no separate rescale pass is needed. Top-K / top-P /
+    /// min-P also treat `-infinity` correctly for free (always sorts
+    /// last, contributes zero to the cumulative-softmax walk, always
+    /// fails the min-P threshold).
+    ///
+    /// Recomputes the same predicate the exact kernel used
+    /// (`coarse[i] + delta[i] >= thr`) in identical operand order --
+    /// written as `!(coarse[i] + delta[i] >= thr)` rather than
+    /// `coarse[i] + delta[i] < thr` so a NaN certificate value (should
+    /// never happen under normal operation, but IEEE-754 comparisons
+    /// with NaN are all false) is treated as non-candidate exactly like
+    /// the kernel's `is_cand` boolean would be, instead of silently
+    /// passing through a `<` comparison that is *also* false for NaN.
+    ///
+    /// ─── Statistical justification (the certificate, notes/68) ───
+    /// `delta[i]` is a certified bound on the coarse approximation
+    /// error: `coarse[i] - delta[i] <= exact[i] <= coarse[i] + delta[i]`
+    /// for every row `i` (see the COARSE step doc above `coarseSrc`).
+    /// Two things follow:
+    ///
+    ///  1. `L := max_j (coarse[j] - delta[j])` is a certified LOWER
+    ///     bound on the true max: for every `i`,
+    ///     `coarse[i] - delta[i] <= exact[i] <= true_max`, so taking the
+    ///     max over `i` gives `L <= true_max`.
+    ///  2. For an excluded row `i` (`coarse[i] + delta[i] < thr`, where
+    ///     `thr = L - |L|/64`): `exact[i] <= coarse[i] + delta[i] < thr
+    ///     = L - |L|/64 <= true_max - |L|/64`.
+    ///
+    /// So every excluded row's exact logit sits more than `|L|/64` below
+    /// the true max. At temperature `T`, that row's softmax weight
+    /// relative to the max row is bounded by `exp(-|L|/(64*T))`. This is
+    /// a WORST-CASE PER-ROW bound, not a bound on the total excluded
+    /// mass (which also depends on how many non-candidate rows there are
+    /// and how close each sits to the `thr` boundary) -- the T29
+    /// diagnosis probe (`BUTTER_LAGUNA_LMHEAD_DIAG=1`, prints `|C|`
+    /// candidates/100352 per token) is the empirical, measured version
+    /// of this argument and should be preferred over this static bound
+    /// when tuning `T`. Illustrative numbers: for `|L| ~= 20` (a
+    /// representative unnormalized bf16 lm_head magnitude for a
+    /// confident decode step) and `T = 0.7`, the guaranteed gap is
+    /// `20/64/0.7 ~= 0.446` nats, i.e. each excluded row's weight is
+    /// bounded by `exp(-0.446) ~= 0.64x` the max row's -- a real but not
+    /// overwhelming per-row exclusion at that `T`; the bound tightens
+    /// sharply as `T` drops (at `T = 0.2`: `exp(-1.56) ~= 0.21x`) and
+    /// loosens as `T` rises. Because it is only a per-row (not
+    /// aggregate) bound, this mode trades a quantifiable-but-not-hard
+    /// exactness guarantee for throughput; callers that need the hard
+    /// guarantee should stay on the default `exactFullVocab`.
+    static func maskNonCandidates(
+        assembled: [Float], coarse: [Float], delta: [Float], thr: Float
+    ) -> [Float] {
+        precondition(
+            assembled.count == coarse.count && coarse.count == delta.count,
+            "maskNonCandidates: assembled/coarse/delta length mismatch "
+                + "(\(assembled.count)/\(coarse.count)/\(delta.count))")
+        var out = assembled
+        for i in 0 ..< out.count where !(coarse[i] + delta[i] >= thr) {
+            out[i] = -Float.infinity
+        }
+        return out
+    }
+
     private static let vocab = 100_352
     private static let kDim = 2048
     // Protected by `lock`; same pattern as other host-side Metal PSO caches.
@@ -540,6 +757,12 @@ enum LagunaLmHeadPrune {
                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
                 enc.endEncoding()
             }
+            // T40 follow-up: stash the certificate for the candidate-restricted CPU
+            // sampling opt-in (see `lastCandidateCertificate` doc above).
+            // Retaining three Tensor handles is free; nothing reads them
+            // back to CPU unless `samplingMode(...)` picked
+            // `.pruneCandidateRestricted` for this token.
+            lastCandidateCertificate = (coarse: coarse, delta: delta, thr: thrBuf)
             return assembled
         }
 
@@ -609,6 +832,10 @@ enum LagunaLmHeadPrune {
                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             enc.endEncoding()
         }
+        // T40 follow-up: same certificate stash as the inline-mask branch above,
+        // kept here too so the kill-switch (BUTTER_LAGUNA_LMHEAD_INLINE_MASK=0)
+        // A/B path still supports the candidate-restricted CPU sampling opt-in.
+        lastCandidateCertificate = (coarse: coarse, delta: delta, thr: thrBuf)
         return assembled
     }
 }

@@ -10,17 +10,14 @@ using namespace metal;
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #endif
 
+// CARRY SIGN-FOLD E4M3 decode (unconditional, bit-exact for all 256 byte
+// values, `sraw` always in [0,255] since callers widen from `device
+// uchar*` -- see Tests/ButterTests/Ops/Nvfp4FastDequantTests.swift and
+// the derivation in LagunaNvfp4Fuse.swift's `header`). Replaces the
+// branch/exp2 sequence above with 5 branchless ops.
 static inline float butter_nax_nvfp4_scale_f(uint sraw, float global_scale) {
-    uint exp_bits = (sraw >> 3) & 15u;
-    float mant = float(sraw & 7u);
-    float scale;
-    if (exp_bits < 1u) {
-        scale = mant * 0.001953125f;
-    } else {
-        scale = (1.0f + mant * 0.125f) * exp2(float(exp_bits) - 7.0f);
-    }
-    if (((sraw >> 7) & 1u) != 0u) scale = -scale;
-    return scale * global_scale;
+    ushort h = ushort((sraw + (sraw & 128u)) << 7);
+    return float(as_type<half>(h)) * 256.0f * global_scale;
 }
 
 // T23 half-staging overflow fix, see butter_nvfp4_gather_qmm_rhs_nax_mpp_bf16.metal

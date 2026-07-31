@@ -34,6 +34,9 @@
 
 import Foundation
 import Tokenizers
+#if canImport(Darwin)
+import Darwin
+#endif
 
 // MARK: - Public types
 
@@ -207,7 +210,18 @@ extension Model {
             // Capture the values we need on the producer task. `Model`
             // is @unchecked Sendable, so this is fine.
             let model = self
-            Task {
+            // T38: decode is a tight latency-sensitive per-token host loop
+            // (unlike prefill's one big batched dispatch). An unstructured
+            // `Task {}` here previously had no explicit priority and just
+            // inherited whatever the ambient context handed it. Request the
+            // highest priority Swift's structured concurrency exposes
+            // (`.high` == QOS_CLASS_USER_INITIATED) so the token loop isn't
+            // left at medium/default if the calling context is anything
+            // less than interactive. Kill switch: BUTTER_DECODE_QOS=0
+            // restores the old bare `Task {}` for A/B.
+            let qosFixEnabled =
+                ProcessInfo.processInfo.environment["BUTTER_DECODE_QOS"] != "0"
+            Task(priority: qosFixEnabled ? .high : nil) {
                 do {
                     try await model.driveGeneration(
                         promptTokens: promptTokens,
@@ -231,6 +245,36 @@ extension Model {
         profile: Profile,
         continuation: AsyncThrowingStream<GenerationChunk, Error>.Continuation
     ) async throws {
+        // T38: pin the executing thread's OS-visible QoS class to
+        // user-interactive for the duration of this generate call (covers
+        // both prefill and decode; prefill was already unaffected by
+        // scheduling pressure so this is a no-op cost there). Swift's
+        // structured-concurrency `Task priority:` only reaches
+        // QOS_CLASS_USER_INITIATED at the top (`.high`). This goes one
+        // step further and asks XNU directly via the pthread QoS API,
+        // covering hops onto worker threads Task priority alone doesn't
+        // guarantee. Best-effort: `pthread_set_qos_class_self_np` can fail
+        // (e.g. thread already opted out of QoS); a failure here is not
+        // fatal, decode just runs at whatever QoS it already had.
+        // Kill switch: BUTTER_DECODE_QOS=0 skips this for A/B.
+        // `Thread.current` is unavailable from async contexts (Swift
+        // concurrency can hop this call onto any worker thread), so the
+        // QoS pin goes straight through the pthread C API instead, which
+        // has no such restriction and applies to whichever OS thread is
+        // actually running this code at the time of the call.
+        #if canImport(Darwin)
+        if ProcessInfo.processInfo.environment["BUTTER_DECODE_QOS"] != "0" {
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
+        }
+        #endif
+        // T21 hygiene: re-pin the weight residency set at the top of
+        // every generate call, not just at load: cheap
+        // (`MTLResidencySet.requestResidency()` re-touches the whole set
+        // in one driver call) and guards against the OS paging weights
+        // back out between calls under memory pressure (long-idle chat
+        // sessions, another process squeezing this one). See
+        // `Device.refreshWeightResidency` for the full rationale.
+        Device.shared.refreshWeightResidency()
         let caches = engine.makeLayerCaches()
         // Gemma 3+, several Qwen variants, and a few llama-tuned models
         // publish `eos_token_id` as a *list* (model EOS plus end-of-turn
@@ -244,20 +288,57 @@ extension Model {
         let weightsBytes = engine.parameters().reduce(0) { $0 + $1.1.byteCount }
         let memTracker = PhaseMemoryTracker()
 
+        // T40 follow-up: clear any candidate certificate left over from a previous
+        // generation call in this process (e.g. a prior Laguna run right
+        // before a different, non-Laguna `engine` -- that family's
+        // forward() never populates this, so a stale value would
+        // otherwise carry an unrelated vocab size into this generation's
+        // `sampleNext`). `currentSamplingMode` doesn't need the same
+        // reset: it's read-then-restored around every `cpuSample` call
+        // below and defaults to `.pruneCertified` at rest.
+        LagunaLmHeadPrune.resetCandidateCertificate()
+
         // Path selector for the sampling step:
         //
-        //   greedy-GPU       T == 0, no filters — existing argmax kernel
-        //                    (4-byte readback per token, fastest path).
+        //   greedy-GPU       T == 0, rep-penalty == 1 - existing argmax
+        //                    kernel (4-byte readback per token, fastest
+        //                    path).
         //   gpu-categorical  T > 0, no filters — forward + GPU softmax +
         //                    categorical sample kernel. Logits stay on GPU;
         //                    only the chosen token id flows back (4 bytes).
-        //   cpu-sample       Any of top-K / top-P / min-P / rep-penalty:
+        //   cpu-sample       T > 0 with any of top-K / top-P / min-P /
+        //                    rep-penalty, or T == 0 with rep-penalty != 1:
         //                    full vocab readback + Sampling.sample pipeline.
         let hasFilters =
             params.topK > 0 || params.topP < 1.0 || params.minP > 0
             || params.repetitionPenalty != 1.0
+        // T39 finding (benchmarks/laguna-xs/README.md): family defaults
+        // like Laguna's `topK: 64, topP: 0.95` used to route every plain
+        // `--temperature 0` call through cpuSample even though greedy
+        // argmax is mathematically invariant to top-K / top-P / min-P
+        // filtering - those filters only ever remove candidates, never
+        // rescale the winning logit's value, and the raw-argmax token
+        // always survives all three (top-K keeps >= 1 candidates
+        // including the max; top-P's cumulative-softmax walk always
+        // includes the top token before it can stop; min-P's threshold
+        // is defined relative to the max token itself, so the max always
+        // clears it). Repetition penalty is the one filter that does not
+        // have this property - it rescales logit values in place before
+        // argmax ever runs (see `Sampling.sample`'s step (1), applied
+        // ahead of its own `temperature == 0` short-circuit), so it can
+        // change which token wins and must keep routing through cpuSample.
+        //
+        // `BUTTER_GREEDY_GPU_ARGMAX=0` disables this and restores the old
+        // routing (any hasFilters sends greedy through cpuSample too).
+        let greedyGPUFastPathEnabled =
+            ProcessInfo.processInfo.environment["BUTTER_GREEDY_GPU_ARGMAX"] != "0"
         enum Path: String { case greedyGPU, gpuCategorical, cpuSample }
         let path: Path = {
+            if greedyGPUFastPathEnabled, params.temperature == 0,
+                params.repetitionPenalty == 1.0
+            {
+                return .greedyGPU
+            }
             if hasFilters { return .cpuSample }
             if params.temperature == 0 { return .greedyGPU }
             return .gpuCategorical
@@ -282,6 +363,13 @@ extension Model {
         var liveNLLCount = 0
 
         func sampleNext(tokenId t: Int, position i: Int) -> Int {
+            // T39: brackets one whole decode token (forward + sample) for
+            // the "sampling/host_gap(residual)" row in
+            // BUTTER_LAGUNA_DECODE_KERNEL_TIMING=1's report - the wall time
+            // inside a token no checkpoint bucket already accounts for. No-op
+            // when the env var is unset.
+            LagunaDecodeKernelTiming.beginToken()
+            defer { LagunaDecodeKernelTiming.endToken() }
             // Capturing path: route through full logits so we can read the
             // chosen token's probability. Only taken when the flag is on.
             if capturePPL {
@@ -309,7 +397,43 @@ extension Model {
                     temperature: params.temperature, uniformDraw: u
                 )
             case .cpuSample:
+                // T40 follow-up: cpuSample is the one path that reads more than the
+                // winning logit's identity (full softmax at temperature>0,
+                // repetition-penalty rescale before argmax/sampling) --
+                // exactly the case the certified lm_head prune's coarse
+                // approximation on non-candidate rows corrupts. Tell
+                // Laguna's `lagunaFinalNormLmHead` which strategy this
+                // token needs via the static context var (see
+                // `LagunaLmHeadPrune.currentSamplingMode` doc for why a
+                // protocol-level parameter isn't used); always restore
+                // the certified default afterward so every other path
+                // (and every non-Laguna family, which never reads this
+                // var) is unaffected.
+                let mode = LagunaLmHeadPrune.samplingMode(
+                    temperature: params.temperature,
+                    repetitionPenalty: params.repetitionPenalty)
+                LagunaLmHeadPrune.currentSamplingMode = mode
+                defer { LagunaLmHeadPrune.currentSamplingMode = .pruneCertified }
                 let logits = engine.forward(tokenId: t, position: i, caches: caches)
+                if mode == .pruneCandidateRestricted,
+                    let cert = LagunaLmHeadPrune.lastCandidateCertificate,
+                    cert.coarse.elementCount == logits.elementCount
+                {
+                    // Certificate came from THIS token's forward pass
+                    // (vocab size matches the logits we just got back) --
+                    // restrict + renormalize to the certified candidate
+                    // set instead of paying for a full BF16 GEMV. See
+                    // `LagunaLmHeadPrune.maskNonCandidates` for the
+                    // statistical justification.
+                    let masked = LagunaLmHeadPrune.maskNonCandidates(
+                        assembled: Sampling.decodeF32(logits),
+                        coarse: Sampling.decodeF32(cert.coarse),
+                        delta: Sampling.decodeF32(cert.delta),
+                        thr: Sampling.decodeF32(cert.thr)[0])
+                    return Sampling.sample(
+                        values: masked, parameters: params,
+                        rng: &rng, tokenHistory: tokenHistory)
+                }
                 return Sampling.sample(
                     logits, parameters: params,
                     rng: &rng, tokenHistory: tokenHistory)
@@ -424,28 +548,107 @@ extension Model {
         var perTokenWallclock: [Double] = []
         var lastStep = decodeStart
         var pos = promptTokens.count
-        for _ in 0 ..< params.maxTokens {
+
+        // F-token-loop: GPU-resident decode feedback for the greedy-argmax
+        // fast path (see GpuTokenLoop.swift). The old loop below reads the
+        // chosen token id back to the host (`forwardSample`'s
+        // `cmd.commit()` + `waitUntilCompleted()`) before the *next* step
+        // can even start encoding, even though the next step's embedding
+        // gather only needs the token id as a GPU buffer, not a host
+        // value. `GpuTokenLoop.runGPU` chains steps directly off each
+        // other's `Ops.argmax` output buffer instead, and only reads
+        // token ids back asynchronously: for detokenization and the
+        // stop-token check, the two things that actually need a host
+        // value. Requires the greedy-argmax path (no PPL capture, no
+        // sampling filters, those still need the full logits or CPU
+        // randomness per step) and family support
+        // (`engine.supportsGPUTokenFeedback`; currently Laguna).
+        // Escape: BUTTER_GPU_TOKEN_LOOP=0 restores the old per-token
+        // synchronous loop unconditionally.
+        let gpuTokenLoopEnabled =
+            ProcessInfo.processInfo.environment["BUTTER_GPU_TOKEN_LOOP"] != "0"
+        let useGpuTokenLoop =
+            gpuTokenLoopEnabled && path == .greedyGPU && !capturePPL
+            && engine.supportsGPUTokenFeedback
+
+        if useGpuTokenLoop {
             try Task.checkCancellation()
-            if stopSet.contains(nextToken) { break }
-            generated.append(nextToken)
-            let chunkText = tokenizer.decode(
-                tokens: [nextToken],
-                skipSpecialTokens: true)
-            continuation.yield(
-                GenerationChunk(
-                    text: chunkText,
-                    tokens: [nextToken],
-                    position: pos + 1, stats: nil))
-            let priorToken = nextToken
-            nextToken = profile.signpost("decode_step") {
-                sampleNext(tokenId: priorToken, position: pos)
+            if params.maxTokens > 0, !stopSet.contains(nextToken) {
+                // The seed token is already known (picked by prefill's
+                // sampler): emit it exactly as the old loop's first
+                // iteration would, no GPU call needed to produce it.
+                generated.append(nextToken)
+                let seedText = tokenizer.decode(
+                    tokens: [nextToken], skipSpecialTokens: true)
+                continuation.yield(
+                    GenerationChunk(
+                        text: seedText, tokens: [nextToken],
+                        position: pos + 1, stats: nil))
+                tokenHistory.append(nextToken)
+                memTracker.sample()
+                let seedNow = Date()
+                perTokenWallclock.append(seedNow.timeIntervalSince(lastStep))
+                lastStep = seedNow
+                pos += 1
+
+                let remainingBudget = params.maxTokens - 1
+                if remainingBudget > 0 {
+                    // One signpost interval for the whole chained batch,
+                    // not one per token: under pipelining there's no
+                    // single discrete "this GPU call produced token N"
+                    // moment on the host any more (that's the point),
+                    // so per-token "decode_step" signposts (as the
+                    // fallback loop below still emits) wouldn't mean
+                    // the same thing here.
+                    _ = try profile.signpost("decode_gpu_loop") {
+                        try GpuTokenLoop.runGPU(
+                            engine: engine, seedToken: nextToken,
+                            startPosition: pos, caches: caches,
+                            remainingBudget: remainingBudget,
+                            stopSet: stopSet, device: Device.shared
+                        ) { tokenId in
+                            try Task.checkCancellation()
+                            generated.append(tokenId)
+                            let text = tokenizer.decode(
+                                tokens: [tokenId], skipSpecialTokens: true)
+                            continuation.yield(
+                                GenerationChunk(
+                                    text: text, tokens: [tokenId],
+                                    position: pos + 1, stats: nil))
+                            tokenHistory.append(tokenId)
+                            memTracker.sample()
+                            let now = Date()
+                            perTokenWallclock.append(now.timeIntervalSince(lastStep))
+                            lastStep = now
+                            pos += 1
+                        }
+                    }
+                }
             }
-            tokenHistory.append(priorToken)
-            memTracker.sample()
-            let now = Date()
-            perTokenWallclock.append(now.timeIntervalSince(lastStep))
-            lastStep = now
-            pos += 1
+        } else {
+            for _ in 0 ..< params.maxTokens {
+                try Task.checkCancellation()
+                if stopSet.contains(nextToken) { break }
+                generated.append(nextToken)
+                let chunkText = tokenizer.decode(
+                    tokens: [nextToken],
+                    skipSpecialTokens: true)
+                continuation.yield(
+                    GenerationChunk(
+                        text: chunkText,
+                        tokens: [nextToken],
+                        position: pos + 1, stats: nil))
+                let priorToken = nextToken
+                nextToken = profile.signpost("decode_step") {
+                    sampleNext(tokenId: priorToken, position: pos)
+                }
+                tokenHistory.append(priorToken)
+                memTracker.sample()
+                let now = Date()
+                perTokenWallclock.append(now.timeIntervalSince(lastStep))
+                lastStep = now
+                pos += 1
+            }
         }
         let decodeTime = Date().timeIntervalSince(decodeStart)
         memTracker.endDecode()

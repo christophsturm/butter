@@ -147,6 +147,36 @@ public protocol LanguageModel: Module {
     /// positions get vision-encoder rows. VL-target families implement
     /// it; the default traps. Check `supportsEmbeddingInput` first.
     func textEmbedding(tokenId: Int, device: Device) -> Tensor
+
+    /// Whether this family implements `forward(tokenIdBuffer:...)`: a
+    /// GPU-resident decode step that takes the token id as a
+    /// **device-resident** `Tensor` instead of a host `Int`. This is
+    /// the primitive `GpuTokenLoop` (Generation/GpuTokenLoop.swift)
+    /// needs to chain decode steps back-to-back on the GPU: step N+1's
+    /// embedding gather reads step N's `Ops.argmax` output buffer
+    /// directly, so issuing step N+1 never waits on the host having
+    /// read step N's chosen token id back first. Default `false`;
+    /// families opt in by overriding both this and
+    /// `forward(tokenIdBuffer:...)`.
+    var supportsGPUTokenFeedback: Bool { get }
+
+    /// GPU-resident decode step: the same computation as
+    /// `forward(tokenId:...)`, but the token id arrives as a
+    /// single-element `.u32` device `Tensor`, typically a previous
+    /// decode step's `Ops.argmax` output buffer, instead of a host
+    /// `Int`. This is what lets `GpuTokenLoop` commit step N+1's work
+    /// without waiting on step N's completion: the embedding gather
+    /// only depends on a GPU buffer write that the same command queue
+    /// already orders correctly, not on a host readback.
+    ///
+    /// Families that don't support this trap; check
+    /// `supportsGPUTokenFeedback` before calling. The default
+    /// implementation traps.
+    func forward(
+        tokenIdBuffer: Tensor, position: Int,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor
 }
 
 extension LanguageModel {
@@ -183,6 +213,24 @@ extension LanguageModel {
         preconditionFailure(
             "\(type(of: self)) does not support textEmbedding — "
                 + "check supportsEmbeddingInput before calling")
+    }
+
+    /// Default: no GPU-resident token feedback. Families that
+    /// implement `forward(tokenIdBuffer:...)` override this to `true`.
+    public var supportsGPUTokenFeedback: Bool { false }
+
+    /// Default `forward(tokenIdBuffer:...)`: traps. Families that
+    /// support GPU-resident token feedback provide a real
+    /// implementation and override `supportsGPUTokenFeedback`; callers
+    /// (`GpuTokenLoop`) check that flag before ever calling this.
+    public func forward(
+        tokenIdBuffer: Tensor, position: Int,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        preconditionFailure(
+            "\(type(of: self)) does not support GPU-resident token feedback; "
+                + "check supportsGPUTokenFeedback before calling")
     }
 
     public func makeLayerCaches(maxSeq: Int? = nil, device: Device = .shared)
@@ -235,15 +283,36 @@ extension LanguageModel {
         caches: [any LayerCacheProtocol],
         device: Device = .shared
     ) -> Int {
-        let cmd = device.makeCommandBuffer()
+        let dkTiming = LagunaDecodeKernelTiming.enabled
+        var cmd = device.makeCommandBuffer()
+        // `forward(...on cmd:)` runs its own internal layer-stack pipe (own
+        // command buffers, already fully waited-on by the time it returns)
+        // and only uses this outer `cmd` for the final norm + lm_head chain.
         let logits = forward(
             tokenId: tokenId, position: position,
             caches: caches, on: cmd, device: device)
-        let outBuf = device.makeBuffer(length: 4)
+        // T39: isolate the lm_head chain (final RMSNorm + coarse/exact/
+        // select) from the argmax/sample dispatch that follows. No-op when
+        // BUTTER_LAGUNA_DECODE_KERNEL_TIMING is unset.
+        if dkTiming {
+            cmd = LagunaDecodeKernelTiming.checkpoint("lmhead_chain", cmd: cmd, device: device)
+        }
+        // T21 hygiene: was a fresh 4-byte `device.makeBuffer` every decode
+        // token (this is the default greedy-sample path every model
+        // family inherits), pooled via the tag-keyed reusable-scratch
+        // cache `Device` already uses for GGUF dequant intermediates.
+        // Safe to reuse across tokens: the CPU read below happens only
+        // after `waitUntilCompleted`/the dkTiming checkpoint, both
+        // synchronous, so there's no cross-token overlap on one instance.
+        let outBuf = device.intermediateScratch(tag: "lm_argmax_out", minBytes: 4)
         let outT = Tensor(buffer: outBuf, offset: 0, shape: [1], dtype: .u32)
         Ops.argmax(logits, into: outT, on: cmd)
-        cmd.commit()
-        cmd.waitUntilCompleted()
+        if dkTiming {
+            _ = LagunaDecodeKernelTiming.checkpoint("argmax_sample", cmd: cmd, device: device)
+        } else {
+            cmd.commit()
+            cmd.waitUntilCompleted()
+        }
         return Int(outBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee)
     }
 
@@ -269,17 +338,22 @@ extension LanguageModel {
             tokenId: tokenId, position: position,
             caches: caches, on: cmd, device: device)
 
-        let tBuf = device.makeBuffer(length: 4)
-        var tVal = temperature
-        memcpy(tBuf.contents(), &tVal, 4)
+        // T21 hygiene: temperature is ~constant across one generation's
+        // token loop, so it fits `Device.scalarBuffer`'s cache-by-value
+        // design exactly (same rationale as that cache's rmsNorm-eps /
+        // RoPE-arg use). `uniformDraw` is a fresh random value every
+        // token by design, so it can't be value-cached (that would grow
+        // `scalarBufCache` unbounded), it gets the tag-keyed reusable
+        // scratch instead, same as the argmax output buffer above.
+        let tBuf = device.scalarBuffer(temperature)
         let temperatureT = Tensor(buffer: tBuf, offset: 0, shape: [1], dtype: .f32)
 
-        let uBuf = device.makeBuffer(length: 4)
+        let uBuf = device.intermediateScratch(tag: "lm_sample_uniform", minBytes: 4)
         var uVal = uniformDraw
         memcpy(uBuf.contents(), &uVal, 4)
         let uniformT = Tensor(buffer: uBuf, offset: 0, shape: [1], dtype: .f32)
 
-        let outBuf = device.makeBuffer(length: 4)
+        let outBuf = device.intermediateScratch(tag: "lm_categorical_out", minBytes: 4)
         let outT = Tensor(buffer: outBuf, offset: 0, shape: [1], dtype: .u32)
         Ops.softmaxCategoricalSample(
             logits, into: outT,

@@ -21,6 +21,14 @@
 //                                          silu per out-row; usually loss)
 //   BUTTER_LAGUNA_PATHB_GATEUP_FUSE=1    — older per-row gateup fuse (opt-in;
 //                                          superseded by ROUTED_SWIGLU)
+//   BUTTER_LAGUNA_GATEUP_SPLIT=1          : T28 nine-slot gate-up dispatch
+//                                          split back into routed-8 +
+//                                          shared-1 (one concurrent-
+//                                          dispatch encoder, shared first).
+//                                          Down+residual nine-slot merge
+//                                          stays intact either way. Opt-in
+//                                          until validated; see the T28
+//                                          nine-slot MARK section below.
 //
 // Kernel packaging:
 //   Default-ON Path B kernels ship in `kernels_extra.metallib` (see
@@ -88,6 +96,17 @@ enum LagunaNvfp4Fuse {
         ProcessInfo.processInfo.environment["BUTTER_LAGUNA_NINE_SLOT"] != "0"
     }
 
+    /// T28 follow-up: split the nine-slot GATE-UP dispatch only into
+    /// routed-8 (needs router top-8 indices) + shared-1 (needs only the
+    /// layer input). Down+residual stays the merged nine-slot dispatch
+    /// regardless of this flag; see `moeGateUpSplitSwigluQmv` for the
+    /// dependency-overlap rationale. Opt-in until validated by the A/B
+    /// harness; escape hatch is simply not setting this (nine-slot merged
+    /// gate-up, `moeNineSlotSwigluQmv`, stays the default).
+    static var gateUpSplitEnabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_GATEUP_SPLIT"] == "1"
+    }
+
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]
     private static let lock = NSLock()
 
@@ -95,18 +114,30 @@ enum LagunaNvfp4Fuse {
     #include <metal_stdlib>
     using namespace metal;
 
-    // Iron-matching E4M3 micro-scale (see iron_nvfp4_qgemv_bf16).
+    // BUTTER_NVFP4_FAST_DEQUANT-style E4M3 micro-scale decode via CARRY
+    // SIGN-FOLD (unconditional -- proved bit-exact for all 256 byte
+    // values, see Tests/ButterTests/Ops/Nvfp4FastDequantTests.swift).
+    //
+    // `uint(bits) + (bits & 128u)`: when sign(bit7)=0 this is a no-op
+    // (adds 0). When sign=1, adding 128 to a byte whose bit7 is already
+    // set carries: bit7+bit7 -> bit7 clears, bit8 sets; the low 7 bits
+    // (exp:4 + mantissa:3) are untouched (128's low 7 bits are 0). So the
+    // 9-bit sum is always `(sign << 8) | (exp:mantissa payload)`.
+    // Shifting left by 7 (the half-vs-e4m3 mantissa width delta, 10-3=7)
+    // lands: sign at half bit15, the 4 exponent bits at half bits[13:10],
+    // the 3 mantissa bits at half bits[9:7]. That is exactly the e4m3
+    // (bias 7) value reinterpreted with half's (bias 15) exponent field
+    // and top-aligned mantissa -- i.e. `half_value == true_value * 2^-8`
+    // for both the normal case (2^(exp-15)*(1+mant/8) vs true
+    // 2^(exp-7)*(1+mant/8)) and the subnormal case (exp=0 in both e4m3
+    // and half; mant/8*2^-14 vs true mant*2^-9 = mant/8*2^-14*2^8).
+    // So `float(as_type<half>(h)) * 256.0f` (2^8) is bit-exact for every
+    // (sign, exp, mantissa) combination -- all 256 byte values.
+    // Replaces a mask/shift/select ~7-op sequence with 5 ops (AND, ADD,
+    // SHL + 2 casts, no branch/exp2/select).
     static inline float iron_nvfp4_e4m3_scale(uchar bits) {
-        uint b = uint(bits);
-        uint exp = (b >> 3) & 15u;
-        float mant = float(b & 7u);
-        float mag;
-        if (exp == 0u) {
-            mag = mant * 0.001953125f;  // 2^-9
-        } else {
-            mag = (1.0f + mant * 0.125f) * exp2(float(exp) - 7.0f);
-        }
-        return ((b >> 7) & 1u) != 0u ? -mag : mag;
+        ushort h = ushort((uint(bits) + (uint(bits) & 128u)) << 7);
+        return float(as_type<half>(h)) * 256.0f;
     }
 
     // Iron-matching E2M1 element from 4-bit nibble (slow path / fallback).
@@ -126,26 +157,59 @@ enum LagunaNvfp4Fuse {
         return ((nibble & 8u) != 0u) ? -mag : mag;
     }
 
-    // mlxfast-style bit-twiddle E2M1 decode of one u32 pack (8 nibbles).
-    // `float2(as_type<half2>(p)) * 16384` is bit-exact against iron_nvfp4_e2m1
-    // for every nibble (verified offline 0..15). *16384 = 2^14 restores the
-    // half-domain encoding used by the bit shuffle.
+    // Bit-twiddle E2M1 decode of one u32 pack (8 nibbles),
+    // via NIBBLE-SPLIT word-parallel decode (19 -> 13 int ops per pack;
+    // see Tests/ButterTests/Ops/Nvfp4FastDequantTests.swift for the
+    // exhaustive 16-code equivalence table vs iron_nvfp4_e2m1):
+    //   xe = c & 0x0F0F0F0F;  ge = xe | (xe << 3)   -- spread even nibbles
+    //   yo = c & 0xF0F0F0F0;  go = yo | (yo >> 3)   -- spread odd  nibbles
+    //   p0=(ge<<9)&M  p1=(go<<8)&M  p2=(ge<<1)&M  p3=go&M   M=0x8E008E00
+    // `ge`/`go` are each computed ONCE (1 AND + 1 SHL/SHR + 1 OR) and
+    // shared across two of the four p0..p3 outputs; the original formula
+    // recomputed an independent 2×(AND+SHL/SHR)+OR pair per output (5 ops
+    // × 4 = 20, or 19 counting p3's unshifted second term) with no shared
+    // work. `float2(as_type<half2>(p))` is bit-exact against
+    // iron_nvfp4_e2m1 (mag/sign) for every nibble up to the caller-scale
+    // multiply below.
+    //
+    // NOTE (2^22 scale fold, task 3): this function no longer applies the
+    // `*16384.0f` half-domain restore itself -- the caller (`scale`
+    // argument) is required to have that factor folded in already. Both
+    // wrappers below (`iron_nvfp4_qdot_16`, `iron_nvfp4_pack_dot`) do this
+    // ONCE per call instead of 4x per pack (8x per qdot_16, since it
+    // covers 2 packs) as the old per-value `* 16384.0f` did. Combined with
+    // the E4M3 scale fold above (256 = 2^8), a caller that sources `scale`
+    // from `iron_nvfp4_e4m3_scale(...) * 16384.0f` is applying a combined
+    // 256 * 16384 = 4,194,304 = 2^22 constant across the two folds -- both
+    // foldings are individually exact (power-of-2 float multiplies, no
+    // rounding, verified in-range for e4m3's finite domain), so splitting
+    // them across the two functions is bit-identical to a single 2^22
+    // multiply at the scale site; kept split so the *unrelated* slow
+    // scalar fallback path (`iron_nvfp4_e2m1(nibble) * iron_nvfp4_e4m3_scale(...)`,
+    // used by e.g. laguna_moe_gateup_swiglu_nvfp4_bf16 below) keeps
+    // getting the plain (non-16384-folded) E4M3 magnitude it expects.
+    // Composing further with the T23 `kNvfp4StageBias` (2^-14) half-
+    // staging fold used by the NAX/NAX64 MPP gather kernels would give
+    // 2^22 * 2^-14 = 2^8 -- N/A here since this qdot family never stages
+    // through `half` tiles (T23 doesn't touch these call sites), but
+    // documented for any future fuse of the two families.
     static inline float iron_nvfp4_pack_dot_fast(
         uint packed, float scale, const thread float* input, uint p_off
     ) {
         float accum = 0.0f;
-        const uint p0 =
-            ((packed & 0x00070007u) << 9) | ((packed & 0x00080008u) << 12);
-        const uint p1 =
-            ((packed & 0x00700070u) << 5) | ((packed & 0x00800080u) << 8);
-        const uint p2 =
-            ((packed & 0x07000700u) << 1) | ((packed & 0x08000800u) << 4);
-        const uint p3 =
-            ((packed & 0x70007000u) >> 3) | (packed & 0x80008000u);
-        const float2 v04 = float2(as_type<half2>(p0)) * 16384.0f;
-        const float2 v15 = float2(as_type<half2>(p1)) * 16384.0f;
-        const float2 v26 = float2(as_type<half2>(p2)) * 16384.0f;
-        const float2 v37 = float2(as_type<half2>(p3)) * 16384.0f;
+        const uint xe = packed & 0x0F0F0F0Fu;
+        const uint ge = xe | (xe << 3);
+        const uint yo = packed & 0xF0F0F0F0u;
+        const uint go = yo | (yo >> 3);
+        const uint M = 0x8E008E00u;
+        const uint p0 = (ge << 9) & M;
+        const uint p1 = (go << 8) & M;
+        const uint p2 = (ge << 1) & M;
+        const uint p3 = go & M;
+        const float2 v04 = float2(as_type<half2>(p0));
+        const float2 v15 = float2(as_type<half2>(p1));
+        const float2 v26 = float2(as_type<half2>(p2));
+        const float2 v37 = float2(as_type<half2>(p3));
         // half2 packs even/odd nibbles: (n0,n4), (n1,n5), (n2,n6), (n3,n7)
         accum += v04.x * scale * input[p_off + 0u];
         accum += v15.x * scale * input[p_off + 1u];
@@ -159,6 +223,12 @@ enum LagunaNvfp4Fuse {
     }
 
     // Dot 16 inputs against 8 bytes of packed E2M1 (16 nibbles) × scale.
+    // External contract unchanged: `scale` is the plain e4m3*global value
+    // (same as every existing call site already passes). The 2^22-class
+    // *16384.0f half-domain-restore fold (task 3) happens ONCE here per
+    // 16-element dot instead of 8x inside iron_nvfp4_pack_dot_fast (4x
+    // per pack × 2 packs) -- exact (power-of-2 multiply, see that
+    // function's header comment for the full equivalence argument).
     static inline float iron_nvfp4_qdot_16(
         const device uchar* weight_bytes,
         const thread float* input,
@@ -166,18 +236,22 @@ enum LagunaNvfp4Fuse {
     ) {
         float accum = 0.0f;
         const device uint* packs = (const device uint*)weight_bytes;
-        accum += iron_nvfp4_pack_dot_fast(packs[0], scale, input, 0u);
-        accum += iron_nvfp4_pack_dot_fast(packs[1], scale, input, 8u);
+        const float scale16k = scale * 16384.0f;
+        accum += iron_nvfp4_pack_dot_fast(packs[0], scale16k, input, 0u);
+        accum += iron_nvfp4_pack_dot_fast(packs[1], scale16k, input, 8u);
         return accum;
     }
 
+    // Threadgroup-pointer sibling of iron_nvfp4_qdot_16 (single pack).
+    // Same external contract (plain e4m3*global `scale`); same *16384.0f
+    // fold applied once here instead of inside pack_dot_fast.
     static inline float iron_nvfp4_pack_dot(
         uint packed, float scale, const threadgroup float* inner, uint p_off
     ) {
         // Promote TG pointer values into thread registers for the fast path.
         thread float tmp[8];
         for (uint i = 0; i < 8u; ++i) tmp[i] = inner[p_off + i];
-        return iron_nvfp4_pack_dot_fast(packed, scale, tmp, 0u);
+        return iron_nvfp4_pack_dot_fast(packed, scale * 16384.0f, tmp, 0u);
     }
     """
 
@@ -1560,6 +1634,121 @@ enum LagunaNvfp4Fuse {
         enc.dispatchThreadgroups(
             MTLSize(width: 512, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 288, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    // MARK: - T28 follow-up: gate-up split (routed-8 + shared-1)
+
+    /// Split the nine-slot GATE-UP dispatch back into its two constituent
+    /// kernels: `routedSwigluSrc` (slots 0-7, needs `expertIndices`) and
+    /// `sharedSwigluSrc` (slot 8, needs only `input`), encoded on ONE
+    /// `.concurrent`-dispatch-type encoder, shared first. Down+residual
+    /// stays on the merged `moeNineSlotDownReduce` dispatch regardless;
+    /// only the gate-up half is split here.
+    ///
+    /// Why this helps (frontier-measured, +0.98% over the fully-merged
+    /// nine-slot gate-up): `laguna_nine_slot_nvfp4_swiglu_qmv_bf16` is a
+    /// single kernel launch whose routed threadgroups (1024 of 1152) read
+    /// `indices`. Metal's hazard tracker therefore can't start ANY of that
+    /// dispatch's threadgroups, including the 128 shared-slot ones, which
+    /// never touch `indices`, until the router chain's write to
+    /// `indices`/`routerWeightsScratch` has retired: one dispatch means one
+    /// hazard set, so the shared leg's independence is invisible to the
+    /// tracker. Splitting shared into its own dispatch removes that false
+    /// dependency: shared only touches `input` + its own fused weight bank
+    /// + `sharedOutput`, none of which the router chain writes, so once
+    /// it's its own dispatch the hazard tracker is free to schedule it
+    /// without waiting on `indices`. Placing both dispatches on one
+    /// `.concurrent` encoder (rather than two separate default/serial
+    /// encoders) additionally drops the blanket ordering `.serial` would
+    /// otherwise impose between the shared and routed dispatches
+    /// themselves; same mechanism this file already leans on in
+    /// `moeGateUpSwigluMany` / `moeSlotSwigluDownMany` above for
+    /// independent per-slot dispatches. Shared is encoded first simply
+    /// because it's the one with nothing left to wait on; routed is
+    /// encoded second because it must follow the router chain's write to
+    /// `expertIndices` in program order regardless of encoder/dispatch
+    /// type (that's a true hazard, not a false one, so it's not something
+    /// `.concurrent` scheduling removes).
+    ///
+    /// Reuses `sharedSwigluSrc` / `routedSwigluSrc` verbatim (same PSOs the
+    /// pre-T28 code path and `moeRoutedSwigluQmv` already use elsewhere in
+    /// this file); the nine-slot kernel's own header comment already
+    /// documents its per-row arithmetic as identical to these two, so this
+    /// is purely a dispatch-count change, not a new numerics path.
+    ///
+    /// Placement (caller side, see `MoELayer.decodeNineSlot`): encode
+    /// AFTER `runPathBRouteChain` (routed needs `expertIndices` ready) and
+    /// on the SAME command buffer/queue as everything else in the nine-slot
+    /// decode path. `decodeNineSlot` does not use the dual-queue (`cmdB` +
+    /// sync-event) pattern; that pattern only exists in the older,
+    /// pre-T28 `decodeGPUPathBNvfp4` fallback below the nine-slot branch,
+    /// so there is no second queue to hand the shared leg to here without
+    /// reintroducing the ~1 CB + 2 events/layer overhead T28 specifically
+    /// removed. A same-encoder concurrent split is the available overlap
+    /// lever that doesn't reopen that cost.
+    static func moeGateUpSplitSwigluQmv(
+        input: Tensor,
+        gateWeight: Tensor, gateScales: Tensor,
+        upWeight: Tensor, upScales: Tensor,
+        expertIndices: Tensor,
+        routedOutputs: [Tensor],
+        sharedWeight: Tensor, sharedScales: Tensor,
+        sharedOutput: Tensor,
+        global: Float, sharedGlobal: Float,
+        on cmd: MTLCommandBuffer, device: Device
+    ) {
+        precondition(routedOutputs.count == 8)
+        precondition(input.dtype == .bf16 && input.elementCount == 2048)
+        precondition(expertIndices.dtype == .u32 && expertIndices.elementCount == 8)
+        precondition(sharedOutput.dtype == .bf16 && sharedOutput.elementCount == 512)
+
+        let mtl = device.mtlDevice
+        let pShared = pso(
+            "laguna_shared_nvfp4_swiglu_qmv", source: sharedSwigluSrc, device: mtl)
+        let pRouted = pso(
+            "laguna_moe_routed_swiglu_qmv_nvfp4_bf16",
+            source: routedSwigluSrc, device: mtl)
+        guard let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
+        else { return }
+
+        // Shared first: no dependency on `expertIndices`, see rationale
+        // above. Same buffer layout as `sharedSwigluQmv`, but writes into
+        // the caller's `sharedOutput` scratch instead of allocating fresh.
+        enc.setComputePipelineState(pShared)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(sharedWeight.buffer, offset: sharedWeight.offset, index: 1)
+        enc.setBuffer(sharedScales.buffer, offset: sharedScales.offset, index: 2)
+        enc.setBuffer(sharedOutput.buffer, offset: sharedOutput.offset, index: 3)
+        var sg = sharedGlobal
+        enc.setBytes(&sg, length: 4, index: 4)
+        // 128 tiles × 64 threads (2 SGs); same geometry as `sharedSwigluQmv`.
+        enc.dispatchThreadgroups(
+            MTLSize(width: 128, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+
+        // Routed second: depends on `expertIndices` (written by
+        // `runPathBRouteChain` before this function is called). Same
+        // buffer layout/geometry as `moeRoutedSwigluQmv`.
+        enc.setComputePipelineState(pRouted)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(gateWeight.buffer, offset: gateWeight.offset, index: 1)
+        enc.setBuffer(gateScales.buffer, offset: gateScales.offset, index: 2)
+        enc.setBuffer(upWeight.buffer, offset: upWeight.offset, index: 3)
+        enc.setBuffer(upScales.buffer, offset: upScales.offset, index: 4)
+        enc.setBuffer(expertIndices.buffer, offset: expertIndices.offset, index: 5)
+        for i in 0 ..< 8 {
+            enc.setBuffer(
+                routedOutputs[i].buffer, offset: routedOutputs[i].offset, index: 6 + i)
+        }
+        var g = global
+        enc.setBytes(&g, length: 4, index: 14)
+        // 8 experts × 128 tiles; TPG=64 (2 SGs × 32); same geometry as
+        // `moeRoutedSwigluQmv`.
+        enc.dispatchThreadgroups(
+            MTLSize(width: 8 * 128, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+
         enc.endEncoding()
     }
 }

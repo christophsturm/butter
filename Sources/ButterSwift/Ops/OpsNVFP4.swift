@@ -205,6 +205,24 @@ extension Ops {
         //   BM64: grid [nOut/64, ceil(mTotal/64), 1], TPG=128 (4 SGs 2×2)
         //   NAX:  same 64-tile grid via live butter_nvfp4_gather_qmm_rhs_nax_mpp_*
         //         when BUTTER_NVFP4_GATHER_NAX=1 (default OFF).
+        if nvfp4MoeGatherPrefersSteel(dtype: input.dtype, mTotal: mTotal, nOut: nOut, kIn: kIn, blockSize: blockSize) {
+            // T35: BM16 row-tile variant below a run-length threshold
+            // (fixes T34's diagnosed tile-fragmentation loss at production
+            // scale), BM64 otherwise (wins outright on long runs).
+            let nExperts = weight.shape[0]
+            if nvfp4GatherSteelPrefersBm16(mTotal: mTotal, nExperts: nExperts) {
+                nvfp4GatherSteelBm16(
+                    input: input, weight: weight, scales: scales, indices: indices,
+                    mTotal: mTotal, nOut: nOut, kIn: kIn,
+                    blockSize: blockSize, global: global, on: cmd, into: out)
+            } else {
+                nvfp4GatherSteel(
+                    input: input, weight: weight, scales: scales, indices: indices,
+                    mTotal: mTotal, nOut: nOut, kIn: kIn,
+                    blockSize: blockSize, global: global, on: cmd, into: out)
+            }
+            return
+        }
         if nvfp4MoeGatherPrefersNax64(mTotal: mTotal, nOut: nOut, kIn: kIn) {
             nvfp4MoeGatherNax64(
                 input: input, weight: weight, scales: scales, indices: indices,
@@ -663,6 +681,28 @@ extension Ops {
     ) {
         precondition(input.dtype == out0.dtype && input.dtype == out1.dtype)
         precondition(nOut % 32 == 0)
+        if nvfp4MoeGatherPrefersSteel(dtype: input.dtype, mTotal: mTotal, nOut: nOut, kIn: kIn, blockSize: blockSize) {
+            // T35: same BM16/BM64 run-length threshold as the serial path.
+            let nExperts = weight0.shape[0]
+            if nvfp4GatherSteelPrefersBm16(mTotal: mTotal, nExperts: nExperts) {
+                nvfp4GatherSteelBm16Pair(
+                    input: input,
+                    weight0: weight0, scales0: scales0, out0: out0,
+                    weight1: weight1, scales1: scales1, out1: out1,
+                    indices: indices,
+                    mTotal: mTotal, nOut: nOut, kIn: kIn,
+                    blockSize: blockSize, global: global, on: cmd)
+            } else {
+                nvfp4GatherSteelPair(
+                    input: input,
+                    weight0: weight0, scales0: scales0, out0: out0,
+                    weight1: weight1, scales1: scales1, out1: out1,
+                    indices: indices,
+                    mTotal: mTotal, nOut: nOut, kIn: kIn,
+                    blockSize: blockSize, global: global, on: cmd)
+            }
+            return
+        }
         if nvfp4MoeGatherPrefersNax64(mTotal: mTotal, nOut: nOut, kIn: kIn) {
             nvfp4MoeGatherNax64Pair(
                 input: input,

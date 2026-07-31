@@ -22,6 +22,167 @@ enum LagunaSdpa {
         return true  // default ON when shapes allow
     }
 
+    // ─── Prefill SDPA mask block-map (opt-in) ────────────────────────
+    //
+    // `prefillMmaBf16`'s causal MMA path (`Ops.sdpaPrefillMma`) always
+    // scans the *entire* `[0, kPad)` K range for every 32-row query
+    // tile and relies on the kernel's own per-element causal test to
+    // zero out the masked-off future. At T=512 causal, roughly half of
+    // every (query-tile, key) pair is in the upper-triangular dead
+    // region (`ki_min > qi_max`): work that can be skipped outright
+    // rather than computed-then-masked, and the surviving live region
+    // itself splits cleanly into a small causal-diagonal "edge" band
+    // that needs the per-row test and a large "full" middle band that
+    // provably doesn't.
+    //
+    // This section computes that closed form host-side per 32-row
+    // query tile (`queryBlockBounds`) and dispatches a new
+    // `laguna_sdpa_prefill_blockmap_f16_128` kernel restructured into
+    // exactly those phases: dead K skipped entirely (the loop bounds
+    // are `[mainStart, kvEnd)`, nothing outside is ever touched), the
+    // always-live sink prefix `[0, sinkEnd)` and the two causal/window
+    // edge bands run the per-row mask test, and the full middle band
+    // runs with no branch at all.
+    //
+    // FORWARD-LOOKING CAPABILITY, not just a preserved-behavior lever:
+    // sliding-window prefill is *inert* today outside this flag:
+    // `KVCacheProtocol.sdpaSinkWindow` unconditionally returns `(0, 0)`
+    // (see `LagunaText.swift`'s T26 comment), so `prefillMmaBf16`'s
+    // causal MMA path already runs fully unwindowed for every prefill
+    // layer, sliding or not. That's numerically harmless at T=512 (the
+    // window is 4096, wider than the whole chunk) but would be silently
+    // wrong at longer prompts. Passing a nonzero `window` through this
+    // path (see `LagunaText.swift`'s call site) is what actually turns
+    // sliding-window masking on at prefill for the first time, rather
+    // than just re-deriving the causal-only result faster.
+    //
+    // SCOPE NOTE: `prefillMmaBf16`'s K/V *compaction* step
+    // (`compactKvBf16ToF16`) still copies the entire `[0, kReal)` cache
+    // prefix regardless of window; this lever removes dead work from
+    // the attention inner loop only, not from compaction. A
+    // window-bounded compaction is a natural follow-up, out of scope
+    // here.
+    //
+    // Deliberately a hand-written *scalar* (no simdgroup_matrix) kernel,
+    // one simdgroup per query row (32 simdgroups = the 32 rows of one
+    // query tile, 32 lanes each over `headDim`), mirroring
+    // `laguna_sdpa_decode_gqa2_bf16_128`'s per-row online-softmax math.
+    // A from-scratch simdgroup_matrix MMA port of the same block-map
+    // bounds would out-throughput this, but is materially higher-risk
+    // to hand-write correctly without a build/test loop; this trades
+    // some raw throughput for a kernel whose correctness is easy to
+    // read off directly. Opt-in: `BUTTER_LAGUNA_PREFILL_BLOCKMAP=1`.
+    // Default OFF: `prefillMmaBf16` keeps calling `Ops.sdpaPrefillMma`
+    // unless this is set, so default behavior is unchanged.
+    static var prefillBlockmapEnabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PREFILL_BLOCKMAP"] == "1"
+    }
+
+    /// Closed-form per-query-block K bounds for the block-map prefill
+    /// kernel. All fields are absolute KV column indices into the
+    /// compacted `[nKVHeads, kPad, headDim]` buffers, forming the
+    /// non-decreasing chain
+    /// `0 <= sinkEnd <= mainStart <= fullLo <= fullHi <= kvEnd <= kPad`:
+    ///   * `[0, sinkEnd)`         : always-live sink prefix, causal-
+    ///                              masked per row (empty when sink is
+    ///                              disabled).
+    ///   * `[sinkEnd, mainStart)` : dead, never visited. Only nonempty
+    ///                              when a small sink leaves a gap
+    ///                              before the window's earliest live
+    ///                              column.
+    ///   * `[mainStart, fullLo)`  : edge, per-row causal+window test.
+    ///   * `[fullLo, fullHi)`     : full, valid for every row in the
+    ///                              tile, no per-row test.
+    ///   * `[fullHi, kvEnd)`      : edge, per-row causal+window test
+    ///                              (the causal diagonal band).
+    ///   * `[kvEnd, kPad)`        : dead, never visited (strictly
+    ///                              future).
+    struct PrefillBlockmapBounds: Equatable {
+        var sinkEnd: Int
+        var mainStart: Int
+        var fullLo: Int
+        var fullHi: Int
+        var kvEnd: Int
+    }
+
+    /// Row validity, matching the convention already used throughout
+    /// Butter's SDPA stack (`KVEvictionState`/`Ops.sdpaDecode`'s
+    /// `windowStart = max(0, nKV - window)`, `nKV = q + 1`): query row
+    /// at absolute position `q` may attend to key column `k` iff
+    /// `k <= q` (causal) AND (`k < sinkEnd` (sink override) OR
+    /// `window <= 0` (no window) OR `k >= q - window + 1` (in-window)).
+    /// `window <= 0` disables the sliding-window rule entirely (pure
+    /// causal); `sinkEnd <= 0` disables the sink exception.
+    ///
+    /// For one query tile spanning absolute rows `[qiMin, qiMax]`
+    /// (`qiMax == qiMin + 31` for a full 32-row tile), returns the
+    /// tightest bounds such that: every `(q, k)` pair with `k` outside
+    /// `[0, sinkEnd) ∪ [mainStart, kvEnd)` is invalid for every row in
+    /// the tile (safe to skip), and every `(q, k)` pair with `k` inside
+    /// `[fullLo, fullHi)` is valid for every row in the tile (safe to
+    /// skip the mask test). See
+    /// `Tests/ButterTests/Ops/LagunaPrefillBlockmapTests.swift` for the
+    /// brute-force proof of both claims.
+    static func queryBlockBounds(
+        qiMin: Int, qiMax: Int, kPad: Int, window: Int, sinkEnd rawSinkEnd: Int
+    ) -> PrefillBlockmapBounds {
+        precondition(qiMin <= qiMax, "queryBlockBounds: qiMin \(qiMin) > qiMax \(qiMax)")
+        func clamp(_ x: Int, _ lo: Int, _ hi: Int) -> Int { min(max(x, lo), hi) }
+
+        // Causal upper bound: no row in the tile can see past its own
+        // position, and no row's position exceeds `qiMax`.
+        let kvEnd = max(0, min(kPad, qiMax + 1))
+        let sinkEnd = max(0, min(rawSinkEnd, kvEnd))
+        // Window lower bound computed from the tile's SMALLEST row
+        // (`qiMin`): that row has the loosest (earliest) window start
+        // of anyone in the tile, so it's the correct "might still be
+        // live for someone" floor.
+        let windowStart = window > 0 ? max(0, qiMin - window + 1) : 0
+        let mainStart = clamp(max(windowStart, sinkEnd), sinkEnd, kvEnd)
+
+        // fullLo: window becomes unconditionally satisfied for every
+        // row once `k >= qiMax - window + 1` (the tile's LARGEST row,
+        // i.e. tightest/latest window start, is satisfied, which
+        // implies every looser row is too).
+        var fullLo = window > 0 ? clamp(qiMax - window + 1, mainStart, kvEnd) : mainStart
+        // fullHi: causal becomes unconditionally satisfied for every
+        // row only while `k <= qiMin` (the tile's SMALLEST row is the
+        // tightest causal constraint).
+        var fullHi = clamp(qiMin + 1, mainStart, kvEnd)
+        if fullLo > fullHi { fullLo = fullHi }  // narrow window vs. wide tile
+
+        return PrefillBlockmapBounds(
+            sinkEnd: sinkEnd, mainStart: mainStart, fullLo: fullLo, fullHi: fullHi, kvEnd: kvEnd)
+    }
+
+    /// Coarse per-(query-block, key-block) classification at an
+    /// arbitrary key-tile size: the "block (qi,ki) fully dead iff..."
+    /// form callers reason about at a glance. Deliberately independent
+    /// of `queryBlockBounds` (different granularity, different
+    /// derivation) so the two can cross-check each other against the
+    /// same brute-force per-element scan in tests.
+    enum BlockClass: Equatable { case dead, full, edge }
+
+    static func classifyBlock(
+        qiMin: Int, qiMax: Int, kiMin: Int, kiMax: Int, window: Int, sinkEnd: Int
+    ) -> BlockClass {
+        let overlapsSink = sinkEnd > 0 && kiMin < sinkEnd
+        // Dead: strictly future (causal), or strictly window-expired
+        // AND not exempted by an overlapping sink prefix.
+        if kiMin > qiMax { return .dead }
+        if window > 0, kiMax < qiMin - window + 1, !overlapsSink { return .dead }
+        // Full: causal-safe for every row (largest k <= smallest q)
+        // AND (window disabled, OR window-safe for every row (smallest
+        // k satisfies the tightest/largest-q bound), OR the whole tile
+        // sits inside the always-live sink prefix).
+        let causalSafe = kiMax <= qiMin
+        let windowSafe = window <= 0 || kiMin >= qiMax - window + 1
+        if causalSafe && (windowSafe || (overlapsSink && kiMax < sinkEnd)) {
+            return .full
+        }
+        return .edge
+    }
+
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]
     private static let lock = NSLock()
 
@@ -143,6 +304,204 @@ enum LagunaSdpa {
         enc.endEncoding()
     }
 
+    // One simdgroup (32 lanes) per query row; one threadgroup = one
+    // 32-row query tile x one Q head (1024 threads = 32 simdgroups x 32
+    // lanes, the same threadgroup geometry `laguna_sdpa_decode_gqa2_bf16_128`
+    // and the stock `iron_sdpa_decode_*` kernels already use). Unlike
+    // those decode kernels, each simdgroup here owns a DIFFERENT query
+    // row end-to-end rather than cooperating on one shared row, so there
+    // is no cross-simdgroup reduction / threadgroup-memory combine step
+    // at the end: every simdgroup just finalizes and writes its own row.
+    //
+    // `bounds` is the host-computed `queryBlockBounds(...)` output, laid
+    // out as `[nQBlocks, 4]` u32 (`mainStart, fullLo, fullHi, kvEnd`, one
+    // row per 32-query tile); `sink_end`/`window` are call-wide scalars
+    // (sink/window don't vary per tile, only the derived bounds do).
+    private static let blockmapSrc = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    kernel void laguna_sdpa_prefill_blockmap_f16_128(
+        const device half *q [[buffer(0)]],       // [n_heads, t_pad, 128]
+        const device half *k [[buffer(1)]],       // [n_kv_heads, k_pad, 128]
+        const device half *v [[buffer(2)]],       // [n_kv_heads, k_pad, 128]
+        device half *out [[buffer(3)]],           // [n_heads, t_pad, 128]
+        const device uint *bounds [[buffer(4)]],  // [n_q_blocks, 4]
+        constant uint &t_pad [[buffer(5)]],
+        constant uint &k_pad [[buffer(6)]],
+        constant uint &position [[buffer(7)]],
+        constant uint &sink_end [[buffer(8)]],
+        constant uint &window [[buffer(9)]],
+        constant uint &heads_per_group [[buffer(10)]],
+        constant float &scale [[buffer(11)]],
+        uint3 tgid [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]])
+    {
+        constexpr uint head_dim = 128u;
+        uint qBlock = tgid.x;
+        uint qHead = tgid.y;
+        uint kvHead = qHead / heads_per_group;
+        uint qRow = qBlock * 32u + sg;            // local row in [0, t_pad)
+        uint qAbs = position + qRow;              // absolute causal position
+        uint d0 = lane * 4u;
+
+        uint bBase = qBlock * 4u;
+        uint mainStart = bounds[bBase + 0u];
+        uint fullLo = bounds[bBase + 1u];
+        uint fullHi = bounds[bBase + 2u];
+        uint kvEnd = bounds[bBase + 3u];
+
+        float qv[4];
+        {
+            const device half *qP = q + (qHead * t_pad + qRow) * head_dim + d0;
+            for (uint i = 0u; i < 4u; ++i) { qv[i] = float(qP[i]) * scale; }
+        }
+
+        float runMax = -INFINITY;
+        float runSum = 0.0f;
+        float os[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        uint kvBase = kvHead * k_pad * head_dim;
+
+        // One K/V element step: dot product via simd_sum across this
+        // simdgroup's 4-lane partial products, then an online-softmax
+        // update. A macro (not a helper function) so every phase loop
+        // below stays a single, independently-readable block; there is
+        // no thread-array-reference plumbing to double-check.
+    #define BM_STEP(kv)                                                        \\
+        {                                                                      \\
+            uint kv0 = kvBase + (kv) * head_dim + d0;                          \\
+            const device half *kP = k + kv0;                                   \\
+            const device half *vP = v + kv0;                                   \\
+            float kk[4];                                                       \\
+            for (uint j = 0u; j < 4u; ++j) { kk[j] = float(kP[j]); }            \\
+            float partial = 0.0f;                                              \\
+            for (uint j = 0u; j < 4u; ++j) { partial += qv[j] * kk[j]; }        \\
+            float score = simd_sum(partial);                                   \\
+            float newMax = max(runMax, score);                                 \\
+            float factor = exp(runMax - newMax);                               \\
+            float weight = exp(score - newMax);                                \\
+            runSum = runSum * factor + weight;                                 \\
+            runMax = newMax;                                                   \\
+            float vv[4];                                                       \\
+            for (uint j = 0u; j < 4u; ++j) { vv[j] = float(vP[j]); }            \\
+            if (factor == 1.0f) {                                              \\
+                for (uint j = 0u; j < 4u; ++j) { os[j] = os[j] + weight * vv[j]; } \\
+            } else {                                                           \\
+                for (uint j = 0u; j < 4u; ++j) { os[j] = os[j] * factor + weight * vv[j]; } \\
+            }                                                                  \\
+        }
+
+        // Phase 0: always-live sink prefix, exempt from the window
+        // rule, never from causality.
+        for (uint kv = 0u; kv < sink_end; ++kv) {
+            if (kv <= qAbs) { BM_STEP(kv); }
+        }
+        // Phase 1: edge-lo, per-row causal + window test.
+        for (uint kv = mainStart; kv < fullLo; ++kv) {
+            bool causalOk = kv <= qAbs;
+            bool windowOk = (window == 0u) || (kv + window > qAbs);
+            if (causalOk && windowOk) { BM_STEP(kv); }
+        }
+        // Phase 2: full middle, provably valid for every row in this
+        // query tile (see `LagunaSdpa.queryBlockBounds`); no mask test.
+        for (uint kv = fullLo; kv < fullHi; ++kv) { BM_STEP(kv); }
+        // Phase 3: edge-hi (causal diagonal band), per-row masked.
+        for (uint kv = fullHi; kv < kvEnd; ++kv) {
+            bool causalOk = kv <= qAbs;
+            bool windowOk = (window == 0u) || (kv + window > qAbs);
+            if (causalOk && windowOk) { BM_STEP(kv); }
+        }
+    #undef BM_STEP
+
+        float invSum = runSum > 0.0f ? (1.0f / runSum) : 0.0f;
+        uint outOff = (qHead * t_pad + qRow) * head_dim + d0;
+        for (uint j = 0u; j < 4u; ++j) { out[outOff + j] = half(os[j] * invSum); }
+    }
+    """
+
+    /// Dispatch `laguna_sdpa_prefill_blockmap_f16_128`. Same call
+    /// contract as `Ops.sdpaPrefillMma`: `q`/`out` are
+    /// `[nHeads, tPad, 128]` f16 (HTD layout), `k`/`v` are
+    /// `[nKVHeads, kPad, 128]` f16. `window <= 0` disables the sliding
+    /// window (pure causal, same masking `Ops.sdpaPrefillMma` computes,
+    /// just via a different, scalar kernel); `sinkEnd <= 0` disables the
+    /// sink exception. Builds and uploads the per-query-tile bounds
+    /// buffer host-side (`queryBlockBounds`), then dispatches one
+    /// `(nQBlocks, nHeads, 1)` threadgroup grid, 1024 threads/group.
+    static func sdpaPrefillBlockmap(
+        qHTD: Tensor, kPacked: Tensor, vPacked: Tensor,
+        nHeads: Int, nKVHeads: Int,
+        tPad: Int, kPad: Int, position: Int,
+        window: Int, sinkEnd: Int, scale: Float,
+        on cmd: MTLCommandBuffer, device: Device,
+        into out: Tensor
+    ) {
+        precondition(tPad > 0 && tPad % 32 == 0, "sdpaPrefillBlockmap: tPad must be a positive multiple of 32")
+        precondition(
+            nHeads % nKVHeads == 0, "sdpaPrefillBlockmap: nHeads must be a multiple of nKVHeads")
+        precondition(
+            qHTD.dtype == .f16 && kPacked.dtype == .f16 && vPacked.dtype == .f16 && out.dtype == .f16,
+            "sdpaPrefillBlockmap: q/k/v/out must be f16")
+
+        let nQBlocks = tPad / 32
+        let clampedSinkEnd = max(0, min(sinkEnd, kPad))
+        let clampedWindow = max(0, window)
+
+        var boundsHost = [UInt32](repeating: 0, count: nQBlocks * 4)
+        for qi in 0 ..< nQBlocks {
+            let qiMin = position + qi * 32
+            let qiMax = qiMin + 31
+            let b = queryBlockBounds(
+                qiMin: qiMin, qiMax: qiMax, kPad: kPad,
+                window: clampedWindow, sinkEnd: clampedSinkEnd)
+            boundsHost[qi * 4 + 0] = UInt32(b.mainStart)
+            boundsHost[qi * 4 + 1] = UInt32(b.fullLo)
+            boundsHost[qi * 4 + 2] = UInt32(b.fullHi)
+            boundsHost[qi * 4 + 3] = UInt32(b.kvEnd)
+        }
+        // Fresh (non-ring) allocation: this buffer is written directly
+        // from the CPU via `copyIn` below, unlike the rest of
+        // `prefillMmaBf16`'s scratch temps, which are only ever written
+        // by GPU kernels/blits already ordered on `cmd`. A CPU write has
+        // no ordering relationship with a prior in-flight command
+        // buffer's GPU reads of a shared ring slot, so this one must not
+        // borrow the `scratch(...)` ring; it's small (`nQBlocks * 16`
+        // bytes), so a fresh allocation per call is cheap.
+        let boundsBuf = Tensor.empty(shape: [nQBlocks, 4], dtype: .u32, device: device)
+        boundsBuf.copyIn(from: boundsHost)
+
+        let headsPerGroup = nHeads / nKVHeads
+        let p = pso(
+            "laguna_sdpa_prefill_blockmap_f16_128", source: blockmapSrc,
+            device: device.mtlDevice)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(qHTD.buffer, offset: qHTD.offset, index: 0)
+        enc.setBuffer(kPacked.buffer, offset: kPacked.offset, index: 1)
+        enc.setBuffer(vPacked.buffer, offset: vPacked.offset, index: 2)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 3)
+        enc.setBuffer(boundsBuf.buffer, offset: boundsBuf.offset, index: 4)
+        var tPadU = UInt32(tPad)
+        var kPadU = UInt32(kPad)
+        var positionU = UInt32(position)
+        var sinkEndU = UInt32(clampedSinkEnd)
+        var windowU = UInt32(clampedWindow)
+        var headsPerGroupU = UInt32(headsPerGroup)
+        var scaleV = scale
+        enc.setBytes(&tPadU, length: 4, index: 5)
+        enc.setBytes(&kPadU, length: 4, index: 6)
+        enc.setBytes(&positionU, length: 4, index: 7)
+        enc.setBytes(&sinkEndU, length: 4, index: 8)
+        enc.setBytes(&windowU, length: 4, index: 9)
+        enc.setBytes(&headsPerGroupU, length: 4, index: 10)
+        enc.setBytes(&scaleV, length: 4, index: 11)
+        enc.dispatchThreadgroups(
+            MTLSize(width: nQBlocks, height: nHeads, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
     /// Causal prefill SDPA via `sdpaPrefillMma` (f16 MMA). Returns bf16
     /// `[nRows, nHeads*headDim]`. headDim=128, nRows≥32. Pads Q/K to next
     /// multiple of 32 when needed (pad queries discarded after).
@@ -156,6 +515,13 @@ enum LagunaSdpa {
     ///   "SDPA MMA kernel itself vs. layout transposes/copies" question
     ///   get a real per-stage answer instead of one lumped "sdpa" bucket.
     ///   See benchmarks/laguna-xs/README.md T26.
+    /// - Parameters window/sinkEnd: block-map opt-in only (see
+    ///   `prefillBlockmapEnabled`'s header comment above); ignored
+    ///   entirely unless `BUTTER_LAGUNA_PREFILL_BLOCKMAP=1`, in which
+    ///   case `window > 0` newly enables real sliding-window masking at
+    ///   prefill (previously inert here) and `sinkEnd > 0` keeps an
+    ///   always-live sink prefix. Both default to `0` (pure causal,
+    ///   identical to every existing call site) for source compatibility.
     static func prefillMmaBf16(
         qTHD: Tensor,  // [nRows, nHeads, headDim] bf16
         cacheK: Tensor, cacheV: Tensor,
@@ -163,6 +529,7 @@ enum LagunaSdpa {
         nHeads: Int, nKVHeads: Int, headDim: Int,
         maxSeq: Int, scale: Float,
         on cmd: inout MTLCommandBuffer, device: Device,
+        window: Int = 0, sinkEnd: Int = 0,
         phaseCheckpoint: ((String, MTLCommandBuffer) -> MTLCommandBuffer)? = nil
     ) -> Tensor? {
         guard prefillMmaEnabled,
@@ -293,10 +660,26 @@ enum LagunaSdpa {
         }
         if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_kv_compact", cmd) }
 
-        _ = Ops.sdpaPrefillMma(
-            q: qHTD, k: kPacked, v: vPacked,
-            nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-            qLen: tPad, kLen: kPad, scale: scale, on: cmd, into: outHTD)
+        if prefillBlockmapEnabled {
+            // T-blockmap opt-in path: same qHTD/kPacked/vPacked inputs,
+            // same outHTD output as the MMA path below, so the two are
+            // directly A/B-able (see LagunaPrefillBlockmapTests' GPU
+            // equivalence cases). Restructures the loop into skip-dead /
+            // full-no-mask / edge-masked phases instead of scanning
+            // `[0, kPad)` unconditionally, and, new here, actually
+            // enforces `window`/`sinkEnd` instead of ignoring them.
+            sdpaPrefillBlockmap(
+                qHTD: qHTD, kPacked: kPacked, vPacked: vPacked,
+                nHeads: nHeads, nKVHeads: nKVHeads,
+                tPad: tPad, kPad: kPad, position: position,
+                window: window, sinkEnd: sinkEnd, scale: scale,
+                on: cmd, device: device, into: outHTD)
+        } else {
+            _ = Ops.sdpaPrefillMma(
+                q: qHTD, k: kPacked, v: vPacked,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                qLen: tPad, kLen: kPad, scale: scale, on: cmd, into: outHTD)
+        }
         if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_mma_kernel", cmd) }
 
         _ = Ops.transposeHTD_f16(outHTD, t: tPad, h: nHeads, d: headDim, on: cmd, into: outTHD)
@@ -372,6 +755,50 @@ enum LagunaSdpa {
             && (nHeads + nKVHeads) % 4 == 0
             && prefillMmaEnabled
             && nRows >= 32
+    }
+
+    // F-85 prefill pack, item 2: H1 threadgroup geometry for the T30 fused
+    // QK-norm+RoPE prefill kernels. T30 shipped one TG (128 threads = 4
+    // simdgroups) per (head-block, token) with 4 heads packed per TG, one
+    // simdgroup per head. H1 dispatches one TG (32 threads = 1 simdgroup)
+    // per (head, token) instead, same per-lane RMSNorm/RoPE math and the
+    // same intra-simdgroup `simd_shuffle` rotary-partner lookup, just a
+    // narrower/more-numerous threadgroup grid (`nHeads+nKVHeads` in the
+    // head dimension instead of `(nHeads+nKVHeads)/4`). Bit-exact vs the
+    // 4-head/128-thread kernel: identical scalar/transcendental expression
+    // per lane, `simd_shuffle` result does not depend on which simdgroup
+    // index a lane's 32-lane group happens to run as. Opt-in, independent
+    // of `BUTTER_LAGUNA_PREFILL_QK_ROPE_FUSE` (still gates whether the
+    // fused path runs at all): this only chooses which of the two
+    // dispatch geometries the fused kernel uses.
+    // Escape/opt-in: BUTTER_LAGUNA_PREFILL_QKROPE_H1=1 (default OFF, unverified
+    // this session, see benchmarks/laguna-xs/README.md F-85 prefill pack).
+    static var prefillQkRopeH1Enabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PREFILL_QKROPE_H1"] == "1"
+    }
+
+    // F-85 prefill pack, item 3: fp32 RoPE angle atlas for prefill (sliding
+    // layers only; decode and the YaRN full-attention twin are explicitly
+    // out of scope this session, see the file-level note above
+    // `fusedQKNormRopeForPrefill`). Precomputes `cos`/`sin` for every
+    // `(position, pair)` up to `ropeAtlasMaxPositions` once (fp32), and the
+    // fused kernel indexes the table by absolute position instead of
+    // evaluating `exp2`/`cos`/`sin` analytically per lane per call. Rotary
+    // partner is still resolved via the existing intra-simdgroup
+    // `simd_shuffle(lane ^ 16)` (full rotary, headDim 128): the atlas only
+    // replaces the angle computation, not the shuffle.
+    // Opt-in: BUTTER_LAGUNA_ROPE_ATLAS=1 (default OFF, unverified this
+    // session). Falls back to the analytic kernel (H1 or base, per the flag
+    // above) whenever `position + tPad` exceeds the atlas's cached
+    // position range.
+    static var prefillRopeAtlasEnabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_ROPE_ATLAS"] == "1"
+    }
+
+    static let ropeAtlasMaxPositions = 4096
+
+    static func prefillQkRopeAtlasEligible(position: Int, tPad: Int) -> Bool {
+        prefillRopeAtlasEnabled && (position + tPad) <= ropeAtlasMaxPositions
     }
 
     private static let prefillFusedQKRopeSrc = """
@@ -487,6 +914,309 @@ enum LagunaSdpa {
     }
     """
 
+    // H1 variant of `prefillFusedQKRopeSrc` (F-85 prefill pack item 2): one
+    // threadgroup (32 threads, 1 simdgroup) per (head, token) instead of
+    // one TG (128 threads, 4 simdgroups) per (head-block, token). Same
+    // per-lane body verbatim otherwise: `head` is just `tgpig.x` directly
+    // (no simdgroup-index offset, always the sole simdgroup in its TG).
+    private static let prefillFusedQKRopeSrcH1 = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    // One threadgroup (32 threads = 1 simdgroup) per (head, token);
+    // grid.x = n_q_heads+n_kv_heads, grid.y = nRows.
+    kernel void laguna_prefill_sliding_qk_norm_rope_direct_bf16_128_h1(
+        device const bfloat *raw_q [[buffer(0)]],
+        device const bfloat *raw_k [[buffer(1)]],
+        device const bfloat *q_weight [[buffer(2)]],
+        device const bfloat *k_weight [[buffer(3)]],
+        device half *out_q_htd [[buffer(4)]],
+        device bfloat *out_k [[buffer(5)]],
+        constant uint &n_q_heads [[buffer(6)]],
+        constant uint &n_kv_heads [[buffer(7)]],
+        constant uint &t_pad [[buffer(8)]],
+        constant uint &position_base [[buffer(9)]],
+        constant float &theta_base [[buffer(10)]],
+        constant float &eps [[buffer(11)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]
+    ) {
+        constexpr uint head_dim = 128u;
+        constexpr uint half_dim = 64u;
+
+        uint t = tgpig.y;
+        uint head = tgpig.x;
+        bool is_q = head < n_q_heads;
+
+        const device bfloat *input;
+        const device bfloat *weight;
+        if (is_q) {
+            input = raw_q + (t * n_q_heads + head) * head_dim;
+            weight = q_weight;
+        } else {
+            uint kh = head - n_q_heads;
+            input = raw_k + (t * n_kv_heads + kh) * head_dim;
+            weight = k_weight;
+        }
+
+        uint base = lane * 4u;
+        float x[4];
+        float sum = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            x[i] = float(input[base + i]);
+            sum += x[i] * x[i];
+        }
+        sum = simd_sum(sum);
+        float inv_rms = rsqrt(sum / float(head_dim) + eps);
+
+        thread bfloat normalized[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            float wi = float(weight[base + i]);
+            normalized[i] = bfloat((x[i] * inv_rms) * wi);
+        }
+
+        thread float paired[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16u);
+        }
+
+        if (lane < 16u) {
+            float log_theta = log2(theta_base);
+            float half_f = float(half_dim);
+            float pos_f = float(position_base + t);
+            if (is_q) {
+                device half *out = out_q_htd + (head * t_pad + t) * head_dim;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 4u; ++i) {
+                    uint pair = base + i;
+                    float first = float(normalized[i]);
+                    float second = paired[i];
+                    float inv_freq = exp2(((-float(pair)) * log_theta) / half_f);
+                    float th = pos_f * inv_freq;
+                    float c = cos(th);
+                    float s = sin(th);
+                    bfloat r0 = bfloat(first * c - second * s);
+                    bfloat r1 = bfloat(first * s + second * c);
+                    out[pair] = half(float(r0));
+                    out[pair + half_dim] = half(float(r1));
+                }
+            } else {
+                uint kh = head - n_q_heads;
+                device bfloat *out = out_k + (t * n_kv_heads + kh) * head_dim;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 4u; ++i) {
+                    uint pair = base + i;
+                    float first = float(normalized[i]);
+                    float second = paired[i];
+                    float inv_freq = exp2(((-float(pair)) * log_theta) / half_f);
+                    float th = pos_f * inv_freq;
+                    float c = cos(th);
+                    float s = sin(th);
+                    out[pair] = bfloat(first * c - second * s);
+                    out[pair + half_dim] = bfloat(first * s + second * c);
+                }
+            }
+        }
+    }
+    """
+
+    // F-85 prefill pack item 3: fp32 angle atlas. Build kernel fills
+    // `cos_atlas`/`sin_atlas` `[maxPositions, rotaryPairs]` (fp32, row per
+    // absolute position) once; the read kernel below indexes it instead of
+    // evaluating `exp2`/`cos`/`sin` per lane. Same H1 (32-thread, 1
+    // simdgroup per head) dispatch geometry as item 2's kernel; the two
+    // levers compose in this one kernel (atlas replaces the angle math,
+    // H1 is the dispatch shape). A base-geometry (4-head/128-thread) atlas
+    // variant was not authored this session (scope: prefill lever
+    // combination left for a follow-up, see the mission report).
+    private static let ropeAtlasBuildSrc = """
+    #include <metal_stdlib>
+    using namespace metal;
+    // grid.x = rotary_pairs, grid.y = maxPositions.
+    kernel void laguna_rope_atlas_build_f32(
+        device float *cos_atlas [[buffer(0)]],
+        device float *sin_atlas [[buffer(1)]],
+        constant uint &rotary_pairs [[buffer(2)]],
+        constant float &theta_base [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        uint pair = gid.x;
+        uint pos = gid.y;
+        if (pair >= rotary_pairs) return;
+        float log_theta = log2(theta_base);
+        float half_f = float(rotary_pairs);
+        float inv_freq = exp2(((-float(pair)) * log_theta) / half_f);
+        float th = float(pos) * inv_freq;
+        uint idx = pos * rotary_pairs + pair;
+        cos_atlas[idx] = cos(th);
+        sin_atlas[idx] = sin(th);
+    }
+    """
+
+    private static let prefillFusedQKRopeSrcAtlas = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    // Atlas-read twin of the H1 kernel above: same one-simdgroup-per-head
+    // dispatch, but `cos`/`sin` come from a precomputed `[maxPositions, 64]`
+    // fp32 table instead of an analytic `exp2`/`cos`/`sin` evaluation.
+    // Rotary partner is still the intra-simdgroup `simd_shuffle(lane^16)`
+    // lookup; the atlas only replaces the angle source.
+    kernel void laguna_prefill_sliding_qk_norm_rope_atlas_bf16_128(
+        device const bfloat *raw_q [[buffer(0)]],
+        device const bfloat *raw_k [[buffer(1)]],
+        device const bfloat *q_weight [[buffer(2)]],
+        device const bfloat *k_weight [[buffer(3)]],
+        device half *out_q_htd [[buffer(4)]],
+        device bfloat *out_k [[buffer(5)]],
+        constant uint &n_q_heads [[buffer(6)]],
+        constant uint &n_kv_heads [[buffer(7)]],
+        constant uint &t_pad [[buffer(8)]],
+        constant uint &position_base [[buffer(9)]],
+        constant float &eps [[buffer(10)]],
+        device const float *cos_atlas [[buffer(11)]],
+        device const float *sin_atlas [[buffer(12)]],
+        constant uint &atlas_stride [[buffer(13)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]
+    ) {
+        constexpr uint head_dim = 128u;
+        constexpr uint half_dim = 64u;
+
+        uint t = tgpig.y;
+        uint head = tgpig.x;
+        bool is_q = head < n_q_heads;
+
+        const device bfloat *input;
+        const device bfloat *weight;
+        if (is_q) {
+            input = raw_q + (t * n_q_heads + head) * head_dim;
+            weight = q_weight;
+        } else {
+            uint kh = head - n_q_heads;
+            input = raw_k + (t * n_kv_heads + kh) * head_dim;
+            weight = k_weight;
+        }
+
+        uint base = lane * 4u;
+        float x[4];
+        float sum = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            x[i] = float(input[base + i]);
+            sum += x[i] * x[i];
+        }
+        sum = simd_sum(sum);
+        float inv_rms = rsqrt(sum / float(head_dim) + eps);
+
+        thread bfloat normalized[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            float wi = float(weight[base + i]);
+            normalized[i] = bfloat((x[i] * inv_rms) * wi);
+        }
+
+        thread float paired[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16u);
+        }
+
+        if (lane < 16u) {
+            uint pos = position_base + t;
+            uint atlas_row = pos * atlas_stride;
+            if (is_q) {
+                device half *out = out_q_htd + (head * t_pad + t) * head_dim;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 4u; ++i) {
+                    uint pair = base + i;
+                    float first = float(normalized[i]);
+                    float second = paired[i];
+                    float c = cos_atlas[atlas_row + pair];
+                    float s = sin_atlas[atlas_row + pair];
+                    bfloat r0 = bfloat(first * c - second * s);
+                    bfloat r1 = bfloat(first * s + second * c);
+                    out[pair] = half(float(r0));
+                    out[pair + half_dim] = half(float(r1));
+                }
+            } else {
+                uint kh = head - n_q_heads;
+                device bfloat *out = out_k + (t * n_kv_heads + kh) * head_dim;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 4u; ++i) {
+                    uint pair = base + i;
+                    float first = float(normalized[i]);
+                    float second = paired[i];
+                    float c = cos_atlas[atlas_row + pair];
+                    float s = sin_atlas[atlas_row + pair];
+                    out[pair] = bfloat(first * c - second * s);
+                    out[pair + half_dim] = bfloat(first * s + second * c);
+                }
+            }
+        }
+    }
+    """
+
+    /// Lazily-built fp32 RoPE angle atlas, cached by `(rotaryPairs,
+    /// thetaBase)`. `cos`/`sin` are separate `[maxPositions, rotaryPairs]`
+    /// buffers built via `laguna_rope_atlas_build_f32` (see source above).
+    /// Built once per distinct `thetaBase` (Laguna XS's sliding layers all
+    /// share one rope theta, so in practice this builds once for the whole
+    /// model run); grown or rebuilt is never needed within
+    /// `ropeAtlasMaxPositions` since prefill chunks that would exceed it
+    /// are routed back to the analytic kernel by
+    /// `prefillQkRopeAtlasEligible` before this is ever called.
+    private struct RopeAtlasKey: Hashable {
+        let rotaryPairs: Int
+        let thetaBits: UInt32
+    }
+    nonisolated(unsafe) private static var ropeAtlasCache: [RopeAtlasKey: (cos: Tensor, sin: Tensor)] = [:]
+    private static let ropeAtlasLock = NSLock()
+
+    private static func ropeAtlas(
+        rotaryPairs: Int, thetaBase: Float, on cmd: MTLCommandBuffer, device: Device
+    ) -> (cos: Tensor, sin: Tensor) {
+        let key = RopeAtlasKey(rotaryPairs: rotaryPairs, thetaBits: thetaBase.bitPattern)
+        ropeAtlasLock.lock()
+        if let cached = ropeAtlasCache[key] {
+            ropeAtlasLock.unlock()
+            return cached
+        }
+        ropeAtlasLock.unlock()
+
+        let cosT = Tensor.empty(shape: [ropeAtlasMaxPositions, rotaryPairs], dtype: .f32, device: device)
+        let sinT = Tensor.empty(shape: [ropeAtlasMaxPositions, rotaryPairs], dtype: .f32, device: device)
+        // Build dispatch is encoded onto the caller's `cmd`, same as every
+        // other kernel in this file: relies on same-`MTLCommandQueue`
+        // commit-order execution (no explicit fence). The first eligible
+        // call's build dispatch and its own atlas-read dispatch share one
+        // command buffer (hazard-tracked automatically), and later cache
+        // hits from later layers/chunks only ever READ these buffers, on
+        // command buffers submitted after the build's, to the same queue.
+        let p = pso(
+            "laguna_rope_atlas_build_f32", source: ropeAtlasBuildSrc, device: device.mtlDevice)
+        if let enc = cmd.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(p)
+            enc.setBuffer(cosT.buffer, offset: cosT.offset, index: 0)
+            enc.setBuffer(sinT.buffer, offset: sinT.offset, index: 1)
+            var rp = UInt32(rotaryPairs)
+            var theta = thetaBase
+            enc.setBytes(&rp, length: 4, index: 2)
+            enc.setBytes(&theta, length: 4, index: 3)
+            enc.dispatchThreads(
+                MTLSize(width: rotaryPairs, height: ropeAtlasMaxPositions, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: min(rotaryPairs, 32), height: 8, depth: 1))
+            enc.endEncoding()
+        }
+        ropeAtlasLock.lock()
+        ropeAtlasCache[key] = (cosT, sinT)
+        ropeAtlasLock.unlock()
+        return (cosT, sinT)
+    }
+
     private static let prefillQhtdZeroPadSrc = """
     #include <metal_stdlib>
     using namespace metal;
@@ -536,34 +1266,106 @@ enum LagunaSdpa {
         let kOut = Tensor.empty(
             shape: [nRows, nKVHeads * headDim], dtype: .bf16, device: device)
 
-        let p = pso(
-            "laguna_prefill_sliding_qk_norm_rope_direct_bf16_128",
-            source: prefillFusedQKRopeSrc, device: device.mtlDevice)
-        if let enc = cmd.makeComputeCommandEncoder() {
-            enc.setComputePipelineState(p)
-            enc.setBuffer(rawQ.buffer, offset: rawQ.offset, index: 0)
-            enc.setBuffer(rawK.buffer, offset: rawK.offset, index: 1)
-            enc.setBuffer(qWeight.buffer, offset: qWeight.offset, index: 2)
-            enc.setBuffer(kWeight.buffer, offset: kWeight.offset, index: 3)
-            enc.setBuffer(qHTD.buffer, offset: qHTD.offset, index: 4)
-            enc.setBuffer(kOut.buffer, offset: kOut.offset, index: 5)
-            var nQU = UInt32(nHeads)
-            var nKvU = UInt32(nKVHeads)
-            var tPadU = UInt32(tPad)
-            var posU = UInt32(position)
-            var theta = thetaBase
-            var epsV = eps
-            enc.setBytes(&nQU, length: 4, index: 6)
-            enc.setBytes(&nKvU, length: 4, index: 7)
-            enc.setBytes(&tPadU, length: 4, index: 8)
-            enc.setBytes(&posU, length: 4, index: 9)
-            enc.setBytes(&theta, length: 4, index: 10)
-            enc.setBytes(&epsV, length: 4, index: 11)
-            let groups = (nHeads + nKVHeads) / 4
-            enc.dispatchThreadgroups(
-                MTLSize(width: groups, height: nRows, depth: 1),
-                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-            enc.endEncoding()
+        // F-85 prefill pack: atlas (item 3) takes priority over H1 (item 2)
+        // when both are opted in. Atlas eligibility already implies the
+        // H1-style one-simdgroup-per-head geometry (see
+        // `prefillFusedQKRopeSrcAtlas`), so there is nothing left for the
+        // H1-only kernel to add on top. Neither flag changes anything by
+        // default (both OFF); the base T30 4-head/128-thread analytic
+        // kernel remains what ships.
+        let useAtlas = prefillQkRopeAtlasEligible(position: position, tPad: tPad)
+        if useAtlas {
+            let (cosAtlas, sinAtlas) = ropeAtlas(
+                rotaryPairs: headDim / 2, thetaBase: thetaBase, on: cmd, device: device)
+            let p = pso(
+                "laguna_prefill_sliding_qk_norm_rope_atlas_bf16_128",
+                source: prefillFusedQKRopeSrcAtlas, device: device.mtlDevice)
+            if let enc = cmd.makeComputeCommandEncoder() {
+                enc.setComputePipelineState(p)
+                enc.setBuffer(rawQ.buffer, offset: rawQ.offset, index: 0)
+                enc.setBuffer(rawK.buffer, offset: rawK.offset, index: 1)
+                enc.setBuffer(qWeight.buffer, offset: qWeight.offset, index: 2)
+                enc.setBuffer(kWeight.buffer, offset: kWeight.offset, index: 3)
+                enc.setBuffer(qHTD.buffer, offset: qHTD.offset, index: 4)
+                enc.setBuffer(kOut.buffer, offset: kOut.offset, index: 5)
+                var nQU = UInt32(nHeads)
+                var nKvU = UInt32(nKVHeads)
+                var tPadU = UInt32(tPad)
+                var posU = UInt32(position)
+                var epsV = eps
+                enc.setBytes(&nQU, length: 4, index: 6)
+                enc.setBytes(&nKvU, length: 4, index: 7)
+                enc.setBytes(&tPadU, length: 4, index: 8)
+                enc.setBytes(&posU, length: 4, index: 9)
+                enc.setBytes(&epsV, length: 4, index: 10)
+                enc.setBuffer(cosAtlas.buffer, offset: cosAtlas.offset, index: 11)
+                enc.setBuffer(sinAtlas.buffer, offset: sinAtlas.offset, index: 12)
+                var atlasStride = UInt32(headDim / 2)
+                enc.setBytes(&atlasStride, length: 4, index: 13)
+                enc.dispatchThreadgroups(
+                    MTLSize(width: nHeads + nKVHeads, height: nRows, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.endEncoding()
+            }
+        } else if prefillQkRopeH1Enabled {
+            let p = pso(
+                "laguna_prefill_sliding_qk_norm_rope_direct_bf16_128_h1",
+                source: prefillFusedQKRopeSrcH1, device: device.mtlDevice)
+            if let enc = cmd.makeComputeCommandEncoder() {
+                enc.setComputePipelineState(p)
+                enc.setBuffer(rawQ.buffer, offset: rawQ.offset, index: 0)
+                enc.setBuffer(rawK.buffer, offset: rawK.offset, index: 1)
+                enc.setBuffer(qWeight.buffer, offset: qWeight.offset, index: 2)
+                enc.setBuffer(kWeight.buffer, offset: kWeight.offset, index: 3)
+                enc.setBuffer(qHTD.buffer, offset: qHTD.offset, index: 4)
+                enc.setBuffer(kOut.buffer, offset: kOut.offset, index: 5)
+                var nQU = UInt32(nHeads)
+                var nKvU = UInt32(nKVHeads)
+                var tPadU = UInt32(tPad)
+                var posU = UInt32(position)
+                var theta = thetaBase
+                var epsV = eps
+                enc.setBytes(&nQU, length: 4, index: 6)
+                enc.setBytes(&nKvU, length: 4, index: 7)
+                enc.setBytes(&tPadU, length: 4, index: 8)
+                enc.setBytes(&posU, length: 4, index: 9)
+                enc.setBytes(&theta, length: 4, index: 10)
+                enc.setBytes(&epsV, length: 4, index: 11)
+                enc.dispatchThreadgroups(
+                    MTLSize(width: nHeads + nKVHeads, height: nRows, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.endEncoding()
+            }
+        } else {
+            let p = pso(
+                "laguna_prefill_sliding_qk_norm_rope_direct_bf16_128",
+                source: prefillFusedQKRopeSrc, device: device.mtlDevice)
+            if let enc = cmd.makeComputeCommandEncoder() {
+                enc.setComputePipelineState(p)
+                enc.setBuffer(rawQ.buffer, offset: rawQ.offset, index: 0)
+                enc.setBuffer(rawK.buffer, offset: rawK.offset, index: 1)
+                enc.setBuffer(qWeight.buffer, offset: qWeight.offset, index: 2)
+                enc.setBuffer(kWeight.buffer, offset: kWeight.offset, index: 3)
+                enc.setBuffer(qHTD.buffer, offset: qHTD.offset, index: 4)
+                enc.setBuffer(kOut.buffer, offset: kOut.offset, index: 5)
+                var nQU = UInt32(nHeads)
+                var nKvU = UInt32(nKVHeads)
+                var tPadU = UInt32(tPad)
+                var posU = UInt32(position)
+                var theta = thetaBase
+                var epsV = eps
+                enc.setBytes(&nQU, length: 4, index: 6)
+                enc.setBytes(&nKvU, length: 4, index: 7)
+                enc.setBytes(&tPadU, length: 4, index: 8)
+                enc.setBytes(&posU, length: 4, index: 9)
+                enc.setBytes(&theta, length: 4, index: 10)
+                enc.setBytes(&epsV, length: 4, index: 11)
+                let groups = (nHeads + nKVHeads) / 4
+                enc.dispatchThreadgroups(
+                    MTLSize(width: groups, height: nRows, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+                enc.endEncoding()
+            }
         }
 
         if tPad > nRows {
@@ -865,6 +1667,129 @@ enum LagunaSdpa {
     }
     """
 
+    // H1 variant of `prefillFusedQKYarnSrc` (F-85 prefill pack item 2),
+    // same relationship as `prefillFusedQKRopeSrcH1` to the sliding
+    // kernel: one threadgroup (32 threads, 1 simdgroup) per (head, token),
+    // `head = tgpig.x` directly, otherwise byte-for-byte the same body.
+    private static let prefillFusedQKYarnSrcH1 = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    // One threadgroup (32 threads = 1 simdgroup) per (head, token);
+    // grid.x = n_q_heads+n_kv_heads, grid.y = nRows.
+    kernel void laguna_prefill_full_qk_norm_yarn_direct_bf16_128_h1(
+        device const bfloat *raw_q [[buffer(0)]],
+        device const bfloat *raw_k [[buffer(1)]],
+        device const bfloat *q_weight [[buffer(2)]],
+        device const bfloat *k_weight [[buffer(3)]],
+        device half *out_q_htd [[buffer(4)]],
+        device bfloat *out_k [[buffer(5)]],
+        constant uint &n_q_heads [[buffer(6)]],
+        constant uint &n_kv_heads [[buffer(7)]],
+        constant uint &t_pad [[buffer(8)]],
+        constant uint &position_base [[buffer(9)]],
+        constant float &theta_base [[buffer(10)]],
+        constant float &eps [[buffer(11)]],
+        constant uint &rotary_pairs [[buffer(12)]],
+        constant float &yarn_factor [[buffer(13)]],
+        constant float &yarn_low [[buffer(14)]],
+        constant float &yarn_high [[buffer(15)]],
+        constant float &yarn_attn_factor [[buffer(16)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]
+    ) {
+        constexpr uint head_dim = 128u;
+
+        uint t = tgpig.y;
+        uint head = tgpig.x;
+        bool is_q = head < n_q_heads;
+
+        const device bfloat *input;
+        const device bfloat *weight;
+        if (is_q) {
+            input = raw_q + (t * n_q_heads + head) * head_dim;
+            weight = q_weight;
+        } else {
+            uint kh = head - n_q_heads;
+            input = raw_k + (t * n_kv_heads + kh) * head_dim;
+            weight = k_weight;
+        }
+
+        uint base = lane * 4u;
+        float x[4];
+        float sum = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            x[i] = float(input[base + i]);
+            sum += x[i] * x[i];
+        }
+        sum = simd_sum(sum);
+        float inv_rms = rsqrt(sum / float(head_dim) + eps);
+
+        thread bfloat normalized[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            float wi = float(weight[base + i]);
+            normalized[i] = bfloat((x[i] * inv_rms) * wi);
+        }
+
+        uint shuffle_dist = rotary_pairs / 4u;
+        thread float paired[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ shuffle_dist);
+        }
+
+        uint rotary_lanes = rotary_pairs / 4u;
+        if (lane < rotary_lanes) {
+            float log_theta = log2(theta_base);
+            float half_f = float(rotary_pairs);
+            float pos_f = float(position_base + t);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4u; ++i) {
+                uint pair = base + i;
+                float pair_f = float(pair);
+                float inv_freq_extrap = exp2(((-pair_f) * log_theta) / half_f);
+                float t_ramp = (pair_f - yarn_low) / (yarn_high - yarn_low);
+                float ramp = select(t_ramp, 1.0f, bool(t_ramp > 1.0f));
+                ramp = select(ramp, 0.0f, bool(0.0f > ramp));
+                float inv_freq =
+                    (inv_freq_extrap / yarn_factor) * ramp
+                    + inv_freq_extrap * (1.0f - ramp);
+                float theta = pos_f * inv_freq;
+                float cos_t = cos(theta) * yarn_attn_factor;
+                float sin_t = sin(theta) * yarn_attn_factor;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                bfloat r0 = bfloat(first * cos_t - second * sin_t);
+                bfloat r1 = bfloat(first * sin_t + second * cos_t);
+                if (is_q) {
+                    device half *out = out_q_htd + (head * t_pad + t) * head_dim;
+                    out[pair] = half(float(r0));
+                    out[pair + rotary_pairs] = half(float(r1));
+                } else {
+                    uint kh = head - n_q_heads;
+                    device bfloat *out = out_k + (t * n_kv_heads + kh) * head_dim;
+                    out[pair] = r0;
+                    out[pair + rotary_pairs] = r1;
+                }
+            }
+        } else if (lane >= 2u * rotary_lanes) {
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4u; ++i) {
+                if (is_q) {
+                    device half *out = out_q_htd + (head * t_pad + t) * head_dim;
+                    out[base + i] = half(float(normalized[i]));
+                } else {
+                    uint kh = head - n_q_heads;
+                    device bfloat *out = out_k + (t * n_kv_heads + kh) * head_dim;
+                    out[base + i] = normalized[i];
+                }
+            }
+        }
+    }
+    """
+
     /// Phase 1 (pure) for full-attention (YaRN, partial-rotary) layers,
     /// same contract as `fusedQKNormRopeForPrefill`.
     static func fusedQKNormYarnForPrefill(
@@ -895,44 +1820,87 @@ enum LagunaSdpa {
         let kOut = Tensor.empty(
             shape: [nRows, nKVHeads * headDim], dtype: .bf16, device: device)
 
-        let p = pso(
-            "laguna_prefill_full_qk_norm_yarn_direct_bf16_128",
-            source: prefillFusedQKYarnSrc, device: device.mtlDevice)
-        if let enc = cmd.makeComputeCommandEncoder() {
-            enc.setComputePipelineState(p)
-            enc.setBuffer(rawQ.buffer, offset: rawQ.offset, index: 0)
-            enc.setBuffer(rawK.buffer, offset: rawK.offset, index: 1)
-            enc.setBuffer(qWeight.buffer, offset: qWeight.offset, index: 2)
-            enc.setBuffer(kWeight.buffer, offset: kWeight.offset, index: 3)
-            enc.setBuffer(qHTD.buffer, offset: qHTD.offset, index: 4)
-            enc.setBuffer(kOut.buffer, offset: kOut.offset, index: 5)
-            var nQU = UInt32(nHeads)
-            var nKvU = UInt32(nKVHeads)
-            var tPadU = UInt32(tPad)
-            var posU = UInt32(position)
-            var theta = thetaBase
-            var epsV = eps
-            var rotaryPairsU = UInt32(rotaryPairs)
-            var yarnFactor = yarn.factor
-            var yarnLow = yarn.low
-            var yarnHigh = yarn.high
-            var yarnAttnFactor = yarn.attnFactor
-            enc.setBytes(&nQU, length: 4, index: 6)
-            enc.setBytes(&nKvU, length: 4, index: 7)
-            enc.setBytes(&tPadU, length: 4, index: 8)
-            enc.setBytes(&posU, length: 4, index: 9)
-            enc.setBytes(&theta, length: 4, index: 10)
-            enc.setBytes(&epsV, length: 4, index: 11)
-            enc.setBytes(&rotaryPairsU, length: 4, index: 12)
-            enc.setBytes(&yarnFactor, length: 4, index: 13)
-            enc.setBytes(&yarnLow, length: 4, index: 14)
-            enc.setBytes(&yarnHigh, length: 4, index: 15)
-            enc.setBytes(&yarnAttnFactor, length: 4, index: 16)
-            let groups = (nHeads + nKVHeads) / 4
-            enc.dispatchThreadgroups(
-                MTLSize(width: groups, height: nRows, depth: 1),
-                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-            enc.endEncoding()
+        // F-85 prefill pack item 2 (H1 geometry). No atlas twin for YaRN
+        // this session (out of scope, see the mission report).
+        if prefillQkRopeH1Enabled {
+            let p = pso(
+                "laguna_prefill_full_qk_norm_yarn_direct_bf16_128_h1",
+                source: prefillFusedQKYarnSrcH1, device: device.mtlDevice)
+            if let enc = cmd.makeComputeCommandEncoder() {
+                enc.setComputePipelineState(p)
+                enc.setBuffer(rawQ.buffer, offset: rawQ.offset, index: 0)
+                enc.setBuffer(rawK.buffer, offset: rawK.offset, index: 1)
+                enc.setBuffer(qWeight.buffer, offset: qWeight.offset, index: 2)
+                enc.setBuffer(kWeight.buffer, offset: kWeight.offset, index: 3)
+                enc.setBuffer(qHTD.buffer, offset: qHTD.offset, index: 4)
+                enc.setBuffer(kOut.buffer, offset: kOut.offset, index: 5)
+                var nQU = UInt32(nHeads)
+                var nKvU = UInt32(nKVHeads)
+                var tPadU = UInt32(tPad)
+                var posU = UInt32(position)
+                var theta = thetaBase
+                var epsV = eps
+                var rotaryPairsU = UInt32(rotaryPairs)
+                var yarnFactor = yarn.factor
+                var yarnLow = yarn.low
+                var yarnHigh = yarn.high
+                var yarnAttnFactor = yarn.attnFactor
+                enc.setBytes(&nQU, length: 4, index: 6)
+                enc.setBytes(&nKvU, length: 4, index: 7)
+                enc.setBytes(&tPadU, length: 4, index: 8)
+                enc.setBytes(&posU, length: 4, index: 9)
+                enc.setBytes(&theta, length: 4, index: 10)
+                enc.setBytes(&epsV, length: 4, index: 11)
+                enc.setBytes(&rotaryPairsU, length: 4, index: 12)
+                enc.setBytes(&yarnFactor, length: 4, index: 13)
+                enc.setBytes(&yarnLow, length: 4, index: 14)
+                enc.setBytes(&yarnHigh, length: 4, index: 15)
+                enc.setBytes(&yarnAttnFactor, length: 4, index: 16)
+                enc.dispatchThreadgroups(
+                    MTLSize(width: nHeads + nKVHeads, height: nRows, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.endEncoding()
+            }
+        } else {
+            let p = pso(
+                "laguna_prefill_full_qk_norm_yarn_direct_bf16_128",
+                source: prefillFusedQKYarnSrc, device: device.mtlDevice)
+            if let enc = cmd.makeComputeCommandEncoder() {
+                enc.setComputePipelineState(p)
+                enc.setBuffer(rawQ.buffer, offset: rawQ.offset, index: 0)
+                enc.setBuffer(rawK.buffer, offset: rawK.offset, index: 1)
+                enc.setBuffer(qWeight.buffer, offset: qWeight.offset, index: 2)
+                enc.setBuffer(kWeight.buffer, offset: kWeight.offset, index: 3)
+                enc.setBuffer(qHTD.buffer, offset: qHTD.offset, index: 4)
+                enc.setBuffer(kOut.buffer, offset: kOut.offset, index: 5)
+                var nQU = UInt32(nHeads)
+                var nKvU = UInt32(nKVHeads)
+                var tPadU = UInt32(tPad)
+                var posU = UInt32(position)
+                var theta = thetaBase
+                var epsV = eps
+                var rotaryPairsU = UInt32(rotaryPairs)
+                var yarnFactor = yarn.factor
+                var yarnLow = yarn.low
+                var yarnHigh = yarn.high
+                var yarnAttnFactor = yarn.attnFactor
+                enc.setBytes(&nQU, length: 4, index: 6)
+                enc.setBytes(&nKvU, length: 4, index: 7)
+                enc.setBytes(&tPadU, length: 4, index: 8)
+                enc.setBytes(&posU, length: 4, index: 9)
+                enc.setBytes(&theta, length: 4, index: 10)
+                enc.setBytes(&epsV, length: 4, index: 11)
+                enc.setBytes(&rotaryPairsU, length: 4, index: 12)
+                enc.setBytes(&yarnFactor, length: 4, index: 13)
+                enc.setBytes(&yarnLow, length: 4, index: 14)
+                enc.setBytes(&yarnHigh, length: 4, index: 15)
+                enc.setBytes(&yarnAttnFactor, length: 4, index: 16)
+                let groups = (nHeads + nKVHeads) / 4
+                enc.dispatchThreadgroups(
+                    MTLSize(width: groups, height: nRows, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+                enc.endEncoding()
+            }
         }
 
         if tPad > nRows {

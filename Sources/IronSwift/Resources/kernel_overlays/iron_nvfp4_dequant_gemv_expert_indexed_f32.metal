@@ -4,35 +4,38 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// CARRY SIGN-FOLD E4M3 decode (unconditional, bit-exact for all 256 byte
+// values -- see Tests/ButterTests/Ops/Nvfp4FastDequantTests.swift and the
+// derivation in LagunaNvfp4Fuse.swift's `header`). Replaces a
+// mask/shift/select ~7-op sequence with 5 ops.
 static inline float iron_nvfp4_e4m3_scale(uchar bits) {
-    uint b = uint(bits);
-    uint exp = (b >> 3) & 15u;
-    float mant = float(b & 7u);
-    float mag;
-    if (exp == 0u) {
-        mag = mant * 0.001953125f;
-    } else {
-        mag = (1.0f + mant * 0.125f) * exp2(float(exp) - 7.0f);
-    }
-    return ((b >> 7) & 1u) != 0u ? -mag : mag;
+    ushort h = ushort((uint(bits) + (uint(bits) & 128u)) << 7);
+    return float(as_type<half>(h)) * 256.0f;
 }
 
+// NIBBLE-SPLIT word-parallel E2M1 decode (19 -> 13 int ops per pack; see
+// LagunaNvfp4Fuse.swift's `header` for the full derivation + equivalence
+// table, and Tests/ButterTests/Ops/Nvfp4FastDequantTests.swift for the
+// exhaustive per-nibble test). `scale` must already carry the *16384.0f
+// half-domain-restore fold -- folded once at this file's call site below
+// (task 3; no qdot_16 wrapper in this kernel family).
 static inline float iron_nvfp4_pack_dot_fast(
     uint packed, float scale, const thread float* input, uint p_off
 ) {
     float accum = 0.0f;
-    const uint p0 =
-        ((packed & 0x00070007u) << 9) | ((packed & 0x00080008u) << 12);
-    const uint p1 =
-        ((packed & 0x00700070u) << 5) | ((packed & 0x00800080u) << 8);
-    const uint p2 =
-        ((packed & 0x07000700u) << 1) | ((packed & 0x08000800u) << 4);
-    const uint p3 =
-        ((packed & 0x70007000u) >> 3) | (packed & 0x80008000u);
-    const float2 v04 = float2(as_type<half2>(p0)) * 16384.0f;
-    const float2 v15 = float2(as_type<half2>(p1)) * 16384.0f;
-    const float2 v26 = float2(as_type<half2>(p2)) * 16384.0f;
-    const float2 v37 = float2(as_type<half2>(p3)) * 16384.0f;
+    const uint xe = packed & 0x0F0F0F0Fu;
+    const uint ge = xe | (xe << 3);
+    const uint yo = packed & 0xF0F0F0F0u;
+    const uint go = yo | (yo >> 3);
+    const uint M = 0x8E008E00u;
+    const uint p0 = (ge << 9) & M;
+    const uint p1 = (go << 8) & M;
+    const uint p2 = (ge << 1) & M;
+    const uint p3 = go & M;
+    const float2 v04 = float2(as_type<half2>(p0));
+    const float2 v15 = float2(as_type<half2>(p1));
+    const float2 v26 = float2(as_type<half2>(p2));
+    const float2 v37 = float2(as_type<half2>(p3));
     accum += v04.x * scale * input[p_off + 0u];
     accum += v15.x * scale * input[p_off + 1u];
     accum += v26.x * scale * input[p_off + 2u];
@@ -81,8 +84,11 @@ kernel void iron_nvfp4_dequant_gemv_expert_indexed_f32(
         uint pack_idx = p_iter * lsize + tid;
         if (pack_idx < n_packs_per_row) {
             uint blk = pack_idx / packs_per_block;
+            // Task 3: *16384.0f folded here (once per pack) instead of
+            // 4x inside pack_dot_fast; exact power-of-2 multiply.
             float scale =
-                iron_nvfp4_e4m3_scale(scales_stacked[row_block_off + blk]) * global;
+                iron_nvfp4_e4m3_scale(scales_stacked[row_block_off + blk])
+                * global * 16384.0f;
             uint packed = weights_stacked[row_pack_off + pack_idx];
             uint p_off = pack_idx * 8u;
             thread float xv[8];
