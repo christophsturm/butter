@@ -24,7 +24,12 @@ import Testing
 
 @Suite("NVFP4 steel-structure gather GEMM kernel bench (T34)", .serialized)
 struct Nvfp4GatherSteelKernelBenchTests {
-    static let steelAvailable: Bool = MTLCreateSystemDefaultDevice() != nil
+    // Steel gather dispatches a coop-tensor `bgemm` PSO that a paravirt CI
+    // GPU (Family < 9) cannot live-compile - it fatal-errors PSOCache. Gate
+    // every cell on the same auto-capability check the production path uses
+    // (honors BUTTER_FORCE_NO_MPP), so incapable runners skip instead of
+    // crashing the whole test bundle.
+    static let steelAvailable: Bool = Ops.mppAutoCapable
 
     static func runAndWait(_ body: (MTLCommandBuffer) -> Void) {
         let cmd = Device.shared.makeCommandBuffer()

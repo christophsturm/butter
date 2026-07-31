@@ -5849,6 +5849,17 @@ public enum Ops {
     /// happen at the `MoELayer` call site, so it reuses this same cached
     /// check instead of re-deriving it.
     static let mppAutoCapable: Bool = {
+        // Diagnostic force-off: BUTTER_FORCE_NO_MPP=1 makes the auto-gate
+        // report incapable, so every coop-tensor path takes its non-MPP
+        // fallback and every MPP-guarded test skips. This lets the full suite
+        // be validated on real hardware exactly as it would run on a paravirt
+        // CI GPU (Family < 9) that cannot build cooperative-tensor PSOs.
+        // Default off; genuine hardware detection below is unchanged.
+        if let raw = ProcessInfo.processInfo.environment["BUTTER_FORCE_NO_MPP"],
+            raw == "1" || raw.lowercased() == "true"
+        {
+            return false
+        }
         guard
             ProcessInfo.processInfo.isOperatingSystemAtLeast(
                 OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0))

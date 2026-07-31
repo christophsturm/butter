@@ -16,8 +16,13 @@ import IronSwift
 
 @Suite("NVFP4 steel-structure dense gather GEMM (T33 stage 1)", .serialized)
 struct Nvfp4GatherSteelDenseTests {
+    // Dense steel gather dispatches a coop-tensor `bgemm` PSO that a paravirt
+    // CI GPU (Family < 9) cannot live-compile - it fatal-errors PSOCache and
+    // takes the whole test bundle down with SIGTRAP. Gate on the same
+    // auto-capability check the production path uses (honors
+    // BUTTER_FORCE_NO_MPP) so incapable runners skip cleanly.
     private var steelAvailable: Bool {
-        MTLCreateSystemDefaultDevice() != nil
+        Ops.mppAutoCapable
     }
 
     private func toF32(_ t: Tensor) -> [Float] {
@@ -83,7 +88,7 @@ struct Nvfp4GatherSteelDenseTests {
 
     @Test("dense steel synthetic uniform weight matches eidx", .enabled(if: true))
     func denseSyntheticMatchesEidx() throws {
-        try #require(steelAvailable)
+        guard steelAvailable else { return }  // MPP coop tensors unavailable (e.g. CI paravirt GPU): skip, not fail
         let device = Device.shared
         let mTotal = 64
         let nOut = 128
@@ -131,7 +136,7 @@ struct Nvfp4GatherSteelDenseTests {
 
     @Test("dense steel real Laguna gate proj slice", .enabled(if: true))
     func denseRealGateProj() throws {
-        try #require(steelAvailable)
+        guard steelAvailable else { return }  // MPP coop tensors unavailable (e.g. CI paravirt GPU): skip, not fail
         let modelDir = URL(fileURLWithPath: NSString(
             string: "~/models/laguna-xs-2.1-nvfp4").expandingTildeInPath)
         guard FileManager.default.fileExists(atPath: modelDir.path) else {
@@ -179,7 +184,7 @@ struct Nvfp4GatherSteelDenseTests {
 
     @Test("dense steel real Laguna down proj slice (kIn<nOut shape class)", .enabled(if: true))
     func denseRealDownProj() throws {
-        try #require(steelAvailable)
+        guard steelAvailable else { return }  // MPP coop tensors unavailable (e.g. CI paravirt GPU): skip, not fail
         let modelDir = URL(fileURLWithPath: NSString(
             string: "~/models/laguna-xs-2.1-nvfp4").expandingTildeInPath)
         guard FileManager.default.fileExists(atPath: modelDir.path) else { return }
@@ -226,7 +231,7 @@ struct Nvfp4GatherSteelDenseTests {
     /// diverges, that is a real finding to report, not to paper over.
     @Test("dense steel magnitude ramp to 800, real layer-38 expert-161 gate", .enabled(if: true))
     func denseMagnitudeRamp() throws {
-        try #require(steelAvailable)
+        guard steelAvailable else { return }  // MPP coop tensors unavailable (e.g. CI paravirt GPU): skip, not fail
         let modelDir = URL(fileURLWithPath: NSString(
             string: "~/models/laguna-xs-2.1-nvfp4").expandingTildeInPath)
         guard FileManager.default.fileExists(atPath: modelDir.path) else {

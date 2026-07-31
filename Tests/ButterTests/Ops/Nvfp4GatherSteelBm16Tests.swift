@@ -20,8 +20,13 @@ import IronSwift
 
 @Suite("NVFP4 steel-structure gather GEMM BM16 (T35)", .serialized)
 struct Nvfp4GatherSteelBm16Tests {
+    // Steel BM16 gather dispatches a coop-tensor `bgemm` PSO that a paravirt
+    // CI GPU (Family < 9) cannot live-compile - it fatal-errors PSOCache and
+    // takes the whole test bundle down with SIGTRAP. Gate on the same
+    // auto-capability check the production path uses (honors
+    // BUTTER_FORCE_NO_MPP) so incapable runners skip cleanly.
     private var steelAvailable: Bool {
-        MTLCreateSystemDefaultDevice() != nil
+        Ops.mppAutoCapable
     }
 
     private func toF32(_ t: Tensor) -> [Float] {
@@ -67,7 +72,7 @@ struct Nvfp4GatherSteelBm16Tests {
 
     @Test("steel BM16 gather same-expert synthetic matches eidx", .enabled(if: true))
     func gatherSyntheticSameExpertMatchesEidx() throws {
-        try #require(steelAvailable)
+        guard steelAvailable else { return }  // MPP coop tensors unavailable (e.g. CI paravirt GPU): skip, not fail
         let device = Device.shared
         let mTotal = 64
         let nOut = 128
@@ -129,7 +134,7 @@ struct Nvfp4GatherSteelBm16Tests {
     /// range), plus zero-count experts interleaved.
     @Test("steel BM16 gather real Laguna gate: boundary straddle + zero-count experts", .enabled(if: true))
     func gatherRealGateBoundaryStraddle() throws {
-        try #require(steelAvailable)
+        guard steelAvailable else { return }  // MPP coop tensors unavailable (e.g. CI paravirt GPU): skip, not fail
         let modelDir = URL(fileURLWithPath: NSString(
             string: "~/models/laguna-xs-2.1-nvfp4").expandingTildeInPath)
         guard FileManager.default.fileExists(atPath: modelDir.path) else {
@@ -216,7 +221,7 @@ struct Nvfp4GatherSteelBm16Tests {
     /// bounds checking path directly.
     @Test("steel BM16 gather real Laguna down proj, ragged mTotal", .enabled(if: true))
     func gatherRealDownProjRagged() throws {
-        try #require(steelAvailable)
+        guard steelAvailable else { return }  // MPP coop tensors unavailable (e.g. CI paravirt GPU): skip, not fail
         let modelDir = URL(fileURLWithPath: NSString(
             string: "~/models/laguna-xs-2.1-nvfp4").expandingTildeInPath)
         guard FileManager.default.fileExists(atPath: modelDir.path) else { return }
@@ -271,7 +276,7 @@ struct Nvfp4GatherSteelBm16Tests {
     /// zero-count experts among 256, since mTotal=80 << 256).
     @Test("steel BM16 gather after moeSortPlan+gather like MoELayer", .enabled(if: true))
     func gatherAfterSortPlanGather() throws {
-        try #require(steelAvailable)
+        guard steelAvailable else { return }  // MPP coop tensors unavailable (e.g. CI paravirt GPU): skip, not fail
         let modelDir = URL(fileURLWithPath: NSString(
             string: "~/models/laguna-xs-2.1-nvfp4").expandingTildeInPath)
         guard FileManager.default.fileExists(atPath: modelDir.path) else { return }
@@ -355,7 +360,7 @@ struct Nvfp4GatherSteelBm16Tests {
     /// expert-161 weights (the T22/T23 failing shape), multi-expert tile.
     @Test("steel BM16 gather magnitude ramp to 800, multi-expert tile", .enabled(if: true))
     func gatherMagnitudeRamp() throws {
-        try #require(steelAvailable)
+        guard steelAvailable else { return }  // MPP coop tensors unavailable (e.g. CI paravirt GPU): skip, not fail
         let modelDir = URL(fileURLWithPath: NSString(
             string: "~/models/laguna-xs-2.1-nvfp4").expandingTildeInPath)
         guard FileManager.default.fileExists(atPath: modelDir.path) else {
