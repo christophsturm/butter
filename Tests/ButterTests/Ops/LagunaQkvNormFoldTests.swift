@@ -37,7 +37,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("LagunaQkvNormFold")
+@Suite("LagunaQkvNormFold", .serialized)
 struct LagunaQkvNormFoldTests {
     private func randomBf16(_ shape: [Int], seed: inout UInt64, magnitude: Float = 1.0) -> Tensor {
         let n = shape.reduce(1, *)
