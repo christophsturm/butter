@@ -459,7 +459,10 @@ private func buildLagunaLayer(
             base: "\(p).mlp.up_proj", in: weights, quantization: quant)
         let down = try loadLinear(
             base: "\(p).mlp.down_proj", in: weights, quantization: quant)
-        ffn = .dense(LagunaDenseMLP(gate: gate, up: up, down: down, hidden: tc.hidden))
+        ffn = .dense(
+            LagunaDenseMLP(
+                gate: gate, up: up, down: down, hidden: tc.hidden,
+                dtype: dtype, device: device))
     }
 
     return LagunaLayer(
@@ -471,7 +474,7 @@ private func buildLagunaLayer(
         headDim: tc.headDim, rotaryDim: rotaryDim,
         ropeTheta: ropeTheta, isSliding: isSliding,
         isFullYarn: !isSliding,
-        dtype: dtype, device: device)
+        dtype: dtype, device: device, layerIndex: i)
 }
 
 private func buildLagunaMoE(
@@ -658,7 +661,8 @@ private func buildLagunaMoE(
         stackedInt4Experts: stackedInt4,
         stackedNvfp4Experts: stackedNvfp4,
         expertBiasGPU: pathBGPU,
-        layerIndex: layerIndex)
+        layerIndex: layerIndex,
+        dtype: actDtype, device: device)
 }
 
 private func lagunaLoadNvfp4Linear(
@@ -833,12 +837,35 @@ private func lagunaTryLoadStackedInt4(
 final class LagunaDenseMLP {
     let gate, up, down: AnyLinear
     let hidden: Int
+    /// T27 Stage 2: L00 is Laguna XS's one dense (non-MoE) FFN layer.
+    /// Its gate/up/down GEMMs are plain BF16 (`hidden=2048`,
+    /// `intermediate=8192`, both %64==0 for this board) and were still
+    /// riding the naive `Ops.gemm` path after T26 only wired the
+    /// attention Q/K/V/O projections. Pre-transposed once at load time,
+    /// same pattern as `LagunaLayer.qWeightT` etc. `nil` when the
+    /// corresponding proj isn't a plain bf16 Linear (falls back safely).
+    /// See benchmarks/laguna-xs/README.md T27.
+    let gateWeightT, upWeightT, downWeightT: Tensor?
+    private let intermediate: Int
 
-    init(gate: AnyLinear, up: AnyLinear, down: AnyLinear, hidden: Int) {
+    init(gate: AnyLinear, up: AnyLinear, down: AnyLinear, hidden: Int, dtype: DType = .bf16, device: Device = .shared) {
         self.gate = gate
         self.up = up
         self.down = down
         self.hidden = hidden
+        self.gateWeightT = LagunaSteelGemm.weightT(gate, dtype: dtype, device: device)
+        self.upWeightT = LagunaSteelGemm.weightT(up, dtype: dtype, device: device)
+        self.downWeightT = LagunaSteelGemm.weightT(down, dtype: dtype, device: device)
+        // intermediate = gate/up's outDim = down's inDim. Only needed for
+        // the eligibility check below; derive from whichever proj is a
+        // plain Linear (falls back to 0, ineligible, if none are).
+        if let l = gate.inner as? Linear {
+            self.intermediate = l.weight.shape[0]
+        } else if let l = down.inner as? Linear {
+            self.intermediate = l.weight.shape[1]
+        } else {
+            self.intermediate = 0
+        }
     }
 
     func parameters() -> [(String, Tensor)] {
@@ -860,10 +887,22 @@ final class LagunaDenseMLP {
         _ x: Tensor, t: Int,
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
-        let g = gate.callMany(x, t: t, on: cmd, device: device)
-        let u = up.callMany(x, t: t, on: cmd, device: device)
+        func projOrSteel(
+            _ linear: AnyLinear, weightT: Tensor?, xIn: Tensor, outDim: Int, inDim: Int
+        ) -> Tensor {
+            if let weightT,
+                LagunaSteelGemm.eligible(t: t, outDim: outDim, inDim: inDim, dtype: xIn.dtype)
+            {
+                return LagunaSteelGemm.callMany(
+                    input: xIn, weightT: weightT, t: t, outDim: outDim, inDim: inDim,
+                    on: cmd, device: device)
+            }
+            return linear.callMany(xIn, t: t, on: cmd, device: device)
+        }
+        let g = projOrSteel(gate, weightT: gateWeightT, xIn: x, outDim: intermediate, inDim: hidden)
+        let u = projOrSteel(up, weightT: upWeightT, xIn: x, outDim: intermediate, inDim: hidden)
         _ = Ops.swiglu(gate: g, up: u, on: cmd, into: u)
-        return down.callMany(u, t: t, on: cmd, device: device)
+        return projOrSteel(down, weightT: downWeightT, xIn: u, outDim: hidden, inDim: intermediate)
     }
 }
 
@@ -892,6 +931,15 @@ final class LagunaLayer {
     let isFullYarn: Bool
     let dtype: DType
     let scale: Float
+    /// Layer index for diagnostic logging only (T26 attn phase timing).
+    /// `-1` when not supplied by the caller (tests etc.); logging just
+    /// prints "L-1" in that case, no functional dependency on it.
+    let layerIndex: Int
+    /// T26 Stage 2: pre-transposed `[inDim,outDim]` bf16 weights for the
+    /// `iron_steel_gemm_64x64x16_2x2_bf16` MMA GEMM fast path (see
+    /// LagunaSteelGemm.swift). `nil` when the corresponding proj isn't a
+    /// plain bf16 Linear (e.g. quantized). Computed once at load time.
+    let qWeightT, kWeightT, vWeightT, oWeightT: Tensor?
     /// Gather indices for softplus head-gate expand: each head id repeated
     /// `headDim` times. Built once at first use (decode T=1).
     private var softplusExpandIds: Tensor?
@@ -909,6 +957,30 @@ final class LagunaLayer {
     private var qOutScratch: Tensor?
     private var kOutScratch: Tensor?
     private var vOutScratch: Tensor?
+    /// Attention-side group-32 affine INT8 requant (see
+    /// `LagunaAttnInt8.swift`). Built lazily on first decode
+    /// call, once, from the resident BF16 Q/K/V/gate/o_proj weights.
+    /// `nil` after a declined attempt (shape/dtype mismatch or
+    /// `BUTTER_LAGUNA_ATTN_INT8=0`); `attnInt8Attempted` distinguishes
+    /// "not tried yet" from "tried and declined" so we only pay the
+    /// one-time setup dispatch once either way.
+    private var attnInt8Attempted = false
+    private var attnInt8QKVBank: LagunaAttnInt8.Bank?
+    private var attnInt8GateRows = 0
+    private var attnInt8OProjBank: LagunaAttnInt8.Bank?
+    private var attnInt8Scratch: Tensor?
+    private var attnInt8QScratch: Tensor?
+    private var attnInt8KScratch: Tensor?
+    private var attnInt8VScratch: Tensor?
+    private var attnInt8GateScratch: Tensor?
+    private var attnInt8OProjScratch: Tensor?
+    /// T24 gated-o_proj fusion scratch (`LagunaGatedOProjFuse`). Kernel 1's
+    /// gated-row output (feeds the INT8 o_proj QMV bank when active).
+    private var fusedGatedScratch: Tensor?
+    /// Kernel 2's final `o_proj` output (plain BF16 `o_proj` path only).
+    private var fusedOProjScratch: Tensor?
+    /// Kernel 2's small `[nHeads]` post-softplus gate-values scratch.
+    private var fusedGateValuesScratch: Tensor?
     /// GPU path may still commit on CPU-router MoE fallback.
     var commitsCommandBuffer: Bool { true }
 
@@ -919,8 +991,9 @@ final class LagunaLayer {
         ffn: LagunaFFN,
         hidden: Int, nHeads: Int, nKVHeads: Int, headDim: Int, rotaryDim: Int,
         ropeTheta: Float, isSliding: Bool, isFullYarn: Bool, dtype: DType,
-        device: Device = .shared
+        device: Device = .shared, layerIndex: Int = -1
     ) {
+        self.layerIndex = layerIndex
         self.qProj = qProj
         self.kProj = kProj
         self.vProj = vProj
@@ -941,6 +1014,17 @@ final class LagunaLayer {
         self.isFullYarn = isFullYarn
         self.dtype = dtype
         self.scale = 1.0 / Float(Double(headDim).squareRoot())
+
+        // T26 Stage 2: pre-transpose plain-bf16 attention weights once at
+        // load time for the steel MMA GEMM fast path. Cheap (one-off,
+        // off the hot path) and independent of the qkvFusedWeight decode
+        // path below; this feeds LagunaLayer.forwardMulti's prefill GEMMs.
+        // T27: factored into `LagunaSteelGemm.weightT` so L00's dense FFN
+        // and the MoE router GEMM can reuse the same guard.
+        self.qWeightT = LagunaSteelGemm.weightT(qProj, dtype: dtype, device: device)
+        self.kWeightT = LagunaSteelGemm.weightT(kProj, dtype: dtype, device: device)
+        self.vWeightT = LagunaSteelGemm.weightT(vProj, dtype: dtype, device: device)
+        self.oWeightT = LagunaSteelGemm.weightT(oProj, dtype: dtype, device: device)
 
         // Build stacked dense QKV for single-GEMV decode when all three are
         // plain Linear (NVFP4 Laguna: BF16 attention).
@@ -971,6 +1055,11 @@ final class LagunaLayer {
                 vd * rowBytes)
             self.qkvFusedWeight = Tensor(
                 buffer: buf, offset: 0, shape: [total, hidden], dtype: dtype)
+            // Fused QKV weight replaces three separate BF16 Linears for
+            // single-GEMV decode; it's read on every decode token for
+            // the lifetime of the model, so pin it like any other
+            // resident weight (same rationale as KVCache.markWeightsResident).
+            device.markWeightsResident([buf])
         } else {
             self.qkvFusedWeight = nil
             // Best-effort dims for non-fused path (unused).
@@ -1005,6 +1094,86 @@ final class LagunaLayer {
         return out
     }
 
+    /// Lazy, once-only build of the group-32 affine INT8 attention side
+    /// layout (`LagunaAttnInt8`). Declines silently (leaves the banks
+    /// `nil`) unless every projection is a plain bias-free BF16
+    /// `Linear` with `hidden` a multiple of 32; the stock BF16 decode
+    /// path below is always the fallback. Runs on its own tiny setup
+    /// command buffer, synchronously, once per layer on the layer's
+    /// first decode call; the concatenation step is pure CPU memcpy so
+    /// it must happen only after that buffer's GPU work completes.
+    private func ensureAttnInt8(device: Device) {
+        guard !attnInt8Attempted else { return }
+        attnInt8Attempted = true
+        guard LagunaAttnInt8.enabled,
+            let lq = qProj.inner as? Linear, let lk = kProj.inner as? Linear,
+            let lv = vProj.inner as? Linear, let lo = oProj.inner as? Linear,
+            lq.weight.dtype == .bf16, lk.weight.dtype == .bf16,
+            lv.weight.dtype == .bf16, lo.weight.dtype == .bf16, lo.bias == nil,
+            lq.weight.shape == [nHeads * headDim, hidden],
+            lk.weight.shape == [nKVHeads * headDim, hidden],
+            lv.weight.shape == [nKVHeads * headDim, hidden],
+            lo.weight.shape == [hidden, nHeads * headDim],
+            hidden.isMultiple(of: LagunaAttnInt8.groupSize),
+            (nHeads * headDim).isMultiple(of: LagunaAttnInt8.groupSize)
+        else { return }
+
+        let setupCmd = device.makeCommandBuffer()
+        guard
+            let qBank = LagunaAttnInt8.quantizeG32(weight: lq.weight, device: device, cmd: setupCmd),
+            let kBank = LagunaAttnInt8.quantizeG32(weight: lk.weight, device: device, cmd: setupCmd),
+            let vBank = LagunaAttnInt8.quantizeG32(weight: lv.weight, device: device, cmd: setupCmd)
+        else { return }
+        var banks = [qBank, kBank, vBank]
+        var gateRows = 0
+        var gBank: LagunaAttnInt8.Bank?
+        if let gProj, let lg = gProj.inner as? Linear, lg.bias == nil,
+            lg.weight.dtype == .bf16, lg.weight.shape == [nHeads, hidden]
+        {
+            gBank = LagunaAttnInt8.quantizeG32(weight: lg.weight, device: device, cmd: setupCmd)
+        }
+        let oBank = LagunaAttnInt8.quantizeG32(weight: lo.weight, device: device, cmd: setupCmd)
+        setupCmd.commit()
+        setupCmd.waitUntilCompleted()
+
+        if let gBank {
+            banks.append(gBank)
+            gateRows = nHeads
+        }
+        guard let fusedQKV = LagunaAttnInt8.concat(banks, device: device), let oBank else { return }
+        attnInt8QKVBank = fusedQKV
+        attnInt8GateRows = gateRows
+        attnInt8OProjBank = oBank
+    }
+
+    /// Stock softplus per-head gate applied to already-computed raw logits
+    /// (either the INT8 QKV bank's tail rows, or a `gProj(xNorm)` call the
+    /// caller already made): softplus, GPU gather-expand [nHeads] ->
+    /// [nHeads·headDim], broadcast-multiply. Fallback path when the T24
+    /// `LagunaGatedOProjFuse` kernels are disabled or decline (shape/dtype
+    /// mismatch).
+    private func applySoftplusHeadGateFromLogits(
+        _ attnOut: Tensor, gateLogits: Tensor, cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let gSoft = Ops.softplus(gateLogits, on: cmd)
+        let table = gSoft.reshaped(to: [nHeads, 1])
+        if softplusExpandIds == nil
+            || softplusExpandIds!.elementCount != nHeads * headDim
+        {
+            var ids = [UInt32](repeating: 0, count: nHeads * headDim)
+            for h in 0 ..< nHeads {
+                let base = h * headDim
+                for d in 0 ..< headDim { ids[base + d] = UInt32(h) }
+            }
+            let t = Tensor.empty(shape: [nHeads * headDim], dtype: .u32, device: device)
+            t.copyIn(from: ids)
+            softplusExpandIds = t
+        }
+        let gExp2d = Ops.gather(table: table, tokenIds: softplusExpandIds!, on: cmd)
+        let gExp = gExp2d.reshaped(to: [nHeads * headDim])
+        return Ops.mul(attnOut, gExp, on: cmd)
+    }
+
     /// Single-token decode. MoE path and softplus gate may commit `cmd`;
     /// the caller must refresh after `commitsCommandBuffer` layers.
     func forward(
@@ -1015,13 +1184,51 @@ final class LagunaLayer {
         let work = cmd
         let residual = h
         let xNorm = inputNorm(h, on: work)
+        ensureAttnInt8(device: device)
 
-        // Fused int4 Q/K/V when all three are QuantizedLinear 4/gs64 and
-        // shapes pass the fast-path contract (hidden % 512 == 0, outs % 8).
+        // Native group-32 affine INT8 QKV(+gate) bank: one batched QMV
+        // dispatch replaces the BF16 fused-GEMV path below. Takes priority
+        // over both the int4 and dense BF16 fused-QKV branches when
+        // available.
+        var attnInt8Gate: Tensor?
         let q: Tensor
         let k: Tensor
         let v: Tensor
-        if let qq = qProj.inner as? QuantizedLinear, qq.bits == 4, qq.groupSize == 64,
+        if let bank = attnInt8QKVBank, xNorm.dtype == .bf16 {
+            let qDim = nHeads * headDim
+            let kDim = nKVHeads * headDim
+            let vDim = nKVHeads * headDim
+            let total = bank.outDim
+            if attnInt8Scratch == nil || attnInt8Scratch!.elementCount != total {
+                attnInt8Scratch = Tensor.empty(shape: [total], dtype: .bf16, device: device)
+                let bytes = attnInt8Scratch!.dtype.byteSize
+                attnInt8QScratch = Tensor(
+                    buffer: attnInt8Scratch!.buffer, offset: attnInt8Scratch!.offset,
+                    shape: [qDim], dtype: .bf16)
+                attnInt8KScratch = Tensor(
+                    buffer: attnInt8Scratch!.buffer,
+                    offset: attnInt8Scratch!.offset + qDim * bytes,
+                    shape: [kDim], dtype: .bf16)
+                attnInt8VScratch = Tensor(
+                    buffer: attnInt8Scratch!.buffer,
+                    offset: attnInt8Scratch!.offset + (qDim + kDim) * bytes,
+                    shape: [vDim], dtype: .bf16)
+                if attnInt8GateRows == nHeads {
+                    attnInt8GateScratch = Tensor(
+                        buffer: attnInt8Scratch!.buffer,
+                        offset: attnInt8Scratch!.offset + (qDim + kDim + vDim) * bytes,
+                        shape: [nHeads], dtype: .bf16)
+                }
+            }
+            LagunaAttnInt8.qmv(
+                input: xNorm, bank: bank, on: work, device: device, into: attnInt8Scratch!)
+            q = attnInt8QScratch!
+            k = attnInt8KScratch!
+            v = attnInt8VScratch!
+            if let gateScratch = attnInt8GateScratch {
+                attnInt8Gate = gateScratch
+            }
+        } else if let qq = qProj.inner as? QuantizedLinear, qq.bits == 4, qq.groupSize == 64,
             let qk = kProj.inner as? QuantizedLinear, qk.bits == 4, qk.groupSize == 64,
             let qv = vProj.inner as? QuantizedLinear, qv.bits == 4, qv.groupSize == 64,
             hidden % 512 == 0
@@ -1144,27 +1351,121 @@ final class LagunaLayer {
 
         let (cacheK, cacheV) = cache.prepareForAttention(on: work)
         let (sinkEnd, windowStart) = cache.sdpaSinkWindow(nKV: cache.length)
-        var attnOut = Ops.sdpaDecode(
-            q: q2d, k: cacheK, v: cacheV,
-            nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-            nKV: cache.length, kvStride: cache.maxSeq,
-            scale: scale, on: work,
-            sinkEnd: sinkEnd, windowStart: windowStart
-        ).reshaped(to: [nHeads * headDim])
+        // T24 kernel 3: GQA head-pairing + ALPHASKIP decode SDPA (opt-out
+        // BUTTER_LAGUNA_SDPA_GQA2=0). Declines outside its shape envelope
+        // (headDim==128, bf16, heads_per_group even) and falls back to the
+        // stock `Ops.sdpaDecode`.
+        var attnOut =
+            (LagunaSdpaDecodeGqa2.apply(
+                q: q2d, k: cacheK, v: cacheV,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                nKV: cache.length, kvStride: cache.maxSeq, scale: scale,
+                on: work, device: device,
+                sinkEnd: sinkEnd, windowStart: windowStart)
+                ?? Ops.sdpaDecode(
+                    q: q2d, k: cacheK, v: cacheV,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    nKV: cache.length, kvStride: cache.maxSeq,
+                    scale: scale, on: work,
+                    sinkEnd: sinkEnd, windowStart: windowStart)
+            ).reshaped(to: [nHeads * headDim])
 
         // Softplus per-head gate before o_proj (GPU expand — no host sync).
-        var workBuf = work
-        if let gProj {
-            attnOut = applySoftplusHeadGate(
-                attnOut, xNorm: xNorm, gProj: gProj,
-                cmd: &workBuf, device: device)
-        }
+        // The INT8 QKV bank's gate tail (raw logits) takes priority when
+        // present; otherwise fall back to the stock `gProj(xNorm)` call.
+        // Both sources land at the same [nHeads] raw-logit shape, which is
+        // what both T24 fused kernels below consume directly.
+        let workBuf = work
+        let gateLogitsRaw: Tensor? = attnInt8Gate ?? gProj?(xNorm, on: workBuf)
 
-        let oOut = oProj(attnOut, on: workBuf)
+        let oOut: Tensor
+        if let oBank = attnInt8OProjBank, attnOut.dtype == .bf16 {
+            // T24 kernel 1: gate-product-softplus fuse feeds the T20 INT8
+            // o_proj QMV bank unchanged: one dispatch replaces the stock
+            // softplus + gather-expand + mul chain.
+            if let gateLogits = gateLogitsRaw {
+                if fusedGatedScratch == nil
+                    || fusedGatedScratch!.elementCount != nHeads * headDim
+                {
+                    fusedGatedScratch = Tensor.empty(
+                        shape: [nHeads * headDim], dtype: .bf16, device: device)
+                }
+                let fused = LagunaGatedOProjFuse.applyGateProductSoftplus(
+                    attnOut: attnOut, gateLogits: gateLogits, heads: nHeads, headDim: headDim,
+                    on: workBuf, device: device, into: fusedGatedScratch!)
+                attnOut =
+                    fused
+                    ? fusedGatedScratch!
+                    : applySoftplusHeadGateFromLogits(
+                        attnOut, gateLogits: gateLogits, cmd: workBuf, device: device)
+            }
+            if attnInt8OProjScratch == nil {
+                attnInt8OProjScratch = Tensor.empty(shape: [hidden], dtype: .bf16, device: device)
+            }
+            LagunaAttnInt8.qmv(
+                input: attnOut, bank: oBank, on: workBuf, device: device,
+                into: attnInt8OProjScratch!)
+            oOut = attnInt8OProjScratch!
+        } else {
+            // T24 kernel 2: plain BF16 o_proj path, fold the gate multiply
+            // directly into the o_proj GEMV (unroll 2); the gated row never
+            // materializes. Needs a post-softplus (activated) [nHeads] gate,
+            // a cheap dispatch vs. the O(hidden)-wide gather+mul it replaces.
+            var fusedOut: Tensor?
+            if let gateLogits = gateLogitsRaw, let lo = oProj.inner as? Linear,
+                lo.bias == nil, lo.weight.dtype == .bf16, attnOut.dtype == .bf16
+            {
+                if fusedGateValuesScratch == nil {
+                    fusedGateValuesScratch = Tensor.empty(
+                        shape: [nHeads], dtype: .bf16, device: device)
+                }
+                _ = Ops.softplus(gateLogits, on: workBuf, into: fusedGateValuesScratch!)
+                if fusedOProjScratch == nil {
+                    fusedOProjScratch = Tensor.empty(shape: [hidden], dtype: .bf16, device: device)
+                }
+                let ok = LagunaGatedOProjFuse.applyGatedOutputProjection(
+                    attentionOutput: attnOut, gateValues: fusedGateValuesScratch!,
+                    weight: lo.weight, heads: nHeads, headDim: headDim, hidden: hidden,
+                    on: workBuf, device: device, into: fusedOProjScratch!)
+                if ok { fusedOut = fusedOProjScratch! }
+            }
+            if let fusedOut {
+                oOut = fusedOut
+            } else {
+                if let gateLogits = gateLogitsRaw {
+                    attnOut = applySoftplusHeadGateFromLogits(
+                        attnOut, gateLogits: gateLogits, cmd: workBuf, device: device)
+                }
+                oOut = oProj(attnOut, on: workBuf)
+            }
+        }
         // Fused residual + post-attn RMSNorm when hidden ≤ 4096 (Laguna = 2048).
+        // T28 lever 2: when the FFN is MoE with a plain-BF16-Linear router
+        // gate at Laguna XS's exact shape, fold the router GEMV into the
+        // SAME dispatch too (LagunaResidualRmsRouterFuse): the normed row
+        // is already resident in the fused kernel's threadgroup memory, so
+        // the router GEMV costs no extra launch. `moe.decode` then skips
+        // its own `gate(h, on: cmd)` via `precomputedLogits`.
         let h2: Tensor
         let ffnIn: Tensor
-        if OpsValidation.validateAddRmsNorm(n: hidden) == nil {
+        var precomputedRouterLogits: Tensor?
+        if case .moe(let moe) = ffn,
+            LagunaResidualRmsRouterFuse.enabled,
+            hidden == 2048, moe.router.nExperts == 256,
+            OpsValidation.validateAddRmsNorm(n: hidden) == nil,
+            let gateLinear = moe.gate.inner as? Linear,
+            gateLinear.bias == nil, gateLinear.weight.dtype == .bf16
+        {
+            let fused = LagunaResidualRmsRouterFuse.apply(
+                residual: residual, attnOut: oOut,
+                normWeight: postAttnNorm.weight, eps: postAttnNorm.eps,
+                routerWeight: gateLinear.weight,
+                hidden: hidden, nExperts: moe.router.nExperts,
+                on: workBuf, device: device)
+            h2 = fused.residual
+            ffnIn = fused.normed
+            precomputedRouterLogits = fused.logits
+        } else if OpsValidation.validateAddRmsNorm(n: hidden) == nil {
             let fused = Ops.addAndRmsNorm(
                 residual, oOut, weight: postAttnNorm.weight, eps: postAttnNorm.eps,
                 nRows: 1, rowSize: hidden, on: workBuf)
@@ -1182,10 +1483,19 @@ final class LagunaLayer {
         case .moe(let moe):
             // Full Path B: residual on same CB, one commit+wait at layer end.
             // Host/hybrid commits mid-decode — residual on fresh CB + wait.
-            let ffnOut = moe.decode(
-                ffnIn, position: position,
-                cache: StatelessLayerCache(),
-                cmd: workBuf, device: device)
+            let ffnOut: Tensor
+            if let logits = precomputedRouterLogits {
+                ffnOut = moe.decodeWithPrecomputedLogits(
+                    ffnIn, position: position,
+                    cache: StatelessLayerCache(),
+                    cmd: workBuf, device: device,
+                    precomputedLogits: logits)
+            } else {
+                ffnOut = moe.decode(
+                    ffnIn, position: position,
+                    cache: StatelessLayerCache(),
+                    cmd: workBuf, device: device)
+            }
             if workBuf.status == .committed || workBuf.status == .completed
                 || workBuf.status == .error
             {
@@ -1226,19 +1536,181 @@ final class LagunaLayer {
         precondition(h.shape == [nRows, hidden], "LagunaLayer.forwardMulti: shape \(h.shape)")
         precondition(nRows > 0)
 
-        let work = cmd
+        // T26: break the `pre` (attention) phase T25 found dominant
+        // (74.9% of MoE-layer prefill wall-clock) into QKV-proj /
+        // qk-norm / rope+kv / sdpa / gate / o_proj / add+postAttnNorm
+        // via forced commit+wait checkpoints, same technique as T25's
+        // BUTTER_LAGUNA_MOE_PHASE_TIMING. Diagnostic only: `work` only
+        // gets reassigned inside `attnPhaseCheckpoint`, whose body is a
+        // no-op (`guard attnPhaseTiming else { return }`) when the env
+        // var is unset, so this is zero behavior change by default.
+        // See benchmarks/laguna-xs/README.md T26.
+        let attnPhaseTiming =
+            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_ATTN_PHASE_TIMING"] == "1"
+        var attnPhaseTimes: [(String, Double)] = []
+        var attnPhaseT0 = CFAbsoluteTimeGetCurrent()
+        var work = cmd
+        // Buffer-passing variant so callees that own their own local `cmd`
+        // (e.g. LagunaSdpa.prefillMmaBf16's internal pad/cast/transpose/
+        // compact/mma/transpose-back stages) can checkpoint sub-phases and
+        // get back the fresh buffer to keep encoding onto, without a
+        // dangling reference to an already-committed one.
+        func attnPhaseCheckpointBuf(_ label: String, _ buf: MTLCommandBuffer) -> MTLCommandBuffer {
+            guard attnPhaseTiming else { return buf }
+            let b = buf
+            if b.status != .committed && b.status != .completed && b.status != .error {
+                b.commit()
+            }
+            b.waitUntilCompleted()
+            let ms = (CFAbsoluteTimeGetCurrent() - attnPhaseT0) * 1000
+            attnPhaseTimes.append((label, ms))
+            attnPhaseT0 = CFAbsoluteTimeGetCurrent()
+            return device.makeCommandBuffer()
+        }
+        func attnPhaseCheckpoint(_ label: String) {
+            guard attnPhaseTiming else { return }
+            work = attnPhaseCheckpointBuf(label, work)
+        }
+        func attnPhaseFlush() {
+            guard attnPhaseTiming, !attnPhaseTimes.isEmpty else { return }
+            let total = attnPhaseTimes.reduce(0.0) { $0 + $1.1 }
+            let parts = attnPhaseTimes.map {
+                "\($0.0)=\(String(format: "%.2f", $0.1))ms"
+            }.joined(separator: " ")
+            fputs(
+                "[laguna-attn-phase] L\(String(format: "%02d", layerIndex)) "
+                    + "total=\(String(format: "%.2f", total))ms \(parts)\n",
+                stderr)
+        }
+
         let residual = h
         let xNormFlat = Ops.rmsNormRows(
             h.reshaped(to: [nRows * hidden]),
             weight: inputNorm.weight, eps: inputNorm.eps,
             nRows: nRows, rowSize: hidden, on: work)
         let xNorm = xNormFlat.reshaped(to: [nRows, hidden])
+        attnPhaseCheckpoint("norm")
 
-        // QKV projections (batched affine/dequant GEMM).
-        var q = qProj.callMany(xNorm, t: nRows, on: work, device: device)
-        var k = kProj.callMany(xNorm, t: nRows, on: work, device: device)
-        let v = vProj.callMany(xNorm, t: nRows, on: work, device: device)
+        // QKV projections (batched affine/dequant GEMM). T26 Stage 2: steel
+        // MMA GEMM fast path when shapes are 64-aligned bf16 (prefill;
+        // decode T=1 always falls back). Escape: BUTTER_LAGUNA_ATTN_STEEL_GEMM=0.
+        func projOrSteel(
+            _ linear: AnyLinear, weightT: Tensor?, x: Tensor, outDim: Int, inDim: Int
+        ) -> Tensor {
+            if let weightT,
+                LagunaSteelGemm.eligible(t: nRows, outDim: outDim, inDim: inDim, dtype: x.dtype)
+            {
+                return LagunaSteelGemm.callMany(
+                    input: x, weightT: weightT, t: nRows, outDim: outDim, inDim: inDim,
+                    on: work, device: device)
+            }
+            return linear.callMany(x, t: nRows, on: work, device: device)
+        }
+        var q = projOrSteel(qProj, weightT: qWeightT, x: xNorm, outDim: qOutDim, inDim: hidden)
+        var k = projOrSteel(kProj, weightT: kWeightT, x: xNorm, outDim: kOutDim, inDim: hidden)
+        let v = projOrSteel(vProj, weightT: vWeightT, x: xNorm, outDim: vOutDim, inDim: hidden)
+        attnPhaseCheckpoint("qkv_proj")
 
+        // T30: prefill sliding-layer fused QK-norm+RoPE. One dispatch
+        // replaces `qknorm` + Q's share of `rope_kv` AND writes Q
+        // directly into the padded `[nHeads,tPad,headDim]` f16 layout
+        // `prefillMmaBf16` otherwise builds via its own pad/cast/transpose
+        // dispatches (`sdpa_qpad` + `sdpa_qcast_transpose`), killing those
+        // too, see benchmarks/laguna-xs/README.md T30. Sliding layers
+        // only; full-attention (YaRN) layers keep the stock chain below.
+        // Escape: BUTTER_LAGUNA_PREFILL_QK_ROPE_FUSE=0.
+        let prefillFuseTPad = ((nRows + 31) / 32) * 32
+        // Matches the old call site's `cache.length` value exactly: that
+        // call ran AFTER this chunk's own K/V append (`cache.length` there
+        // == `position + nRows`), so evaluating it here, before any
+        // append, with the post-append length explicitly keeps the same
+        // semantics if `sdpaSinkWindow` ever stops ignoring `nKV` (today
+        // it unconditionally returns `(0, 0)`, per T26).
+        let (sinkEnd, windowStart) = cache.sdpaSinkWindow(nKV: position + nRows)
+        let prefillFuseEligible =
+            LagunaSdpa.prefillQkRopeFuseEligible(
+                isSliding: isSliding, rotaryDim: rotaryDim, headDim: headDim,
+                dtype: q.dtype, nHeads: nHeads, nKVHeads: nKVHeads, nRows: nRows)
+            && position + prefillFuseTPad <= cache.maxSeq
+            && !(windowStart > 0 || sinkEnd > 0)
+        // T30 stretch: YaRN full-attention twin (partial rotary), same
+        // fuse flag, same eligibility shape modulo isSliding/rotaryDim.
+        let prefillYarnFuseEligible =
+            LagunaSdpa.prefillQkYarnFuseEligible(
+                isSliding: isSliding, rotaryDim: rotaryDim, headDim: headDim,
+                dtype: q.dtype, nHeads: nHeads, nKVHeads: nKVHeads, nRows: nRows)
+            && position + prefillFuseTPad <= cache.maxSeq
+            && !(windowStart > 0 || sinkEnd > 0)
+
+        let attnOut: Tensor
+        // T26 diagnosis: which branch this layer actually takes. Logged
+        // alongside the phase breakdown so "sliding path dominates" can
+        // be confirmed/refuted with real per-layer evidence instead of
+        // assumed from `isSliding` alone (KVCacheProtocol's default
+        // `sdpaSinkWindow` is `(0, 0)` (unoverridden today), so the
+        // windowed branch below may never actually fire even on SWA
+        // layers at T <= slidingWindow; see T26 README section).
+        var attnPathLabel = "?"
+
+        if prefillFuseEligible, let kv = cache as? KVCache {
+            let (qHTD, kFused, slot) = LagunaSdpa.fusedQKNormRopeForPrefill(
+                rawQ: q, rawK: k, qWeight: qNorm.weight, kWeight: kNorm.weight,
+                nRows: nRows, tPad: prefillFuseTPad, position: position,
+                nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                thetaBase: ropeTheta, eps: qNorm.eps,
+                on: work, device: device)
+            attnPhaseCheckpoint("qknorm_rope_fused")
+
+            let appendPositions = Tensor.empty(shape: [nRows], dtype: .u32, device: device)
+            kv.reserveSlotsManyOnHost(t: nRows, into: appendPositions)
+            kv.appendRangeOnGPUMany(
+                kFlat: kFused, vFlat: v, t: nRows,
+                positions: appendPositions, on: work)
+            attnPhaseCheckpoint("rope_kv")
+
+            let (cacheK, cacheV) = cache.prepareForAttention(on: work)
+            attnPhaseCheckpoint("kv_prep")
+
+            attnOut = LagunaSdpa.prefillMmaTailFromHTD(
+                qHTD: qHTD, tPad: prefillFuseTPad, slot: slot,
+                cacheK: cacheK, cacheV: cacheV,
+                nRows: nRows, position: position,
+                nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                maxSeq: cache.maxSeq, scale: scale,
+                on: &work, device: device,
+                phaseCheckpoint: attnPhaseTiming ? attnPhaseCheckpointBuf : nil)
+            attnPathLabel = "prefillMma+qkRopeFused"
+            attnPhaseCheckpoint("sdpa[\(attnPathLabel)]")
+        } else if prefillYarnFuseEligible, let kv = cache as? KVCache {
+            let (qHTD, kFused, slot) = LagunaSdpa.fusedQKNormYarnForPrefill(
+                rawQ: q, rawK: k, qWeight: qNorm.weight, kWeight: kNorm.weight,
+                nRows: nRows, tPad: prefillFuseTPad, position: position,
+                nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim, rotaryDim: rotaryDim,
+                thetaBase: ropeTheta, eps: qNorm.eps, yarn: yarn,
+                on: work, device: device)
+            attnPhaseCheckpoint("qknorm_rope_fused")
+
+            let appendPositions = Tensor.empty(shape: [nRows], dtype: .u32, device: device)
+            kv.reserveSlotsManyOnHost(t: nRows, into: appendPositions)
+            kv.appendRangeOnGPUMany(
+                kFlat: kFused, vFlat: v, t: nRows,
+                positions: appendPositions, on: work)
+            attnPhaseCheckpoint("rope_kv")
+
+            let (cacheK, cacheV) = cache.prepareForAttention(on: work)
+            attnPhaseCheckpoint("kv_prep")
+
+            attnOut = LagunaSdpa.prefillMmaTailFromHTD(
+                qHTD: qHTD, tPad: prefillFuseTPad, slot: slot,
+                cacheK: cacheK, cacheV: cacheV,
+                nRows: nRows, position: position,
+                nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                maxSeq: cache.maxSeq, scale: scale,
+                on: &work, device: device,
+                phaseCheckpoint: attnPhaseTiming ? attnPhaseCheckpointBuf : nil)
+            attnPathLabel = "prefillMma+qkYarnFused"
+            attnPhaseCheckpoint("sdpa[\(attnPathLabel)]")
+        } else {
         // QK-norm over T·heads rows.
         q = Ops.rmsNormRows(
             q.reshaped(to: [nRows * nHeads * headDim]),
@@ -1250,6 +1722,7 @@ final class LagunaLayer {
             weight: kNorm.weight, eps: kNorm.eps,
             nRows: nRows * nKVHeads, rowSize: headDim, on: work
         ).reshaped(to: [nRows, nKVHeads * headDim])
+        attnPhaseCheckpoint("qknorm")
 
         // RoPE + KV append for the whole chunk.
         lagunaBatchedRopeAndKV(
@@ -1259,15 +1732,15 @@ final class LagunaLayer {
             rotaryDim: rotaryDim, ropeTheta: ropeTheta,
             isFullYarn: isFullYarn, yarn: yarn,
             cache: cache, cmd: work, device: device)
+        attnPhaseCheckpoint("rope_kv")
 
         // Causal multi-query SDPA over the growing cache.
         let qForSdpa = q.reshaped(to: [nRows, nHeads, headDim])
         let (cacheK, cacheV) = cache.prepareForAttention(on: work)
-        let (sinkEnd, windowStart) = cache.sdpaSinkWindow(nKV: cache.length)
+        attnPhaseCheckpoint("kv_prep")
         // Sliding-window layers: sdpaMulti is causal-only; when window
         // applies, fall back to per-row decode SDPA (still better than a
         // full per-token layer graph for the FFN). Full layers use sdpaMulti.
-        let attnOut: Tensor
         if isSliding, windowStart > 0 || sinkEnd > 0 {
             // Concurrent per-query windowed SDPA (one encoder, all rows).
             // Sequential sdpaDecode was 30 SWA layers × T serial kernels.
@@ -1343,16 +1816,19 @@ final class LagunaLayer {
                 }
             }
             attnOut = flat
+            attnPathLabel = "windowed-decode-loop"
         } else if let mmaOut = LagunaSdpa.prefillMmaBf16(
             qTHD: qForSdpa, cacheK: cacheK, cacheV: cacheV,
             nRows: nRows, position: position,
             nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
             maxSeq: cache.maxSeq, scale: scale,
-            on: work, device: device)
+            on: &work, device: device,
+            phaseCheckpoint: attnPhaseTiming ? attnPhaseCheckpointBuf : nil)
         {
             // sdpaPrefillMma (f16 MMA via bf16 cast) — big prefill lever
             // when T%32==0. Escape: BUTTER_LAGUNA_SDPA_PREFILL_MMA=0.
             attnOut = mmaOut
+            attnPathLabel = "prefillMma"
         } else {
             attnOut = Ops.sdpaMulti(
                 q: qForSdpa, k: cacheK, v: cacheV,
@@ -1360,19 +1836,23 @@ final class LagunaLayer {
                 baseKV: position, nQuery: nRows, kvStride: cache.maxSeq,
                 causal: true, scale: scale, on: work
             ).reshaped(to: [nRows, nHeads * headDim])
+            attnPathLabel = "sdpaMulti-fallback"
+        }
+        attnPhaseCheckpoint("sdpa[\(attnPathLabel)]")
         }
 
         // Softplus head gate for the chunk — host expand (same math as decode).
         var gated = attnOut
-        var workBuf = work
         if let gProj {
             gated = applySoftplusHeadGateManyHost(
                 attnOut, xNorm: xNorm, gProj: gProj, t: nRows,
-                cmd: &workBuf, device: device)
+                cmd: &work, device: device)
         }
-        let work2 = workBuf
+        attnPhaseCheckpoint("gate")
 
-        let oOut = oProj.callMany(gated, t: nRows, on: work2, device: device)
+        let oOut = projOrSteel(
+            oProj, weightT: oWeightT, x: gated, outDim: hidden, inDim: qOutDim)
+        attnPhaseCheckpoint("oproj")
         let residualFlat = residual.reshaped(to: [nRows * hidden])
         let oFlat = oOut.reshaped(to: [nRows * hidden])
         let h2: Tensor
@@ -1380,32 +1860,34 @@ final class LagunaLayer {
         if OpsValidation.validateAddRmsNorm(n: hidden) == nil {
             let fused = Ops.addAndRmsNorm(
                 residualFlat, oFlat, weight: postAttnNorm.weight, eps: postAttnNorm.eps,
-                nRows: nRows, rowSize: hidden, on: work2)
+                nRows: nRows, rowSize: hidden, on: work)
             h2 = fused.residual.reshaped(to: [nRows, hidden])
             ffnIn = fused.normed.reshaped(to: [nRows, hidden])
         } else {
-            h2 = Ops.add(residualFlat, oFlat, on: work2).reshaped(to: [nRows, hidden])
+            h2 = Ops.add(residualFlat, oFlat, on: work).reshaped(to: [nRows, hidden])
             ffnIn = Ops.rmsNormRows(
                 h2.reshaped(to: [nRows * hidden]),
                 weight: postAttnNorm.weight, eps: postAttnNorm.eps,
-                nRows: nRows, rowSize: hidden, on: work2
+                nRows: nRows, rowSize: hidden, on: work
             ).reshaped(to: [nRows, hidden])
         }
+        attnPhaseCheckpoint("addnorm")
+        attnPhaseFlush()
 
         switch ffn {
         case .dense(let mlp):
-            let ffnOut = mlp.forwardMany(ffnIn, t: nRows, on: work2, device: device)
+            let ffnOut = mlp.forwardMany(ffnIn, t: nRows, on: work, device: device)
             let out = Ops.add(
                 h2.reshaped(to: [nRows * hidden]),
                 ffnOut.reshaped(to: [nRows * hidden]),
-                on: work2
+                on: work
             ).reshaped(to: [nRows, hidden])
-            if work2.status != .committed && work2.status != .completed
-                && work2.status != .error
+            if work.status != .committed && work.status != .completed
+                && work.status != .error
             {
-                work2.commit()
+                work.commit()
             }
-            work2.waitUntilCompleted()
+            work.waitUntilCompleted()
             return out
         case .moe(let moe):
             // Batched gather MoE (decodeMany). Default ON — big prefill win.
@@ -1421,7 +1903,7 @@ final class LagunaLayer {
                 let dtBytes = ffnIn.dtype.byteSize
                 let outFlat = Tensor.empty(
                     shape: [nRows * hidden], dtype: ffnIn.dtype, device: device)
-                var moeCmd = work2
+                var moeCmd = work
                 for r in 0 ..< nRows {
                     let hRow = Tensor(
                         buffer: ffnIn.buffer,
@@ -1456,14 +1938,14 @@ final class LagunaLayer {
                 addCmd.waitUntilCompleted()
                 return out
             }
-            // Stay on work2 when device plan keeps cmd open; residual on
+            // Stay on work when device plan keeps cmd open; residual on
             // same CB then commit without wait (model prefill pipe fences).
             let ffnOutFlat = moe.decodeMany(
                 ffnIn.reshaped(to: [nRows * hidden]),
-                t: nRows, cmd: work2, device: device, commitAtEnd: false)
+                t: nRows, cmd: work, device: device, commitAtEnd: false)
             let out: Tensor
-            if work2.status == .committed || work2.status == .completed
-                || work2.status == .error
+            if work.status == .committed || work.status == .completed
+                || work.status == .error
             {
                 // MoE committed the layer CB (e.g. isolated MPP path). Residual
                 // must land on a fresh CB and be waited (or at least committed
@@ -1475,19 +1957,19 @@ final class LagunaLayer {
                     on: addCmd
                 ).reshaped(to: [nRows, hidden])
                 addCmd.commit()
-                // Wait here: prefill pipe only tracks work2, not this addCmd.
+                // Wait here: prefill pipe only tracks work, not this addCmd.
                 addCmd.waitUntilCompleted()
                 return out
             }
             out = Ops.add(
                 h2.reshaped(to: [nRows * hidden]),
                 ffnOutFlat,
-                on: work2
+                on: work
             ).reshaped(to: [nRows, hidden])
-            if work2.status != .committed && work2.status != .completed
-                && work2.status != .error
+            if work.status != .committed && work.status != .completed
+                && work.status != .error
             {
-                work2.commit()
+                work.commit()
             }
             return out
         }
@@ -1567,33 +2049,6 @@ final class LagunaLayer {
         }
     }
 
-    /// Softplus headwise gate: expand [nHeads] → [nHeads·headDim] via GPU
-    /// gather (table = softplus gates as `[nHeads, 1]`, ids = head id
-    /// repeated `headDim` times). No host sync — stays on `cmd`.
-    private func applySoftplusHeadGate(
-        _ attnOut: Tensor, xNorm: Tensor, gProj: AnyLinear,
-        cmd: inout MTLCommandBuffer, device: Device
-    ) -> Tensor {
-        let gRaw = gProj(xNorm, on: cmd)
-        let gSoft = Ops.softplus(gRaw, on: cmd)
-        // Table [nHeads, 1] for gather expand.
-        let table = gSoft.reshaped(to: [nHeads, 1])
-        if softplusExpandIds == nil
-            || softplusExpandIds!.elementCount != nHeads * headDim
-        {
-            var ids = [UInt32](repeating: 0, count: nHeads * headDim)
-            for h in 0 ..< nHeads {
-                let base = h * headDim
-                for d in 0 ..< headDim { ids[base + d] = UInt32(h) }
-            }
-            let t = Tensor.empty(shape: [nHeads * headDim], dtype: .u32, device: device)
-            t.copyIn(from: ids)
-            softplusExpandIds = t
-        }
-        let gExp2d = Ops.gather(table: table, tokenIds: softplusExpandIds!, on: cmd)
-        let gExp = gExp2d.reshaped(to: [nHeads * headDim])
-        return Ops.mul(attnOut, gExp, on: cmd)
-    }
 }
 
 /// Batched RoPE + KV append for a prefill chunk.
@@ -1817,15 +2272,27 @@ public final class LagunaModel: LanguageModel {
         var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
 
         if pipe {
-            // Depth: how many CBs in flight (default 4).
+            // Depth: how many CBs in flight (default 4). T28 lever 4 swept
+            // 1..8 (fib prompt, --stats, 5s cooldowns): flat ~100.1-100.5
+            // tok/s across the whole range: depth is already past its
+            // saturation point at every value tested here, so the default
+            // (4) is kept as-is.
             let depth = max(
                 1, Int(ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PIPE_DEPTH"] ?? "") ?? 4)
-            // Layers packed into one CB before commit (default 2 → ~half
-            // the main-queue commits vs 1-layer/CB). Escape 1 for triage.
+            // Layers packed into one CB before commit. T28 lever 4 swept
+            // 1..20 (fib prompt, --stats, 3 runs/side, 5s cooldowns) and
+            // found the old default (2) was already past its own sweet
+            // spot: 1 measured +1.9% over 2 (102.1 vs 100.1 tok/s avg) and
+            // every larger value regressed monotonically (3→98.3, 4→96.5,
+            // ... 20→75.3 tok/s): packing MORE layers per CB trades away
+            // overlap for bigger, less-parallel command buffers on this
+            // per-layer-CB architecture. Flipped default to 1 (finest
+            // granularity = fastest here); escape via the env var if a
+            // future change shifts this balance again.
             let layersPerCB = max(
                 1,
                 Int(ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LAYERS_PER_CB"] ?? "")
-                    ?? 2)
+                    ?? 1)
             var inflight: [MTLCommandBuffer] = []
             if workCmd.status != .committed && workCmd.status != .completed
                 && workCmd.status != .error
@@ -2114,5 +2581,10 @@ private func lagunaLoadMxfp8LmHead(
         buffer: codesBuf, offset: 0, shape: [vocab, hidden], dtype: .u8)
     let scales = Tensor(
         buffer: scalesBuf, offset: 0, shape: [vocab, hidden / 32], dtype: .u8)
+    // Sidecar lm_head bytes are loaded straight from disk (not through
+    // the GGUF mmap-view path), so they never hit the residency set
+    // that path wires automatically. It's read every decode-prune pass
+    // (or every forward, in full-replace mode), so pin it explicitly.
+    device.markWeightsResident([codesBuf, scalesBuf])
     return Mxfp8Linear(weight: codes, scales: scales, blockSize: 32)
 }

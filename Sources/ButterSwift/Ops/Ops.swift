@@ -8972,6 +8972,19 @@ public enum Ops {
         enc.setComputePipelineState(pso)
         enc.setBuffer(input.buffer, offset: input.offset, index: 0)
         enc.setBuffer(out.buffer, offset: out.offset, index: 1)
+        // T30 fix: `iron_cast_bf16_to_f16_f32` reads a bounds check
+        // `constant uint &n [[buffer(2)]]` that this call site never
+        // bound; the kernel's `n > tid` guard was reading whatever
+        // was left in that slot by an unrelated prior encoder (Metal
+        // does not zero-initialize unbound buffer slots). Usually
+        // "safe" in practice because the dispatches that typically
+        // precede this call in this codebase bind a large `n`
+        // elsewhere first, but not guaranteed: found via
+        // LagunaPrefillFusedQKRopeProbeTests where a small preceding
+        // dispatch left a residual `n` smaller than this call's actual
+        // element count, silently truncating the cast.
+        var nU = UInt32(n)
+        enc.setBytes(&nU, length: 4, index: 2)
         enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
         enc.endEncoding()
         return Tensor(

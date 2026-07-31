@@ -14,7 +14,15 @@ Sources/IronSwift/Resources/kernels.metallib
 # scripts/link-extra-metals.sh after iron emit; sources in kernel_overlays/.
 Sources/IronSwift/Resources/kernels_extra.metallib
 Sources/IronSwift/Resources/manifest.json
-Sources/IronSwift/Resources/kernels/
+# `iron build --emit all` regenerates iron_*.metal here; those stay ignored.
+# Hand-written `butter_*.metal` MPP live-compile sources (PSOCache
+# `liveCompileMppFunction` reads Resources/kernels/<name>.metal at runtime;
+# see Sources/IronSwift/PSOCache.swift) are NOT emitted by iron and must be
+# tracked, or a fresh clone silently loses working kernels (e.g. T13/T22 NAX
+# gather QMM spikes were previously invisible to git under the blanket
+# ignore below).
+Sources/IronSwift/Resources/kernels/*
+!Sources/IronSwift/Resources/kernels/butter_*.metal
 Sources/IronSwift/Generated/*
 !Sources/IronSwift/Generated/.gitkeep
 

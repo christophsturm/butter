@@ -148,6 +148,12 @@ extension Ops {
         {
             return true
         }
+        // NAX64 (T22 true-BK64 stage) also needs the 64-tile materialise path.
+        if env["BUTTER_NVFP4_GATHER_NAX64"] == "1"
+            || env["BUTTER_NVFP4_GATHER_NAX64"]?.lowercased() == "true"
+        {
+            return kIn % 64 == 0
+        }
         // Board-class BK=64 stage (BM=BN=64) — opt-in, needs k_in % 64.
         if env["BUTTER_NVFP4_GATHER_BK64"] == "1"
             || env["BUTTER_NVFP4_GATHER_BK64"]?.lowercased() == "true"
@@ -199,6 +205,15 @@ extension Ops {
         //   BM64: grid [nOut/64, ceil(mTotal/64), 1], TPG=128 (4 SGs 2×2)
         //   NAX:  same 64-tile grid via live butter_nvfp4_gather_qmm_rhs_nax_mpp_*
         //         when BUTTER_NVFP4_GATHER_NAX=1 (default OFF).
+        if nvfp4MoeGatherPrefersNax64(mTotal: mTotal, nOut: nOut, kIn: kIn) {
+            nvfp4MoeGatherNax64(
+                input: input, weight: weight, scales: scales, indices: indices,
+                mTotal: mTotal, nOut: nOut, kIn: kIn,
+                blockSize: blockSize, global: global,
+                preferNativeBf16: preferNativeBf16,
+                on: cmd, into: out)
+            return
+        }
         if nvfp4MoeGatherPrefersNax(mTotal: mTotal, nOut: nOut, kIn: kIn) {
             nvfp4MoeGatherNax(
                 input: input, weight: weight, scales: scales, indices: indices,
@@ -648,6 +663,16 @@ extension Ops {
     ) {
         precondition(input.dtype == out0.dtype && input.dtype == out1.dtype)
         precondition(nOut % 32 == 0)
+        if nvfp4MoeGatherPrefersNax64(mTotal: mTotal, nOut: nOut, kIn: kIn) {
+            nvfp4MoeGatherNax64Pair(
+                input: input,
+                weight0: weight0, scales0: scales0, out0: out0,
+                weight1: weight1, scales1: scales1, out1: out1,
+                indices: indices,
+                mTotal: mTotal, nOut: nOut, kIn: kIn,
+                blockSize: blockSize, global: global, on: cmd)
+            return
+        }
         if nvfp4MoeGatherPrefersNax(mTotal: mTotal, nOut: nOut, kIn: kIn) {
             nvfp4MoeGatherNaxPair(
                 input: input,
