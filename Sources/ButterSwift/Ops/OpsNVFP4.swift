@@ -205,6 +205,20 @@ extension Ops {
         //   BM64: grid [nOut/64, ceil(mTotal/64), 1], TPG=128 (4 SGs 2×2)
         //   NAX:  same 64-tile grid via live butter_nvfp4_gather_qmm_rhs_nax_mpp_*
         //         when BUTTER_NVFP4_GATHER_NAX=1 (default OFF).
+        //   EG-MPP: fused-dequant MPP tensor-ops gather-GEMM with true
+        //         1-expert/threadgroup ownership (device-side tile plan,
+        //         no straddling, no indirect dispatch) via live
+        //         butter_nvfp4_moe_gather_eg_mpp_bf16, default ON
+        //         (escape BUTTER_NVFP4_MPP_GATHER=0). See
+        //         `LagunaNvfp4MppGather.swift` for the full design.
+        if LagunaNvfp4MppGather.eligible(dtype: input.dtype, nOut: nOut, kIn: kIn, blockSize: blockSize) {
+            LagunaNvfp4MppGather.callGather(
+                input: input, weight: weight, scales: scales, indices: indices,
+                mTotal: mTotal, nOut: nOut, kIn: kIn,
+                blockSize: blockSize, global: global,
+                on: cmd, device: Device.shared, into: out)
+            return
+        }
         if nvfp4MoeGatherPrefersSteel(dtype: input.dtype, mTotal: mTotal, nOut: nOut, kIn: kIn, blockSize: blockSize) {
             // T35: BM16 row-tile variant below a run-length threshold
             // (fixes T34's diagnosed tile-fragmentation loss at production
@@ -681,6 +695,21 @@ extension Ops {
     ) {
         precondition(input.dtype == out0.dtype && input.dtype == out1.dtype)
         precondition(nOut % 32 == 0)
+        // EG-MPP: see `nvfp4MoeGatherBm16`'s own header comment +
+        // `LagunaNvfp4MppGather.swift`. Default ON (escape
+        // BUTTER_NVFP4_MPP_GATHER=0), checked ahead of steel/NAX/NAX64/BM16
+        // same as the serial path above.
+        if LagunaNvfp4MppGather.eligible(dtype: input.dtype, nOut: nOut, kIn: kIn, blockSize: blockSize) {
+            LagunaNvfp4MppGather.callGatherPair(
+                input: input,
+                weight0: weight0, scales0: scales0, out0: out0,
+                weight1: weight1, scales1: scales1, out1: out1,
+                indices: indices,
+                mTotal: mTotal, nOut: nOut, kIn: kIn,
+                blockSize: blockSize, global: global,
+                on: cmd, device: Device.shared)
+            return
+        }
         if nvfp4MoeGatherPrefersSteel(dtype: input.dtype, mTotal: mTotal, nOut: nOut, kIn: kIn, blockSize: blockSize) {
             // T35: same BM16/BM64 run-length threshold as the serial path.
             let nExperts = weight0.shape[0]
