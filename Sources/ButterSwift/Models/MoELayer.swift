@@ -734,6 +734,61 @@ public final class MoELayer: Module, DecoderLayer {
     private var tilePlanTileRowCountBuf: MTLBuffer?
     private var tilePlanBufCapacity = 0
 
+    /// T21 hygiene: host-sorted MoE routing transients for `decodeMany`
+    /// (int4) / `decodeManyNvfp4`: gather-index (source token per sorted
+    /// row) and expert-id (routed expert per sorted row) buffers, plus the
+    /// unpermute-scatter inverse-permutation buffer. These were a fresh
+    /// `device.makeBuffer` pair/single every forward call on EVERY MoE
+    /// layer (i.e. every decode token and every prefill chunk) until this
+    /// cache was added, same grow-only per-instance reuse pattern as
+    /// `tilePlanTileExpertBuf` above, same cross-call GPU-ordering safety
+    /// argument (this file's per-layer command-buffer chaining already
+    /// depends on committed-order execution), and same reason growing is
+    /// always safe: every call `memcpy`s its own full `mTotal` prefix
+    /// before any dispatch reads it, so a larger backing buffer never
+    /// leaks a previous call's stale tail into a smaller current call.
+    /// `decodeMany` and `decodeManyNvfp4` are mutually exclusive per
+    /// instance (an instance is either int4- or NVFP4-stacked, decided at
+    /// load time), so sharing one set of buffers between them is safe,
+    /// same sharing argument as `coopIndirectArgsGateUpBuf` above.
+    ///
+    /// Being per-instance stored properties, these are also independently
+    /// kept alive by `MoELayer`'s own lifetime (not by any one command
+    /// buffer's retain): a required precondition, not just a perf nicety,
+    /// for `Device.unretainedCommandBuffersEnabled` to ever be safe to
+    /// flip on for this file's `commitAtEnd`-chained (commit-without-wait)
+    /// dispatches. See the audit in the T21 hygiene PR description.
+    private var gatherIdxPoolBuf: MTLBuffer?
+    private var expertIdsPoolBuf: MTLBuffer?
+    private var gatherIdxPoolCapacity = 0
+    private var invPermPoolBuf: MTLBuffer?
+    private var invPermPoolCapacity = 0
+
+    /// Lazily allocates (grow-only) and returns the gather-index +
+    /// expert-id routing buffers. See the property doc above
+    /// `gatherIdxPoolBuf` for the reuse design.
+    private func gatherRoutingBuffers(
+        mTotal: Int, device: Device
+    ) -> (gatherIdx: MTLBuffer, expertIds: MTLBuffer) {
+        if gatherIdxPoolBuf == nil || gatherIdxPoolCapacity < mTotal {
+            gatherIdxPoolBuf = device.makeBuffer(length: mTotal * 4)
+            expertIdsPoolBuf = device.makeBuffer(length: mTotal * 4)
+            gatherIdxPoolCapacity = mTotal
+        }
+        return (gatherIdxPoolBuf!, expertIdsPoolBuf!)
+    }
+
+    /// Lazily allocates (grow-only) and returns the unpermute inverse-
+    /// permutation buffer. See the property doc above `gatherIdxPoolBuf`
+    /// for the reuse design.
+    private func invPermRoutingBuffer(mTotal: Int, device: Device) -> MTLBuffer {
+        if invPermPoolBuf == nil || invPermPoolCapacity < mTotal {
+            invPermPoolBuf = device.makeBuffer(length: mTotal * 4)
+            invPermPoolCapacity = mTotal
+        }
+        return invPermPoolBuf!
+    }
+
     /// - gate: hidden → nExperts router projection.
     /// - gateProj/upProj/downProj: `nExperts`-long arrays of per-expert
     ///   SwiGLU projections, index-aligned with the expert id.
@@ -1677,12 +1732,11 @@ public final class MoELayer: Module, DecoderLayer {
             gatherIdxTensor = ds
             indices = di
         } else {
-            let gatherIdxBuf = device.makeBuffer(length: mTotal * 4)
+            let (gatherIdxBuf, expertIdsBuf) = gatherRoutingBuffers(mTotal: mTotal, device: device)
             sourceTokensHost.withUnsafeBytes {
                 _ = memcpy(gatherIdxBuf.contents(), $0.baseAddress!, mTotal * 4)
             }
             gatherIdxTensor = Tensor(buffer: gatherIdxBuf, offset: 0, shape: [mTotal], dtype: .u32)
-            let expertIdsBuf = device.makeBuffer(length: mTotal * 4)
             sortedExpertsHost.withUnsafeBytes {
                 _ = memcpy(expertIdsBuf.contents(), $0.baseAddress!, mTotal * 4)
             }
@@ -2127,7 +2181,7 @@ public final class MoELayer: Module, DecoderLayer {
             invPermTensor = dip
             weightsTensor = dw
         } else {
-            let invPermBuf = device.makeBuffer(length: mTotal * 4)
+            let invPermBuf = invPermRoutingBuffer(mTotal: mTotal, device: device)
             invPermHost.withUnsafeBytes {
                 _ = memcpy(invPermBuf.contents(), $0.baseAddress!, mTotal * 4)
             }
@@ -3087,10 +3141,27 @@ public final class MoELayer: Module, DecoderLayer {
                         blit.fill(buffer: outFlat.buffer, range: o0 ..< o1, value: 0)
                         blit.endEncoding()
                     }
-                    Ops.moeUnpermute(
-                        expertOutputs: downOut, invPerm: inv,
-                        topKWeights: weightsTok, into: outFlat,
-                        nRows: t, hidden: hidden, k: topK, on: work)
+                    // F-85 prefill pack item 4: opt-in hand-authored
+                    // combine kernel with explicit split multiply/add (no
+                    // FMA contraction), see LagunaSortedCombine.swift's
+                    // file header for why this exists alongside
+                    // Ops.moeUnpermute (which already does the same fusion
+                    // structurally, but its generated-kernel source isn't
+                    // visible in this repo to audit for the numerics risk
+                    // the mission flags). Default OFF, zero behavior
+                    // change unless BUTTER_LAGUNA_SORTED_COMBINE=1.
+                    if LagunaSortedCombine.enabled, topK <= 8 {
+                        LagunaSortedCombine.combine(
+                            expertOutputs: downOut, invPerm: inv,
+                            topKWeights: weightsTok, into: outFlat,
+                            nRows: t, hidden: hidden, k: topK,
+                            on: work, device: device)
+                    } else {
+                        Ops.moeUnpermute(
+                            expertOutputs: downOut, invPerm: inv,
+                            topKWeights: weightsTok, into: outFlat,
+                            nRows: t, hidden: hidden, k: topK, on: work)
+                    }
                 } else {
                     for r in 0 ..< t {
                         var scalars: [Tensor] = []
@@ -3180,13 +3251,12 @@ public final class MoELayer: Module, DecoderLayer {
             gatherIdxTensor = gi
             indices = se
         } else {
-            let gatherIdxBuf = device.makeBuffer(length: mTotal * 4)
+            let (gatherIdxBuf, expertIdsBuf) = gatherRoutingBuffers(mTotal: mTotal, device: device)
             sourceTokensHost.withUnsafeBytes {
                 _ = memcpy(gatherIdxBuf.contents(), $0.baseAddress!, mTotal * 4)
             }
             gatherIdxTensor = Tensor(
                 buffer: gatherIdxBuf, offset: 0, shape: [mTotal], dtype: .u32)
-            let expertIdsBuf = device.makeBuffer(length: mTotal * 4)
             sortedExpertsHost.withUnsafeBytes {
                 _ = memcpy(expertIdsBuf.contents(), $0.baseAddress!, mTotal * 4)
             }
@@ -3282,7 +3352,7 @@ public final class MoELayer: Module, DecoderLayer {
             invPermTensor = ip
             weightsTensor = wt
         } else {
-            let invPermBuf = device.makeBuffer(length: mTotal * 4)
+            let invPermBuf = invPermRoutingBuffer(mTotal: mTotal, device: device)
             invPermHost.withUnsafeBytes {
                 _ = memcpy(invPermBuf.contents(), $0.baseAddress!, mTotal * 4)
             }
@@ -3982,6 +4052,51 @@ public final class MoELayer: Module, DecoderLayer {
         return acc
     }
 
+    /// T32 task 1: sigmoid + bias + top-k select + x-scale, one dispatch
+    /// when eligible (`LagunaRouteFuse.fusedRoute`), else the stock
+    /// four-dispatch chain (sigmoid, +bias, moeRouterTopKBiased, x scale).
+    /// Shared by `decodeGPUPathBNvfp4` and `decodeNineSlot`: both run the
+    /// identical post-router-GEMV elementwise tail on the identical
+    /// scratch tensors. Writes `routerIndicesScratch!` /
+    /// `routerWeightsScratch!` in place; does not touch `logitsTensor`
+    /// (the router GEMV itself); see the file header of
+    /// `LagunaRouteFuse.swift` for why that GEMV stays out of scope.
+    private func runPathBRouteChain(
+        logitsTensor: Tensor, expertBiasGPU: Tensor,
+        nExperts: Int, topK: Int, scoreDt: DType,
+        cmd: MTLCommandBuffer, device: Device
+    ) {
+        let scale = router.routedScalingFactor
+        if LagunaRouteFuse.fusedRoute(
+            logits: logitsTensor, bias: expertBiasGPU,
+            indicesOut: routerIndicesScratch!, weightsOut: routerWeightsScratch!,
+            nExperts: nExperts, k: topK, scale: scale,
+            on: cmd, device: device)
+        {
+            return
+        }
+        // Fallback: stock four-dispatch chain.
+        let unbiased = Ops.sigmoid(logitsTensor, on: cmd, into: unbiasedScoreScratch!)
+        let biased = Ops.add(unbiased, expertBiasGPU, on: cmd, into: biasedScoreScratch!)
+        Ops.moeRouterTopKBiased(
+            scoreBiased: biased, scoreUnbiased: unbiased,
+            indicesOut: routerIndicesScratch!,
+            weightsOut: routerWeightsScratch!,
+            nExperts: nExperts, k: topK, on: cmd)
+        if scale != 1.0 {
+            if pathBScaleVecScratch == nil
+                || pathBScaleVecScratch!.dtype != scoreDt
+                || pathBScaleVecScratch!.elementCount != topK
+            {
+                pathBScaleVecScratch = Tensor.filled(
+                    scale, shape: [topK], dtype: scoreDt, device: device)
+            }
+            _ = Ops.mul(
+                routerWeightsScratch!, pathBScaleVecScratch!, on: cmd,
+                into: routerWeightsScratch!)
+        }
+    }
+
     /// Path B full with stacked NVFP4 experts (board quant).
     private func decodeGPUPathBNvfp4(
         h: Tensor, logitsTensor: Tensor,
@@ -4097,26 +4212,10 @@ public final class MoELayer: Module, DecoderLayer {
             }
         }
 
-        let unbiased = Ops.sigmoid(logitsTensor, on: cmd, into: unbiasedScoreScratch!)
-        let biased = Ops.add(unbiased, expertBiasGPU, on: cmd, into: biasedScoreScratch!)
-        Ops.moeRouterTopKBiased(
-            scoreBiased: biased, scoreUnbiased: unbiased,
-            indicesOut: routerIndicesScratch!,
-            weightsOut: routerWeightsScratch!,
-            nExperts: nExperts, k: topK, on: cmd)
-        let scale = router.routedScalingFactor
-        if scale != 1.0 {
-            if pathBScaleVecScratch == nil
-                || pathBScaleVecScratch!.dtype != scoreDt
-                || pathBScaleVecScratch!.elementCount != topK
-            {
-                pathBScaleVecScratch = Tensor.filled(
-                    scale, shape: [topK], dtype: scoreDt, device: device)
-            }
-            _ = Ops.mul(
-                routerWeightsScratch!, pathBScaleVecScratch!, on: cmd,
-                into: routerWeightsScratch!)
-        }
+        runPathBRouteChain(
+            logitsTensor: logitsTensor, expertBiasGPU: expertBiasGPU,
+            nExperts: nExperts, topK: topK, scoreDt: scoreDt,
+            cmd: cmd, device: device)
 
         var expertIdxScratches: [Tensor] = []
         expertIdxScratches.reserveCapacity(topK)
@@ -4399,6 +4498,15 @@ public final class MoELayer: Module, DecoderLayer {
     /// dispatch. Returns the combined (routed + shared) MoE output directly,
     /// with no separate `Ops.add(acc, sharedOut)`, since the down-reduce
     /// kernel already folds the shared leg into its weighted-sum accumulator.
+    ///
+    /// T28 follow-up (`BUTTER_LAGUNA_GATEUP_SPLIT=1`,
+    /// `LagunaNvfp4Fuse.gateUpSplitEnabled`): the gate-up half only can be
+    /// split back into a routed-8 dispatch + a shared-1 dispatch (one
+    /// concurrent-dispatch encoder, shared first) instead of the single
+    /// merged nine-slot gate-up kernel; see
+    /// `LagunaNvfp4Fuse.moeGateUpSplitSwigluQmv` for the dependency-overlap
+    /// rationale. The down+residual leg (`moeNineSlotDownReduce`) is NOT
+    /// split and runs identically either way.
     private func decodeNineSlot(
         h: Tensor, logitsTensor: Tensor,
         stacked: StackedNvfp4Experts, expertBiasGPU: Tensor,
@@ -4409,41 +4517,60 @@ public final class MoELayer: Module, DecoderLayer {
         let nExperts = router.nExperts
         let scoreDt = h.dtype
 
-        let unbiased = Ops.sigmoid(logitsTensor, on: cmd, into: unbiasedScoreScratch!)
-        let biased = Ops.add(unbiased, expertBiasGPU, on: cmd, into: biasedScoreScratch!)
-        Ops.moeRouterTopKBiased(
-            scoreBiased: biased, scoreUnbiased: unbiased,
-            indicesOut: routerIndicesScratch!,
-            weightsOut: routerWeightsScratch!,
-            nExperts: nExperts, k: topK, on: cmd)
-        let scale = router.routedScalingFactor
-        if scale != 1.0 {
-            if pathBScaleVecScratch == nil
-                || pathBScaleVecScratch!.dtype != scoreDt
-                || pathBScaleVecScratch!.elementCount != topK
-            {
-                pathBScaleVecScratch = Tensor.filled(
-                    scale, shape: [topK], dtype: scoreDt, device: device)
-            }
-            _ = Ops.mul(
-                routerWeightsScratch!, pathBScaleVecScratch!, on: cmd,
-                into: routerWeightsScratch!)
+        // T39: per-kernel decode GPU-time probe. `localCmd` starts aliased
+        // to the caller's `cmd` (== `workBuf` in `LagunaLayer.forward`); the
+        // first checkpoint below commits that buffer (so the caller's own
+        // `workBuf.status == .committed` check already in place for the
+        // host/hybrid MoE path picks it up correctly and allocates its own
+        // fresh residual-add buffer) and every checkpoint after that keeps
+        // encoding on progressively fresher buffers. No-op when the env var
+        // is unset: `localCmd` never diverges from `cmd`, dispatches land on
+        // the caller's buffer exactly as before. See
+        // benchmarks/laguna-xs/README.md T39.
+        let dkTiming = LagunaDecodeKernelTiming.enabled
+        var localCmd = cmd
+        func dk(_ label: String) {
+            guard dkTiming else { return }
+            localCmd = LagunaDecodeKernelTiming.checkpoint(label, cmd: localCmd, device: device)
         }
+
+        runPathBRouteChain(
+            logitsTensor: logitsTensor, expertBiasGPU: expertBiasGPU,
+            nExperts: nExperts, topK: topK, scoreDt: scoreDt,
+            cmd: localCmd, device: device)
+        dk("router_route")
 
         if sharedMidScratch == nil || sharedMidScratch!.dtype != h.dtype {
             sharedMidScratch = Tensor.empty(shape: [512], dtype: h.dtype, device: device)
         }
         let inners = Array(expertInnerScratches.prefix(topK))
-        LagunaNvfp4Fuse.moeNineSlotSwigluQmv(
-            input: h,
-            gateWeight: stacked.gateWeight, gateScales: stacked.gateScales,
-            upWeight: stacked.upWeight, upScales: stacked.upScales,
-            expertIndices: routerIndicesScratch!,
-            routedOutputs: inners,
-            sharedWeight: shared.fusedWeight, sharedScales: shared.fusedScales,
-            sharedOutput: sharedMidScratch!,
-            global: stacked.global, sharedGlobal: shared.fusedGlobal,
-            on: cmd, device: device)
+        if LagunaNvfp4Fuse.gateUpSplitEnabled {
+            // T28 follow-up: routed-8 + shared-1 on one concurrent-dispatch
+            // encoder (shared first) instead of the merged nine-slot
+            // gate-up kernel. See moeGateUpSplitSwigluQmv doc comment.
+            LagunaNvfp4Fuse.moeGateUpSplitSwigluQmv(
+                input: h,
+                gateWeight: stacked.gateWeight, gateScales: stacked.gateScales,
+                upWeight: stacked.upWeight, upScales: stacked.upScales,
+                expertIndices: routerIndicesScratch!,
+                routedOutputs: inners,
+                sharedWeight: shared.fusedWeight, sharedScales: shared.fusedScales,
+                sharedOutput: sharedMidScratch!,
+                global: stacked.global, sharedGlobal: shared.fusedGlobal,
+                on: localCmd, device: device)
+        } else {
+            LagunaNvfp4Fuse.moeNineSlotSwigluQmv(
+                input: h,
+                gateWeight: stacked.gateWeight, gateScales: stacked.gateScales,
+                upWeight: stacked.upWeight, upScales: stacked.upScales,
+                expertIndices: routerIndicesScratch!,
+                routedOutputs: inners,
+                sharedWeight: shared.fusedWeight, sharedScales: shared.fusedScales,
+                sharedOutput: sharedMidScratch!,
+                global: stacked.global, sharedGlobal: shared.fusedGlobal,
+                on: localCmd, device: device)
+        }
+        dk("moe_swiglu")
 
         let acc = accumulatorScratch!
         LagunaNvfp4Fuse.moeNineSlotDownReduce(
@@ -4453,7 +4580,8 @@ public final class MoELayer: Module, DecoderLayer {
             sharedDownWeight: shared.downWeight, sharedDownScales: shared.downScales,
             output: acc,
             global: stacked.global, sharedGlobal: shared.downGlobal,
-            on: cmd, device: device)
+            on: localCmd, device: device)
+        dk("moe_down_reduce")
         return acc
     }
 

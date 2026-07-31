@@ -7,35 +7,37 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// CARRY SIGN-FOLD E4M3 decode (unconditional, bit-exact for all 256 byte
+// values -- see Tests/ButterTests/Ops/Nvfp4FastDequantTests.swift and the
+// derivation in LagunaNvfp4Fuse.swift's `header`). Replaces a
+// mask/shift/select ~7-op sequence with 5 ops.
 static inline float iron_nvfp4_e4m3_scale(uchar bits) {
-    uint b = uint(bits);
-    uint exp = (b >> 3) & 15u;
-    float mant = float(b & 7u);
-    float mag;
-    if (exp == 0u) {
-        mag = mant * 0.001953125f;
-    } else {
-        mag = (1.0f + mant * 0.125f) * exp2(float(exp) - 7.0f);
-    }
-    return ((b >> 7) & 1u) != 0u ? -mag : mag;
+    ushort h = ushort((uint(bits) + (uint(bits) & 128u)) << 7);
+    return float(as_type<half>(h)) * 256.0f;
 }
 
+// NIBBLE-SPLIT word-parallel E2M1 decode (19 -> 13 int ops per pack; see
+// LagunaNvfp4Fuse.swift's `header` for the full derivation + equivalence
+// table, and Tests/ButterTests/Ops/Nvfp4FastDequantTests.swift for the
+// exhaustive per-nibble test). `scale` must already carry the *16384.0f
+// half-domain-restore fold -- see iron_nvfp4_qdot_16 below (task 3).
 static inline float iron_nvfp4_pack_dot_fast(
     uint packed, float scale, const thread float* input, uint p_off
 ) {
     float accum = 0.0f;
-    const uint p0 =
-        ((packed & 0x00070007u) << 9) | ((packed & 0x00080008u) << 12);
-    const uint p1 =
-        ((packed & 0x00700070u) << 5) | ((packed & 0x00800080u) << 8);
-    const uint p2 =
-        ((packed & 0x07000700u) << 1) | ((packed & 0x08000800u) << 4);
-    const uint p3 =
-        ((packed & 0x70007000u) >> 3) | (packed & 0x80008000u);
-    const float2 v04 = float2(as_type<half2>(p0)) * 16384.0f;
-    const float2 v15 = float2(as_type<half2>(p1)) * 16384.0f;
-    const float2 v26 = float2(as_type<half2>(p2)) * 16384.0f;
-    const float2 v37 = float2(as_type<half2>(p3)) * 16384.0f;
+    const uint xe = packed & 0x0F0F0F0Fu;
+    const uint ge = xe | (xe << 3);
+    const uint yo = packed & 0xF0F0F0F0u;
+    const uint go = yo | (yo >> 3);
+    const uint M = 0x8E008E00u;
+    const uint p0 = (ge << 9) & M;
+    const uint p1 = (go << 8) & M;
+    const uint p2 = (ge << 1) & M;
+    const uint p3 = go & M;
+    const float2 v04 = float2(as_type<half2>(p0));
+    const float2 v15 = float2(as_type<half2>(p1));
+    const float2 v26 = float2(as_type<half2>(p2));
+    const float2 v37 = float2(as_type<half2>(p3));
     accum += v04.x * scale * input[p_off + 0u];
     accum += v15.x * scale * input[p_off + 1u];
     accum += v26.x * scale * input[p_off + 2u];
@@ -47,6 +49,10 @@ static inline float iron_nvfp4_pack_dot_fast(
     return accum;
 }
 
+// External contract unchanged (`scale` = plain e4m3*global). The
+// *16384.0f fold (2^22-class combined with the E4M3 fold above once
+// composed at a caller that also pre-scales) now happens ONCE per
+// 16-element dot instead of 8x inside pack_dot_fast.
 static inline float iron_nvfp4_qdot_16(
     const device uchar* weight_bytes,
     const thread float* input,
@@ -54,8 +60,9 @@ static inline float iron_nvfp4_qdot_16(
 ) {
     float accum = 0.0f;
     const device uint* packs = (const device uint*)weight_bytes;
-    accum += iron_nvfp4_pack_dot_fast(packs[0], scale, input, 0u);
-    accum += iron_nvfp4_pack_dot_fast(packs[1], scale, input, 8u);
+    const float scale16k = scale * 16384.0f;
+    accum += iron_nvfp4_pack_dot_fast(packs[0], scale16k, input, 0u);
+    accum += iron_nvfp4_pack_dot_fast(packs[1], scale16k, input, 8u);
     return accum;
 }
 

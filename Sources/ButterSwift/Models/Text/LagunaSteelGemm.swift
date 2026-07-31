@@ -164,4 +164,82 @@ enum LagunaSteelGemm {
             gridSize: grid, threadgroupSize: tg, on: cmd)
         return out
     }
+
+    /// T37: Q/K/V steel GEMM as three `dispatchThreadgroups` calls on one
+    /// `.concurrent` `MTLComputeCommandEncoder`, mirroring the hand-rolled
+    /// "Pair" pattern `OpsNVFP4.nvfp4MoeGatherBm16Pair` already uses for
+    /// gate+up (see `Ops/OpsNVFP4.swift`). All three read the same `input`
+    /// (this layer's post-norm activations) and write disjoint `out`
+    /// buffers - no data dependency between them, so pairing is safe by
+    /// construction (verified by reading `IronKernels.
+    /// iron_steel_gemm_64x64x16_2x2_bf16_threadgroups`: it only touches
+    /// its own `a`/`b`/`out` buffers, no shared scratch).
+    ///
+    /// T36 found `.concurrent` only buys real *compute-time* overlap when
+    /// a dispatch's threadgroup is light enough to leave free occupancy
+    /// for a second one to interleave into (mpp's 32-thread/1-simdgroup
+    /// BM16 kernel); its 128-thread/4-simdgroup steel BM16 MoE kernel got
+    /// zero overlap benefit because it already saturates enough of the
+    /// GPU alone. This GEMM's threadgroup (`tg = 128, 1, 1` = 4
+    /// simdgroups, 2x2 8x8 fragment tiling per T26's own header) is the
+    /// same "heavy" occupancy class, so T36's compute-overlap mechanism
+    /// predicts ~zero win from that specific effect here too - and
+    /// measurement agrees the win is NOT compute-overlap-sized. But
+    /// merging 3 encoder submissions into 1 (one `makeComputeCommandEncoder`
+    /// + 3 `dispatchThreadgroups` + one `endEncoding`, vs 3 full
+    /// create/dispatch/end cycles) is a distinct mechanism - per-encoder
+    /// host/driver overhead, the same class of cost T28's dispatch-count
+    /// census (README T31) already identified as a real lever at this
+    /// dispatch density - and that DOES show up: +1.3% prefill@512
+    /// (median of 3 interleaved runs, byte-identical output), decode
+    /// flat (T=1 never eligible). See benchmarks/laguna-xs/README.md T37
+    /// for the full A/B.
+    ///
+    /// Default ON (`!= "0"`, matching `LagunaSteelGemm.enabled`'s own
+    /// convention): gates passed (byte-identical Paris/fib/512+20 at
+    /// `--temperature 0`, measurable prefill win, no decode regression).
+    /// Escape: `BUTTER_LAGUNA_QKV_CONCURRENT=0`. Caller must have already
+    /// checked `eligible(...)` for all three shapes.
+    static var concurrentQkvEnabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_QKV_CONCURRENT"] != "0"
+    }
+
+    static func callManyQKVConcurrent(
+        input: Tensor,
+        qWeightT: Tensor, qOutDim: Int,
+        kWeightT: Tensor, kOutDim: Int,
+        vWeightT: Tensor, vOutDim: Int,
+        t: Int, inDim: Int,
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> (Tensor, Tensor, Tensor)? {
+        let qOut = Tensor.empty(shape: [t, qOutDim], dtype: .bf16, device: device)
+        let kOut = Tensor.empty(shape: [t, kOutDim], dtype: .bf16, device: device)
+        let vOut = Tensor.empty(shape: [t, vOutDim], dtype: .bf16, device: device)
+        let pso = PSOCache.shared.pipelineState(for: "iron_steel_gemm_64x64x16_2x2_bf16")
+        guard let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) else {
+            return nil
+        }
+        enc.setComputePipelineState(pso)
+        let bm = 64, bn = 64
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        var kU = UInt32(inDim)
+        func dispatch(_ weightT: Tensor, _ out: Tensor, _ outDim: Int) {
+            enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+            enc.setBuffer(weightT.buffer, offset: weightT.offset, index: 1)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 2)
+            var mU = UInt32(t)
+            var nU = UInt32(outDim)
+            enc.setBytes(&mU, length: 4, index: 3)
+            enc.setBytes(&nU, length: 4, index: 4)
+            enc.setBytes(&kU, length: 4, index: 5)
+            let grid = MTLSize(
+                width: (outDim + bn - 1) / bn, height: (t + bm - 1) / bm, depth: 1)
+            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(qWeightT, qOut, qOutDim)
+        dispatch(kWeightT, kOut, kOutDim)
+        dispatch(vWeightT, vOut, vOutDim)
+        enc.endEncoding()
+        return (qOut, kOut, vOut)
+    }
 }
