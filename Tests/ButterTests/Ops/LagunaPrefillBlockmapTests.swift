@@ -335,6 +335,15 @@ struct LagunaPrefillBlockmapClassifyTests {
 
 // MARK: - 3. GPU equivalence: new kernel vs. existing shipped kernels
 
+
+/// Apple GPU Family 9+ required for the MPP cooperative-tensor kernels the
+/// MoE and prefill paths dispatch. CI paravirtualized GPUs cannot build
+/// those PSOs, so the GPU-equivalence suites skip there rather than crash.
+private func mppCoopTensorsAvailable() -> Bool {
+    guard let dev = MTLCreateSystemDefaultDevice() else { return false }
+    return dev.supportsFamily(.apple9)
+}
+
 @Suite("LagunaPrefillBlockmap - GPU equivalence")
 struct LagunaPrefillBlockmapGPUTests {
     private func randomF16(_ shape: [Int], seed: inout UInt64) -> Tensor {
@@ -373,6 +382,7 @@ struct LagunaPrefillBlockmapGPUTests {
     /// masking, two independently-written kernels: the direct "the new
     /// kernel computes the same thing the shipped one does" check.
     private func compareVsMma(nHeads: Int, nKVHeads: Int, tPad: Int, position: Int, label: String) {
+        guard mppCoopTensorsAvailable() else { return }
         autoreleasepool {
             let headDim = 128
             let kPad = position + tPad
@@ -432,6 +442,7 @@ struct LagunaPrefillBlockmapGPUTests {
         nHeads: Int, nKVHeads: Int, tPad: Int, position: Int,
         window: Int, sinkEnd: Int, label: String
     ) {
+        guard mppCoopTensorsAvailable() else { return }
         autoreleasepool {
             let headDim = 128
             let kPad = position + tPad

@@ -168,6 +168,15 @@ private func withEnv(_ overrides: [String: String], _ body: () -> Void) {
 
 // ─── CPU-checkable plumbing ────────────────────────────────────────────
 
+
+/// Apple GPU Family 9+ required for the MPP cooperative-tensor kernels the
+/// MoE and prefill paths dispatch. CI paravirtualized GPUs cannot build
+/// those PSOs, so the GPU-equivalence suites skip there rather than crash.
+private func mppCoopTensorsAvailable() -> Bool {
+    guard let dev = MTLCreateSystemDefaultDevice() else { return false }
+    return dev.supportsFamily(.apple9)
+}
+
 @Suite("LagunaLastRowPrefill plumbing")
 struct LagunaLastRowPrefillPlumbingTests {
     @Test("slicedRows(start: T-1) picks the physically-last row")
@@ -256,6 +265,7 @@ struct LagunaLastRowPrefillGPUTests {
     private func compare(
         isSliding: Bool, isFullYarn: Bool, useMoE: Bool, label: String
     ) {
+        guard mppCoopTensorsAvailable() else { return }
         autoreleasepool {
             withEnv([
                 // Isolate the comparison to the SDPA-algorithm delta
