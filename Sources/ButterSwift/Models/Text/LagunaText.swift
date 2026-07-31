@@ -878,6 +878,13 @@ final class LagunaDenseMLP {
     /// same pattern as `LagunaLayer.qWeightT` etc. `nil` when the
     /// corresponding proj isn't a plain bf16 Linear (falls back safely).
     /// See benchmarks/laguna-xs/README.md T27.
+    ///
+    /// F-85: `nil` ALSO when `LagunaMppGemm.staticEligible` holds for the
+    /// projection -- MPP takes the raw untransposed weight directly, so
+    /// every real (t%64==0) forward call routes through it and the steel
+    /// weightT copy would be dead weight (a full [outDim,inDim] bf16
+    /// buffer + a one-time transpose dispatch, never read). See
+    /// `LagunaMppGemm.swift`'s header for the full "lazy build" reasoning.
     let gateWeightT, upWeightT, downWeightT: Tensor?
     private let intermediate: Int
 
@@ -886,9 +893,12 @@ final class LagunaDenseMLP {
         self.up = up
         self.down = down
         self.hidden = hidden
-        self.gateWeightT = LagunaSteelGemm.weightT(gate, dtype: dtype, device: device)
-        self.upWeightT = LagunaSteelGemm.weightT(up, dtype: dtype, device: device)
-        self.downWeightT = LagunaSteelGemm.weightT(down, dtype: dtype, device: device)
+        self.gateWeightT = LagunaMppGemm.staticEligible(gate, dtype: dtype)
+            ? nil : LagunaSteelGemm.weightT(gate, dtype: dtype, device: device)
+        self.upWeightT = LagunaMppGemm.staticEligible(up, dtype: dtype)
+            ? nil : LagunaSteelGemm.weightT(up, dtype: dtype, device: device)
+        self.downWeightT = LagunaMppGemm.staticEligible(down, dtype: dtype)
+            ? nil : LagunaSteelGemm.weightT(down, dtype: dtype, device: device)
         // intermediate = gate/up's outDim = down's inDim. Only needed for
         // the eligibility check below; derive from whichever proj is a
         // plain Linear (falls back to 0, ineligible, if none are).
@@ -920,9 +930,17 @@ final class LagunaDenseMLP {
         _ x: Tensor, t: Int,
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
-        func projOrSteel(
+        // F-85: MPP first, steel second, naive `AnyLinear.callMany` last.
+        // See `LagunaMppGemm.tryMppGemm`'s header for why this is the one
+        // hook every call site uses instead of re-deriving the tiering.
+        func projOrMpp(
             _ linear: AnyLinear, weightT: Tensor?, xIn: Tensor, outDim: Int, inDim: Int
         ) -> Tensor {
+            if let mpp = LagunaMppGemm.tryMppGemm(
+                linear, x: xIn, t: t, outDim: outDim, inDim: inDim, on: cmd, device: device)
+            {
+                return mpp
+            }
             if let weightT,
                 LagunaSteelGemm.eligible(t: t, outDim: outDim, inDim: inDim, dtype: xIn.dtype)
             {
@@ -932,10 +950,10 @@ final class LagunaDenseMLP {
             }
             return linear.callMany(xIn, t: t, on: cmd, device: device)
         }
-        let g = projOrSteel(gate, weightT: gateWeightT, xIn: x, outDim: intermediate, inDim: hidden)
-        let u = projOrSteel(up, weightT: upWeightT, xIn: x, outDim: intermediate, inDim: hidden)
+        let g = projOrMpp(gate, weightT: gateWeightT, xIn: x, outDim: intermediate, inDim: hidden)
+        let u = projOrMpp(up, weightT: upWeightT, xIn: x, outDim: intermediate, inDim: hidden)
         _ = Ops.swiglu(gate: g, up: u, on: cmd, into: u)
-        return projOrSteel(down, weightT: downWeightT, xIn: u, outDim: hidden, inDim: intermediate)
+        return projOrMpp(down, weightT: downWeightT, xIn: u, outDim: hidden, inDim: intermediate)
     }
 }
 
@@ -1066,10 +1084,20 @@ final class LagunaLayer {
         // path below; this feeds LagunaLayer.forwardMulti's prefill GEMMs.
         // T27: factored into `LagunaSteelGemm.weightT` so L00's dense FFN
         // and the MoE router GEMM can reuse the same guard.
-        self.qWeightT = LagunaSteelGemm.weightT(qProj, dtype: dtype, device: device)
-        self.kWeightT = LagunaSteelGemm.weightT(kProj, dtype: dtype, device: device)
-        self.vWeightT = LagunaSteelGemm.weightT(vProj, dtype: dtype, device: device)
-        self.oWeightT = LagunaSteelGemm.weightT(oProj, dtype: dtype, device: device)
+        //
+        // F-85: skip building the steel weightT entirely when
+        // `LagunaMppGemm.staticEligible` already covers this projection's
+        // shape -- MPP takes the raw `[outDim,inDim]` weight directly, so
+        // steel's transposed copy would never be read. See
+        // `LagunaMppGemm.swift`'s header.
+        self.qWeightT = LagunaMppGemm.staticEligible(qProj, dtype: dtype)
+            ? nil : LagunaSteelGemm.weightT(qProj, dtype: dtype, device: device)
+        self.kWeightT = LagunaMppGemm.staticEligible(kProj, dtype: dtype)
+            ? nil : LagunaSteelGemm.weightT(kProj, dtype: dtype, device: device)
+        self.vWeightT = LagunaMppGemm.staticEligible(vProj, dtype: dtype)
+            ? nil : LagunaSteelGemm.weightT(vProj, dtype: dtype, device: device)
+        self.oWeightT = LagunaMppGemm.staticEligible(oProj, dtype: dtype)
+            ? nil : LagunaSteelGemm.weightT(oProj, dtype: dtype, device: device)
 
         // Build stacked dense QKV for single-GEMV decode when all three are
         // plain Linear (NVFP4 Laguna: BF16 attention).
@@ -1814,12 +1842,19 @@ final class LagunaLayer {
         let xNorm = xNormFlat.reshaped(to: [nRows, hidden])
         attnPhaseCheckpoint("norm")
 
-        // QKV projections (batched affine/dequant GEMM). T26 Stage 2: steel
-        // MMA GEMM fast path when shapes are 64-aligned bf16 (prefill;
-        // decode T=1 always falls back). Escape: BUTTER_LAGUNA_ATTN_STEEL_GEMM=0.
-        func projOrSteel(
+        // QKV projections (batched affine/dequant GEMM). F-85: MPP tensor-
+        // ops GEMM first (see `LagunaMppGemm.tryMppGemm`), steel MMA GEMM
+        // second when shapes are 64-aligned bf16 (prefill; decode T=1
+        // always falls back to naive), naive `AnyLinear.callMany` last.
+        // Escape: BUTTER_LAGUNA_MPP_GEMM=0 / BUTTER_LAGUNA_ATTN_STEEL_GEMM=0.
+        func projOrMpp(
             _ linear: AnyLinear, weightT: Tensor?, x: Tensor, outDim: Int, inDim: Int
         ) -> Tensor {
+            if let mpp = LagunaMppGemm.tryMppGemm(
+                linear, x: x, t: nRows, outDim: outDim, inDim: inDim, on: work, device: device)
+            {
+                return mpp
+            }
             if let weightT,
                 LagunaSteelGemm.eligible(t: nRows, outDim: outDim, inDim: inDim, dtype: x.dtype)
             {
@@ -1832,13 +1867,28 @@ final class LagunaLayer {
         var q: Tensor
         var k: Tensor
         let v: Tensor
+        // F-85: when MPP statically covers all three of Q/K/V's shapes,
+        // prefer three individual `projOrMpp` calls (each routes through
+        // the faster MPP kernel) over T37's steel-concurrent-encoder
+        // batch below -- per the w3/mpp-bench numbers, MPP's per-dispatch
+        // win (2.2-3.3x vs steel) dwarfs the +1.3% T37 measured from
+        // merging 3 steel dispatches into 1 encoder. Only falls through
+        // to the steel-concurrent tier when MPP can't take at least one
+        // of the three (quantized weight, odd shape, MPP disabled/
+        // incapable) -- unchanged from T37 in that case.
+        //
         // T37: candidate (c), Q/K/V as one concurrent-encoder Pair-of-3
         // instead of three separate serial encoders - only when all
-        // three shapes are steel-eligible (same guard `projOrSteel` uses
+        // three shapes are steel-eligible (same guard `projOrMpp` uses
         // per-projection). Default ON (measured +1.3% prefill@512,
         // byte-identical, decode flat); escape BUTTER_LAGUNA_QKV_CONCURRENT=0.
         // See LagunaSteelGemm.swift + README T37 for the full reasoning.
-        if LagunaSteelGemm.concurrentQkvEnabled,
+        let qkvAllMppEligible =
+            LagunaMppGemm.eligible(t: nRows, outDim: qOutDim, inDim: hidden, dtype: xNorm.dtype)
+            && LagunaMppGemm.eligible(t: nRows, outDim: kOutDim, inDim: hidden, dtype: xNorm.dtype)
+            && LagunaMppGemm.eligible(t: nRows, outDim: vOutDim, inDim: hidden, dtype: xNorm.dtype)
+        if !qkvAllMppEligible,
+            LagunaSteelGemm.concurrentQkvEnabled,
             let qWeightT, let kWeightT, let vWeightT,
             LagunaSteelGemm.eligible(t: nRows, outDim: qOutDim, inDim: hidden, dtype: xNorm.dtype),
             LagunaSteelGemm.eligible(t: nRows, outDim: kOutDim, inDim: hidden, dtype: xNorm.dtype),
@@ -1854,9 +1904,9 @@ final class LagunaLayer {
             k = kc
             v = vc
         } else {
-            q = projOrSteel(qProj, weightT: qWeightT, x: xNorm, outDim: qOutDim, inDim: hidden)
-            k = projOrSteel(kProj, weightT: kWeightT, x: xNorm, outDim: kOutDim, inDim: hidden)
-            v = projOrSteel(vProj, weightT: vWeightT, x: xNorm, outDim: vOutDim, inDim: hidden)
+            q = projOrMpp(qProj, weightT: qWeightT, x: xNorm, outDim: qOutDim, inDim: hidden)
+            k = projOrMpp(kProj, weightT: kWeightT, x: xNorm, outDim: kOutDim, inDim: hidden)
+            v = projOrMpp(vProj, weightT: vWeightT, x: xNorm, outDim: vOutDim, inDim: hidden)
         }
         attnPhaseCheckpoint("qkv_proj")
 
@@ -2120,7 +2170,7 @@ final class LagunaLayer {
         }
         attnPhaseCheckpoint("gate")
 
-        let oOut = projOrSteel(
+        let oOut = projOrMpp(
             oProj, weightT: oWeightT, x: gated, outDim: hidden, inDim: qOutDim)
         attnPhaseCheckpoint("oproj")
         let residualFlat = residual.reshaped(to: [nRows * hidden])

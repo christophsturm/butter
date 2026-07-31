@@ -1,76 +1,82 @@
 // Copyright 2026 Tom Turney (@TheTom)
 //
-// F-85 prefill decisive experiment: dense (non-gather, non-quantized) bf16
-// GEMM via MPP `mpp::tensor_ops::matmul2d`, at the shipped steel simdgroup
-// MMA kernel's exact output-tile granularity (BM=BN=64, TPG=128, 2x2 SG
-// grid of 32x32x32 matmul2d calls), so it can be A/B-benchmarked directly
-// against `iron_steel_gemm_64x64x16_2x2_bf16` at real Laguna prefill
-// projection shapes. Pure microbench infrastructure -- not wired into any
-// model forward path.
+// F-85 campaign pivot: dense (non-gather, non-quantized) bf16 GEMM via MPP
+// `mpp::tensor_ops::matmul2d`, at the shipped steel simdgroup MMA kernel's
+// exact output-tile granularity (BM=BN=64, TPG=128, 2x2 SG grid of
+// 32x32x32 matmul2d calls). Originated as pure microbench infrastructure
+// (see the w3/mpp-bench branch, `MppSteelGemmBenchTests.swift`) that
+// measured this kernel 2.2-3.3x faster than
+// `iron_steel_gemm_64x64x16_2x2_bf16` at real Laguna prefill projection
+// shapes (qproj/kvproj/oproj/L00 gate-up/down; ratios 0.30-0.45 mpp/steel,
+// one outlier qproj48h n=6144 at 0.88 -- flagged, not yet root-caused).
+// This file is that kernel PRODUCTIONIZED for the prefill dense-GEMM
+// call sites: see `LagunaMppGemm.swift` for the Swift wrapper wiring it
+// into Q/K/V/O projections, L00's dense FFN, and the MoE router GEMM.
 //
-// GEOMETRY LABEL: this is the same MPP `matmul2d` 32x32x32 x 4 SGs (2x2)
-// cooperative-tensor structure every existing hand-written `_mpp_*.metal`
-// kernel in this repo uses (see e.g.
-// `butter_nvfp4_gather_qmm_rhs_nax_mpp_bf16.metal`), stripped of the
-// NVFP4 dequant + expert-gather machinery: this is the DENSE case those
-// kernels' K-loop and store/scatter structure already generalizes to.
+// GEOMETRY LABEL: same MPP `matmul2d` 32x32x32 x 4 SGs (2x2) cooperative-
+// tensor structure every existing hand-written `_mpp_*.metal` kernel in
+// this repo uses (see e.g. `butter_nvfp4_gather_qmm_rhs_nax_mpp_bf16.metal`),
+// stripped of the NVFP4 dequant + expert-gather machinery: this is the
+// DENSE case those kernels' K-loop and store/scatter structure already
+// generalizes to.
 //
 // SEMANTICS -- matches Butter's `Linear` convention exactly: out[M,N] =
 // X[M,K] @ W^T, W stored [N,K] row-major (K/inDim contiguous). That is
-// the SAME layout real Q/K/V/O/gate/up/down weights live in (Butter
-// `Linear.weight` is `[outDim, inDim]`), so `b` here takes an
+// the SAME layout real Q/K/V/O/gate/up/down/router weights live in
+// (Butter `Linear.weight` is `[outDim, inDim]`), so `b` here takes an
 // UNTRANSPOSED Linear weight directly -- unlike
 // `iron_steel_gemm_64x64x16_2x2_bf16`, which needs the weight
 // pre-transposed to `[K,N]` first (see `LagunaSteelGemm.transposeWeightBf16`).
 // `tb=true` in the `matmul2d_descriptor` below is what buys this: MPP
 // transposes the right operand internally, so staging directly from
-// `[N,K]` needs no host-side or on-device transpose pass at all -- a
-// real structural difference between the two kernel families worth
-// noting for whoever reads the bench numbers (steel pays a one-time
-// transpose at weight-load time that this MPP path never needs).
+// `[N,K]` needs no host-side or on-device transpose pass at all -- the
+// real memory/compute saving `LagunaMppGemm` banks on when it skips
+// building a steel `weightT` copy for shapes MPP already covers.
 //
 // COOPERATIVE-TENSOR OPERAND DTYPE: staged into `half`, matching every
-// other MPP `matmul2d` kernel in this repo (all 8 existing `_mpp_*.metal`
-// kernels use `half,half,float` -- confirmed via
-// `grep -n "get_left_input_cooperative_tensor" Sources/IronSwift/Resources/kernels/*_mpp_*.metal`).
-// Whether `mpp::tensor_ops::matmul2d` accepts `bfloat` cooperative-tensor
-// operands directly is an OPEN QUESTION in this repo's own history --
-// see `benchmarks/laguna-xs/README.md` T25 ("not verified this
-// session... an open question whether MPP's matmul2d on this
-// hardware/Metal-version accepts bfloat cooperative-tensor operands the
-// same way it accepts half"). T33's "bfloat staging needs no fold"
-// finding was demonstrated on a DIFFERENT Metal surface -- the steel
-// kernel's raw `simdgroup_matrix<bfloat,8,8>` MMA path, not
-// `mpp::tensor_ops::matmul2d`'s cooperative tensor. This session cannot
-// build/run (`swift build`/`swift test` are off-limits -- a separate
-// validation lane compiles and runs this), so risking an unverified
-// operand type on the one class of kernel that MUST live-compile against
-// the running OS's MPP header (see `PSOCache.liveCompileMppFunction`)
-// is the wrong tradeoff for a correctness-gated decisive experiment.
-// Staying on `half`, the only operand dtype every existing MPP kernel in
-// this repo has actually compiled and run correctly with, is the
-// lower-risk choice. (A `bfloat`-cooperative-tensor variant is a natural
-// follow-up once this file is confirmed to build -- flagged in the PR
-// description, not attempted here.)
+// other MPP `matmul2d` kernel in this repo (all existing `_mpp_*.metal`
+// kernels use `half,half,float`). Whether `matmul2d` accepts `bfloat`
+// cooperative-tensor operands directly remains an open question in this
+// repo's own history (see the bench kernel's header on w3/mpp-bench,
+// T25/T33) -- staying on `half`, the only operand dtype every existing
+// MPP kernel here has actually compiled and run correctly with.
 //
-// NO T23 magnitude-bias fold: that fold exists to survive NVFP4-dequant's
-// pathological post-scale magnitude range (observed non-finite past
-// activation magnitude ~50 without it, see T23 in the README). This
-// kernel stages plain bf16 activations/weights at ordinary transformer
-// magnitude -- post-RMSNorm activations and trained projection weights,
-// O(1)-O(10), nowhere near half's ~65504 ceiling -- so the fold's
-// overflow protection has nothing to protect against here and would only
-// cost precision (subnormal crowding) for zero benefit. See T33's own
-// "bfloat staging needs no fold" finding for the same reasoning applied
-// to the steel path.
+// T23 MAGNITUDE FOLD (new here vs the w3/mpp-bench microbench kernel,
+// which had none): the bench kernel's own header argued post-RMSNorm
+// activations and trained projection weights sit at ordinary O(1)-O(10)
+// magnitude, nowhere near half's ~65504 ceiling, so no fold was needed
+// for THAT experiment's synthetic inputs. Production Laguna prefill rows
+// are not all that tame -- SwiGLU-amplified activations entering a
+// down_proj-shaped GEMM have been measured at magnitude 40-60 in this
+// codebase (T23, see `butter_nvfp4_gather_qmm_rhs_nax_mpp_bf16.metal`'s
+// own header and `Nvfp4GatherNax64MagnitudeTests.swift`), and MPP's
+// half-compute-type multiply can round an individual A*B product to Inf
+// well before either operand alone overflows half. The fold applies here
+// for the same reason it applies there: fold a constant power-of-two
+// bias into BOTH staged operands before the half cast, multiply the
+// compensation back into the f32 accumulator once at the final store.
+// Because the bias is a fixed constant (not data/group dependent), it
+// factors out of the entire K-sum exactly -- `sum_k((a_k*B) * (b_k*B)) ==
+// B^2 * sum_k(a_k*b_k)` -- bit-for-bit equivalent to the unbiased
+// computation up to ordinary half-precision rounding, no new
+// approximation. Reuses the exact `kNvfp4StageBias` / `kNvfp4StageComp`
+// constants (2^-14 / 2^28) the NAX gather kernel already validated
+// (finite + cos>0.9999 through activation magnitude 800, zero regression
+// on real-weight coverage at typical magnitude) -- see that file's header
+// for the full empirical derivation. The fold is unconditional (no
+// magnitude check at dispatch time): it is free at typical magnitude and
+// removes the whole overflow risk class, so there is no reason to gate
+// it.
 //
 // Grid: [N/64, ceil(M/64), 1] threadgroups; TPG=128. Requires N % 64 ==
 // 0 and K % 32 == 0 (both required for the `Bs`/matmul2d tiling below to
 // stay in-bounds; there is no N or K masking, only M is boundary-masked).
-// All shapes this experiment benchmarks (Laguna XS QKV/O/L00-FFN
-// projections) satisfy N%64==0 and K%32==0 exactly; M boundary-masking
-// exists so the correctness tests can probe a non-64-multiple M without
-// a second kernel variant.
+// `LagunaMppGemm.eligible` additionally requires M % 64 == 0 at the
+// Swift call-site level (decode T=1 and other small/odd chunk counts
+// fall back to steel or the naive path instead) -- the M-boundary mask
+// below is defense in depth for callers that don't go through that
+// gate (and is exercised directly by the boundary-M correctness test),
+// not something production prefill dispatch relies on.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -79,6 +85,13 @@ using namespace metal;
 #include <metal_simdgroup>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #endif
+
+// Same fold constants `butter_nvfp4_gather_qmm_rhs_nax_mpp_bf16.metal`
+// validated for half-staged MPP matmul2d operands (see that file's T23
+// header for the full derivation): 2^-14 folded into both operands
+// before the half cast, 2^28 == 1/bias^2 multiplied back once at store.
+constant float kDenseGemmStageBias = 0.00006103515625f;  // 2^-14
+constant float kDenseGemmStageComp = 268435456.0f;        // 2^28
 
 kernel void butter_dense_gemm_mpp_bf16(
     const device bfloat *a [[buffer(0)]],   // [M, K] row-major, K contiguous
@@ -135,7 +148,7 @@ kernel void butter_dense_gemm_mpp_bf16(
             for (uint t = 0u; t < 16u; t++) {
                 float av = 0.0f;
                 if (in_range) av = float(a[a_dev + t]);
-                As[a_ws + t] = half(av);
+                As[a_ws + t] = half(av * kDenseGemmStageBias);
             }
         }
 
@@ -148,7 +161,7 @@ kernel void butter_dense_gemm_mpp_bf16(
             const uint b_dev = gc * K + k0 + b_k_base;
             const uint b_ws = b_n_row * 32u + b_k_base;
             for (uint t = 0u; t < 16u; t++) {
-                Bs[b_ws + t] = half(float(b[b_dev + t]));
+                Bs[b_ws + t] = half(float(b[b_dev + t]) * kDenseGemmStageBias);
             }
         }
 
@@ -165,7 +178,11 @@ kernel void butter_dense_gemm_mpp_bf16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Store cooperative C -> TG scratch (per-SG 32x32 block).
+    // Store cooperative C -> TG scratch (per-SG 32x32 block). Both
+    // operands were folded by `kDenseGemmStageBias` above, so the
+    // accumulated products are scaled by `kDenseGemmStageBias^2` --
+    // undone once here via `kDenseGemmStageComp == 1/kDenseGemmStageBias^2`
+    // rather than per-K-step, matching the NAX gather kernel's fold.
     {
         metal::tensor<threadgroup float, metal::extents<int, 32, 32>, metal::tensor_inline>
             tC(OutScratch + simd_group * 1024u, metal::extents<int, 32, 32>{});
@@ -184,7 +201,7 @@ kernel void butter_dense_gemm_mpp_bf16(
         if (gr < M) {
             const uint sg = (mr / 32u) * 2u + (nc / 32u);
             const uint local = sg * 1024u + (mr % 32u) * 32u + (nc % 32u);
-            out[gr * N + gc] = bfloat(OutScratch[local]);
+            out[gr * N + gc] = bfloat(OutScratch[local] * kDenseGemmStageComp);
         }
     }
 #endif

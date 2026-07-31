@@ -396,6 +396,12 @@ public final class MoELayer: Module, DecoderLayer {
     /// of gap T26 found in attention's Q/K/V/O projections. `nil` when
     /// `gate` isn't a plain bf16 Linear (falls back automatically via
     /// `LagunaSteelGemm.eligible`). See benchmarks/laguna-xs/README.md T27.
+    ///
+    /// F-85: also `nil` when `LagunaMppGemm.staticEligible` already
+    /// covers the router GEMM's shape -- MPP takes the raw untransposed
+    /// weight directly, so the steel copy is skipped whenever every real
+    /// (t%64==0) router call would route through MPP instead. See
+    /// `LagunaMppGemm.swift`'s header.
     let gateWeightT: Tensor?
 
     /// Stacked-expert weight handles for the batched gather BGEMM fast
@@ -835,7 +841,8 @@ public final class MoELayer: Module, DecoderLayer {
         self.sharedDownProj = sharedDownProj
         self.router = router
         self.hidden = hidden
-        self.gateWeightT = LagunaSteelGemm.weightT(gate, dtype: dtype, device: device)
+        self.gateWeightT = LagunaMppGemm.staticEligible(gate, dtype: dtype)
+            ? nil : LagunaSteelGemm.weightT(gate, dtype: dtype, device: device)
         if let s = stackedInt4Experts {
             precondition(
                 s.numExperts == router.nExperts,
@@ -2326,14 +2333,20 @@ public final class MoELayer: Module, DecoderLayer {
         // this checkpoint exists to soak up the backlog).
         moePhaseCheckpoint("pre")
         if !useGather {
-            // T27 Stage 2: steel MMA GEMM fast path for the router
-            // projection (hidden -> nExperts, both %64==0 on Laguna XS:
-            // 2048 / 256), same naive-`Ops.gemm`-to-steel swap T26 did
-            // for attention's Q/K/V/O. Falls back to `gate.callMany`
-            // automatically when ineligible (non-bf16, non-64-aligned
-            // shapes, or BUTTER_LAGUNA_ATTN_STEEL_GEMM=0).
+            // F-85: MPP tensor-ops GEMM fast path first for the router
+            // projection (hidden -> nExperts, e.g. 2048 -> 256 on Laguna
+            // XS -- `outDim%64==0`/`inDim%32==0` satisfies MPP's looser
+            // tile contract), T27's steel MMA GEMM second, naive
+            // `gate.callMany` last. Falls back automatically when
+            // ineligible (non-bf16, unaligned shapes, T=1 decode, or
+            // BUTTER_LAGUNA_MPP_GEMM=0 / BUTTER_LAGUNA_ATTN_STEEL_GEMM=0).
             let logitsAll: Tensor
-            if let gateWeightT,
+            if let mpp = LagunaMppGemm.tryMppGemm(
+                gate, x: hRows, t: t, outDim: router.nExperts, inDim: hidden,
+                on: work, device: device)
+            {
+                logitsAll = mpp
+            } else if let gateWeightT,
                 LagunaSteelGemm.eligible(
                     t: t, outDim: router.nExperts, inDim: hidden, dtype: hRows.dtype)
             {
