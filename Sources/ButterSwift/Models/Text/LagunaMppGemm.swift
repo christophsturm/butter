@@ -35,13 +35,23 @@
 // already requires before it's safe to live-compile
 // `MetalPerformancePrimitives` against the running OS's header -- see
 // `PSOCache.liveCompileMppFunction` / `PSOCache.isMppKernel`, which
-// triggers on this kernel's name containing `_mpp_`). `t % 64 == 0` is
-// enforced same as steel: decode (`t == 1`) and any non-64-aligned
-// prefill remainder chunk fall back to steel or the naive
-// `AnyLinear.callMany` path automatically, never this kernel -- the
-// kernel's own M-boundary masking (see its header) exists for direct
-// callers / correctness tests, not because production dispatch relies
-// on it.
+// triggers on this kernel's name containing `_mpp_`). The kernel itself
+// requires `t % 64 == 0` at dispatch (its own M-boundary masking exists
+// for direct callers / correctness tests, not because production
+// dispatch relies on it) -- decode (`t == 1`) never reaches this kernel
+// at all (see `tryMppGemm`'s callers, both batched-prefill-only paths).
+//
+// M-PADDING (benchmarks/laguna-xs/README.md section 21): real prefill
+// chunk lengths are essentially never 64-aligned, so gating dispatch on
+// `t % 64 == 0` directly (the original cut of this file) meant MPP
+// declined for almost every real prompt, silently paying the ~1.7x-
+// slower steel tax for the entire prefill over a remainder of at most
+// 63 rows. `tryMppGemm` now pads the activation with zero rows up to
+// the next multiple of 64 when only `t` (not the weight shape) fails
+// the gate, dispatches MPP at the padded M, and slices the real rows
+// back off -- see `tryMppGemm`'s header for the per-row-independence
+// correctness argument and `padMEnabled`'s header for the A/B escape
+// (BUTTER_LAGUNA_MPP_PAD_M=0).
 //
 // Escape: BUTTER_LAGUNA_MPP_GEMM=0 (falls back to steel / naive
 // unconditionally, matching `LagunaSteelGemm.enabled`'s own convention).
@@ -106,8 +116,33 @@ enum LagunaMppGemm {
     /// exact call: `shapeEligible` plus `t % 64 == 0` (decode T=1 and
     /// non-64-aligned prefill remainder chunks decline, same convention
     /// `LagunaSteelGemm.eligible` uses for its own M dimension).
+    ///
+    /// NOTE: this exact-multiple gate is what `tryMppGemm` below no
+    /// longer uses directly for the M dimension -- see its header for
+    /// why (`t % 64 == 0` is a hard requirement of the underlying
+    /// kernel's tiling, but not of `t` itself, since padding fixes it).
+    /// `eligible` is kept as-is because `BUTTER_LAGUNA_MPP_PAD_M=0`
+    /// still routes `tryMppGemm` through it unchanged, for A/B against
+    /// the padded path.
     static func eligible(t: Int, outDim: Int, inDim: Int, dtype: DType) -> Bool {
         shapeEligible(outDim: outDim, inDim: inDim, dtype: dtype) && t % 64 == 0
+    }
+
+    /// F-85 follow-up, section 21 of `benchmarks/laguna-xs/README.md`:
+    /// `eligible(t:...)`'s `t % 64 == 0` gate means MPP only ever engaged
+    /// when the whole prefill chunk happened to be 64-row-aligned --
+    /// vanishingly rare for real prompts (measured: at M=2688, a 64
+    /// multiple, MPP hit 1916 tok/s vs steel's 1110; at M=2690, two rows
+    /// off, MPP declined outright and both paths tied at 515). Every
+    /// real prompt was silently paying the ~1.7x-slower steel tax for
+    /// the entire prefill because of a two-row remainder.
+    ///
+    /// Default ON (`!= "0"`): gates the M-padding path in `tryMppGemm`
+    /// below. Escape: BUTTER_LAGUNA_MPP_PAD_M=0 reverts `tryMppGemm` to
+    /// the pre-padding behavior (`eligible(t:...)` as the sole gate, no
+    /// padding) for A/B against this change.
+    static var padMEnabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_MPP_PAD_M"] != "0"
     }
 
     /// `out[m,n] = a[m,k] @ w[n,k]^T` via `butter_dense_gemm_mpp_bf16`.
@@ -153,19 +188,90 @@ enum LagunaMppGemm {
     }
 
     /// Single call-site hook: try the MPP GEMM for `linear` against `x`;
-    /// `nil` when ineligible (wrong dtype/shape, disabled, incapable
-    /// hardware, or `t` not a multiple of 64) so the caller falls back to
-    /// `LagunaSteelGemm` and then the naive `AnyLinear.callMany` path, in
-    /// that order. This is the one hook every call site in
-    /// `LagunaText.swift` / `MoELayer.swift` uses -- no per-call-site
-    /// re-derivation of the eligibility/dispatch logic.
+    /// `nil` when ineligible (wrong dtype/shape, disabled, or incapable
+    /// hardware) so the caller falls back to `LagunaSteelGemm` and then
+    /// the naive `AnyLinear.callMany` path, in that order. This is the
+    /// one hook every call site in `LagunaText.swift` / `MoELayer.swift`
+    /// uses -- no per-call-site re-derivation of the eligibility/
+    /// dispatch logic.
+    ///
+    /// M-padding (see `padMEnabled`'s header for the section-21 finding
+    /// motivating this): `t % 64 == 0` is a hard requirement of
+    /// `butter_dense_gemm_mpp_bf16`'s 64-row tiling, but it is a
+    /// requirement on the GEMM's row COUNT at dispatch time, not on the
+    /// real prefill length `t` itself. So when `shapeEligible` passes
+    /// (the weight shape/dtype/capability gate -- the part padding
+    /// *can't* fix) but `t` isn't 64-aligned, this pads the activation
+    /// with zero rows up to the next multiple of 64, dispatches MPP at
+    /// that padded M, and slices the real `t` rows back off before
+    /// returning.
+    ///
+    /// Correctness: for a GEMM `out[m,:] = a[m,:] @ w^T`, each output row
+    /// depends ONLY on its own input row `a[m,:]` -- there is no
+    /// cross-row reduction. Appending padding rows after row `t-1`
+    /// therefore cannot change rows `[0, t)` of the output; they come
+    /// out byte-identical to what an unpadded GEMM over just the real
+    /// rows would have produced (which is exactly what `steel`/naive
+    /// would have computed for those rows). The padding rows' own
+    /// (garbage-inconsequential, but zeroed here defensively so the
+    /// kernel never reads uninitialized/NaN memory) output rows are
+    /// simply discarded by the trailing `slicedRows`.
+    ///
+    /// Escape: BUTTER_LAGUNA_MPP_PAD_M=0 disables the pad path and
+    /// reverts to the pre-padding `eligible(t:...)`-gated behavior (MPP
+    /// only ever engages on already-64-aligned `t`), for A/B against
+    /// this change.
     static func tryMppGemm(
         _ linear: AnyLinear, x: Tensor, t: Int, outDim: Int, inDim: Int,
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor? {
-        guard let l = linear.inner as? Linear, l.weight.dtype == x.dtype,
-            eligible(t: t, outDim: outDim, inDim: inDim, dtype: x.dtype)
-        else { return nil }
-        return callMany(a: x, w: l.weight, m: t, n: outDim, k: inDim, on: cmd, device: device)
+        guard let l = linear.inner as? Linear, l.weight.dtype == x.dtype else { return nil }
+
+        guard padMEnabled else {
+            guard eligible(t: t, outDim: outDim, inDim: inDim, dtype: x.dtype) else { return nil }
+            return callMany(a: x, w: l.weight, m: t, n: outDim, k: inDim, on: cmd, device: device)
+        }
+
+        guard shapeEligible(outDim: outDim, inDim: inDim, dtype: x.dtype) else { return nil }
+
+        let t64 = ((t + 63) / 64) * 64
+        guard t64 != t else {
+            return callMany(a: x, w: l.weight, m: t, n: outDim, k: inDim, on: cmd, device: device)
+        }
+
+        // Pad `x` ([t, inDim]) up to `xPad` ([t64, inDim]): blit-copy the
+        // real `t` rows into `xPad`'s head, blit-fill the remaining
+        // `t64 - t` rows to zero. One blit encoder does both, ordered
+        // correctly against other GPU work already encoded on `cmd` --
+        // same idiom as the existing int8 M-pad-to-32 caller in
+        // `Hy3Text.swift` (`hy3Int8CallMany`, which pads to 32 the same
+        // way for MPP's int8 dequant-GEMM kernel). A CPU-side `Tensor.zero()`
+        // memset was deliberately NOT used here: it's only safe
+        // immediately after a fresh, GPU-untouched allocation (see
+        // `DecoderLayer.decodeMulti`'s header for that exact caveat) --
+        // unsafe in general mid-forward-pass where `xPad` may alias a
+        // reused scratch slab with GPU work still queued against it on
+        // this same `cmd`.
+        let xPad = Tensor.empty(shape: [t64, inDim], dtype: x.dtype, device: device)
+        let rowBytes = inDim * x.dtype.byteSize
+        let validBytes = t * rowBytes
+        let tailBytes = (t64 - t) * rowBytes
+        let blit = cmd.makeBlitCommandEncoder()!
+        blit.copy(
+            from: x.buffer, sourceOffset: x.offset,
+            to: xPad.buffer, destinationOffset: xPad.offset, size: validBytes)
+        blit.fill(
+            buffer: xPad.buffer,
+            range: (xPad.offset + validBytes) ..< (xPad.offset + validBytes + tailBytes),
+            value: 0)
+        blit.endEncoding()
+
+        // outPad is [t64, outDim]; slicedRows gives a contiguous [t,
+        // outDim] view (same buffer, offset 0, row-major -- no copy) of
+        // exactly the real rows, which is what every caller expects
+        // back.
+        let outPad = callMany(
+            a: xPad, w: l.weight, m: t64, n: outDim, k: inDim, on: cmd, device: device)
+        return outPad.slicedRows(start: 0, count: t)
     }
 }
