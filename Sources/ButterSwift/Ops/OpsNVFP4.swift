@@ -943,12 +943,85 @@ extension Ops {
         enc.endEncoding()
     }
 
+    /// Shared NAX cooperative-tensor dispatch for `nvfp4Qmm`'s aligned
+    /// and M-padded call paths -- BM=BN=32, TPG 128 (4 SG × 32), grid
+    /// `[out/32, m/32, 1]`. `m` here is whatever row count the caller
+    /// wants dispatched (the real `m` for the already-aligned path, the
+    /// padded `m32` for the pad path); `input`/`result` must have `m`
+    /// rows. Returns `false` for a dtype the NAX kernels don't cover
+    /// (caller falls back to the reduction kernel), `true` once the
+    /// kernel has been encoded on `cmd`.
+    private static func dispatchNaxQmm(
+        weight: Tensor, scales: Tensor, input: Tensor, result: Tensor,
+        m: Int, outDim: Int, inDim: Int,
+        blockSize: Int, global: Float,
+        on cmd: MTLCommandBuffer
+    ) -> Bool {
+        let tg = MTLSize(width: 128, height: 1, depth: 1)
+        let grid = MTLSize(width: outDim / 32, height: m / 32, depth: 1)
+        switch input.dtype {
+        case .f32:
+            IronKernels.iron_nvfp4_qmm_nax_f32_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                k: UInt32(inDim), n: UInt32(outDim),
+                block_size: UInt32(blockSize), global: global,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+            return true
+        case .f16:
+            IronKernels.iron_nvfp4_qmm_nax_f16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                k: UInt32(inDim), n: UInt32(outDim),
+                block_size: UInt32(blockSize), global: global,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+            return true
+        case .bf16:
+            IronKernels.iron_nvfp4_qmm_nax_bf16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                k: UInt32(inDim), n: UInt32(outDim),
+                block_size: UInt32(blockSize), global: global,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+            return true
+        default:
+            return false
+        }
+    }
+
     /// Dense NVFP4 QMM: `Y[M, out] = X[M, in] · dequant(W)[out, in]ᵀ`.
     ///
     /// Prefers NAX cooperative-tensor (`iron_nvfp4_qmm_nax_*`) when
     /// `m` and `outDim` are multiples of 32 (BM=BN=32, TPG=128, grid
     /// `[out/32, m/32, 1]`). Escape: `BUTTER_NVFP4_QMM_NAX=0`.
-    /// Falls back to the reduction kernel (TPG=64, one TG per out-row).
+    ///
+    /// M-padding: real prefill token counts are almost never a multiple
+    /// of 32, so gating NAX on `m % 32 == 0` directly meant it declined
+    /// for nearly every real prompt, paying the slower reduction-kernel
+    /// tax for the whole call over a remainder of at most 31 rows
+    /// (measured at aligned M=2688: NAX 1926 tok/s vs reduction 1315,
+    /// 1.46x). When `m` is 32-eligible-otherwise (`outDim`/`inDim` both
+    /// 32-aligned) but not itself 32-aligned, this pads the input with
+    /// zero rows up to the next multiple of 32, dispatches NAX at that
+    /// padded `m32`, and copies/slices just the real `m` rows back out
+    /// -- same idiom as `LagunaMppGemm.tryMppGemm`'s M-pad-to-64 path.
+    ///
+    /// Correctness: `out[m,:] = dequant(W)[out,:] · x[m,:]` -- each
+    /// output row depends only on its own input row, so appending zero
+    /// padding rows after row `m-1` cannot change rows `[0, m)` of the
+    /// output; they come out byte-identical to the unpadded reduction
+    /// kernel's result for those rows. The padding rows' own output is
+    /// simply discarded (sliced off, or never copied into `out`).
+    ///
+    /// Escape: `BUTTER_NVFP4_QMM_NAX_PAD=0` disables the pad and reverts
+    /// to the pre-pad behavior (NAX only engages on already-32-aligned
+    /// `m`), for A/B against this change.
     public static func nvfp4Qmm(
         weight: Tensor, scales: Tensor, input: Tensor,
         m: Int, blockSize: Int = 16, global: Float = 1.0,
@@ -966,42 +1039,63 @@ extension Ops {
         // prefill shapes (T=512, mid=512, hidden multiple of 32).
         let naxEnv = ProcessInfo.processInfo.environment["BUTTER_NVFP4_QMM_NAX"]
         let naxOn = naxEnv != "0" && naxEnv != "false"
+        let padEnv = ProcessInfo.processInfo.environment["BUTTER_NVFP4_QMM_NAX_PAD"]
+        let padEnabled = padEnv != "0"
+
+        if padEnabled, naxOn, m >= 32, m % 32 != 0, outDim % 32 == 0, inDim % 32 == 0 {
+            let m32 = ((m + 31) / 32) * 32
+            let rowBytes = inDim * input.dtype.byteSize
+            let validBytes = m * rowBytes
+            let tailBytes = (m32 - m) * rowBytes
+            let xPad = Tensor.empty(shape: [m32, inDim], dtype: input.dtype)
+            let padBlit = cmd.makeBlitCommandEncoder()!
+            padBlit.copy(
+                from: input.buffer, sourceOffset: input.offset,
+                to: xPad.buffer, destinationOffset: xPad.offset, size: validBytes)
+            padBlit.fill(
+                buffer: xPad.buffer,
+                range: (xPad.offset + validBytes) ..< (xPad.offset + validBytes + tailBytes),
+                value: 0)
+            padBlit.endEncoding()
+
+            let resultPad = Tensor.empty(shape: [m32, outDim], dtype: input.dtype)
+            if dispatchNaxQmm(
+                weight: weight, scales: scales, input: xPad, result: resultPad,
+                m: m32, outDim: outDim, inDim: inDim,
+                blockSize: blockSize, global: global, on: cmd)
+            {
+                if let out {
+                    // `into out:` contract: callers pass a pre-allocated
+                    // (often scratch) buffer and read straight out of it,
+                    // ignoring the return value -- see MoELayer.swift's
+                    // `_ = Ops.nvfp4Qmm(..., into: gu)` call sites. Copy
+                    // just the real `m` rows into `out`'s own buffer
+                    // rather than returning `resultPad`'s.
+                    let outRowBytes = outDim * input.dtype.byteSize
+                    let outBlit = cmd.makeBlitCommandEncoder()!
+                    outBlit.copy(
+                        from: resultPad.buffer, sourceOffset: resultPad.offset,
+                        to: out.buffer, destinationOffset: out.offset,
+                        size: m * outRowBytes)
+                    outBlit.endEncoding()
+                    return out
+                }
+                return resultPad.slicedRows(start: 0, count: m)
+            }
+            // Unsupported dtype for the NAX kernels: abandon the pad
+            // attempt (harmless -- xPad/resultPad just go unused) and
+            // fall through to the reduction kernel below at the
+            // original `m`/`result`, same as the aligned path's own
+            // `default: break` fallback.
+        }
+
         if naxOn, m >= 32, m % 32 == 0, outDim % 32 == 0, inDim % 32 == 0 {
-            let tg = MTLSize(width: 128, height: 1, depth: 1)
-            let grid = MTLSize(width: outDim / 32, height: m / 32, depth: 1)
-            switch input.dtype {
-            case .f32:
-                IronKernels.iron_nvfp4_qmm_nax_f32_threadgroups(
-                    w: weight.buffer, wOffset: weight.offset,
-                    scales: scales.buffer, scalesOffset: scales.offset,
-                    x: input.buffer, xOffset: input.offset,
-                    out: result.buffer, outOffset: result.offset,
-                    k: UInt32(inDim), n: UInt32(outDim),
-                    block_size: UInt32(blockSize), global: global,
-                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            if dispatchNaxQmm(
+                weight: weight, scales: scales, input: input, result: result,
+                m: m, outDim: outDim, inDim: inDim,
+                blockSize: blockSize, global: global, on: cmd)
+            {
                 return result
-            case .f16:
-                IronKernels.iron_nvfp4_qmm_nax_f16_threadgroups(
-                    w: weight.buffer, wOffset: weight.offset,
-                    scales: scales.buffer, scalesOffset: scales.offset,
-                    x: input.buffer, xOffset: input.offset,
-                    out: result.buffer, outOffset: result.offset,
-                    k: UInt32(inDim), n: UInt32(outDim),
-                    block_size: UInt32(blockSize), global: global,
-                    gridSize: grid, threadgroupSize: tg, on: cmd)
-                return result
-            case .bf16:
-                IronKernels.iron_nvfp4_qmm_nax_bf16_threadgroups(
-                    w: weight.buffer, wOffset: weight.offset,
-                    scales: scales.buffer, scalesOffset: scales.offset,
-                    x: input.buffer, xOffset: input.offset,
-                    out: result.buffer, outOffset: result.offset,
-                    k: UInt32(inDim), n: UInt32(outDim),
-                    block_size: UInt32(blockSize), global: global,
-                    gridSize: grid, threadgroupSize: tg, on: cmd)
-                return result
-            default:
-                break
             }
         }
 
