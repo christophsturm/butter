@@ -552,8 +552,18 @@ struct LagunaQmvSplitKTests {
 
             let got = out.toFloatArray()
             let (cos, maxAbsDiff) = cosAndMaxAbsDiff(expected, got)
+            // cos is the structural arbiter (a real reduction error shows
+            // here across many rows). maxAbsDiff uses the same magnitude-
+            // relative bound as the plain shapes: bf16 rounding of the
+            // gate softplus + product chain differs by a few ULP across
+            // GPU families (0.0 on M-series, up to ~1 percent of the
+            // output magnitude on the paravirtualized CI GPU), which a
+            // bare 0.05 falsely trips at this shape's ~O(70) magnitude.
+            let maxExpected = expected.reduce(0) { max($0, abs($1)) }
             #expect(cos > 0.99999, "cos=\(cos)")
-            #expect(maxAbsDiff < 0.05, "maxAbsDiff=\(maxAbsDiff)")
+            #expect(
+                maxAbsDiff < max(0.05, 0.02 * maxExpected),
+                "maxAbsDiff=\(maxAbsDiff) maxExpected=\(maxExpected)")
         }
     }
 
