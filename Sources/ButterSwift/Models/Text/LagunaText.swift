@@ -385,6 +385,24 @@ public enum LagunaHybrid: LagunaVariant {
                     + "(BUTTER_LAGUNA_LM_HEAD_PRUNE=0 to disable)\n",
                 stderr)
         }
+        // w21: build the planar int5 coarse copy from the BF16 lm_head weight
+        // when BUTTER_LAGUNA_LMHEAD_INT5=1. Untimed init; the range guard can
+        // decline (returns nil) and the prune keeps the MXFP8 arm. Only worth
+        // building when the prune can actually run (needs the BF16 head).
+        var lmHeadInt5: LagunaLmHeadPrune.LagunaInt5Coarse? = nil
+        if LagunaLmHeadPrune.int5Enabled,
+            let lin = lmHead.inner as? Linear,
+            lin.weight.dtype == .bf16,
+            lin.weight.shape == [100_352, 2048]
+        {
+            lmHeadInt5 = LagunaLmHeadPrune.LagunaInt5Coarse.build(
+                from: lin.weight, device: device)
+            fputs(
+                lmHeadInt5 != nil
+                    ? "[laguna] lm_head: int5 coarse copy built (w21, ~-36% coarse bytes)\n"
+                    : "[laguna] lm_head: int5 coarse copy declined; using MXFP8 arm\n",
+                stderr)
+        }
         // YaRN bounds from the *rotated* dim (partial_rotary 0.5 → 64 on
         // S-2.1). attn_factor comes from config.attention_factor (1.4852),
         // not the mscale/mscale_all_dim ratio (both 1.0 in the HF file).
@@ -414,6 +432,7 @@ public enum LagunaHybrid: LagunaVariant {
             finalNorm: finalNorm,
             lmHead: lmHead,
             lmHeadMxfp8: lmHeadMxfp8,
+            lmHeadInt5: lmHeadInt5,
             textConfig: tc,
             yarn: yarn,
             hidden: tc.hidden,
@@ -2895,6 +2914,9 @@ public final class LagunaModel: LanguageModel {
     public let lmHead: AnyLinear
     /// Optional MXFP8 coarse copy for decode prune.
     let lmHeadMxfp8: Mxfp8Linear?
+    /// Optional w21 planar int5 coarse copy (BUTTER_LAGUNA_LMHEAD_INT5=1);
+    /// swaps the coarse GEMV's byte layout, MXFP8 stays the fallback.
+    let lmHeadInt5: LagunaLmHeadPrune.LagunaInt5Coarse?
     let textConfig: LagunaTextConfig
     let yarn: Ops.RoPEYaRN
 
@@ -2911,6 +2933,7 @@ public final class LagunaModel: LanguageModel {
         finalNorm: RMSNorm,
         lmHead: AnyLinear,
         lmHeadMxfp8: Mxfp8Linear? = nil,
+        lmHeadInt5: LagunaLmHeadPrune.LagunaInt5Coarse? = nil,
         textConfig: LagunaTextConfig,
         yarn: Ops.RoPEYaRN,
         hidden: Int, nLayers: Int, nHeads: Int, nKVHeads: Int,
@@ -2922,6 +2945,7 @@ public final class LagunaModel: LanguageModel {
         self.finalNorm = finalNorm
         self.lmHead = lmHead
         self.lmHeadMxfp8 = lmHeadMxfp8
+        self.lmHeadInt5 = lmHeadInt5
         self.textConfig = textConfig
         self.yarn = yarn
         self.hidden = hidden
@@ -3106,7 +3130,8 @@ public final class LagunaModel: LanguageModel {
 
         return lagunaFinalNormLmHead(
             h: h, finalNorm: finalNorm, lmHead: lmHead,
-            lmHeadMxfp8: lmHeadMxfp8, on: cmd, device: device)
+            lmHeadMxfp8: lmHeadMxfp8, lmHeadInt5: lmHeadInt5,
+            on: cmd, device: device)
     }
 
     /// Chunked batched prefill: embed once, then per-layer `forwardMulti`
@@ -3270,7 +3295,8 @@ public final class LagunaModel: LanguageModel {
         let last = lastRowOut ?? h.slicedRows(start: n - 1, count: 1).reshaped(to: [hidden])
         return lagunaFinalNormLmHead(
             h: last, finalNorm: finalNorm, lmHead: lmHead,
-            lmHeadMxfp8: lmHeadMxfp8, on: cmd, device: device)
+            lmHeadMxfp8: lmHeadMxfp8, lmHeadInt5: lmHeadInt5,
+            on: cmd, device: device)
     }
 }
 
@@ -3281,6 +3307,7 @@ public final class LagunaModel: LanguageModel {
 private func lagunaFinalNormLmHead(
     h: Tensor, finalNorm: RMSNorm, lmHead: AnyLinear,
     lmHeadMxfp8: Mxfp8Linear? = nil,
+    lmHeadInt5: LagunaLmHeadPrune.LagunaInt5Coarse? = nil,
     on cmd: MTLCommandBuffer,
     device: Device = .shared
 ) -> Tensor {
@@ -3326,7 +3353,7 @@ private func lagunaFinalNormLmHead(
         // computes it.
         return LagunaLmHeadPrune.logits(
             normed: normed, mx: mx, bf16Weight: lin.weight,
-            on: cmd, device: device)
+            int5: lmHeadInt5, on: cmd, device: device)
     }
     return lmHead(normed, on: cmd)
 }

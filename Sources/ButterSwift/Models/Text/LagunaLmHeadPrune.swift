@@ -29,6 +29,42 @@
 // DEFAULT ON. Escape: BUTTER_LAGUNA_LMHEAD_INLINE_MASK=0 (restores the
 // original four-dispatch coarse_bf/select/exact path above, byte-identical
 // to pre-T29).
+//
+// w21: INT5-planar alternative coarse copy. DEFAULT OFF, opt in with
+// BUTTER_LAGUNA_LMHEAD_INT5=1 (author-time port, not yet A/B'd on real
+// decode traffic -- flip default only after a paired gate-off measurement
+// per this repo's convention). Where the MXFP8 arm above reads an offline
+// sidecar file (2112 B/row: 2048 e4m3 code bytes + 64 e8m0 scale bytes),
+// this arm builds a 1344 B/row copy AT MODEL LOAD directly from the
+// resident BF16 `lm_head` weight (`LagunaInt5Coarse.build`, no extra file
+// needed): a 4-bit nibble plane (1024 B/row) + a 1-bit high plane
+// (256 B/row) + the same per-32-element e8m0 group scale (64 B/row),
+// -36.4% coarse bytes. Each element is a signed 5-bit offset-binary code
+// (`nibble | (highbit << 4)`, decoded as `q = u - 16`) instead of a full
+// e4m3 byte.
+//
+// The int5 coarse kernel (`int5InlineCoarseSrc`) emits the SAME two f32
+// outputs (coarse, delta) with the SAME `d*(1+GAMMA) + 2*GAMMA*m` bound as
+// the MXFP8 inline coarse kernel -- only the per-element quantization terms
+// change to the int5 alphabet (flat half-cell 0.5 in ratio units, and
+// |what| = |q|; see `int5InlineCoarseSrc`'s doc for the re-derived, still
+// certified-conservative bound). The inline-mask EXACT pass (step 3) is
+// reused UNCHANGED, since it only consumes the (coarse, delta, thr,
+// lm_head, x) contract both arms satisfy identically.
+//
+// Step 2 (the threshold) is NOT reused as-is: int5's `delta` is
+// systematically wider than MXFP8's (a flat 0.5 half-cell vs the tighter
+// per-code `laguna_hs8` table), and the shared `L = max(coarse - delta)`
+// reduction folds every row's OWN delta into the threshold, so a wider
+// delta alone would widen the candidate set well beyond what the same
+// `|L|/64` margin gives the MXFP8 arm. `int5WinnerThresholdSrc` swaps in
+// an EXACT-WINNER threshold instead: locate a row via a coarse-only
+// argmax, then recompute that ONE row's exact BF16 logit in the same
+// dispatch and threshold against it directly -- removing every row's
+// delta from the threshold computation, not just widening the margin
+// around it. See `LagunaInt5Coarse` and its `build` for the planar layout
+// and the init-time range guard that declines back to the MXFP8 arm if
+// the tensor ever produces |q| > 15.
 
 import Foundation
 import Metal
@@ -47,6 +83,19 @@ enum LagunaLmHeadPrune {
     /// below for the kill switch and same-binary A/B).
     static var inlineMaskEnabled: Bool {
         ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LMHEAD_INLINE_MASK"] != "0"
+    }
+
+    /// w21: DEFAULT OFF. Set `BUTTER_LAGUNA_LMHEAD_INT5=1` to swap the coarse
+    /// copy's byte layout from the 1 byte/value MXFP8 sidecar to a planar
+    /// int5 copy (nibble plane + 1-bit plane + e8m0 group scale = 1344 B/row,
+    /// about -36% coarse bytes; see `LagunaInt5Coarse`). The certified bound,
+    /// the L/threshold reduction and the exact-assembly stage are all
+    /// UNCHANGED -- only the coarse GEMV reads a smaller weight copy and folds
+    /// the int5 half-cell into the same `d*(1+GAMMA) + 2*GAMMA*m` delta. Only
+    /// consulted on the inline-mask path and only when the sidecar was built
+    /// at init (the range guard can decline it); otherwise the MXFP8 arm runs.
+    static var int5Enabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LMHEAD_INT5"] == "1"
     }
 
     /// T29 diagnosis-only probe: prints `[laguna-lmhead-diag] candidates=K`
@@ -562,6 +611,196 @@ enum LagunaLmHeadPrune {
     }
     """
 
+    // w21: int5-planar coarse GEMV. Same per-row shape as the MXFP8
+    // `inlineCoarseSrc` above (one simdgroup per row, 32 lanes, 2 groups per
+    // lane, `simd_sum` reduction, `laguna_e8m0_decode` group scale) and the
+    // SAME two f32 outputs (coarse, delta) with the SAME
+    // `d*(1+GAMMA) + 2*GAMMA*m` bound -- so the L/threshold reduction and the
+    // inline exact pass below consume it unchanged. Only the coarse copy's
+    // byte layout differs: instead of one e4m3 byte per value it reads a 4-bit
+    // nibble plane (codes_lo, 1024 B/row, uint4 per lane-group at g*16) plus a
+    // 1-bit plane (codes_hi, 256 B/row, one uint per lane-group at g*4),
+    // decoding each value as offset-binary u-16 in [-15, 15] (see
+    // `LagunaInt5Coarse.build`). Because the int5 alphabet is the flat integer
+    // lattice q in ratio (w/sd) units, the half-cell is a constant 0.5 (vs the
+    // MXFP8 per-code `laguna_hs8`) and |decode| in ratio units is |q| (vs
+    // `laguna_e4m3_decode`): the certificate is identical in structure with
+    // those two substitutions. d_i = sum_g sd_g * sum_{j in g} |x_j| * 0.5
+    // >= sum_j |x_j| * |w_ij - sd_g*q_ij| (exact flat half-cell, sd a power of
+    // two, |q| <= 15 by the init guard), and m_i = sum_g sd_g * sum_j |x_j| *
+    // |q_ij| = sum_j |x_j| * |what_ij|, so delta_i = d_i*(1+GAMMA) +
+    // 2*GAMMA*m_i is the same certified upper bound on |exact_i - coarse_i|
+    // (int5 accumulation depth ~45 roundings/element-path << the GAMMA = 2^-15
+    // budget, exactly as on the MXFP8 arm).
+    private static let int5InlineCoarseSrc = header + """
+    kernel void laguna_lmhead_int5_inline_coarse(
+        device const bfloat *x [[buffer(0)]],
+        device const uchar *codes_lo [[buffer(1)]],
+        device const uchar *codes_hi [[buffer(2)]],
+        device const uchar *scales [[buffer(3)]],
+        device float *coarse [[buffer(4)]],
+        device float *delta [[buffer(5)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        uint sgid [[simdgroup_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]]) {
+        constexpr float GAMMA = 0x1p-15f;
+        uint row = tgid * 8u + sgid;
+        if (row >= 100352u) return;
+
+        const device uchar* lorow = codes_lo + size_t(row) * 1024u;
+        const device uchar* hirow = codes_hi + size_t(row) * 256u;
+        const device uchar* srow = scales + size_t(row) * 64u;
+
+        float c_acc = 0.0f;
+        float d_acc = 0.0f;
+        float m_acc = 0.0f;
+        for (uint gg = 0; gg < 2u; ++gg) {
+            uint g = 2u * lane + gg;
+            float sd = laguna_e8m0_decode(srow[g]);
+            uint4 lo4 = ((const device uint4*)(lorow + g * 16u))[0];
+            uint hb = ((const device uint*)(hirow + g * 4u))[0];
+            const device ushort4* xrow = (const device ushort4*)(x + g * 32u);
+            float cg = 0.0f;
+            float dg = 0.0f;
+            float mg = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint w = 0; w < 4u; ++w) {
+                // Word w: elements 8w..8w+7 of the group. Nibble plane byte b
+                // holds elements 2b (low) / 2b+1 (high); 1-bit plane bit j of
+                // the group's word holds element j's bit 4.
+                uint lw = lo4[w];
+                uint hw = hb >> (8u * w);
+                uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
+                uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
+                uint4 he = (uint4(hw) >> uint4(0u, 2u, 4u, 6u)) & 1u;
+                uint4 ho = (uint4(hw) >> uint4(1u, 3u, 5u, 7u)) & 1u;
+                // Offset-binary decode: value = u - 16 in [-15, 15], exact.
+                float4 ve = float4(ne | (he << 4u)) - 16.0f;
+                float4 vo = float4(no | (ho << 4u)) - 16.0f;
+                // bf16 -> f32 is exactly bits<<16 for every value class.
+                float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+                float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+                float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+                float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+                float4 axe = metal::abs(xe);
+                float4 axo = metal::abs(xo);
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 4u; ++k) {
+                    cg += xe[k] * ve[k];
+                    cg += xo[k] * vo[k];
+                    // Flat int5 half-cell: |w/sd - q| <= 0.5 for every element.
+                    dg += axe[k] * 0.5f;
+                    dg += axo[k] * 0.5f;
+                    // Rounding-cover term: |what| in ratio units is |q|.
+                    mg += axe[k] * metal::abs(ve[k]);
+                    mg += axo[k] * metal::abs(vo[k]);
+                }
+            }
+            c_acc += sd * cg;
+            d_acc += sd * dg;
+            m_acc += sd * mg;
+        }
+        c_acc = simd_sum(c_acc);
+        d_acc = simd_sum(d_acc);
+        m_acc = simd_sum(m_acc);
+        if (lane == 0) {
+            coarse[row] = c_acc;
+            delta[row] = d_acc * (1.0f + GAMMA) + (2.0f * GAMMA) * m_acc;
+        }
+    }
+    """
+
+    // w21: EXACT-WINNER threshold, int5 arm only. The int5 coarse kernel's
+    // `delta` is systematically wider than the MXFP8 arm's (flat 0.5 half-
+    // cell vs the tighter per-code `laguna_hs8` table), and `maxThrSrc`
+    // above folds every row's OWN delta into `L = max(coarse - delta)`
+    // before subtracting the safety margin -- so a wider delta pulls `L`
+    // down and widens `thr`'s candidate set for every row, not just the
+    // ones that actually need the slack. This kernel removes `delta` from
+    // the threshold entirely: single-TG strided argmax over `coarse` alone
+    // (same reduction shape as `laguna_lmhead_max_thr`, just tracking an
+    // index alongside the value) locates a row `r`, then the SAME dispatch
+    // recomputes `r`'s exact BF16 logit `e_r` with a textual replica of
+    // `laguna_lmhead_exact_inline_mask_block`'s per-row GEMV body (same
+    // 32-lane partition, same 16 strided vec4 loads, same sequential f32
+    // accumulation, same simd_shuffle_down tree) and emits
+    // `thr = e_r - |e_r|/64` -- the same BF16-cast safety margin as
+    // `laguna_lmhead_max_thr`, just anchored on one exact row instead of
+    // every row's coarse-minus-delta.
+    //
+    // Soundness holds for ANY row `r`, not just the argmax-of-coarse pick:
+    // `e_r <= max_i e_i` trivially, since `e_r` is one term of that max, and
+    // that is the ONLY property of the old `L` the downstream candidacy
+    // proof uses (see `maskNonCandidates`'s doc: `exact[i] <= coarse[i] +
+    // delta[i] < thr = L - |L|/64 <= true_max - |L|/64`, substitute `e_r`
+    // for `L` verbatim). So the coarse-argmax choice here is purely a
+    // TIGHTNESS heuristic -- a row whose exact logit is likely close to the
+    // true winner gives a threshold close to the ideal `L` -- never a
+    // correctness requirement; a NaN or duplicate-max `coarse` still yields
+    // SOME valid row index and the proof goes through unchanged.
+    private static let int5WinnerThresholdSrc = header + """
+    kernel void laguna_lmhead_int5_winner_threshold(
+        device const float *coarse [[buffer(0)]],
+        device const bfloat *lm_head [[buffer(1)]],
+        device const bfloat *x [[buffer(2)]],
+        device float *thr [[buffer(3)]],
+        threadgroup float *sh_val [[threadgroup(0)]],
+        threadgroup uint *sh_idx [[threadgroup(1)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint sgid [[simdgroup_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]]) {
+        constexpr uint VOCAB = 100352u;
+        constexpr uint K = 2048u;
+        constexpr uint TG = 256u;
+
+        float bestV = -metal::numeric_limits<float>::infinity();
+        uint bestI = 0u;
+        for (uint i = tid; i < VOCAB; i += TG) {
+            float v = coarse[i];
+            if (v > bestV) {
+                bestV = v;
+                bestI = i;
+            }
+        }
+        sh_val[tid] = bestV;
+        sh_idx[tid] = bestI;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = TG / 2u; s > 0u; s >>= 1u) {
+            if (tid < s && sh_val[tid + s] > sh_val[tid]) {
+                sh_val[tid] = sh_val[tid + s];
+                sh_idx[tid] = sh_idx[tid + s];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        uint r = sh_idx[0];
+
+        // Exact GEMV of row r, simdgroup 0 only -- textually the same
+        // per-row body as `laguna_lmhead_exact_inline_mask_block`'s
+        // candidate path above.
+        if (sgid == 0u) {
+            float result = 0.0f;
+            uint bn = lane * 4u;
+            const device bfloat* mrow = lm_head + size_t(r) * K;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 16u; ++i) {
+                vec<bfloat, 4> xv = *((const device vec<bfloat, 4>*)(x + bn));
+                vec<bfloat, 4> mv = *((const device vec<bfloat, 4>*)(mrow + bn));
+                result += float(mv.x) * float(xv.x) + float(mv.y) * float(xv.y)
+                        + float(mv.z) * float(xv.z) + float(mv.w) * float(xv.w);
+                bn += 128u;
+            }
+            #pragma clang loop unroll(full)
+            for (ushort sn = 16; sn >= 1; sn >>= 1) {
+                result += simd_shuffle_down(result, sn);
+            }
+            if (lane == 0u) {
+                float e_r = result;
+                thr[0] = e_r - metal::abs(e_r) * (1.0f / 64.0f);
+            }
+        }
+    }
+    """
+
     // T29 inline-mask exact pass. Folds SELECTION into EXACT: each
     // simdgroup recomputes `coarse[r] + delta[r] >= thr[0]` itself for its
     // fixed 4-row block instead of reading a precomputed `is_cand[r]` byte,
@@ -657,12 +896,138 @@ enum LagunaLmHeadPrune {
         return p
     }
 
+    /// w21: planar int5 coarse copy of the lm_head weight. Same certified
+    /// two-pass role as the MXFP8 `Mxfp8Linear` sidecar, at ~0.66 byte/value:
+    /// a 4-bit nibble plane (`codesLo`, 1024 B/row) + a 1-bit plane
+    /// (`codesHi`, 256 B/row) + a per-32-element e8m0 group scale byte
+    /// (`scales`, 64 B/row) = 1344 B/row, vs the MXFP8 copy's 2048 code bytes +
+    /// 64 scale bytes = 2112 B/row (about -36% coarse bytes). Built once from
+    /// the BF16 weight at init and only when `int5Enabled`; the MXFP8 sidecar
+    /// stays the default/fallback. Consumed by `int5InlineCoarseSrc` above.
+    struct LagunaInt5Coarse {
+        let codesLo: Tensor  // u8 [vocab, kDim/2]  nibble plane
+        let codesHi: Tensor  // u8 [vocab, kDim/8]  1-bit plane
+        let scales: Tensor   // u8 [vocab, kDim/32] e8m0 group scale bytes
+
+        /// Symmetric int5 quantize + planar pack, laid out so
+        /// `int5InlineCoarseSrc` decodes it bit-for-bit (this is the
+        /// CPU/Tensor translation of the reference `buildInt5Planes` MLX ops).
+        ///
+        /// Scale rule (per 32-element group, gmax = max|w|): sd = 2^e with
+        /// e = floor_exp(gmax) - 3, bumped one exponent when the gmax mantissa
+        /// is >= 1.9375 (bit test mant >= 0x780000), so gmax/sd < 15.5 EXACTLY
+        /// (8m < 15.5 when m < 1.9375; 4m < 8 otherwise). Then q = round(w/sd)
+        /// -- the quotient is EXACT because sd is a power of two -- has
+        /// |q| <= 15 with a flat half-cell |w - sd*q| <= sd/2. The scale byte
+        /// carries e8m0 semantics (decoded by the shared `laguna_e8m0_decode`).
+        ///
+        /// RANGE GUARD (mirrors the reference): the no-overflow property is
+        /// re-verified on the actual tensor; if any element would need |q| > 15
+        /// (a 6th magnitude bit, which would make u = q + 16 leave [1, 31] and
+        /// break the kernel's certified bound) the build declines and returns
+        /// nil, so the caller keeps the MXFP8 arm.
+        ///
+        /// Untimed init and gated OFF by default, so this per-row CPU pass over
+        /// the 100352 x 2048 weight is paid only when `BUTTER_LAGUNA_LMHEAD_INT5=1`.
+        static func build(from weight: Tensor, device: Device) -> LagunaInt5Coarse? {
+            precondition(weight.dtype == .bf16 && weight.shape == [vocab, kDim])
+            let groups = kDim / 32  // 64
+            let loBytes = kDim / 2  // 1024
+            let hiBytes = kDim / 8  // 256
+
+            let loBuf = device.makeBuffer(length: vocab * loBytes)
+            let hiBuf = device.makeBuffer(length: vocab * hiBytes)
+            let scBuf = device.makeBuffer(length: vocab * groups)
+
+            let wPtr = weight.buffer.contents().advanced(by: weight.offset)
+                .assumingMemoryBound(to: UInt16.self)
+            let loPtr = loBuf.contents().assumingMemoryBound(to: UInt8.self)
+            let hiPtr = hiBuf.contents().assumingMemoryBound(to: UInt8.self)
+            let scPtr = scBuf.contents().assumingMemoryBound(to: UInt8.self)
+
+            var u = [UInt8](repeating: 0, count: kDim)  // offset-binary, one row
+            var overflow = false
+            for row in 0 ..< vocab {
+                let wRow = wPtr + row * kDim
+                let scRow = scPtr + row * groups
+                for g in 0 ..< groups {
+                    let base = g * 32
+                    var gmax: Float = 0
+                    for j in 0 ..< 32 {
+                        let a = abs(Float(bitPattern: UInt32(wRow[base + j]) << 16))
+                        if a > gmax { gmax = a }
+                    }
+                    // e8m0 scale byte: exponent(gmax) - 3, +1 when mant >= 1.9375.
+                    let gbits = gmax.bitPattern
+                    let biasedE = Int(gbits >> 23)
+                    let mant = gbits & 0x007F_FFFF
+                    let bump = (mant >= 0x0078_0000) ? 1 : 0
+                    var sdByte = biasedE - 3 + bump
+                    if sdByte < 0 { sdByte = 0 }
+                    if sdByte > 255 { sdByte = 255 }
+                    scRow[g] = UInt8(sdByte)
+                    let sd =
+                        (sdByte == 0)
+                        ? Float(bitPattern: 0x0040_0000)  // 2^-127, e8m0 semantics
+                        : Float(bitPattern: UInt32(sdByte) << 23)
+                    for j in 0 ..< 32 {
+                        let f = Float(bitPattern: UInt32(wRow[base + j]) << 16)
+                        let q = (f / sd).rounded(.toNearestOrEven)
+                        if abs(q) > 15 { overflow = true }
+                        u[base + j] = UInt8(truncatingIfNeeded: Int(q) + 16)
+                    }
+                }
+                if overflow { break }
+                // Planar pack this row. Nibble plane: byte b = low 4 bits of the
+                // even element (2b) in the low nibble, of the odd element (2b+1)
+                // in the high nibble. 1-bit plane: byte s = bit 4 of elements
+                // 8s..8s+7, one per bit position. (Global-linear layout; the
+                // group scale is the only per-group quantity.)
+                let loRow = loPtr + row * loBytes
+                for b in 0 ..< loBytes {
+                    loRow[b] = (u[2 * b] & 0x0F) | ((u[2 * b + 1] & 0x0F) << 4)
+                }
+                let hiRow = hiPtr + row * hiBytes
+                for s in 0 ..< hiBytes {
+                    var byte: UInt8 = 0
+                    for p in 0 ..< 8 {
+                        byte |= ((u[8 * s + p] >> 4) & 1) << p
+                    }
+                    hiRow[s] = byte
+                }
+            }
+            guard !overflow else {
+                FileHandle.standardError.write(
+                    Data(
+                        "[laguna] lm_head int5: code overflow (|q|>15); using MXFP8 arm\n"
+                            .utf8))
+                return nil
+            }
+            // Loaded straight into a host-built buffer (not the GGUF mmap-view
+            // residency path), read every decode-prune pass -- pin it, exactly
+            // like the MXFP8 sidecar in `lagunaLoadMxfp8LmHead`.
+            device.markWeightsResident([loBuf, hiBuf, scBuf])
+            return LagunaInt5Coarse(
+                codesLo: Tensor(
+                    buffer: loBuf, offset: 0, shape: [vocab, loBytes], dtype: .u8),
+                codesHi: Tensor(
+                    buffer: hiBuf, offset: 0, shape: [vocab, hiBytes], dtype: .u8),
+                scales: Tensor(
+                    buffer: scBuf, offset: 0, shape: [vocab, groups], dtype: .u8))
+        }
+    }
+
     /// Pruned decode head. `normed` is post-finalNorm hidden [hidden] bf16.
     /// `mx` is MXFP8 sidecar; `bf16Weight` is full BF16 lm_head [vocab, hidden].
+    /// `int5` is the optional w21 planar int5 coarse copy: when present and
+    /// `int5Enabled`, the inline-mask path reads it for the coarse GEMV instead
+    /// of `mx`, producing the same `coarse`/`delta` the rest of the pass
+    /// consumes. `mx` is still the fallback and drives every other path.
     static func logits(
         normed: Tensor,
         mx: Mxfp8Linear,
         bf16Weight: Tensor,
+        int5: LagunaInt5Coarse? = nil,
         on cmd: MTLCommandBuffer,
         device: Device
     ) -> Tensor {
@@ -674,35 +1039,86 @@ enum LagunaLmHeadPrune {
         let delta = Tensor.empty(shape: [vocab], dtype: .f32, device: device)
 
         if inlineMaskEnabled {
-            // T29: 1) inline coarse (coarse, delta only, no coarse_bf store)
-            let coarsePSO = pso(
-                "laguna_lmhead_inline_coarse_v2", source: inlineCoarseSrc, device: mtl)
-            if let enc = cmd.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(coarsePSO)
-                enc.setBuffer(normed.buffer, offset: normed.offset, index: 0)
-                enc.setBuffer(mx.weight.buffer, offset: mx.weight.offset, index: 1)
-                enc.setBuffer(mx.scales.buffer, offset: mx.scales.offset, index: 2)
-                enc.setBuffer(coarse.buffer, offset: coarse.offset, index: 3)
-                enc.setBuffer(delta.buffer, offset: delta.offset, index: 4)
-                enc.dispatchThreadgroups(
-                    MTLSize(width: (vocab + 7) / 8, height: 1, depth: 1),
-                    threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-                enc.endEncoding()
+            // T29: 1) inline coarse (coarse, delta only, no coarse_bf store).
+            // w21: when the int5 sidecar is built and enabled, read the smaller
+            // planar int5 coarse copy instead of the MXFP8 codes/scales; both
+            // emit the SAME f32 `coarse`/`delta` so steps 2/3 below are
+            // untouched. The MXFP8 kernel is the default/fallback arm.
+            if int5Enabled, let i5 = int5 {
+                let coarsePSO = pso(
+                    "laguna_lmhead_int5_inline_coarse",
+                    source: int5InlineCoarseSrc, device: mtl)
+                if let enc = cmd.makeComputeCommandEncoder() {
+                    enc.setComputePipelineState(coarsePSO)
+                    enc.setBuffer(normed.buffer, offset: normed.offset, index: 0)
+                    enc.setBuffer(i5.codesLo.buffer, offset: i5.codesLo.offset, index: 1)
+                    enc.setBuffer(i5.codesHi.buffer, offset: i5.codesHi.offset, index: 2)
+                    enc.setBuffer(i5.scales.buffer, offset: i5.scales.offset, index: 3)
+                    enc.setBuffer(coarse.buffer, offset: coarse.offset, index: 4)
+                    enc.setBuffer(delta.buffer, offset: delta.offset, index: 5)
+                    enc.dispatchThreadgroups(
+                        MTLSize(width: (vocab + 7) / 8, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                    enc.endEncoding()
+                }
+            } else {
+                let coarsePSO = pso(
+                    "laguna_lmhead_inline_coarse_v2", source: inlineCoarseSrc, device: mtl)
+                if let enc = cmd.makeComputeCommandEncoder() {
+                    enc.setComputePipelineState(coarsePSO)
+                    enc.setBuffer(normed.buffer, offset: normed.offset, index: 0)
+                    enc.setBuffer(mx.weight.buffer, offset: mx.weight.offset, index: 1)
+                    enc.setBuffer(mx.scales.buffer, offset: mx.scales.offset, index: 2)
+                    enc.setBuffer(coarse.buffer, offset: coarse.offset, index: 3)
+                    enc.setBuffer(delta.buffer, offset: delta.offset, index: 4)
+                    enc.dispatchThreadgroups(
+                        MTLSize(width: (vocab + 7) / 8, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                    enc.endEncoding()
+                }
             }
 
-            // 2) thr = max(coarse - delta) - |L|/64 (single TG reduction)
+            // 2) threshold. w21: the int5 arm swaps in the EXACT-WINNER
+            // threshold (`int5WinnerThresholdSrc`) instead of the shared
+            // `L = max(coarse - delta)` reduction below -- int5's wider,
+            // flat-half-cell `delta` would otherwise get folded into `L`
+            // for every row, not just the ones that need the slack, and
+            // widen the candidate set well beyond what the MXFP8 arm sees
+            // at the same `thr` margin (see the kernel's doc above). Both
+            // arms still produce the same single-scalar `thrBuf` that step
+            // 3 below consumes identically.
             let thrBuf = Tensor.empty(shape: [1], dtype: .f32, device: device)
-            let maxPSO = pso("laguna_lmhead_max_thr", source: maxThrSrc, device: mtl)
-            if let enc = cmd.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(maxPSO)
-                enc.setBuffer(coarse.buffer, offset: coarse.offset, index: 0)
-                enc.setBuffer(delta.buffer, offset: delta.offset, index: 1)
-                enc.setBuffer(thrBuf.buffer, offset: thrBuf.offset, index: 2)
-                enc.setThreadgroupMemoryLength(256 * 4, index: 0)
-                enc.dispatchThreadgroups(
-                    MTLSize(width: 1, height: 1, depth: 1),
-                    threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-                enc.endEncoding()
+            if int5Enabled, int5 != nil {
+                let winnerPSO = pso(
+                    "laguna_lmhead_int5_winner_threshold",
+                    source: int5WinnerThresholdSrc, device: mtl)
+                if let enc = cmd.makeComputeCommandEncoder() {
+                    enc.setComputePipelineState(winnerPSO)
+                    enc.setBuffer(coarse.buffer, offset: coarse.offset, index: 0)
+                    enc.setBuffer(bf16Weight.buffer, offset: bf16Weight.offset, index: 1)
+                    enc.setBuffer(normed.buffer, offset: normed.offset, index: 2)
+                    enc.setBuffer(thrBuf.buffer, offset: thrBuf.offset, index: 3)
+                    enc.setThreadgroupMemoryLength(256 * 4, index: 0)
+                    enc.setThreadgroupMemoryLength(256 * 4, index: 1)
+                    enc.dispatchThreadgroups(
+                        MTLSize(width: 1, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                    enc.endEncoding()
+                }
+            } else {
+                // thr = max(coarse - delta) - |L|/64 (single TG reduction)
+                let maxPSO = pso("laguna_lmhead_max_thr", source: maxThrSrc, device: mtl)
+                if let enc = cmd.makeComputeCommandEncoder() {
+                    enc.setComputePipelineState(maxPSO)
+                    enc.setBuffer(coarse.buffer, offset: coarse.offset, index: 0)
+                    enc.setBuffer(delta.buffer, offset: delta.offset, index: 1)
+                    enc.setBuffer(thrBuf.buffer, offset: thrBuf.offset, index: 2)
+                    enc.setThreadgroupMemoryLength(256 * 4, index: 0)
+                    enc.dispatchThreadgroups(
+                        MTLSize(width: 1, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                    enc.endEncoding()
+                }
             }
 
             // T29 diagnosis-only probe (BUTTER_LAGUNA_LMHEAD_DIAG=1): count

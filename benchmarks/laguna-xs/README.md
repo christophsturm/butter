@@ -4995,3 +4995,15 @@ fused kernel compiles fastMath=false to keep its three phases FP-stable;
 vs the stock fastMath chain it is cos>=0.99999999 (worst 6.1e-5/elem,
 h64), within the cos gate, not bit-exact. Regression suite: 12 cases,
 h48/h64, history 0-513 incl. past-window-wrap.
+
+#### int5-planar lm_head coarse copy: -36% coarse bytes, byte-identical
+
+BUTTER_LAGUNA_LMHEAD_INT5=1 (default OFF) swaps the certified 2-pass
+prune's coarse copy from the MXFP8 sidecar (2112 B/row) to an int5-planar
+layout built at load from the resident BF16 weight (nibble plane + 1-bit
+plane + e8m0 group scale = 1344 B/row, -36.4%; full-vocab resident 211.9
+-> 134.9 MB; per-token coarse read -77 MB). The delta bound keeps the
+same certified three-accumulator closed form with int5's flat half-cell
+terms; an int5-specific exact-winner threshold keeps the candidate set
+tight. Exact stage unchanged. Digest-verified byte-identical to the
+default path (off == int5 == base, temp-0, 200 tokens).
