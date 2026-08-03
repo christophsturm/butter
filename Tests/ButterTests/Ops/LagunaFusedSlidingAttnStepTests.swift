@@ -129,11 +129,13 @@ struct LagunaFusedSlidingAttnStepTests {
             let rawV = randomBf16([nKVHeads * headDim], seed: &seed)
             let position = historyLen
 
+            // Default is ON; `=0` must disable (opt-out contract).
+            setenv("BUTTER_LAGUNA_FUSED_ATTN_STEP", "0", 1)
             #expect(
                 LagunaFusedSlidingAttnStep.canFuse(
                     isSliding: true, rotaryDim: headDim, headDim: headDim,
                     nHeads: nHeads, nKVHeads: nKVHeads, dtype: .bf16) == false,
-                "canFuse should require BUTTER_LAGUNA_FUSED_ATTN_STEP=1 (default OFF)")
+                "BUTTER_LAGUNA_FUSED_ATTN_STEP=0 must disable the fused step")
 
             setenv("BUTTER_LAGUNA_FUSED_ATTN_STEP", "1", 1)
             defer { unsetenv("BUTTER_LAGUNA_FUSED_ATTN_STEP") }
