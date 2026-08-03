@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// `BUTTER_LAGUNA_FUSED_ATTN_STEP=1` (default OFF, opt-in): collapses
+// `BUTTER_LAGUNA_FUSED_ATTN_STEP` (default ON; set =0 to disable): collapses
 // the sliding-layer decode attention chain [fused QK-norm+RoPE
 // dispatch] -> [KV cache append, 2 dispatches on one encoder] ->
 // [GQA2 SDPA dispatch] into ONE Metal dispatch per layer per decode
@@ -172,11 +172,13 @@ import Metal
 import IronSwift
 
 enum LagunaFusedSlidingAttnStep {
-    /// Default OFF (opt-in, `== "1"`) -- unlike most levers in this
-    /// file family, this one has not been validated on the hardware
-    /// gates yet.
+    /// Default ON (`=0` to disable). Validated on the hardware gates:
+    /// 12-case regression suite (h48/h64, history 0-513 incl.
+    /// past-window-wrap), cos >= 0.99999999 vs the stock chain (worst
+    /// 6.1e-5/elem), digest-stable across runs, and paired ABBA on the
+    /// merged tree measured 85.3 vs 70.9 tok/s stock (+20% decode).
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_FUSED_ATTN_STEP"] == "1"
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_FUSED_ATTN_STEP"] != "0"
     }
 
     /// Sliding-layer decode only: full rotary, head_dim 128, bf16,

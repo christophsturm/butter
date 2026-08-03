@@ -5007,3 +5007,17 @@ same certified three-accumulator closed form with int5's flat half-cell
 terms; an int5-specific exact-winner threshold keeps the candidate set
 tight. Exact stage unchanged. Digest-verified byte-identical to the
 default path (off == int5 == base, temp-0, 200 tokens).
+
+#### Fused decode attention step: DEFAULT ON (+20% decode on the merged tree)
+
+Stacked ABBA on the merged tree: stock 69-72, fused 84-87 tok/s (+20%).
+Flipping BUTTER_LAGUNA_FUSED_ATTN_STEP to default ON (=0 to disable).
+Numerics unchanged from the feature PR: cos >= 0.99999999 vs stock,
+digest-stable, 12-case suite green.
+
+Also measured: stacking BUTTER_LAGUNA_LMHEAD_INT5=1 on the fused profile
+REGRESSES to 62-73 tok/s - the int5 coarse ALU cost plus its extra
+winner-threshold dispatch are exposed once attention dispatches shrink.
+int5 stays default OFF, reframed as a memory-footprint option; rework
+(fold the winner threshold into the coarse kernel, revisit geometry)
+queued before any latency claim.
