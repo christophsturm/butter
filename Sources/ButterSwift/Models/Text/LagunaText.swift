@@ -1534,6 +1534,21 @@ final class LagunaLayer {
                 isSliding: isSliding, rotaryDim: rotaryDim, headDim: headDim,
                 nHeads: nHeads, nKVHeads: nKVHeads, dtype: q.dtype)
 
+        // F-fullattn: BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP (default OFF,
+        // opt-in) is the full-attention twin of the sliding fusion
+        // above: collapses [RMSNorm + partial YaRN RoPE] -> [KV
+        // append] -> [GQA2 SDPA] into ONE dispatch for full-attention
+        // layers. See LagunaFusedFullAttnStep.swift for the full
+        // design. `LagunaFusedSlidingAttnStep.canFuse` requires
+        // `isSliding == true` and `LagunaFusedFullAttnStep.canFuse`
+        // requires `isSliding == false`, so these two fused branches
+        // are mutually exclusive by construction.
+        let fusedFullAttnStepFuses =
+            !dkTiming && fusedAttnStepCache != nil
+            && LagunaFusedFullAttnStep.canFuse(
+                isSliding: isSliding, rotaryDim: rotaryDim, headDim: headDim,
+                nHeads: nHeads, nKVHeads: nKVHeads, dtype: q.dtype)
+
         var attnOut: Tensor
         if fusedAttnStepFuses, let fusedCache = fusedAttnStepCache {
             attnOut = LagunaFusedSlidingAttnStep.apply(
@@ -1541,6 +1556,18 @@ final class LagunaLayer {
                 qWeight: qNorm.weight, kWeight: kNorm.weight,
                 nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
                 position: position, thetaBase: ropeTheta, eps: qNorm.eps,
+                cache: fusedCache, scale: scale,
+                on: work, device: device)
+            dk("qknorm_rope")
+            dk("kv_append")
+            dk("sdpa_gqa2")
+        } else if fusedFullAttnStepFuses, let fusedCache = fusedAttnStepCache {
+            attnOut = LagunaFusedFullAttnStep.apply(
+                rawQ: q, rawK: k, rawV: v,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim, rotaryDim: rotaryDim,
+                position: position, thetaBase: ropeTheta, eps: qNorm.eps,
+                yarn: yarn,
                 cache: fusedCache, scale: scale,
                 on: work, device: device)
             dk("qknorm_rope")

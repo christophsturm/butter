@@ -5036,3 +5036,37 @@ int5 = latency-neutral, -36% coarse-copy memory; stays default OFF as a
 memory option. Known infra gap: DECODE_KERNEL_TIMING is incompatible
 with the GPU-resident token loop (stale command-buffer ref after the
 internal logits() commit) - fix before any per-kernel lm_head timing.
+
+#### Fused single-dispatch decode attention step (full-attention layers): +4.9% decode
+
+BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP=1 (default OFF, opt-in) is the
+full-attention twin of the sliding fusion above: collapses the
+full-attention-layer decode attention chain (RMSNorm + partial YaRN
+RoPE, KV append, GQA2 SDPA) into ONE dispatch. `~/models/laguna-xs-2.1-4bit`'s
+`layer_types` (40 layers, pattern repeats every 4 starting at index 0)
+has 10 full-attention layers (h48/kv8) out of 40; cutting ~3 dispatches
+x 10 full-attention layers = ~30 fewer dispatches/token on top of the
+sliding fusion's ~90, on the same host-bound decode path (sections
+13-17). Deliberately opt-in rather than default-ON like the sliding
+flag, since it is new and unvalidated at commit time.
+
+Paired ABBA (12 runs, 6 A / 6 B, ABBA-BAAB block order, "Write a rust
+fib function", 300 tokens, steady-state tok/s from tokens 11+): A =
+default (sliding fusion only) = [87.45, 87.61, 87.88, 87.88, 88.37,
+86.72] tok/s, mean 87.65; B = this flag on (sliding + full-attention
+fusion) = [92.56, 92.18, 90.36, 93.24, 92.03, 91.39] tok/s, mean 91.96
+- a +4.9% decode win, above the +1.5% ship gate.
+
+Numerics: default (flag unset) path digest-verified byte-identical to
+a clean `origin/dev` @ c357840c build. The fused kernel compiles
+fastMath=false, same convention as the sliding twin, so it is not
+bit-exact vs the stock fastMath chain - cos > 0.99999 / maxAbsDiff <
+5e-3, matching the sliding suite's bound. Regression suite
+(`LagunaFusedFullAttnStepTests`, 6/6 green): h48/kv8, history 0
+through 1000 (well past any sliding-window size, since full-attention
+layers back an `.unbounded` cache and never wrap), plus canFuse
+decline checks (unset / `=0` / sliding layer / rotaryDim not a
+multiple of 8) and a same-input repeatability check. Sibling
+`LagunaFusedSlidingAttnStepTests` suite stays green (12/12),
+unaffected. Flag-on output is also deterministic across repeated runs
+(byte-identical token stream, two 300-token greedy runs).
