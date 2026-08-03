@@ -1499,66 +1499,96 @@ final class LagunaLayer {
         }
         dk("qkv_qmv")
 
-        // QK-norm + RoPE. Sliding decode: fused one-dispatch path
-        // (BUTTER_LAGUNA_FUSED_QK_NORM_ROPE, default ON) collapses four
-        // stock kernels into one TG-per-head kernel — mlxfast
-        // DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE. Full / partial / YaRN
-        // keep the stock chain.
-        let qN: Tensor
-        let kN: Tensor
-        if LagunaFusedQKNormRoPE.canFuse(
-            isSliding: isSliding, rotaryDim: rotaryDim,
-            headDim: headDim, dtype: q.dtype)
-        {
-            let fused = LagunaFusedQKNormRoPE.apply(
-                rawQ: q, rawK: k,
+        // F86: BUTTER_LAGUNA_FUSED_ATTN_STEP (default OFF, opt-in
+        // until validated on the hardware gates) collapses the
+        // sliding-layer decode attention chain [QK-norm+RoPE] -> [KV
+        // append] -> [GQA2 SDPA] into ONE dispatch. See
+        // LagunaFusedSlidingAttnStep.swift for the full design and the
+        // bit-exactness argument. Declines (falls through to the
+        // unchanged stock chain below) for full-attention layers,
+        // non-bf16, a quantized cache, or any GQA-pairing shape
+        // mismatch.
+        let fusedAttnStepCache = cache as? KVCache
+        let fusedAttnStepFuses =
+            !dkTiming && fusedAttnStepCache != nil
+            && LagunaFusedSlidingAttnStep.canFuse(
+                isSliding: isSliding, rotaryDim: rotaryDim, headDim: headDim,
+                nHeads: nHeads, nKVHeads: nKVHeads, dtype: q.dtype)
+
+        var attnOut: Tensor
+        if fusedAttnStepFuses, let fusedCache = fusedAttnStepCache {
+            attnOut = LagunaFusedSlidingAttnStep.apply(
+                rawQ: q, rawK: k, rawV: v,
                 qWeight: qNorm.weight, kWeight: kNorm.weight,
-                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
                 position: position, thetaBase: ropeTheta, eps: qNorm.eps,
+                cache: fusedCache, scale: scale,
                 on: work, device: device)
-            qN = fused.q
-            kN = fused.k
+            dk("qknorm_rope")
+            dk("kv_append")
+            dk("sdpa_gqa2")
         } else {
-            var qTmp = Ops.rmsNormRows(
-                q, weight: qNorm.weight, eps: qNorm.eps,
-                nRows: nHeads, rowSize: headDim, on: work)
-            var kTmp = Ops.rmsNormRows(
-                k, weight: kNorm.weight, eps: kNorm.eps,
-                nRows: nKVHeads, rowSize: headDim, on: work)
-            applyRopeInPlace(
-                q: &qTmp, k: &kTmp, position: position, yarn: yarn, on: work)
-            qN = qTmp
-            kN = kTmp
-        }
-        dk("qknorm_rope")
+            // QK-norm + RoPE. Sliding decode: fused one-dispatch path
+            // (BUTTER_LAGUNA_FUSED_QK_NORM_ROPE, default ON) collapses four
+            // stock kernels into one TG-per-head kernel — mlxfast
+            // DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE. Full / partial / YaRN
+            // keep the stock chain.
+            let qN: Tensor
+            let kN: Tensor
+            if LagunaFusedQKNormRoPE.canFuse(
+                isSliding: isSliding, rotaryDim: rotaryDim,
+                headDim: headDim, dtype: q.dtype)
+            {
+                let fused = LagunaFusedQKNormRoPE.apply(
+                    rawQ: q, rawK: k,
+                    qWeight: qNorm.weight, kWeight: kNorm.weight,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    position: position, thetaBase: ropeTheta, eps: qNorm.eps,
+                    on: work, device: device)
+                qN = fused.q
+                kN = fused.k
+            } else {
+                var qTmp = Ops.rmsNormRows(
+                    q, weight: qNorm.weight, eps: qNorm.eps,
+                    nRows: nHeads, rowSize: headDim, on: work)
+                var kTmp = Ops.rmsNormRows(
+                    k, weight: kNorm.weight, eps: kNorm.eps,
+                    nRows: nKVHeads, rowSize: headDim, on: work)
+                applyRopeInPlace(
+                    q: &qTmp, k: &kTmp, position: position, yarn: yarn, on: work)
+                qN = qTmp
+                kN = kTmp
+            }
+            dk("qknorm_rope")
 
-        let q2d = qN.reshaped(to: [nHeads, headDim])
-        let k2d = kN.reshaped(to: [nKVHeads, headDim])
-        let v2d = v.reshaped(to: [nKVHeads, headDim])
-        cache.appendOnGPU(kFlat: k2d, vFlat: v2d, on: work)
+            let q2d = qN.reshaped(to: [nHeads, headDim])
+            let k2d = kN.reshaped(to: [nKVHeads, headDim])
+            let v2d = v.reshaped(to: [nKVHeads, headDim])
+            cache.appendOnGPU(kFlat: k2d, vFlat: v2d, on: work)
 
-        let (cacheK, cacheV) = cache.prepareForAttention(on: work)
-        let (sinkEnd, windowStart) = cache.sdpaSinkWindow(nKV: cache.length)
-        dk("kv_append")
-        // T24 kernel 3: GQA head-pairing + ALPHASKIP decode SDPA (opt-out
-        // BUTTER_LAGUNA_SDPA_GQA2=0). Declines outside its shape envelope
-        // (headDim==128, bf16, heads_per_group even) and falls back to the
-        // stock `Ops.sdpaDecode`.
-        var attnOut =
-            (LagunaSdpaDecodeGqa2.apply(
-                q: q2d, k: cacheK, v: cacheV,
-                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-                nKV: cache.length, kvStride: cache.maxSeq, scale: scale,
-                on: work, device: device,
-                sinkEnd: sinkEnd, windowStart: windowStart)
-                ?? Ops.sdpaDecode(
+            let (cacheK, cacheV) = cache.prepareForAttention(on: work)
+            let (sinkEnd, windowStart) = cache.sdpaSinkWindow(nKV: cache.length)
+            dk("kv_append")
+            // T24 kernel 3: GQA head-pairing + ALPHASKIP decode SDPA (opt-out
+            // BUTTER_LAGUNA_SDPA_GQA2=0). Declines outside its shape envelope
+            // (headDim==128, bf16, heads_per_group even) and falls back to the
+            // stock `Ops.sdpaDecode`.
+            attnOut =
+                (LagunaSdpaDecodeGqa2.apply(
                     q: q2d, k: cacheK, v: cacheV,
                     nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-                    nKV: cache.length, kvStride: cache.maxSeq,
-                    scale: scale, on: work,
+                    nKV: cache.length, kvStride: cache.maxSeq, scale: scale,
+                    on: work, device: device,
                     sinkEnd: sinkEnd, windowStart: windowStart)
-            ).reshaped(to: [nHeads * headDim])
-        dk("sdpa_gqa2")
+                    ?? Ops.sdpaDecode(
+                        q: q2d, k: cacheK, v: cacheV,
+                        nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                        nKV: cache.length, kvStride: cache.maxSeq,
+                        scale: scale, on: work,
+                        sinkEnd: sinkEnd, windowStart: windowStart)
+                ).reshaped(to: [nHeads * headDim])
+            dk("sdpa_gqa2")
+        }
 
         // Softplus per-head gate before o_proj (GPU expand — no host sync).
         // The INT8 QKV bank's gate tail (raw logits) takes priority when

@@ -4981,3 +4981,17 @@ gate (default on). Opt-in path only: zero risk to the default decode
 path. Kernel-level win banked now so the tail is ready when the
 host-bound ceiling lifts; wall-clock effect at default settings is nil
 by construction (path off).
+
+#### Fused single-dispatch decode attention step (sliding layers): +16-17% decode
+
+BUTTER_LAGUNA_FUSED_ATTN_STEP=1 (default OFF) collapses the sliding-layer
+decode attention chain (fused QK-norm+RoPE, KV append, GQA2 SDPA) into
+ONE dispatch, cutting ~3 dispatches x 30 sliding layers = ~90
+dispatches/token on the host-bound decode path (sections 13-17). Paired
+ABBA: flag-on 84-93 vs stock 51-72 tok/s; worst-on beat best-off by 17%.
+
+Numerics: default path byte-identical (digest-verified vs base). The
+fused kernel compiles fastMath=false to keep its three phases FP-stable;
+vs the stock fastMath chain it is cos>=0.99999999 (worst 6.1e-5/elem,
+h64), within the cos gate, not bit-exact. Regression suite: 12 cases,
+h48/h64, history 0-513 incl. past-window-wrap.

@@ -253,6 +253,21 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
         lengthLock.withLock { _evictionState.truncate(toLength: length) }
     }
 
+    /// Reserve the next physical write slot WITHOUT queuing any GPU
+    /// work and without touching K/V storage -- for
+    /// `LagunaFusedSlidingAttnStep` (`BUTTER_LAGUNA_FUSED_ATTN_STEP`),
+    /// whose single fused dispatch performs the cache write itself
+    /// instead of going through `Ops.kvCacheUpdateKV`. Same
+    /// `reserveNextSlot()` bookkeeping `appendOnGPU` uses (ring
+    /// rotation, `length`/`absolutePosition` accounting), just without
+    /// the paired Metal dispatches. Callers MUST write valid K and V
+    /// rows to the returned slot before any later reader observes it
+    /// -- `length` already reports it filled the instant this returns,
+    /// same as `appendOnGPU`'s contract.
+    public func reserveSlotForFusedStep() -> Int {
+        lengthLock.withLock { _evictionState.reserveNextSlot() }
+    }
+
     /// Append `kRows`/`vRows` (each `[nKVHeads, headDim]`) as consecutive
     /// timesteps in one call, bumping `length` by `kRows.count`. Used by
     /// multi-token forwards (diffusion-block commit, multi-token
