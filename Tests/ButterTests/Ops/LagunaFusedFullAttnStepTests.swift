@@ -128,13 +128,7 @@ struct LagunaFusedFullAttnStepTests {
             let rawV = randomBf16([nKVHeads * headDim], seed: &seed)
             let position = historyLen
 
-            // Opt-in contract: unset or "0" must decline.
-            unsetenv("BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP")
-            #expect(
-                LagunaFusedFullAttnStep.canFuse(
-                    isSliding: false, rotaryDim: rotaryDim, headDim: headDim,
-                    nHeads: nHeads, nKVHeads: nKVHeads, dtype: .bf16) == false,
-                "BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP unset must decline (opt-in contract)")
+            // Opt-out contract: default (unset) fuses; =0 must decline.
             setenv("BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP", "0", 1)
             #expect(
                 LagunaFusedFullAttnStep.canFuse(

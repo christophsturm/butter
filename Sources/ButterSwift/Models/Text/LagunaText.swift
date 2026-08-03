@@ -1534,7 +1534,7 @@ final class LagunaLayer {
                 isSliding: isSliding, rotaryDim: rotaryDim, headDim: headDim,
                 nHeads: nHeads, nKVHeads: nKVHeads, dtype: q.dtype)
 
-        // F-fullattn: BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP (default OFF,
+        // F-fullattn: BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP (default ON,
         // opt-in) is the full-attention twin of the sliding fusion
         // above: collapses [RMSNorm + partial YaRN RoPE] -> [KV
         // append] -> [GQA2 SDPA] into ONE dispatch for full-attention

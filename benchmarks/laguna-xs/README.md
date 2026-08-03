@@ -5070,3 +5070,12 @@ multiple of 8) and a same-input repeatability check. Sibling
 `LagunaFusedSlidingAttnStepTests` suite stays green (12/12),
 unaffected. Flag-on output is also deterministic across repeated runs
 (byte-identical token stream, two 300-token greedy runs).
+
+#### Fused full-attention decode step: DEFAULT ON
+
+Flipping BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP to default ON (=0 to
+disable) after the feature PR validated +4.9% decode (87.65 -> 91.96
+tok/s ABBA) on top of the sliding fusion. Test contract updated to
+opt-out in the same change. Hardware gate (mppAutoCapable) still
+declines on non-target devices. Combined fused-attention state: both
+layer classes fuse by default; decode ~92 tok/s vs ~71 at start of day.

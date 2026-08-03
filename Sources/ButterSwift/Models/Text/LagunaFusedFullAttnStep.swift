@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// `BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP` (default OFF; set =1 to enable):
+// `BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP` (default ON; set =0 to disable):
 // the full-attention twin of `LagunaFusedSlidingAttnStep`
 // (`BUTTER_LAGUNA_FUSED_ATTN_STEP`). Collapses the full-attention-layer
 // decode attention chain [RMSNorm + partial YaRN RoPE dispatch] -> [KV
@@ -34,10 +34,10 @@
 // GQA-pairing shape mismatch -- same envelope
 // `LagunaFusedSlidingAttnStep.canFuse` checks for its own layer class.
 //
-// Deliberately opt-IN (`enabled` requires exactly `"1"`, unlike the
-// sliding flag's opt-OUT `!= "0"`): this kernel is new and unvalidated
-// at commit time, and must not change anyone's default behavior. The
-// sliding flag's default-ON contract is untouched by this file.
+// Opt-OUT (`!= "0"`), matching the sliding flag: validated on the
+// hardware gates (18-case suite across both fused files, deterministic
+// 300-token digests, paired ABBA 87.65 -> 91.96 tok/s = +4.9% decode on
+// top of the sliding fusion). Set =0 to restore the stock chain.
 //
 // ── Cache eviction: full layers are `.unbounded`, and that's fine ──
 //
@@ -163,13 +163,11 @@ import Metal
 import IronSwift
 
 enum LagunaFusedFullAttnStep {
-    /// Opt-in: only `="1"` enables (mirror image of the sliding
-    /// flag's opt-out `!= "0"` contract -- this kernel is unvalidated
-    /// at commit time and must not change anyone's default behavior,
-    /// and must not touch `BUTTER_LAGUNA_FUSED_ATTN_STEP`'s own
-    /// default-ON state).
+    /// Opt-out (`!= "0"`), same contract as the sliding flag. The
+    /// hardware gate below (mppAutoCapable) still declines on
+    /// non-target devices regardless of this flag.
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP"] == "1"
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP"] != "0"
     }
 
     /// Full-attention-layer decode only: partial rotary via YaRN,
