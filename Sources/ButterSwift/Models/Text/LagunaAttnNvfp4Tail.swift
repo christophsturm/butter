@@ -464,6 +464,233 @@ enum LagunaAttnNvfp4Tail {
         }
         """
 
+    // Split-K variant of the gated o_proj NVFP4 QMV. T39 finding (see
+    // benchmarks/laguna-xs/README.md section 14, "The actionable lever:
+    // NVFP4 gated o_proj kernel is missing split-K"): with the NVFP4
+    // tail ON end to end (`BUTTER_LAGUNA_ATTN_NVFP4_FROM=0`), the gated
+    // o_proj kernel measured 2443us GPU-busy vs INT8's 1992us (+23%)
+    // purely because `qmvGatedSrc` above never received the K-parallel
+    // restructure `LagunaAttnInt8.qmvGatedSplitK` already has, while the
+    // plain NVFP4 `qkv_qmv` kernel (no split-K needed, already ahead of
+    // INT8 at -35%) shows the byte-width win NVFP4 should deliver
+    // everywhere once this gap closes. This kernel ports that same
+    // `NR0=2`/`NSG=4` two-stage-reduce geometry from
+    // `LagunaAttnInt8.qmvGatedSplitKSrc` (mirror it 1:1 for the
+    // restructure) with the affine INT8 dequant swapped for this file's
+    // symmetric NVFP4 g16 dequant (no zero-point, no `xs` correction
+    // term) and the pack width widened from 4 codes/word (INT8 u32) to
+    // 8 codes/word (NVFP4 u32), so `packIdx` strides `8*NSG` elements
+    // per simdgroup burst instead of `4*NSG`, and each simdgroup loads
+    // two `bfloat4`s (`xv0`/`xv1`) per K-chunk instead of one.
+    //
+    // ROUNDING FIX (same trap as INT8's `qmvGatedSplitK`, commit
+    // `1614148f`): the softplus GATE VALUE is rounded through bf16
+    // before use (`gate = float(bfloat((pos ? gl : 0.0f) + log(1.0f +
+    // exp(0.0f - ax))))`), matching what a separate
+    // gate-product-softplus dispatch would materialize into a real bf16
+    // tensor before a downstream QMV reads it back. Skipping this round
+    // and carrying the softplus result in float32 end to end reproduces
+    // the INT8 kernel's exact failure mode (a systematic ~0.5
+    // max-abs-diff vs the reference, not a near-ULP reduction-order
+    // gap) because it is a genuine value substitution, not just a
+    // different summation order. The gated activation PRODUCT
+    // (`xf0..xf7`, gate times each of the 8 activation lanes) is
+    // likewise rounded through bf16 per lane, mirroring INT8's second
+    // rounding point for the same reason (the fused kernel stands in
+    // for a materialized bf16 intermediate).
+    private static let qmvGatedSplitKSrc =
+        """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        \(helperSrc)
+
+        kernel void laguna_attn_qmv_nvfp4_g16_gated_splitk_bf16(
+            const device uint *w [[buffer(0)]],
+            const device uchar *scales [[buffer(1)]],
+            const device bfloat *x [[buffer(2)]],
+            const device bfloat *gate_logits [[buffer(3)]],
+            device bfloat *out [[buffer(4)]],
+            constant uint &inDim [[buffer(5)]],
+            constant uint &outDim [[buffer(6)]],
+            constant uint &packsPerHead [[buffer(7)]],
+            threadgroup float *shmem [[threadgroup(0)]],
+            uint3 tgid [[threadgroup_position_in_grid]],
+            uint lane [[thread_index_in_simdgroup]],
+            uint sgitg [[simdgroup_index_in_threadgroup]])
+        {
+            constexpr uint GROUP = 16;
+            constexpr uint NR0 = 2;
+            constexpr uint NSG = 4;
+            uint packsPerRow = inDim / 8u;
+            uint groupsPerRow = inDim / GROUP;
+            uint rowBase = tgid.x * NR0;
+
+            float acc[NR0] = {0.0f, 0.0f};
+
+            for (uint block = sgitg * 32u; block < packsPerRow; block += NSG * 32u) {
+                uint packIdx = block + lane;
+                if (packIdx < packsPerRow) {
+                    uint xBase = packIdx * 8u;
+                    uint head = packIdx / packsPerHead;
+                    float gl = float(gate_logits[head]);
+                    bool pos = gl > 0.0f;
+                    float ax = pos ? gl : (0.0f - gl);
+                    // ROUNDING POINT 1 (softplus gate value -> bf16): see
+                    // the header comment above this kernel.
+                    float gate = float(bfloat((pos ? gl : 0.0f) + log(1.0f + exp(0.0f - ax))));
+
+                    bfloat4 xv0 = *((const device bfloat4 *)(x + xBase));
+                    bfloat4 xv1 = *((const device bfloat4 *)(x + xBase + 4u));
+                    // ROUNDING POINT 2 (gate*activation product -> bf16):
+                    // see the header comment above this kernel.
+                    float xf0 = float(bfloat(float(xv0[0]) * gate));
+                    float xf1 = float(bfloat(float(xv0[1]) * gate));
+                    float xf2 = float(bfloat(float(xv0[2]) * gate));
+                    float xf3 = float(bfloat(float(xv0[3]) * gate));
+                    float xf4 = float(bfloat(float(xv1[0]) * gate));
+                    float xf5 = float(bfloat(float(xv1[1]) * gate));
+                    float xf6 = float(bfloat(float(xv1[2]) * gate));
+                    float xf7 = float(bfloat(float(xv1[3]) * gate));
+                    uint g = xBase / GROUP;
+                    for (uint r = 0; r < NR0; ++r) {
+                        uint row = rowBase + r;
+                        if (row < outDim) {
+                            uint p = w[row * packsPerRow + packIdx];
+                            float scale = iron_nvfp4_e4m3_scale(scales[row * groupsPerRow + g]);
+                            float qd = 0.0f;
+                            qd += iron_nvfp4_nibble_value(p & 0xFu) * xf0;
+                            qd += iron_nvfp4_nibble_value((p >> 4u) & 0xFu) * xf1;
+                            qd += iron_nvfp4_nibble_value((p >> 8u) & 0xFu) * xf2;
+                            qd += iron_nvfp4_nibble_value((p >> 12u) & 0xFu) * xf3;
+                            qd += iron_nvfp4_nibble_value((p >> 16u) & 0xFu) * xf4;
+                            qd += iron_nvfp4_nibble_value((p >> 20u) & 0xFu) * xf5;
+                            qd += iron_nvfp4_nibble_value((p >> 24u) & 0xFu) * xf6;
+                            qd += iron_nvfp4_nibble_value((p >> 28u) & 0xFu) * xf7;
+                            acc[r] += scale * qd;
+                        }
+                    }
+                }
+            }
+
+            for (uint r = 0; r < NR0; ++r) {
+                float partial = simd_sum(acc[r]);
+                if (lane == 0) {
+                    shmem[32u * r + sgitg] = partial;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (sgitg == 0) {
+                for (uint r = 0; r < NR0; ++r) {
+                    float v = lane < NSG ? shmem[32u * r + lane] : 0.0f;
+                    float total = simd_sum(v);
+                    if (lane == 0) {
+                        uint row = rowBase + r;
+                        if (row < outDim) {
+                            out[row] = bfloat(total);
+                        }
+                    }
+                }
+            }
+        }
+        """
+
+    // Split-K variant of `qmvSrc` (see `qmvGatedSplitKSrc` above for the
+    // full T39 rationale + geometry writeup; this is the ungated
+    // sibling, same `NR0=2`/`NSG=4` two-stage reduce, same 8-wide NVFP4
+    // pack stride, mirroring `LagunaAttnInt8.qmvSplitKSrc` with the
+    // symmetric NVFP4 dequant swapped in for the affine INT8 one (no
+    // bias/`xs` term). Measured mainly to close the `oproj_gated`
+    // regression above; ported here too since `qkv_qmv` already wins
+    // and split-K should only help further, and INT8 ships both
+    // variants behind the one flag for the same reason.
+    private static let qmvSplitKSrc =
+        """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        \(helperSrc)
+
+        kernel void laguna_attn_qmv_nvfp4_g16_splitk_bf16(
+            const device uint *w [[buffer(0)]],
+            const device uchar *scales [[buffer(1)]],
+            const device bfloat *x [[buffer(2)]],
+            device bfloat *out [[buffer(3)]],
+            constant uint &inDim [[buffer(4)]],
+            constant uint &outDim [[buffer(5)]],
+            threadgroup float *shmem [[threadgroup(0)]],
+            uint3 tgid [[threadgroup_position_in_grid]],
+            uint lane [[thread_index_in_simdgroup]],
+            uint sgitg [[simdgroup_index_in_threadgroup]])
+        {
+            constexpr uint GROUP = 16;
+            constexpr uint NR0 = 2;
+            constexpr uint NSG = 4;
+            uint packsPerRow = inDim / 8u;
+            uint groupsPerRow = inDim / GROUP;
+            uint rowBase = tgid.x * NR0;
+
+            float acc[NR0] = {0.0f, 0.0f};
+
+            for (uint block = sgitg * 32u; block < packsPerRow; block += NSG * 32u) {
+                uint packIdx = block + lane;
+                if (packIdx < packsPerRow) {
+                    uint xBase = packIdx * 8u;
+                    bfloat4 xv0 = *((const device bfloat4 *)(x + xBase));
+                    bfloat4 xv1 = *((const device bfloat4 *)(x + xBase + 4u));
+                    float xf0 = float(xv0[0]);
+                    float xf1 = float(xv0[1]);
+                    float xf2 = float(xv0[2]);
+                    float xf3 = float(xv0[3]);
+                    float xf4 = float(xv1[0]);
+                    float xf5 = float(xv1[1]);
+                    float xf6 = float(xv1[2]);
+                    float xf7 = float(xv1[3]);
+                    uint g = xBase / GROUP;
+                    for (uint r = 0; r < NR0; ++r) {
+                        uint row = rowBase + r;
+                        if (row < outDim) {
+                            uint p = w[row * packsPerRow + packIdx];
+                            float scale = iron_nvfp4_e4m3_scale(scales[row * groupsPerRow + g]);
+                            float qd = 0.0f;
+                            qd += iron_nvfp4_nibble_value(p & 0xFu) * xf0;
+                            qd += iron_nvfp4_nibble_value((p >> 4u) & 0xFu) * xf1;
+                            qd += iron_nvfp4_nibble_value((p >> 8u) & 0xFu) * xf2;
+                            qd += iron_nvfp4_nibble_value((p >> 12u) & 0xFu) * xf3;
+                            qd += iron_nvfp4_nibble_value((p >> 16u) & 0xFu) * xf4;
+                            qd += iron_nvfp4_nibble_value((p >> 20u) & 0xFu) * xf5;
+                            qd += iron_nvfp4_nibble_value((p >> 24u) & 0xFu) * xf6;
+                            qd += iron_nvfp4_nibble_value((p >> 28u) & 0xFu) * xf7;
+                            acc[r] += scale * qd;
+                        }
+                    }
+                }
+            }
+
+            for (uint r = 0; r < NR0; ++r) {
+                float partial = simd_sum(acc[r]);
+                if (lane == 0) {
+                    shmem[32u * r + sgitg] = partial;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (sgitg == 0) {
+                for (uint r = 0; r < NR0; ++r) {
+                    float v = lane < NSG ? shmem[32u * r + lane] : 0.0f;
+                    float total = simd_sum(v);
+                    if (lane == 0) {
+                        uint row = rowBase + r;
+                        if (row < outDim) {
+                            out[row] = bfloat(total);
+                        }
+                    }
+                }
+            }
+        }
+        """
+
     /// Quantize a `[outDim, inDim]` BF16 weight to a group-16 NVFP4 side
     /// layout. Declines (returns `nil`) unless `inDim` is a multiple of
     /// 16 and `weight` is 2D BF16, matching the group-16 alignment the
@@ -538,6 +765,62 @@ enum LagunaAttnNvfp4Tail {
             outDim: totalOut, inDim: first.inDim)
     }
 
+    private static func gatedShapesValid(
+        input: Tensor, gateLogits: Tensor, bank: Bank, heads: Int, headDim: Int, out: Tensor
+    ) -> Bool {
+        input.dtype == .bf16 && gateLogits.dtype == .bf16 && out.dtype == .bf16
+            && input.elementCount == bank.inDim
+            && gateLogits.elementCount == heads
+            && out.elementCount == bank.outDim
+            && bank.inDim == heads * headDim
+            && headDim % 8 == 0
+    }
+
+    /// Split-K variant of `qmvGated` (see `qmvGatedSplitKSrc` above for
+    /// the T39 rationale + design, and
+    /// `LagunaAttnInt8.qmvGatedSplitK`/`splitKEnabled` for the geometry
+    /// this mirrors). Same shape/dtype contract as the non-split
+    /// `qmvGated`, plus declines (returns `false`, `out` left untouched)
+    /// unless `bank.outDim` is a multiple of 2 (fixed `NR0 = 2` tiling,
+    /// no partial-pair tail).
+    static func qmvGatedSplitK(
+        input: Tensor, gateLogits: Tensor, bank: Bank,
+        heads: Int, headDim: Int,
+        on cmd: MTLCommandBuffer, device: Device, into out: Tensor
+    ) -> Bool {
+        guard LagunaAttnInt8.gatedEnabled,
+            gatedShapesValid(
+                input: input, gateLogits: gateLogits, bank: bank, heads: heads, headDim: headDim,
+                out: out),
+            bank.outDim.isMultiple(of: 2)
+        else { return false }
+
+        let packsPerHead = headDim / 8
+        let p = pso(
+            "laguna_attn_qmv_nvfp4_g16_gated_splitk_bf16", source: qmvGatedSplitKSrc,
+            device: device.mtlDevice)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return false }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(bank.packed.buffer, offset: bank.packed.offset, index: 0)
+        enc.setBuffer(bank.scales.buffer, offset: bank.scales.offset, index: 1)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 2)
+        enc.setBuffer(gateLogits.buffer, offset: gateLogits.offset, index: 3)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 4)
+        var inDimV = UInt32(bank.inDim)
+        var outDimV = UInt32(bank.outDim)
+        var packsPerHeadV = UInt32(packsPerHead)
+        enc.setBytes(&inDimV, length: 4, index: 5)
+        enc.setBytes(&outDimV, length: 4, index: 6)
+        enc.setBytes(&packsPerHeadV, length: 4, index: 7)
+        enc.setThreadgroupMemoryLength(2 * 32 * MemoryLayout<Float>.stride, index: 0)
+        let tiles = bank.outDim / 2
+        enc.dispatchThreadgroups(
+            MTLSize(width: tiles, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        enc.endEncoding()
+        return true
+    }
+
     /// Fused gate-product-softplus + o_proj NVFP4 QMV in one dispatch:
     /// the NVFP4 sibling of `LagunaAttnInt8.qmvGated`. Gated behind the same
     /// `LagunaAttnInt8.gatedEnabled` toggle (`BUTTER_LAGUNA_INT8_OPROJ_GATED`)
@@ -545,19 +828,27 @@ enum LagunaAttnNvfp4Tail {
     /// quantization scheme the bank underneath uses. Declines (returns
     /// `false`, `into` left untouched) unless every shape/dtype
     /// precondition holds; caller falls back to the separate-dispatch
-    /// chain feeding stock `qmv`.
+    /// chain feeding stock `qmv`. Tries `qmvGatedSplitK` first when
+    /// `LagunaAttnInt8.splitKEnabled` (same `BUTTER_LAGUNA_QMV_SPLITK`
+    /// flag the INT8 bank uses, one kill switch for split-K across both
+    /// quantization schemes), falling through to this file's original
+    /// (pre-T39) geometry on any decline.
     static func qmvGated(
         input: Tensor, gateLogits: Tensor, bank: Bank,
         heads: Int, headDim: Int,
         on cmd: MTLCommandBuffer, device: Device, into out: Tensor
     ) -> Bool {
-        guard LagunaAttnInt8.gatedEnabled,
-            input.dtype == .bf16, gateLogits.dtype == .bf16, out.dtype == .bf16,
-            input.elementCount == bank.inDim,
-            gateLogits.elementCount == heads,
-            out.elementCount == bank.outDim,
-            bank.inDim == heads * headDim,
-            headDim % 8 == 0
+        guard LagunaAttnInt8.gatedEnabled else { return false }
+        if LagunaAttnInt8.splitKEnabled,
+            qmvGatedSplitK(
+                input: input, gateLogits: gateLogits, bank: bank, heads: heads, headDim: headDim,
+                on: cmd, device: device, into: out)
+        {
+            return true
+        }
+        guard gatedShapesValid(
+            input: input, gateLogits: gateLogits, bank: bank, heads: heads, headDim: headDim,
+            out: out)
         else { return false }
 
         let packsPerHead = headDim / 8
@@ -586,8 +877,48 @@ enum LagunaAttnNvfp4Tail {
         return true
     }
 
+    /// Split-K variant of `qmv` (see `qmvSplitKSrc` above for the T39
+    /// rationale + design, and
+    /// `LagunaAttnInt8.qmvSplitK`/`splitKEnabled` for the geometry this
+    /// mirrors). Same shape/dtype contract as `qmv`, plus declines
+    /// (returns `false`, `out` left untouched) unless `bank.outDim` is a
+    /// multiple of 2 (fixed `NR0 = 2` tiling, no partial-pair tail).
+    static func qmvSplitK(
+        input: Tensor, bank: Bank, on cmd: MTLCommandBuffer, device: Device, into out: Tensor
+    ) -> Bool {
+        guard input.dtype == .bf16, out.dtype == .bf16,
+            input.elementCount == bank.inDim,
+            out.elementCount == bank.outDim,
+            bank.outDim.isMultiple(of: 2)
+        else { return false }
+
+        let p = pso(
+            "laguna_attn_qmv_nvfp4_g16_splitk_bf16", source: qmvSplitKSrc,
+            device: device.mtlDevice)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return false }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(bank.packed.buffer, offset: bank.packed.offset, index: 0)
+        enc.setBuffer(bank.scales.buffer, offset: bank.scales.offset, index: 1)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 2)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 3)
+        var inDimV = UInt32(bank.inDim)
+        var outDimV = UInt32(bank.outDim)
+        enc.setBytes(&inDimV, length: 4, index: 4)
+        enc.setBytes(&outDimV, length: 4, index: 5)
+        enc.setThreadgroupMemoryLength(2 * 32 * MemoryLayout<Float>.stride, index: 0)
+        let tiles = bank.outDim / 2
+        enc.dispatchThreadgroups(
+            MTLSize(width: tiles, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        enc.endEncoding()
+        return true
+    }
+
     /// Single-token (`x = [inDim]` bf16) batched QMV over `bank`,
-    /// writing `[bank.outDim]` bf16 into `out`.
+    /// writing `[bank.outDim]` bf16 into `out`. Tries `qmvSplitK` first
+    /// when `LagunaAttnInt8.splitKEnabled`, falling through to this
+    /// file's original geometry on any decline (shape mismatch or odd
+    /// `bank.outDim`).
     static func qmv(
         input: Tensor, bank: Bank, on cmd: MTLCommandBuffer, device: Device, into out: Tensor
     ) {
@@ -600,6 +931,11 @@ enum LagunaAttnNvfp4Tail {
             out.elementCount == bank.outDim,
             "LagunaAttnNvfp4Tail.qmv: out.elementCount \(out.elementCount) != bank.outDim \(bank.outDim)"
         )
+        if LagunaAttnInt8.splitKEnabled,
+            qmvSplitK(input: input, bank: bank, on: cmd, device: device, into: out)
+        {
+            return
+        }
         let p = pso(
             "laguna_attn_qmv_nvfp4_g16_bf16", source: qmvSrc, device: device.mtlDevice)
         if let enc = cmd.makeComputeCommandEncoder() {

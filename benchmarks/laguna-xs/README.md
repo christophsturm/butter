@@ -4969,3 +4969,15 @@ Per-branch defaults at end state: `w2/token-loop` ON,
 `w2/nvfp4-tail` OFF (99), `w2/blockmap` OFF, `w2/prefill-attn` OFF
 (both H1 and RoPE-atlas levers), `w3/lastrow` ON. `w3/mpp-bench` is
 experiment infra only, wires into nothing.
+
+#### NVFP4 attention-tail split-K QMV
+
+The NVFP4 attention tail (BUTTER_LAGUNA_ATTN_NVFP4_FROM, default off)
+lacked the split-K treatment its INT8 sibling got in #81, leaving its
+oproj_gated kernel measurably behind (2443us vs 1992us per-phase GPU
+time). This adds NR0=2/NSG=4 split-K variants (qmvSplitK, qmvGatedSplitK)
+mirroring the INT8 pattern, riding the existing BUTTER_LAGUNA_QMV_SPLITK
+gate (default on). Opt-in path only: zero risk to the default decode
+path. Kernel-level win banked now so the tail is ready when the
+host-bound ceiling lifts; wall-clock effect at default settings is nil
+by construction (path off).
