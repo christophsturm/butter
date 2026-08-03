@@ -98,6 +98,20 @@ enum LagunaLmHeadPrune {
         ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LMHEAD_INT5"] == "1"
     }
 
+    /// w24 isolation probe (NOT for shipping): forces the int5 arm to reuse
+    /// the shared `laguna_lmhead_max_thr` reduction (the same kernel the
+    /// MXFP8 arm uses) instead of `int5WinnerThresholdSrc`, even though the
+    /// wider flat int5 delta will widen the candidate set beyond what that
+    /// kernel gives the MXFP8 arm (see `int5WinnerThresholdSrc`'s doc). Only
+    /// meaningful with `int5Enabled` set. Exists to isolate whether the
+    /// extra single-TG winner-threshold dispatch (argmax reduction + serial
+    /// one-row BF16 GEMV) is the source of the fused+int5 latency
+    /// regression, independent of candidate-set width. Set
+    /// `BUTTER_LAGUNA_LMHEAD_INT5_SHAREDTHR=1` to enable.
+    static var int5SharedThresholdEnabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LMHEAD_INT5_SHAREDTHR"] == "1"
+    }
+
     /// T29 diagnosis-only probe: prints `[laguna-lmhead-diag] candidates=K`
     /// (K of 100352 rows passing the certified bound, i.e. the size of the
     /// candidate set |C| that the exact pass must full-GEMV) per decode
@@ -1088,7 +1102,7 @@ enum LagunaLmHeadPrune {
             // arms still produce the same single-scalar `thrBuf` that step
             // 3 below consumes identically.
             let thrBuf = Tensor.empty(shape: [1], dtype: .f32, device: device)
-            if int5Enabled, int5 != nil {
+            if int5Enabled, int5 != nil, !int5SharedThresholdEnabled {
                 let winnerPSO = pso(
                     "laguna_lmhead_int5_winner_threshold",
                     source: int5WinnerThresholdSrc, device: mtl)

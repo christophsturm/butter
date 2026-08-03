@@ -5021,3 +5021,18 @@ winner-threshold dispatch are exposed once attention dispatches shrink.
 int5 stays default OFF, reframed as a memory-footprint option; rework
 (fold the winner threshold into the coarse kernel, revisit geometry)
 queued before any latency claim.
+
+#### int5 stacked-regression correction: it was box noise; int5 is latency-neutral
+
+Re-measured under clean conditions (paired ABBA n=8, 300 tokens): fused
+alone 91.57, fused+int5 90.33 tok/s (-1.35%, within noise). The earlier
+62-73 reading that framed int5 as a stacked regression was measurement
+noise from a loaded box. Isolation (new BUTTER_LAGUNA_LMHEAD_INT5_SHAREDTHR
+toggle, kept as A/B infrastructure): bypassing int5's winner-threshold
+kernel is WORSE (-2.5%) - the tighter candidate set beats the extra
+dispatch, so that kernel is a net win. Candidate-count diagnostics show
+int5 <= MXFP8 per token. Byte-identity holds across all arms. Verdict:
+int5 = latency-neutral, -36% coarse-copy memory; stays default OFF as a
+memory option. Known infra gap: DECODE_KERNEL_TIMING is incompatible
+with the GPU-resident token loop (stale command-buffer ref after the
+internal logits() commit) - fix before any per-kernel lm_head timing.
