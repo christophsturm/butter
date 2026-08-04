@@ -5177,3 +5177,11 @@ exercises this path):**
   `BUTTER_LAGUNA_ROUTER_TOP8_FUSED=0` (default) is also the permanent
   fallback if a future model config (different nExperts/topK/dtype)
   hits the kernel's guard and silently declines to the stock chain.
+
+#### Fused router top-8: DEFAULT ON
+
+Flipping BUTTER_LAGUNA_ROUTER_TOP8_FUSED to default ON (=0 to disable)
+after the feature PR validated byte-identical selection and +4.6%
+decode. Router chain now 1 dispatch (was 4) on the NVFP4 nine-slot
+path: per-MoE-layer decode chain is 7 dispatches (was 10 at start of
+day, 6 is the known floor with the down-residual fold still parked).
