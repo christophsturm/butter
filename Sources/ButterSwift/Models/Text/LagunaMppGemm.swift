@@ -64,10 +64,43 @@ import IronSwift
 enum LagunaMppGemm {
     static let kernelName = "butter_dense_gemm_mpp_bf16"
 
+    /// W34: register-direct NAX-structure dense GEMM (see
+    /// `butter_dense_gemm_nax2_mpp_bf16.metal`'s header for the four
+    /// structural differences vs the staged kernel above -- no
+    /// threadgroup staging, deep BK=256 barrier-free K-loop, paired
+    /// (16,32,16) matmul2d fragment calls, native bfloat operands).
+    static let nax2KernelName = "butter_dense_gemm_nax2_mpp_bf16"
+
     /// Default ON (`!= "0"`): candidate for the F-85 campaign pivot.
     /// Escape: BUTTER_LAGUNA_MPP_GEMM=0.
     static var enabled: Bool {
         ProcessInfo.processInfo.environment["BUTTER_LAGUNA_MPP_GEMM"] != "0"
+    }
+
+    /// W34 NAX2 try-first path. Default OFF -- opt-in via
+    /// BUTTER_LAGUNA_NAX2_GEMM=1 while the structure is being qualified;
+    /// when off, every dispatch takes the staged `kernelName` path
+    /// exactly as before this change.
+    static var nax2Enabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_NAX2_GEMM"] == "1"
+    }
+
+    /// L2-locality threadgroup-ID swizzle exponent for the NAX2 kernel
+    /// (0 = identity, the measured-best default at Laguna prefill
+    /// shapes; exposed for A/B on longer prompts / bigger grids).
+    static var nax2SwizzleLog: UInt32 {
+        UInt32(ProcessInfo.processInfo.environment["BUTTER_LAGUNA_NAX2_SWIZZLE"] ?? "0") ?? 0
+    }
+
+    /// The NAX2 kernel implements ONLY the fully aligned fast path
+    /// (M%64, N%128, K%256 -- no edge masking of any kind, see its
+    /// header). `m` here is the DISPATCH row count, i.e. post-pad when
+    /// the pad-M path is engaged, so real prompts qualify via padding.
+    /// Every Laguna XS prefill projection this file routes (Q/K/V/O,
+    /// L00 gate/up/down, router) satisfies the N/K conditions; anything
+    /// that does not declines to the staged kernel, not to steel.
+    static func nax2Eligible(m: Int, n: Int, k: Int) -> Bool {
+        nax2Enabled && capable && m % 64 == 0 && n % 128 == 0 && k % 256 == 0
     }
 
     /// Apple GPU Family 9+ / macOS 26+ -- the same gate every other MPP
@@ -166,6 +199,14 @@ enum LagunaMppGemm {
         a: Tensor, w: Tensor, out: Tensor, m: Int, n: Int, k: Int,
         on cmd: MTLCommandBuffer
     ) {
+        // W34 try-first: route fully aligned shapes through the
+        // register-direct NAX2 structure when opted in; everything else
+        // (and everything when the flag is off) takes the staged kernel
+        // unchanged.
+        if nax2Eligible(m: m, n: n, k: k) {
+            dispatchNax2(a: a, w: w, out: out, m: m, n: n, k: k, on: cmd)
+            return
+        }
         let pso = PSOCache.shared.pipelineState(for: kernelName)
         guard let enc = cmd.makeComputeCommandEncoder() else {
             fatalError("LagunaMppGemm.dispatch: could not make compute encoder")
@@ -183,6 +224,43 @@ enum LagunaMppGemm {
         let bm = 64, bn = 64
         let grid = MTLSize(width: (n + bn - 1) / bn, height: (m + bm - 1) / bm, depth: 1)
         let tg = MTLSize(width: 128, height: 1, depth: 1)
+        enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+    }
+
+    /// NAX2 dispatch: BM=64, BN=128, 8 simdgroups (256 threads) per
+    /// threadgroup. Caller (`dispatch` above) has already checked
+    /// `nax2Eligible`, so the grid divides exactly; the swizzle
+    /// remapping pads the M dimension up when `swizzleLog > 0` (the
+    /// kernel's own tiles_m/tiles_n guard drops the overshoot).
+    private static func dispatchNax2(
+        a: Tensor, w: Tensor, out: Tensor, m: Int, n: Int, k: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        let pso = PSOCache.shared.pipelineState(for: nax2KernelName)
+        guard let enc = cmd.makeComputeCommandEncoder() else {
+            fatalError("LagunaMppGemm.dispatchNax2: could not make compute encoder")
+        }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(a.buffer, offset: a.offset, index: 0)
+        enc.setBuffer(w.buffer, offset: w.offset, index: 1)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 2)
+        var mU = UInt32(m)
+        var nU = UInt32(n)
+        var kU = UInt32(k)
+        var swizzle = nax2SwizzleLog
+        enc.setBytes(&mU, length: 4, index: 3)
+        enc.setBytes(&nU, length: 4, index: 4)
+        enc.setBytes(&kU, length: 4, index: 5)
+        enc.setBytes(&swizzle, length: 4, index: 6)
+        let tilesM = m / 64
+        let tilesN = n / 128
+        let swizzleTile = 1 << Int(swizzle)
+        let grid = MTLSize(
+            width: tilesN * swizzleTile,
+            height: (tilesM + swizzleTile - 1) / swizzleTile,
+            depth: 1)
+        let tg = MTLSize(width: 256, height: 1, depth: 1)
         enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
         enc.endEncoding()
     }

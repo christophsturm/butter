@@ -5251,3 +5251,98 @@ after the feature PR validated byte-identical output and +5.3% decode
 (worst-on beat best-off across 6 pairs). Decode is now GPU-execution
 bound; the host-scheduling vein is closed. Loop lag defaults to 3 under
 the flag; LAYERS_PER_CB to 8.
+
+#### Down-residual fold: DEFAULT ON
+
+Flipping BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD to default ON (=0 to disable)
+after the feature PR validated bit-exact output and +6 percent decode.
+Per-MoE-layer decode chain now 6 dispatches (o_proj, residual+norm,
+router GEMV, fused top8, gate-up, down+residual) - the known floor for
+the current kernel set, matching the external chase target's chain
+shape. Decode default is now in the ~95-100 tok/s band on a quiet box
+vs ~71 at the start of the effort.
+
+### W34 - register-direct NAX-structure dense prefill GEMM (flag OFF)
+
+The flagship dense prefill GEMM `butter_dense_gemm_mpp_bf16` (F-85,
+sections above) runs at 10-15 percent of peak; a mature reference GEMM
+structure (MLX steel `nax.h` / `gemm_nax.h` / `steel_gemm_fused_nax`,
+the shipped Apple mlx-swift NAX kernels) hits roughly 2.7x more on
+identical silicon. This wave ports that STRUCTURE into a new butter
+kernel, `butter_dense_gemm_nax2_mpp_bf16.metal`, wired as a try-first
+path inside `LagunaMppGemm` behind `BUTTER_LAGUNA_NAX2_GEMM` (default
+OFF, "1" enables; declines fall through to the staged MPP kernel
+unchanged).
+
+Structure ported (wave 1, single config BM=64 BN=128 BK=256 WM=2 WN=4,
+8 simdgroups / 256 threads):
+
+- A/B fragments load device -> registers directly (per-lane 16x16
+  fragment ownership map), written element-wise into the matmul2d
+  cooperative tensors. NO threadgroup staging anywhere.
+- Deep BK=256 K-loop: 8 SK=32 fragment steps with no memory barriers;
+  one `mem_none` execution fence per BK block. K=2048 projections run 8
+  fences total vs the staged kernel's 64 barrier-PAIR K-steps.
+- Per-simdgroup 32x32 f32 register output tile, paired (16,32,16)
+  matmul2d calls (two N-fragments per issue).
+- Threadgroup-ID swizzle knob ported (`BUTTER_LAGUNA_NAX2_SWIZZLE`,
+  default 0; measured neutral at these grid sizes).
+- Aligned fast path only: M%64, N%128, K%256 (every Laguna prefill
+  projection incl. the router qualifies; M via the existing pad-M path).
+
+**bfloat operands: the "never worked" claim was a usage artifact.**
+`matmul2d` accepts native `<bfloat, bfloat, float>` cooperative tensors
+fine when fragments are written element-wise into them; only the
+threadgroup-tensor `ct.load()` staging path had ever been exercised
+with half. Native bfloat + f32 accumulate removes the T23 half-overflow
+fold entirely (verified finite + cos>0.9999 vs f32 CPU reference
+through activation magnitude 800 with NO fold). `relaxed_precision` was
+A/B'd: perf-identical within noise, but strict tightens end-to-end
+prefill-logit agreement (cos 0.984 vs 0.971 against the staged
+baseline), so the kernel ships strict.
+
+Correctness (all in `LagunaNax2GemmTests`, plus e2e):
+
+- vs f32 CPU reference, m=64, all 7 bench shapes + router: cos
+  0.99985-0.99999, 0 NaN (same class as the staged kernel's own gate).
+- vs staged MPP kernel, m=512, all shapes: cos > 0.99999.
+- Swizzle log 0 vs 2 at m=192: bit-identical.
+- e2e `--dump-prefill-logits` @1351 tokens (nvfp4 snapshot): NAX2 vs
+  staged cos 0.984, top1 match; yardstick: the SHIPPED staged-vs-steel
+  delta on the identical prompt is cos 0.987. Same noise class.
+- Greedy T=0 64-token digests: paris + fib byte-identical; the
+  1351-token prompt's continuation identical until one tie flip 58
+  tokens in (both continuations coherent) - expected FP-reorder class.
+
+Perf, kernel level (median of 3, clock-warmed, `LagunaNax2GemmBenchTests`;
+ratio = nax2/staged, lower is better): at m=1408 every shape wins -
+qproj48h 0.47, qproj64h 0.50, kvproj 0.58, oproj48h 0.45, oproj64h
+0.42, l00gateup 0.45, l00down 0.44, router 0.94 - i.e. ~2-2.4x on the
+big projections, peaking ~36 TFLOP/s bf16 (staged peaks ~16). At m=512
+the same shapes land 0.49-0.61 (kvproj ties). First bench run without a
+clock warmup showed a phantom qproj48h "regression" (1.27) that was
+pure GPU clock ramp - warm up before trusting any single-shape number.
+
+Perf, end to end (laguna-xs-2.1-nvfp4, temp-0, --stats prefill tok/s,
+ABBA x4, 5s cooldowns, single 4096-token chunk):
+
+| Prompt | NAX2=1 | NAX2=0 | delta |
+|---|---|---|---|
+| 1351 tok | 2317.3 / 2321.6 / 2330.9 / 2306.3 (median 2319.5) | 1887.8 / 1879.4 / 1848.7 / 1867.7 (median 1873.6) | **+23.8%** |
+| 4051 tok | 1950.4 / 1950.1 (x2) | 1647.0 / 1651.1 (x2) | **+18.3%** |
+
+Verdict: kernel-level mechanism confirmed (~2x on the real projection
+shapes, matching the wave-1 prediction), but the WALL win is capped by
+dense-GEMM share of prefill (~24% at 1351 tokens, shrinking as
+attention grows quadratically with prompt length) - short of the +30%
+ship gate, so the flag stays default OFF pending either the follow-ups
+below or a revised gate. Follow-ups, in expected-value order: (1)
+attention/SDPA is now the dominant prefill wall slice - the same
+register-direct NAX structure applies to the prefill SDPA kernels; (2)
+edge-masked fragment loads to lift N%128/K%256 (covers non-Laguna
+shapes); (3) BM=128 WM=4 was probed and LOSES (ratios 0.90-2.1 vs BM64
+at m=1408; 512-thread threadgroups hurt occupancy more than the halved
+B re-reads help) - do not re-try without a different angle. Also fixed
+in passing: `LagunaMppGemmTests.declinesNonAlignedM` still asserted the
+pre-pad-M `nil` decline at t=100 (stale since #83; unnoticed because CI
+GPUs are MPP-incapable and skip the suite).
