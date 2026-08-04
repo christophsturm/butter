@@ -3035,11 +3035,27 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
             ffnNorm = nil
         }
 
-        return qwen35ApplyFFNMany(
+        let out = qwen35ApplyFFNMany(
             ffn, postMix: postMix, t: t,
             postNorm: postNorm, hidden: hidden,
             cmd: cmd, device: device,
             preNormed: ffnNorm)
+        // Honour this layer's `commitsCommandBuffer == true` contract for
+        // the dense-FFN case: `qwen35ApplyFFNMany`'s dense branch leaves
+        // the whole layer (mixer + FFN + residual) queued on `cmd`, and
+        // the model-level batched driver unconditionally REPLACES its
+        // `workCmd` after every GDN layer on the assumption the layer
+        // committed it. Without this commit the entire command buffer —
+        // including the embedding gather when this is layer 0 — was
+        // silently dropped un-executed on dense checkpoints (Qwen3.5
+        // 0.8B/4B, Qwen3.6-27B), zeroing the hidden state and collapsing
+        // batched-prefill logits to argmax token 0 ("!" loops). The MoE
+        // branch already commits inside `MoELayer/Qwen35MoEFFN.forwardMany`
+        // (which is why Qwen3.6-35B-A3B never showed the bug). Commit
+        // without wait — same pipelining contract as the single-token
+        // `qwen35ApplyFFN(commitCmd: true)` path.
+        if case .dense = ffn { cmd.commit() }
+        return out
     }
 }
 
