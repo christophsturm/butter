@@ -592,7 +592,7 @@ extension Model {
                 pos += 1
 
                 // W35: under the non-blocking decode window
-                // (BUTTER_LAGUNA_NONBLOCK_DECODE=1) the engine's
+                // (BUTTER_LAGUNA_NONBLOCK_DECODE, default ON) the engine's
                 // forward returns after *committing* the layer stack
                 // instead of draining it, so raising the loop lag to 3
                 // lets tokens N+1..N+3 encode on the host while token N
@@ -603,7 +603,7 @@ extension Model {
                 // BUTTER_GPU_LOOP_LAG. Default (flag off) stays 1.
                 let nonblockDecode =
                     ProcessInfo.processInfo.environment[
-                        "BUTTER_LAGUNA_NONBLOCK_DECODE"] == "1"
+                        "BUTTER_LAGUNA_NONBLOCK_DECODE"] != "0"
                 let gpuLoopLag = max(
                     1,
                     Int(ProcessInfo.processInfo.environment["BUTTER_GPU_LOOP_LAG"] ?? "")

@@ -2987,7 +2987,7 @@ public final class LagunaModel: LanguageModel {
     public var requiresLeadingBOS: Bool { false }
 
     // ─── W35: non-blocking decode CB window ──────────────────────────
-    // BUTTER_LAGUNA_NONBLOCK_DECODE=1 replaces the per-token blocking
+    // BUTTER_LAGUNA_NONBLOCK_DECODE (default ON; =0 disables) replaces the per-token blocking
     // depth window in `forwardFromTokenTensor` (removeFirst().
     // waitUntilCompleted() ~10x/token + trailing full drain) with a
     // NON-blocking window: every layer-group CB gets an
@@ -3019,7 +3019,7 @@ public final class LagunaModel: LanguageModel {
     // window (uncounted); Laguna's default GPU-router Path B never
     // takes those, and they self-limit (they commit+wait on the host).
     static let nonblockDecodeEnabled: Bool =
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_NONBLOCK_DECODE"] == "1"
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_NONBLOCK_DECODE"] != "0"
     static let nonblockInflightCBs: Int = max(
         2,
         Int(ProcessInfo.processInfo.environment["BUTTER_LAGUNA_INFLIGHT_CBS"] ?? "") ?? 24)

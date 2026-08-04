@@ -5243,3 +5243,11 @@ within a token, decode is GPU-bound (T_enc is mostly hidden already);
 removing the remaining drain + cross-token lookahead only reclaims the
 inter-token bubble. The residual gap to the theoretical
 max(T_enc, T_gpu) sits in GPU execution itself, not host scheduling.
+
+#### Non-blocking decode window: DEFAULT ON
+
+Flipping BUTTER_LAGUNA_NONBLOCK_DECODE to default ON (=0 to disable)
+after the feature PR validated byte-identical output and +5.3% decode
+(worst-on beat best-off across 6 pairs). Decode is now GPU-execution
+bound; the host-scheduling vein is closed. Loop lag defaults to 3 under
+the flag; LAYERS_PER_CB to 8.
