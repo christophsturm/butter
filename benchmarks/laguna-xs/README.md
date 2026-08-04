@@ -5079,3 +5079,101 @@ tok/s ABBA) on top of the sliding fusion. Test contract updated to
 opt-out in the same change. Hardware gate (mppAutoCapable) still
 declines on non-target devices. Combined fused-attention state: both
 layer classes fuse by default; decode ~92 tok/s vs ~71 at start of day.
+
+#### W31: bit-exact fused decode router top-8 select: +4.6% decode
+
+`BUTTER_LAGUNA_ROUTER_TOP8_FUSED=1` (default OFF, opt-in) replaces
+`runPathBRouteChain`'s stock four-dispatch decode router chain
+(`Ops.sigmoid` -> `Ops.add` (+expert bias) -> `Ops.moeRouterTopKBiased`
+(top-8 select) -> `Ops.mul` (routedScalingFactor, 2.5x)) with ONE
+hand-written Metal dispatch, cutting ~3 dispatches x 39 MoE layers/
+token — the single biggest remaining decode-lever candidate at mission
+start. New file `LagunaRouterTop8Fuse.swift`, NOT a reuse of the
+existing (default-OFF, known-divergent) `LagunaRouteFuse.swift` from
+T32.
+
+**Stock-chain math analysis (the correctness oracle):**
+- Sigmoid (`iron_sigmoid_bf16.metal`): `bf16(1/(1+exp(-float(logit))))`,
+  stored to `unbiasedScoreScratch` — round #1.
+- Bias add (`vector_add_bf16.metal`): `bf16(float(unbiased) +
+  float(bias))`, stored to `biasedScoreScratch` — round #2. This is
+  what top-k selection actually compares on — bias is
+  selection-only, never enters the weight.
+- Top-k (`iron_moe_router_topk_biased_bf16.metal`): one threadgroup, 32
+  lanes, per-lane strided scan (`j = i*32 + lane`) over the 256 experts,
+  8 slots. Tie-break: the per-lane scan uses strict `candidate >
+  best_val`, so an equal-valued later candidate never displaces an
+  earlier one within a lane (first-found-wins on tie, in ascending
+  index order within that lane's stride); cross-lane ties resolve via
+  `simd_max` on value then `simd_min` on index (smallest global index
+  wins). Weight = UNBIASED bf16 score at the chosen index (re-read from
+  `unbiasedScoreScratch`, i.e. `sigmoid`'s round #1, never the biased
+  value) / sum of the 8 chosen unbiased scores, then bf16-rounded on
+  store to `weightsOut` — round #3.
+- Scale (`iron_mul_bf16.metal`): only when `routedScalingFactor != 1.0`
+  (it's 2.5 for Laguna); separate `bf16(float(weight) * float(scale))`
+  — round #4, a SECOND rounding on top of round #3, not folded into it.
+
+**Why `LagunaRouteFuse` (T32) measured flat/divergent and this one
+doesn't:** that kernel computes sigmoid+bias inline and keeps
+everything in float until one final store — a single rounding instead
+of stock's four, which both changes which candidate wins near-tied
+top-k slots (comparisons run on un-rounded values) and, per its own
+file header, measured -2.6% wall. This kernel instead inserts an
+explicit `bfloat(...)` cast at each of the four points above,
+reproducing stock's rounding chain (including round #3 -> round #4
+double-rounding) bit-for-bit inside one dispatch. Sigmoid is
+recomputed inline wherever the stock chain would re-read
+`unbiasedScoreScratch` from memory (both during selection and at the
+final weight lookup) instead of cached in threadgroup memory — a pure
+function of an unchanged input, so recompute is bit-identical to
+caching, just trades a few redundant `exp()` calls (irrelevant; this
+kernel's whole reason to exist is dispatch count, not ALU/bandwidth,
+on a single 256-wide row).
+
+**Reachability gotcha (cost real debugging time):** `runPathBRouteChain`
+is only reachable from `decodeGPUPathBNvfp4` / `decodeNineSlot`, which
+`MoELayer.decodeImpl` only takes when `stackedNvfp4Experts` is set —
+i.e. the NVFP4 checkpoint (`~/models/laguna-xs-2.1-nvfp4`). The affine
+4-bit checkpoint (`~/models/laguna-xs-2.1-4bit`, this doc's usual
+primary model) instead runs `decodeGPUPathB` ->
+`decodeGPUPathBHybrid`/`decodeGPUPathBFull`, which have their OWN
+separately inlined stock chains untouched by this change. First-pass
+validation against the affine4 checkpoint was a false green (digest
+"matched" and ABBA measured flat because the flag never actually
+dispatched anything on that model — confirmed via a temporary
+`W31_DEBUG=1` fire/decline counter before re-running everything against
+NVFP4). Left a note in the source file header so the next person
+doesn't lose the same hour.
+
+**Validation (against `laguna-xs-2.1-nvfp4`, the model that actually
+exercises this path):**
+- Byte-identity, temp-0, 200 tokens, flag off vs on, two prompts
+  ("Write a rust fib function", "What is the capital of France?
+  Explain briefly."): SHA-256 of the generated text matches exactly
+  both times (only the non-deterministic load-time/tok-s stats lines
+  differ).
+- `MoELayerTests` (9 tests, incl. `sigmoidBiasedTopK` weight/select
+  unit coverage and the tie-break-toward-smaller-index case): 9/9
+  pass, unaffected.
+- ABBA (6 pairs, 12 runs, ABBA-BAAB block order, "Write a rust fib
+  function", 300 tokens, temp 0, 8s cooldowns, contention-guarded —
+  skipped/retried any run that raced a concurrent `butter generate`
+  from another session on this shared box): A (off) = [83.44, 82.93,
+  79.69, 80.82, 78.15, 82.30] tok/s, mean 81.22; B (on) = [87.69,
+  87.32, 85.30, 83.81, 85.46, 80.29] tok/s, mean 84.98 — **+4.6%
+  decode**, clears the +1% ship gate. (An earlier 6-pair run against
+  the wrong model, and a separate run contaminated by a concurrent
+  agent's benchmark on the same box, are discarded — see the
+  reachability gotcha above and the box-noise precedent elsewhere in
+  this doc.)
+- Verdict: **SHIPPED, default OFF.** Byte-identical + above-gate win,
+  but kept opt-in (unlike several fusions above that flipped to
+  default-ON) since it's new this session and only exercised on the
+  NVFP4 checkpoint so far — flip to default ON after it's been run on
+  the affine4/int4 `decodeGPUPathBHybrid`/`decodeGPUPathBFull` chains
+  too (out of scope here; those have their own separate stock chains,
+  noted above, that a follow-up could fuse the same way). Escape hatch
+  `BUTTER_LAGUNA_ROUTER_TOP8_FUSED=0` (default) is also the permanent
+  fallback if a future model config (different nExperts/topK/dtype)
+  hits the kernel's guard and silently declines to the stock chain.

@@ -4080,6 +4080,19 @@ public final class MoELayer: Module, DecoderLayer {
         cmd: MTLCommandBuffer, device: Device
     ) {
         let scale = router.routedScalingFactor
+        // W31: bit-exact single-dispatch fusion, checked first — see
+        // `LagunaRouterTop8Fuse.swift`. Takes priority over the older
+        // `LagunaRouteFuse` (known to diverge past the first few tokens,
+        // see its file header) so a user who has both env vars set gets
+        // the correct one.
+        if LagunaRouterTop8Fuse.fusedRoute(
+            logits: logitsTensor, bias: expertBiasGPU,
+            indicesOut: routerIndicesScratch!, weightsOut: routerWeightsScratch!,
+            nExperts: nExperts, k: topK, scale: scale,
+            on: cmd, device: device)
+        {
+            return
+        }
         if LagunaRouteFuse.fusedRoute(
             logits: logitsTensor, bias: expertBiasGPU,
             indicesOut: routerIndicesScratch!, weightsOut: routerWeightsScratch!,
