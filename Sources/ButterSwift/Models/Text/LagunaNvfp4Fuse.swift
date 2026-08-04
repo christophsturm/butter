@@ -107,6 +107,17 @@ enum LagunaNvfp4Fuse {
         ProcessInfo.processInfo.environment["BUTTER_LAGUNA_GATEUP_SPLIT"] == "1"
     }
 
+    /// T43: fold the post-MoE residual add into the nine-slot down-reduce
+    /// kernel's lane-0 epilogue (`laguna_nine_slot_nvfp4_down_reduce_residual_bf16`),
+    /// removing the separate `Ops.add(h2, ffnOut, ...)` dispatch on the
+    /// nine-slot decode path. Opt-in until validated by the A/B harness;
+    /// escape hatch is simply not setting this (stock two-dispatch
+    /// down-reduce + residual-add chain stays the default). See
+    /// `LagunaNvfp4Fuse.nineSlotDownReduceSource` / `moeNineSlotDownReduce`.
+    static var downResidualFoldEnabled: Bool {
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD"] == "1"
+    }
+
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]
     private static let lock = NSLock()
 
@@ -1467,8 +1478,78 @@ enum LagunaNvfp4Fuse {
     /// trajectory row-for-row (not claimed byte-identical against the
     /// *shared* leg specifically, since the shared leg's own dequant-GEMV
     /// numerics differ, see T28 README).
-    private static let nineSlotDownReduceSrc = header + """
-    kernel void laguna_nine_slot_nvfp4_down_reduce_bf16(
+    /// T43: template shared by the stock and residual-folding down-reduce
+    /// kernels (no function-constant/#if machinery elsewhere in this file
+    /// -- the established convention is a full source string per PSO
+    /// variant, see the T28 gate-up-split doc comment above). With
+    /// `foldResidual: false` this reproduces `laguna_nine_slot_nvfp4_down_reduce_bf16`
+    /// byte-for-byte (stock kernel untouched). With `foldResidual: true` it
+    /// emits the `_residual_bf16` sibling: one extra `residual` input
+    /// (buffer 18, next free index after the two `setBytes` scalar slots
+    /// at 16/17) and the lane-0 epilogue's final store becomes
+    /// `bfloat(float(bfloat(total)) + float(residual[row]))` instead of a
+    /// bare store. The inner `bfloat(total)` cast deliberately emulates
+    /// the stock chain's DOUBLE rounding: the stock down-reduce stores
+    /// `bfloat(total)` (round 1) and `Ops.add` then computes
+    /// `bfloat(float(a) + float(b))` over the two bf16 inputs (round 2).
+    /// Skipping round 1 (adding the unrounded float `total`) is more
+    /// accurate but diverges from the two-dispatch chain by 1 ulp on
+    /// round-boundary values; emulating both rounds makes the fused
+    /// result bit-exact vs. stock, which is the ship gate here.
+    private static func nineSlotDownReduceSource(foldResidual: Bool) -> String {
+        let fnName = foldResidual
+            ? "laguna_nine_slot_nvfp4_down_reduce_residual_bf16"
+            : "laguna_nine_slot_nvfp4_down_reduce_bf16"
+        let residualParam = foldResidual
+            ? "\n        device const bfloat *residual [[buffer(18)]],"
+            : ""
+        // T43 fix: the residual epilogue's "round 1" MUST be a genuine
+        // device-memory round-trip, not just a `bfloat(total)` cast held in
+        // registers. `total` is already bf16-typed by the time we get here
+        // (see the accumulation loop above), so an in-register
+        // `bfloat(total)` cast is a no-op AS FAR AS THE SOURCE IS
+        // CONCERNED -- but under Metal's default fastMathEnabled=true (this
+        // kernel is compiled with the same default as every other
+        // `LagunaNvfp4Fuse.pso(...)` caller, on purpose: the qdot/dequant
+        // math above must stay numerically identical to the stock kernel's
+        // compile), the compiler is free to treat that cast as an advisory
+        // precision hint rather than a hard rounding boundary, since
+        // `total` never actually left the function before. The STOCK
+        // two-dispatch chain gets its rounding boundary for free: dispatch
+        // 1 stores `total` to `output` (device memory, real bf16 truncation
+        // no optimizer can undo), dispatch 2 (`Ops.add`) reloads that
+        // exact stored value as its `a` operand. Reproducing that here
+        // needs an ACTUAL store + reload through `output` (device address
+        // space), with a `threadgroup_barrier(mem_flags::mem_device)` in
+        // between so the reload can't be forwarded from the just-computed
+        // register value -- measured to close a ~2 ULP bf16 drift on ~25%
+        // of a layer's output elements that an in-register cast alone left
+        // open (present from the very first isolated decode call, no
+        // command buffers or pipelining involved). The barrier must be
+        // called by every thread in the threadgroup (Metal requirement),
+        // so it sits OUTSIDE the `expert_slot == 0u && lane < outputs_per_simd`
+        // guard, same pattern the existing `mem_threadgroup` barrier above
+        // already uses for its own guarded producer.
+        let residualEpilogue =
+            foldResidual
+            ? """
+
+                threadgroup_barrier(mem_flags::mem_device);
+                if (expert_slot == 0u && lane < outputs_per_simd) {
+                    // Round 1 already committed to device memory by the
+                    // store above; reload it for a real bf16 round-trip
+                    // (immune to fast-math register-level reassociation),
+                    // then round 2 matches `Ops.add`'s
+                    // `bfloat(float(a) + float(b))` exactly.
+                    bfloat rounded_total = output[first_row + lane];
+                    output[first_row + lane] = bfloat(
+                        float(rounded_total)
+                        + float(residual[first_row + lane]));
+                }
+            """
+            : ""
+        return header + """
+    kernel void \(fnName)(
         device const bfloat *mid_0 [[buffer(0)]],
         device const bfloat *mid_1 [[buffer(1)]],
         device const bfloat *mid_2 [[buffer(2)]],
@@ -1486,7 +1567,7 @@ enum LagunaNvfp4Fuse {
         device const uchar *shared_down_scales [[buffer(14)]],
         device bfloat *output [[buffer(15)]],
         constant float &global_scale [[buffer(16)]],
-        constant float &shared_global_scale [[buffer(17)]],
+        constant float &shared_global_scale [[buffer(17)]],\(residualParam)
         uint tgid [[threadgroup_position_in_grid]],
         uint simd_lane [[thread_index_in_simdgroup]],
         uint simd_group [[simdgroup_index_in_threadgroup]]
@@ -1591,11 +1672,25 @@ enum LagunaNvfp4Fuse {
                 float(total)
                 + float(expert_outputs[routed_experts * outputs_per_simd + lane]));
             output[first_row + lane] = total;
-        }
+        }\(residualEpilogue)
     }
     """
+    }
+
+    private static let nineSlotDownReduceSrc = nineSlotDownReduceSource(foldResidual: false)
+
+    /// T43 residual-folding sibling of `nineSlotDownReduceSrc`: identical
+    /// kernel body plus a `residual` input and a final store that adds it
+    /// in (`Ops.add`-bit-exact rounding, see `nineSlotDownReduceSource`).
+    private static let nineSlotDownReduceResidualSrc = nineSlotDownReduceSource(foldResidual: true)
 
     /// Nine-slot down QMV + weighted reduce (routed + shared, one dispatch).
+    /// T43: when `residual` is non-nil, the fused `_residual_bf16` PSO
+    /// variant runs instead, folding `output = residual + (routed-weighted-
+    /// sum + shared)` into the same dispatch -- removing the separate
+    /// `Ops.add(h2, ffnOut, ...)` the caller would otherwise need. `residual`
+    /// must be `[hidden]` bf16, same shape/dtype as `output`; the stock
+    /// (residual == nil) PSO/dispatch geometry is completely unchanged.
     static func moeNineSlotDownReduce(
         mids: [Tensor], sharedMid: Tensor,
         expertIndices: Tensor, slotWeights: Tensor,
@@ -1603,16 +1698,24 @@ enum LagunaNvfp4Fuse {
         sharedDownWeight: Tensor, sharedDownScales: Tensor,
         output: Tensor,
         global: Float, sharedGlobal: Float,
+        residual: Tensor? = nil,
         on cmd: MTLCommandBuffer, device: Device
     ) {
         precondition(mids.count == 8)
         precondition(sharedMid.dtype == .bf16 && sharedMid.elementCount == 512)
         precondition(output.dtype == .bf16 && output.elementCount == 2048)
+        if let residual {
+            precondition(residual.dtype == .bf16 && residual.elementCount == 2048)
+        }
 
         let mtl = device.mtlDevice
-        let p = pso(
-            "laguna_nine_slot_nvfp4_down_reduce_bf16",
-            source: nineSlotDownReduceSrc, device: mtl)
+        let p = residual == nil
+            ? pso(
+                "laguna_nine_slot_nvfp4_down_reduce_bf16",
+                source: nineSlotDownReduceSrc, device: mtl)
+            : pso(
+                "laguna_nine_slot_nvfp4_down_reduce_residual_bf16",
+                source: nineSlotDownReduceResidualSrc, device: mtl)
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(p)
         for i in 0 ..< 8 {
@@ -1630,6 +1733,9 @@ enum LagunaNvfp4Fuse {
         var sg = sharedGlobal
         enc.setBytes(&g, length: 4, index: 16)
         enc.setBytes(&sg, length: 4, index: 17)
+        if let residual {
+            enc.setBuffer(residual.buffer, offset: residual.offset, index: 18)
+        }
         // 512 tiles × 4 rows = 2048; TPG=288 (9 SGs × 32 lanes)
         enc.dispatchThreadgroups(
             MTLSize(width: 512, height: 1, depth: 1),

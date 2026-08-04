@@ -5080,108 +5080,95 @@ opt-out in the same change. Hardware gate (mppAutoCapable) still
 declines on non-target devices. Combined fused-attention state: both
 layer classes fuse by default; decode ~92 tok/s vs ~71 at start of day.
 
-#### W31: bit-exact fused decode router top-8 select: +4.6% decode
+#### Down+residual fold (w30): ROOT-CAUSED + FIXED - was a fast-math rounding bug, not a CB hazard
 
-`BUTTER_LAGUNA_ROUTER_TOP8_FUSED=1` (default OFF, opt-in) replaces
-`runPathBRouteChain`'s stock four-dispatch decode router chain
-(`Ops.sigmoid` -> `Ops.add` (+expert bias) -> `Ops.moeRouterTopKBiased`
-(top-8 select) -> `Ops.mul` (routedScalingFactor, 2.5x)) with ONE
-hand-written Metal dispatch, cutting ~3 dispatches x 39 MoE layers/
-token — the single biggest remaining decode-lever candidate at mission
-start. New file `LagunaRouterTop8Fuse.swift`, NOT a reuse of the
-existing (default-OFF, known-divergent) `LagunaRouteFuse.swift` from
-T32.
+BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD (default OFF) folds the post-MoE
+residual add into the nine-slot down-reduce epilogue (-39 dispatches/
+token). Paired ABBA consistently +4-8% decode, now bit-exact vs stock
+(see below) -- ready to flip the default once someone signs off on
+turning it on.
 
-**Stock-chain math analysis (the correctness oracle):**
-- Sigmoid (`iron_sigmoid_bf16.metal`): `bf16(1/(1+exp(-float(logit))))`,
-  stored to `unbiasedScoreScratch` — round #1.
-- Bias add (`vector_add_bf16.metal`): `bf16(float(unbiased) +
-  float(bias))`, stored to `biasedScoreScratch` — round #2. This is
-  what top-k selection actually compares on — bias is
-  selection-only, never enters the weight.
-- Top-k (`iron_moe_router_topk_biased_bf16.metal`): one threadgroup, 32
-  lanes, per-lane strided scan (`j = i*32 + lane`) over the 256 experts,
-  8 slots. Tie-break: the per-lane scan uses strict `candidate >
-  best_val`, so an equal-valued later candidate never displaces an
-  earlier one within a lane (first-found-wins on tie, in ascending
-  index order within that lane's stride); cross-lane ties resolve via
-  `simd_max` on value then `simd_min` on index (smallest global index
-  wins). Weight = UNBIASED bf16 score at the chosen index (re-read from
-  `unbiasedScoreScratch`, i.e. `sigmoid`'s round #1, never the biased
-  value) / sum of the 8 chosen unbiased scores, then bf16-rounded on
-  store to `weightsOut` — round #3.
-- Scale (`iron_mul_bf16.metal`): only when `routedScalingFactor != 1.0`
-  (it's 2.5 for Laguna); separate `bf16(float(weight) * float(scale))`
-  — round #4, a SECOND rounding on top of round #3, not folded into it.
+**The w30-parked write-up's "KV-cache cross-command-buffer visibility"
+lead was a mis-diagnosis.** Re-investigated from scratch with a
+temporary digest hook (per-layer/per-step checksum of the hidden state
+`h` and the raw KV cache bytes, stripped before this commit): the
+divergence is present, bit-for-bit deterministic, on the very FIRST
+decode call of a fresh process -- an isolated single-token forward pass
+at position 0, cache empty beforehand, `BUTTER_LAGUNA_LAYER_PIPE=0` (no
+multi-CB pipelining at all) and both fused-attention flags off. A race
+across command buffers cannot reproduce on a single, isolated dispatch
+with no other GPU work in flight. Element-wise diff of `h` right after
+layer 1 (the first MoE layer) showed ~25% of the 2048 elements off by
+1-2 bf16 ULPs (e.g. `-0.671875` vs `-0.67578125`) -- small, structured,
+100% reproducible: a rounding bug, not corrupted/garbage memory. Layers
+0 (dense, no MoE) and 1's OWN attention output (computed before its own
+MoE block) matched exactly; every layer from 2 onward inherited the
+drift via the residual stream. The parked write-up's LAYER_PIPE /
+FUSED_ATTN_STEP discriminator matrix was very likely a confound: those
+flags change other kernels' float rounding enough to shift *whether*
+the pre-existing drift happens to flip a greedy-argmax tie for a given
+prompt, not whether the drift exists.
 
-**Why `LagunaRouteFuse` (T32) measured flat/divergent and this one
-doesn't:** that kernel computes sigmoid+bias inline and keeps
-everything in float until one final store — a single rounding instead
-of stock's four, which both changes which candidate wins near-tied
-top-k slots (comparisons run on un-rounded values) and, per its own
-file header, measured -2.6% wall. This kernel instead inserts an
-explicit `bfloat(...)` cast at each of the four points above,
-reproducing stock's rounding chain (including round #3 -> round #4
-double-rounding) bit-for-bit inside one dispatch. Sigmoid is
-recomputed inline wherever the stock chain would re-read
-`unbiasedScoreScratch` from memory (both during selection and at the
-final weight lookup) instead of cached in threadgroup memory — a pure
-function of an unchanged input, so recompute is bit-identical to
-caching, just trades a few redundant `exp()` calls (irrelevant; this
-kernel's whole reason to exist is dispatch count, not ALU/bandwidth,
-on a single 256-wide row).
+**Mechanism:** `nineSlotDownReduceSource(foldResidual:)`'s fused
+epilogue computed `bfloat(float(bfloat(total)) + float(residual[...]))`
+entirely in registers, all within one Metal function. The inner
+`bfloat(total)` cast was meant to reproduce the stock two-dispatch
+chain's real rounding boundary (dispatch 1 stores `total` to `output`
+as bf16; dispatch 2, `Ops.add`, reloads that exact stored value). But
+`LagunaNvfp4Fuse.pso(...)` compiles with Metal's default
+`fastMathEnabled = true` (unlike the sibling attention fusions, which
+explicitly force it off) -- deliberately, since this kernel's dequant/
+qdot math has to stay bit-identical to the stock down-reduce kernel's
+own fastMath=true compile. Under fastMath, the compiler is free to
+treat an in-register `bfloat(...)` cast as an elidable precision hint
+rather than a hard rounding boundary, since `total` never actually left
+the function before -- so the fused epilogue was quietly rounding once
+instead of twice on a chunk of elements, exactly the "more accurate but
+diverges from the two-dispatch chain" case the code comment warned
+about and thought it had emulated away.
 
-**Reachability gotcha (cost real debugging time):** `runPathBRouteChain`
-is only reachable from `decodeGPUPathBNvfp4` / `decodeNineSlot`, which
-`MoELayer.decodeImpl` only takes when `stackedNvfp4Experts` is set —
-i.e. the NVFP4 checkpoint (`~/models/laguna-xs-2.1-nvfp4`). The affine
-4-bit checkpoint (`~/models/laguna-xs-2.1-4bit`, this doc's usual
-primary model) instead runs `decodeGPUPathB` ->
-`decodeGPUPathBHybrid`/`decodeGPUPathBFull`, which have their OWN
-separately inlined stock chains untouched by this change. First-pass
-validation against the affine4 checkpoint was a false green (digest
-"matched" and ABBA measured flat because the flag never actually
-dispatched anything on that model — confirmed via a temporary
-`W31_DEBUG=1` fire/decline counter before re-running everything against
-NVFP4). Left a note in the source file header so the next person
-doesn't lose the same hour.
+**Fix (`Sources/ButterSwift/Models/Text/LagunaNvfp4Fuse.swift`,
+`nineSlotDownReduceSource`):** force a REAL device-memory round-trip
+for round 1 instead of relying on an in-register cast. The residual
+kernel variant now: stores `total` to `output[first_row+lane]` (same
+store stock already does), executes an unconditional
+`threadgroup_barrier(mem_flags::mem_device)` (must be called by every
+thread in the threadgroup per Metal's rules, so it sits outside the
+`expert_slot==0 && lane<4` guard, mirroring the existing
+`mem_threadgroup` barrier's placement above it), then reloads
+`output[first_row+lane]` as a fresh `bfloat` and adds the residual,
+matching `Ops.add`'s `bfloat(float(a)+float(b))` exactly. A genuine
+store + full memory barrier + reload cannot be reassociated away by
+fast-math the way a bare cast can. The stock (non-fold) kernel's
+generated source text is untouched byte-for-byte (`foldResidual: false`
+still emits exactly `output[first_row + lane] = total;` with no
+epilogue) -- confirmed by running the default (fold OFF) path before
+and after this fix and diffing the 200-token greedy output: identical.
 
-**Validation (against `laguna-xs-2.1-nvfp4`, the model that actually
-exercises this path):**
-- Byte-identity, temp-0, 200 tokens, flag off vs on, two prompts
-  ("Write a rust fib function", "What is the capital of France?
-  Explain briefly."): SHA-256 of the generated text matches exactly
-  both times (only the non-deterministic load-time/tok-s stats lines
-  differ).
-- `MoELayerTests` (9 tests, incl. `sigmoidBiasedTopK` weight/select
-  unit coverage and the tie-break-toward-smaller-index case): 9/9
-  pass, unaffected.
-- ABBA (6 pairs, 12 runs, ABBA-BAAB block order, "Write a rust fib
-  function", 300 tokens, temp 0, 8s cooldowns, contention-guarded —
-  skipped/retried any run that raced a concurrent `butter generate`
-  from another session on this shared box): A (off) = [83.44, 82.93,
-  79.69, 80.82, 78.15, 82.30] tok/s, mean 81.22; B (on) = [87.69,
-  87.32, 85.30, 83.81, 85.46, 80.29] tok/s, mean 84.98 — **+4.6%
-  decode**, clears the +1% ship gate. (An earlier 6-pair run against
-  the wrong model, and a separate run contaminated by a concurrent
-  agent's benchmark on the same box, are discarded — see the
-  reachability gotcha above and the box-noise precedent elsewhere in
-  this doc.)
-- Verdict: **SHIPPED, default OFF.** Byte-identical + above-gate win,
-  but kept opt-in (unlike several fusions above that flipped to
-  default-ON) since it's new this session and only exercised on the
-  NVFP4 checkpoint so far — flip to default ON after it's been run on
-  the affine4/int4 `decodeGPUPathBHybrid`/`decodeGPUPathBFull` chains
-  too (out of scope here; those have their own separate stock chains,
-  noted above, that a follow-up could fuse the same way). Escape hatch
-  `BUTTER_LAGUNA_ROUTER_TOP8_FUSED=0` (default) is also the permanent
-  fallback if a future model config (different nExperts/topK/dtype)
-  hits the kernel's guard and silently declines to the stock chain.
-
-#### Fused router top-8: DEFAULT ON
-
-Flipping BUTTER_LAGUNA_ROUTER_TOP8_FUSED to default ON (=0 to disable)
-after the feature PR validated byte-identical selection and +4.6%
-decode. Router chain now 1 dispatch (was 4) on the NVFP4 nine-slot
-path: per-MoE-layer decode chain is 7 dispatches (was 10 at start of
-day, 6 is the known floor with the down-residual fold still parked).
+**Validation** (`~/models/laguna-xs-2.1-nvfp4`, M5 Max, temp-0 greedy):
+- Element-wise `h` diff after layer 1 (isolated first decode call,
+  LAYER_PIPE=0, fused attn off): 538/2048 elements differing pre-fix ->
+  **0/2048 post-fix**, checked at layers 0/1/2/39.
+- KV cache byte digest (all 40 layers' k/v buffers) across 8 decode
+  steps at default config (pipe4 + both fused attn steps ON): **exact
+  match**, fold ON vs fold OFF.
+- 200-token greedy digest, default config, 4 varied prompts ("Write a
+  rust fib function", "The capital of France is", "def quicksort(arr):",
+  "Explain quantum computing in simple terms.") -- 3 of 4 diverged
+  pre-fix (at prompt-dependent token depths, consistent with slow
+  ULP-level drift eventually flipping an argmax tie, not a fixed
+  step-2 cutoff); **all 4 bit-exact match post-fix**.
+- Default (fold OFF) path digest unchanged before vs. after this fix,
+  same 2 prompts, 200 tokens: byte-identical (no behavior change on
+  today's shipped path, as expected since its kernel source is
+  untouched).
+- Paired ABBA, "Write a rust fib function", 300 tokens, temp-0, A=fold
+  OFF (stock) / B=fold ON (fixed): run 1 (ABBA-BAAB x4) A=[87.13, 84.71,
+  86.14, 85.95] mean 85.98, B=[91.52, 92.00, 90.67, 90.16] mean 91.09,
+  **+5.9%**; run 2 (ABAB x5) A=[84.26, 84.51, 86.66, 81.81, 85.46] mean
+  84.54, B=[89.69, 91.01, 91.70, 89.76, 92.57] mean 90.95, **+7.6%** --
+  both well above the +1.5% ship gate and consistent with the
+  originally-measured (but incorrect-output) +4-6%. The fence + reload
+  cost is not measurable against the dispatch-count win; not shipped as
+  default yet pending sign-off, but `BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD=1`
+  is now correctness-clean.

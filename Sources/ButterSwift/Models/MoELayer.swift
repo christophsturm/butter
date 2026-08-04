@@ -589,6 +589,15 @@ public final class MoELayer: Module, DecoderLayer {
     private var nineSlotSharedDownScales: Tensor?
     private var nineSlotSharedDownGlobal: Float = 1.0
     private var sharedMidScratch: Tensor?
+    /// T43: set by `decodeNineSlot` when the nine-slot down-reduce dispatch
+    /// folded the post-MoE residual add into its own lane-0 epilogue
+    /// (`BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD=1`, nine-slot bf16 path only).
+    /// Reset at the top of every `decodeFoldingResidual` call so a decode
+    /// that takes a different internal branch (GPU router, Path B int4,
+    /// CPU fallback — none of which fold) reports `false` and the caller
+    /// falls back to its own residual add. Single-threaded per layer
+    /// instance, same assumption the other decode scratches above rely on.
+    private var lastResidualFolded = false
     /// Layer index in the stack (for late-layer MPP f32 promote). `-1` = unknown.
     public let layerIndex: Int
     /// Prefill NVFP4 MoE matmul scratches (grow-only; avoids per-layer
@@ -1321,14 +1330,43 @@ public final class MoELayer: Module, DecoderLayer {
     ) -> Tensor {
         decodeImpl(
             h, position: position, cache: cache,
-            cmd: cmd, device: device, precomputedLogits: precomputedLogits)
+            cmd: cmd, device: device, precomputedLogits: precomputedLogits, residual: nil)
+    }
+
+    /// T43: down-residual-fold entry point. Not part of `DecoderLayer`
+    /// protocol conformance (unlike `decode`/`decodeWithPrecomputedLogits`
+    /// above, so its signature is free to carry the extra `residual` arg
+    /// and tuple return) — callers that know their `ffn` case is `.moe`
+    /// concretely (e.g. `LagunaLayer.forward`) can call it directly.
+    /// Attempts to fold `residual` into the nine-slot down-reduce kernel's
+    /// epilogue (`BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD=1`, nine-slot-eligible
+    /// shapes only); when `residualFolded` comes back `false` (flag off,
+    /// shapes don't qualify, or a non-nine-slot decode branch fired),
+    /// `output` is the plain MoE ffn output exactly as `decode` would
+    /// return, and the caller must still add `residual` itself.
+    public func decodeFoldingResidual(
+        _ h: Tensor, position: Int,
+        cache: any LayerCacheProtocol,
+        cmd: MTLCommandBuffer, device: Device,
+        precomputedLogits: Tensor?,
+        residual: Tensor,
+        foldInto: Tensor? = nil
+    ) -> (output: Tensor, residualFolded: Bool) {
+        lastResidualFolded = false
+        let output = decodeImpl(
+            h, position: position, cache: cache,
+            cmd: cmd, device: device, precomputedLogits: precomputedLogits,
+            residual: residual, foldInto: foldInto)
+        return (output, lastResidualFolded)
     }
 
     private func decodeImpl(
         _ h: Tensor, position _: Int,
         cache _: any LayerCacheProtocol,
         cmd: MTLCommandBuffer, device: Device,
-        precomputedLogits: Tensor?
+        precomputedLogits: Tensor?,
+        residual: Tensor? = nil,
+        foldInto: Tensor? = nil
     ) -> Tensor {
         return Profile.signpost("moe.decode") { () -> Tensor in
         precondition(
@@ -1372,7 +1410,8 @@ public final class MoELayer: Module, DecoderLayer {
                 return decodeGPUPathBNvfp4(
                     h: h, logitsTensor: logitsTensor,
                     stacked: nv, expertBiasGPU: biasGPU,
-                    cmd: cmd, device: device)
+                    cmd: cmd, device: device, residual: residual,
+                    foldInto: foldInto)
             }
             if let stacked = stackedInt4Experts, stacked.dtype == h.dtype {
                 return decodeGPUPathB(
@@ -4128,7 +4167,9 @@ public final class MoELayer: Module, DecoderLayer {
         h: Tensor, logitsTensor: Tensor,
         stacked: StackedNvfp4Experts,
         expertBiasGPU: Tensor,
-        cmd: MTLCommandBuffer, device: Device
+        cmd: MTLCommandBuffer, device: Device,
+        residual: Tensor? = nil,
+        foldInto: Tensor? = nil
     ) -> Tensor {
         let topK = router.topK
         let nExperts = router.nExperts
@@ -4179,7 +4220,8 @@ public final class MoELayer: Module, DecoderLayer {
             return decodeNineSlot(
                 h: h, logitsTensor: logitsTensor, stacked: stacked,
                 expertBiasGPU: expertBiasGPU, shared: nineSlot,
-                cmd: cmd, device: device)
+                cmd: cmd, device: device, residual: residual,
+                foldInto: foldInto)
         }
 
         // Shared expert depends only on h (not routing). Two schedules:
@@ -4533,11 +4575,20 @@ public final class MoELayer: Module, DecoderLayer {
     /// `LagunaNvfp4Fuse.moeGateUpSplitSwigluQmv` for the dependency-overlap
     /// rationale. The down+residual leg (`moeNineSlotDownReduce`) is NOT
     /// split and runs identically either way.
+    ///
+    /// T43 (`BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD=1`,
+    /// `LagunaNvfp4Fuse.downResidualFoldEnabled`): when `residual` is
+    /// non-nil and the flag is on, the down-reduce dispatch also folds in
+    /// `+ residual` (sets `self.lastResidualFolded = true` so
+    /// `decodeFoldingResidual` can tell the caller it no longer needs its
+    /// own `Ops.add`). Otherwise behaves exactly as before this note.
     private func decodeNineSlot(
         h: Tensor, logitsTensor: Tensor,
         stacked: StackedNvfp4Experts, expertBiasGPU: Tensor,
         shared: NineSlotShared,
-        cmd: MTLCommandBuffer, device: Device
+        cmd: MTLCommandBuffer, device: Device,
+        residual: Tensor? = nil,
+        foldInto: Tensor? = nil
     ) -> Tensor {
         let topK = router.topK
         let nExperts = router.nExperts
@@ -4599,16 +4650,41 @@ public final class MoELayer: Module, DecoderLayer {
         dk("moe_swiglu")
 
         let acc = accumulatorScratch!
+        // T43: fold `+ residual` into this dispatch when the caller passed
+        // one, the flag is on, and `residual` is a matching [hidden] bf16
+        // tensor (same guard shape the nine-slot branch above already
+        // established: h.dtype == .bf16, hidden == 2048). Declines silently
+        // (stock two-dispatch chain) on any mismatch instead of trapping,
+        // since `residual` here is caller-supplied, not derived from the
+        // same shape preconditions as the rest of this function's tensors.
+        let foldResidual: Tensor? =
+            if let residual, LagunaNvfp4Fuse.downResidualFoldEnabled,
+                residual.dtype == acc.dtype, residual.elementCount == hidden
+            {
+                residual
+            } else {
+                nil
+            }
+        // T43 fix: when folding, the layer OUTPUT must not alias
+        // accumulatorScratch (the stock chain's own comment in
+        // LagunaText.forward documents that hazard; its Ops.add writes to
+        // a dedicated ffnOutScratch for exactly this reason). Bind the
+        // caller-provided destination as the kernel's output instead.
+        let downOut = (foldResidual != nil ? foldInto : nil) ?? acc
         LagunaNvfp4Fuse.moeNineSlotDownReduce(
             mids: inners, sharedMid: sharedMidScratch!,
             expertIndices: routerIndicesScratch!, slotWeights: routerWeightsScratch!,
             downWeight: stacked.downWeight, downScales: stacked.downScales,
             sharedDownWeight: shared.downWeight, sharedDownScales: shared.downScales,
-            output: acc,
+            output: downOut,
             global: stacked.global, sharedGlobal: shared.downGlobal,
+            residual: foldResidual,
             on: localCmd, device: device)
+        if foldResidual != nil {
+            lastResidualFolded = true
+        }
         dk("moe_down_reduce")
-        return acc
+        return downOut
     }
 
     /// Lazy build of fused shared [gate; up] NVFP4 banks (once per layer).

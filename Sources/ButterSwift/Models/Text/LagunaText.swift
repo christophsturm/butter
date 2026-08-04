@@ -1805,18 +1805,50 @@ final class LagunaLayer {
         case .moe(let moe):
             // Full Path B: residual on same CB, one commit+wait at layer end.
             // Host/hybrid commits mid-decode — residual on fresh CB + wait.
+            //
+            // T43: always call through `decodeFoldingResidual` and pass
+            // `h2` (the pre-FFN residual). `moe` itself decides whether it
+            // can fold (nine-slot-eligible shapes + `BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD=1`)
+            // — when it does, `residualFolded` comes back true and `ffnOut`
+            // already IS `h2 + ffn(ffnIn)`, so the `Ops.add` below (and the
+            // `workBuf.status` fresh-CB fallback branch) are skipped
+            // entirely: one dispatch fewer per MoE decode layer. When it
+            // declines (flag off, non-nine-slot decode branch, shape
+            // mismatch), `ffnOut` is exactly what `decode` /
+            // `decodeWithPrecomputedLogits` would have returned and every
+            // path below behaves exactly as before this change.
+            // T43 fix: pre-allocate the dedicated per-layer output tensor
+            // and hand it to the fold as the down-reduce destination, so
+            // the folded layer output has the same tensor identity as the
+            // stock chain's Ops.add result (never accumulatorScratch --
+            // see the aliasing note above the stock Ops.add below).
+            if ffnOutScratch == nil
+                || ffnOutScratch!.dtype != ffnIn.dtype
+                || ffnOutScratch!.elementCount != hidden
+            {
+                ffnOutScratch = Tensor.empty(
+                    shape: [hidden], dtype: ffnIn.dtype, device: device)
+            }
             let ffnOut: Tensor
+            let residualFolded: Bool
             if let logits = precomputedRouterLogits {
-                ffnOut = moe.decodeWithPrecomputedLogits(
+                (ffnOut, residualFolded) = moe.decodeFoldingResidual(
                     ffnIn, position: position,
                     cache: StatelessLayerCache(),
                     cmd: workBuf, device: device,
-                    precomputedLogits: logits)
+                    precomputedLogits: logits, residual: h2,
+                    foldInto: ffnOutScratch!)
             } else {
-                ffnOut = moe.decode(
+                (ffnOut, residualFolded) = moe.decodeFoldingResidual(
                     ffnIn, position: position,
                     cache: StatelessLayerCache(),
-                    cmd: workBuf, device: device)
+                    cmd: workBuf, device: device,
+                    precomputedLogits: nil, residual: h2,
+                    foldInto: ffnOutScratch!)
+            }
+            if residualFolded {
+                dkB("l00_moe_ffn_residual_folded")
+                return ffnOut
             }
             if workBuf.status == .committed || workBuf.status == .completed
                 || workBuf.status == .error
