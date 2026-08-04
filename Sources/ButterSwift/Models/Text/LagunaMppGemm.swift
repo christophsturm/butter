@@ -77,12 +77,15 @@ enum LagunaMppGemm {
         ProcessInfo.processInfo.environment["BUTTER_LAGUNA_MPP_GEMM"] != "0"
     }
 
-    /// W34 NAX2 try-first path. Default OFF -- opt-in via
-    /// BUTTER_LAGUNA_NAX2_GEMM=1 while the structure is being qualified;
-    /// when off, every dispatch takes the staged `kernelName` path
-    /// exactly as before this change.
+    /// W34 NAX2 try-first path. Default ON (=0 to disable, restoring
+    /// the staged kernel for every dispatch): qualified via the W34/W39
+    /// gates -- kernel-level 2-2.4x vs the staged kernel, wall +23.8
+    /// percent prefill at 1351 tokens, cos 0.984 end-to-end logits vs
+    /// staged (the same accepted noise class as the shipped
+    /// staged-vs-steel delta), 6/6 correctness suite vs f32 CPU
+    /// reference, native bfloat operands with strict precision.
     static var nax2Enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_NAX2_GEMM"] == "1"
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_NAX2_GEMM"] != "0"
     }
 
     /// L2-locality threadgroup-ID swizzle exponent for the NAX2 kernel

@@ -5346,3 +5346,12 @@ B re-reads help) - do not re-try without a different angle. Also fixed
 in passing: `LagunaMppGemmTests.declinesNonAlignedM` still asserted the
 pre-pad-M `nil` decline at t=100 (stale since #83; unnoticed because CI
 GPUs are MPP-incapable and skip the suite).
+
+#### NAX2 dense prefill GEMM: DEFAULT ON
+
+Flipping BUTTER_LAGUNA_NAX2_GEMM to default ON (=0 to disable) after
+the W34 feature PR validated +23.8 percent prefill at 1351 tokens
+(kernel-level 2-2.4x) with cos 0.984 end-to-end logits vs the staged
+kernel - the same accepted numerics class as the shipped staged-vs-steel
+delta. Test contract updated to opt-out in this same change. Prefill
+default moves from ~1874 to ~2319 tok/s at the standard long prompt.

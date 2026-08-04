@@ -112,9 +112,10 @@ struct LagunaNax2GemmTests {
 
     @Test("NAX2 gate: default OFF, and stricter N/K alignment declines to the staged kernel")
     func eligibilityGate() throws {
-        // Default (flag unset): never eligible, even for perfect shapes.
+        // Opt-out contract: =0 must decline, even for perfect shapes.
+        setenv("BUTTER_LAGUNA_NAX2_GEMM", "0", 1)
+        #expect(!LagunaMppGemm.nax2Eligible(m: 512, n: 8192, k: 2048), "BUTTER_LAGUNA_NAX2_GEMM=0 must disable")
         unsetenv("BUTTER_LAGUNA_NAX2_GEMM")
-        #expect(!LagunaMppGemm.nax2Eligible(m: 512, n: 8192, k: 2048), "NAX2 must be opt-in (default OFF)")
 
         try withNax2 {
             guard mppAvailable else { return }  // capability is part of the gate below
