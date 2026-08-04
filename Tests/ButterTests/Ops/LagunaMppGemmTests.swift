@@ -263,7 +263,17 @@ struct LagunaMppGemmTests {
             result = LagunaMppGemm.tryMppGemm(
                 linear, x: x, t: 100, outDim: outDim, inDim: inDim, on: cmd, device: device)
         }
-        #expect(result == nil, "tryMppGemm must decline t=100 (not a multiple of 64)")
+        // Since the pad-M path landed (see `padMEnabled`'s header), t=100
+        // no longer declines outright: `tryMppGemm` pads to 128, dispatches
+        // MPP, and returns exactly the real t rows. (This expectation was
+        // stale from before pad-M -- it asserted `nil` -- and only went
+        // unnoticed because CI GPUs are MPP-incapable and skip this suite.)
+        if LagunaMppGemm.padMEnabled {
+            #expect(result != nil, "pad-M path must engage MPP at t=100 via padding")
+            #expect(result?.shape == [100, outDim], "padded dispatch must slice back to the real t rows")
+        } else {
+            #expect(result == nil, "with pad-M disabled, tryMppGemm must decline t=100")
+        }
     }
 
     // MARK: - Equivalence vs the steel path
