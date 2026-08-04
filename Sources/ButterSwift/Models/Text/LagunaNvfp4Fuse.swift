@@ -110,12 +110,13 @@ enum LagunaNvfp4Fuse {
     /// T43: fold the post-MoE residual add into the nine-slot down-reduce
     /// kernel's lane-0 epilogue (`laguna_nine_slot_nvfp4_down_reduce_residual_bf16`),
     /// removing the separate `Ops.add(h2, ffnOut, ...)` dispatch on the
-    /// nine-slot decode path. Opt-in until validated by the A/B harness;
-    /// escape hatch is simply not setting this (stock two-dispatch
-    /// down-reduce + residual-add chain stays the default). See
+    /// nine-slot decode path. Default ON (`=0` to disable, restoring the
+    /// stock two-dispatch chain): validated bit-exact vs stock (element
+    /// diff 0/2048, KV digests equal, four-prompt 200-token digests
+    /// match) with +6 percent paired-ABBA decode. See
     /// `LagunaNvfp4Fuse.nineSlotDownReduceSource` / `moeNineSlotDownReduce`.
     static var downResidualFoldEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD"] == "1"
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD"] != "0"
     }
 
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]

@@ -5172,3 +5172,13 @@ and after this fix and diffing the 200-token greedy output: identical.
   cost is not measurable against the dispatch-count win; not shipped as
   default yet pending sign-off, but `BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD=1`
   is now correctness-clean.
+
+#### Down-residual fold: DEFAULT ON
+
+Flipping BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD to default ON (=0 to disable)
+after the feature PR validated bit-exact output and +6 percent decode.
+Per-MoE-layer decode chain now 6 dispatches (o_proj, residual+norm,
+router GEMV, fused top8, gate-up, down+residual) - the known floor for
+the current kernel set, matching the external chase target's chain
+shape. Decode default is now in the ~95-100 tok/s band on a quiet box
+vs ~71 at the start of the effort.
