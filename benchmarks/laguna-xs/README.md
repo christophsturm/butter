@@ -5182,3 +5182,64 @@ router GEMV, fused top8, gate-up, down+residual) - the known floor for
 the current kernel set, matching the external chase target's chain
 shape. Decode default is now in the ~95-100 tok/s band on a quiet box
 vs ~71 at the start of the effort.
+
+### W35: non-blocking decode window (BUTTER_LAGUNA_NONBLOCK_DECODE)
+
+Structural lever: `forwardFromTokenTensor`'s pipe path blocked the host
+per token (`inflight.removeFirst().waitUntilCompleted()` whenever
+in-flight CBs > depth 4, plus a trailing full drain before returning),
+so steady-state decode paid T_enc + T_gpu sequentially even though
+`GpuTokenLoop` already chains token ids GPU-side. The flag replaces
+that with a NON-blocking, cross-token window: each layer-group CB
+registers an `addCompletedHandler` that signals a counting semaphore
+(instance-persistent, so the window spans tokens); the host blocks
+only when total in-flight CBs would exceed
+`BUTTER_LAGUNA_INFLIGHT_CBS` (default 24). The trailing drain is
+removed (the caller's final-norm+lm_head+argmax CB is on the same
+queue, so it sequences after the stack anyway), layers/CB defaults
+1 -> 8 under the flag (~6 CBs/token so 3-4 tokens fit in the window),
+and `GpuTokenLoop` lag rises 1 -> 3 (`BUTTER_GPU_LOOP_LAG`) so tokens
+N+1..N+3 encode while N executes.
+
+**Host-state audit** (what makes this safe):
+- All decode CBs in this path come from the PRIMARY queue only
+  (`device.makeCommandBuffer()`; no `makeCommandBufferB` anywhere in
+  the Laguna decode path — the nine-slot MoE dispatch replaced the old
+  dual-queue shared-expert chain on the default path and is
+  commit-free). Same-queue commit order + hazard tracking sequence all
+  scratch reuse across layers AND tokens.
+- Per-layer scratch (`ffnOutScratch`, router/expert scratches, fused
+  attn step caches) is GPU-written only; the host just binds.
+- `KVEvictionState.reserveNextSlot` / `length` bumps mutate at ENCODE
+  time on the single host encode thread — order identical to the
+  blocking regime.
+- No mid-loop host readback besides the ring-buffer token resolve
+  (already async via per-slot semaphores). LmHeadPrune diag paths are
+  env-gated off.
+- Incompatible with the T39 per-kernel timing probe: flag is forced
+  off when `LagunaDecodeKernelTiming.enabled`.
+- Queue cap is 256 in-flight CBs (`IronLibrary`); window 24 stays far
+  below, so `makeCommandBuffer` never silently blocks.
+
+**Validation** (`~/models/laguna-xs-2.1-nvfp4`, M5 Max, temp-0 greedy):
+- Byte-identity, flag off vs on: 200-token fib prompt digest
+  IDENTICAL; 500-token runs on 2 prompts (fib, quantum) IDENTICAL.
+  Same math, same encode order — only host scheduling changed.
+- Paired ABBA (ABBA-BAAB-ABBA-BAAB x12, 240 tokens, fib prompt, 5s
+  cooldowns): A = flag off [90.15, 90.54, 92.11, 91.53, 91.18, 90.79]
+  mean 91.05; B = flag on (24 CBs / 8 layers-per-CB / lag 3) [96.59,
+  96.56, 95.45, 95.26, 95.55, 95.70] mean 95.85 — **+5.3%**, worst-on
+  (95.26) > best-off (92.11).
+- Knob sweep (3 runs each; box under load ~9 loadavg, so treat as
+  directional): (16,4) 86.7-91.8, (30,13) 91.2-92.8, (48,2) 87.9-90.1,
+  (64,1) 87.3-89.8 — none beat the (24,8) default. Paired lag probe:
+  lag3 96.76 vs lag1 94.03 mean (+2.9%), so the cross-token lookahead
+  is real; lag5/cbs36 vs lag3/cbs24 paired showed no further gain.
+
+**Verdict:** consistent, byte-identical **+5.3%** — but BELOW the +10%
+ship gate, so the flag stays **default OFF**. The structural ~2x thesis
+did not materialize: with the depth-4 pipe already overlapping encode
+within a token, decode is GPU-bound (T_enc is mostly hidden already);
+removing the remaining drain + cross-token lookahead only reclaims the
+inter-token bubble. The residual gap to the theoretical
+max(T_enc, T_gpu) sits in GPU execution itself, not host scheduling.

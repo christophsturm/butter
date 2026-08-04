@@ -2986,6 +2986,47 @@ public final class LagunaModel: LanguageModel {
     public var defaultPrefillStepSize: Int { 4096 }
     public var requiresLeadingBOS: Bool { false }
 
+    // ─── W35: non-blocking decode CB window ──────────────────────────
+    // BUTTER_LAGUNA_NONBLOCK_DECODE=1 replaces the per-token blocking
+    // depth window in `forwardFromTokenTensor` (removeFirst().
+    // waitUntilCompleted() ~10x/token + trailing full drain) with a
+    // NON-blocking window: every layer-group CB gets an
+    // addCompletedHandler that signals a counting semaphore, and the
+    // host only blocks when the total number of in-flight CBs would
+    // exceed `nonblockInflightCBs` (BUTTER_LAGUNA_INFLIGHT_CBS,
+    // default 24). The window is an *instance* semaphore, so it spans
+    // MULTIPLE tokens: `forwardFromTokenTensor` returns as soon as the
+    // stack is committed, and GpuTokenLoop (lag > 1) starts encoding
+    // token N+1..N+3 while token N still executes — steady-state
+    // throughput approaches max(T_enc, T_gpu) instead of the sum.
+    //
+    // Correctness: all decode CBs in this path come from
+    // `device.makeCommandBuffer()` = the PRIMARY queue only (verified:
+    // no `makeCommandBufferB`/`commandQueueB` use anywhere in the
+    // Laguna decode path), so GPU-side sequencing of per-layer scratch
+    // reuse across layers AND tokens follows commit order + Metal
+    // hazard tracking; no fences needed. Host-side per-token state
+    // (KVEvictionState.reserveNextSlot, `length` bumps) mutates at
+    // ENCODE time on the single host encode thread, so its order is
+    // unchanged. The queue caps in-flight CBs at 256
+    // (IronLibrary.defaultMaxCommandBufferCount); the default window
+    // (24) stays far below that so `makeCommandBuffer` never blocks
+    // silently. Incompatible with the T39 dkTiming probe (which needs
+    // per-kernel commit+wait): the flag is guarded off when
+    // `LagunaDecodeKernelTiming.enabled`.
+    //
+    // NOTE: mid-layer commits by host/hybrid MoE fallbacks bypass the
+    // window (uncounted); Laguna's default GPU-router Path B never
+    // takes those, and they self-limit (they commit+wait on the host).
+    static let nonblockDecodeEnabled: Bool =
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_NONBLOCK_DECODE"] == "1"
+    static let nonblockInflightCBs: Int = max(
+        2,
+        Int(ProcessInfo.processInfo.environment["BUTTER_LAGUNA_INFLIGHT_CBS"] ?? "") ?? 24)
+    /// Counting semaphore backing the cross-token in-flight window.
+    /// Lazy is safe: decode host encode is single-threaded.
+    private lazy var nonblockSem = DispatchSemaphore(value: Self.nonblockInflightCBs)
+
     init(
         embedTokens: AnyEmbedding,
         layers: [LagunaLayer],
@@ -3125,17 +3166,36 @@ public final class LagunaModel: LanguageModel {
             // per-layer-CB architecture. Flipped default to 1 (finest
             // granularity = fastest here); escape via the env var if a
             // future change shifts this balance again.
+            // W35 non-blocking window (see the property block above the
+            // initializer). dkTiming needs per-kernel commit+wait, so the
+            // flag is forced off under it. Under nonblock the layers/CB
+            // default rises 1 → 8: with layersPerCB=1 a token is ~41 CBs,
+            // which would eat the whole 24-CB window in half a token; at
+            // 8 a token is ~6 CBs so 3-4 tokens fit in flight.
+            let nonblock = Self.nonblockDecodeEnabled && !LagunaDecodeKernelTiming.enabled
             let layersPerCB = max(
                 1,
                 Int(ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LAYERS_PER_CB"] ?? "")
-                    ?? 1)
+                    ?? (nonblock ? 8 : 1))
+            // Non-blocking commit: block only when the cross-token
+            // in-flight CB count would exceed the window. Handler is
+            // registered BEFORE commit (commit-then-add can miss the
+            // callback if the buffer finishes first).
+            let sem = nonblock ? nonblockSem : nil
+            func commitWindowed(_ cb: MTLCommandBuffer) {
+                if let sem {
+                    sem.wait()
+                    cb.addCompletedHandler { _ in sem.signal() }
+                }
+                cb.commit()
+            }
             var inflight: [MTLCommandBuffer] = []
             if workCmd.status != .committed && workCmd.status != .completed
                 && workCmd.status != .error
             {
-                workCmd.commit()
+                commitWindowed(workCmd)
             }
-            inflight.append(workCmd)
+            if !nonblock { inflight.append(workCmd) }
             var i = 0
             while i < layers.count {
                 workCmd = device.makeCommandBuffer()
@@ -3157,14 +3217,22 @@ public final class LagunaModel: LanguageModel {
                 if workCmd.status != .committed && workCmd.status != .completed
                     && workCmd.status != .error
                 {
-                    workCmd.commit()
+                    commitWindowed(workCmd)
                 }
-                inflight.append(workCmd)
-                while inflight.count > depth {
-                    inflight.removeFirst().waitUntilCompleted()
+                if !nonblock {
+                    inflight.append(workCmd)
+                    while inflight.count > depth {
+                        inflight.removeFirst().waitUntilCompleted()
+                    }
                 }
             }
-            for cb in inflight { cb.waitUntilCompleted() }
+            // W35: no trailing drain under nonblock — the caller's `cmd`
+            // (final-norm + lm_head, committed by GpuTokenLoop with the
+            // argmax) is on the same queue and therefore already
+            // sequences after every layer CB committed above.
+            if !nonblock {
+                for cb in inflight { cb.waitUntilCompleted() }
+            }
         } else {
             for (i, layer) in layers.enumerated() {
                 if workCmd.status == .committed || workCmd.status == .completed
