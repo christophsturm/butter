@@ -90,6 +90,22 @@ public final class Qwen3xMTPHead: Module {
     let embedTokens: AnyEmbedding
     let lmHead: AnyLinear
 
+    /// Optional cheaper draft-only lm_head, loaded from
+    /// `<model>/draft_lm_head_3bit.safetensors` when
+    /// `BUTTER_QWEN_MTP_DRAFT_LMHEAD_3BIT=1` and the sidecar file is
+    /// present (see `load(sidecarDirectory:...)`). MLX-format 3-bit
+    /// affine g64, requantized offline from the shared 4-bit g64
+    /// `lmHead` (`scratch/quantize_draft_lmhead_3bit.py`). Used ONLY by
+    /// `draftStep` for the draft-burst logits that pick candidate
+    /// tokens — `draftStepMany` (KV lockstep) never computes logits at
+    /// all, and the verifier / backbone always read the shared 4-bit
+    /// `lmHead`. A draft mistake here only costs acceptance rate (the
+    /// verifier still argmaxes the TRUNK, never this head's logits), so
+    /// it can never produce incorrect output — only a different
+    /// draft/accept boundary. `nil` when the flag is unset or the
+    /// sidecar is absent (falls back to the shared `lmHead`).
+    let draftLmHead: AnyLinear?
+
     /// The head's OWN KV cache (the draft layer attends over its own
     /// key/value history, independent of every backbone layer cache).
     /// Unbounded eviction; capacity is `defaultCacheCapacity` slots
@@ -113,6 +129,7 @@ public final class Qwen3xMTPHead: Module {
         preFcNormHidden: RMSNorm, preFcNormEmbedding: RMSNorm,
         layer: Qwen35AttentionLayer, mtpNorm: RMSNorm,
         embedTokens: AnyEmbedding, lmHead: AnyLinear,
+        draftLmHead: AnyLinear? = nil,
         kvCache: KVCache,
         hidden: Int, vocab: Int, dtype: DType
     ) {
@@ -123,6 +140,7 @@ public final class Qwen3xMTPHead: Module {
         self.mtpNorm = mtpNorm
         self.embedTokens = embedTokens
         self.lmHead = lmHead
+        self.draftLmHead = draftLmHead
         self.kvCache = kvCache
         self.hidden = hidden
         self.vocab = vocab
@@ -225,9 +243,12 @@ public final class Qwen3xMTPHead: Module {
             fused, position: position, cache: kvCache,
             cmd: cmd, device: device)
 
-        // mtp.norm + shared lm_head.
+        // mtp.norm + lm_head. Draft logits only ever feed candidate
+        // selection (see `draftLmHead`'s doc comment) — prefer the
+        // cheaper 3-bit draft-only head when loaded, else the shared
+        // 4-bit head the backbone/verifier also use.
         let normed = mtpNorm(hOut, on: cmd)
-        let logits = lmHead(normed, on: cmd)
+        let logits = (draftLmHead ?? lmHead)(normed, on: cmd)
         return (hidden: hOut, logits: logits)
     }
 
@@ -462,12 +483,60 @@ public final class Qwen3xMTPHead: Module {
             nKVHeads: nKVHeads, headDim: headDim, maxSeq: cacheCapacity,
             dtype: dtype, device: device)
 
+        // Optional cheaper draft-only lm_head (see `draftLmHead`'s doc
+        // comment). Lives beside the model checkpoint (a sibling of
+        // `sidecarDirectory`, which is `<model>/mtp-sidecar`), not
+        // inside the mtp-sidecar bundle itself — it's a standalone
+        // single-file safetensors, produced offline by
+        // `scratch/quantize_draft_lmhead_3bit.py`.
+        var draftLmHead: AnyLinear?
+        if ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_DRAFT_LMHEAD_3BIT"] == "1" {
+            let modelRoot = sidecarDirectory.deletingLastPathComponent()
+            let draftLmHeadURL = modelRoot.appendingPathComponent(
+                "draft_lm_head_3bit.safetensors")
+            if FileManager.default.fileExists(atPath: draftLmHeadURL.path) {
+                let file = try SafeTensorsFile(url: draftLmHeadURL, device: device)
+                guard let weightEntry = file.entries["weight"],
+                    let scalesEntry = file.entries["scales"],
+                    let biasesEntry = file.entries["biases"]
+                else {
+                    throw Qwen35Error.missingConfig(
+                        "draft_lm_head_3bit.safetensors missing weight/scales/biases")
+                }
+                let draftGroupSize = 64
+                let bits = deriveAffineQuantBits(
+                    weightPackedCols: weightEntry.shape[weightEntry.shape.count - 1],
+                    scaleCols: scalesEntry.shape[scalesEntry.shape.count - 1],
+                    groupSize: draftGroupSize)
+                guard bits == 3 else {
+                    throw Qwen35Error.unsupportedConfig(
+                        "draft_lm_head_3bit.safetensors derived bits=\(bits), expected 3")
+                }
+                device.markWeightsResident([
+                    weightEntry.buffer, scalesEntry.buffer, biasesEntry.buffer,
+                ])
+                draftLmHead = AnyLinear(
+                    QuantizedLinear(
+                        weight: try file.tensor(named: "weight"),
+                        scales: try file.tensor(named: "scales"),
+                        biases: try file.tensor(named: "biases"),
+                        bits: bits, groupSize: draftGroupSize))
+            } else {
+                fputs(
+                    "[qwen3x] WARNING: BUTTER_QWEN_MTP_DRAFT_LMHEAD_3BIT=1 but "
+                        + "\(draftLmHeadURL.path) does not exist; draft head falls "
+                        + "back to the shared 4-bit lm_head\n",
+                    stderr)
+            }
+        }
+
         return Qwen3xMTPHead(
             fc: fc,
             preFcNormHidden: preFcNormHidden,
             preFcNormEmbedding: preFcNormEmbedding,
             layer: layer, mtpNorm: mtpNorm,
             embedTokens: embedTokens, lmHead: lmHead,
+            draftLmHead: draftLmHead,
             kvCache: kvCache,
             hidden: hidden, vocab: vocab, dtype: dtype)
     }

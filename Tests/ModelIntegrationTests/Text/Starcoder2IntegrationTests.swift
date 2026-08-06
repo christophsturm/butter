@@ -22,7 +22,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Starcoder2 Integration", .serialized)
+@Suite("Starcoder2 Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Starcoder2IntegrationTests {
 
     @Test("Starcoder2-3B (Starcoder2ForCausalLM, attention biases) decodes coherently")

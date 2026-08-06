@@ -572,19 +572,33 @@ extension Model {
             && engine.supportsGPUTokenFeedback
 
         // Spec 030 phase 2: MTP self-speculative decode. Opt-in via
-        // BUTTER_QWEN_MTP_SPEC=1 (default OFF), greedy-only (the
-        // `.greedyGPU` path already implies temperature == 0 and
-        // repetitionPenalty == 1), Qwen3x-only, and only when the
-        // checkpoint shipped an `mtp-sidecar/` (`mtpHead != nil`).
-        // γ (draft chain length) defaults to 2; override with
+        // BUTTER_QWEN_MTP_SPEC=1 (default OFF), Qwen3x-only, and only
+        // when the checkpoint shipped an `mtp-sidecar/` (`mtpHead !=
+        // nil`). γ (draft chain length) defaults to 2; override with
         // BUTTER_QWEN_MTP_GAMMA=<n>.
+        //
+        // Two arms: `temperature == 0` dispatches the original
+        // greedy-argmax loop (the `.greedyGPU` path already implies
+        // repetitionPenalty == 1); `temperature > 0` dispatches lossless
+        // rejection-sampling MTP (`SpecDecode.generateSampledMTP`) —
+        // gated additionally on `repetitionPenalty == 1.0` since the
+        // sampled path's p_j/q_j pipeline doesn't support it (it has no
+        // well-defined meaning mid-draft-burst; see
+        // `Sampling.buildFilteredWeights`'s doc). Falls through to the
+        // non-spec `cpuSample`/`gpuCategorical` path otherwise.
         let mtpSpecEnabled =
             ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_SPEC"] == "1"
         let mtpModel = engine as? Qwen35Model
-        let useMTPSpec =
+        let useMTPSpecGreedy =
             mtpSpecEnabled && path == .greedyGPU && !capturePPL
             && params.temperature == 0
             && (mtpModel?.mtpHead) != nil
+        let useMTPSpecSampled =
+            mtpSpecEnabled && !capturePPL
+            && params.temperature > 0
+            && params.repetitionPenalty == 1.0
+            && (mtpModel?.mtpHead) != nil
+        let useMTPSpec = useMTPSpecGreedy || useMTPSpecSampled
 
         if useMTPSpec, let qwen = mtpModel, let mtpHead = qwen.mtpHead {
             try Task.checkCancellation()
@@ -599,14 +613,9 @@ extension Model {
                 // prefill above only returns logits), then keeps the
                 // head's cache in lockstep with every committed token.
                 mtpHead.resetCache()
+                var mtpRNG = params.makeRNG()
                 let stats = profile.signpost("decode_mtp_spec") {
-                    SpecDecode.generateGreedyMTP(
-                        model: qwen, head: mtpHead, gamma: gamma,
-                        lastToken: nextToken, position: pos,
-                        caches: caches, history: &tokenHistory,
-                        maxNewTokens: params.maxTokens,
-                        stopTokens: stopSet, device: Device.shared
-                    ) { tokenId in
+                    let emitToken: (Int) -> Void = { tokenId in
                         generated.append(tokenId)
                         let text = self.tokenizer.decode(
                             tokens: [tokenId], skipSpecialTokens: true)
@@ -620,6 +629,23 @@ extension Model {
                         lastStep = now
                         pos += 1
                     }
+                    if useMTPSpecSampled {
+                        return SpecDecode.generateSampledMTP(
+                            model: qwen, head: mtpHead, gamma: gamma,
+                            lastToken: nextToken, position: pos,
+                            caches: caches, history: &tokenHistory,
+                            maxNewTokens: params.maxTokens,
+                            stopTokens: stopSet, device: Device.shared,
+                            parameters: params, rng: &mtpRNG,
+                            emit: emitToken)
+                    }
+                    return SpecDecode.generateGreedyMTP(
+                        model: qwen, head: mtpHead, gamma: gamma,
+                        lastToken: nextToken, position: pos,
+                        caches: caches, history: &tokenHistory,
+                        maxNewTokens: params.maxTokens,
+                        stopTokens: stopSet, device: Device.shared,
+                        emit: emitToken)
                 }
                 Debug.log(
                     .generate,

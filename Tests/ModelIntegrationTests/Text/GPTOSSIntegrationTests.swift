@@ -53,7 +53,8 @@ import Testing
     "GPTOSS Integration", .serialized,
     .enabled(
         if: ProcessInfo.processInfo.environment["BUTTER_BUILD_MACHINE"] != nil,
-        "GPT-OSS-20B is build-machine-only; set BUTTER_BUILD_MACHINE to run")
+        "GPT-OSS-20B is build-machine-only; set BUTTER_BUILD_MACHINE to run"),
+    .enabled(if: modelTestsOptedIn)
 )
 struct GPTOSSIntegrationTests {
 

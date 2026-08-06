@@ -34,7 +34,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("MiniCPM5 Integration", .serialized)
+@Suite("MiniCPM5 Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct MiniCPM5IntegrationTests {
 
     @Test("MiniCPM5-1B (bf16) — Llama dispatch + coherent decode")

@@ -36,7 +36,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("FishSpeech Integration", .serialized)
+@Suite("FishSpeech Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct FishSpeechIntegrationTests {
 
     /// Canonical HF repo id — the 8-bit MLX conversion of fish-audio-s2-pro.

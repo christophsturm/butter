@@ -31,7 +31,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("LFMAudio Integration", .serialized)
+@Suite("LFMAudio Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct LFMAudioIntegrationTests {
 
     /// Canonical HF repo id for the LFM2.5-Audio checkpoint. The 4-bit

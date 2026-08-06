@@ -23,7 +23,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("OLMo Integration", .serialized)
+@Suite("OLMo Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct OLMoIntegrationTests {
 
     @Test("OLMo-2-1124-7B-Instruct (Olmo2ForCausalLM) decodes coherently")

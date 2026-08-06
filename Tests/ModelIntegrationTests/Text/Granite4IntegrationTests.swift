@@ -41,7 +41,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Granite4 Integration", .serialized)
+@Suite("Granite4 Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Granite4IntegrationTests {
 
     @Test("load + greedy generate produces coherent hybrid output")

@@ -26,7 +26,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Llama Integration", .serialized)
+@Suite("Llama Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct LlamaIntegrationTests {
 
     @Test("load + greedy generate produces coherent output")

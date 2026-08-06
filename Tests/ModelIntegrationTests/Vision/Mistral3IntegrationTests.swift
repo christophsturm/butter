@@ -32,7 +32,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Mistral3 Vision Integration", .serialized)
+@Suite("Mistral3 Vision Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Mistral3IntegrationTests {
 
     static let modelId = "mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit"

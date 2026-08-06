@@ -25,11 +25,12 @@
 
 import Foundation
 import Testing
+import TestHelpers
 import Tokenizers
 
 @testable import ButterSwift
 
-@Suite("GGUF loader integration", .serialized)
+@Suite("GGUF loader integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct GGUFLoaderTests {
 
     private var modelPath: String? {

@@ -29,7 +29,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("SmolLM Integration", .serialized)
+@Suite("SmolLM Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct SmolLMIntegrationTests {
 
     @Test("SmolLM-360M (SmolLMForCausalLM, original family) decodes coherently")

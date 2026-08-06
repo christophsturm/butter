@@ -34,7 +34,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Whisper Integration", .serialized)
+@Suite("Whisper Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct WhisperIntegrationTests {
 
     /// Canonical HF repo id. The 4-bit MLX conversion is the smallest

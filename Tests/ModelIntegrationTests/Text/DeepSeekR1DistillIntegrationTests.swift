@@ -26,7 +26,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("DeepSeek R1 Distill Integration", .serialized)
+@Suite("DeepSeek R1 Distill Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct DeepSeekR1DistillIntegrationTests {
 
     @Test("R1-Distill-Llama-8B (Llama architecture) generates coherent output")

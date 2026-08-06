@@ -29,7 +29,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("SenseVoice Integration", .serialized)
+@Suite("SenseVoice Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct SenseVoiceIntegrationTests {
 
     /// Canonical HF repo id. No 4-bit MLX conversion exists at time of

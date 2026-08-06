@@ -27,7 +27,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Phi Integration", .serialized)
+@Suite("Phi Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Phi3IntegrationTests {
 
     @Test("load + greedy generate produces coherent output")

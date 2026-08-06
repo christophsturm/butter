@@ -31,7 +31,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Qwen2 Vision Integration (image + video)", .serialized)
+@Suite("Qwen2 Vision Integration (image + video)", .serialized, .enabled(if: modelTestsOptedIn))
 struct Qwen2VisionIntegrationTests {
 
     static let modelId = "mlx-community/Qwen2-VL-2B-Instruct-4bit"

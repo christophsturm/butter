@@ -40,7 +40,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Gemma4 Text Integration", .serialized)
+@Suite("Gemma4 Text Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Gemma4TextIntegrationTests {
 
     @Test("Gemma4E (E2B): load + greedy generate produces coherent output")

@@ -22,7 +22,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("InternLM2 Integration", .serialized)
+@Suite("InternLM2 Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct InternLM2IntegrationTests {
 
     @Test("InternLM2.5-7B-Chat (InternLM2ForCausalLM) decodes coherently")

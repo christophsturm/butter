@@ -37,7 +37,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("LFM2 Text Integration", .serialized)
+@Suite("LFM2 Text Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct LFM2TextIntegrationTests {
 
     @Test("load + greedy generate produces coherent hybrid output")

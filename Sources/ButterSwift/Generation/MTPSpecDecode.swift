@@ -116,6 +116,135 @@ extension SpecDecode {
         let nextHiddenRow: Int
     }
 
+    /// Adaptive per-cycle draft-depth (gamma) controller, gated on
+    /// REALIZED trailing acceptance rather than drafter self-confidence
+    /// — `BUTTER_QWEN_MTP_PMIN` (this file's confidence gate) was
+    /// measured uninformative on the Qwen3.6 MTP head (it's confident
+    /// everywhere); acceptance instead decays via CONTENT DRIFT over
+    /// generation length (the `BUTTER_QWEN_MTP_ACCEPT_CURVE=1`
+    /// instrumentation: per-64-token buckets oscillate 73->47% over 512
+    /// tokens). Realized accept/reject outcomes are the honest signal.
+    /// `BUTTER_QWEN_MTP_ADAPTIVE=1` wires this into `mtpDecodeLoop` —
+    /// see its env-var block for the knobs (window/lo/hi) and default
+    /// values.
+    ///
+    /// Pure logic, no model/tensor dependency — unit-testable directly
+    /// (`MTPAdaptiveGammaTests`). Never affects accept semantics: it
+    /// only chooses how many tokens the NEXT burst drafts, so
+    /// LOSSLESSNESS is untouched (see the file header's exactness
+    /// discipline) — a bad gamma choice costs speed, never correctness.
+    struct MTPAdaptiveGamma {
+        /// Ceiling: the loop's configured `gamma`. Effective gamma never
+        /// exceeds this.
+        let cap: Int
+        /// Trailing window size, in per-candidate accept/reject outcomes
+        /// (not cycles — a cycle can propose 0..cap candidates).
+        let window: Int
+        /// Step gamma DOWN by 1 (floor 1) once trailing acceptance falls
+        /// strictly below this.
+        let lo: Double
+        /// Step gamma UP by 1 (ceiling `cap`) once trailing acceptance
+        /// rises strictly above this. Requires `lo < hi`; the band
+        /// between them is the hysteresis zone — trailing rates inside
+        /// it hold gamma steady instead of adjusting every cycle.
+        let hi: Double
+
+        /// Effective gamma for the cycle about to draft. Starts at
+        /// `cap` and is stepped by at most 1 per `record` call.
+        private(set) var gamma: Int
+
+        // Trailing window: fixed-capacity ring buffer of per-candidate
+        // accept outcomes (true = accepted, false = rejected or never
+        // reached — see `record`'s doc). `ringFilled` is the number of
+        // valid slots so far, capped at `window`; `trueCount` is
+        // maintained incrementally so the trailing rate is O(1) per
+        // push rather than a full rescan.
+        private var ring: [Bool]
+        private var ringNext = 0
+        private var ringFilled = 0
+        private var trueCount = 0
+
+        // Cross-cycle stats for the `[mtp-prof]` line (avg/min/max
+        // effective gamma actually used).
+        private(set) var gammaCycleSum = 0
+        private(set) var gammaCycles = 0
+        private(set) var gammaMin = Int.max
+        private(set) var gammaMax = 0
+
+        init(cap: Int, window: Int, lo: Double, hi: Double) {
+            precondition(cap >= 1, "MTPAdaptiveGamma: cap must be >= 1")
+            precondition(window >= 1, "MTPAdaptiveGamma: window must be >= 1")
+            precondition(
+                lo < hi, "MTPAdaptiveGamma: lo (\(lo)) must be < hi (\(hi))")
+            self.cap = cap
+            self.window = window
+            self.lo = lo
+            self.hi = hi
+            self.gamma = cap
+            self.ring = Array(repeating: false, count: window)
+        }
+
+        /// Effective gamma to draft with THIS cycle — call exactly once
+        /// per cycle, before drafting; folds the value into the running
+        /// avg/min/max stats as a side effect.
+        mutating func nextCycleGamma() -> Int {
+            gammaCycleSum += gamma
+            gammaCycles += 1
+            gammaMin = min(gammaMin, gamma)
+            gammaMax = max(gammaMax, gamma)
+            return gamma
+        }
+
+        /// Record this cycle's per-candidate outcomes and step gamma by
+        /// at most 1 for the NEXT cycle. Mirrors the longest-matching-
+        /// prefix shape the loop's own `candidatesProposed`/
+        /// `candidatesAccepted` tally already uses: of `proposed`
+        /// drafted candidates, the first `accepted` were committed and
+        /// the rest were not (either verified-and-rejected, or, for a
+        /// chained draft past the first rejection, never independently
+        /// verified at all — both count as "not accepted" for the
+        /// trailing rate, same as the existing global tally). A
+        /// draft-free cycle (`proposed == 0`, i.e. the priming
+        /// iteration) is a no-op — nothing to record, gamma unchanged.
+        mutating func record(accepted: Int, proposed: Int) {
+            guard proposed > 0 else { return }
+            precondition(
+                accepted >= 0 && accepted <= proposed,
+                "MTPAdaptiveGamma.record: accepted (\(accepted)) out of "
+                    + "range for proposed (\(proposed))")
+            for i in 0 ..< proposed {
+                push(i < accepted)
+            }
+            // Warmup: hold at the cap until the window has observed a
+            // full `window` candidates — the trailing rate is noisy
+            // (and, early on, computed over a partially-stale/all-false
+            // ring) before then.
+            guard ringFilled >= window else { return }
+            let rate = Double(trueCount) / Double(ringFilled)
+            if rate < lo {
+                gamma = max(1, gamma - 1)
+            } else if rate > hi {
+                gamma = min(cap, gamma + 1)
+            }
+            // rate in [lo, hi]: hold — the hysteresis band.
+        }
+
+        private mutating func push(_ accepted: Bool) {
+            if ringFilled == window {
+                if ring[ringNext] { trueCount -= 1 }
+            } else {
+                ringFilled += 1
+            }
+            ring[ringNext] = accepted
+            if accepted { trueCount += 1 }
+            ringNext = (ringNext + 1) % window
+        }
+
+        var avgGamma: Double {
+            gammaCycles > 0 ? Double(gammaCycleSum) / Double(gammaCycles) : 0
+        }
+    }
+
     /// Compute the commit plan from the draft block and the verifier's
     /// own (argmax) tokens. `verifierTokens[j]` verifies `drafts[j]`;
     /// `batchedBonus` is the verifier's token one past the draft block.
@@ -151,11 +280,217 @@ extension SpecDecode {
             nextHiddenRow: committed.count - 1)
     }
 
-    /// Run the greedy MTP self-speculative decode loop. Caller
-    /// contract matches `generateGreedy`: `caches` already reflect the
-    /// prompt, `lastToken` is the most recent (already-sampled, not yet
-    /// cache-committed) token, `position` is where `lastToken` lands on
-    /// the next decode step.
+    /// Compute the commit plan via lossless rejection sampling instead
+    /// of exact-match verification. Standard speculative-sampling
+    /// (Leviathan et al.), same `MTPAcceptPlan` shape as
+    /// `planMTPAccept` so every downstream consumer (replay, KV
+    /// lockstep, commit/emit) is unmodified — only the accept DECISION
+    /// differs.
+    ///
+    /// SUPERSEDED as the sampled path's default by `planMTPAcceptMatch`
+    /// (see its doc comment): sampled drafts + a p/q ratio test give
+    /// per-position acceptance Σ min(p,q), which is *worse* than greedy
+    /// drafts' p(argmax q) once temperature softens both distributions
+    /// (measured 53.6% here vs vLLM's 87.9% / llama.cpp's 0.72-0.83 on
+    /// the same model class with greedy drafts — see
+    /// `SAMPLING_RESEARCH.md` §2). Kept as a correctness oracle behind
+    /// `BUTTER_QWEN_MTP_ACCEPT=ratio` — `mtpDecodeLoop` only reaches
+    /// this function (and only samples drafts from q, see its `.sampled`
+    /// branch) when that env var is set; the default sampled path calls
+    /// `planMTPAcceptMatch` instead.
+    ///
+    /// Per drafted token x_j (j = 0..<drafts.count): reuse q_j from
+    /// `draftQDistributions[j]` — the SAME `Sampling.FilteredDistribution`
+    /// the draft step already built to sample x_j from q_j in the first
+    /// place (see `mtpDecodeLoop`'s `.sampled` branch) — and build p_j
+    /// fresh from `verifyFlat`'s row j (the batched verify pass), through
+    /// the IDENTICAL filter pipeline (same temp/top-K/top-P/min-P as the
+    /// non-spec sampled path). Passing in the already-built q_j instead
+    /// of the raw logits row avoids rebuilding (and, pre-T43, re-sorting)
+    /// the SAME distribution twice per draft — once at draft time, once
+    /// here — which used to roughly double this path's CPU cost on top
+    /// of the O(vocab log vocab) sort itself (see Sampling.swift's T43
+    /// perf note).
+    ///
+    /// Accept x_j with probability `min(1, p_j(x_j)/q_j(x_j))`. On the
+    /// first rejection, resample the replacement from the residual
+    /// `normalize(max(0, p_j - q_j))` over the full vocab and stop —
+    /// this is what makes the algorithm lossless (the emitted token's
+    /// marginal distribution is exactly p_j regardless of q_j). If
+    /// every draft is accepted, sample the bonus token fresh from
+    /// `verifyFlat`'s trailing row (p_gamma), matching the greedy
+    /// path's full-accept bonus handling.
+    ///
+    /// Repetition penalty is NOT applied (`Sampling.buildFilteredWeights`
+    /// doesn't take a token history) — callers gate the sampled MTP path
+    /// on `repetitionPenalty == 1.0` (see `Generate.swift`).
+    static func planMTPAcceptSampled(
+        prev: Int, drafts: [Int], draftQDistributions: [Sampling.FilteredDistribution],
+        verifyFlat: [Float], rows: Int, vocab: Int,
+        parameters: GenerationParameters, rng: inout AnyRandomNumberGenerator
+    ) -> MTPAcceptPlan {
+        precondition(
+            drafts.count == draftQDistributions.count,
+            "planMTPAcceptSampled: drafts/draftQDistributions length mismatch")
+        precondition(
+            verifyFlat.count == rows * vocab,
+            "planMTPAcceptSampled: verifyFlat has \(verifyFlat.count) elements; "
+                + "expected rows*vocab = \(rows * vocab)")
+
+        func bonusDistribution() -> Sampling.FilteredDistribution {
+            Sampling.FilteredDistribution(
+                rawValues: Array(verifyFlat[(rows - 1) * vocab ..< rows * vocab]),
+                parameters: parameters)
+        }
+
+        if drafts.isEmpty {
+            // Priming / draft-free iteration: same contract as
+            // `planMTPAccept` — commit `prev` alone, force replay. The
+            // candidate here is discarded by the caller's replay
+            // handling exactly like the greedy path's `batchedBonus`
+            // placeholder (see the file header's PRIMING note); still
+            // sample it from p (not argmax) so a caller that skipped
+            // the discard would see a temperature-consistent value.
+            let bonus = bonusDistribution().sample(&rng)
+            return MTPAcceptPlan(
+                committed: [prev], nextToken: bonus,
+                needsReplay: true, nextHiddenRow: 0)
+        }
+
+        var accepted: [Int] = []
+        var nextToken = -1
+        var j = 0
+        while j < drafts.count {
+            let x = drafts[j]
+            let q = draftQDistributions[j]
+            let p = Sampling.FilteredDistribution(
+                rawValues: Array(verifyFlat[j * vocab ..< (j + 1) * vocab]),
+                parameters: parameters)
+            let acceptProb = Sampling.acceptProbability(
+                p: p.probability(of: x), q: q.probability(of: x))
+            let u = Double.random(in: 0 ..< 1, using: &rng)
+            if u < acceptProb {
+                accepted.append(x)
+                j += 1
+                continue
+            }
+            // First rejection: resample from the residual over the
+            // FULL vocab and stop — later drafts are discarded (they
+            // were chained off a draft hidden state that's now wrong).
+            let residual = Sampling.residual(
+                p: p.denseVector(vocab: vocab), q: q.denseVector(vocab: vocab))
+            nextToken = Sampling.sampleFromVector(residual, rng: &rng)
+            break
+        }
+        if accepted.count == drafts.count {
+            // Full accept: bonus token sampled fresh from p_gamma, the
+            // trailing verify row one past the drafted block.
+            nextToken = bonusDistribution().sample(&rng)
+        }
+        let committed = [prev] + accepted
+        return MTPAcceptPlan(
+            committed: committed,
+            nextToken: nextToken,
+            needsReplay: accepted.count < drafts.count,
+            nextHiddenRow: committed.count - 1)
+    }
+
+    /// Compute the commit plan via "sample-target-then-match" — the
+    /// DEFAULT sampled-mode accept scheme (`SAMPLING_RESEARCH.md` #1),
+    /// replacing `planMTPAcceptSampled`'s p/q ratio test. Pairs with
+    /// GREEDY drafts (`mtpDecodeLoop`'s `.sampled` branch draws `drafts`
+    /// via argmax, identical to `.greedy` mode, when
+    /// `BUTTER_QWEN_MTP_ACCEPT` isn't "ratio" — no q is built or passed
+    /// in here at all).
+    ///
+    /// For every verify row j = 0...gamma (drafted rows THEN the
+    /// trailing bonus row, in that order so RNG consumption stays
+    /// deterministic regardless of where the draft/target match later
+    /// breaks): build p_j — the SAME temp/top-K/top-P/min-P filtered
+    /// distribution `Sampling.sample` uses, via
+    /// `Sampling.buildFilteredWeights` (heap-fast since T43) — and
+    /// PRE-SAMPLE one token t_j from it with `FilteredDistribution.sample`
+    /// (one categorical draw per row).
+    ///
+    /// The accept/correct/bonus rule is then EXACTLY `planMTPAccept`'s
+    /// longest-matching-prefix machinery (`SpeculativeAccept.verify`)
+    /// with `t_j` standing in for the verifier's argmax: accept the
+    /// longest prefix where `drafts[j] == t_j`; the first mismatch
+    /// commits `t_j` itself (already a lawful draw from p_j — no
+    /// residual math needed, unlike the ratio scheme); a full accept's
+    /// bonus is `t_gamma`, the trailing row's pre-sample. This is why no
+    /// separate plan struct or bookkeeping exists here — it's the
+    /// greedy plan's own arithmetic, just fed sampled rather than
+    /// argmax'd verifier tokens.
+    ///
+    /// Losslessness is by construction: every emitted token (matched
+    /// prefix, mismatch correction, and full-accept bonus alike) is
+    /// literally a draw from its row's filtered target distribution —
+    /// there is nothing left to prove, unlike the ratio scheme's
+    /// min(1,p/q)-plus-residual argument.
+    ///
+    /// Priming iteration (`drafts` empty, `rows == 1`): the loop below
+    /// runs zero times and `bonusDist` is built from the lone row, so
+    /// this samples the priming bonus from p rather than taking an
+    /// argmax — `planMTPAccept`'s `drafts.isEmpty` branch then commits
+    /// `prev` alone and forces replay, same contract as
+    /// `planMTPAcceptSampled`'s priming case.
+    static func planMTPAcceptMatch(
+        prev: Int, drafts: [Int],
+        verifyFlat: [Float], rows: Int, vocab: Int,
+        parameters: GenerationParameters, rng: inout AnyRandomNumberGenerator
+    ) -> MTPAcceptPlan {
+        precondition(
+            verifyFlat.count == rows * vocab,
+            "planMTPAcceptMatch: verifyFlat has \(verifyFlat.count) elements; "
+                + "expected rows*vocab = \(rows * vocab)")
+        precondition(
+            rows == drafts.count + 1,
+            "planMTPAcceptMatch: rows (\(rows)) must be drafts.count + 1 (\(drafts.count + 1))"
+        )
+
+        var verifierTokens: [Int] = []
+        verifierTokens.reserveCapacity(drafts.count)
+        for j in 0 ..< drafts.count {
+            let p = Sampling.FilteredDistribution(
+                rawValues: Array(verifyFlat[j * vocab ..< (j + 1) * vocab]),
+                parameters: parameters)
+            verifierTokens.append(p.sample(&rng))
+        }
+        let bonusDist = Sampling.FilteredDistribution(
+            rawValues: Array(verifyFlat[(rows - 1) * vocab ..< rows * vocab]),
+            parameters: parameters)
+        let batchedBonus = bonusDist.sample(&rng)
+
+        return planMTPAccept(
+            prev: prev, drafts: drafts,
+            verifierTokens: verifierTokens, batchedBonus: batchedBonus)
+    }
+
+    /// Decode-loop accept strategy: `.greedy` (exact-match verification,
+    /// deterministic) or `.sampled` (lossless rejection sampling,
+    /// requires `temperature > 0`). Both share `mtpDecodeLoop` below —
+    /// this is the ONLY thing that differs between
+    /// `generateGreedyMTP` and `generateSampledMTP`.
+    enum MTPDecodeMode {
+        case greedy
+        case sampled(GenerationParameters)
+
+        var isGreedy: Bool {
+            if case .greedy = self { return true }
+            return false
+        }
+    }
+
+    /// Run the greedy MTP self-speculative decode loop — argmax
+    /// everywhere, deterministic. Thin wrapper over `mtpDecodeLoop`
+    /// (`.greedy` mode); the RNG is unused on this path (nothing draws
+    /// from it) but threaded through for a single shared loop body.
+    ///
+    /// Caller contract matches `generateGreedy`: `caches` already
+    /// reflect the prompt, `lastToken` is the most recent
+    /// (already-sampled, not yet cache-committed) token, `position` is
+    /// where `lastToken` lands on the next decode step.
     ///
     /// - `head`: the checkpoint's MTP draft head (`model.mtpHead`). Its
     ///   KV cache is truncated/advanced by this loop; callers starting
@@ -184,10 +519,113 @@ extension SpecDecode {
         device: Device = .shared,
         emit: ((Int) -> Void)? = nil
     ) -> MTPSpecDecodeStats {
-        precondition(gamma >= 1, "SpecDecode.generateGreedyMTP: gamma must be ≥ 1")
+        var unusedRNG = AnyRandomNumberGenerator(SystemRandomNumberGenerator())
+        return mtpDecodeLoop(
+            model: model, head: head, gamma: gamma, mode: .greedy,
+            lastToken: lastToken, position: position, lastHidden: lastHidden,
+            caches: caches, history: &history, maxNewTokens: maxNewTokens,
+            stopTokens: stopTokens, device: device, rng: &unusedRNG, emit: emit)
+    }
+
+    /// Run the MTP self-speculative decode loop with lossless
+    /// temperature support (`parameters.temperature > 0`) instead of
+    /// greedy argmax. Thin wrapper over `mtpDecodeLoop` (`.sampled`
+    /// mode); same caller contract as `generateGreedyMTP` otherwise,
+    /// plus:
+    ///
+    /// - `parameters`: sampling knobs (temperature / topP / topK /
+    ///   minP). `repetitionPenalty` must be `1.0` — the sampled MTP
+    ///   path does not support it (see `Sampling.buildFilteredWeights`);
+    ///   `Generate.swift` gates dispatch on this.
+    /// - `rng`: drives every draw — pass `parameters.makeRNG()` for the
+    ///   same seeded/system-random behavior as the non-spec sampled
+    ///   path.
+    ///
+    /// DEFAULT scheme (see `planMTPAcceptMatch`'s doc):
+    /// "sample-target-then-match" — greedy drafts, one pre-sampled draw
+    /// per verify row from the filtered target distribution, accept by
+    /// match/replace. `BUTTER_QWEN_MTP_ACCEPT=ratio` switches to the
+    /// original sampled-draft + min(1,p/q) rejection-sampling scheme
+    /// (`planMTPAcceptSampled`'s doc), kept as a correctness oracle —
+    /// see `mtpDecodeLoop`'s doc comment for the full fork.
+    public static func generateSampledMTP(
+        model: Qwen35Model,
+        head: Qwen3xMTPHead,
+        gamma: Int,
+        lastToken: Int,
+        position: Int,
+        lastHidden: Tensor? = nil,
+        caches: [any LayerCacheProtocol],
+        history: inout [Int],
+        maxNewTokens: Int,
+        stopTokens: Set<Int> = [],
+        device: Device = .shared,
+        parameters: GenerationParameters,
+        rng: inout AnyRandomNumberGenerator,
+        emit: ((Int) -> Void)? = nil
+    ) -> MTPSpecDecodeStats {
+        precondition(
+            parameters.temperature > 0,
+            "SpecDecode.generateSampledMTP: temperature must be > 0 (use generateGreedyMTP for temperature == 0)"
+        )
+        return mtpDecodeLoop(
+            model: model, head: head, gamma: gamma, mode: .sampled(parameters),
+            lastToken: lastToken, position: position, lastHidden: lastHidden,
+            caches: caches, history: &history, maxNewTokens: maxNewTokens,
+            stopTokens: stopTokens, device: device, rng: &rng, emit: emit)
+    }
+
+    /// Shared MTP self-speculative decode loop body for both
+    /// `generateGreedyMTP` and `generateSampledMTP` — see their doc
+    /// comments for the caller contract. `mode` selects exactly THREE
+    /// divergence points, marked `── mode:` in the body below: (1) how
+    /// each draft token is chosen, (2) how the accept plan is built, (3)
+    /// whether a partial/zero-accept replay is allowed to overwrite
+    /// `nextTok` via argmax (greedy's baseline-matching exactness
+    /// discipline — the sampled path's `nextTok` already came from a
+    /// correct draw and must NOT be clobbered). Every other line — draft
+    /// chaining, snapshot/restore, the batched verify pass, KV
+    /// lockstep, commit/emit, stats/profiling — runs identically
+    /// regardless of `mode`.
+    ///
+    /// `.sampled` itself carries a SECOND, env-gated fork nested inside
+    /// divergences (1) and (2) — `BUTTER_QWEN_MTP_ACCEPT=ratio` selects
+    /// which sampled scheme runs:
+    ///
+    ///   - Default (unset, or any value other than "ratio") —
+    ///     "sample-target-then-match" (`SAMPLING_RESEARCH.md` #1):
+    ///     drafts are argmax, IDENTICAL to `.greedy`'s divergence-1
+    ///     branch (no q built at all); the accept plan
+    ///     (`planMTPAcceptMatch`) pre-samples one token per verify row
+    ///     from the filtered target distribution and reuses
+    ///     `planMTPAccept`'s own match/replace machinery with those
+    ///     pre-samples standing in for the verifier's argmax tokens.
+    ///   - `ratio` — the original scheme: drafts are sampled from q_j
+    ///     (`draftQDistributions`), and the accept plan
+    ///     (`planMTPAcceptSampled`) runs the standard
+    ///     min(1,p_j(x_j)/q_j(x_j)) accept/residual test. Kept only as a
+    ///     correctness oracle for the match scheme above — see
+    ///     `planMTPAcceptSampled`'s doc comment.
+    private static func mtpDecodeLoop(
+        model: Qwen35Model,
+        head: Qwen3xMTPHead,
+        gamma: Int,
+        mode: MTPDecodeMode,
+        lastToken: Int,
+        position: Int,
+        lastHidden: Tensor? = nil,
+        caches: [any LayerCacheProtocol],
+        history: inout [Int],
+        maxNewTokens: Int,
+        stopTokens: Set<Int> = [],
+        device: Device = .shared,
+        rng: inout AnyRandomNumberGenerator,
+        emit: ((Int) -> Void)? = nil
+    ) -> MTPSpecDecodeStats {
+        precondition(gamma >= 1, "SpecDecode.mtpDecodeLoop: gamma must be ≥ 1")
         precondition(
             maxNewTokens >= 0,
-            "SpecDecode.generateGreedyMTP: maxNewTokens must be ≥ 0")
+            "SpecDecode.mtpDecodeLoop: maxNewTokens must be ≥ 0")
 
         var pos = position
         var prev = lastToken
@@ -232,12 +670,84 @@ extension SpecDecode {
         // env-gated knobs above.
         let pMinEnv = ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_PMIN"]
         let pMin: Float? = (pMinEnv?.isEmpty == false) ? Float(pMinEnv!) : nil
+        // BUTTER_QWEN_MTP_ADAPTIVE=1: adaptive per-cycle draft depth,
+        // gated on REALIZED trailing acceptance rather than drafter
+        // self-confidence (BUTTER_QWEN_MTP_PMIN above was measured
+        // uninformative on this head — confident everywhere; see the
+        // BUTTER_QWEN_MTP_ACCEPT_CURVE=1 diagnosis: acceptance decays
+        // via CONTENT DRIFT, oscillating 73->47% over 512 tokens, not
+        // via a confidence signal). Unset/empty ⇒ feature OFF, behavior
+        // byte-identical to the fixed-γ loop — every burst drafts
+        // exactly `gamma` tokens, matching every other env-gated knob's
+        // contract in this file. Read fresh every call, no static
+        // caching.
+        //
+        // When set, `gamma` becomes the CEILING (`MTPAdaptiveGamma.cap`):
+        // each cycle's effective draft length starts there and is
+        // stepped by AT MOST 1 per cycle from the trailing acceptance
+        // rate over the last BUTTER_QWEN_MTP_ADAPT_WINDOW per-candidate
+        // accept/reject outcomes (default 32) — below
+        // BUTTER_QWEN_MTP_ADAPT_LO (default 0.55) steps DOWN (floor 1),
+        // above BUTTER_QWEN_MTP_ADAPT_HI (default 0.70) steps UP
+        // (ceiling `gamma`); the gap between the two is the hysteresis
+        // band that holds gamma steady rather than flapping every
+        // cycle. Before the window has observed `window` candidates
+        // (warmup), gamma stays at the cap. See `MTPAdaptiveGamma`'s
+        // doc for the controller itself.
+        //
+        // Works identically in BOTH `.greedy` and `.sampled` mode: the
+        // controller only consumes `drafts.count` /
+        // `plan.committed.count - 1`, the same per-cycle accept
+        // arithmetic `candidatesProposed`/`candidatesAccepted` already
+        // tally below — no new verification or acceptance semantics, so
+        // LOSSLESSNESS is untouched (gamma choice changes only how many
+        // tokens are DRAFTED per cycle, never what gets accepted or
+        // emitted; a greedy exact-match run is gamma-INVARIANT in its
+        // output stream by construction).
+        let adaptiveEnabled =
+            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_ADAPTIVE"] == "1"
+        let adaptWindowEnv =
+            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_ADAPT_WINDOW"]
+        let adaptWindow =
+            (adaptWindowEnv?.isEmpty == false) ? (Int(adaptWindowEnv!) ?? 32) : 32
+        let adaptLoEnv = ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_ADAPT_LO"]
+        let adaptLo = (adaptLoEnv?.isEmpty == false) ? (Double(adaptLoEnv!) ?? 0.55) : 0.55
+        let adaptHiEnv = ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_ADAPT_HI"]
+        let adaptHi = (adaptHiEnv?.isEmpty == false) ? (Double(adaptHiEnv!) ?? 0.70) : 0.70
+        var adaptiveGamma: MTPAdaptiveGamma? =
+            adaptiveEnabled
+            ? MTPAdaptiveGamma(cap: gamma, window: adaptWindow, lo: adaptLo, hi: adaptHi)
+            : nil
+        // BUTTER_QWEN_MTP_ACCEPT=ratio: correctness-oracle override for
+        // `.sampled` mode, reproducing the original sampled-draft +
+        // min(1,p/q) scheme (`planMTPAcceptSampled`) verbatim. Any other
+        // value (default: unset) selects the "sample-target-then-match"
+        // scheme (`planMTPAcceptMatch`) — greedy drafts, pre-sampled
+        // target match/replace — which is the sampled path's default per
+        // `SAMPLING_RESEARCH.md` #1. Read fresh every call, matching the
+        // other env-gated knobs above; no effect in `.greedy` mode.
+        let useRatioAccept =
+            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_ACCEPT"] == "ratio"
         // avgdraft observability (BUTTER_QWEN_MTP_PROF=1 line below):
         // draftCycles counts bursts actually run (excludes the priming
         // iteration, which has no seed hidden and drafts nothing).
         var draftCycles = 0
         var minDraftLen = Int.max
         var maxDraftLen = 0
+        // BUTTER_QWEN_MTP_ACCEPT_CURVE=1: positional acceptance
+        // instrumentation (diagnostic only, T39 investigation into
+        // acceptance decay over generation length). Buckets candidates
+        // proposed/accepted by the OUTPUT position (tokensGenerated) at
+        // the START of the cycle that proposed them — a cycle straddling
+        // a bucket boundary is attributed whole to its start bucket
+        // (gamma is small, so this never blurs the curve materially).
+        // Printed as a single [mtp-accept] stderr line at the end, one
+        // field per 64-token bucket.
+        let acceptCurve =
+            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_ACCEPT_CURVE"] == "1"
+        let acceptCurveBucket = 64
+        var bucketProposed: [Int] = []
+        var bucketAccepted: [Int] = []
 
         if stateRewind { model.setSpecCapture(true, caches: caches) }
         defer { if stateRewind { model.setSpecCapture(false, caches: caches) } }
@@ -247,6 +757,10 @@ extension SpecDecode {
             // before the canonical re-advance). MUST be read before
             // the burst appends its rows.
             let mtpLen = head.kvCache.length
+            // Output-position bucket for this cycle's candidates —
+            // captured before `tokensGenerated` advances below (see
+            // BUTTER_QWEN_MTP_ACCEPT_CURVE above).
+            let curveBucketIdx = tokensGenerated / acceptCurveBucket
 
             // ── Draft burst (skipped on the priming iteration) ────────
             // Chain up to γ tokens through the single MTP layer. Each
@@ -254,10 +768,29 @@ extension SpecDecode {
             // reuses per-instance scratch — see its threading contract)
             // and reads one argmax back to feed the chain.
             var drafts: [Int] = []
+            // q_j's filtered distribution, one per draft step — only
+            // populated in `.sampled` mode's RATIO-ORACLE branch
+            // (BUTTER_QWEN_MTP_ACCEPT=ratio; ── mode: divergence 1).
+            // Built ONCE here (to sample x_j from q_j) and reused
+            // as-is by `planMTPAcceptSampled` at the accept step — see
+            // its doc comment for why rebuilding it there used to
+            // roughly double this path's CPU cost. Stays empty (unused)
+            // under the default match scheme, which drafts greedily —
+            // no q is ever built.
+            var draftQDistributions: [Sampling.FilteredDistribution] = []
             if let seedHidden = prevHidden {
                 var chainHidden = seedHidden
                 var chainTok = prev
-                for j in 0 ..< gamma {
+                // Effective burst length: `gamma` (the cap) unless
+                // BUTTER_QWEN_MTP_ADAPTIVE=1, in which case this cycle's
+                // controller-chosen value (see the env-var block above).
+                // Recorded into `adaptiveGamma`'s avg/min/max stats as a
+                // side effect — call exactly once per drafting cycle,
+                // which this `if let seedHidden` branch already is (the
+                // priming iteration never reaches here, so it never
+                // pollutes the stats or the trailing window).
+                let effectiveGamma = adaptiveGamma?.nextCycleGamma() ?? gamma
+                for j in 0 ..< effectiveGamma {
                     let dT = Date()
                     let dCmd = device.makeCommandBuffer()
                     let (h, dLogits) = head.draftStep(
@@ -272,13 +805,56 @@ extension SpecDecode {
                     let flatD = dLogits.toFloatArray()
                     let c: Int
                     var pTop: Float = 1
-                    if pMin != nil {
-                        let (idx, top) = argmaxAndTopProb(
-                            flatD, offset: 0, count: flatD.count)
-                        c = idx
-                        pTop = top
+                    // ── mode: divergence 1 — draft token choice.
+                    // Greedy, and sampled's DEFAULT match scheme: BOTH
+                    // argmax — identical computation, no q construction,
+                    // no draft-side sampling at all
+                    // (`SAMPLING_RESEARCH.md` #1: greedy drafts are what
+                    // make the accept step's p(argmax q) beat the old
+                    // ratio scheme's Σ min(p,q)). Sampled +
+                    // BUTTER_QWEN_MTP_ACCEPT=ratio (correctness oracle
+                    // only): draw from q_j (the SAME filter pipeline
+                    // `Sampling.sample` uses on the non-spec path) and
+                    // stash the raw row for the accept step, reproducing
+                    // the pre-match scheme verbatim.
+                    let draftsGreedily: Bool
+                    switch mode {
+                    case .greedy: draftsGreedily = true
+                    case .sampled: draftsGreedily = !useRatioAccept
+                    }
+                    if draftsGreedily {
+                        if pMin != nil {
+                            let (idx, top) = argmaxAndTopProb(
+                                flatD, offset: 0, count: flatD.count)
+                            c = idx
+                            pTop = top
+                        } else {
+                            c = argmax(flatD, offset: 0, count: flatD.count)
+                        }
+                    } else if case .sampled(let params) = mode {
+                        // Ratio-oracle branch (BUTTER_QWEN_MTP_ACCEPT=ratio):
+                        // build q_j's filtered distribution ONCE, sample
+                        // x_j from it, and stash it for reuse both by
+                        // the confidence gate below (probability of the
+                        // token actually drawn) and by the accept step
+                        // in `planMTPAcceptSampled` — avoids the double
+                        // (pre-T43, triple under BUTTER_QWEN_MTP_PMIN)
+                        // rebuild of the same row's distribution.
+                        let qDist = Sampling.FilteredDistribution(
+                            rawValues: flatD, parameters: params)
+                        c = qDist.sample(&rng)
+                        draftQDistributions.append(qDist)
+                        if pMin != nil {
+                            // Confidence gate reads the SAMPLED token's
+                            // own q-probability (not argmax's), so a
+                            // low-probability draw still triggers an
+                            // early burst stop under BUTTER_QWEN_MTP_PMIN.
+                            pTop = Float(qDist.probability(of: c))
+                        }
                     } else {
-                        c = argmax(flatD, offset: 0, count: flatD.count)
+                        // Unreachable: draftsGreedily is false only when
+                        // mode is .sampled (see the switch above).
+                        fatalError("MTPSpecDecode: unreachable draft-choice branch")
                     }
                     drafts.append(c)
                     chainHidden = h
@@ -360,29 +936,69 @@ extension SpecDecode {
                 "generateGreedyMTP: logits have \(flat.count) elements; "
                     + "expected rows*vocab = \(rows * vocab)")
 
-            // Verifier tokens: argmax per draft-aligned row. Row j
-            // verifies drafts[j] (the token at position pos + 1 + j);
-            // the trailing row is the full-accept bonus.
-            var verifierTokens: [Int] = []
-            verifierTokens.reserveCapacity(drafts.count)
-            for j in 0 ..< drafts.count {
-                verifierTokens.append(argmax(flat, offset: j * vocab, count: vocab))
+            // ── Accept plan ── mode: divergence 2 ──────────────────────
+            // Greedy: argmax per draft-aligned row (verifierTokens) +
+            // the trailing bonus row, then longest-matching-prefix via
+            // `planMTPAccept` — byte-identical to the original loop.
+            // Sampled + default (match scheme): `planMTPAcceptMatch`
+            // PRE-SAMPLES one token per row from each row's filtered
+            // target distribution (row order, deterministic RNG
+            // consumption) and feeds those into the SAME `planMTPAccept`
+            // match/replace machinery greedy mode uses above — see its
+            // doc comment. Sampled + BUTTER_QWEN_MTP_ACCEPT=ratio
+            // (correctness oracle): `planMTPAcceptSampled` rebuilds p_j
+            // from `flat` itself and makes the original
+            // accept/reject/residual/bonus draws.
+            let plan: MTPAcceptPlan
+            switch mode {
+            case .greedy:
+                // Verifier tokens: argmax per draft-aligned row. Row j
+                // verifies drafts[j] (the token at position pos + 1 + j);
+                // the trailing row is the full-accept bonus.
+                var verifierTokens: [Int] = []
+                verifierTokens.reserveCapacity(drafts.count)
+                for j in 0 ..< drafts.count {
+                    verifierTokens.append(argmax(flat, offset: j * vocab, count: vocab))
+                }
+                let batchedBonus = argmax(
+                    flat, offset: (rows - 1) * vocab, count: vocab)
+                if ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_TRACE"] == "1",
+                    verifySteps <= 6
+                {
+                    FileHandle.standardError.write(
+                        "[mtp-trace] verifier=\(verifierTokens) bonus=\(batchedBonus)\n"
+                            .data(using: .utf8)!)
+                }
+                plan = planMTPAccept(
+                    prev: prev, drafts: drafts,
+                    verifierTokens: verifierTokens, batchedBonus: batchedBonus)
+            case .sampled(let params):
+                if useRatioAccept {
+                    plan = planMTPAcceptSampled(
+                        prev: prev, drafts: drafts, draftQDistributions: draftQDistributions,
+                        verifyFlat: flat, rows: rows, vocab: vocab,
+                        parameters: params, rng: &rng)
+                } else {
+                    plan = planMTPAcceptMatch(
+                        prev: prev, drafts: drafts,
+                        verifyFlat: flat, rows: rows, vocab: vocab,
+                        parameters: params, rng: &rng)
+                }
             }
-            let batchedBonus = argmax(
-                flat, offset: (rows - 1) * vocab, count: vocab)
-
-            // ── Accept plan (longest matching prefix) ─────────────────
-            if ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_TRACE"] == "1",
-                verifySteps <= 6
-            {
-                FileHandle.standardError.write(
-                    "[mtp-trace] verifier=\(verifierTokens) bonus=\(batchedBonus)\n"
-                        .data(using: .utf8)!)
-            }
-            let plan = planMTPAccept(
-                prev: prev, drafts: drafts,
-                verifierTokens: verifierTokens, batchedBonus: batchedBonus)
             candidatesAccepted += plan.committed.count - 1
+            // Feed the realized outcome back into the controller for
+            // the NEXT cycle's gamma decision. No-ops on the priming
+            // cycle (`drafts.count == 0`) — see `record`'s doc.
+            adaptiveGamma?.record(
+                accepted: plan.committed.count - 1, proposed: drafts.count)
+            if acceptCurve {
+                while bucketProposed.count <= curveBucketIdx {
+                    bucketProposed.append(0)
+                    bucketAccepted.append(0)
+                }
+                bucketProposed[curveBucketIdx] += drafts.count
+                bucketAccepted[curveBucketIdx] += plan.committed.count - 1
+            }
 
             var nextTok = plan.nextToken
             var replayed = false
@@ -452,11 +1068,27 @@ extension SpecDecode {
                     rCmd.commit()
                     rCmd.waitUntilCompleted()
                     replaySingleSteps += 1
+                    // ── mode: divergence 3 ─────────────────────────────
+                    // Greedy: re-derive nextTok via argmax on the exact
+                    // replay-kernel logits (the baseline-matching
+                    // exactness discipline — see the file header).
+                    // Sampled (both match and ratio schemes):
+                    // `plan.nextToken` already came from the correct
+                    // pre-sample/residual/bonus draw over the BATCHED
+                    // pass's p; that's the algorithm's contract
+                    // (lossless w.r.t. p regardless of which kernel
+                    // computed it), so it must NOT be clobbered here.
+                    // The replay above still ran for its cache-write
+                    // side effect — the accepted prefix's KV entries
+                    // must come from the restored snapshot, not the
+                    // rejected-draft-polluted batched pass.
                     let rf = rLogits.toFloatArray()
                     let rv = rf.count / plan.committed.count
-                    nextTok = argmax(
-                        rf, offset: (plan.committed.count - 1) * rv,
-                        count: rv)
+                    if mode.isGreedy {
+                        nextTok = argmax(
+                            rf, offset: (plan.committed.count - 1) * rv,
+                            count: rv)
+                    }
                     // Seed the next burst from THIS pass's hiddens: the
                     // verify pass's rows were computed before the
                     // restore and its trailing rows are backed by
@@ -473,7 +1105,10 @@ extension SpecDecode {
                         sCmd.waitUntilCompleted()
                         replaySingleSteps += 1
                     }
-                    nextTok = argmax(lastLogits)
+                    // ── mode: divergence 3 (see above) ──────────────────
+                    if mode.isGreedy {
+                        nextTok = argmax(lastLogits)
+                    }
                 }
                 msReplay += Date().timeIntervalSince(rT)
                 }
@@ -495,7 +1130,14 @@ extension SpecDecode {
             // batched pass computed materially different logits, which
             // would also be silently costing acceptance on the verifier
             // rows.
-            if parityProbe, !plan.needsReplay {
+            // Greedy-only diagnostic: "batched vs single-token argmax"
+            // parity has no meaning once tokens are drawn probabilistically.
+            if parityProbe, mode.isGreedy, !plan.needsReplay {
+                // Recomputed locally (not read from the `.greedy` accept-plan
+                // branch's own local) — this diagnostic block only runs in
+                // greedy mode, where it equals the batched trailing row's
+                // argmax, same value `planMTPAccept`'s caller derived.
+                let batchedBonus = argmax(flat, offset: (rows - 1) * vocab, count: vocab)
                 let saved = caches.snapshotAll(device: device)
                 caches.restoreAll(from: snap, device: device)
                 var truthLogits: Tensor!
@@ -643,6 +1285,21 @@ extension SpecDecode {
                     lockstepSteps += 1
                 }
             }
+            // Diagnostic: head KV cache length vs. the backbone position
+            // it should be tracking (offset by a constant -1 from the
+            // documented priming gap — see the file header's PRIMING
+            // note). Printed every 32 verify steps under
+            // BUTTER_QWEN_MTP_ACCEPT_CURVE=1 to rule out a slow leak
+            // (offset growing instead of staying pinned at 1).
+            if acceptCurve, verifySteps % 32 == 0 {
+                let kvLen = head.kvCache.length
+                let posAfter = pos + plan.committed.count
+                FileHandle.standardError.write(
+                    "[mtp-kvcheck] verifystep=\(verifySteps) posAfter=\(posAfter) "
+                        .data(using: .utf8)!)
+                FileHandle.standardError.write(
+                    "kvlen=\(kvLen) offset=\(posAfter - kvLen)\n".data(using: .utf8)!)
+            }
 
             // ── Advance ───────────────────────────────────────────────
             // Next burst seeds from the verify hidden at the last
@@ -663,12 +1320,42 @@ extension SpecDecode {
                 draftCycles > 0
                 ? Double(candidatesProposed) / Double(draftCycles) : 0.0
             let minD = draftCycles > 0 ? minDraftLen : 0
+            // Acceptance stats: accepted-per-cycle mirrors avgdraft
+            // (average, not per-cycle detail — this loop doesn't retain
+            // a per-cycle history array) and acceptance-rate is
+            // candidatesAccepted/candidatesProposed, same definition as
+            // `MTPSpecDecodeStats.acceptanceRate`. Reported on both
+            // modes; most useful for `.sampled` where acceptance isn't
+            // "1.0 unless the drafter is wrong" the way greedy's is.
+            let acceptedPerCycle =
+                draftCycles > 0
+                ? Double(candidatesAccepted) / Double(draftCycles) : 0.0
+            let acceptRate =
+                candidatesProposed > 0
+                ? 100.0 * Double(candidatesAccepted) / Double(candidatesProposed) : 0.0
+            // BUTTER_QWEN_MTP_ADAPTIVE=1 effective-gamma stats — always
+            // printed as `adaptive=on/off` so log-scraping tooling has a
+            // stable field either way; avg/min/max only populated `on`
+            // (mirrors `adaptiveGamma`'s own optionality).
+            let adaptiveSuffix: String
+            if let ag = adaptiveGamma {
+                let mn = ag.gammaMin == Int.max ? 0 : ag.gammaMin
+                adaptiveSuffix =
+                    " adaptive=on avggamma=\(String(format: "%.2f", ag.avgGamma)) "
+                    + "mingamma=\(mn) maxgamma=\(ag.gammaMax)"
+            } else {
+                adaptiveSuffix = " adaptive=off"
+            }
             let line = String(
                 format:
                     "[mtp-prof] total=%.2fs draft=%.2f verify=%.2f replay=%.2f "
                     + "lockstep=%.2f snap=%.2f other=%.2f rewinds=\(rewindSteps) "
                     + "avgdraft=\(String(format: "%.2f", avgDraft)) "
-                    + "mindraft=\(minD) maxdraft=\(maxDraftLen) draftcycles=\(draftCycles)\n",
+                    + "mindraft=\(minD) maxdraft=\(maxDraftLen) draftcycles=\(draftCycles) "
+                    + "accepted=\(candidatesAccepted)/\(candidatesProposed) "
+                    + "acceptrate=\(String(format: "%.1f", acceptRate))%% "
+                    + "acceptedpercycle=\(String(format: "%.2f", acceptedPerCycle))"
+                    + "\(adaptiveSuffix)\n",
                 tot, msDraft, msVerify, msReplay, msLockstep, msSnap,
                 tot - msDraft - msVerify - msReplay - msLockstep - msSnap)
             FileHandle.standardError.write(line.data(using: .utf8)!)
@@ -690,6 +1377,18 @@ extension SpecDecode {
                 rows += " row\(i)=\(parityRowMismatch[i])/\(parityRowChecked[i])"
             }
             FileHandle.standardError.write((rows + "\n").data(using: .utf8)!)
+        }
+        if acceptCurve, !bucketProposed.isEmpty {
+            var line = "[mtp-accept]"
+            for i in 0 ..< bucketProposed.count {
+                let lo = i * acceptCurveBucket
+                let hi = lo + acceptCurveBucket - 1
+                let p = bucketProposed[i]
+                let a = bucketAccepted[i]
+                let rate = p > 0 ? 100.0 * Double(a) / Double(p) : 0.0
+                line += " b\(lo)-\(hi)=\(a)/\(p)(\(String(format: "%.1f", rate))%)"
+            }
+            FileHandle.standardError.write((line + "\n").data(using: .utf8)!)
         }
         return MTPSpecDecodeStats(
             tokensGenerated: tokensGenerated,

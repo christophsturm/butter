@@ -26,10 +26,11 @@
 
 import Foundation
 import Testing
+import TestHelpers
 
 @testable import ButterSwift
 
-@Suite("DeepSeekV4 integration", .serialized)
+@Suite("DeepSeekV4 integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct DeepSeekV4IntegrationTests {
 
     /// Local checkpoint dir, or `nil` to skip (model too big for CI).

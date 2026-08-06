@@ -42,6 +42,7 @@ private let mtpModelAvailable =
 
 @Suite(
     "MTP spec decode vs baseline greedy (27B)", .serialized,
+    .enabled(if: modelTestsOptedIn),
     .enabled(
         if: mtpModelAvailable,
         "requires the 27B checkpoint + mtp-sidecar at \(mtpModelPath)")

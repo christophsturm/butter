@@ -33,7 +33,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("SmartTurn Integration", .serialized)
+@Suite("SmartTurn Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct SmartTurnIntegrationTests {
 
     /// The published SmartTurn-v3 checkpoint (matches the

@@ -24,7 +24,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Qwen3 5-bit Integration", .serialized)
+@Suite("Qwen3 5-bit Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Quantized5bitIntegrationTests {
 
     @Test("load + greedy generate produces coherent output")

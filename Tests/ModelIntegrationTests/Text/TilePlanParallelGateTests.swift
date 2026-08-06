@@ -48,7 +48,8 @@ private let gateCheckpointAvailable =
     "F-85 Parallel Tile-Plan Builder Gate", .serialized,
     .enabled(
         if: gateCheckpointAvailable,
-        "requires a local checkpoint at \(gateLocalPath)")
+        "requires a local checkpoint at \(gateLocalPath)"),
+    .enabled(if: modelTestsOptedIn)
 )
 struct TilePlanParallelGateTests {
 

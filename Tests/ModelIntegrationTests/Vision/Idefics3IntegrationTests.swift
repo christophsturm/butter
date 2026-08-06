@@ -32,7 +32,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Idefics3 Vision Integration", .serialized)
+@Suite("Idefics3 Vision Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Idefics3IntegrationTests {
 
     /// Load dog.jpeg from the test Fixtures directory.

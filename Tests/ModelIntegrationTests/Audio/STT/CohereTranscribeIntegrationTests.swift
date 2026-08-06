@@ -36,7 +36,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("CohereTranscribe Integration", .serialized)
+@Suite("CohereTranscribe Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct CohereTranscribeIntegrationTests {
 
     /// Canonical HF repo id. The 8-bit MLX conversion is the smallest

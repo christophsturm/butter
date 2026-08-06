@@ -36,7 +36,8 @@ private let qwen36CheckpointAvailable =
     "Qwen3.6 Text Integration", .serialized,
     .enabled(
         if: qwen36CheckpointAvailable,
-        "Qwen3.6 integration requires a local checkpoint at \(qwen36LocalPath)")
+        "Qwen3.6 integration requires a local checkpoint at \(qwen36LocalPath)"),
+    .enabled(if: modelTestsOptedIn)
 )
 struct Qwen36TextIntegrationTests {
 

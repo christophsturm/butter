@@ -26,7 +26,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Granite3 Integration", .serialized)
+@Suite("Granite3 Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Granite3IntegrationTests {
 
     @Test("Granite-3.2-2B-Instruct (GraniteForCausalLM) decodes coherently")

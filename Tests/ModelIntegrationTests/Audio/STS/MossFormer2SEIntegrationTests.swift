@@ -30,10 +30,11 @@
 
 import Foundation
 import Testing
+import TestHelpers
 
 @testable import ButterSwift
 
-@Suite("MossFormer2SE Integration", .serialized)
+@Suite("MossFormer2SE Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct MossFormer2SEIntegrationTests {
 
     // ─── Checkpoint resolution ────────────────────────────────────────

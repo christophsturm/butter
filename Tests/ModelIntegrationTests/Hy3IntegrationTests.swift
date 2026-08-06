@@ -28,7 +28,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Hy3 Integration", .serialized)
+@Suite("Hy3 Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Hy3IntegrationTests {
 
     @Test("load + config basics + generation defaults + greedy generate")

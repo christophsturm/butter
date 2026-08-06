@@ -30,7 +30,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("QwenOmni Integration", .serialized)
+@Suite("QwenOmni Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct QwenOmniIntegrationTests {
 
     /// Canonical HF repo id. No 4-bit MLX conversion exists at time of

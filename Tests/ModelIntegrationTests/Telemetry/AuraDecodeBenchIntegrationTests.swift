@@ -82,7 +82,7 @@ private func benchModelPath(_ testName: String) -> String? {
     return p
 }
 
-@Suite("AURA decode bench — compressed vs dequant-mirror", .serialized)
+@Suite("AURA decode bench — compressed vs dequant-mirror", .serialized, .enabled(if: modelTestsOptedIn))
 struct AuraDecodeBenchIntegrationTests {
 
     /// Same diverse prompt as the KLD harness — lets us cross-reference

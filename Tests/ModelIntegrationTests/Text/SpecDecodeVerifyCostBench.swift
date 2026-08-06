@@ -37,7 +37,7 @@ private let qwen36VerifyPath =
     ProcessInfo.processInfo.environment["BUTTER_VERIFY_BENCH_MODEL"]
     ?? "/Users/tom/models/Qwen3.6-35B-A3B-4bit"
 
-@Suite("SpecDecode verify-cost bench")
+@Suite("SpecDecode verify-cost bench", .enabled(if: modelTestsOptedIn))
 struct SpecDecodeVerifyCostBench {
 
     @Test("Compare forwardManyAllLogits(T=3) vs 3× forward() at decode shape")
