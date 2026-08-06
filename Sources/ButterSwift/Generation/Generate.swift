@@ -571,7 +571,65 @@ extension Model {
             gpuTokenLoopEnabled && path == .greedyGPU && !capturePPL
             && engine.supportsGPUTokenFeedback
 
-        if useGpuTokenLoop {
+        // Spec 030 phase 2: MTP self-speculative decode. Opt-in via
+        // BUTTER_QWEN_MTP_SPEC=1 (default OFF), greedy-only (the
+        // `.greedyGPU` path already implies temperature == 0 and
+        // repetitionPenalty == 1), Qwen3x-only, and only when the
+        // checkpoint shipped an `mtp-sidecar/` (`mtpHead != nil`).
+        // γ (draft chain length) defaults to 2; override with
+        // BUTTER_QWEN_MTP_GAMMA=<n>.
+        let mtpSpecEnabled =
+            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_SPEC"] == "1"
+        let mtpModel = engine as? Qwen35Model
+        let useMTPSpec =
+            mtpSpecEnabled && path == .greedyGPU && !capturePPL
+            && params.temperature == 0
+            && (mtpModel?.mtpHead) != nil
+
+        if useMTPSpec, let qwen = mtpModel, let mtpHead = qwen.mtpHead {
+            try Task.checkCancellation()
+            if params.maxTokens > 0, !stopSet.contains(nextToken) {
+                let gamma = max(
+                    1,
+                    Int(
+                        ProcessInfo.processInfo.environment[
+                            "BUTTER_QWEN_MTP_GAMMA"] ?? "") ?? 2)
+                // Fresh generation → fresh draft-head KV history. The
+                // loop primes its own first hidden state (the chunked
+                // prefill above only returns logits), then keeps the
+                // head's cache in lockstep with every committed token.
+                mtpHead.resetCache()
+                let stats = profile.signpost("decode_mtp_spec") {
+                    SpecDecode.generateGreedyMTP(
+                        model: qwen, head: mtpHead, gamma: gamma,
+                        lastToken: nextToken, position: pos,
+                        caches: caches, history: &tokenHistory,
+                        maxNewTokens: params.maxTokens,
+                        stopTokens: stopSet, device: Device.shared
+                    ) { tokenId in
+                        generated.append(tokenId)
+                        let text = self.tokenizer.decode(
+                            tokens: [tokenId], skipSpecialTokens: true)
+                        continuation.yield(
+                            GenerationChunk(
+                                text: text, tokens: [tokenId],
+                                position: pos + 1, stats: nil))
+                        memTracker.sample()
+                        let now = Date()
+                        perTokenWallclock.append(now.timeIntervalSince(lastStep))
+                        lastStep = now
+                        pos += 1
+                    }
+                }
+                Debug.log(
+                    .generate,
+                    "MTP spec decode: γ=\(gamma), "
+                        + "accepted \(stats.candidatesAccepted)/\(stats.candidatesProposed) "
+                        + "(\(String(format: "%.1f", stats.acceptanceRate * 100))%), "
+                        + "verify=\(stats.verifySteps), replay=\(stats.replaySingleSteps), "
+                        + "lockstep=\(stats.lockstepSteps)")
+            }
+        } else if useGpuTokenLoop {
             try Task.checkCancellation()
             if params.maxTokens > 0, !stopSet.contains(nextToken) {
                 // The seed token is already known (picked by prefill's

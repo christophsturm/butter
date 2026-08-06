@@ -200,4 +200,82 @@ struct Qwen35BatchedPrefillTests {
         let batArgmax = bat.indices.max(by: { bat[$0] < bat[$1] })!
         #expect(refArgmax == batArgmax)
     }
+
+    /// Per-ROW batched-vs-sequential parity.
+    ///
+    /// `batchedMatchesPerToken` above only compares the LAST logits row,
+    /// which hides a divergence concentrated in the earlier rows. The MTP
+    /// speculative loop consumes every row (row j decides whether draft j
+    /// is accepted, and the trailing row is emitted directly on a full
+    /// accept), so each row has to track the per-token reference — not
+    /// just the last one.
+    ///
+    /// Measured on the real Qwen3.6-27B checkpoint, row 0 disagreed with
+    /// the single-token path on 45% of full-accept cycles at gamma=3 and
+    /// 21% at gamma=1, at logit margins up to 7.0 (a confidently
+    /// different token, not an argmax tie-break). This test is the
+    /// checkpoint-free reproduction of that.
+    @Test("batched forwardMany matches the per-token reference on EVERY row")
+    func batchedMatchesPerTokenAllRows() {
+        let model = Self.makeTinyDenseModel()
+        let tokens = [3, 17, 42, 5, 60]
+        let device = Device.shared
+
+        // Reference: one logits row per position from the single-token
+        // decode path, which is the exactness baseline.
+        let refCaches = model.makeLayerCaches(maxSeq: nil, device: device)
+        var refRows: [[Float]] = []
+        for (i, t) in tokens.enumerated() {
+            let cmd = device.makeCommandBuffer()
+            let lg = model.forward(
+                tokenId: t, position: i, caches: refCaches,
+                on: cmd, device: device)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            refRows.append(lg.toFloatArray())
+        }
+
+        // Batched: all rows from a single forwardMany over the block.
+        let batCaches = model.makeLayerCaches(maxSeq: nil, device: device)
+        let cmd = device.makeCommandBuffer()
+        let batAll = model.forwardManyAllLogits(
+            tokenIds: tokens, startPosition: 0, caches: batCaches,
+            on: cmd, device: device)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        let flat = batAll.toFloatArray()
+        let vocab = refRows[0].count
+        #expect(flat.count == tokens.count * vocab)
+
+        var worstRow = -1
+        var worstDiff: Float = 0
+        var argmaxMismatches: [Int] = []
+        for r in 0 ..< tokens.count {
+            let ref = refRows[r]
+            var maxAbsDiff: Float = 0
+            for v in 0 ..< vocab {
+                maxAbsDiff = max(maxAbsDiff, abs(ref[v] - flat[r * vocab + v]))
+            }
+            if maxAbsDiff > worstDiff {
+                worstDiff = maxAbsDiff
+                worstRow = r
+            }
+            let refArg = ref.indices.max(by: { ref[$0] < ref[$1] })!
+            var batArg = 0
+            var best = -Float.infinity
+            for v in 0 ..< vocab where flat[r * vocab + v] > best {
+                best = flat[r * vocab + v]
+                batArg = v
+            }
+            if refArg != batArg { argmaxMismatches.append(r) }
+        }
+
+        #expect(
+            argmaxMismatches.isEmpty,
+            "batched argmax differs from per-token on rows \(argmaxMismatches); worst |diff| \(worstDiff) on row \(worstRow)")
+        #expect(
+            worstDiff < 0.05,
+            "per-row batched vs per-token divergence: max_abs_diff=\(worstDiff) on row \(worstRow)")
+    }
+
 }

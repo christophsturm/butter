@@ -8391,8 +8391,225 @@ public enum Ops {
             bits == 2 || bits == 4 || bits == 8,
             "Ops.dequantGemmDynamicM: only int2/int4/int8 supported (got bits=\(bits))")
 
-        let mPadded = ((t + 31) / 32) * 32
         let gsPerRow = kIn / groupSize
+
+        // ── BM8 MMA fast path (BUTTER_QMM_MMA_BM8, default OFF — opt-in
+        // experiment) ───────────────────────────────────────────────
+        // `iron_qmm_mma_bm8` maps M=8 to exactly one 8-row frag position
+        // (bandwidth-bound marginal cost) vs the BM=2/4 small-M kernels'
+        // compute-bound marginal cost below — see the kernel's Rust doc
+        // comment for the full rationale (T≈1-8 spec-decode verify
+        // batches). Takes precedence over BOTH the small-M fast path and
+        // the padded BM=32 MMA path when enabled — checked first, before
+        // either. Env is read FRESH every call (not a static let): sibling
+        // flags like `qmmSmallMMax` cache at process start, which breaks
+        // toggling the env mid-process from in-process tests.
+        if bits == 4, nOut % 32 == 0, kIn % 32 == 0, t >= 1, t <= 16,
+            ProcessInfo.processInfo.environment["BUTTER_QMM_MMA_BM8"] == "1"
+        {
+            let mPadded8 = ((t + 7) / 8) * 8
+            let grid = MTLSize(width: nOut / 32, height: mPadded8 / 8, depth: 1)
+            let tg = MTLSize(width: 64, height: 1, depth: 1)
+            if mPadded8 == t {
+                if dispatchQmmMmaBm8(
+                    weight: weight, scales: scales, biases: biases,
+                    input: input, output: out,
+                    n: nOut, k: kIn, gsPerRow: gsPerRow,
+                    grid: grid, tg: tg, on: cmd)
+                {
+                    return
+                }
+            } else {
+                // Pad up to the BM8 tile (8 or 16 for t in 1...16) rather
+                // than 32: at most 7 wasted rows instead of 31. Same
+                // blit-pad-slice shape as the small-M path just below.
+                var handled = false
+                autoreleasepool {
+                    let xPad = Tensor.empty(
+                        shape: [mPadded8, kIn], dtype: input.dtype, device: device)
+                    let oPad = Tensor.empty(
+                        shape: [mPadded8, nOut], dtype: input.dtype, device: device)
+                    let validIn = t * kIn * input.dtype.byteSize
+                    let tailIn = (mPadded8 - t) * kIn * input.dtype.byteSize
+                    guard let b1 = cmd.makeBlitCommandEncoder() else { return }
+                    b1.copy(
+                        from: input.buffer, sourceOffset: input.offset,
+                        to: xPad.buffer, destinationOffset: xPad.offset,
+                        size: validIn)
+                    if tailIn > 0 {
+                        b1.fill(
+                            buffer: xPad.buffer,
+                            range: (xPad.offset + validIn)
+                                ..< (xPad.offset + validIn + tailIn),
+                            value: 0)
+                    }
+                    b1.endEncoding()
+                    guard
+                        dispatchQmmMmaBm8(
+                            weight: weight, scales: scales, biases: biases,
+                            input: xPad, output: oPad,
+                            n: nOut, k: kIn, gsPerRow: gsPerRow,
+                            grid: grid, tg: tg, on: cmd)
+                    else { return }
+                    let validOut = t * nOut * input.dtype.byteSize
+                    guard let b2 = cmd.makeBlitCommandEncoder() else { return }
+                    b2.copy(
+                        from: oPad.buffer, sourceOffset: oPad.offset,
+                        to: out.buffer, destinationOffset: out.offset,
+                        size: validOut)
+                    b2.endEncoding()
+                    handled = true
+                }
+                if handled { return }
+            }
+        }
+
+        // ── Scalar BM8 fast path (BUTTER_QMM_BM8_SCALAR, default OFF —
+        // opt-in experiment) ───────────────────────────────────────────
+        // `iron_qmm_bm8` extends `iron_qmm_bm4`'s own W-reuse geometry
+        // (2 SG x 32 lanes, BN=8, grid [n/8, m/BM, 1]) from BM=4 to
+        // BM=8: one M-tile covers T=5..8 instead of bm4 needing two
+        // M-tiles (i.e. two full W reads) over that range, halving W
+        // traffic again relative to bm4 at the cost of ~2x per-lane
+        // register pressure (see the kernel's Rust doc comment —
+        // ~800B/lane vs bm4's ~440B, near the ~1KB Apple GPU budget).
+        // Motivated by `iron_qmm_mma_bm8` (the simdgroup-matrix MMA
+        // BM8 kernel above) losing to bm4 at T=8 — this is the scalar
+        // follow-up experiment. Takes precedence over the small-M fast
+        // path below for t in 5...qmmSmallMMax when enabled. Env is
+        // read FRESH every call — same reasoning as BUTTER_QMM_MMA_BM8
+        // above (sibling flags like `qmmSmallMMax` cache at process
+        // start, which breaks toggling this env mid-process from
+        // in-process tests).
+        if bits == 4, t >= 5, t <= Self.qmmSmallMMax, nOut % 8 == 0,
+            ProcessInfo.processInfo.environment["BUTTER_QMM_BM8_SCALAR"] == "1"
+        {
+            let mSmall8 = ((t + 7) / 8) * 8
+            let grid = MTLSize(width: nOut / 8, height: mSmall8 / 8, depth: 1)
+            let tg = MTLSize(width: 64, height: 1, depth: 1)
+            if mSmall8 == t {
+                if dispatchQmmBm8Scalar(
+                    weight: weight, scales: scales, biases: biases,
+                    input: input, output: out,
+                    n: nOut, k: kIn, gsPerRow: gsPerRow,
+                    grid: grid, tg: tg, on: cmd)
+                {
+                    return
+                }
+            } else {
+                // T=5..7 pad up to 8 (a single BM tile) — at most 3
+                // wasted rows. Same blit-pad-slice shape as the
+                // small-M / BM8-MMA paths above/below.
+                var handled = false
+                autoreleasepool {
+                    let xPad = Tensor.empty(
+                        shape: [mSmall8, kIn], dtype: input.dtype, device: device)
+                    let oPad = Tensor.empty(
+                        shape: [mSmall8, nOut], dtype: input.dtype, device: device)
+                    let validIn = t * kIn * input.dtype.byteSize
+                    let tailIn = (mSmall8 - t) * kIn * input.dtype.byteSize
+                    guard let b1 = cmd.makeBlitCommandEncoder() else { return }
+                    b1.copy(
+                        from: input.buffer, sourceOffset: input.offset,
+                        to: xPad.buffer, destinationOffset: xPad.offset,
+                        size: validIn)
+                    if tailIn > 0 {
+                        b1.fill(
+                            buffer: xPad.buffer,
+                            range: (xPad.offset + validIn)
+                                ..< (xPad.offset + validIn + tailIn),
+                            value: 0)
+                    }
+                    b1.endEncoding()
+                    guard
+                        dispatchQmmBm8Scalar(
+                            weight: weight, scales: scales, biases: biases,
+                            input: xPad, output: oPad,
+                            n: nOut, k: kIn, gsPerRow: gsPerRow,
+                            grid: grid, tg: tg, on: cmd)
+                    else { return }
+                    let validOut = t * nOut * input.dtype.byteSize
+                    guard let b2 = cmd.makeBlitCommandEncoder() else { return }
+                    b2.copy(
+                        from: oPad.buffer, sourceOffset: oPad.offset,
+                        to: out.buffer, destinationOffset: out.offset,
+                        size: validOut)
+                    b2.endEncoding()
+                    handled = true
+                }
+                if handled { return }
+            }
+        }
+
+        // ── Small-M fast path (BUTTER_QMM_SMALL_M, default ON) ────────
+        // The BM=32 tile below pads M up to 32, so a 2-row spec-decode
+        // verify does 16x the needed compute and flips the pass from
+        // weight-bound to compute-bound. Iron already ships BM=2 / BM=4
+        // variants of the same int4 kernel (`ffai_qmm_bm2` / `_bm4`,
+        // 2 SG x 32 lanes, BN=8, grid [n/8, m/BM, 1]) whose whole point
+        // is exactly this shape. Route T <= smallMMax through them and
+        // pad only up to BM (2 or 4) instead of 32.
+        if bits == 4, t >= 1, t <= Self.qmmSmallMMax, nOut % 8 == 0 {
+            let useBm4 = t > 2
+            let bm = useBm4 ? 4 : 2
+            let mSmall = ((t + bm - 1) / bm) * bm
+            let grid = MTLSize(width: nOut / 8, height: mSmall / bm, depth: 1)
+            let tg = MTLSize(width: 64, height: 1, depth: 1)
+            if mSmall == t {
+                if dispatchQmmSmallM(
+                    weight: weight, scales: scales, biases: biases,
+                    input: input, output: out,
+                    n: nOut, k: kIn, gsPerRow: gsPerRow, useBm4: useBm4,
+                    grid: grid, tg: tg, on: cmd)
+                {
+                    return
+                }
+            } else {
+                // Pad up to the SMALL BM (2 or 4) rather than 32: at most
+                // 3 wasted rows instead of 31. Same blit-pad-slice shape as
+                // the BM=32 path below.
+                var handled = false
+                autoreleasepool {
+                    let xPad = Tensor.empty(
+                        shape: [mSmall, kIn], dtype: input.dtype, device: device)
+                    let oPad = Tensor.empty(
+                        shape: [mSmall, nOut], dtype: input.dtype, device: device)
+                    let validIn = t * kIn * input.dtype.byteSize
+                    let tailIn = (mSmall - t) * kIn * input.dtype.byteSize
+                    guard let b1 = cmd.makeBlitCommandEncoder() else { return }
+                    b1.copy(
+                        from: input.buffer, sourceOffset: input.offset,
+                        to: xPad.buffer, destinationOffset: xPad.offset,
+                        size: validIn)
+                    if tailIn > 0 {
+                        b1.fill(
+                            buffer: xPad.buffer,
+                            range: (xPad.offset + validIn)
+                                ..< (xPad.offset + validIn + tailIn),
+                            value: 0)
+                    }
+                    b1.endEncoding()
+                    guard
+                        dispatchQmmSmallM(
+                            weight: weight, scales: scales, biases: biases,
+                            input: xPad, output: oPad,
+                            n: nOut, k: kIn, gsPerRow: gsPerRow, useBm4: useBm4,
+                            grid: grid, tg: tg, on: cmd)
+                    else { return }
+                    let validOut = t * nOut * input.dtype.byteSize
+                    guard let b2 = cmd.makeBlitCommandEncoder() else { return }
+                    b2.copy(
+                        from: oPad.buffer, sourceOffset: oPad.offset,
+                        to: out.buffer, destinationOffset: out.offset,
+                        size: validOut)
+                    b2.endEncoding()
+                    handled = true
+                }
+                if handled { return }
+            }
+        }
+
+        let mPadded = ((t + 31) / 32) * 32
 
         // Fast path: T already multiple of 32 — dispatch directly without
         // padding. The hot-loop case for Qwen3.6 prefill (T = 32, 256, 1024,
@@ -8542,6 +8759,161 @@ public enum Ops {
     /// group size falls back to the simdgroup path regardless of either
     /// gate, since those kernels would silently read scales/biases at the
     /// wrong stride otherwise.
+    /// Max T routed to the BM=2 / BM=4 small-M quantized matmul kernels.
+    /// 0 disables the fast path (BUTTER_QMM_SMALL_M=0).
+    static let qmmSmallMMax: Int = {
+        if let raw = ProcessInfo.processInfo.environment["BUTTER_QMM_SMALL_M"] {
+            return Int(raw) ?? 8
+        }
+        return 8
+    }()
+
+    /// Dispatch `iron_qmm_bm2` / `iron_qmm_bm4` for exact small M.
+    /// Returns false when no kernel exists for the dtype (caller falls
+    /// through to the padded BM=32 path).
+    private static func dispatchQmmSmallM(
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        input: Tensor, output: Tensor,
+        n: Int, k: Int, gsPerRow: Int, useBm4: Bool,
+        grid: MTLSize, tg: MTLSize, on cmd: MTLCommandBuffer
+    ) -> Bool {
+        let kU = UInt32(k), nU = UInt32(n), gsU = UInt32(gsPerRow)
+        switch (input.dtype, useBm4) {
+        case (.bf16, false):
+            IronKernels.iron_qmm_bm2_bf16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.bf16, true):
+            IronKernels.iron_qmm_bm4_bf16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.f16, false):
+            IronKernels.iron_qmm_bm2_f16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.f16, true):
+            IronKernels.iron_qmm_bm4_f16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            return false
+        }
+        return true
+    }
+
+    /// Dispatch `iron_qmm_mma_bm8` (BUTTER_QMM_MMA_BM8 opt-in). Same
+    /// buffer signature and quarter-height MMA geometry as `iron_qmm_mma`
+    /// / `iron_qmm_mma_m16`, just BM=8: grid `[N/32, M/8, 1]`, tg
+    /// `[64, 1, 1]`. Returns false when no kernel exists for the dtype
+    /// (caller falls through to the small-M / padded BM=32 paths).
+    private static func dispatchQmmMmaBm8(
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        input: Tensor, output: Tensor,
+        n: Int, k: Int, gsPerRow: Int,
+        grid: MTLSize, tg: MTLSize, on cmd: MTLCommandBuffer
+    ) -> Bool {
+        let kU = UInt32(k), nU = UInt32(n), gsU = UInt32(gsPerRow)
+        switch input.dtype {
+        case .f32:
+            IronKernels.iron_qmm_mma_bm8_f32_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_qmm_mma_bm8_f16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_qmm_mma_bm8_bf16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            return false
+        }
+        return true
+    }
+
+    /// Dispatch `iron_qmm_bm8` (BUTTER_QMM_BM8_SCALAR opt-in). Scalar
+    /// (non-MMA) extension of `iron_qmm_bm4`'s own geometry to BM=8:
+    /// grid `[N/8, M/8, 1]`, tg `[64, 1, 1]` — same 2 SG x 32 lane, BN=8
+    /// tile as `dispatchQmmSmallM`'s bm2/bm4, just BM=8. Returns false
+    /// when no kernel exists for the dtype (caller falls through to the
+    /// small-M / padded BM=32 paths).
+    private static func dispatchQmmBm8Scalar(
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        input: Tensor, output: Tensor,
+        n: Int, k: Int, gsPerRow: Int,
+        grid: MTLSize, tg: MTLSize, on cmd: MTLCommandBuffer
+    ) -> Bool {
+        let kU = UInt32(k), nU = UInt32(n), gsU = UInt32(gsPerRow)
+        switch input.dtype {
+        case .f32:
+            IronKernels.iron_qmm_bm8_f32_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_qmm_bm8_f16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_qmm_bm8_bf16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            return false
+        }
+        return true
+    }
+
     private static func dispatchQmmMma(
         weight: Tensor, scales: Tensor, biases: Tensor,
         input: Tensor, output: Tensor,
