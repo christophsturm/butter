@@ -679,11 +679,24 @@ public final class Gemma3Model: LanguageModel {
                     ? .window(maxSize: min(slidingWindow, cap), keep: 0)
                     : .unbounded
             }
+            // Physical buffer capacity from the eviction policy itself —
+            // same fix as Gemma4 (#105, c1880c7e): a `.window` layer's
+            // FIFO eviction never touches slots past `maxSize`, so sizing
+            // the backing buffer to the full `cap` is pure waste (a large
+            // `max_position_embeddings` checkpoint paid it once per
+            // sliding layer at setup). Deriving from `eviction` keeps the
+            // bound and the buffer size from drifting apart.
+            let physicalCap: Int
+            if case .window(let maxSize, _) = layerEviction {
+                physicalCap = maxSize
+            } else {
+                physicalCap = cap
+            }
             switch kvCacheKind {
             case .raw:
                 caches.append(
                     KVCache(
-                        nKVHeads: nKVHeads, headDim: headDim, maxSeq: cap,
+                        nKVHeads: nKVHeads, headDim: headDim, maxSeq: physicalCap,
                         dtype: dtype, eviction: layerEviction, device: device
                     ))
             default:

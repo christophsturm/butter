@@ -297,6 +297,11 @@ extension Model {
         // reset: it's read-then-restored around every `cpuSample` call
         // below and defaults to `.pruneCertified` at rest.
         LagunaLmHeadPrune.resetCandidateCertificate()
+        // BUTTER_DEBUG_LOGIT_MARGIN: fresh per-generation token counter so
+        // t=0 always lands on the prefill-computed seed token below,
+        // regardless of which decode loop (GPU token loop / fallback
+        // forwardSample / cpuSample) produces the rest. No-op when off.
+        LogitMarginDebug.reset()
 
         // Path selector for the sampling step:
         //
@@ -430,13 +435,28 @@ extension Model {
                         coarse: Sampling.decodeF32(cert.coarse),
                         delta: Sampling.decodeF32(cert.delta),
                         thr: Sampling.decodeF32(cert.thr)[0])
-                    return Sampling.sample(
+                    let chosen = Sampling.sample(
                         values: masked, parameters: params,
                         rng: &rng, tokenHistory: tokenHistory)
+                    // BUTTER_DEBUG_LOGIT_MARGIN: CPU path, candidate-
+                    // restricted branch — margin computed from the same
+                    // masked values Sampling.sample just argmaxed over.
+                    if params.temperature == 0 {
+                        LogitMarginDebug.report(values: masked, chosenId: chosen)
+                    }
+                    return chosen
                 }
-                return Sampling.sample(
+                let chosen = Sampling.sample(
                     logits, parameters: params,
                     rng: &rng, tokenHistory: tokenHistory)
+                // BUTTER_DEBUG_LOGIT_MARGIN: CPU path, unmasked branch —
+                // the "CPU argmax" arm of the drift investigation
+                // (BUTTER_GREEDY_GPU_ARGMAX=0 routes Laguna's default
+                // top-K/top-P-having params here even at temperature 0).
+                if params.temperature == 0 {
+                    LogitMarginDebug.report(logits: logits, chosenId: chosen)
+                }
+                return chosen
             }
         }
 
@@ -500,6 +520,16 @@ extension Model {
                 let chosen: Int
                 if path == .greedyGPU || params.temperature == 0 {
                     chosen = Sampling.argmax(logits)
+                    // BUTTER_DEBUG_LOGIT_MARGIN: t=0 is always this
+                    // prefill-computed seed token — identical code path
+                    // regardless of BUTTER_GREEDY_GPU_ARGMAX /
+                    // BUTTER_GPU_TOKEN_LOOP, so any divergence those
+                    // flags cause only shows up from t=1 on. Skip when
+                    // maxTokens == 0: `chosen` is computed either way but
+                    // never actually emitted in that case.
+                    if params.maxTokens > 0 {
+                        LogitMarginDebug.report(logits: logits, chosenId: chosen)
+                    }
                 } else {
                     chosen = Sampling.sample(
                         logits, parameters: params,

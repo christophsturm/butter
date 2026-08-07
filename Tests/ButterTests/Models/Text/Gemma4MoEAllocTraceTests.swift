@@ -173,26 +173,27 @@ struct Gemma4MoEAllocTraceTests {
 
     @Test("baseline: per-token bytes are stable across tokens (no intra-token leak)")
     func perTokenStability() throws {
-        let m = try measure(Knobs(), promptLen: 4)
-        #expect(m.perTokenBytes.count == 4)
+        let m = try measure(Knobs(), promptLen: 8)
+        #expect(m.perTokenBytes.count == 8)
         for (i, b) in m.perTokenBytes.enumerated() {
             print("[alloc-trace] token\(i): \(b) bytes")
         }
-        // Tokens 1..<4 should be byte-identical: same op sequence, same
-        // shapes, every call re-derives the same allocation pattern — no
-        // growth, no leak. Token 0 is allowed to differ by a handful of
-        // bytes from a one-time `Device.scalarBuffer` cache warm-up
-        // (kernel scalar args like rmsNorm's `eps` are cached by value;
-        // the FIRST call for a given constant allocates+caches a 4-byte
-        // buffer, every later call reuses it) — that's a one-time
-        // memoization effect, not a per-token leak, so it's excluded
-        // from the steady-state check rather than papered over with a
-        // tolerance on every token.
-        let steadyState = Array(m.perTokenBytes.dropFirst())
+        // Steady-state tokens must be byte-identical: same op sequence,
+        // same shapes, every call re-derives the same allocation pattern
+        // — no growth, no leak. "Steady state" is the TAIL of the run,
+        // not everything after token 0: one-time warm-up allocations
+        // (`Device.scalarBuffer` value-cache fills, first-hit pipeline
+        // state, allocator arena growth) can spread across the first few
+        // tokens and differ per GPU/driver — CI's runner showed a warmup
+        // effect at token 1 that the M5 dev box doesn't have. A LEAK, by
+        // contrast, changes the byte count on every token, so requiring
+        // the last four tokens identical still detects it while
+        // tolerating hardware-dependent warm-up length.
+        let steadyState = Array(m.perTokenBytes.suffix(4))
         let distinct = Set(steadyState)
         #expect(
             distinct.count == 1,
-            "expected identical steady-state per-token byte counts, got \(m.perTokenBytes)")
+            "expected identical steady-state (tail) per-token byte counts, got \(m.perTokenBytes)")
     }
 
     @Test(

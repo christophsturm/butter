@@ -313,7 +313,13 @@ extension LanguageModel {
             cmd.commit()
             cmd.waitUntilCompleted()
         }
-        return Int(outBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee)
+        let chosen = Int(outBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee)
+        // BUTTER_DEBUG_LOGIT_MARGIN: GPU path, synchronous-fallback arm
+        // (BUTTER_GPU_TOKEN_LOOP=0, or any family without
+        // supportsGPUTokenFeedback). `logits` is guaranteed synced by
+        // this point on both branches above. No-op when off.
+        LogitMarginDebug.report(logits: logits, chosenId: chosen)
+        return chosen
     }
 
     /// Forward + GPU softmax-categorical-sample for the pure-temperature

@@ -252,6 +252,24 @@ extension GpuTokenLoop {
             let sem = resolvedSem[outputSlot]
             cmd.addCompletedHandler { _ in sem.signal() }
             cmd.commit()
+            // BUTTER_DEBUG_LOGIT_MARGIN: GPU path, chained-loop arm — the
+            // default decode path for engines with GPU token feedback
+            // (e.g. Laguna). This loop is normally fully async (the
+            // whole point is never waiting on a single step here); when
+            // the flag is on we force a synchronous readback of this
+            // step's logits + chosen id so the margin can be reported in
+            // strict emission order. Debug-only cost, and it collapses
+            // the lag-pipelined schedule to effectively synchronous for
+            // the run — expected, this is not a perf-preserving flag.
+            if LogitMarginDebug.enabled {
+                cmd.waitUntilCompleted()
+                let outBuf = ringBuffers[outputSlot]
+                let chosenId = Int(
+                    outBuf.buffer.contents()
+                        .advanced(by: outBuf.offset)
+                        .assumingMemoryBound(to: UInt32.self).pointee)
+                LogitMarginDebug.report(logits: logits, chosenId: chosenId)
+            }
         }
 
         func resolve(_ tokenIndex: Int) -> UInt32 {
