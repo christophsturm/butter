@@ -106,8 +106,19 @@ func gemma3vlLoadVisionEncoder(
 /// `Gemma3Dense` loader needs the full set, so the omitted fields are
 /// filled here from the documented Gemma 3 defaults. Any field already
 /// present in `raw` wins — only missing keys are added.
+///
+/// `quantization` is threaded in separately (not part of `raw`): HF
+/// puts the MLX `{bits, group_size}` block at the checkpoint's
+/// top level, not inside `text_config`, so a caller building a
+/// `text_config`-only `ModelConfig` must forward it explicitly or
+/// `Gemma3Dense.loadModel`'s `config.quantization` reads nil —
+/// `loadEmbedding` / `loadLinear` then silently fall back to their
+/// unquantized branch and hand raw packed-u32 tensors to plain
+/// `Embedding` / `Linear`, which crashes downstream in `Ops.gather`
+/// (butter#109).
 func gemma3TextConfigWithDefaults(
-    _ raw: [String: Any], vocabFallback: Int?
+    _ raw: [String: Any], vocabFallback: Int?,
+    quantization: [String: Any]? = nil
 ) -> [String: Any] {
     // HF `transformers` Gemma3TextConfig defaults.
     var merged: [String: Any] = [
@@ -126,6 +137,13 @@ func gemma3TextConfigWithDefaults(
     ]
     // Checkpoint-declared fields override the defaults.
     for (k, v) in raw { merged[k] = v }
+    // Top-level `quantization` isn't part of `text_config` — thread it
+    // through explicitly so `ModelConfig.quantization` resolves on the
+    // reconstructed text-only config. `text_config` wins if it somehow
+    // carries its own block already (mirrors the override rule above).
+    if merged["quantization"] == nil, let quantization {
+        merged["quantization"] = quantization
+    }
     return merged
 }
 
@@ -449,7 +467,8 @@ public enum Gemma3VL {
             modelType: "gemma3_text",
             raw: gemma3TextConfigWithDefaults(
                 textConfigRaw,
-                vocabFallback: config.int("vocab_size")))
+                vocabFallback: config.int("vocab_size"),
+                quantization: config.nested("quantization")))
         let textWeights = weights.prefixed("language_model.")
         let textEngine = try Gemma3Dense.loadModel(
             config: textConfig, weights: textWeights,
