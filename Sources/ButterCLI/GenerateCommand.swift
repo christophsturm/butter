@@ -26,6 +26,19 @@ struct GenerateCommand: AsyncParsableCommand {
         abstract: "Generate text from a single prompt."
     )
 
+    // Parameter sanity. Without this, `--max-tokens=-1` (the `=` form
+    // bypasses argument-parser range niceties) reached the generation
+    // loop's `0 ..< maxTokens` range and died on a messageless SIGTRAP;
+    // negative temperatures produced special-token garbage.
+    func validate() throws {
+        if let n = maxTokens, n < 0 {
+            throw ValidationError("--max-tokens must be >= 0 (got \(n))")
+        }
+        if let t = temperature, t < 0 {
+            throw ValidationError("--temperature must be >= 0 (got \(t))")
+        }
+    }
+
     @Option(name: .shortAndLong, help: "HuggingFace repo id or local model path.")
     var model: String = "unsloth/Llama-3.2-1B"
 
@@ -90,6 +103,13 @@ struct GenerateCommand: AsyncParsableCommand {
 
     @Option(name: .long, help: "PRNG seed for reproducible sampling.")
     var seed: UInt64?
+
+    @Flag(
+        name: .long,
+        help:
+            "Print the raw generated token ids as a JSON array after generation (scripted statistical-harness consumption, e.g. Loop E)."
+    )
+    var printTokenIds: Bool = false
 
     @Option(
         name: .long,
@@ -347,6 +367,10 @@ struct GenerateCommand: AsyncParsableCommand {
             "generated: \(result.generatedTokens.count) tokens "
                 + "in \(String(format: "%.2f", result.decodeTimeS))s "
                 + "(\(String(format: "%.2f", result.tokensPerSecond)) tok/s)")
+        if printTokenIds {
+            let ids = result.generatedTokens.map(String.init).joined(separator: ",")
+            print("token ids: [\(ids)]")
+        }
         if stats {
             print(result.stats.formatted())
         }
@@ -398,7 +422,7 @@ struct GenerateCommand: AsyncParsableCommand {
             }
             print("")  // newline after the streamed text
             return GenerationResult(
-                promptTokens: model.tokenizer.encode(text: prompt),
+                promptTokens: model.encodePrompt(prompt),
                 generatedTokens: generated, text: text,
                 stats: stats!  // streamEndedWithoutFinalChunk would have thrown above
             )

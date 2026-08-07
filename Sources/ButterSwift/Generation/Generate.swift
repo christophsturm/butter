@@ -148,7 +148,11 @@ extension Model {
     /// here. The guard against a BOS already being present keeps the
     /// helper idempotent and safe for families whose post-processor
     /// does add one.
-    internal func encodePrompt(_ prompt: String) -> [Int] {
+    /// Public because it is the CANONICAL prompt tokenization — any
+    /// caller that reports prompt-token counts (e.g. the CLI's streaming
+    /// display) must use this, not a bare `tokenizer.encode`, or its
+    /// count drifts from what generation actually prefills (BOS).
+    public func encodePrompt(_ prompt: String) -> [Int] {
         var tokens = tokenizer.encode(text: prompt)
         guard engine.requiresLeadingBOS,
             let bos = tokenizer.bosTokenId ?? config.bosTokenId
