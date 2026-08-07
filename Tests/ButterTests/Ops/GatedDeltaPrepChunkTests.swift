@@ -174,6 +174,7 @@ struct GatedDeltaPrepChunkTests {
             let tLen = Tensor.empty(shape: [1], dtype: .u32)
             tLen.copyIn(from: [UInt32(t)])
 
+            let (statePlanes, planesEnabled) = Ops.disabledGdnPlanes(dtype: .f32, device: .shared)
             runAndWait { cb in
                 Ops.gatedDeltaPrepChunk(
                     convOut: convOut, aLog: aLog, dtBias: dtBias,
@@ -181,6 +182,7 @@ struct GatedDeltaPrepChunkTests {
                     qNormed: qNormed, kNormed: kNormed,
                     stateIn: stateIn, stateOut: stateOut, y: y,
                     tLen: tLen,
+                    statePlanes: statePlanes, planesEnabled: planesEnabled,
                     batchSize: b, dk: dk, dv: dv, hv: hv, hk: hk, on: cb)
             }
 
@@ -275,6 +277,7 @@ struct GatedDeltaPrepChunkTests {
             let tLen = Tensor.empty(shape: [1], dtype: .u32)
             tLen.copyIn(from: [UInt32(t)])
 
+            let (statePlanes, planesEnabled) = Ops.disabledGdnPlanes(dtype: .f32, device: .shared)
             runAndWait { cb in
                 Ops.gatedDeltaPrepChunkFast(
                     convOut: convOut, aLog: aLog, dtBias: dtBias,
@@ -282,6 +285,7 @@ struct GatedDeltaPrepChunkTests {
                     qNormed: qNormed, kNormed: kNormed,
                     stateIn: stateIn, stateOut: stateOut, y: y,
                     tLen: tLen,
+                    statePlanes: statePlanes, planesEnabled: planesEnabled,
                     batchSize: b, on: cb)
             }
 
@@ -366,6 +370,7 @@ struct GatedDeltaPrepChunkTests {
 
             let (convOutG, aLogG, dtBiasG, aRawG, bRawG, qNormedG, kNormedG, stateInG, stateOutG, yG, tLenG) =
                 buffers()
+            let (statePlanesG, planesEnabledG) = Ops.disabledGdnPlanes(dtype: .f32, device: .shared)
             runAndWait { cb in
                 Ops.gatedDeltaPrepChunk(
                     convOut: convOutG, aLog: aLogG, dtBias: dtBiasG,
@@ -373,11 +378,13 @@ struct GatedDeltaPrepChunkTests {
                     qNormed: qNormedG, kNormed: kNormedG,
                     stateIn: stateInG, stateOut: stateOutG, y: yG,
                     tLen: tLenG,
+                    statePlanes: statePlanesG, planesEnabled: planesEnabledG,
                     batchSize: b, dk: dk, dv: dv, hv: hv, hk: hk, on: cb)
             }
 
             let (convOutF, aLogF, dtBiasF, aRawF, bRawF, qNormedF, kNormedF, stateInF, stateOutF, yF, tLenF) =
                 buffers()
+            let (statePlanesF, planesEnabledF) = Ops.disabledGdnPlanes(dtype: .f32, device: .shared)
             runAndWait { cb in
                 Ops.gatedDeltaPrepChunkFast(
                     convOut: convOutF, aLog: aLogF, dtBias: dtBiasF,
@@ -385,6 +392,7 @@ struct GatedDeltaPrepChunkTests {
                     qNormed: qNormedF, kNormed: kNormedF,
                     stateIn: stateInF, stateOut: stateOutF, y: yF,
                     tLen: tLenF,
+                    statePlanes: statePlanesF, planesEnabled: planesEnabledF,
                     batchSize: b, on: cb)
             }
 

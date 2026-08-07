@@ -3262,9 +3262,15 @@ public enum Ops {
     /// reads `stateIn[*, c]` once at the start of the sweep and
     /// writes `stateOut[*, c]` once at the end. Passing the same
     /// buffer for both is safe.
+    /// `statePlanes` / `planesEnabled` — spec-decode rollback side channel,
+    /// same contract as `gatedDeltaPrepChunk`'s (see
+    /// `iron_conv1d_causal_step_silu_cast_many`'s "Per-token conv-state
+    /// planes" doc). `statePlanes` must be `[T, conv_kernel-1, convDim]`
+    /// when enabled; pass `Ops.disabledGdnPlanes(dtype:device:)` otherwise.
     public static func conv1dCausalStepSiluCastMany(
         src: Tensor, w: Tensor, b: Tensor,
         stateIn: Tensor, outF32: Tensor, stateOut: Tensor,
+        statePlanes: Tensor, planesEnabled: Tensor,
         t: Int, convDim: Int, convKernel: Int,
         on cmd: MTLCommandBuffer
     ) {
@@ -3273,11 +3279,15 @@ public enum Ops {
             "Ops.conv1dCausalStepSiluCastMany: requires conv_kernel = 4")
         precondition(
             src.dtype == w.dtype && src.dtype == b.dtype
-                && src.dtype == stateIn.dtype && src.dtype == stateOut.dtype,
+                && src.dtype == stateIn.dtype && src.dtype == stateOut.dtype
+                && src.dtype == statePlanes.dtype,
             "Ops.conv1dCausalStepSiluCastMany: dtype mismatch")
         precondition(
             outF32.dtype == .f32,
             "Ops.conv1dCausalStepSiluCastMany: outF32 must be .f32")
+        precondition(
+            planesEnabled.dtype == .u32 && planesEnabled.elementCount == 1,
+            "Ops.conv1dCausalStepSiluCastMany: planesEnabled must be a [1] u32 scalar buffer")
         let grid = MTLSize(width: convDim, height: 1, depth: 1)
         let tg = MTLSize(width: min(convDim, 256), height: 1, depth: 1)
         let tLenU = UInt32(t)
@@ -3292,6 +3302,8 @@ public enum Ops {
                 state_in: stateIn.buffer, state_inOffset: stateIn.offset,
                 out_f32: outF32.buffer, out_f32Offset: outF32.offset,
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
                 t_len: tLenU, conv_dim: cdU, conv_kernel: ckU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
@@ -3302,6 +3314,8 @@ public enum Ops {
                 state_in: stateIn.buffer, state_inOffset: stateIn.offset,
                 out_f32: outF32.buffer, out_f32Offset: outF32.offset,
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
                 t_len: tLenU, conv_dim: cdU, conv_kernel: ckU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
@@ -3312,6 +3326,8 @@ public enum Ops {
                 state_in: stateIn.buffer, state_inOffset: stateIn.offset,
                 out_f32: outF32.buffer, out_f32Offset: outF32.offset,
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
                 t_len: tLenU, conv_dim: cdU, conv_kernel: ckU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
@@ -7736,6 +7752,13 @@ public enum Ops {
     ///   - `stateIn` / `stateOut` : `[batchSize, hv, dv, dk]` fp32
     ///     recurrent state (read-once / write-once across the chunk)
     ///   - `y`         : `[batchSize, tLen, hv·dv]` output activations
+    /// `statePlanes` / `planesEnabled` — spec-decode rollback side channel
+    /// (see `iron_gated_delta_prep_chunk`'s "Per-token state planes" doc).
+    /// `statePlanes` must be `[T, batchSize·hv, dv, dk]` sized (same dtype
+    /// as everything else) when `planesEnabled` carries a nonzero u32, and
+    /// may be any nonempty buffer of the right dtype (never indexed)
+    /// otherwise — pass `Ops.disabledGdnPlanes(dtype:device:)` for the
+    /// common "planes off" case.
     public static func gatedDeltaPrepChunk(
         convOut: Tensor,
         aLog: Tensor, dtBias: Tensor,
@@ -7743,6 +7766,7 @@ public enum Ops {
         qNormed: Tensor, kNormed: Tensor,
         stateIn: Tensor, stateOut: Tensor, y: Tensor,
         tLen: Tensor,
+        statePlanes: Tensor, planesEnabled: Tensor,
         batchSize: Int, dk: Int, dv: Int, hv: Int, hk: Int,
         on cmd: MTLCommandBuffer
     ) {
@@ -7751,7 +7775,7 @@ public enum Ops {
                 && dtBias.dtype == aRaw.dtype && aRaw.dtype == bRaw.dtype
                 && bRaw.dtype == qNormed.dtype && qNormed.dtype == kNormed.dtype
                 && kNormed.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
-                && stateOut.dtype == y.dtype,
+                && stateOut.dtype == y.dtype && y.dtype == statePlanes.dtype,
             "Ops.gatedDeltaPrepChunk: every tensor must share dtype")
         precondition(
             dk % 32 == 0,
@@ -7765,6 +7789,9 @@ public enum Ops {
         precondition(
             tLen.dtype == .u32 && tLen.elementCount == 1,
             "Ops.gatedDeltaPrepChunk: tLen must be a [1] u32 scalar buffer")
+        precondition(
+            planesEnabled.dtype == .u32 && planesEnabled.elementCount == 1,
+            "Ops.gatedDeltaPrepChunk: planesEnabled must be a [1] u32 scalar buffer")
         // 4 SGs per TG pack 4 Dv slots (reference Metal GDN geometry).
         // Grid TGs: [ceil(Dv/4), batch·Hv, 1], TG 128. Kernel walks tLen
         // tokens internally with state register-resident.
@@ -7779,6 +7806,7 @@ public enum Ops {
         let dvU = UInt32(dv)
         let hvU = UInt32(hv)
         let hkU = UInt32(hk)
+        let nTotalU = UInt32(batchSize * hv)
         switch convOut.dtype {
         case .f32:
             IronKernels.iron_gated_delta_prep_chunk_f32(
@@ -7793,7 +7821,9 @@ public enum Ops {
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
-                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU, n_total: nTotalU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
             IronKernels.iron_gated_delta_prep_chunk_f16(
@@ -7808,7 +7838,9 @@ public enum Ops {
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
-                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU, n_total: nTotalU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
             IronKernels.iron_gated_delta_prep_chunk_bf16(
@@ -7823,11 +7855,31 @@ public enum Ops {
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
-                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU, n_total: nTotalU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.gatedDeltaPrepChunk: unsupported dtype \(convOut.dtype)")
         }
+    }
+
+    /// Small reusable dummy "planes off" pair for `gatedDeltaPrepChunk(Fast)`
+    /// call sites that never roll back via planes (regular decode, prefill,
+    /// the `rewindState` prefix recompute). `statePlanes` is a 1-element
+    /// buffer of `dtype` — never indexed since `planesEnabled` is 0 — and
+    /// `planesEnabled` is a 1-element zeroed u32 buffer. Allocated fresh
+    /// (4-16 bytes) rather than cached: these call sites are not hot enough
+    /// to justify a shared/tagged scratch slot.
+    public static func disabledGdnPlanes(dtype: DType, device: Device) -> (statePlanes: Tensor, planesEnabled: Tensor) {
+        // Content is never read (planesEnabled == 0 short-circuits every
+        // store in the kernel), so `statePlanes` skips the zero-fill other
+        // callers give freshly allocated tensors.
+        let planes = Tensor.empty(shape: [1], dtype: dtype, device: device)
+        let flagBuf = device.makeBuffer(length: 4)
+        memset(flagBuf.contents(), 0, 4)
+        let flag = Tensor(buffer: flagBuf, offset: 0, shape: [1], dtype: .u32)
+        return (planes, flag)
     }
 
     /// Shape-specialized fast path for `gatedDeltaPrepChunk`, valid ONLY at
@@ -7856,6 +7908,9 @@ public enum Ops {
     /// No `dk`/`dv`/`hv`/`hk` parameters. Callers must confirm the shape
     /// matches before calling (see `Qwen35GDNMixer.forwardManyChunked`'s
     /// guard). `batchSize`/`hv` are still needed for grid sizing.
+    /// `statePlanes` / `planesEnabled` — see `gatedDeltaPrepChunk`'s doc;
+    /// same contract here (`statePlanes` shape `[T, batchSize·32, 128, 128]`
+    /// when enabled).
     public static func gatedDeltaPrepChunkFast(
         convOut: Tensor,
         aLog: Tensor, dtBias: Tensor,
@@ -7863,6 +7918,7 @@ public enum Ops {
         qNormed: Tensor, kNormed: Tensor,
         stateIn: Tensor, stateOut: Tensor, y: Tensor,
         tLen: Tensor,
+        statePlanes: Tensor, planesEnabled: Tensor,
         batchSize: Int,
         on cmd: MTLCommandBuffer
     ) {
@@ -7871,11 +7927,14 @@ public enum Ops {
                 && dtBias.dtype == aRaw.dtype && aRaw.dtype == bRaw.dtype
                 && bRaw.dtype == qNormed.dtype && qNormed.dtype == kNormed.dtype
                 && kNormed.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
-                && stateOut.dtype == y.dtype,
+                && stateOut.dtype == y.dtype && y.dtype == statePlanes.dtype,
             "Ops.gatedDeltaPrepChunkFast: every tensor must share dtype")
         precondition(
             tLen.dtype == .u32 && tLen.elementCount == 1,
             "Ops.gatedDeltaPrepChunkFast: tLen must be a [1] u32 scalar buffer")
+        precondition(
+            planesEnabled.dtype == .u32 && planesEnabled.elementCount == 1,
+            "Ops.gatedDeltaPrepChunkFast: planesEnabled must be a [1] u32 scalar buffer")
         // Fixed production shape: Dv=128, Hv=32 (Dk/Hk are baked into the
         // kernel and never touch grid sizing; grid math mirrors
         // `gatedDeltaPrepChunk` exactly at dv=128/hv=32).
@@ -7888,6 +7947,7 @@ public enum Ops {
             height: batchSize * hv,
             depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let nTotalU = UInt32(batchSize * hv)
         switch convOut.dtype {
         case .f32:
             IronKernels.iron_gated_delta_prep_chunk_fast_d128_128_32_16_f32(
@@ -7902,6 +7962,9 @@ public enum Ops {
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                n_total: nTotalU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
             IronKernels.iron_gated_delta_prep_chunk_fast_d128_128_32_16_f16(
@@ -7916,6 +7979,9 @@ public enum Ops {
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                n_total: nTotalU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
             IronKernels.iron_gated_delta_prep_chunk_fast_d128_128_32_16_bf16(
@@ -7930,6 +7996,9 @@ public enum Ops {
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                n_total: nTotalU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.gatedDeltaPrepChunkFast: unsupported dtype \(convOut.dtype)")

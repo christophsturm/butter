@@ -72,6 +72,59 @@
 import Foundation
 import Metal
 
+/// Which draft steps (if any) consult the cheaper 3-bit draft-only
+/// `lm_head` instead of the shared 4-bit one. Parsed once, at head-load
+/// time, from `BUTTER_QWEN_MTP_DRAFT_LMHEAD_3BIT` — see
+/// `Qwen3xMTPHead.load` and the `draftLmHead` doc comment. `draftStep`
+/// is the ONLY consumer; verify/backbone logits always read the shared
+/// 4-bit `lmHead` regardless of this mode.
+///
+///   - "1"       -> `.always`     every draft step in every burst
+///   - "greedy"  -> `.greedyOnly` only when the run is greedy
+///                  (temperature == 0); sampled runs fall back to 4-bit
+///   - "depth2+" -> `.depth2Plus` 4-bit for draft-step 0 of a burst (the
+///                  first speculative token — errors here "anchor" and
+///                  poison the rest of the chain under sampling), 3-bit
+///                  for every chained step after it (index ≥ 1). Measured
+///                  NOT a reliable net win for sampled runs (2 A/B reps
+///                  landed on opposite sides of the flag-off baseline,
+///                  59.1%/42.2% accept vs 43.9%/46.4% off) — stays
+///                  opt-in only, never auto-selected.
+///   - unset     -> `.off`. Greedy 3-bit is a measured WASH on
+///                  throughput, not a win: the draft bucket shrinks
+///                  (~1.9 -> 1.7s / 512 tok) but acceptance drops
+///                  ~1-2pp and the two cancel — paired A/B read
+///                  +0.7% in one session and -0.7% in another, i.e.
+///                  zero inside noise. A default flip also makes the
+///                  regenerable sidecar artifact load-bearing for
+///                  every greedy caller. Not worth it; digest-safety
+///                  is proven, so flipping later is a one-line change
+///                  if a real win ever shows up.
+///   - any other value -> treated as unset (`.off`), with a
+///                  stderr warning (typo guard)
+enum DraftLmHead3BitMode: Equatable {
+    case off
+    case always
+    case greedyOnly
+    case depth2Plus
+
+    static func parse(_ raw: String?) -> DraftLmHead3BitMode {
+        switch raw {
+        case nil: return .off
+        case "1": return .always
+        case "greedy": return .greedyOnly
+        case "depth2+": return .depth2Plus
+        default:
+            fputs(
+                "[qwen3x] WARNING: BUTTER_QWEN_MTP_DRAFT_LMHEAD_3BIT="
+                    + "\(raw ?? "") not recognized (want 1|greedy|depth2+); "
+                    + "treating as unset (off)\n",
+                stderr)
+            return .off
+        }
+    }
+}
+
 public final class Qwen3xMTPHead: Module {
     // ── Sidecar-owned modules ────────────────────────────────────────
     /// Fuse projection `[hidden, 2*hidden]`, no bias.
@@ -106,6 +159,12 @@ public final class Qwen3xMTPHead: Module {
     /// sidecar is absent (falls back to the shared `lmHead`).
     let draftLmHead: AnyLinear?
 
+    /// Resolved policy for which draft steps use `draftLmHead` (see
+    /// `DraftLmHead3BitMode`'s doc comment). `.off` whenever
+    /// `draftLmHead` is `nil` regardless of this value — `draftStep`
+    /// still gates on `draftLmHead != nil` first.
+    let draftLmHeadMode: DraftLmHead3BitMode
+
     /// The head's OWN KV cache (the draft layer attends over its own
     /// key/value history, independent of every backbone layer cache).
     /// Unbounded eviction; capacity is `defaultCacheCapacity` slots
@@ -130,6 +189,7 @@ public final class Qwen3xMTPHead: Module {
         layer: Qwen35AttentionLayer, mtpNorm: RMSNorm,
         embedTokens: AnyEmbedding, lmHead: AnyLinear,
         draftLmHead: AnyLinear? = nil,
+        draftLmHeadMode: DraftLmHead3BitMode = .off,
         kvCache: KVCache,
         hidden: Int, vocab: Int, dtype: DType
     ) {
@@ -141,6 +201,7 @@ public final class Qwen3xMTPHead: Module {
         self.embedTokens = embedTokens
         self.lmHead = lmHead
         self.draftLmHead = draftLmHead
+        self.draftLmHeadMode = draftLmHeadMode
         self.kvCache = kvCache
         self.hidden = hidden
         self.vocab = vocab
@@ -222,8 +283,18 @@ public final class Qwen3xMTPHead: Module {
     /// the head's causal history mirrors the backbone's, with no
     /// position offset. Rejected draft rows are rolled back with
     /// `kvCache.truncate(toLength:)`.
+    /// - `draftStepIndex`: 0-based position of THIS call within its
+    ///   speculative burst (0 = the first drafted token after the seed;
+    ///   see `mtpDecodeLoop`'s `for j in 0 ..< effectiveGamma` — pass
+    ///   its `j` straight through). Only consulted under
+    ///   `.depth2Plus` mode; callers outside a burst (the KV-lockstep
+    ///   re-advance over already-committed tokens, whose logits are
+    ///   always discarded) may pass the default.
+    /// - `isGreedy`: whether the CURRENT generation run is greedy
+    ///   (temperature == 0). Only consulted under `.greedyOnly` mode.
     public func draftStep(
         prevHidden: Tensor, prevToken: Int, position: Int,
+        draftStepIndex: Int = 0, isGreedy: Bool = true,
         on cmd: MTLCommandBuffer, device: Device
     ) -> (hidden: Tensor, logits: Tensor) {
         // Token embedding via the shared backbone table.
@@ -245,10 +316,22 @@ public final class Qwen3xMTPHead: Module {
 
         // mtp.norm + lm_head. Draft logits only ever feed candidate
         // selection (see `draftLmHead`'s doc comment) — prefer the
-        // cheaper 3-bit draft-only head when loaded, else the shared
-        // 4-bit head the backbone/verifier also use.
+        // cheaper 3-bit draft-only head when loaded AND this step's
+        // policy (see `DraftLmHead3BitMode`) says to use it, else the
+        // shared 4-bit head the backbone/verifier also use.
+        let useDraftHead: Bool
+        if draftLmHead != nil {
+            switch draftLmHeadMode {
+            case .off: useDraftHead = false
+            case .always: useDraftHead = true
+            case .greedyOnly: useDraftHead = isGreedy
+            case .depth2Plus: useDraftHead = draftStepIndex >= 1
+            }
+        } else {
+            useDraftHead = false
+        }
         let normed = mtpNorm(hOut, on: cmd)
-        let logits = (draftLmHead ?? lmHead)(normed, on: cmd)
+        let logits = (useDraftHead ? draftLmHead! : lmHead)(normed, on: cmd)
         return (hidden: hOut, logits: logits)
     }
 
@@ -488,9 +571,19 @@ public final class Qwen3xMTPHead: Module {
         // `sidecarDirectory`, which is `<model>/mtp-sidecar`), not
         // inside the mtp-sidecar bundle itself — it's a standalone
         // single-file safetensors, produced offline by
-        // `scratch/quantize_draft_lmhead_3bit.py`.
+        // `scratch/quantize_draft_lmhead_3bit.py`. Loaded whenever the
+        // mode is anything but `.off` — `draftStep` decides per-call
+        // whether to actually CONSULT it (see `DraftLmHead3BitMode`).
+        // Note the default (env unset) now resolves to `.greedyOnly`, so
+        // this load is attempted for EVERY model whose sidecar directory
+        // exists, not just opt-in runs — the missing-file warning below
+        // is therefore gated on an EXPLICIT env var so the common "no
+        // sidecar built for this checkpoint" case stays silent.
+        let draftLmHead3BitEnv =
+            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_DRAFT_LMHEAD_3BIT"]
+        let draftLmHeadMode = DraftLmHead3BitMode.parse(draftLmHead3BitEnv)
         var draftLmHead: AnyLinear?
-        if ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_DRAFT_LMHEAD_3BIT"] == "1" {
+        if draftLmHeadMode != .off {
             let modelRoot = sidecarDirectory.deletingLastPathComponent()
             let draftLmHeadURL = modelRoot.appendingPathComponent(
                 "draft_lm_head_3bit.safetensors")
@@ -521,11 +614,15 @@ public final class Qwen3xMTPHead: Module {
                         scales: try file.tensor(named: "scales"),
                         biases: try file.tensor(named: "biases"),
                         bits: bits, groupSize: draftGroupSize))
-            } else {
+            } else if let draftLmHead3BitEnv {
+                // Only warn when the caller EXPLICITLY asked for the
+                // 3-bit draft head (see the note above) — the silent
+                // `.greedyOnly` default should never spam stderr for
+                // checkpoints that simply never had a sidecar built.
                 fputs(
-                    "[qwen3x] WARNING: BUTTER_QWEN_MTP_DRAFT_LMHEAD_3BIT=1 but "
-                        + "\(draftLmHeadURL.path) does not exist; draft head falls "
-                        + "back to the shared 4-bit lm_head\n",
+                    "[qwen3x] WARNING: BUTTER_QWEN_MTP_DRAFT_LMHEAD_3BIT="
+                        + "\(draftLmHead3BitEnv) but \(draftLmHeadURL.path) does not "
+                        + "exist; draft head falls back to the shared 4-bit lm_head\n",
                     stderr)
             }
         }
@@ -537,6 +634,7 @@ public final class Qwen3xMTPHead: Module {
             layer: layer, mtpNorm: mtpNorm,
             embedTokens: embedTokens, lmHead: lmHead,
             draftLmHead: draftLmHead,
+            draftLmHeadMode: draftLmHeadMode,
             kvCache: kvCache,
             hidden: hidden, vocab: vocab, dtype: dtype)
     }

@@ -1183,6 +1183,19 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
     public var specBRawF32: Tensor?
     public var specT: Int = 0
 
+    /// Per-token state planes captured by the last verify pass, when
+    /// `BUTTER_GDN_STATE_PLANES=1` and `specCapture` were both active for
+    /// that call (see `Qwen35GDNLayer.forwardManyChunked`). `specGdnPlanes`
+    /// is `[specPlanesT, Hv, Dv, Dk]` f32; `specConvPlanes` is
+    /// `[specPlanesT, convKernel-1, convDim]` in the layer's running
+    /// dtype. `nil` whenever the last verify pass didn't capture planes
+    /// (flag off, or `t` above the plane-eligible cap) — the rollback
+    /// path (`Qwen35GDNLayer.adoptPlaneState`) checks for `nil` and
+    /// reports ineligible so the caller falls back to `rewindState`.
+    public var specGdnPlanes: Tensor?
+    public var specConvPlanes: Tensor?
+    public var specPlanesT: Int = 0
+
     public private(set) var length: Int = 0
     public let maxSeq: Int = .max
 
@@ -2248,6 +2261,80 @@ public final class Qwen35GDNMixer: Module {
             cache.specT = t
         }
 
+        // ── Per-token state planes (spec-decode rollback) ────────────────
+        //
+        // `BUTTER_GDN_STATE_PLANES=1` opts the fused conv+scan kernels into
+        // writing their register-resident state out to a per-token plane at
+        // every token boundary — see `iron_gated_delta_prep_chunk`'s
+        // "Per-token state planes" doc and
+        // `iron_conv1d_causal_step_silu_cast_many`'s "Per-token conv-state
+        // planes" doc. The goal: MTP partial-accept rollback becomes
+        // selecting `plane[k-1]` (a cheap blit into the live cache buffers
+        // via `GDNStateCache.restoreEncode` / `ConvStateCache.restoreEncode`
+        // — see `Qwen35GDNLayer.adoptPlaneState`) instead of restoring a
+        // pre-verify snapshot and re-running conv+scan over the accepted
+        // prefix (`rewindState`).
+        //
+        // Deliberately NOT gated on `cache.specCapture` for the WRITE side:
+        // that flag also drives the pre-existing qkv/a_raw/b_raw stash used
+        // by `rewindState` (see the doc above `specCapture`'s declaration),
+        // and piggybacking planes on it would fold that stash's cost into
+        // any plane-cost A/B measurement — `SpecDecodeVerifyCostBench`
+        // calls `forwardManyAllLogits` directly, without ever touching
+        // `setSpecCapture`, precisely so verify-cost numbers stay
+        // uncontaminated by spec-decode bookkeeping. The STASH onto the
+        // cache below (for a later `adoptPlaneState` to consume) IS gated
+        // on `specCapture`, since only an active spec-decode run has a
+        // consumer for it.
+        //
+        // Gate on a small `t` cap plus the batched-conv1d eligibility this
+        // block is nested inside: state planes only make sense at
+        // decode/verify-shaped `T` (spec-decode γ+1, realistically ≤ 8) —
+        // there is no rollback use case at prefill-chunk `T` (1024-4096),
+        // and honoring the flag there would transiently allocate `T ·
+        // Hv·Dv·Dk · 4B` per layer (e.g. ~8.6 GB at T=4096) for zero
+        // benefit. `maxPlaneT` keeps a naive/global `BUTTER_GDN_STATE_PLANES=1`
+        // safe even outside a scoped spec-decode run. Conv planes require
+        // the batched `conv1dCausalStepSiluCastMany` path specifically
+        // (the per-token fallback loop below never writes them), so the
+        // gate also requires that path's own eligibility check.
+        let maxPlaneT = 16
+        let useConv1dMany =
+            convKernel == 4
+            && ProcessInfo.processInfo.environment["BUTTER_NO_CONV1D_MANY"] == nil
+        let gdnPlanesEnabled =
+            useConv1dMany
+            && t <= maxPlaneT
+            && ProcessInfo.processInfo.environment["BUTTER_GDN_STATE_PLANES"] == "1"
+        let convStatePlanesBuf: Tensor
+        let convPlanesEnabledBuf: Tensor
+        let gdnStatePlanesBuf: Tensor
+        let gdnPlanesEnabledBuf: Tensor
+        if gdnPlanesEnabled {
+            convStatePlanesBuf = Tensor.empty(
+                shape: [t * (convKernel - 1) * convDim], dtype: dt, device: device)
+            gdnStatePlanesBuf = Tensor.empty(
+                shape: [t * numValueHeads * valueHeadDim * keyHeadDim],
+                dtype: .f32, device: device)
+            let flagBuf = device.makeBuffer(length: 4)
+            var flagU32: UInt32 = 1
+            memcpy(flagBuf.contents(), &flagU32, 4)
+            let flag = Tensor(buffer: flagBuf, offset: 0, shape: [1], dtype: .u32)
+            convPlanesEnabledBuf = flag
+            gdnPlanesEnabledBuf = flag
+        } else {
+            (convStatePlanesBuf, convPlanesEnabledBuf) = Ops.disabledGdnPlanes(dtype: dt, device: device)
+            (gdnStatePlanesBuf, gdnPlanesEnabledBuf) = Ops.disabledGdnPlanes(dtype: .f32, device: device)
+        }
+        if gdnPlanesEnabled && cache.specCapture {
+            cache.specGdnPlanes = gdnStatePlanesBuf
+            cache.specConvPlanes = convStatePlanesBuf
+            cache.specPlanesT = t
+        } else {
+            cache.specGdnPlanes = nil
+            cache.specConvPlanes = nil
+        }
+
         // ── Conv1d + silu+cast → `[T, convDim]` f32 staging buffer ──────
         // When conv_kernel = 4, the batched
         // `conv1dCausalStepSiluCastMany` kernel sweeps all T tokens in
@@ -2258,15 +2345,14 @@ public final class Qwen35GDNMixer: Module {
         // via BUTTER_NO_CONV1D_MANY=1.
         let convOutAllF32 = Tensor.empty(
             shape: [t * convDim], dtype: .f32, device: device)
-        if convKernel == 4
-            && ProcessInfo.processInfo.environment["BUTTER_NO_CONV1D_MANY"] == nil
-        {
+        if useConv1dMany {
             Ops.conv1dCausalStepSiluCastMany(
                 src: qkvAll.reshaped(to: [t, convDim]),
                 w: convW, b: convB,
                 stateIn: cache.conv.state,
                 outF32: convOutAllF32,
                 stateOut: cache.conv.state,
+                statePlanes: convStatePlanesBuf, planesEnabled: convPlanesEnabledBuf,
                 t: t, convDim: convDim, convKernel: convKernel,
                 on: cmd)
         } else {
@@ -2347,6 +2433,7 @@ public final class Qwen35GDNMixer: Module {
         // cached at init (`fastPrepChunkEligible`) - only the `!useWY` half
         // varies per call (`useWY` itself depends on per-call `t`).
         let useFast = !useWY && fastPrepChunkEligible
+
         if useWY {
             Ops.gatedDeltaWYPrefill(
                 convOut: convOutAllF32,
@@ -2368,6 +2455,7 @@ public final class Qwen35GDNMixer: Module {
                 stateIn: cache.gdn.current, stateOut: cache.gdn.next,
                 y: yF32All,
                 tLen: tLenScalar,
+                statePlanes: gdnStatePlanesBuf, planesEnabled: gdnPlanesEnabledBuf,
                 batchSize: 1,
                 on: cmd)
         } else {
@@ -2379,6 +2467,7 @@ public final class Qwen35GDNMixer: Module {
                 stateIn: cache.gdn.current, stateOut: cache.gdn.next,
                 y: yF32All,
                 tLen: tLenScalar,
+                statePlanes: gdnStatePlanesBuf, planesEnabled: gdnPlanesEnabledBuf,
                 batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
                 hv: numValueHeads, hk: numKeyHeads,
                 on: cmd)
@@ -2442,11 +2531,16 @@ public final class Qwen35GDNMixer: Module {
 
         let convOutF32 = Tensor.empty(
             shape: [k * convDim], dtype: .f32, device: device)
+        // Rewind never needs planes — see the matching note on the GDN
+        // prep-chunk dispatch below.
+        let (rewindConvPlanes, rewindConvPlanesEnabled) =
+            Ops.disabledGdnPlanes(dtype: qkvPrefix.dtype, device: device)
         Ops.conv1dCausalStepSiluCastMany(
             src: qkvPrefix, w: convW, b: convB,
             stateIn: cache.conv.state,
             outF32: convOutF32,
             stateOut: cache.conv.state,
+            statePlanes: rewindConvPlanes, planesEnabled: rewindConvPlanesEnabled,
             t: k, convDim: convDim, convKernel: convKernel,
             on: cmd)
 
@@ -2474,6 +2568,10 @@ public final class Qwen35GDNMixer: Module {
         let yScratch = Tensor.empty(
             shape: [k * numValueHeads * valueHeadDim],
             dtype: .f32, device: device)
+        // Rewind never needs planes — it's the fallback path planes are
+        // meant to replace, not a producer of them. Always disabled.
+        let (rewindPlanes, rewindPlanesEnabled) =
+            Ops.disabledGdnPlanes(dtype: .f32, device: device)
         if fastPrepChunkEligible {
             Ops.gatedDeltaPrepChunkFast(
                 convOut: convOutF32,
@@ -2483,6 +2581,7 @@ public final class Qwen35GDNMixer: Module {
                 stateIn: cache.gdn.current, stateOut: cache.gdn.next,
                 y: yScratch,
                 tLen: kLenScalar,
+                statePlanes: rewindPlanes, planesEnabled: rewindPlanesEnabled,
                 batchSize: 1,
                 on: cmd)
         } else {
@@ -2494,11 +2593,58 @@ public final class Qwen35GDNMixer: Module {
                 stateIn: cache.gdn.current, stateOut: cache.gdn.next,
                 y: yScratch,
                 tLen: kLenScalar,
+                statePlanes: rewindPlanes, planesEnabled: rewindPlanesEnabled,
                 batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
                 hv: numValueHeads, hk: numKeyHeads,
                 on: cmd)
         }
         cache.gdn.swap()
+        return true
+    }
+
+    /// Roll this layer's recurrent state forward to `k` accepted tokens by
+    /// SELECTING the `(k-1)`th captured plane instead of restoring a
+    /// pre-verify snapshot and re-running conv+scan (`rewindState` above).
+    /// Requires the last verify pass to have captured planes for at least
+    /// `k` tokens (`BUTTER_GDN_STATE_PLANES=1` was active and `t` was
+    /// plane-eligible — see `Qwen35GDNLayerCache.specGdnPlanes` doc);
+    /// returns false otherwise so the caller falls back to `rewindState`.
+    ///
+    /// Cost: one blit per state (~2 MiB GDN + tens of KB conv — see
+    /// `GDNStateCache.restoreEncode` / `ConvStateCache.restoreEncode`,
+    /// which this reuses directly by handing each a Tensor VIEW into the
+    /// stashed plane buffer at the `k-1` offset) — no re-scan dispatch, no
+    /// weight traffic, and critically no pre-verify snapshot restore
+    /// first: both `restoreEncode` calls write straight into the live
+    /// `current` / `state` buffers the verify pass just left in the WRONG
+    /// (full-T) state, overwriting them directly with the correct
+    /// k-token state in one step. The caller must NOT also call
+    /// `caches.restoreAll(recurrentOnly: true)` before this — unlike
+    /// `rewindState`, which depends on that prior restore, this path
+    /// replaces the restore, not follows it.
+    func adoptPlaneState(
+        to k: Int, cache: Qwen35GDNLayerCache,
+        cmd: MTLCommandBuffer
+    ) -> Bool {
+        guard k > 0, k <= cache.specPlanesT,
+            let gdnPlanes = cache.specGdnPlanes,
+            let convPlanes = cache.specConvPlanes
+        else { return false }
+
+        let gdnPlaneElems = numValueHeads * valueHeadDim * keyHeadDim
+        let gdnSlice = Tensor(
+            buffer: gdnPlanes.buffer,
+            offset: gdnPlanes.offset + (k - 1) * gdnPlaneElems * DType.f32.byteSize,
+            shape: [numValueHeads, valueHeadDim, keyHeadDim], dtype: .f32)
+        cache.gdn.restoreEncode(from: gdnSlice, on: cmd)
+
+        let convStateRows = convKernel - 1
+        let convPlaneElems = convStateRows * convDim
+        let convSlice = Tensor(
+            buffer: convPlanes.buffer,
+            offset: convPlanes.offset + (k - 1) * convPlaneElems * convPlanes.dtype.byteSize,
+            shape: [convStateRows, convDim], dtype: convPlanes.dtype)
+        cache.conv.restoreEncode(from: convSlice, on: cmd)
         return true
     }
 }
@@ -3196,6 +3342,15 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
         cmd: MTLCommandBuffer, device: Device
     ) -> Bool {
         mixer.rewindState(to: k, cache: cache, cmd: cmd, device: device)
+    }
+
+    /// Adopt this layer's `k-1`th captured state plane in place of a
+    /// restore+rewind. Forwards to the mixer; see its `adoptPlaneState`.
+    func adoptPlaneState(
+        to k: Int, cache: Qwen35GDNLayerCache,
+        cmd: MTLCommandBuffer
+    ) -> Bool {
+        mixer.adoptPlaneState(to: k, cache: cache, cmd: cmd)
     }
 
     public func decodeMany(
@@ -3903,6 +4058,40 @@ public final class Qwen35Model: LanguageModel {
                 if !gdnLayer.rewindState(
                     to: keep, cache: gc, cmd: cmd, device: device)
                 {
+                    ok = false
+                }
+            } else if let kv = caches[i] as? KVCache {
+                kv.truncate(toLength: absolutePosition + keep)
+            }
+        }
+        return ok
+    }
+
+    /// Roll every cache forward to `keep` tokens of the last batched pass
+    /// by SELECTING each GDN layer's `(keep-1)`th captured state plane —
+    /// the scan-emitted-planes alternative to `rewindCaches` (restore +
+    /// re-scan). See `Qwen35GDNLayer.adoptPlaneState` for the mechanism
+    /// and why the caller must NOT restore a snapshot first.
+    ///
+    /// KV caches truncate exactly as `rewindCaches` does (the batched
+    /// pass is causal, so entries for accepted positions are already
+    /// correct). Returns false if any GDN layer had no planes captured
+    /// (flag was off, or `t` exceeded the plane-eligible cap for that
+    /// call) — the caller must fall back to `restoreAll` + `rewindCaches`
+    /// (or a full replay) in that case, exactly like `rewindCaches`'s own
+    /// ineligible-shape fallback.
+    public func adoptPlanes(
+        keep: Int, absolutePosition: Int,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer
+    ) -> Bool {
+        var ok = true
+        for (i, layer) in layers.enumerated() {
+            guard i < caches.count else { break }
+            if let gdnLayer = layer as? Qwen35GDNLayer,
+                let gc = caches[i] as? Qwen35GDNLayerCache
+            {
+                if !gdnLayer.adoptPlaneState(to: keep, cache: gc, cmd: cmd) {
                     ok = false
                 }
             } else if let kv = caches[i] as? KVCache {

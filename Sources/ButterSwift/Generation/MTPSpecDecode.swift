@@ -627,6 +627,16 @@ extension SpecDecode {
             maxNewTokens >= 0,
             "SpecDecode.mtpDecodeLoop: maxNewTokens must be ≥ 0")
 
+        // Resolved once per run — feeds `Qwen3xMTPHead.draftStep`'s
+        // `isGreedy` param (`.greedyOnly` draft-lm-head mode). Matches
+        // the temperature==0 definition `generateGreedyMTP` /
+        // `generateSampledMTP` already assert on entry.
+        let isGreedyRun: Bool
+        switch mode {
+        case .greedy: isGreedyRun = true
+        case .sampled: isGreedyRun = false
+        }
+
         var pos = position
         var prev = lastToken
         var prevHidden = lastHidden
@@ -643,6 +653,19 @@ extension SpecDecode {
         let stateRewind =
             ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_STATE_REWIND"] == "1"
         var rewindSteps = 0
+        // BUTTER_GDN_STATE_PLANES=1 — same flag that opts the fused
+        // conv+scan kernels into writing per-token state planes (see
+        // `Qwen35GDNLayer.forwardManyChunked`) — tried FIRST on partial
+        // accept, ahead of `stateRewind`: `model.adoptPlanes` selects the
+        // `(keep-1)`th captured plane directly into the live cache
+        // buffers, skipping both the pre-verify snapshot restore AND the
+        // conv+scan re-run `rewindCaches` needs. Falls back to
+        // `stateRewind` (if set) then full replay when planes weren't
+        // captured for this cycle (e.g. `t` exceeded the plane-eligible
+        // cap — see `forwardManyChunked`'s `maxPlaneT`).
+        let statePlanes =
+            ProcessInfo.processInfo.environment["BUTTER_GDN_STATE_PLANES"] == "1"
+        var planeSteps = 0
         let batchedReplay =
             ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_BATCHED_REPLAY"] == "1"
         // BUTTER_QWEN_MTP_BATCHED_LOCKSTEP=1: run the post-accept MTP
@@ -749,8 +772,13 @@ extension SpecDecode {
         var bucketProposed: [Int] = []
         var bucketAccepted: [Int] = []
 
-        if stateRewind { model.setSpecCapture(true, caches: caches) }
-        defer { if stateRewind { model.setSpecCapture(false, caches: caches) } }
+        // `statePlanes` also needs `specCapture` on: it gates
+        // `forwardManyChunked`'s plane STASH onto the cache (the WRITE
+        // itself is separately gated on the `BUTTER_GDN_STATE_PLANES` env
+        // check alone — see that method's doc), same as `stateRewind`
+        // needing it for the qkv/a_raw/b_raw stash.
+        if stateRewind || statePlanes { model.setSpecCapture(true, caches: caches) }
+        defer { if stateRewind || statePlanes { model.setSpecCapture(false, caches: caches) } }
         loop: while tokensGenerated < maxNewTokens {
             // Pre-burst MTP cache length — the truncation target for
             // the post-accept lockstep (every burst row is rolled back
@@ -795,7 +823,9 @@ extension SpecDecode {
                     let dCmd = device.makeCommandBuffer()
                     let (h, dLogits) = head.draftStep(
                         prevHidden: chainHidden, prevToken: chainTok,
-                        position: pos + j, on: dCmd, device: device)
+                        position: pos + j,
+                        draftStepIndex: j, isGreedy: isGreedyRun,
+                        on: dCmd, device: device)
                     dCmd.commit()
                     dCmd.waitUntilCompleted()
                     // Single CPU readback of this step's logits row,
@@ -1011,7 +1041,42 @@ extension SpecDecode {
                 // baseline greedy loop. Next-prev comes from the LAST
                 // single-step forward, not the batched row.
                 let rT = Date()
-                if stateRewind {
+                if statePlanes {
+                    // ── Partial accept via plane select ────────────────
+                    // Cheaper still than `stateRewind` below: the last
+                    // verify pass's fused conv+scan kernels already wrote
+                    // every token's state out to a plane (see
+                    // `forwardManyChunked`'s per-token-planes block), so
+                    // recovering the k-token state is a direct SELECT —
+                    // `model.adoptPlanes` blits `plane[keep-1]` straight
+                    // into the live cache buffers. No pre-verify snapshot
+                    // restore (unlike `stateRewind`, this doesn't need
+                    // `caches.restoreAll(..., recurrentOnly: true)` first
+                    // — see `Qwen35GDNLayer.adoptPlaneState`'s doc), and
+                    // no re-scan dispatch at all.
+                    let wCmd = device.makeCommandBuffer()
+                    let ok = model.adoptPlanes(
+                        keep: plan.committed.count, absolutePosition: pos,
+                        caches: caches, on: wCmd)
+                    wCmd.commit()
+                    wCmd.waitUntilCompleted()
+                    if ok {
+                        msReplay += Date().timeIntervalSince(rT)
+                        // nextTok stays plan.nextToken; hiddenAll stays
+                        // the verify pass's rows — same contract as
+                        // `stateRewind` below.
+                        planeSteps += 1
+                        replayed = true
+                    }
+                    // else: planes weren't captured this cycle (flag was
+                    // on but `t` exceeded the eligible cap, or this is
+                    // the priming cycle) — fall through to `stateRewind`
+                    // / full replay below. Caches are untouched so far
+                    // (adoptPlanes only writes on success), so both
+                    // fallbacks below still see the verify pass's
+                    // (wrong, full-T) state exactly as they expect.
+                }
+                if !replayed, stateRewind {
                     // ── Partial accept WITHOUT replay ─────────────────
                     // The batched pass is causal, so everything it
                     // produced for accepted rows is already correct: the
@@ -1276,8 +1341,16 @@ extension SpecDecode {
                     }
                     let lT = Date()
                     let lCmd = device.makeCommandBuffer()
+                    // Not a speculative burst — this re-advances the
+                    // head's KV cache over already-COMMITTED tokens and
+                    // discards the logits (see the surrounding comment),
+                    // so which lm_head computes them is irrelevant to
+                    // correctness. Pass draftStepIndex 0 (always maps to
+                    // the 4-bit head under `.depth2Plus`, the cheapest
+                    // safe default) rather than threading `j` here.
                     _ = head.draftStep(
                         prevHidden: ph, prevToken: tok, position: pos + j,
+                        draftStepIndex: 0, isGreedy: isGreedyRun,
                         on: lCmd, device: device)
                     lCmd.commit()
                     lCmd.waitUntilCompleted()
@@ -1350,6 +1423,7 @@ extension SpecDecode {
                 format:
                     "[mtp-prof] total=%.2fs draft=%.2f verify=%.2f replay=%.2f "
                     + "lockstep=%.2f snap=%.2f other=%.2f rewinds=\(rewindSteps) "
+                    + "planes=\(planeSteps) "
                     + "avgdraft=\(String(format: "%.2f", avgDraft)) "
                     + "mindraft=\(minD) maxdraft=\(maxDraftLen) draftcycles=\(draftCycles) "
                     + "accepted=\(candidatesAccepted)/\(candidatesProposed) "

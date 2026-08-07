@@ -109,6 +109,7 @@ struct GatedDeltaWYPrefillTests {
             stateOutA.zero()
             let yA = Tensor.empty(shape: [b, t, hv, dv], dtype: .f32)
             yA.zero()
+            let (statePlanesA, planesEnabledA) = Ops.disabledGdnPlanes(dtype: .f32, device: .shared)
             runAndWait { cb in
                 Ops.gatedDeltaPrepChunk(
                     convOut: convOut, aLog: aLog, dtBias: dtBias,
@@ -116,6 +117,7 @@ struct GatedDeltaWYPrefillTests {
                     qNormed: qNormed, kNormed: kNormed,
                     stateIn: stateInA, stateOut: stateOutA, y: yA,
                     tLen: tLen,
+                    statePlanes: statePlanesA, planesEnabled: planesEnabledA,
                     batchSize: b, dk: dk, dv: dv, hv: hv, hk: hk, on: cb)
             }
 

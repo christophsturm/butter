@@ -79,10 +79,10 @@ struct QmvQmmParityTests {
     }
 
     /// Build one random int4 weight bank plus a random activation row.
-    static func fixture() -> (
+    static func fixture(seed: UInt64 = 0x5DEE_CE66_D3A7_1B41) -> (
         weight: Tensor, scales: Tensor, biases: Tensor, x: [Float]
     ) {
-        var rng = RNG(state: 0x5DEE_CE66_D3A7_1B41)
+        var rng = RNG(state: seed)
         let groupsPerRow = kIn / groupSize
 
         // Packed nibbles: 8 per u32.
@@ -287,6 +287,72 @@ struct QmvQmmParityTests {
                 maxRel < 0.02,
                 "T=\(t): QMV vs scalar-BM8 QMM row 0 disagree: max_abs=\(maxAbs) max_rel=\(maxRel) at out[\(worst)] (qmv=\(v[max(worst, 0)]) qmm=\(m[max(worst, 0)]))"
             )
+        }
+    }
+
+    /// The fused 4-projection fast path (`Ops.batched4QmmFast`, taken by
+    /// the GDN input projections when `BUTTER_GDN_BATCHED4_MANY=1`) was
+    /// the last quantized-matmul variant with NO cross-parity coverage.
+    /// An exactness sweep showed the flag alone shifts a 512-token greedy
+    /// stream through its prefill-path use — coherent output, so
+    /// kernel-family ULP drift, but the bound was never pinned by a test.
+    /// This pins it: each of the four fused banks must agree with the
+    /// unfused `dequantGemmDynamicM` on identical inputs, every row,
+    /// across the T range the draft/verify paths use. The fused kernel
+    /// accumulates per-thread like the scalar family (no threadgroup
+    /// staging of dequantized weights in activation dtype), so the
+    /// scalar-kernel bar (0.02 rel) applies, not the 0.03 MMA-class bar.
+    @Test("fused-4 QMM matches unfused QMM, all banks, all rows, T=1,2,4,5,8")
+    func batched4FusedMatchesUnfused() {
+        // Four distinct banks — same shapes, different weights, like the
+        // GDN q/k/v/(z|b) projections the production call site fuses.
+        let banks = [
+            Self.fixture(seed: 0x5DEE_CE66_D3A7_1B41),
+            Self.fixture(seed: 0xA24B_AED4_963E_E407),
+            Self.fixture(seed: 0x9E37_79B9_7F4A_7C15),
+            Self.fixture(seed: 0xD1B5_4A32_D192_ED03),
+        ]
+        let x = banks[0].x
+        for t in [1, 2, 4, 5, 8] {
+            var rows: [Float] = []
+            for _ in 0 ..< t { rows.append(contentsOf: x) }
+            let input = Self.bf16Tensor(rows, shape: [t * Self.kIn])
+            let outs = (0 ..< 4).map { _ in
+                Tensor.empty(shape: [t * Self.nOut], dtype: .bf16)
+            }
+            Self.runAndWait { cb in
+                Ops.batched4QmmFast(
+                    input: input, m: t,
+                    wA: banks[0].weight, scalesA: banks[0].scales,
+                    biasesA: banks[0].biases, outA: outs[0],
+                    wB: banks[1].weight, scalesB: banks[1].scales,
+                    biasesB: banks[1].biases, outB: outs[1],
+                    wC: banks[2].weight, scalesC: banks[2].scales,
+                    biasesC: banks[2].biases, outC: outs[2],
+                    wD: banks[3].weight, scalesD: banks[3].scales,
+                    biasesD: banks[3].biases, outD: outs[3],
+                    groupSize: Self.groupSize, on: cb)
+            }
+            for (bi, bank) in banks.enumerated() {
+                let device = Device.shared
+                let ref = Tensor.empty(shape: [t * Self.nOut], dtype: .bf16)
+                Self.runAndWait { cb in
+                    Ops.dequantGemmDynamicM(
+                        input: input,
+                        weight: bank.weight, scales: bank.scales,
+                        biases: bank.biases,
+                        t: t, nOut: Self.nOut, kIn: Self.kIn,
+                        groupSize: Self.groupSize,
+                        on: cb, device: device, into: ref)
+                }
+                let a = Self.bf16Values(outs[bi])
+                let b = Self.bf16Values(ref)
+                let (maxAbs, maxRel, worst) = Self.report(a, b)
+                #expect(
+                    maxRel < 0.02,
+                    "T=\(t) bank=\(bi): fused-4 vs unfused disagree: max_abs=\(maxAbs) max_rel=\(maxRel) at out[\(worst)] (fused=\(a[max(worst, 0)]) unfused=\(b[max(worst, 0)]))"
+                )
+            }
         }
     }
 }
