@@ -123,6 +123,53 @@ public final class Device: @unchecked Sendable {
     public var scratchAllocCount: Int = 0
     public var scratchAllocBytes: Int = 0
 
+    // ─── Alloc trace (BUTTER_ALLOC_TRACE=1) ────────────────────────────
+    //
+    // Per-boundary transient-allocation telemetry for #105 (gemma4 MoE
+    // per-token footprint investigation). `bufferAllocCount/Bytes` and
+    // `scratchAllocCount/Bytes` above already tally every
+    // `Device.makeBuffer` / scratch-slab call unconditionally (near-zero
+    // marginal cost — a couple of int adds per allocation, already
+    // shipped). What was missing was a way to READ that tally at
+    // meaningful boundaries (a forward-token start/end, a per-layer
+    // checkpoint) without every call site hand-rolling its own
+    // before/after diff.
+    //
+    // `allocTraceReset()` zeroes the counters; `allocTraceReport(_:)`
+    // prints the cumulative counts since the last reset, tagged with a
+    // caller-supplied label, to stderr. Both are gated on
+    // `Device.allocTraceEnabled` (env `BUTTER_ALLOC_TRACE=1`) so a
+    // normal run pays only the one-time environment-variable read (a
+    // `static let`, evaluated once) plus a branch per call site — no
+    // string formatting or I/O unless explicitly opted in.
+    public static let allocTraceEnabled: Bool = {
+        ProcessInfo.processInfo.environment["BUTTER_ALLOC_TRACE"] == "1"
+    }()
+
+    /// Zero the alloc-trace counters. No-op when
+    /// `Device.allocTraceEnabled` is false. Call at a boundary (e.g. the
+    /// top of a per-token forward, or right after KV-cache setup) to
+    /// start a fresh measurement window.
+    public func allocTraceReset() {
+        guard Device.allocTraceEnabled else { return }
+        bufferAllocCount = 0
+        bufferAllocBytes = 0
+        scratchAllocCount = 0
+        scratchAllocBytes = 0
+    }
+
+    /// Print the cumulative alloc-trace counters since the last
+    /// `allocTraceReset()` (or since process start, if never reset), tagged
+    /// with `label`. No-op when `Device.allocTraceEnabled` is false.
+    public func allocTraceReport(_ label: String) {
+        guard Device.allocTraceEnabled else { return }
+        let line =
+            "[BUTTER_ALLOC_TRACE] \(label): "
+            + "buffers=\(bufferAllocCount) (\(bufferAllocBytes) bytes), "
+            + "scratch=\(scratchAllocCount) (\(scratchAllocBytes) bytes)\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+
     // ─── Dequant-intermediate scratch (persistent reusable buffer) ────
     //
     // GGUF dequant kernels need 1-2 large transient buffers per call
