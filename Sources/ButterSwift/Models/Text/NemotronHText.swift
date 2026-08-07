@@ -225,15 +225,19 @@ public struct NemotronHHybrid: NemotronHVariant {
         }()
 
         // ── Activation dtype — taken from the embedding table ─────────
+        // The quantization guard must run BEFORE the dtype precondition:
+        // a quantized checkpoint's packed-u32 embedding used to trip the
+        // precondition first, killing the process with a messageless
+        // SIGTRAP in release builds instead of this thrown error.
+        guard config.quantization == nil else {
+            throw NemotronHError.unsupportedConfig(
+                "quantized NemotronH checkpoints not yet supported — load a raw bf16/f16 variant")
+        }
         let embedWRaw = try weights.tensor(named: "backbone.embeddings.weight")
         let activationDtype = embedWRaw.dtype
         precondition(
             activationDtype == .f32 || activationDtype == .bf16 || activationDtype == .f16,
             "NemotronH: unexpected activation dtype \(activationDtype)")
-        guard config.quantization == nil else {
-            throw NemotronHError.unsupportedConfig(
-                "quantized NemotronH checkpoints not yet supported — load a raw bf16/f16 variant")
-        }
         let embedTokens = AnyEmbedding(Embedding(weight: embedWRaw))
 
         // ── MoE hyper-parameters (only read when an "E" layer exists) ─
