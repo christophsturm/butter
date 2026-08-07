@@ -104,6 +104,13 @@ struct GenerateCommand: AsyncParsableCommand {
     @Option(name: .long, help: "PRNG seed for reproducible sampling.")
     var seed: UInt64?
 
+    @Flag(
+        name: .long,
+        help:
+            "Print the raw generated token ids as a JSON array after generation (scripted statistical-harness consumption, e.g. Loop E)."
+    )
+    var printTokenIds: Bool = false
+
     @Option(
         name: .long,
         help:
@@ -360,6 +367,10 @@ struct GenerateCommand: AsyncParsableCommand {
             "generated: \(result.generatedTokens.count) tokens "
                 + "in \(String(format: "%.2f", result.decodeTimeS))s "
                 + "(\(String(format: "%.2f", result.tokensPerSecond)) tok/s)")
+        if printTokenIds {
+            let ids = result.generatedTokens.map(String.init).joined(separator: ",")
+            print("token ids: [\(ids)]")
+        }
         if stats {
             print(result.stats.formatted())
         }
