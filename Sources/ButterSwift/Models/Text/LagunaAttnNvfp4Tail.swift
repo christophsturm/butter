@@ -89,14 +89,14 @@ import IronSwift
 enum LagunaAttnNvfp4Tail {
     static let groupSize = 16
 
-    /// W9 decode-attention-QMV V2 (`BUTTER_LAGUNA_DECODE_QMV_V2=1`,
+    /// Decode-attention QMV V2 (`BUTTER_LAGUNA_DECODE_QMV_V2=1`,
     /// default OFF). One flag, three effects, all decode-only:
     ///
     /// 1. `fromLayer` defaults to 0 instead of 99: EVERY attention layer
     ///    builds the group-16 NVFP4 bank instead of the T20 group-32
     ///    affine INT8 bank, halving attention weight bytes/token
     ///    (0.5625 B/param vs 1.125). T42's +0.83% verdict against this
-    ///    was measured in the ~81 tok/s HOST-bound era (pre W8 lever 0);
+    ///    was measured in the ~81 tok/s HOST-bound era (pre the launch-flag hoist);
     ///    post-lever-0 decode is GPU-bandwidth-bound in exactly these
     ///    two buckets (`qkv_qmv` + `oproj_gated` ≈ 52% of the token), so
     ///    the byte halving now lands (§3e of the campaign compendium).
@@ -118,8 +118,14 @@ enum LagunaAttnNvfp4Tail {
     /// default in `fromLayer` (so the tail-only configuration stays
     /// reachable under V2 for ablation). Live read (not a static let):
     /// tests toggle this per-case via setenv.
+    /// DEFAULT ON (Tom's flip 2026-08-08, +32% decode): all-layer NVFP4
+    /// g16 attention banks. Output is coherent but NOT byte-identical to
+    /// the prior INT8-g32 default — a dequant-association reorder, the
+    /// same FP-reorder class the reference engine ships NVFP4-attn
+    /// everywhere through 1,344 exact-token checks. Escape `=0` restores
+    /// the INT8 path. Live read (tests toggle per-case via setenv).
     static var v2Enabled: Bool {
-        ButterEnv["BUTTER_LAGUNA_DECODE_QMV_V2"] == "1"
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DECODE_QMV_V2"] != "0"
     }
 
     /// Default 99 (OFF, w2-integration cycle 3 verdict): layers
@@ -265,7 +271,7 @@ enum LagunaAttnNvfp4Tail {
         }
         """
 
-    // W9 / DECODE_QMV_V2 fast-dequant helpers. Bit-exact vs the V1
+    // DECODE_QMV_V2 fast-dequant helpers. Bit-exact vs the V1
     // helpers above (locked exhaustively over all 256 E4M3 bytes x 16
     // E2M1 nibbles by `LagunaAttnNvfp4V2Tests.dequantEquivalence...`),
     // in a fraction of the integer/select ops:
@@ -792,7 +798,7 @@ enum LagunaAttnNvfp4Tail {
     /// x 16 E2M1 nibbles). Not read by any production dispatch.
     static var helperSrcForTesting: String { helperSrc }
 
-    // W9 / DECODE_QMV_V2 kernel 1: norm-folded QKV(+gate) NVFP4 QMV.
+    // DECODE_QMV_V2 kernel 1: norm-folded QKV(+gate) NVFP4 QMV.
     // The NVFP4 twin of `LagunaAttnInt8.normQmvSrc` (T-series
     // BUTTER_LAGUNA_QKV_NORMFOLD): folds the block's input RMSNorm into
     // the bank's own QMV so the decode QKV head is ONE dispatch instead
@@ -910,7 +916,7 @@ enum LagunaAttnNvfp4Tail {
         }
         """
 
-    // W9 / DECODE_QMV_V2 kernel 2: gated o_proj split-K NVFP4 QMV, V2.
+    // DECODE_QMV_V2 kernel 2: gated o_proj split-K NVFP4 QMV, V2.
     // Two changes vs `qmvGatedSplitKSrc` (V1), both bit-exact:
     // 1. The per-head softplus gate is computed ONCE per head into a
     //    threadgroup gate table (the reference stack's o_proj kernel
@@ -1024,7 +1030,7 @@ enum LagunaAttnNvfp4Tail {
         }
         """
 
-    // W9 / DECODE_QMV_V2 kernel 1b: split-K norm-folded QKV(+gate) NVFP4
+    // DECODE_QMV_V2 kernel 1b: split-K norm-folded QKV(+gate) NVFP4
     // QMV. Same fold as `normQmvV2Src` but with `qmvSplitKSrc`'s NR0=2 /
     // NSG=4 K-parallel geometry (128 threads jointly striding K for a
     // 2-row pair, two-stage reduce): measured in-situ, the 8-rows/TG
@@ -1255,7 +1261,7 @@ enum LagunaAttnNvfp4Tail {
             bank.outDim.isMultiple(of: 2)
         else { return false }
 
-        // W9: V2 twin (threadgroup gate table + fast dequant, bit-exact
+        // V2 twin (threadgroup gate table + fast dequant, bit-exact
         // vs V1 — see `qmvGatedSplitKV2Src`). The V2 kernel's gate table
         // is fixed at 64 slots, the largest Laguna-family head count;
         // anything wider falls through to V1.
@@ -1444,7 +1450,7 @@ enum LagunaAttnNvfp4Tail {
         }
     }
 
-    /// W9 / DECODE_QMV_V2: norm-folded QKV(+gate) NVFP4 QMV — RMSNorm
+    /// DECODE_QMV_V2: norm-folded QKV(+gate) NVFP4 QMV — RMSNorm
     /// reduction + QMV in one dispatch (see `normQmvV2Src`). Declines
     /// (returns `false`, `out` untouched) unless `v2Enabled` and the
     /// same fast-path envelope `LagunaAttnInt8.qmvNormFolded` requires
@@ -1475,7 +1481,7 @@ enum LagunaAttnNvfp4Tail {
         // `BUTTER_LAGUNA_QMV_V2_NORMFOLD_SPLITK=0` pins the 8-rows/TG
         // variant for ablation.
         if bank.outDim.isMultiple(of: 2), bank.inDim.isMultiple(of: 512),
-            ButterEnv["BUTTER_LAGUNA_QMV_V2_NORMFOLD_SPLITK"] != "0"
+            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_QMV_V2_NORMFOLD_SPLITK"] != "0"
         {
             let p = pso(
                 "laguna_attn_norm_qmv_nvfp4_g16_splitk_v2_bf16", source: normQmvSplitKV2Src,

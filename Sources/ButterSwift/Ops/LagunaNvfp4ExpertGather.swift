@@ -43,9 +43,12 @@ import Metal
 import IronSwift
 
 enum LagunaNvfp4ExpertGather {
-    /// Opt-in A/B flag (default OFF): `BUTTER_LAGUNA_GATHER_V2=1`.
+    /// DEFAULT ON (Tom's flip 2026-08-08, +20-31% prefill): expert-aligned
+    /// A-device-direct NVFP4 gather QMM + 3 scaffolding levers. Coherent,
+    /// NOT byte-identical to the prior EG-MPP path (dequant-association
+    /// reorder, same class as DECODE_QMV_V2 above). Escape `=0`.
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_GATHER_V2"] == "1"
+        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_GATHER_V2"] != "0"
     }
 
     // MARK: - Follow-on levers (scaffolding removal)
@@ -231,7 +234,7 @@ enum LagunaNvfp4ExpertGather {
     /// `iron_swiglu_bf16` bit-for-bit (`x / (1 + exp(-x))`), pinned by
     /// the lever test suite's byte-identity bar.
     ///
-    /// `inner.dtype` selects the store: bf16 (wave-6 value exactly) or
+    /// `inner.dtype` selects the store: bf16 (base value exactly) or
     /// f16 for the f16Inner lever — the f16 store DELIBERATELY rounds
     /// through bf16 first and saturates at ±65504, reproducing
     /// [bf16 store → `gatherCastBf16ToF16`] to the bit (see the lever
@@ -287,7 +290,7 @@ enum LagunaNvfp4ExpertGather {
                 float g = float(gs[s * dimN + d]);
                 float u = float(us[s * dimN + d]);
                 float sv = g / (1.0f + exp(-g));
-                // DELIBERATE double rounding: bf16 first (the wave-6
+                // DELIBERATE double rounding: bf16 first (the base
                 // store), then the saturating f16 cast that the deleted
                 // gatherCastBf16ToF16 pass would have applied — keeps
                 // the down GEMM's A operand bit-identical to the
@@ -486,7 +489,7 @@ enum LagunaNvfp4ExpertGather {
         _ = Ops.gather(table: sortedOut1, tokenIds: sort.invPerm, on: cmd, into: out1)
     }
 
-    // MARK: - W6 follow-on lever chain (MoELayer fused-gateup prefill path)
+    // MARK: - Follow-on lever chain (MoELayer fused-gateup prefill path)
 
     /// Gate+up stage of the lever chain. Called by `MoELayer`'s
     /// fused-gateup prefill branch ONLY on the sorted-plan path (rows in
@@ -495,7 +498,7 @@ enum LagunaNvfp4ExpertGather {
     /// activation `[mTotal, nOut]` (row order preserved).
     ///
     /// skipSort lever ON here means: ONE fused gather-cast straight from
-    /// the `[t, hidden]` token table (deletes the wave-6 chain's separate
+    /// the `[t, hidden]` token table (deletes the base chain's separate
     /// bf16 materialise gather AND the identity k=1 re-sort) and the
     /// GEMM pair writes `gateOut`/`upOut` directly (deletes two identity
     /// scatter-back copies). Bit-identical by construction:
@@ -534,7 +537,7 @@ enum LagunaNvfp4ExpertGather {
                 table: hRows, tokenIds: srcTok, mTotal: mTotal, hidden: kIn,
                 on: cmd, into: sortedIn)
         } else {
-            // Replicate the wave-6 chain: bf16 materialise gather +
+            // Replicate the base chain: bf16 materialise gather +
             // local k=1 sort (identity on this path) + sort-order cast.
             let gBuf = device.intermediateScratch(
                 tag: "nvfp4_xg_gathered_\(kIn)", minBytes: mTotal * kIn * 2)
@@ -605,7 +608,7 @@ enum LagunaNvfp4ExpertGather {
             return inner
         }
         if !gemmDirect {
-            // Replicate the wave-6 scatter-back (identity copies here).
+            // Replicate the base scatter-back (identity copies here).
             _ = Ops.gather(table: dest0, tokenIds: sortInfo!.invPerm, on: cmd, into: gateOut)
             _ = Ops.gather(table: dest1, tokenIds: sortInfo!.invPerm, on: cmd, into: upOut)
         }
@@ -661,7 +664,7 @@ enum LagunaNvfp4ExpertGather {
                 enc.endEncoding()
                 return
             }
-            // Without skipSort: replicate the wave-6 shape — local k=1
+            // Without skipSort: replicate the base shape — local k=1
             // sort (identity on this path), f16 row reorder (plain
             // gather, no cast — that's the lever's saving here), GEMM,
             // invPerm scatter-back.

@@ -44,10 +44,12 @@ import Testing
 @Suite("Laguna attention NVFP4 decode-QMV V2", .serialized)
 struct LagunaAttnNvfp4V2Tests {
     private func setV2(_ on: Bool) {
+        // Default-on flag (escape `=0`): "off" must be the explicit
+        // escape hatch, not an unset var — unsetting now means enabled.
         if on {
             setenv("BUTTER_LAGUNA_DECODE_QMV_V2", "1", 1)
         } else {
-            unsetenv("BUTTER_LAGUNA_DECODE_QMV_V2")
+            setenv("BUTTER_LAGUNA_DECODE_QMV_V2", "0", 1)
         }
     }
 
