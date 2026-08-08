@@ -3061,6 +3061,52 @@ public final class MoELayer: Module, DecoderLayer {
                             Ops.castF32ToBf16(downF, into: downOut, on: work)
                             moePhaseCheckpoint("down")
                         } else if useFusedGateUp {
+                            // Follow-on lever chain (skip identity
+                            // re-sort; see LagunaNvfp4ExpertGather's
+                            // lever header). Fires only with
+                            // BUTTER_LAGUNA_GATHER_V2=1 + a lever flag
+                            // + the sorted plan + both routed
+                            // projections V2-eligible; the base
+                            // default chain below is untouched
+                            // otherwise (base A/B arm stays exact).
+                            let v2Levers = LagunaNvfp4ExpertGather.levers
+                            if v2Levers.any, sortedSource != nil,
+                                sortedExperts != nil,
+                                LagunaNvfp4ExpertGather.eligible(
+                                    dtype: dt, nOut: moeIntermediate,
+                                    kIn: hidden,
+                                    blockSize: stacked.blockSize),
+                                LagunaNvfp4ExpertGather.eligible(
+                                    dtype: dt, nOut: hidden,
+                                    kIn: moeIntermediate,
+                                    blockSize: stacked.blockSize)
+                            {
+                                let inner = LagunaNvfp4ExpertGather.gateUpChain(
+                                    hRows: hRows, srcTok: srcTok, indices: expIds,
+                                    gateWeight: stacked.gateWeight,
+                                    gateScales: stacked.gateScales,
+                                    upWeight: stacked.upWeight,
+                                    upScales: stacked.upScales,
+                                    gateOut: gateOut, upOut: upOut,
+                                    mTotal: mTotal, nOut: moeIntermediate,
+                                    kIn: hidden,
+                                    blockSize: stacked.blockSize,
+                                    global: stacked.global,
+                                    levers: v2Levers,
+                                    on: work, device: device)
+                                moePhaseCheckpoint("gateup")
+                                LagunaNvfp4ExpertGather.downChain(
+                                    inner: inner, indices: expIds,
+                                    weight: stacked.downWeight,
+                                    scales: stacked.downScales,
+                                    mTotal: mTotal, nOut: hidden,
+                                    kIn: moeIntermediate,
+                                    blockSize: stacked.blockSize,
+                                    global: stacked.global,
+                                    levers: v2Levers,
+                                    on: work, device: device, into: downOut)
+                                moePhaseCheckpoint("down")
+                            } else {
                             // Native bf16 fused gate+up (x_rows, no materialise).
                             Ops.nvfp4MoeGatherBm16GateUp(
                                 input: hRows, xRows: srcTok,
@@ -3083,6 +3129,7 @@ public final class MoELayer: Module, DecoderLayer {
                                 preferNativeBf16: useNativeBf16Mpp,
                                 on: work, into: downOut)
                             moePhaseCheckpoint("down")
+                            }
                         } else {
                             // Materialise gather + concurrent pair (BM16 or BM64)
                             // / serial fallback.

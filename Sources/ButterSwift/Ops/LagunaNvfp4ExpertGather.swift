@@ -48,6 +48,43 @@ enum LagunaNvfp4ExpertGather {
         ProcessInfo.processInfo.environment["BUTTER_LAGUNA_GATHER_V2"] == "1"
     }
 
+    // MARK: - Follow-on levers (scaffolding removal)
+
+    /// A/B testing showed the gather bucket is scaffolding-bound
+    /// (sort + gather-cast + scatter-back ≈ the GEMM itself). Each lever
+    /// removes one piece, each behind its own opt-in env flag so the A/B
+    /// arms compose incrementally on top of `BUTTER_LAGUNA_GATHER_V2=1`
+    /// (which stays the master switch — none of this runs without it):
+    ///
+    ///   * `BUTTER_LAGUNA_V2_SKIP_SORT=1` — on MoELayer's sorted-plan
+    ///     path the rows arriving here are ALREADY in expert-sorted
+    ///     order (`Ops.moeSortPlan` ran upstream), so the local k=1
+    ///     re-sort is the identity permutation, the sort-order gather is
+    ///     a copy, and the invPerm scatter-back is a copy. Skipping them
+    ///     is bit-identical: the caller's plan ids are used directly as
+    ///     `sortedExperts`, the gather-cast reads straight from the
+    ///     token table via the caller's `srcTok` (one pass, same values)
+    ///     and the GEMM writes its output rows directly into the caller
+    ///     target ("every row written exactly once" per the kernel
+    ///     contract, so no zero-fill is needed either).
+    ///
+    /// The lever chain entry points (`gateUpChain` / `downChain`) are
+    /// called by MoELayer's fused-gateup prefill branch only when the
+    /// sorted plan exists — passing unsorted indices with skipSort on
+    /// violates the kernel's "indices sorted ascending" contract and is
+    /// the caller's responsibility (MoELayer guarantees it by
+    /// construction; the lever tests pin the equivalence).
+    struct Levers {
+        var skipSort: Bool
+        var any: Bool { skipSort }
+    }
+
+    static var levers: Levers {
+        let env = ProcessInfo.processInfo.environment
+        return Levers(
+            skipSort: env["BUTTER_LAGUNA_V2_SKIP_SORT"] == "1")
+    }
+
     /// Same MPP capability gate as every other `matmul2d` kernel here.
     static var capable: Bool { Ops.mppAutoCapable }
 
@@ -191,6 +228,7 @@ enum LagunaNvfp4ExpertGather {
         input: Tensor, weight: Tensor, scales: Tensor, indices: Tensor,
         mTotal: Int, nOut: Int, kIn: Int,
         blockSize: Int = 16, global: Float = 1.0,
+        sortedIndices: Bool = false,
         on cmd: MTLCommandBuffer, device: Device,
         into out: Tensor
     ) {
@@ -204,13 +242,39 @@ enum LagunaNvfp4ExpertGather {
         let nExperts = weight.shape[0]
         precondition(mTotal <= 65536, "16-step binary search bound")
 
-        let sort = sortRowsByExpert(indices: indices, mTotal: mTotal, on: cmd, device: device)
-
         // Sorted f16 A with the 64-row padding contract (see header).
         let sortedInBuf = device.intermediateScratch(
             tag: "nvfp4_xg_in_\(kIn)", minBytes: (mTotal + 64) * kIn * 2)
         let sortedIn = Tensor(
             buffer: sortedInBuf, offset: 0, shape: [mTotal, kIn], dtype: .f16)
+
+        if sortedIndices {
+            // SKIP_SORT lever: `indices` is already sorted ascending and
+            // the rows of `input` are already in that order (MoELayer's
+            // sorted-plan path). The local k=1 sort would be the identity
+            // permutation — skip it, cast in place order, and let the
+            // GEMM write `out` directly (every row written exactly once
+            // per the kernel contract; no scatter-back copy).
+            let idBuf = Ops.identityRowsBuffer(minCount: mTotal, device: device)
+            let idRows = Tensor(buffer: idBuf, offset: 0, shape: [mTotal], dtype: .u32)
+            gatherCastBf16ToF16(
+                table: input, tokenIds: idRows, mTotal: mTotal, hidden: kIn,
+                on: cmd, into: sortedIn)
+            let pso = PSOCache.shared.pipelineState(for: kernelName(kIn: kIn))
+            guard let enc = cmd.makeComputeCommandEncoder() else {
+                fatalError("LagunaNvfp4ExpertGather.callGather: could not make compute encoder")
+            }
+            encode(
+                enc, pso: pso, x: sortedIn, weight: weight, scales: scales,
+                sortedExperts: indices, out: out,
+                mTotal: mTotal, nOut: nOut, nExperts: nExperts,
+                blockSize: blockSize, global: global)
+            enc.endEncoding()
+            return
+        }
+
+        let sort = sortRowsByExpert(indices: indices, mTotal: mTotal, on: cmd, device: device)
+
         gatherCastBf16ToF16(
             table: input, tokenIds: sort.sourceRows, mTotal: mTotal, hidden: kIn,
             on: cmd, into: sortedIn)
@@ -287,5 +351,91 @@ enum LagunaNvfp4ExpertGather {
 
         _ = Ops.gather(table: sortedOut0, tokenIds: sort.invPerm, on: cmd, into: out0)
         _ = Ops.gather(table: sortedOut1, tokenIds: sort.invPerm, on: cmd, into: out1)
+    }
+
+    // MARK: - W6 follow-on lever chain (MoELayer fused-gateup prefill path)
+
+    /// Gate+up stage of the lever chain. Called by `MoELayer`'s
+    /// fused-gateup prefill branch ONLY on the sorted-plan path (rows in
+    /// expert-sorted order, `indices` sorted ascending, `srcTok` maps
+    /// sorted slot → token row of `hRows`). Returns the SwiGLU inner
+    /// activation `[mTotal, nOut]` (row order preserved).
+    ///
+    /// skipSort lever ON here means: ONE fused gather-cast straight from
+    /// the `[t, hidden]` token table (deletes the wave-6 chain's separate
+    /// bf16 materialise gather AND the identity k=1 re-sort) and the
+    /// GEMM pair writes `gateOut`/`upOut` directly (deletes two identity
+    /// scatter-back copies). Bit-identical by construction:
+    /// f16(bf16 row) is the same value whether the row was copied first,
+    /// and the kernel writes every output row exactly once.
+    static func gateUpChain(
+        hRows: Tensor, srcTok: Tensor, indices: Tensor,
+        gateWeight: Tensor, gateScales: Tensor,
+        upWeight: Tensor, upScales: Tensor,
+        gateOut: Tensor, upOut: Tensor,
+        mTotal: Int, nOut: Int, kIn: Int,
+        blockSize: Int, global: Float,
+        levers: Levers,
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        precondition(levers.any, "lever chain entered with no lever active")
+        precondition(levers.skipSort, "gateUpChain currently requires the skipSort lever")
+        precondition(hRows.dtype == .bf16 && gateOut.dtype == .bf16 && upOut.dtype == .bf16)
+        precondition(srcTok.dtype == .u32 && srcTok.elementCount == mTotal)
+        precondition(indices.dtype == .u32 && indices.elementCount == mTotal)
+        precondition(gateOut.elementCount == mTotal * nOut)
+        precondition(upOut.elementCount == mTotal * nOut)
+        precondition(kIn == 2048 || kIn == 512, "K is baked into the kernel variant")
+        precondition(nOut % 64 == 0 && blockSize == 16)
+        let nExperts = gateWeight.shape[0]
+        precondition(mTotal <= 65536, "16-step binary search bound")
+
+        // Sorted f16 A with the 64-row padding contract (see header).
+        let sortedInBuf = device.intermediateScratch(
+            tag: "nvfp4_xg_in_\(kIn)", minBytes: (mTotal + 64) * kIn * 2)
+        let sortedIn = Tensor(
+            buffer: sortedInBuf, offset: 0, shape: [mTotal, kIn], dtype: .f16)
+        // One pass: token-table row fetch + bf16→f16 cast, in plan order.
+        gatherCastBf16ToF16(
+            table: hRows, tokenIds: srcTok, mTotal: mTotal, hidden: kIn,
+            on: cmd, into: sortedIn)
+
+        let pso = PSOCache.shared.pipelineState(for: kernelName(kIn: kIn))
+        guard let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) else {
+            fatalError("LagunaNvfp4ExpertGather.gateUpChain: could not make compute encoder")
+        }
+        encode(
+            enc, pso: pso, x: sortedIn, weight: gateWeight, scales: gateScales,
+            sortedExperts: indices, out: gateOut,
+            mTotal: mTotal, nOut: nOut, nExperts: nExperts,
+            blockSize: blockSize, global: global)
+        encode(
+            enc, pso: pso, x: sortedIn, weight: upWeight, scales: upScales,
+            sortedExperts: indices, out: upOut,
+            mTotal: mTotal, nOut: nOut, nExperts: nExperts,
+            blockSize: blockSize, global: global)
+        enc.endEncoding()
+
+        return Ops.swiglu(gate: gateOut, up: upOut, on: cmd, into: gateOut)
+    }
+
+    /// Down stage of the lever chain — same sorted-plan contract as
+    /// `gateUpChain`. `inner` is the SwiGLU output in plan row order.
+    static func downChain(
+        inner: Tensor, indices: Tensor,
+        weight: Tensor, scales: Tensor,
+        mTotal: Int, nOut: Int, kIn: Int,
+        blockSize: Int, global: Float,
+        levers: Levers,
+        on cmd: MTLCommandBuffer, device: Device,
+        into out: Tensor
+    ) {
+        precondition(levers.skipSort, "downChain currently requires the skipSort lever")
+        callGather(
+            input: inner, weight: weight, scales: scales, indices: indices,
+            mTotal: mTotal, nOut: nOut, kIn: kIn,
+            blockSize: blockSize, global: global,
+            sortedIndices: true,
+            on: cmd, device: device, into: out)
     }
 }
