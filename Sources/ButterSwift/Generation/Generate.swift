@@ -652,6 +652,12 @@ extension Model {
                 // head's cache in lockstep with every committed token.
                 mtpHead.resetCache()
                 var mtpRNG = params.makeRNG()
+                // The seed (`nextToken`) sits at `pos` — same contract as
+                // the GPU-loop's seedPosition (#108): capture it by name
+                // BEFORE the emit closure below starts mutating `pos` for
+                // display bookkeeping, so the MTP entry position can never
+                // drift if this block is reordered.
+                let mtpEntryPosition = pos
                 let stats = profile.signpost("decode_mtp_spec") {
                     let emitToken: (Int) -> Void = { tokenId in
                         generated.append(tokenId)
@@ -670,7 +676,7 @@ extension Model {
                     if useMTPSpecSampled {
                         return SpecDecode.generateSampledMTP(
                             model: qwen, head: mtpHead, gamma: gamma,
-                            lastToken: nextToken, position: pos,
+                            lastToken: nextToken, position: mtpEntryPosition,
                             caches: caches, history: &tokenHistory,
                             maxNewTokens: params.maxTokens,
                             stopTokens: stopSet, device: Device.shared,
@@ -679,7 +685,7 @@ extension Model {
                     }
                     return SpecDecode.generateGreedyMTP(
                         model: qwen, head: mtpHead, gamma: gamma,
-                        lastToken: nextToken, position: pos,
+                        lastToken: nextToken, position: mtpEntryPosition,
                         caches: caches, history: &tokenHistory,
                         maxNewTokens: params.maxTokens,
                         stopTokens: stopSet, device: Device.shared,
