@@ -3148,6 +3148,58 @@ public final class LagunaModel: LanguageModel {
         var workCmd = device.makeCommandBuffer()
         var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
 
+        // BUTTER_DEBUG_ROUTER_SETS (butter#108): debug-only fully
+        // synchronous per-layer branch, taken instead of the pipe/nonblock
+        // machinery below. `forwardFromTokenTensor` is the shared body for
+        // BOTH `forward(tokenId:)` (host) and `forward(tokenIdBuffer:)`
+        // (GPU-chained) — the whole point of the flag is comparing the
+        // per-layer MoE router's top-K expert selection between those two
+        // arms at the same prompt/position, so both must go through this
+        // same instrumented path. One `RouterSetsDebug.nextToken()` per
+        // call (i.e. once per generated token, not per layer) then a
+        // commit+wait after EVERY layer: Laguna's decode scratches
+        // (`routerIndicesScratch` et al.) are grow-only and reused in
+        // place, so without forcing full completion here a later
+        // layer/token's write could race the readback in
+        // `MoELayer.debugRouterSnapshot()` under the default nonblock
+        // decode window (see `LagunaModel.nonblockDecodeEnabled`'s header
+        // for why that window is otherwise safe: it relies on single-queue
+        // ordering, which this branch just collapses to synchronous
+        // instead of relying on).
+        if RouterSetsDebug.enabled {
+            RouterSetsDebug.nextToken()
+            if workCmd.status != .committed && workCmd.status != .completed
+                && workCmd.status != .error
+            {
+                workCmd.commit()
+            }
+            workCmd.waitUntilCompleted()
+            for (i, layer) in layers.enumerated() {
+                let stepCmd = device.makeCommandBuffer()
+                h = layer.forward(
+                    h, position: position,
+                    cache: caches[i] as! any KVCacheProtocol,
+                    yarn: yarn,
+                    cmd: stepCmd, device: device)
+                if stepCmd.status != .committed && stepCmd.status != .completed
+                    && stepCmd.status != .error
+                {
+                    stepCmd.commit()
+                }
+                stepCmd.waitUntilCompleted()
+                if case .moe(let moe) = layer.ffn,
+                    let snap = moe.debugRouterSnapshot()
+                {
+                    RouterSetsDebug.report(
+                        layer: moe.layerIndex, indices: snap.indices, scores: snap.scores)
+                }
+            }
+            return lagunaFinalNormLmHead(
+                h: h, finalNorm: finalNorm, lmHead: lmHead,
+                lmHeadMxfp8: lmHeadMxfp8, lmHeadInt5: lmHeadInt5,
+                on: cmd, device: device)
+        }
+
         if pipe {
             // Depth: how many CBs in flight (default 4). T28 lever 4 swept
             // 1..8 (fib prompt, --stats, 5s cooldowns): flat ~100.1-100.5

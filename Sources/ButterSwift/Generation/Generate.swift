@@ -306,6 +306,10 @@ extension Model {
         // regardless of which decode loop (GPU token loop / fallback
         // forwardSample / cpuSample) produces the rest. No-op when off.
         LogitMarginDebug.reset()
+        // BUTTER_DEBUG_ROUTER_SETS: same per-generation reset, sibling
+        // instrument for butter#108 (see RouterSetsDebug.swift). No-op
+        // when off.
+        RouterSetsDebug.reset()
 
         // Path selector for the sampling step:
         //
