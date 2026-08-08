@@ -306,6 +306,10 @@ extension Model {
         // regardless of which decode loop (GPU token loop / fallback
         // forwardSample / cpuSample) produces the rest. No-op when off.
         LogitMarginDebug.reset()
+        // BUTTER_DEBUG_ROUTER_SETS: same per-generation reset, sibling
+        // instrument for butter#108 (see RouterSetsDebug.swift). No-op
+        // when off.
+        RouterSetsDebug.reset()
 
         // Path selector for the sampling step:
         //
@@ -648,6 +652,12 @@ extension Model {
                 // head's cache in lockstep with every committed token.
                 mtpHead.resetCache()
                 var mtpRNG = params.makeRNG()
+                // The seed (`nextToken`) sits at `pos` — same contract as
+                // the GPU-loop's seedPosition (#108): capture it by name
+                // BEFORE the emit closure below starts mutating `pos` for
+                // display bookkeeping, so the MTP entry position can never
+                // drift if this block is reordered.
+                let mtpEntryPosition = pos
                 let stats = profile.signpost("decode_mtp_spec") {
                     let emitToken: (Int) -> Void = { tokenId in
                         generated.append(tokenId)
@@ -666,7 +676,7 @@ extension Model {
                     if useMTPSpecSampled {
                         return SpecDecode.generateSampledMTP(
                             model: qwen, head: mtpHead, gamma: gamma,
-                            lastToken: nextToken, position: pos,
+                            lastToken: nextToken, position: mtpEntryPosition,
                             caches: caches, history: &tokenHistory,
                             maxNewTokens: params.maxTokens,
                             stopTokens: stopSet, device: Device.shared,
@@ -675,7 +685,7 @@ extension Model {
                     }
                     return SpecDecode.generateGreedyMTP(
                         model: qwen, head: mtpHead, gamma: gamma,
-                        lastToken: nextToken, position: pos,
+                        lastToken: nextToken, position: mtpEntryPosition,
                         caches: caches, history: &tokenHistory,
                         maxNewTokens: params.maxTokens,
                         stopTokens: stopSet, device: Device.shared,
@@ -707,6 +717,18 @@ extension Model {
                 let seedNow = Date()
                 perTokenWallclock.append(seedNow.timeIntervalSince(lastStep))
                 lastStep = seedNow
+                // The seed token SITS at `pos`: prefill consumed the
+                // prompt through pos-1 and sampled the seed as the
+                // token at `pos`. The chained loop's first forward must
+                // therefore process the seed AT `pos` (its RoPE angle,
+                // its KV slot) — exactly like the host branch below,
+                // which calls sampleNext(position: pos) BEFORE
+                // incrementing. Capture that before the display
+                // bookkeeping bumps `pos`, or the whole chained stream
+                // runs one position late (butter#108: wrong RoPE +
+                // KV written to slot pos+1 leaving slot pos stale —
+                // observably different logits from layer 0 onward).
+                let seedPosition = pos
                 pos += 1
 
                 // W35: under the non-blocking decode window
@@ -738,7 +760,7 @@ extension Model {
                     _ = try profile.signpost("decode_gpu_loop") {
                         try GpuTokenLoop.runGPU(
                             engine: engine, seedToken: nextToken,
-                            startPosition: pos, caches: caches,
+                            startPosition: seedPosition, caches: caches,
                             remainingBudget: remainingBudget,
                             stopSet: stopSet, device: Device.shared,
                             lag: gpuLoopLag

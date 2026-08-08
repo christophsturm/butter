@@ -576,6 +576,44 @@ public final class MoELayer: Module, DecoderLayer {
     private var unbiasedScoreScratch: Tensor?
     private var biasedScoreScratch: Tensor?
     private var pathBScaleVecScratch: Tensor?
+    /// BUTTER_DEBUG_ROUTER_SETS (butter#108): raw (pre-sigmoid) router
+    /// GEMV logits + expert bias tensors from this layer's most recent
+    /// decode-step routing dispatch, stashed only when the flag is on.
+    /// `LagunaRouterTop8Fuse`'s fused kernel (the default) computes
+    /// sigmoid+bias inline and never writes `unbiasedScoreScratch` /
+    /// `biasedScoreScratch`, so those can't be read back for a debug
+    /// dump — these two are the raw ingredients instead, always valid
+    /// regardless of which route-chain variant fired. See
+    /// `debugRouterSnapshot()` below and `RouterSetsDebug.swift`.
+    private var debugRouterLogits: Tensor?
+    private var debugRouterBias: Tensor?
+
+    /// BUTTER_DEBUG_ROUTER_SETS (butter#108): host readback of this
+    /// layer's most recent decode-step top-K expert selection. Callers
+    /// (`LagunaModel.forwardFromTokenTensor`'s debug-only synchronous
+    /// per-layer branch) must have already ensured the command buffer
+    /// that encoded the routing dispatch has completed — this performs
+    /// no synchronization of its own, matching `LogitMarginDebug`'s
+    /// "caller guarantees host-readable" precondition. Returns `nil`
+    /// when the flag is off, this layer hasn't routed yet this call (a
+    /// dense FFN layer, or a decode branch that predates the stash
+    /// sites), or the scratch shapes don't line up.
+    public func debugRouterSnapshot() -> (indices: [Int], scores: [Float])? {
+        guard RouterSetsDebug.enabled,
+            let idxT = routerIndicesScratch,
+            let logitsT = debugRouterLogits,
+            let biasT = debugRouterBias
+        else { return nil }
+        let indices = idxT.toArray(as: UInt32.self).map { Int($0) }
+        let logits = logitsT.toFloatArray()
+        let bias = biasT.toFloatArray()
+        let scores: [Float] = indices.map { id in
+            guard id >= 0, id < logits.count, id < bias.count else { return .nan }
+            let sig: Float = 1.0 / (1.0 + exp(-logits[id]))
+            return sig + bias[id]
+        }
+        return (indices, scores)
+    }
     /// Optional row-concat [gate; up] NVFP4 banks for fused shared SwiGLU.
     private var fusedSharedGateUpWeight: Tensor?
     private var fusedSharedGateUpScales: Tensor?
@@ -3844,6 +3882,10 @@ public final class MoELayer: Module, DecoderLayer {
             biasedScoreScratch = Tensor.empty(shape: [nExperts], dtype: scoreDt, device: device)
         }
 
+        if RouterSetsDebug.enabled {
+            debugRouterLogits = logitsTensor
+            debugRouterBias = expertBiasGPU
+        }
         let unbiased = Ops.sigmoid(logitsTensor, on: cmd, into: unbiasedScoreScratch!)
         let biased = Ops.add(unbiased, expertBiasGPU, on: cmd, into: biasedScoreScratch!)
         Ops.moeRouterTopKBiased(
@@ -3940,6 +3982,10 @@ public final class MoELayer: Module, DecoderLayer {
                 Tensor.empty(shape: [hidden], dtype: h.dtype, device: device))
         }
 
+        if RouterSetsDebug.enabled {
+            debugRouterLogits = logitsTensor
+            debugRouterBias = expertBiasGPU
+        }
         let unbiased = Ops.sigmoid(logitsTensor, on: cmd, into: unbiasedScoreScratch!)
         let biased = Ops.add(unbiased, expertBiasGPU, on: cmd, into: biasedScoreScratch!)
         Ops.moeRouterTopKBiased(
@@ -4118,6 +4164,10 @@ public final class MoELayer: Module, DecoderLayer {
         nExperts: Int, topK: Int, scoreDt: DType,
         cmd: MTLCommandBuffer, device: Device
     ) {
+        if RouterSetsDebug.enabled {
+            debugRouterLogits = logitsTensor
+            debugRouterBias = expertBiasGPU
+        }
         let scale = router.routedScalingFactor
         // W31: bit-exact single-dispatch fusion, checked first — see
         // `LagunaRouterTop8Fuse.swift`. Takes priority over the older
