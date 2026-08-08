@@ -74,15 +74,28 @@ enum LagunaNvfp4ExpertGather {
     /// violates the kernel's "indices sorted ascending" contract and is
     /// the caller's responsibility (MoELayer guarantees it by
     /// construction; the lever tests pin the equivalence).
+    ///   * `BUTTER_LAGUNA_V2_FUSED_SILU=1` — SiLU·mul fused into the
+    ///     scatter-back. The base chain runs [2 invPerm output copies
+    ///     + a separate `Ops.swiglu` dispatch] between the gate/up GEMMs
+    ///     and the down GEMM; all three are elementwise passes over the
+    ///     same `[mTotal, 512]` pair, so one kernel does
+    ///     `inner[m] = bf16(silu(g[ip[m]]) · u[ip[m]])` in a single
+    ///     read-modify-write (fusing SiLU into the GEMM epilogue itself
+    ///     was previously found to lose to occupancy pressure — but the
+    ///     scatter is elementwise, so fusion there is free). The f32
+    ///     math reproduces the generated `iron_swiglu_bf16` expression
+    ///     exactly (`x / (1 + exp(-x))`), so the store is bit-identical.
     struct Levers {
         var skipSort: Bool
-        var any: Bool { skipSort }
+        var fusedSilu: Bool = false
+        var any: Bool { skipSort || fusedSilu }
     }
 
     static var levers: Levers {
         let env = ProcessInfo.processInfo.environment
         return Levers(
-            skipSort: env["BUTTER_LAGUNA_V2_SKIP_SORT"] == "1")
+            skipSort: env["BUTTER_LAGUNA_V2_SKIP_SORT"] == "1",
+            fusedSilu: env["BUTTER_LAGUNA_V2_FUSED_SILU"] == "1")
     }
 
     /// Same MPP capability gate as every other `matmul2d` kernel here.
@@ -186,6 +199,77 @@ enum LagunaNvfp4ExpertGather {
         let tgH = min(hidden, 16)
         enc.dispatchThreads(
             MTLSize(width: mTotal, height: hidden, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: tgW, height: tgH, depth: 1))
+        enc.endEncoding()
+    }
+
+    // MARK: - Fused SiLU·mul scatter-back (lever 2)
+
+    nonisolated(unsafe) private static var siluScatterBf16PSO: MTLComputePipelineState?
+    private static let siluScatterLock = NSLock()
+
+    /// One pass replacing [gather(ip)→gate, gather(ip)→up, swiglu]:
+    /// `inner[m, :] = bf16(silu(gs[ip[m], :]) · us[ip[m], :])`.
+    /// `ip` is the invPerm scatter order (identity buffer on the
+    /// skipSort path). f32 math matches the generated
+    /// `iron_swiglu_bf16` bit-for-bit (`x / (1 + exp(-x))`), pinned by
+    /// the lever test suite's byte-identity bar.
+    private static func siluScatter(
+        gs: Tensor, us: Tensor, ip: Tensor,
+        mTotal: Int, dimN: Int,
+        on cmd: MTLCommandBuffer, into inner: Tensor
+    ) {
+        precondition(gs.dtype == .bf16 && us.dtype == .bf16 && inner.dtype == .bf16)
+        precondition(ip.dtype == .u32)
+        siluScatterLock.lock()
+        let pso: MTLComputePipelineState = {
+            if let p = siluScatterBf16PSO { return p }
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void butter_v2_silu_scatter_bf16(
+                device const bfloat *gs [[buffer(0)]],
+                device const bfloat *us [[buffer(1)]],
+                device const uint *ip [[buffer(2)]],
+                device bfloat *inner [[buffer(3)]],
+                constant uint &dimN [[buffer(4)]],
+                constant uint &m_total [[buffer(5)]],
+                uint2 gid [[thread_position_in_grid]]
+            ) {
+                uint m = gid.x;
+                uint d = gid.y;
+                if (m >= m_total || d >= dimN) return;
+                uint s = ip[m];
+                float g = float(gs[s * dimN + d]);
+                float u = float(us[s * dimN + d]);
+                // Bit-exact clone of generated iron_swiglu_bf16:
+                // silu(x) = x / (1 + exp(-x)) in f32, bf16 store.
+                float sv = g / (1.0f + exp(-g));
+                inner[m * dimN + d] = bfloat(sv * u);
+            }
+            """
+            let dev = Device.shared.mtlDevice
+            let lib = try! dev.makeLibrary(source: src, options: MTLCompileOptions())
+            let fn = lib.makeFunction(name: "butter_v2_silu_scatter_bf16")!
+            let p = try! dev.makeComputePipelineState(function: fn)
+            siluScatterBf16PSO = p
+            return p
+        }()
+        siluScatterLock.unlock()
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(gs.buffer, offset: gs.offset, index: 0)
+        enc.setBuffer(us.buffer, offset: us.offset, index: 1)
+        enc.setBuffer(ip.buffer, offset: ip.offset, index: 2)
+        enc.setBuffer(inner.buffer, offset: inner.offset, index: 3)
+        var dU = UInt32(dimN)
+        var mU = UInt32(mTotal)
+        enc.setBytes(&dU, length: 4, index: 4)
+        enc.setBytes(&mU, length: 4, index: 5)
+        let tgW = min(mTotal, 16)
+        let tgH = min(dimN, 16)
+        enc.dispatchThreads(
+            MTLSize(width: mTotal, height: dimN, depth: 1),
             threadsPerThreadgroup: MTLSize(width: tgW, height: tgH, depth: 1))
         enc.endEncoding()
     }
@@ -379,7 +463,6 @@ enum LagunaNvfp4ExpertGather {
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
         precondition(levers.any, "lever chain entered with no lever active")
-        precondition(levers.skipSort, "gateUpChain currently requires the skipSort lever")
         precondition(hRows.dtype == .bf16 && gateOut.dtype == .bf16 && upOut.dtype == .bf16)
         precondition(srcTok.dtype == .u32 && srcTok.elementCount == mTotal)
         precondition(indices.dtype == .u32 && indices.elementCount == mTotal)
@@ -390,32 +473,84 @@ enum LagunaNvfp4ExpertGather {
         let nExperts = gateWeight.shape[0]
         precondition(mTotal <= 65536, "16-step binary search bound")
 
-        // Sorted f16 A with the 64-row padding contract (see header).
+        // ── Stage A: A-operand staging (f16, padded, plan order) ──
         let sortedInBuf = device.intermediateScratch(
             tag: "nvfp4_xg_in_\(kIn)", minBytes: (mTotal + 64) * kIn * 2)
         let sortedIn = Tensor(
             buffer: sortedInBuf, offset: 0, shape: [mTotal, kIn], dtype: .f16)
-        // One pass: token-table row fetch + bf16→f16 cast, in plan order.
-        gatherCastBf16ToF16(
-            table: hRows, tokenIds: srcTok, mTotal: mTotal, hidden: kIn,
-            on: cmd, into: sortedIn)
+        var sortInfo: RowSort? = nil
+        if levers.skipSort {
+            // One pass: token-table fetch + bf16→f16 cast, in plan order.
+            gatherCastBf16ToF16(
+                table: hRows, tokenIds: srcTok, mTotal: mTotal, hidden: kIn,
+                on: cmd, into: sortedIn)
+        } else {
+            // Replicate the wave-6 chain: bf16 materialise gather +
+            // local k=1 sort (identity on this path) + sort-order cast.
+            let gBuf = device.intermediateScratch(
+                tag: "nvfp4_xg_gathered_\(kIn)", minBytes: mTotal * kIn * 2)
+            let gathered = Tensor(
+                buffer: gBuf, offset: 0, shape: [mTotal, kIn], dtype: .bf16)
+            _ = Ops.gather(table: hRows, tokenIds: srcTok, on: cmd, into: gathered)
+            let s = sortRowsByExpert(indices: indices, mTotal: mTotal, on: cmd, device: device)
+            sortInfo = s
+            gatherCastBf16ToF16(
+                table: gathered, tokenIds: s.sourceRows, mTotal: mTotal, hidden: kIn,
+                on: cmd, into: sortedIn)
+        }
+        let se = sortInfo?.sortedExperts ?? indices
 
+        // ── Stage B: concurrent GEMM pair ──
+        // Direct writes are only valid when no scatter/fusion follows.
+        let gemmDirect = levers.skipSort && !levers.fusedSilu
+        let dest0: Tensor
+        let dest1: Tensor
+        if gemmDirect {
+            dest0 = gateOut
+            dest1 = upOut
+        } else {
+            let s0Buf = device.intermediateScratch(
+                tag: "nvfp4_xg_out0_\(nOut)", minBytes: mTotal * nOut * 2)
+            let s1Buf = device.intermediateScratch(
+                tag: "nvfp4_xg_out1_\(nOut)", minBytes: mTotal * nOut * 2)
+            dest0 = Tensor(buffer: s0Buf, offset: 0, shape: [mTotal, nOut], dtype: .bf16)
+            dest1 = Tensor(buffer: s1Buf, offset: 0, shape: [mTotal, nOut], dtype: .bf16)
+        }
         let pso = PSOCache.shared.pipelineState(for: kernelName(kIn: kIn))
         guard let enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) else {
             fatalError("LagunaNvfp4ExpertGather.gateUpChain: could not make compute encoder")
         }
         encode(
             enc, pso: pso, x: sortedIn, weight: gateWeight, scales: gateScales,
-            sortedExperts: indices, out: gateOut,
+            sortedExperts: se, out: dest0,
             mTotal: mTotal, nOut: nOut, nExperts: nExperts,
             blockSize: blockSize, global: global)
         encode(
             enc, pso: pso, x: sortedIn, weight: upWeight, scales: upScales,
-            sortedExperts: indices, out: upOut,
+            sortedExperts: se, out: dest1,
             mTotal: mTotal, nOut: nOut, nExperts: nExperts,
             blockSize: blockSize, global: global)
         enc.endEncoding()
 
+        // ── Stage C: scatter-back + SiLU·mul ──
+        if levers.fusedSilu {
+            let ip: Tensor
+            if let s = sortInfo {
+                ip = s.invPerm
+            } else {
+                let idBuf = Ops.identityRowsBuffer(minCount: mTotal, device: device)
+                ip = Tensor(buffer: idBuf, offset: 0, shape: [mTotal], dtype: .u32)
+            }
+            siluScatter(
+                gs: dest0, us: dest1, ip: ip,
+                mTotal: mTotal, dimN: nOut, on: cmd, into: gateOut)
+            return gateOut
+        }
+        if !gemmDirect {
+            // Replicate the wave-6 scatter-back (identity copies here).
+            _ = Ops.gather(table: dest0, tokenIds: sortInfo!.invPerm, on: cmd, into: gateOut)
+            _ = Ops.gather(table: dest1, tokenIds: sortInfo!.invPerm, on: cmd, into: upOut)
+        }
         return Ops.swiglu(gate: gateOut, up: upOut, on: cmd, into: gateOut)
     }
 
@@ -430,12 +565,12 @@ enum LagunaNvfp4ExpertGather {
         on cmd: MTLCommandBuffer, device: Device,
         into out: Tensor
     ) {
-        precondition(levers.skipSort, "downChain currently requires the skipSort lever")
+        precondition(levers.any, "lever chain entered with no lever active")
         callGather(
             input: inner, weight: weight, scales: scales, indices: indices,
             mTotal: mTotal, nOut: nOut, kIn: kIn,
             blockSize: blockSize, global: global,
-            sortedIndices: true,
+            sortedIndices: levers.skipSort,
             on: cmd, device: device, into: out)
     }
 }

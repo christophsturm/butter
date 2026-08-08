@@ -250,6 +250,139 @@ struct LagunaExpertGatherLeverTests {
         expectByteIdentical(refDown, levDown, "skipSort chain down")
     }
 
+    // MARK: - Lever 2: fused SiLU·mul in the scatter-back
+
+    /// Reference chain (wave-6 V2 semantics) built from public pieces;
+    /// returns (inner, up, down) for byte-comparison.
+    private func referenceChain(
+        _ fx: Fixture, nOut: Int, kIn: Int
+    ) -> (inner: Tensor, up: Tensor, down: Tensor) {
+        let device = fx.device
+        let refGate = emptyBf16([fx.mTotal, nOut], device)
+        let refUp = emptyBf16([fx.mTotal, nOut], device)
+        let refDown = emptyBf16([fx.mTotal, kIn], device)
+        let cmd = device.makeCommandBuffer()
+        let gathered = Ops.gather(table: fx.hRows, tokenIds: fx.srcTok, on: cmd)
+        LagunaNvfp4ExpertGather.callGatherPair(
+            input: gathered,
+            weight0: fx.weight, scales0: fx.scales, out0: refGate,
+            weight1: fx.weight2, scales1: fx.scales2, out1: refUp,
+            indices: fx.indices,
+            mTotal: fx.mTotal, nOut: nOut, kIn: kIn,
+            on: cmd, device: device)
+        let refInner = Ops.swiglu(gate: refGate, up: refUp, on: cmd, into: refGate)
+        LagunaNvfp4ExpertGather.callGather(
+            input: refInner, weight: fx.weight, scales: fx.scales, indices: fx.indices,
+            mTotal: fx.mTotal, nOut: kIn, kIn: nOut,
+            on: cmd, device: device, into: refDown)
+        cmd.commit(); cmd.waitUntilCompleted()
+        return (refInner, refUp, refDown)
+    }
+
+    private func leverChain(
+        _ fx: Fixture, nOut: Int, kIn: Int,
+        levers: LagunaNvfp4ExpertGather.Levers
+    ) -> (inner: Tensor, down: Tensor) {
+        let device = fx.device
+        let levGate = emptyBf16([fx.mTotal, nOut], device)
+        let levUp = emptyBf16([fx.mTotal, nOut], device)
+        let levDown = emptyBf16([fx.mTotal, kIn], device)
+        let cmd = device.makeCommandBuffer()
+        let inner = LagunaNvfp4ExpertGather.gateUpChain(
+            hRows: fx.hRows, srcTok: fx.srcTok, indices: fx.indices,
+            gateWeight: fx.weight, gateScales: fx.scales,
+            upWeight: fx.weight2, upScales: fx.scales2,
+            gateOut: levGate, upOut: levUp,
+            mTotal: fx.mTotal, nOut: nOut, kIn: kIn,
+            blockSize: 16, global: 1.0,
+            levers: levers, on: cmd, device: device)
+        LagunaNvfp4ExpertGather.downChain(
+            inner: inner, indices: fx.indices,
+            weight: fx.weight, scales: fx.scales,
+            mTotal: fx.mTotal, nOut: kIn, kIn: nOut,
+            blockSize: 16, global: 1.0,
+            levers: levers, on: cmd, device: device, into: levDown)
+        cmd.commit(); cmd.waitUntilCompleted()
+        #expect(cmd.status == .completed)
+        return (inner, levDown)
+    }
+
+    @Test("fusedSilu chain is byte-identical to the wave-6 chain (with and without skipSort)")
+    func fusedSiluByteIdentical() throws {
+        guard mppAvailable else { return }
+        let kIn = 2048, nOut = 512
+        let fx = try makeFixture(kIn: kIn, nOut: nOut)
+        let ref = referenceChain(fx, nOut: nOut, kIn: kIn)
+
+        // fusedSilu alone (skipSort off → internal identity re-sort).
+        let alone = leverChain(
+            fx, nOut: nOut, kIn: kIn,
+            levers: .init(skipSort: false, fusedSilu: true))
+        expectByteIdentical(ref.inner, alone.inner, "fusedSilu-alone inner")
+        expectByteIdentical(ref.down, alone.down, "fusedSilu-alone down")
+
+        // fusedSilu + skipSort stacked.
+        let stacked = leverChain(
+            fx, nOut: nOut, kIn: kIn,
+            levers: .init(skipSort: true, fusedSilu: true))
+        expectByteIdentical(ref.inner, stacked.inner, "fusedSilu+skipSort inner")
+        expectByteIdentical(ref.down, stacked.down, "fusedSilu+skipSort down")
+    }
+
+    @Test("mutation check: dropping the SiLU factor must change the inner bytes")
+    func fusedSiluMutationCheck() throws {
+        guard mppAvailable else { return }
+        let kIn = 2048, nOut = 512
+        let fx = try makeFixture(kIn: kIn, nOut: nOut)
+        // Raw gate/up GEMM outputs (no SwiGLU): the pair call scattered
+        // into gate/up targets, un-SwiGLU'd.
+        let device = fx.device
+        let rawGate = emptyBf16([fx.mTotal, nOut], device)
+        let rawUp = emptyBf16([fx.mTotal, nOut], device)
+        let cmd = device.makeCommandBuffer()
+        let gathered = Ops.gather(table: fx.hRows, tokenIds: fx.srcTok, on: cmd)
+        LagunaNvfp4ExpertGather.callGatherPair(
+            input: gathered,
+            weight0: fx.weight, scales0: fx.scales, out0: rawGate,
+            weight1: fx.weight2, scales1: fx.scales2, out1: rawUp,
+            indices: fx.indices,
+            mTotal: fx.mTotal, nOut: nOut, kIn: kIn,
+            on: cmd, device: device)
+        cmd.commit(); cmd.waitUntilCompleted()
+
+        // A silu-less mutant would produce plain g·u. Verify the fused
+        // path's output differs from that on a large fraction of
+        // elements — i.e. this suite HAS the power to catch a dropped
+        // SiLU (the byte-identity tests above then pin the real math).
+        let fused = leverChain(
+            fx, nOut: nOut, kIn: kIn,
+            levers: .init(skipSort: true, fusedSilu: true))
+        let g = bytesU16(rawGate)
+        let u = bytesU16(rawUp)
+        let inner = bytesU16(fused.inner)
+        var mulOnlyMatches = 0
+        for i in 0 ..< inner.count {
+            let gf = Float(bitPattern: UInt32(g[i]) << 16)
+            let uf = Float(bitPattern: UInt32(u[i]) << 16)
+            // bf16 RNE of the silu-less product.
+            let prod = gf * uf
+            var bits = prod.bitPattern
+            let lsb = (bits >> 16) & 1
+            bits = bits &+ 0x7FFF &+ lsb
+            if UInt16(truncatingIfNeeded: bits >> 16) == inner[i] { mulOnlyMatches += 1 }
+        }
+        // Zeros match trivially (0·u == silu(0)·u == 0 at bf16) and the
+        // synthetic NVFP4 banks produce many exact-zero products, so
+        // don't demand a majority — demand a LARGE ABSOLUTE disagreement
+        // (a silu-less mutant flips ≥20% of all elements, far beyond any
+        // rounding-level fluke), which is what gives the byte-identity
+        // tests above their power against a dropped SiLU.
+        let differing = inner.count - mulOnlyMatches
+        #expect(
+            differing > inner.count / 5,
+            "only \(differing)/\(inner.count) elements differ from the silu-less mutant — mutation would go undetected")
+    }
+
     @Test("moeSortPlan over already-sorted plan ids is the identity (skipSort premise)")
     func sortPlanIdentityPremise() throws {
         guard mppAvailable else { return }
