@@ -1,6 +1,6 @@
 // Copyright 2026 Tom Turney (@TheTom)
 //
-// W6 follow-on lever gate for `LagunaNvfp4ExpertGather` — the
+// Follow-on lever gate for `LagunaNvfp4ExpertGather` — the
 // scaffolding-removal levers stacked on the endgame expert-aligned
 // gather QMM (`BUTTER_LAGUNA_GATHER_V2` path):
 //
@@ -12,7 +12,7 @@
 //                   reads it device-direct with no cast pass.
 //
 // THE BAR IS BYTE-IDENTITY, not cosine: every lever is a pure
-// scaffolding removal and must reproduce the wave-6 V2 chain's output
+// scaffolding removal and must reproduce the base V2 chain's output
 // bits exactly (the full-model convergence gate — identical greedy
 // token streams — rests on this). Tests follow the sibling suites'
 // idioms (LagunaMppGatherTests.swift): synthetic NVFP4 weights, sorted
@@ -25,7 +25,7 @@ import Testing
 @testable import ButterSwift
 import IronSwift
 
-@Suite("LagunaNvfp4ExpertGather W6 follow-on levers", .serialized)
+@Suite("LagunaNvfp4ExpertGather follow-on levers", .serialized)
 struct LagunaExpertGatherLeverTests {
     private var mppAvailable: Bool { Ops.mppAutoCapable }
 
@@ -192,7 +192,7 @@ struct LagunaExpertGatherLeverTests {
         }
     }
 
-    @Test("gateUpChain(skipSort) + downChain match the wave-6 V2 reference chain byte-exactly")
+    @Test("gateUpChain(skipSort) + downChain match the base V2 reference chain byte-exactly")
     func skipSortChainByteIdentical() throws {
         guard mppAvailable else { return }
         let kIn = 2048, nOut = 512
@@ -200,7 +200,7 @@ struct LagunaExpertGatherLeverTests {
         let device = fx.device
         let levers = LagunaNvfp4ExpertGather.Levers(skipSort: true)
 
-        // Reference: exactly what the wave-6 fused-gateup branch does —
+        // Reference: exactly what the base fused-gateup branch does —
         // materialise gather, V2 pair (internal identity re-sort +
         // scatter-back), separate SwiGLU, V2 down (identity re-sort).
         let refGate = emptyBf16([fx.mTotal, nOut], device)
@@ -252,7 +252,7 @@ struct LagunaExpertGatherLeverTests {
 
     // MARK: - Lever 2: fused SiLU·mul in the scatter-back
 
-    /// Reference chain (wave-6 V2 semantics) built from public pieces;
+    /// Reference chain (base V2 semantics) built from public pieces;
     /// returns (inner, up, down) for byte-comparison.
     private func referenceChain(
         _ fx: Fixture, nOut: Int, kIn: Int
@@ -307,7 +307,7 @@ struct LagunaExpertGatherLeverTests {
         return (inner, levDown)
     }
 
-    @Test("fusedSilu chain is byte-identical to the wave-6 chain (with and without skipSort)")
+    @Test("fusedSilu chain is byte-identical to the base chain (with and without skipSort)")
     func fusedSiluByteIdentical() throws {
         guard mppAvailable else { return }
         let kIn = 2048, nOut = 512
@@ -381,6 +381,112 @@ struct LagunaExpertGatherLeverTests {
         #expect(
             differing > inner.count / 5,
             "only \(differing)/\(inner.count) elements differ from the silu-less mutant — mutation would go undetected")
+    }
+
+    // MARK: - Lever 3: f16-native down input
+
+    /// Exact bf16→f16 conversion with the gatherCastBf16ToF16 clamp —
+    /// this is the CPU mirror of what the deleted cast pass does, used
+    /// to check the f16 inner against the bf16 reference inner.
+    private func bf16BitsToF16Bits(_ b: UInt16) -> UInt16 {
+        let f = Float(bitPattern: UInt32(b) << 16)
+        let c = max(-65504.0, min(65504.0, f))
+        return Float16(c).bitPattern
+    }
+
+    @Test("f16Inner chain is byte-identical to the base chain (alone and stacked)")
+    func f16InnerByteIdentical() throws {
+        guard mppAvailable else { return }
+        let kIn = 2048, nOut = 512
+        let fx = try makeFixture(kIn: kIn, nOut: nOut)
+        let ref = referenceChain(fx, nOut: nOut, kIn: kIn)
+        let refInnerBytes = bytesU16(ref.inner)
+
+        let combos: [(String, LagunaNvfp4ExpertGather.Levers)] = [
+            ("f16Inner-alone", .init(skipSort: false, fusedSilu: false, f16Inner: true)),
+            ("f16Inner+skipSort", .init(skipSort: true, fusedSilu: false, f16Inner: true)),
+            ("f16Inner+fusedSilu", .init(skipSort: false, fusedSilu: true, f16Inner: true)),
+            ("all-three", .init(skipSort: true, fusedSilu: true, f16Inner: true)),
+        ]
+        for (label, levers) in combos {
+            let lev = leverChain(fx, nOut: nOut, kIn: kIn, levers: levers)
+            // Down output is the chain's contract — must be bit-exact.
+            expectByteIdentical(ref.down, lev.down, "\(label) down")
+            // The f16 inner must equal the exact bf16→f16(+clamp) image
+            // of the reference bf16 inner (the deleted cast's output).
+            #expect(lev.inner.dtype == .f16, "\(label): inner must be f16")
+            let innerBytes = bytesU16(lev.inner)
+            var diffs = 0
+            var firstDiff = -1
+            for i in 0 ..< innerBytes.count
+            where innerBytes[i] != bf16BitsToF16Bits(refInnerBytes[i]) {
+                if firstDiff < 0 { firstDiff = i }
+                diffs += 1
+            }
+            let msg = "\(label): f16 inner deviates from the exact cast image "
+                + "on \(diffs) elements (first at \(firstDiff))"
+            #expect(diffs == 0, Comment(rawValue: msg))
+        }
+    }
+
+    @Test("f16 inner range safety: finite at 10x the measured |inner| bound, clamped at the half ceiling")
+    func f16InnerRangeSafety() throws {
+        guard mppAvailable else { return }
+        // Measured Laguna inner activation bound: |silu(g)*u| ~ 800
+        // (T23 calibration; see the kernel module docs). This test
+        // drives the f16 store at >= 10x that (8000+) and past the half
+        // ceiling (65504) to pin the saturating clamp — 80x documented
+        // headroom between measured reality and the clamp.
+        let device = Device.shared
+        let mTotal = 64
+        let dimN = 64
+        func bf16Tensor(_ vals: [Float]) -> Tensor {
+            let bits = vals.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+            let buf = device.makeBuffer(length: bits.count * 2)
+            bits.withUnsafeBytes { _ = memcpy(buf.contents(), $0.baseAddress!, bits.count * 2) }
+            return Tensor(buffer: buf, offset: 0, shape: [mTotal, dimN], dtype: .bf16)
+        }
+        // g = 15 → silu(g) ≈ g; u sweeps ±(1 … 5000) → products up to
+        // ~±75000: covers the 8000-class range AND the clamp region.
+        var gVals = [Float](), uVals = [Float]()
+        for i in 0 ..< mTotal * dimN {
+            gVals.append(15.0)
+            let mag = 1.0 + Float(i % 100) * 50.0  // 1 … 4951
+            uVals.append(i % 2 == 0 ? mag : -mag)
+        }
+        let gs = bf16Tensor(gVals)
+        let us = bf16Tensor(uVals)
+        let idBuf = Ops.identityRowsBuffer(minCount: mTotal, device: device)
+        let ip = Tensor(buffer: idBuf, offset: 0, shape: [mTotal], dtype: .u32)
+
+        let innerB = emptyBf16([mTotal, dimN], device)
+        let innerFBuf = device.makeBuffer(length: (mTotal + 64) * dimN * 2)
+        let innerF = Tensor(buffer: innerFBuf, offset: 0, shape: [mTotal, dimN], dtype: .f16)
+        let cmd = device.makeCommandBuffer()
+        LagunaNvfp4ExpertGather.siluScatter(
+            gs: gs, us: us, ip: ip, mTotal: mTotal, dimN: dimN, on: cmd, into: innerB)
+        LagunaNvfp4ExpertGather.siluScatter(
+            gs: gs, us: us, ip: ip, mTotal: mTotal, dimN: dimN, on: cmd, into: innerF)
+        cmd.commit(); cmd.waitUntilCompleted()
+        #expect(cmd.status == .completed)
+
+        let bBytes = bytesU16(innerB)
+        let fBytes = bytesU16(innerF)
+        var maxAbs: Float = 0
+        var clamped = 0
+        var mismatches = 0
+        for i in 0 ..< fBytes.count {
+            let f16v = Float(Float16(bitPattern: fBytes[i]))
+            #expect(f16v.isFinite, "f16 inner produced non-finite at \(i)")
+            maxAbs = max(maxAbs, abs(f16v))
+            if abs(f16v) == 65504.0 { clamped += 1 }
+            // The f16 store must be the exact cast image of the bf16
+            // store (no independent rounding path).
+            if fBytes[i] != bf16BitsToF16Bits(bBytes[i]) { mismatches += 1 }
+        }
+        #expect(mismatches == 0, "f16 store deviates from the bf16 cast image on \(mismatches) elements")
+        #expect(maxAbs >= 8000.0, "range test never reached 10x the measured bound (max |v| = \(maxAbs))")
+        #expect(clamped > 0, "clamp region never exercised")
     }
 
     @Test("moeSortPlan over already-sorted plan ids is the identity (skipSort premise)")
