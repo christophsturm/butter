@@ -711,6 +711,18 @@ extension Model {
                 let seedNow = Date()
                 perTokenWallclock.append(seedNow.timeIntervalSince(lastStep))
                 lastStep = seedNow
+                // The seed token SITS at `pos`: prefill consumed the
+                // prompt through pos-1 and sampled the seed as the
+                // token at `pos`. The chained loop's first forward must
+                // therefore process the seed AT `pos` (its RoPE angle,
+                // its KV slot) — exactly like the host branch below,
+                // which calls sampleNext(position: pos) BEFORE
+                // incrementing. Capture that before the display
+                // bookkeeping bumps `pos`, or the whole chained stream
+                // runs one position late (butter#108: wrong RoPE +
+                // KV written to slot pos+1 leaving slot pos stale —
+                // observably different logits from layer 0 onward).
+                let seedPosition = pos
                 pos += 1
 
                 // W35: under the non-blocking decode window
@@ -742,7 +754,7 @@ extension Model {
                     _ = try profile.signpost("decode_gpu_loop") {
                         try GpuTokenLoop.runGPU(
                             engine: engine, seedToken: nextToken,
-                            startPosition: pos, caches: caches,
+                            startPosition: seedPosition, caches: caches,
                             remainingBudget: remainingBudget,
                             stopSet: stopSet, device: Device.shared,
                             lag: gpuLoopLag
