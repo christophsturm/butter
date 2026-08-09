@@ -385,7 +385,12 @@ struct GenerateCommand: AsyncParsableCommand {
         // timing OFF) decode tok/s via BUTTER_LAGUNA_DECODE_REAL_TOKS for
         // the share-projection column; omit it to see raw forced-sync
         // numbers only.
-        if LagunaDecodeKernelTiming.enabled {
+        // The per-N-token probe (BUTTER_LAGUNA_DECODE_PROBE=N, see
+        // GpuTokenLoop) toggles the KERNEL_TIMING var around each probe
+        // token, so also gate the report on the probe var itself.
+        let decodeProbeOn =
+            (Int(ButterEnv["BUTTER_LAGUNA_DECODE_PROBE"] ?? "") ?? 0) > 0
+        if LagunaDecodeKernelTiming.enabled || decodeProbeOn {
             let realUsPerToken: Double?
             if let realToks = ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DECODE_REAL_TOKS"]
                 .flatMap(Double.init), realToks > 0

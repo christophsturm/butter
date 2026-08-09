@@ -238,10 +238,52 @@ extension GpuTokenLoop {
         // done) has already run.
         let resolvedSem = (0 ..< ringSize).map { _ in DispatchSemaphore(value: 0) }
 
+        // `BUTTER_LAGUNA_DECODE_PROBE=N` — every Nth chained token runs as
+        // a forced-sync, phase-instrumented token through the T39
+        // `LagunaDecodeKernelTiming` checkpoint machinery, while every
+        // other token keeps the normal pipelined path at full speed. This
+        // is the decode analog of the prefill phase probes, which the
+        // default GPU token loop bypasses entirely: sampling 1-in-N keeps
+        // the run representative (steady-state pipelined
+        // decode between probes) instead of collapsing the whole run to
+        // forced-sync like BUTTER_LAGUNA_DECODE_KERNEL_TIMING=1 does.
+        //
+        // Mechanics per probe token:
+        //   1. drain: wait on the previous token's outer CB — every CB of
+        //      every earlier token was committed (single caller thread)
+        //      before this launch and the queue is FIFO, so this drains
+        //      ALL in-flight work. The probe token therefore soaks no
+        //      prior-phase tail (the §6.4 drain-contamination trap is
+        //      handled by construction, not by discarding first buckets).
+        //   2. flip `BUTTER_LAGUNA_DECODE_KERNEL_TIMING` on via setenv for
+        //      exactly this token — `LagunaDecodeKernelTiming.enabled` is
+        //      a LIVE getenv read, so the per-layer attn/moe/embed
+        //      checkpoints inside `forwardFromTokenTensor` fire for this
+        //      token only; the final norm + lm_head + argmax on the outer
+        //      CB is recorded here as `lmhead_argmax_chain`.
+        //   3. restore the env and resume the pipelined loop.
+        //
+        // Zero-cost off: when the var is unset/0 the per-launch cost is
+        // one Int compare. No-op when full-run KERNEL_TIMING=1 is already
+        // on (that mode owns the flag). setenv mid-run is a diagnostics-
+        // only concession (theoretical race with concurrent getenv on
+        // other threads); never on unless the probe var is exported.
+        let probeEveryN = max(0, Int(ButterEnv["BUTTER_LAGUNA_DECODE_PROBE"] ?? "") ?? 0)
+        let fullRunTimingOn = LagunaDecodeKernelTiming.enabled
+        var lastOuterCmd: MTLCommandBuffer?
+
         func launch(_ tokenIndex: Int) {
             let inputSlot = schedule.slot(forToken: tokenIndex - 1)
             let outputSlot = schedule.slot(forToken: tokenIndex)
             let position = startPosition + tokenIndex - 1
+            let probing =
+                probeEveryN > 0 && !fullRunTimingOn
+                && tokenIndex % probeEveryN == 0
+            if probing {
+                lastOuterCmd?.waitUntilCompleted()
+                setenv("BUTTER_LAGUNA_DECODE_KERNEL_TIMING", "1", 1)
+                LagunaDecodeKernelTiming.beginToken()
+            }
             let cmd = device.makeCommandBuffer()
             let logits = engine.forward(
                 tokenIdBuffer: ringBuffers[inputSlot], position: position,
@@ -251,6 +293,18 @@ extension GpuTokenLoop {
             // can miss the callback if the buffer finishes first.
             let sem = resolvedSem[outputSlot]
             cmd.addCompletedHandler { _ in sem.signal() }
+            if probing {
+                // Commits + waits `cmd` internally and records the bucket;
+                // the completed handler above still fires, so `resolve`
+                // is satisfied exactly as on the normal path.
+                _ = LagunaDecodeKernelTiming.checkpoint(
+                    "lmhead_argmax_chain", cmd: cmd, device: device)
+                LagunaDecodeKernelTiming.endToken()
+                unsetenv("BUTTER_LAGUNA_DECODE_KERNEL_TIMING")
+                lastOuterCmd = cmd
+                return
+            }
+            lastOuterCmd = cmd
             cmd.commit()
             // BUTTER_DEBUG_LOGIT_MARGIN: GPU path, chained-loop arm — the
             // default decode path for engines with GPU token feedback
