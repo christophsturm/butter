@@ -38,7 +38,7 @@ enum LagunaResidualRmsRouterFuse {
     /// this repo's own precedent (`BUTTER_LAGUNA_FUSED_SHARED_SWIGLU`,
     /// `BUTTER_NVFP4_MOE_BM64`) for correct-but-slower kernels.
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_RESIDUAL_RMS_ROUTER"] == "1"
+        ButterEnv["BUTTER_LAGUNA_RESIDUAL_RMS_ROUTER"] == "1"
     }
 
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]

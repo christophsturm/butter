@@ -272,7 +272,7 @@ extension SpecDecode {
         // greedy. BUTTER_QWEN_MTP_ALWAYS_REPLAY=1 forces the replay path
         // on every iteration to isolate that as the divergence source.
         let forceReplay =
-            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_ALWAYS_REPLAY"] == "1"
+            ButterEnv["BUTTER_QWEN_MTP_ALWAYS_REPLAY"] == "1"
         return MTPAcceptPlan(
             committed: committed,
             nextToken: outcome.bonusToken,
@@ -651,7 +651,7 @@ extension SpecDecode {
         var msDraft = 0.0, msVerify = 0.0, msReplay = 0.0
         var msLockstep = 0.0, msSnap = 0.0
         let stateRewind =
-            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_STATE_REWIND"] == "1"
+            ButterEnv["BUTTER_QWEN_MTP_STATE_REWIND"] == "1"
         var rewindSteps = 0
         // BUTTER_GDN_STATE_PLANES=1 — same flag that opts the fused
         // conv+scan kernels into writing per-token state planes (see
@@ -664,19 +664,19 @@ extension SpecDecode {
         // captured for this cycle (e.g. `t` exceeded the plane-eligible
         // cap — see `forwardManyChunked`'s `maxPlaneT`).
         let statePlanes =
-            ProcessInfo.processInfo.environment["BUTTER_GDN_STATE_PLANES"] == "1"
+            ButterEnv["BUTTER_GDN_STATE_PLANES"] == "1"
         var planeSteps = 0
         let batchedReplay =
-            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_BATCHED_REPLAY"] == "1"
+            ButterEnv["BUTTER_QWEN_MTP_BATCHED_REPLAY"] == "1"
         // BUTTER_QWEN_MTP_BATCHED_LOCKSTEP=1: run the post-accept MTP
         // KV re-advance (below) as ONE T-batched `draftStepMany` pass
         // instead of k+1 sequential `draftStep` calls. Off by default;
         // read fresh on every call (no hoisted/cached global) so a
         // per-process env change always takes effect.
         let batchedLockstep =
-            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_BATCHED_LOCKSTEP"] == "1"
+            ButterEnv["BUTTER_QWEN_MTP_BATCHED_LOCKSTEP"] == "1"
         let parityProbe =
-            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_PARITY"] == "1"
+            ButterEnv["BUTTER_QWEN_MTP_PARITY"] == "1"
         var parityChecked = 0
         var parityMismatch = 0
         var parityMismatchMargin = 0.0
@@ -691,7 +691,7 @@ extension SpecDecode {
         // drafter's own top-token probability drops below `pMin` — read
         // fresh every call, no static caching, matching the other
         // env-gated knobs above.
-        let pMinEnv = ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_PMIN"]
+        let pMinEnv = ButterEnv["BUTTER_QWEN_MTP_PMIN"]
         let pMin: Float? = (pMinEnv?.isEmpty == false) ? Float(pMinEnv!) : nil
         // BUTTER_QWEN_MTP_ADAPTIVE=1: adaptive per-cycle draft depth,
         // gated on REALIZED trailing acceptance rather than drafter
@@ -728,14 +728,14 @@ extension SpecDecode {
         // emitted; a greedy exact-match run is gamma-INVARIANT in its
         // output stream by construction).
         let adaptiveEnabled =
-            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_ADAPTIVE"] == "1"
+            ButterEnv["BUTTER_QWEN_MTP_ADAPTIVE"] == "1"
         let adaptWindowEnv =
-            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_ADAPT_WINDOW"]
+            ButterEnv["BUTTER_QWEN_MTP_ADAPT_WINDOW"]
         let adaptWindow =
             (adaptWindowEnv?.isEmpty == false) ? (Int(adaptWindowEnv!) ?? 32) : 32
-        let adaptLoEnv = ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_ADAPT_LO"]
+        let adaptLoEnv = ButterEnv["BUTTER_QWEN_MTP_ADAPT_LO"]
         let adaptLo = (adaptLoEnv?.isEmpty == false) ? (Double(adaptLoEnv!) ?? 0.55) : 0.55
-        let adaptHiEnv = ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_ADAPT_HI"]
+        let adaptHiEnv = ButterEnv["BUTTER_QWEN_MTP_ADAPT_HI"]
         let adaptHi = (adaptHiEnv?.isEmpty == false) ? (Double(adaptHiEnv!) ?? 0.70) : 0.70
         var adaptiveGamma: MTPAdaptiveGamma? =
             adaptiveEnabled
@@ -750,7 +750,7 @@ extension SpecDecode {
         // `SAMPLING_RESEARCH.md` #1. Read fresh every call, matching the
         // other env-gated knobs above; no effect in `.greedy` mode.
         let useRatioAccept =
-            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_ACCEPT"] == "ratio"
+            ButterEnv["BUTTER_QWEN_MTP_ACCEPT"] == "ratio"
         // avgdraft observability (BUTTER_QWEN_MTP_PROF=1 line below):
         // draftCycles counts bursts actually run (excludes the priming
         // iteration, which has no seed hidden and drafts nothing).
@@ -767,7 +767,7 @@ extension SpecDecode {
         // Printed as a single [mtp-accept] stderr line at the end, one
         // field per 64-token bucket.
         let acceptCurve =
-            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_ACCEPT_CURVE"] == "1"
+            ButterEnv["BUTTER_QWEN_MTP_ACCEPT_CURVE"] == "1"
         let acceptCurveBucket = 64
         var bucketProposed: [Int] = []
         var bucketAccepted: [Int] = []
@@ -925,7 +925,7 @@ extension SpecDecode {
                 // apart a numerically broken head (constant/degenerate
                 // draft ids) from a misaligned-but-live one (varied,
                 // confident ids that simply do not match the verifier).
-                if ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_TRACE"] == "1",
+                if ButterEnv["BUTTER_QWEN_MTP_TRACE"] == "1",
                     verifySteps < 6
                 {
                     FileHandle.standardError.write(
@@ -992,7 +992,7 @@ extension SpecDecode {
                 }
                 let batchedBonus = argmax(
                     flat, offset: (rows - 1) * vocab, count: vocab)
-                if ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_TRACE"] == "1",
+                if ButterEnv["BUTTER_QWEN_MTP_TRACE"] == "1",
                     verifySteps <= 6
                 {
                     FileHandle.standardError.write(
@@ -1387,7 +1387,7 @@ extension SpecDecode {
         // Like `generateGreedy`: `prev` is next-iteration input (its KV
         // slot may not be committed); it is NOT appended to `history`.
 
-        if ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_PROF"] == "1" {
+        if ButterEnv["BUTTER_QWEN_MTP_PROF"] == "1" {
             let tot = Date().timeIntervalSince(t0)
             let avgDraft =
                 draftCycles > 0

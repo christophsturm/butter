@@ -51,7 +51,7 @@ import Metal
 
 public enum LagunaDecodeKernelTiming {
     public static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DECODE_KERNEL_TIMING"] == "1"
+        ButterEnv["BUTTER_LAGUNA_DECODE_KERNEL_TIMING"] == "1"
     }
 
     private struct Bucket {

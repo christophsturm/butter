@@ -543,7 +543,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
         // for the layout). Attach it when present; a malformed sidecar
         // logs and degrades to no-MTP rather than failing the whole
         // backbone load. `BUTTER_QWEN_MTP=0` disables the load entirely.
-        if ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP"] != "0" {
+        if ButterEnv["BUTTER_QWEN_MTP"] != "0" {
             let sidecarDir = weights.directory.appendingPathComponent("mtp-sidecar")
             if FileManager.default.fileExists(atPath: sidecarDir.path) {
                 do {
@@ -1692,16 +1692,16 @@ public final class Qwen35GDNMixer: Module {
         // path lives behind `BUTTER_GDN_NO_FUSED_PREP=1` for precision
         // comparison.
         self.fused =
-            ProcessInfo.processInfo.environment["BUTTER_GDN_NO_FUSED_PREP"] == nil
+            ButterEnv["BUTTER_GDN_NO_FUSED_PREP"] == nil
         // See `wyShapeEligible`/`fastPrepChunkEligible` doc above - cached
         // once here instead of read from `forwardManyChunked` on every
         // chunk.
         self.wyShapeEligible =
-            ProcessInfo.processInfo.environment["BUTTER_GDN_WY"] != nil
+            ButterEnv["BUTTER_GDN_WY"] != nil
             && valueHeadDim % 32 == 0 && keyHeadDim % 16 == 0 && valueHeadDim % 16 == 0
         self.fastPrepChunkEligible =
             keyHeadDim == 128 && valueHeadDim == 128 && numValueHeads == 32 && numKeyHeads == 16
-            && ProcessInfo.processInfo.environment["BUTTER_GDN_NO_PREP_CHUNK_FAST"] == nil
+            && ButterEnv["BUTTER_GDN_NO_PREP_CHUNK_FAST"] == nil
 
         // Per-decode-token scratch — pre-allocated once at init so the
         // fused GDN path doesn't pay 6 × MTLBuffer allocations per call.
@@ -1740,7 +1740,7 @@ public final class Qwen35GDNMixer: Module {
                 && convDim % 8 == 0 && valueDim % 8 == 0
                 && numValueHeads % 8 == 0
                 && qQL.groupSize == 64
-                && ProcessInfo.processInfo.environment["BUTTER_NO_FUSED_GDN_4"] == nil
+                && ButterEnv["BUTTER_NO_FUSED_GDN_4"] == nil
             {
                 self.fused4Eligible = true
             }
@@ -2080,7 +2080,7 @@ public final class Qwen35GDNMixer: Module {
         // per-token T-loop body with one `Ops.gatedDeltaPrepChunk`
         // dispatch — state register-resident across the full T-sweep.
         // Opt out via BUTTER_GDN_NO_PREP_CHUNK=1 for A/B benching.
-        if ProcessInfo.processInfo.environment["BUTTER_GDN_NO_PREP_CHUNK"] == nil {
+        if ButterEnv["BUTTER_GDN_NO_PREP_CHUNK"] == nil {
             return forwardManyChunked(
                 xNormFlat, t: t, cache: cache, cmd: cmd, device: device)
         }
@@ -2214,7 +2214,7 @@ public final class Qwen35GDNMixer: Module {
         let bRawAll: Tensor
         let aRawAll: Tensor
         if fused4Eligible, let bp = batchedInputProj,
-            ProcessInfo.processInfo.environment["BUTTER_GDN_BATCHED4_MANY"] == "1"
+            ButterEnv["BUTTER_GDN_BATCHED4_MANY"] == "1"
         {
             let qkvBuf = Tensor.empty(shape: [t, convDim], dtype: dt, device: device)
             let zBuf = Tensor.empty(shape: [t, valueDim], dtype: dt, device: device)
@@ -2301,11 +2301,11 @@ public final class Qwen35GDNMixer: Module {
         let maxPlaneT = 16
         let useConv1dMany =
             convKernel == 4
-            && ProcessInfo.processInfo.environment["BUTTER_NO_CONV1D_MANY"] == nil
+            && ButterEnv["BUTTER_NO_CONV1D_MANY"] == nil
         let gdnPlanesEnabled =
             useConv1dMany
             && t <= maxPlaneT
-            && ProcessInfo.processInfo.environment["BUTTER_GDN_STATE_PLANES"] == "1"
+            && ButterEnv["BUTTER_GDN_STATE_PLANES"] == "1"
         let convStatePlanesBuf: Tensor
         let convPlanesEnabledBuf: Tensor
         let gdnStatePlanesBuf: Tensor
@@ -2515,7 +2515,7 @@ public final class Qwen35GDNMixer: Module {
             let aRawF32All = cache.specARawF32,
             let bRawF32All = cache.specBRawF32,
             convKernel == 4,
-            ProcessInfo.processInfo.environment["BUTTER_NO_CONV1D_MANY"] == nil
+            ButterEnv["BUTTER_NO_CONV1D_MANY"] == nil
         else { return false }
 
         // Prefix views over the stashed rows — same buffers, fewer rows.
@@ -2714,7 +2714,7 @@ public final class Qwen35AttentionMixer: Module {
     private var partialLScratch: Tensor?
     private let sdpa2PassBlocks: Int = 32
     private let sdpa2PassThreshold: Int = {
-        if let raw = ProcessInfo.processInfo.environment["BUTTER_SDPA_2PASS_THRESHOLD"],
+        if let raw = ButterEnv["BUTTER_SDPA_2PASS_THRESHOLD"],
             let n = Int(raw)
         {
             return n
@@ -2758,10 +2758,10 @@ public final class Qwen35AttentionMixer: Module {
         // once here instead of read from `forwardMany` on every call.
         let qtiledD256 =
             headDim == 256
-                && ProcessInfo.processInfo.environment["BUTTER_SDPA_QTILED_D256"] == "1"
+                && ButterEnv["BUTTER_SDPA_QTILED_D256"] == "1"
         let legacyD256 =
             headDim == 256 && !qtiledD256
-                && ProcessInfo.processInfo.environment["BUTTER_SDPA_LEGACY_D256"] == "1"
+                && ButterEnv["BUTTER_SDPA_LEGACY_D256"] == "1"
         self.useQtiledD256Cached = qtiledD256
         self.useMmaD256Cached = headDim == 256 && !legacyD256 && !qtiledD256
         if attnOutputGate {
@@ -2814,7 +2814,7 @@ public final class Qwen35AttentionMixer: Module {
             if inDim % 512 == 0
                 && qDim % 8 == 0 && kDim % 8 == 0 && vDim % 8 == 0
                 && qQL.groupSize == 64
-                && ProcessInfo.processInfo.environment["BUTTER_NO_FUSED_QKV"] == nil
+                && ButterEnv["BUTTER_NO_FUSED_QKV"] == nil
             {
                 self.fusedQKVEligible = true
             }
@@ -3072,7 +3072,7 @@ public final class Qwen35AttentionMixer: Module {
         // MMA `callMany` qmms. BUTTER_FUSED_QKV_PREFILL=1 forces the old
         // routing for A/B.
         let fusedQkvAtPrefill =
-            ProcessInfo.processInfo.environment["BUTTER_FUSED_QKV_PREFILL"] != nil || t <= 8
+            ButterEnv["BUTTER_FUSED_QKV_PREFILL"] != nil || t <= 8
         let qOut: Tensor
         let kOut: Tensor
         let vOut: Tensor
@@ -3973,7 +3973,7 @@ public final class Qwen35Model: LanguageModel {
         // fan from T·gemv to 1·gemm, SDPA from T·sdpaDecode to 1·
         // sdpaMulti, gate-split gather from T to 1. Compounds across
         // every attention layer in the stack.
-        if ProcessInfo.processInfo.environment["BUTTER_LEGACY_FORWARDMANY"] != nil {
+        if ButterEnv["BUTTER_LEGACY_FORWARDMANY"] != nil {
             return _forwardManyPerTokenLegacy(
                 tokenIds: tokenIds,
                 startPosition: startPosition,
@@ -4185,10 +4185,10 @@ public final class Qwen35Model: LanguageModel {
         // GPU windows cover the outer workCmd only — layers that commit
         // internal buffers (MoE FFN paths) undercount slightly.
         let profileLayers =
-            ProcessInfo.processInfo.environment["BUTTER_PROFILE_LAYERS"] == "1"
-                || ProcessInfo.processInfo.environment["BUTTER_PROFILE_LAYERS"] == "2"
+            ButterEnv["BUTTER_PROFILE_LAYERS"] == "1"
+                || ButterEnv["BUTTER_PROFILE_LAYERS"] == "2"
         let profilePerLayer =
-            ProcessInfo.processInfo.environment["BUTTER_PROFILE_LAYERS"] == "2"
+            ButterEnv["BUTTER_PROFILE_LAYERS"] == "2"
 
         var workCmd = device.makeCommandBuffer()
         let embWall0 = profileLayers ? CFAbsoluteTimeGetCurrent() : 0
@@ -4361,7 +4361,7 @@ public final class Qwen35Model: LanguageModel {
         // per-channel weight, not by magnitude. Flagged so both arms are
         // measurable from one build.
         let mtpPostNormHidden =
-            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_POSTNORM"] == "1"
+            ButterEnv["BUTTER_QWEN_MTP_POSTNORM"] == "1"
         var hiddenSnapshot: Tensor?
         if returnHidden && !(mtpPostNormHidden && returnAllLogits) {
             let snap = Tensor.empty(

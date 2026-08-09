@@ -44,47 +44,33 @@ import IronSwift
 enum LagunaNvfp4Fuse {
     /// Decode shared expert: single NVFP4 QMV + SwiGLU over fused [gate;up].
     /// Opt-in only — runtime Metal loses to iron dual QMV on M5 (~−10%).
-    static var sharedSwigluEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_FUSED_SHARED_SWIGLU"] == "1"
-    }
+    static let sharedSwigluEnabled: Bool = ButterEnv["BUTTER_LAGUNA_FUSED_SHARED_SWIGLU"] == "1"
 
     /// Serial all-8-slot fuse (slow on M5). Opt-in only.
-    static var pathBDownFusedEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PATHB_NVFP4_FUSED"] == "1"
-    }
+    static let pathBDownFusedEnabled: Bool = ButterEnv["BUTTER_LAGUNA_PATHB_NVFP4_FUSED"] == "1"
 
     /// Per-slot concurrent swiglu+down fuse. Opt-in (usually a loss at mid=512).
-    static var pathBSlotFuseEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PATHB_NVFP4_SLOT_FUSE"] == "1"
-    }
+    static let pathBSlotFuseEnabled: Bool = ButterEnv["BUTTER_LAGUNA_PATHB_NVFP4_SLOT_FUSE"] == "1"
 
     /// Fused gate+up eidx → SwiGLU mid. Opt-in (runtime Metal; no win vs iron yet).
-    static var pathBGateUpFuseEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PATHB_GATEUP_FUSE"] == "1"
-    }
+    static let pathBGateUpFuseEnabled: Bool = ButterEnv["BUTTER_LAGUNA_PATHB_GATEUP_FUSE"] == "1"
 
     /// Decode routed down: one dispatch over 8 expert mids → weighted sum.
     /// mlxfast `DARKBLOOM_FUSED_ROUTED_DOWN_REDUCE`. Default ON; escape `=0`.
     /// Constraints: mid=512, hidden=2048, topK=8, bf16, block=16.
-    static var pathBDownReduceEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PATHB_DOWN_REDUCE"] != "0"
-    }
+    static let pathBDownReduceEnabled: Bool = ButterEnv["BUTTER_LAGUNA_PATHB_DOWN_REDUCE"] != "0"
 
     /// Decode routed gate+up QMV + SwiGLU (mlxfast FUSED_ROUTED_SWIGLU_QMV).
     /// One dispatch over 8 expert slots × 128 tiles; reuses input loads for
     /// gate and up. Default ON; escape `BUTTER_LAGUNA_PATHB_ROUTED_SWIGLU=0`.
     /// Constraints: mid=512, hidden=2048, topK=8, bf16, block=16.
-    static var pathBRoutedSwigluEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PATHB_ROUTED_SWIGLU"]
+    static let pathBRoutedSwigluEnabled: Bool = ButterEnv["BUTTER_LAGUNA_PATHB_ROUTED_SWIGLU"]
             != "0"
-    }
 
     /// Prefill shared: single iron NVFP4 QMM on fused [gate;up] then interleaved
     /// SwiGLU. Default ON (same iron dequant as two QMMs). Escape `=0`.
-    static var sharedPrefillFusedGateUpEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_SHARED_PREFILL_FUSED_GATEUP"]
+    static let sharedPrefillFusedGateUpEnabled: Bool = ButterEnv["BUTTER_LAGUNA_SHARED_PREFILL_FUSED_GATEUP"]
             != "0"
-    }
 
     /// T28: nine-slot merged MoE dispatch, one threadgroup family owns all
     /// 8 routed + 1 shared expert slots (geometry only, no residual fold,
@@ -92,9 +78,7 @@ enum LagunaNvfp4Fuse {
     /// separate shared SwiGLU/down dispatches plus the final acc+shared
     /// add with two dispatches (swiglu, down+reduce). Default ON when
     /// eligible; escape `BUTTER_LAGUNA_NINE_SLOT=0`.
-    static var nineSlotEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_NINE_SLOT"] != "0"
-    }
+    static let nineSlotEnabled: Bool = ButterEnv["BUTTER_LAGUNA_NINE_SLOT"] != "0"
 
     /// T28 follow-up: split the nine-slot GATE-UP dispatch only into
     /// routed-8 (needs router top-8 indices) + shared-1 (needs only the
@@ -103,9 +87,7 @@ enum LagunaNvfp4Fuse {
     /// dependency-overlap rationale. Opt-in until validated by the A/B
     /// harness; escape hatch is simply not setting this (nine-slot merged
     /// gate-up, `moeNineSlotSwigluQmv`, stays the default).
-    static var gateUpSplitEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_GATEUP_SPLIT"] == "1"
-    }
+    static let gateUpSplitEnabled: Bool = ButterEnv["BUTTER_LAGUNA_GATEUP_SPLIT"] == "1"
 
     /// T43: fold the post-MoE residual add into the nine-slot down-reduce
     /// kernel's lane-0 epilogue (`laguna_nine_slot_nvfp4_down_reduce_residual_bf16`),
@@ -115,9 +97,7 @@ enum LagunaNvfp4Fuse {
     /// diff 0/2048, KV digests equal, four-prompt 200-token digests
     /// match) with +6 percent paired-ABBA decode. See
     /// `LagunaNvfp4Fuse.nineSlotDownReduceSource` / `moeNineSlotDownReduce`.
-    static var downResidualFoldEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD"] != "0"
-    }
+    static let downResidualFoldEnabled: Bool = ButterEnv["BUTTER_LAGUNA_DOWN_RESIDUAL_FOLD"] != "0"
 
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]
     private static let lock = NSLock()
@@ -455,7 +435,7 @@ enum LagunaNvfp4Fuse {
         // 1) Metallib / Iron PSOCache (no runtime MSL parse).
         if let p = try? PSOCache.shared.pipelineStateThrowing(for: name) {
             psoCache[name] = p
-            if ProcessInfo.processInfo.environment["BUTTER_LAGUNA_QDOT_VERBOSE"]
+            if ButterEnv["BUTTER_LAGUNA_QDOT_VERBOSE"]
                 == "1"
             {
                 fputs("[LagunaNvfp4Fuse] metallib PSO: \(name)\n", stderr)
@@ -468,7 +448,7 @@ enum LagunaNvfp4Fuse {
         let fn = lib.makeFunction(name: name)!
         let p = try! device.makeComputePipelineState(function: fn)
         psoCache[name] = p
-        if ProcessInfo.processInfo.environment["BUTTER_LAGUNA_QDOT_VERBOSE"]
+        if ButterEnv["BUTTER_LAGUNA_QDOT_VERBOSE"]
             == "1"
         {
             fputs("[LagunaNvfp4Fuse] live-compile PSO: \(name)\n", stderr)
@@ -868,7 +848,7 @@ enum LagunaNvfp4Fuse {
             "laguna_moe_gateup_swiglu_nvfp4_bf16",
             source: gateUpSwigluSrc, device: mtl)
         let useConcurrent =
-            ProcessInfo.processInfo.environment["BUTTER_MOE_SERIAL_EXPERT_GEMV"] == nil
+            ButterEnv["BUTTER_MOE_SERIAL_EXPERT_GEMV"] == nil
         let enc: MTLComputeCommandEncoder?
         if useConcurrent {
             enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
@@ -927,7 +907,7 @@ enum LagunaNvfp4Fuse {
             "laguna_moe_slot_swiglu_down_nvfp4_bf16",
             source: slotSwigluDownSrc, device: mtl)
         let useConcurrent =
-            ProcessInfo.processInfo.environment["BUTTER_MOE_SERIAL_EXPERT_GEMV"] == nil
+            ButterEnv["BUTTER_MOE_SERIAL_EXPERT_GEMV"] == nil
         let enc: MTLComputeCommandEncoder?
         if useConcurrent {
             enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)

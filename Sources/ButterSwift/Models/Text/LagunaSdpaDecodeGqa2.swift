@@ -100,15 +100,13 @@ import IronSwift
 enum LagunaSdpaDecodeGqa2 {
     /// Default ON; set `BUTTER_LAGUNA_SDPA_GQA2=0` to restore
     /// `Ops.sdpaDecode` unconditionally.
-    static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_SDPA_GQA2"] != "0"
-    }
+    static let enabled: Bool = ButterEnv["BUTTER_LAGUNA_SDPA_GQA2"] != "0"
 
     /// Default ON (once `enabled` already holds); set
     /// `BUTTER_LAGUNA_SDPA_GQA2_V2=0` to force the v1 (rolled-loop)
     /// kernel body for A/B, see file header point 3.
     static var v2Enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_SDPA_GQA2_V2"] != "0"
+        ButterEnv["BUTTER_LAGUNA_SDPA_GQA2_V2"] != "0"
     }
 
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]

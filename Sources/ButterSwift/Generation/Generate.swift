@@ -224,7 +224,7 @@ extension Model {
             // less than interactive. Kill switch: BUTTER_DECODE_QOS=0
             // restores the old bare `Task {}` for A/B.
             let qosFixEnabled =
-                ProcessInfo.processInfo.environment["BUTTER_DECODE_QOS"] != "0"
+                ButterEnv["BUTTER_DECODE_QOS"] != "0"
             Task(priority: qosFixEnabled ? .high : nil) {
                 do {
                     try await model.driveGeneration(
@@ -267,7 +267,7 @@ extension Model {
         // has no such restriction and applies to whichever OS thread is
         // actually running this code at the time of the call.
         #if canImport(Darwin)
-        if ProcessInfo.processInfo.environment["BUTTER_DECODE_QOS"] != "0" {
+        if ButterEnv["BUTTER_DECODE_QOS"] != "0" {
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
         }
         #endif
@@ -344,7 +344,7 @@ extension Model {
         // `BUTTER_GREEDY_GPU_ARGMAX=0` disables this and restores the old
         // routing (any hasFilters sends greedy through cpuSample too).
         let greedyGPUFastPathEnabled =
-            ProcessInfo.processInfo.environment["BUTTER_GREEDY_GPU_ARGMAX"] != "0"
+            ButterEnv["BUTTER_GREEDY_GPU_ARGMAX"] != "0"
         enum Path: String { case greedyGPU, gpuCategorical, cpuSample }
         let path: Path = {
             if greedyGPUFastPathEnabled, params.temperature == 0,
@@ -499,7 +499,7 @@ extension Model {
             // transient activations.
             let chunkSize = max(
                 1,
-                ProcessInfo.processInfo.environment["BUTTER_PREFILL_STEP"].flatMap(Int.init)
+                ButterEnv["BUTTER_PREFILL_STEP"].flatMap(Int.init)
                     ?? params.prefillStepSize
                     ?? engine.defaultPrefillStepSize)
             // Multi over the full prompt (all n tokens). The last multi
@@ -604,7 +604,7 @@ extension Model {
         // Escape: BUTTER_GPU_TOKEN_LOOP=0 restores the old per-token
         // synchronous loop unconditionally.
         let gpuTokenLoopEnabled =
-            ProcessInfo.processInfo.environment["BUTTER_GPU_TOKEN_LOOP"] != "0"
+            ButterEnv["BUTTER_GPU_TOKEN_LOOP"] != "0"
         let useGpuTokenLoop =
             gpuTokenLoopEnabled && path == .greedyGPU && !capturePPL
             && engine.supportsGPUTokenFeedback
@@ -625,7 +625,7 @@ extension Model {
         // `Sampling.buildFilteredWeights`'s doc). Falls through to the
         // non-spec `cpuSample`/`gpuCategorical` path otherwise.
         let mtpSpecEnabled =
-            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_SPEC"] == "1"
+            ButterEnv["BUTTER_QWEN_MTP_SPEC"] == "1"
         let mtpModel = engine as? Qwen35Model
         let useMTPSpecGreedy =
             mtpSpecEnabled && path == .greedyGPU && !capturePPL
@@ -644,7 +644,7 @@ extension Model {
                 let gamma = max(
                     1,
                     Int(
-                        ProcessInfo.processInfo.environment[
+                        ButterEnv[
                             "BUTTER_QWEN_MTP_GAMMA"] ?? "") ?? 2)
                 // Fresh generation → fresh draft-head KV history. The
                 // loop primes its own first hidden state (the chunked
@@ -742,11 +742,11 @@ extension Model {
                 // computed and discarded, by design). Override via
                 // BUTTER_GPU_LOOP_LAG. Default (flag off) stays 1.
                 let nonblockDecode =
-                    ProcessInfo.processInfo.environment[
+                    ButterEnv[
                         "BUTTER_LAGUNA_NONBLOCK_DECODE"] != "0"
                 let gpuLoopLag = max(
                     1,
-                    Int(ProcessInfo.processInfo.environment["BUTTER_GPU_LOOP_LAG"] ?? "")
+                    Int(ButterEnv["BUTTER_GPU_LOOP_LAG"] ?? "")
                         ?? (nonblockDecode ? 3 : 1))
                 let remainingBudget = params.maxTokens - 1
                 if remainingBudget > 0 {

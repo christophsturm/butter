@@ -16,10 +16,29 @@ import IronSwift
 
 enum LagunaSdpa {
     static var prefillMmaEnabled: Bool {
-        let env = ProcessInfo.processInfo.environment["BUTTER_LAGUNA_SDPA_PREFILL_MMA"]
+        let env = ButterEnv["BUTTER_LAGUNA_SDPA_PREFILL_MMA"]
         if env == "0" { return false }
         if env == "1" { return true }
         return true  // default ON when shapes allow
+    }
+
+    // Fuse the SDPA-output layout round trip. The MMA kernel emits
+    // head-major f16 `[nHeads, tPad, headDim]` (`outHTD`); o_proj consumes
+    // token-major bf16 `[nRows, nHeads*headDim]`. The stock tail pays two
+    // dispatches AND a full `outTHD` f16 intermediate round trip for this:
+    // `transposeHTD_f16` (HTD→THD, pure layout) then `castF16ToBf16`
+    // (f16→bf16, real rows only). This lever fuses both into a single
+    // `laguna_transpose_htd_cast_bf16` dispatch that reads `outHTD` and
+    // writes `outBf` directly — deleting one dispatch/layer and the entire
+    // `outTHD` scratch write+read (tPad·nHeads·headDim f16 each way).
+    //
+    // BYTE-IDENTICAL: the transpose is a pure address remap (no rounding)
+    // and the fused kernel reproduces the exact cast the stock chain paid,
+    // `bfloat(float(outHTD[(h·tPad+t)·headDim+d]))`, over the same real
+    // `[0, nRows)` rows. Default ON; escape `BUTTER_LAGUNA_SDPA_NATIVE_LAYOUT=0`
+    // restores the two-dispatch transpose+cast path (for A/B / fallback).
+    static var sdpaNativeLayoutEnabled: Bool {
+        ButterEnv["BUTTER_LAGUNA_SDPA_NATIVE_LAYOUT"] != "0"
     }
 
     // ─── Prefill SDPA mask block-map (opt-in) ────────────────────────
@@ -75,7 +94,7 @@ enum LagunaSdpa {
     // Default OFF: `prefillMmaBf16` keeps calling `Ops.sdpaPrefillMma`
     // unless this is set, so default behavior is unchanged.
     static var prefillBlockmapEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PREFILL_BLOCKMAP"] == "1"
+        ButterEnv["BUTTER_LAGUNA_PREFILL_BLOCKMAP"] == "1"
     }
 
     /// Closed-form per-query-block K bounds for the block-map prefill
@@ -284,6 +303,65 @@ enum LagunaSdpa {
         let buf = device.intermediateScratch(
             tag: "\(tag)_s\(slot)", minBytes: bytes)
         return Tensor(buffer: buf, offset: 0, shape: shape, dtype: dtype)
+    }
+
+    // Fused transpose `[nHeads, tPad, headDim]` f16 (HTD, MMA output)
+    // → `[nRows, nHeads*headDim]` bf16 (THD token-major, o_proj input),
+    // real rows only. One dispatch replaces `transposeHTD_f16` + the
+    // `castF16ToBf16` real-row copy, and skips the `outTHD` f16 scratch
+    // entirely. Byte-identical: `dst` linear index `tid` decomposes to
+    // (t, h, d) in token-major order; the read `bfloat(float(inp[src]))`
+    // is the exact expression `castF16ToBf16` applied post-transpose.
+    private static let transposeHtdCastBf16Src = """
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void laguna_transpose_htd_cast_bf16(
+        device const half *inp [[buffer(0)]],   // [n_heads, t_pad, head_dim]
+        device bfloat *out [[buffer(1)]],        // [n_rows, n_heads*head_dim]
+        constant uint &t_pad [[buffer(2)]],
+        constant uint &n_heads [[buffer(3)]],
+        constant uint &head_dim [[buffer(4)]],
+        constant uint &total [[buffer(5)]],
+        uint tid [[thread_position_in_grid]]
+    ) {
+        if (tid >= total) return;
+        uint d = tid % head_dim;
+        uint hh = tid / head_dim;
+        uint h = hh % n_heads;
+        uint t = hh / n_heads;
+        uint srcIdx = (h * t_pad + t) * head_dim + d;
+        out[tid] = bfloat(float(inp[srcIdx]));
+    }
+    """
+
+    /// Dispatch `laguna_transpose_htd_cast_bf16` (fused out-layout).
+    /// `input` = `[nHeads, tPad, headDim]` f16; `out` = `[nRows,
+    /// nHeads*headDim]` bf16 (real rows). Deletes the stock
+    /// transpose+cast pair (and the `outTHD` round trip). Byte-identical.
+    static func transposeHTDCastToBf16(
+        _ input: Tensor, nRows: Int, tPad: Int, nHeads: Int, headDim: Int,
+        into out: Tensor, on cmd: MTLCommandBuffer, device: Device
+    ) {
+        precondition(input.dtype == .f16 && out.dtype == .bf16)
+        let total = nRows * nHeads * headDim
+        precondition(out.elementCount == total)
+        let p = pso(
+            "laguna_transpose_htd_cast_bf16", source: transposeHtdCastBf16Src,
+            device: device.mtlDevice)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 1)
+        var tPadU = UInt32(tPad), hU = UInt32(nHeads)
+        var dU = UInt32(headDim), totU = UInt32(total)
+        enc.setBytes(&tPadU, length: 4, index: 2)
+        enc.setBytes(&hU, length: 4, index: 3)
+        enc.setBytes(&dU, length: 4, index: 4)
+        enc.setBytes(&totU, length: 4, index: 5)
+        enc.dispatchThreads(
+            MTLSize(width: total, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(total, 256), height: 1, depth: 1))
+        enc.endEncoding()
     }
 
     static func castF16ToBf16(
@@ -563,9 +641,6 @@ enum LagunaSdpa {
         let outHTD = scratch(
             tag: "laguna_sdpa_outhtd", shape: [nHeads, tPad, headDim],
             dtype: .f16, device: device, slot: slot)
-        let outTHD = scratch(
-            tag: "laguna_sdpa_outthd", shape: [tPad, nHeads, headDim],
-            dtype: .f16, device: device, slot: slot)
         // Owned output — must not share ring (caller holds across layers).
         let outBf = Tensor.empty(
             shape: [nRows, nHeads * headDim], dtype: .bf16, device: device)
@@ -682,16 +757,25 @@ enum LagunaSdpa {
         }
         if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_mma_kernel", cmd) }
 
-        _ = Ops.transposeHTD_f16(outHTD, t: tPad, h: nHeads, d: headDim, on: cmd, into: outTHD)
-
-        // Cast only the real T rows back to bf16.
-        let realOutF16 = Tensor(
-            buffer: outTHD.buffer, offset: outTHD.offset,
-            shape: [nRows * nHeads * headDim], dtype: .f16)
-        castF16ToBf16(
-            realOutF16,
-            into: outBf.reshaped(to: [nRows * nHeads * headDim]),
-            on: cmd, device: device)
+        if sdpaNativeLayoutEnabled {
+            // Single fused transpose+cast dispatch (byte-identical).
+            transposeHTDCastToBf16(
+                outHTD, nRows: nRows, tPad: tPad, nHeads: nHeads, headDim: headDim,
+                into: outBf, on: cmd, device: device)
+        } else {
+            let outTHD = scratch(
+                tag: "laguna_sdpa_outthd", shape: [tPad, nHeads, headDim],
+                dtype: .f16, device: device, slot: slot)
+            _ = Ops.transposeHTD_f16(outHTD, t: tPad, h: nHeads, d: headDim, on: cmd, into: outTHD)
+            // Cast only the real T rows back to bf16.
+            let realOutF16 = Tensor(
+                buffer: outTHD.buffer, offset: outTHD.offset,
+                shape: [nRows * nHeads * headDim], dtype: .f16)
+            castF16ToBf16(
+                realOutF16,
+                into: outBf.reshaped(to: [nRows * nHeads * headDim]),
+                on: cmd, device: device)
+        }
         if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_out_transpose_cast", cmd) }
         return outBf
     }
@@ -735,7 +819,7 @@ enum LagunaSdpa {
     // Escape: BUTTER_LAGUNA_PREFILL_QK_ROPE_FUSE=0.
 
     static var prefillQkRopeFuseEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PREFILL_QK_ROPE_FUSE"] != "0"
+        ButterEnv["BUTTER_LAGUNA_PREFILL_QK_ROPE_FUSE"] != "0"
     }
 
     /// Shape/dtype/env eligibility only. Caller must ALSO check
@@ -774,7 +858,7 @@ enum LagunaSdpa {
     // Escape/opt-in: BUTTER_LAGUNA_PREFILL_QKROPE_H1=1 (default OFF, unverified
     // this session, see benchmarks/laguna-xs/README.md F-85 prefill pack).
     static var prefillQkRopeH1Enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PREFILL_QKROPE_H1"] == "1"
+        ButterEnv["BUTTER_LAGUNA_PREFILL_QKROPE_H1"] == "1"
     }
 
     // F-85 prefill pack, item 3: fp32 RoPE angle atlas for prefill (sliding
@@ -792,7 +876,7 @@ enum LagunaSdpa {
     // above) whenever `position + tPad` exceeds the atlas's cached
     // position range.
     static var prefillRopeAtlasEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_ROPE_ATLAS"] == "1"
+        ButterEnv["BUTTER_LAGUNA_ROPE_ATLAS"] == "1"
     }
 
     static let ropeAtlasMaxPositions = 4096
@@ -1413,9 +1497,6 @@ enum LagunaSdpa {
         let outHTD = scratch(
             tag: "laguna_sdpa_outhtd", shape: [nHeads, tPad, headDim],
             dtype: .f16, device: device, slot: slot)
-        let outTHD = scratch(
-            tag: "laguna_sdpa_outthd", shape: [tPad, nHeads, headDim],
-            dtype: .f16, device: device, slot: slot)
         let outBf = Tensor.empty(
             shape: [nRows, nHeads * headDim], dtype: .bf16, device: device)
         let kPacked = scratch(
@@ -1490,14 +1571,25 @@ enum LagunaSdpa {
             qLen: tPad, kLen: kPad, scale: scale, on: cmd, into: outHTD)
         if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_mma_kernel", cmd) }
 
-        _ = Ops.transposeHTD_f16(outHTD, t: tPad, h: nHeads, d: headDim, on: cmd, into: outTHD)
-        let realOutF16 = Tensor(
-            buffer: outTHD.buffer, offset: outTHD.offset,
-            shape: [nRows * nHeads * headDim], dtype: .f16)
-        castF16ToBf16(
-            realOutF16,
-            into: outBf.reshaped(to: [nRows * nHeads * headDim]),
-            on: cmd, device: device)
+        if sdpaNativeLayoutEnabled {
+            // Single fused transpose+cast dispatch (byte-identical),
+            // no `outTHD` round trip.
+            transposeHTDCastToBf16(
+                outHTD, nRows: nRows, tPad: tPad, nHeads: nHeads, headDim: headDim,
+                into: outBf, on: cmd, device: device)
+        } else {
+            let outTHD = scratch(
+                tag: "laguna_sdpa_outthd", shape: [tPad, nHeads, headDim],
+                dtype: .f16, device: device, slot: slot)
+            _ = Ops.transposeHTD_f16(outHTD, t: tPad, h: nHeads, d: headDim, on: cmd, into: outTHD)
+            let realOutF16 = Tensor(
+                buffer: outTHD.buffer, offset: outTHD.offset,
+                shape: [nRows * nHeads * headDim], dtype: .f16)
+            castF16ToBf16(
+                realOutF16,
+                into: outBf.reshaped(to: [nRows * nHeads * headDim]),
+                on: cmd, device: device)
+        }
         if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_out_transpose_cast", cmd) }
         return outBf
     }
@@ -1942,7 +2034,7 @@ enum LagunaSdpa {
 enum LagunaFusedQKNormRoPE {
     /// Default ON (`!= "0"`). Set `BUTTER_LAGUNA_FUSED_QK_NORM_ROPE=0` to ablate.
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_FUSED_QK_NORM_ROPE"] != "0"
+        ButterEnv["BUTTER_LAGUNA_FUSED_QK_NORM_ROPE"] != "0"
     }
 
     /// Sliding-layer decode only: full rotary, head_dim 128, bf16/f16.

@@ -43,9 +43,7 @@ import IronSwift
 enum LagunaAttnInt8 {
     /// Default ON; set `BUTTER_LAGUNA_ATTN_INT8=0` to fall back to the
     /// stock BF16 QKV / o_proj decode path.
-    static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_ATTN_INT8"] != "0"
-    }
+    static let enabled: Bool = ButterEnv["BUTTER_LAGUNA_ATTN_INT8"] != "0"
 
     /// T32 task 2: fold the per-head gate-product-softplus multiply into
     /// this bank's own QMV as an activation prologue (see `qmvGated`
@@ -62,7 +60,7 @@ enum LagunaAttnInt8 {
     /// separate-dispatch (T24 kernel 1) chain. Only takes effect where
     /// `enabled` (this bank) already holds.
     static var gatedEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_INT8_OPROJ_GATED"] != "0"
+        ButterEnv["BUTTER_LAGUNA_INT8_OPROJ_GATED"] != "0"
     }
 
     /// `qmvGated` dispatch geometry, v2 vs the original T32 kernel.
@@ -107,9 +105,7 @@ enum LagunaAttnInt8 {
     /// its speed, so this defaults OFF until root-caused. Set
     /// `BUTTER_LAGUNA_QMV_V2=1` to opt back in for further
     /// investigation; the kernel and its tests are kept, not removed.
-    static var qmvV2Enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_QMV_V2"] == "1"
-    }
+    static let qmvV2Enabled: Bool = ButterEnv["BUTTER_LAGUNA_QMV_V2"] == "1"
 
     /// Split-K dispatch geometry for the group-32 INT8 QMV kernels
     /// (`qmv`/`qmvGated`). See `qmvSplitK`/`qmvGatedSplitK` below for the
@@ -145,9 +141,7 @@ enum LagunaAttnInt8 {
     /// to their existing (unmodified) kernel whenever it declines —
     /// shape/dtype mismatch, or `bank.outDim` not a multiple of 2 (the
     /// fixed `NR0 = 2` tiling has no partial-pair tail path).
-    static var splitKEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_QMV_SPLITK"] != "0"
-    }
+    static let splitKEnabled: Bool = ButterEnv["BUTTER_LAGUNA_QMV_SPLITK"] != "0"
 
     static let groupSize = 32
 
@@ -1103,7 +1097,7 @@ enum LagunaAttnInt8 {
     /// separate `inputNorm` + `qmv` chain. Only takes effect where
     /// `enabled` (this bank) already holds.
     static var normFoldEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_QKV_NORMFOLD"] != "0"
+        ButterEnv["BUTTER_LAGUNA_QKV_NORMFOLD"] != "0"
     }
 
     // Norm-folded variant of `qmvSrc`: folds the block's input RMSNorm

@@ -95,7 +95,7 @@ enum LagunaRouterTop8Fuse {
     /// temp 0 over 200-token runs on two prompts; paired ABBA measured
     /// +4.6% decode from the three saved dispatches per MoE layer.
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_ROUTER_TOP8_FUSED"] != "0"
+        ButterEnv["BUTTER_LAGUNA_ROUTER_TOP8_FUSED"] != "0"
     }
 
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]

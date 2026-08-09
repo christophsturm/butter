@@ -547,7 +547,7 @@ public final class DeepSeekV4Model: @unchecked Sendable {
         // experiments. (Follow-up: selective f32 — f32 residual only — if a
         // future kernel makes f16 activations cheaper than f32.)
         let activationDtype: DType =
-            ProcessInfo.processInfo.environment["BUTTER_DSV4_ACT_F16"] == "1" ? .f16 : .f32
+            ButterEnv["BUTTER_DSV4_ACT_F16"] == "1" ? .f16 : .f32
         // Extract the compress_ratios array from GGUF metadata. The
         // key matches the canonical DSv4 GGUF naming convention used
         // by the converter. Falls back to inferring from layer-tensor
@@ -1151,7 +1151,7 @@ extension DeepSeekV4Model {
         // q_a/q_b/kv/output_* are Q8_0 on disk — gemv straight from
         // resident Q8 (1 byte/weight) instead of the f16-expanded copy,
         // halving read bandwidth (attn is bandwidth-bound).
-        let useQ8Attn = ProcessInfo.processInfo.environment["BUTTER_DSV4_Q8ATTN"] != "0"
+        let useQ8Attn = ButterEnv["BUTTER_DSV4_Q8ATTN"] != "0"
         let qA: Tensor
         if useQ8Attn, let qaQ8 = try? bundle.residentQ8("blk.\(layer.layerIndex).attn_q_a.weight", device: device) {
             qA = Tensor.empty(shape: [qaQ8.mOut], dtype: dt)
@@ -1402,7 +1402,7 @@ extension DeepSeekV4Model {
         let gateNameF = "blk.\(layer.layerIndex).ffn_gate_exps.weight"
         let upNameF = "blk.\(layer.layerIndex).ffn_up_exps.weight"
         let downNameF = "blk.\(layer.layerIndex).ffn_down_exps.weight"
-        if ProcessInfo.processInfo.environment["BUTTER_DSV4_GPUROUTER"] != "0", topK == 6,
+        if ButterEnv["BUTTER_DSV4_GPUROUTER"] != "0", topK == 6,
             layer.ffnGateTid2Eid == nil,  // hash-routed layers select via token→expert table, not GPU top-k
             let rg = bundle.builtIQ2(gateNameF),
             let ru = bundle.builtIQ2(upNameF),
@@ -1428,7 +1428,7 @@ extension DeepSeekV4Model {
         // deviates. Round-trip xNorm through Q8_K (per-256-block,
         // iscale=-128/max) in place so the expert gemvs see the same
         // rounded activation. Router already consumed the f16 xNorm above.
-        if ProcessInfo.processInfo.environment["BUTTER_DSV4_Q8K_ACT"] == "1" {
+        if ButterEnv["BUTTER_DSV4_Q8K_ACT"] == "1" {
             var h = xNorm.toFloatArray()
             let n = h.count
             var i = 0
@@ -1517,12 +1517,11 @@ extension DeepSeekV4Model {
         let downName = "blk.\(layer.layerIndex).ffn_down_exps.weight"
         _ = intermediate
         let moeAccum = Tensor.filled(0.0, shape: [hidden], dtype: dt, device: device)
-        let env = ProcessInfo.processInfo.environment
-        let useFusedDown = topK == 6 && env["BUTTER_DSV4_FUSED_DOWN"] == "1"
+        let useFusedDown = topK == 6 && ButterEnv["BUTTER_DSV4_FUSED_DOWN"] == "1"
         let useFusedEpilogue =
             topK == 6
             && !useFusedDown
-            && env["BUTTER_DSV4_FUSED_EPILOGUE"] == "1"
+            && ButterEnv["BUTTER_DSV4_FUSED_EPILOGUE"] == "1"
         // PER-EXPERT 3-stage pipeline: gate / up / down on separate cmd
         // buffers. gate+up are independent of each other so CPU staging
         // for up can run concurrent with GPU running gate's dequant +
@@ -1663,8 +1662,8 @@ extension DeepSeekV4Model {
         // (gate, up) computing all topK experts' outputs in a single
         // dispatch each — replaces 2*topK per-expert {dequant,gemv} cmd
         // buffers (12/layer) with 2. gate/up share x=xNorm.
-        let useGather = topK == 6 && env["BUTTER_DSV4_GATHER"] != "0"
-        let useResident = env["BUTTER_DSV4_RESIDENT"] != "0"
+        let useGather = topK == 6 && ButterEnv["BUTTER_DSV4_GATHER"] != "0"
+        let useResident = ButterEnv["BUTTER_DSV4_RESIDENT"] != "0"
         // Build a u32 expert_ids tensor for a role's gather dispatch.
         func eids(_ slots: [Int]) -> Tensor {
             let t = Tensor.empty(shape: [slots.count], dtype: .u32, device: device)
@@ -1850,7 +1849,7 @@ extension DeepSeekV4Model {
         // Shared expert — independent of routing, commit first. Q8 gemv
         // straight from resident Q8 (shexp gate/up/down are Q8_0).
         let shexpCmd = device.makeCommandBuffer()
-        let q8on = ProcessInfo.processInfo.environment["BUTTER_DSV4_Q8ATTN"] != "0"
+        let q8on = ButterEnv["BUTTER_DSV4_Q8ATTN"] != "0"
         let li = layer.layerIndex
         let sGate: Tensor; let sUp: Tensor
         if q8on, let g = try? bundle.residentQ8("blk.\(li).ffn_gate_shexp.weight", device: device),
@@ -1947,7 +1946,7 @@ extension DeepSeekV4Model {
     nonisolated(unsafe) public static var profKernelEncodeCount: Int = 0
     nonisolated(unsafe) public static let profGpuLock = NSLock()
     public static let profileEnabled =
-        ProcessInfo.processInfo.environment["BUTTER_DSV4_PROFILE"] == "1"
+        ButterEnv["BUTTER_DSV4_PROFILE"] == "1"
 
     public static func resetGpuProf() {
         profGpuLock.lock()
@@ -2140,7 +2139,7 @@ extension DeepSeekV4Model {
         // LM head (output.weight is Q8_0, ~1 GB as f16) — gemv from
         // resident Q8 to halve the per-token output-projection bandwidth.
         let logits: Tensor
-        if ProcessInfo.processInfo.environment["BUTTER_DSV4_Q8ATTN"] != "0",
+        if ButterEnv["BUTTER_DSV4_Q8ATTN"] != "0",
             let lmQ8 = try? bundle.residentQ8("output.weight", device: device)
         {
             logits = Tensor.empty(shape: [lmQ8.mOut], dtype: dt)
@@ -2251,7 +2250,7 @@ extension DeepSeekV4Model {
             // reclaim instead of the app-quit-monitor freeze. Override the
             // floor via BUTTER_MEM_FLOOR_PCT, disable with =0.
             if let freePct = MemorySnapshot.systemFreePercent() {
-                let floor = Double(ProcessInfo.processInfo.environment["BUTTER_MEM_FLOOR_PCT"].flatMap { Int($0) } ?? 12)
+                let floor = Double(ButterEnv["BUTTER_MEM_FLOOR_PCT"].flatMap { Int($0) } ?? 12)
                 if floor > 0 && freePct < floor {
                     throw PrefillError(
                         message:

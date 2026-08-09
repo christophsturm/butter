@@ -55,7 +55,7 @@ enum LagunaSteelGemm {
     /// prefill@512 win (569 -> 1013 tok/s median of 3, <0.3% run-to-run
     /// variance). Escape: BUTTER_LAGUNA_ATTN_STEEL_GEMM=0. See T26 README.
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_ATTN_STEEL_GEMM"] != "0"
+        ButterEnv["BUTTER_LAGUNA_ATTN_STEEL_GEMM"] != "0"
     }
 
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]
@@ -201,7 +201,7 @@ enum LagunaSteelGemm {
     /// Escape: `BUTTER_LAGUNA_QKV_CONCURRENT=0`. Caller must have already
     /// checked `eligible(...)` for all three shapes.
     static var concurrentQkvEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_QKV_CONCURRENT"] != "0"
+        ButterEnv["BUTTER_LAGUNA_QKV_CONCURRENT"] != "0"
     }
 
     static func callManyQKVConcurrent(

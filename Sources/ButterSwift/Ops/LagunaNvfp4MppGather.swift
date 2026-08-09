@@ -125,7 +125,7 @@ enum LagunaNvfp4MppGather {
     /// convention: `BUTTER_NVFP4_MPP_GATHER=0` restores the
     /// NAX/NAX64/steel/BM16 dispatch chain unconditionally.
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_NVFP4_MPP_GATHER"] != "0"
+        ButterEnv["BUTTER_NVFP4_MPP_GATHER"] != "0"
     }
 
     /// Apple GPU Family 9+ / macOS 26+ -- same gate as every other MPP

@@ -55,7 +55,7 @@ import Metal
 
 enum LagunaSortedCombine {
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_SORTED_COMBINE"] == "1"
+        ButterEnv["BUTTER_LAGUNA_SORTED_COMBINE"] == "1"
     }
 
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]

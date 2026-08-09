@@ -317,12 +317,11 @@ extension Ops {
     /// `BUTTER_NVFP4_GATHER_STEEL_BM=16`/`=64` forces a side for triage,
     /// `BUTTER_NVFP4_GATHER_STEEL_BM_THRESHOLD=<rows>` overrides the cutoff.
     public static func nvfp4GatherSteelPrefersBm16(mTotal: Int, nExperts: Int) -> Bool {
-        let env = ProcessInfo.processInfo.environment
-        if env["BUTTER_NVFP4_GATHER_STEEL_BM"] == "16" { return true }
-        if env["BUTTER_NVFP4_GATHER_STEEL_BM"] == "64" { return false }
+        if ButterEnv["BUTTER_NVFP4_GATHER_STEEL_BM"] == "16" { return true }
+        if ButterEnv["BUTTER_NVFP4_GATHER_STEEL_BM"] == "64" { return false }
         guard nExperts > 0 else { return false }
         let avgRun = Double(mTotal) / Double(nExperts)
-        let threshold = env["BUTTER_NVFP4_GATHER_STEEL_BM_THRESHOLD"].flatMap(Double.init) ?? 128.0
+        let threshold = ButterEnv["BUTTER_NVFP4_GATHER_STEEL_BM_THRESHOLD"].flatMap(Double.init) ?? 128.0
         return avgRun < threshold
     }
 
@@ -378,7 +377,7 @@ extension Ops {
         dtype: DType, mTotal: Int, nOut: Int, kIn: Int, blockSize: Int = 16
     ) -> Bool {
         guard dtype == .bf16 else { return false }
-        let env = ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_STEEL"]
+        let env = ButterEnv["BUTTER_NVFP4_GATHER_STEEL"]
         guard env == "1" || env?.lowercased() == "true" else { return false }
         return nvfp4GatherSteelGatherEligible(nOut: nOut, kIn: kIn, blockSize: blockSize)
     }

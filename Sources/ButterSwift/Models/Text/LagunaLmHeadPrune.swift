@@ -30,10 +30,13 @@
 // original four-dispatch coarse_bf/select/exact path above, byte-identical
 // to pre-T29).
 //
-// w21: INT5-planar alternative coarse copy. DEFAULT OFF, opt in with
-// BUTTER_LAGUNA_LMHEAD_INT5=1 (author-time port, not yet A/B'd on real
-// decode traffic -- flip default only after a paired gate-off measurement
-// per this repo's convention). Where the MXFP8 arm above reads an offline
+// w21: INT5-planar alternative coarse copy. DEFAULT ON (A/B'd, escape
+// BUTTER_LAGUNA_LMHEAD_INT5=0). The int5 coarse copy carries the SAME
+// certified-conservative bound + exact-assembly stage, so it is argmax-
+// identical to the MXFP8 arm by construction; confirmed byte-for-byte
+// over a 128-tok greedy stream and measured +2.17% decode (183.9 vs 180.0
+// tok/s, 5/5 env-balanced paired wins on laguna-xs-2.1-nvfp4, base arm
+// BUTTER_LAGUNA_DECODE_QMV_V2=1). Where the MXFP8 arm above reads an offline
 // sidecar file (2112 B/row: 2048 e4m3 code bytes + 64 e8m0 scale bytes),
 // this arm builds a 1344 B/row copy AT MODEL LOAD directly from the
 // resident BF16 `lm_head` weight (`LagunaInt5Coarse.build`, no extra file
@@ -74,29 +77,25 @@ enum LagunaLmHeadPrune {
     /// DEFAULT ON: unset or any value other than `"0"` enables the certified
     /// two-pass decode head when the MXFP8 sidecar + BF16 weight exist.
     /// Set `BUTTER_LAGUNA_LM_HEAD_PRUNE=0` to restore stock full lm_head.
-    static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LM_HEAD_PRUNE"] != "0"
-    }
+    static let enabled: Bool = ButterEnv["BUTTER_LAGUNA_LM_HEAD_PRUNE"] != "0"
 
     /// T29: DEFAULT ON. Set `BUTTER_LAGUNA_LMHEAD_INLINE_MASK=0` to restore
     /// the pre-T29 four-dispatch coarse_bf/select/exact path (kept verbatim
     /// below for the kill switch and same-binary A/B).
-    static var inlineMaskEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LMHEAD_INLINE_MASK"] != "0"
-    }
+    static let inlineMaskEnabled: Bool = ButterEnv["BUTTER_LAGUNA_LMHEAD_INLINE_MASK"] != "0"
 
-    /// w21: DEFAULT OFF. Set `BUTTER_LAGUNA_LMHEAD_INT5=1` to swap the coarse
-    /// copy's byte layout from the 1 byte/value MXFP8 sidecar to a planar
-    /// int5 copy (nibble plane + 1-bit plane + e8m0 group scale = 1344 B/row,
-    /// about -36% coarse bytes; see `LagunaInt5Coarse`). The certified bound,
-    /// the L/threshold reduction and the exact-assembly stage are all
-    /// UNCHANGED -- only the coarse GEMV reads a smaller weight copy and folds
-    /// the int5 half-cell into the same `d*(1+GAMMA) + 2*GAMMA*m` delta. Only
-    /// consulted on the inline-mask path and only when the sidecar was built
-    /// at init (the range guard can decline it); otherwise the MXFP8 arm runs.
-    static var int5Enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LMHEAD_INT5"] == "1"
-    }
+    /// w21: DEFAULT ON. Set `BUTTER_LAGUNA_LMHEAD_INT5=0` to restore the
+    /// 1 byte/value MXFP8 sidecar coarse copy. The int5 planar copy (nibble
+    /// plane + 1-bit plane + e8m0 group scale = 1344 B/row, about -36% coarse
+    /// bytes; see `LagunaInt5Coarse`) leaves the certified bound, the
+    /// L/threshold reduction and the exact-assembly stage UNCHANGED -- only the
+    /// coarse GEMV reads a smaller weight copy and folds the int5 half-cell
+    /// into the same `d*(1+GAMMA) + 2*GAMMA*m` delta, so it is argmax-identical
+    /// to the MXFP8 arm by construction (byte-identical 128-tok stream,
+    /// +2.17% decode). Only consulted on the inline-mask path and only when the
+    /// coarse copy was built at init (the range guard can decline back to the
+    /// MXFP8 arm if the tensor ever produces |q| > 15); otherwise MXFP8 runs.
+    static let int5Enabled: Bool = ButterEnv["BUTTER_LAGUNA_LMHEAD_INT5"] != "0"
 
     /// w24 isolation probe (NOT for shipping): forces the int5 arm to reuse
     /// the shared `laguna_lmhead_max_thr` reduction (the same kernel the
@@ -108,9 +107,7 @@ enum LagunaLmHeadPrune {
     /// one-row BF16 GEMV) is the source of the fused+int5 latency
     /// regression, independent of candidate-set width. Set
     /// `BUTTER_LAGUNA_LMHEAD_INT5_SHAREDTHR=1` to enable.
-    static var int5SharedThresholdEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LMHEAD_INT5_SHAREDTHR"] == "1"
-    }
+    static let int5SharedThresholdEnabled: Bool = ButterEnv["BUTTER_LAGUNA_LMHEAD_INT5_SHAREDTHR"] == "1"
 
     /// T29 diagnosis-only probe: prints `[laguna-lmhead-diag] candidates=K`
     /// (K of 100352 rows passing the certified bound, i.e. the size of the
@@ -118,9 +115,7 @@ enum LagunaLmHeadPrune {
     /// step to stderr. Adds one extra atomic-counter dispatch plus a
     /// blocking GPU readback, so it is OFF the hot path used for the A/B
     /// timing gates above -- opt-in only, never default ON.
-    static var diagEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LMHEAD_DIAG"] == "1"
-    }
+    static let diagEnabled: Bool = ButterEnv["BUTTER_LAGUNA_LMHEAD_DIAG"] == "1"
 
     /// T40 follow-up opt-in: when a token routes through CPU sampling (see
     /// `SamplingMode` below), keep the certified prune's cheap GPU pass
@@ -130,7 +125,7 @@ enum LagunaLmHeadPrune {
     /// for CPU-sampled tokens unless this is set. See `maskNonCandidates`
     /// for the statistical justification and its excluded-mass bound.
     static var candidateRestrictedSamplingEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LMHEAD_PRUNE_SAMPLE_CANDIDATES"] == "1"
+        ButterEnv["BUTTER_LMHEAD_PRUNE_SAMPLE_CANDIDATES"] == "1"
     }
 
     // ── T40 follow-up: sampling-path awareness ─────────────────────────

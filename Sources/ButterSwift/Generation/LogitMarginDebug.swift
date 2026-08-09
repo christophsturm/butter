@@ -44,7 +44,7 @@ import Foundation
 public enum LogitMarginDebug {
     /// 0 = off, 1 = margin line, 2 = margin line + top-5.
     public static var level: Int {
-        switch ProcessInfo.processInfo.environment["BUTTER_DEBUG_LOGIT_MARGIN"] {
+        switch ButterEnv["BUTTER_DEBUG_LOGIT_MARGIN"] {
         case "1": return 1
         case "2": return 2
         default: return 0

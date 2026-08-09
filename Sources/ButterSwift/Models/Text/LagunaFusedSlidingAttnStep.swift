@@ -178,7 +178,7 @@ enum LagunaFusedSlidingAttnStep {
     /// 6.1e-5/elem), digest-stable across runs, and paired ABBA on the
     /// merged tree measured 85.3 vs 70.9 tok/s stock (+20% decode).
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_FUSED_ATTN_STEP"] != "0"
+        ButterEnv["BUTTER_LAGUNA_FUSED_ATTN_STEP"] != "0"
     }
 
     /// Sliding-layer decode only: full rotary, head_dim 128, bf16,

@@ -63,10 +63,37 @@ import IronSwift
 /// 0.97s vs ON median 0.83s, a 14.4% win comfortably clearing the 1.5%
 /// bar. Set `BUTTER_LAGUNA_LASTROW_PREFILL=0` to restore the full
 /// per-row terminal-layer path.
+
+/// Launch-time flags on the per-token / per-layer Laguna forward paths,
+/// hoisted to cached statics. None toggled mid-process by tests
+/// (verified against Tests/ setenv sites); live-toggled flags must stay
+/// on `ButterEnv[...]`.
+private enum LagunaEnvFlags {
+    static let serialQkv = ButterEnv["BUTTER_LAGUNA_SERIAL_QKV"] != nil
+    static let ffnCopy = ButterEnv["BUTTER_LAGUNA_FFN_COPY"] == "1"
+    static let attnPhaseTiming = ButterEnv["BUTTER_LAGUNA_ATTN_PHASE_TIMING"] == "1"
+    static let layerPipe = ButterEnv["BUTTER_LAGUNA_LAYER_PIPE"] != "0"
+    static let pipeDepth = max(1, Int(ButterEnv["BUTTER_LAGUNA_PIPE_DEPTH"] ?? "") ?? 4)
+    static let layersPerCBEnv = Int(ButterEnv["BUTTER_LAGUNA_LAYERS_PER_CB"] ?? "")
+    static let serialPrefill = ButterEnv["BUTTER_LAGUNA_SERIAL_PREFILL"] == "1"
+    static let layerScan = ButterEnv["BUTTER_LAGUNA_LAYER_SCAN"] == "1"
+    static let timing = ButterEnv["BUTTER_LAGUNA_TIMING"] == "1"
+    static let prefillPipeEnv = Int(ButterEnv["BUTTER_LAGUNA_PREFILL_PIPE"] ?? "")
+    static let moeBgemmNoMpp = ButterEnv["BUTTER_MOE_BGEMM_NO_MPP"] != nil
+    static let moeBgemmMpp = ButterEnv["BUTTER_MOE_BGEMM_MPP"] != nil
+    static let moeManyOff = ButterEnv["BUTTER_LAGUNA_MOE_MANY"] == "0"
+    // W-headgate: fuse the softplus head-gate's `gather(expand_ids) + mul`
+    // scaffolding into one `iron_head_gate_mul` broadcast pass (no host
+    // expand-id build, no gExp intermediate, one dispatch). Byte-identical
+    // to the gather+mul it replaces (bit-exact gate copy + native-T mul),
+    // so default ON; escape `BUTTER_LAGUNA_HEAD_GATE_FUSE=0`. The measured
+    // `gate` bucket is the largest non-GEMM prefill block (~0.95 ms/layer,
+    // 26% of attention) — see benchmarks/laguna-xs README head-gate note.
+    static let headGateFuse = ButterEnv["BUTTER_LAGUNA_HEAD_GATE_FUSE"] != "0"
+}
+
 enum LagunaLastRowPrefill {
-    static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LASTROW_PREFILL"] != "0"
-    }
+    static let enabled: Bool = ButterEnv["BUTTER_LAGUNA_LASTROW_PREFILL"] != "0"
 }
 
 // ─── LagunaTextConfig ────────────────────────────────────────────────
@@ -307,7 +334,7 @@ public enum LagunaHybrid: LagunaVariant {
         // Cap context: 1M advertized is not practical for first load.
         // Override with LoadOptions.maxContextLength or BUTTER_LAGUNA_MAX_SEQ.
         let defaultMaxSeq: Int = {
-            if let s = ProcessInfo.processInfo.environment["BUTTER_LAGUNA_MAX_SEQ"],
+            if let s = ButterEnv["BUTTER_LAGUNA_MAX_SEQ"],
                 let n = Int(s), n > 0
             {
                 return n
@@ -363,7 +390,7 @@ public enum LagunaHybrid: LagunaVariant {
             lmHeadMxfp8 = mx
             fputs("[laguna] lm_head: MXFP8 sidecar present\n", stderr)
         }
-        if ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LM_HEAD_MXFP8"] == "1",
+        if ButterEnv["BUTTER_LAGUNA_LM_HEAD_MXFP8"] == "1",
             let mx = lmHeadMxfp8
         {
             lmHead = AnyLinear(mx)
@@ -699,7 +726,7 @@ private func buildLagunaMoE(
     // Path B: GPU top-k + host experts (default ON). Opt out with
     // BUTTER_LAGUNA_PATHB=0 to force fully-host routing.
     let pathBGPU =
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PATHB"] == "0"
+        ButterEnv["BUTTER_LAGUNA_PATHB"] == "0"
             ? nil : expertBiasGPU
 
     return MoELayer(
@@ -1288,6 +1315,13 @@ final class LagunaLayer {
         _ attnOut: Tensor, gateLogits: Tensor, cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
         let gSoft = Ops.softplus(gateLogits, on: cmd)
+        // W-headgate fuse: one broadcast pass replaces the expand-id gather
+        // + separate mul (byte-identical). Escape `BUTTER_LAGUNA_HEAD_GATE_FUSE=0`.
+        if LagunaEnvFlags.headGateFuse {
+            let gate = gSoft.reshaped(to: [nHeads])
+            return Ops.headGateMul(
+                attn: attnOut, gate: gate, headDim: headDim, on: cmd)
+        }
         let table = gSoft.reshaped(to: [nHeads, 1])
         if softplusExpandIds == nil
             || softplusExpandIds!.elementCount != nHeads * headDim
@@ -1480,7 +1514,7 @@ final class LagunaLayer {
             }
         } else if let qkvW = qkvFusedWeight,
             qkvW.dtype == xNorm().dtype,
-            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_SERIAL_QKV"] == nil
+            !LagunaEnvFlags.serialQkv
         {
             // Single dense GEMV over stacked [Q;K;V] (NVFP4 board: BF16 attn).
             let qDim = qOutDim
@@ -1876,7 +1910,7 @@ final class LagunaLayer {
                     shape: [hidden], dtype: ffnOut.dtype, device: device)
             }
             // Escape: old blit materialize (debug / if residual quality drifts).
-            if ProcessInfo.processInfo.environment["BUTTER_LAGUNA_FFN_COPY"] == "1" {
+            if LagunaEnvFlags.ffnCopy {
                 Ops.copy(ffnOut, into: ffnOutScratch!, on: workBuf)
                 return Ops.add(h2, ffnOutScratch!, on: workBuf)
             }
@@ -1904,8 +1938,7 @@ final class LagunaLayer {
         // no-op (`guard attnPhaseTiming else { return }`) when the env
         // var is unset, so this is zero behavior change by default.
         // See benchmarks/laguna-xs/README.md T26.
-        let attnPhaseTiming =
-            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_ATTN_PHASE_TIMING"] == "1"
+        let attnPhaseTiming = LagunaEnvFlags.attnPhaseTiming
         var attnPhaseTimes: [(String, Double)] = []
         var attnPhaseT0 = CFAbsoluteTimeGetCurrent()
         var work = cmd
@@ -2322,12 +2355,12 @@ final class LagunaLayer {
             // MPP gather is quality-broken for Laguna affine4 on M5; force
             // simdgroup path. Escape: BUTTER_LAGUNA_MOE_MANY=0 → serial.
             // MPP re-enable: BUTTER_MOE_BGEMM_MPP=1 (and unset NO_MPP).
-            if ProcessInfo.processInfo.environment["BUTTER_MOE_BGEMM_NO_MPP"] == nil
-                && ProcessInfo.processInfo.environment["BUTTER_MOE_BGEMM_MPP"] == nil
+            if !LagunaEnvFlags.moeBgemmNoMpp
+                && !LagunaEnvFlags.moeBgemmMpp
             {
                 setenv("BUTTER_MOE_BGEMM_NO_MPP", "1", 0)
             }
-            if ProcessInfo.processInfo.environment["BUTTER_LAGUNA_MOE_MANY"] == "0" {
+            if LagunaEnvFlags.moeManyOff {
                 let dtBytes = ffnIn.dtype.byteSize
                 let outFlat = Tensor.empty(
                     shape: [nRows * hidden], dtype: ffnIn.dtype, device: device)
@@ -2717,6 +2750,14 @@ final class LagunaLayer {
         let gRaw = gProj.callMany(xNorm, t: t, on: cmd, device: device)
         let gSoft = Ops.softplus(gRaw, on: cmd)
         let nGates = t * nHeads
+        // W-headgate fuse: one broadcast pass replaces the host-built
+        // expand-id gather + separate mul (byte-identical). Escape `=0`.
+        if LagunaEnvFlags.headGateFuse {
+            let attn = attnOut.reshaped(to: [t, nHeads * headDim])
+            let gate = gSoft.reshaped(to: [nGates])
+            return Ops.headGateMul(
+                attn: attn, gate: gate, headDim: headDim, on: cmd)
+        }
         let table = gSoft.reshaped(to: [nGates, 1])
         // Expand ids: for each gate g, headDim repeats of g. Cache by T.
         let expandCount = nGates * headDim
@@ -3019,10 +3060,10 @@ public final class LagunaModel: LanguageModel {
     // window (uncounted); Laguna's default GPU-router Path B never
     // takes those, and they self-limit (they commit+wait on the host).
     static let nonblockDecodeEnabled: Bool =
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_NONBLOCK_DECODE"] != "0"
+        ButterEnv["BUTTER_LAGUNA_NONBLOCK_DECODE"] != "0"
     static let nonblockInflightCBs: Int = max(
         2,
-        Int(ProcessInfo.processInfo.environment["BUTTER_LAGUNA_INFLIGHT_CBS"] ?? "") ?? 24)
+        Int(ButterEnv["BUTTER_LAGUNA_INFLIGHT_CBS"] ?? "") ?? 24)
     /// Counting semaphore backing the cross-token in-flight window.
     /// Lazy is safe: decode host encode is single-threaded.
     private lazy var nonblockSem = DispatchSemaphore(value: Self.nonblockInflightCBs)
@@ -3143,10 +3184,20 @@ public final class LagunaModel: LanguageModel {
         //   ~41 main CBs + ~39 dual-queue B CBs + ~78 events + 39 blits
         // Packing layers/CB cuts main CB count; dual-queue opt-out cuts B/events;
         // residual-into-scratch skips the blit.
-        let pipe =
-            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LAYER_PIPE"] != "0"
+        let pipe = LagunaEnvFlags.layerPipe
         var workCmd = device.makeCommandBuffer()
         var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
+        // Embed-phase checkpoint, closing the last gap in the per-phase
+        // decode timing taxonomy (embed/attn/moe/lm_head_sample/host_gap).
+        // Reuses T39's decode-kernel-timing checkpoint (same forced
+        // commit+wait methodology; `LagunaDecodeKernelTiming.enabled`
+        // already forces `nonblock = false` below, so this stays
+        // consistent with the rest of the decode step being measured
+        // synchronously). No-op when BUTTER_LAGUNA_DECODE_KERNEL_TIMING is
+        // unset.
+        if LagunaDecodeKernelTiming.enabled {
+            workCmd = LagunaDecodeKernelTiming.checkpoint("embed", cmd: workCmd, device: device)
+        }
 
         // BUTTER_DEBUG_ROUTER_SETS (butter#108): debug-only fully
         // synchronous per-layer branch, taken instead of the pipe/nonblock
@@ -3206,8 +3257,7 @@ public final class LagunaModel: LanguageModel {
             // tok/s across the whole range: depth is already past its
             // saturation point at every value tested here, so the default
             // (4) is kept as-is.
-            let depth = max(
-                1, Int(ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PIPE_DEPTH"] ?? "") ?? 4)
+            let depth = LagunaEnvFlags.pipeDepth
             // Layers packed into one CB before commit. T28 lever 4 swept
             // 1..20 (fib prompt, --stats, 3 runs/side, 5s cooldowns) and
             // found the old default (2) was already past its own sweet
@@ -3227,7 +3277,7 @@ public final class LagunaModel: LanguageModel {
             let nonblock = Self.nonblockDecodeEnabled && !LagunaDecodeKernelTiming.enabled
             let layersPerCB = max(
                 1,
-                Int(ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LAYERS_PER_CB"] ?? "")
+                LagunaEnvFlags.layersPerCBEnv
                     ?? (nonblock ? 8 : 1))
             // Non-blocking commit: block only when the cross-token
             // in-flight CB count would exceed the window. Handler is
@@ -3328,7 +3378,7 @@ public final class LagunaModel: LanguageModel {
                 caches: caches, on: cmd, device: device)
         }
         // Full serial escape hatch (debug only).
-        if ProcessInfo.processInfo.environment["BUTTER_LAGUNA_SERIAL_PREFILL"] == "1" {
+        if LagunaEnvFlags.serialPrefill {
             var logits: Tensor!
             for (i, tok) in tokenIds.enumerated() {
                 logits = forward(
@@ -3345,6 +3395,15 @@ public final class LagunaModel: LanguageModel {
             _ = memcpy(tokBuf.contents(), $0.baseAddress!, n * 4)
         }
         let tokenTensor = Tensor(buffer: tokBuf, offset: 0, shape: [n], dtype: .u32)
+        // Embed-phase checkpoint, closing the last gap in the per-phase
+        // prefill timing taxonomy (embed/attn/moe/lm_head_sample/host_gap).
+        // This commit+wait was already unconditional here (embed must land
+        // before the first layer reads `h`), so timing it costs nothing
+        // extra -- just a clock read on each side, gated by the same
+        // BUTTER_LAGUNA_ATTN_PHASE_TIMING flag the rest of this function's
+        // prefill phase timing (below) already uses.
+        let embedPhaseTiming = LagunaEnvFlags.attnPhaseTiming
+        let embedT0 = embedPhaseTiming ? CFAbsoluteTimeGetCurrent() : 0
         var workCmd = device.makeCommandBuffer()
         var h = embedTokens(tokenTensor, on: workCmd)
             .reshaped(to: [n, hidden])
@@ -3354,21 +3413,22 @@ public final class LagunaModel: LanguageModel {
             workCmd.commit()
         }
         workCmd.waitUntilCompleted()
+        if embedPhaseTiming {
+            let ms = (CFAbsoluteTimeGetCurrent() - embedT0) * 1000
+            fputs("[laguna-prefill-embed] total=\(String(format: "%.2f", ms))ms\n", stderr)
+        }
 
         // Depth-2 pipe for prefill layers (same as decode) when MoE
         // decodeMany commits without mid-layer host waits.
         let layerScan =
-            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_LAYER_SCAN"] == "1"
+            LagunaEnvFlags.layerScan
         let layerTiming =
-            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_TIMING"] == "1"
+            LagunaEnvFlags.timing
         // When scanning/timing, force pipe depth 1 so each layer is fully
         // complete before the host reads h (or times the CB).
         let prefDepth = (layerScan || layerTiming)
             ? 1
-            : max(
-                1,
-                Int(ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PREFILL_PIPE"] ?? "")
-                    ?? 4)
+            : max(1, LagunaEnvFlags.prefillPipeEnv ?? 4)
         var inflight: [MTLCommandBuffer] = []
         var timingMs: [(Int, String, Double)] = []
         // F-lastrow: when set, the FINAL layer's already-computed last

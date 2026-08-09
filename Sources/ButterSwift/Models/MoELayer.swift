@@ -371,6 +371,39 @@ public struct MoERouter: Sendable {
 /// already do this since a token can't fan out across MoE layers in
 /// parallel. The class is `final` for closed-world dispatch, not for
 /// concurrency.
+
+/// Launch-time A/B flags read on the per-token / per-layer MoE decode
+/// paths. Hoisted to cached statics: these are process-lifetime
+/// switches, and even the getenv(3) form costs a libc environ scan per
+/// read x ~30 reads x 40 layers per token. None of these names is
+/// toggled mid-process by tests (verified against every setenv/unsetenv
+/// site under Tests/); mid-process-toggled flags must stay on live
+/// `ButterEnv[...]` reads.
+private enum MoEEnvFlags {
+    static let devplan2 = ButterEnv["DEVPLAN2"] != "0"
+    static let nvfp4Gather = ButterEnv["BUTTER_NVFP4_GATHER"] == "1"
+    static let moePhaseTiming = ButterEnv["BUTTER_LAGUNA_MOE_PHASE_TIMING"] == "1"
+    static let serialPathB = ButterEnv["BUTTER_NVFP4_SERIAL_PATHB"] == "1"
+    static let dualQueueOn = ButterEnv["BUTTER_LAGUNA_DUAL_QUEUE"] != "0"
+    static let noShared = ButterEnv["BUTTER_NVFP4_NO_SHARED"] != nil
+    static let sharedQmmOn = ButterEnv["BUTTER_NVFP4_SHARED_QMM"] != "0"
+    static let useGatherQmm = ButterEnv["BUTTER_NVFP4_USE_GATHER_QMM"] == "1"
+    static let gatherMppEnv = ButterEnv["BUTTER_NVFP4_USE_GATHER_MPP"]
+    static let gatherNax =
+        ButterEnv["BUTTER_NVFP4_GATHER_NAX"] == "1"
+        || ButterEnv["BUTTER_NVFP4_GATHER_NAX"]?.lowercased() == "true"
+    static let expertGroupQmm = ButterEnv["BUTTER_NVFP4_EXPERT_GROUP_QMM"] == "1"
+    static let gatherSort = ButterEnv["BUTTER_NVFP4_GATHER_SORT"] == "1"
+    static let expertGroupAsync = ButterEnv["BUTTER_NVFP4_EXPERT_GROUP_ASYNC"] != "0"
+    static let mppForceAllBf16 = ButterEnv["BUTTER_NVFP4_MPP_BF16"] == "1"
+    static let mppBf16MaxLayer = Int(ButterEnv["BUTTER_NVFP4_MPP_BF16_MAX_LAYER"] ?? "") ?? 36
+    static let mppNoSharedCast = ButterEnv["BUTTER_NVFP4_MPP_NO_SHARED_CAST"] == "1"
+    static let mppFusedGateUp = ButterEnv["BUTTER_NVFP4_MPP_FUSED_GATEUP"] != "0"
+    static let mppSerialGateUp = ButterEnv["BUTTER_NVFP4_MPP_SERIAL_GATEUP"] == "1"
+    static let pathBMode = ButterEnv["BUTTER_LAGUNA_PATHB"] ?? "full"
+    static let pathBFused = ButterEnv["BUTTER_LAGUNA_PATHB_FUSED"] != "0"
+}
+
 public final class MoELayer: Module, DecoderLayer {
     /// Router projection: hidden → nExperts logits.
     public let gate: AnyLinear
@@ -1152,7 +1185,7 @@ public final class MoELayer: Module, DecoderLayer {
     /// branches on this same predicate, so caller chaining (`commitAtEnd:
     /// false`) and the internal no-mid-commit path can never disagree.
     public var prefillChainsOnCallerCmd: Bool {
-        ProcessInfo.processInfo.environment["DEVPLAN2"] != "0"
+        MoEEnvFlags.devplan2
             && gpuRouterEnabled
             && router.gatingMode == .softmaxThenTopK
             && router.normTopKProb
@@ -1555,7 +1588,7 @@ public final class MoELayer: Module, DecoderLayer {
         // rides the default Path-B MPP gather — do NOT force the experimental
         // useGather branch (that skips default MPP entirely).
         if let nv = stackedNvfp4Experts, nv.dtype == dt,
-            ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER"] != "1"
+            !MoEEnvFlags.nvfp4Gather
         {
             return decodeManyNvfp4(
                 hFlat: hFlat, t: t, stacked: nv,
@@ -2356,7 +2389,7 @@ public final class MoELayer: Module, DecoderLayer {
         // and is off by default (zero behavior change when unset).
         // See benchmarks/laguna-xs/README.md T25.
         let moePhaseTiming =
-            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_MOE_PHASE_TIMING"] == "1"
+            MoEEnvFlags.moePhaseTiming
         var moePhaseTimes: [(String, Double)] = []
         var moePhaseT0 = CFAbsoluteTimeGetCurrent()
         func moePhaseCheckpoint(_ label: String) {
@@ -2400,9 +2433,9 @@ public final class MoELayer: Module, DecoderLayer {
         // gather for T≥4. BUTTER_NVFP4_GATHER_NAX=1 only swaps the MPP body
         // via Ops.nvfp4MoeGatherPrefersNax — leave useGather alone.
         let useGather =
-            ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER"] == "1"
+            MoEEnvFlags.nvfp4Gather
         let useSerialPathB =
-            ProcessInfo.processInfo.environment["BUTTER_NVFP4_SERIAL_PATHB"] == "1"
+            MoEEnvFlags.serialPathB
         // "pre" isolates whatever attention/norm work the caller already
         // encoded onto this same command buffer before MoE started (this
         // is the FIRST checkpoint of the layer's CB, so it is NOT free;
@@ -2480,12 +2513,9 @@ public final class MoELayer: Module, DecoderLayer {
                 var prefillSharedOut: Tensor?
                 var prefillSharedDone: UInt64?
                 let dualPrefillEarly =
-                    ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DUAL_QUEUE"]
-                        != "0"
-                    && ProcessInfo.processInfo.environment["BUTTER_NVFP4_NO_SHARED"]
-                        == nil
-                    && ProcessInfo.processInfo.environment["BUTTER_NVFP4_SHARED_QMM"]
-                        != "0"
+                    MoEEnvFlags.dualQueueOn
+                    && !MoEEnvFlags.noShared
+                    && MoEEnvFlags.sharedQmmOn
                     && sharedGateProj != nil
                 if dualPrefillEarly,
                     let sg = sharedGateProj, let su = sharedUpProj,
@@ -2610,29 +2640,26 @@ public final class MoELayer: Module, DecoderLayer {
                 //   • Expert-group dense QMM: BUTTER_NVFP4_EXPERT_GROUP_QMM=1
                 //   • Concurrent eidx: T<4 or MPP disabled
                 let useGatherQmm =
-                    ProcessInfo.processInfo.environment["BUTTER_NVFP4_USE_GATHER_QMM"] == "1"
+                    MoEEnvFlags.useGatherQmm
                 let mppEnv =
-                    ProcessInfo.processInfo.environment["BUTTER_NVFP4_USE_GATHER_MPP"]
+                    MoEEnvFlags.gatherMppEnv
                 // GATHER_NAX rides default MPP; force MPP on even for T<4.
                 let naxOn =
-                    ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX"] == "1"
-                    || ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX"]?
-                        .lowercased() == "true"
+                    MoEEnvFlags.gatherNax
                 let useGatherMpp =
                     !useGatherQmm
                     && mppEnv != "0"
                     && (naxOn || mppEnv == "1" || t >= 4)
                 let useExpertGroupQmm =
                     !useGatherQmm && !useGatherMpp
-                    && ProcessInfo.processInfo.environment["BUTTER_NVFP4_EXPERT_GROUP_QMM"]
-                        == "1"
+                    && MoEEnvFlags.expertGroupQmm
                 // Sorted plan for group QMM / MPP.
                 var sortedExperts: Tensor? = nil
                 var sortedSource: Tensor? = nil
                 var sortedInvPerm: Tensor? = nil
                 // Sort when MPP, expert-group, or gather-QMM with SORT=1.
                 let sortGather =
-                    ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_SORT"] == "1"
+                    MoEEnvFlags.gatherSort
                 if useGatherMpp || useExpertGroupQmm
                     || (useGatherQmm && sortGather)
                 {
@@ -2714,8 +2741,7 @@ public final class MoELayer: Module, DecoderLayer {
                     // the old gather-before-wait ordering (same math).
                     // Default = async pipe ON whenever expert-group is on.
                     let asyncPipe =
-                        ProcessInfo.processInfo.environment[
-                            "BUTTER_NVFP4_EXPERT_GROUP_ASYNC"] != "0"
+                        MoEEnvFlags.expertGroupAsync
 
                     let xGathered: Tensor
                     if asyncPipe {
@@ -2852,14 +2878,11 @@ public final class MoELayer: Module, DecoderLayer {
                     if let done = prefillSharedDone, let sOut = prefillSharedOut {
                         qmmCmd.encodeWaitForEvent(device.syncEvent, value: done)
                         _ = Ops.add(outFlat, sOut, on: qmmCmd, into: outFlat)
-                    } else if ProcessInfo.processInfo.environment["BUTTER_NVFP4_NO_SHARED"]
-                        == nil,
+                    } else if !MoEEnvFlags.noShared,
                         let sg = sharedGateProj, let su = sharedUpProj,
                         let sd = sharedDownProj
                     {
-                        let useSharedQmm =
-                            ProcessInfo.processInfo.environment["BUTTER_NVFP4_SHARED_QMM"]
-                            != "0"
+                        let useSharedQmm = MoEEnvFlags.sharedQmmOn
                         if useSharedQmm,
                             let shared = prefillSharedExpertNvfp4(
                                 hRows: hRows, t: t, gate: sg, up: su, down: sd,
@@ -2922,21 +2945,13 @@ public final class MoELayer: Module, DecoderLayer {
                     }
                     // Decide MPP dtype early so f32 path can fuse gather+cast
                     // (skip materializing bf16 xGathered).
-                    let forceAllBf16 =
-                        ProcessInfo.processInfo.environment["BUTTER_NVFP4_MPP_BF16"]
-                        == "1"
-                    let bf16MaxLayer =
-                        Int(
-                            ProcessInfo.processInfo.environment[
-                                "BUTTER_NVFP4_MPP_BF16_MAX_LAYER"] ?? "")
-                        ?? 36
+                    let forceAllBf16 = MoEEnvFlags.mppForceAllBf16
+                    let bf16MaxLayer = MoEEnvFlags.mppBf16MaxLayer
                     let useNativeBf16Mpp =
                         forceAllBf16
                         || (layerIndex >= 0 && layerIndex <= bf16MaxLayer
                             && bf16MaxLayer >= 0)
-                    let noSharedCast =
-                        ProcessInfo.processInfo.environment[
-                            "BUTTER_NVFP4_MPP_NO_SHARED_CAST"] == "1"
+                    let noSharedCast = MoEEnvFlags.mppNoSharedCast
                     let useF32Promote =
                         useGatherMpp && dt == .bf16 && !useNativeBf16Mpp && !noSharedCast
 
@@ -2951,8 +2966,7 @@ public final class MoELayer: Module, DecoderLayer {
                         mTotal: mTotal, nOut: moeIntermediate, kIn: hidden)
                     let useFusedGateUp =
                         !wantBm64GateUp
-                        && ProcessInfo.processInfo.environment[
-                            "BUTTER_NVFP4_MPP_FUSED_GATEUP"] != "0"
+                        && MoEEnvFlags.mppFusedGateUp
                     let xGathered: Tensor
                     if useF32Promote || (useGatherMpp && useFusedGateUp) {
                         // Fused paths read hRows via x_rows / gatherCast.
@@ -3099,8 +3113,7 @@ public final class MoELayer: Module, DecoderLayer {
                         } else {
                             // Materialise gather + concurrent pair (BM16 or BM64)
                             // / serial fallback.
-                            if ProcessInfo.processInfo.environment[
-                                    "BUTTER_NVFP4_MPP_SERIAL_GATEUP"] != "1"
+                            if !MoEEnvFlags.mppSerialGateUp
                             {
                                 Ops.nvfp4MoeGatherBm16Pair(
                                     input: xGathered,
@@ -3297,11 +3310,11 @@ public final class MoELayer: Module, DecoderLayer {
                 if let done = prefillSharedDone, let sOut = prefillSharedOut {
                     work.encodeWaitForEvent(device.syncEvent, value: done)
                     _ = Ops.add(outFlat, sOut, on: work, into: outFlat)
-                } else if ProcessInfo.processInfo.environment["BUTTER_NVFP4_NO_SHARED"] == nil,
+                } else if !MoEEnvFlags.noShared,
                     let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj
                 {
                     let useSharedQmm =
-                        ProcessInfo.processInfo.environment["BUTTER_NVFP4_SHARED_QMM"] != "0"
+                        MoEEnvFlags.sharedQmmOn
                     if useSharedQmm,
                         let shared = prefillSharedExpertNvfp4(
                             hRows: hRows, t: t, gate: sg, up: su, down: sd,
@@ -3347,7 +3360,7 @@ public final class MoELayer: Module, DecoderLayer {
 
         // ── Experimental gather / sorted eidx (A/B only) ─────────────
         let useGatherQmm =
-            ProcessInfo.processInfo.environment["BUTTER_NVFP4_USE_GATHER_QMM"] == "1"
+            MoEEnvFlags.useGatherQmm
         let gatherIdxTensor: Tensor
         let indices: Tensor
         if let se = sortedExperts, let gi = gatherIdx {
@@ -3480,7 +3493,7 @@ public final class MoELayer: Module, DecoderLayer {
             topKWeights: weightsTensor, into: outFlat,
             nRows: t, hidden: hidden, k: topK, on: work)
 
-        if ProcessInfo.processInfo.environment["BUTTER_NVFP4_NO_SHARED"] == nil,
+        if !MoEEnvFlags.noShared,
             let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj,
             let shared = prefillSharedExpertNvfp4(
                 hRows: hRows, t: t, gate: sg, up: su, down: sd,
@@ -3860,7 +3873,7 @@ public final class MoELayer: Module, DecoderLayer {
         expertBiasGPU: Tensor,
         cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
-        let mode = (ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PATHB"] ?? "full")
+        let mode = MoEEnvFlags.pathBMode
             .lowercased()
         if mode == "hybrid" {
             return decodeGPUPathBHybrid(
@@ -4066,7 +4079,7 @@ public final class MoELayer: Module, DecoderLayer {
         // queue B concurrent with routed experts on `cmd`. Escape:
         // BUTTER_LAGUNA_DUAL_QUEUE=0.
         let dualQueue =
-            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DUAL_QUEUE"] != "0"
+            MoEEnvFlags.dualQueueOn
             && sharedGateProj != nil && sharedUpProj != nil && sharedDownProj != nil
         var sharedOut: Tensor?
         var sharedDone: UInt64?
@@ -4094,7 +4107,7 @@ public final class MoELayer: Module, DecoderLayer {
         // Fused swiglu+down+weighted-sum when mid≤768 and gs=64 (Laguna OK).
         // Escape: BUTTER_LAGUNA_PATHB_FUSED=0 → 3-dispatch chain.
         let useFused =
-            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_PATHB_FUSED"] != "0"
+            MoEEnvFlags.pathBFused
             && stacked.moeIntermediate <= 768 && stacked.groupSize == 64
         if useFused {
             Ops.moeDownSwigluAccumInt4Chain8(
@@ -4296,7 +4309,7 @@ public final class MoELayer: Module, DecoderLayer {
         //     first on `cmd` so Metal can overlap independent dispatches
         //     with router+experts without cross-queue events.
         let dualQueue =
-            ProcessInfo.processInfo.environment["BUTTER_LAGUNA_DUAL_QUEUE"] != "0"
+            MoEEnvFlags.dualQueueOn
             && sharedGateProj != nil
         var sharedOut: Tensor?
         var sharedDone: UInt64?

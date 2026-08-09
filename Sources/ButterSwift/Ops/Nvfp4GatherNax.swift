@@ -18,7 +18,7 @@ extension Ops {
     public static func nvfp4MoeGatherPrefersNax(
         mTotal: Int, nOut: Int, kIn: Int
     ) -> Bool {
-        let env = ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX"]
+        let env = ButterEnv["BUTTER_NVFP4_GATHER_NAX"]
         guard env == "1" || env?.lowercased() == "true" else { return false }
         guard mTotal >= 64, nOut % 64 == 0, kIn % 32 == 0 else { return false }
         return true
@@ -34,7 +34,7 @@ extension Ops {
     public static func nvfp4MoeGatherPrefersNax64(
         mTotal: Int, nOut: Int, kIn: Int
     ) -> Bool {
-        let env = ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX64"]
+        let env = ButterEnv["BUTTER_NVFP4_GATHER_NAX64"]
         guard env == "1" || env?.lowercased() == "true" else { return false }
         guard mTotal >= 64, nOut % 64 == 0, kIn % 64 == 0 else { return false }
         return true
@@ -60,7 +60,7 @@ extension Ops {
         // f32 MPP unless early-layer preferNativeBf16 / force flag.
         let forceBf16Mpp =
             preferNativeBf16
-            || ProcessInfo.processInfo.environment["BUTTER_NVFP4_MPP_BF16"] == "1"
+            || ButterEnv["BUTTER_NVFP4_MPP_BF16"] == "1"
         if input.dtype == .bf16 && !forceBf16Mpp {
             let xTag = "nvfp4_nax64_xf_\(kIn)x\(nOut)"
             let oTag = "nvfp4_nax64_outf_\(kIn)x\(nOut)"
@@ -96,7 +96,7 @@ extension Ops {
         let tg = MTLSize(width: 128, height: 1, depth: 1)
         var m = UInt32(mTotal), n = UInt32(nOut), k = UInt32(kIn)
         var b = UInt32(blockSize), g = global
-        if ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX_VERBOSE"] == "1" {
+        if ButterEnv["BUTTER_NVFP4_GATHER_NAX_VERBOSE"] == "1" {
             struct Once { nonisolated(unsafe) static var printed = false }
             if !Once.printed {
                 Once.printed = true
@@ -205,7 +205,7 @@ extension Ops {
         // unless early-layer preferNativeBf16 / force flag.
         let forceBf16Mpp =
             preferNativeBf16
-            || ProcessInfo.processInfo.environment["BUTTER_NVFP4_MPP_BF16"] == "1"
+            || ButterEnv["BUTTER_NVFP4_MPP_BF16"] == "1"
         if input.dtype == .bf16 && !forceBf16Mpp {
             let xTag = "nvfp4_nax_xf_\(kIn)x\(nOut)"
             let oTag = "nvfp4_nax_outf_\(kIn)x\(nOut)"
@@ -230,7 +230,7 @@ extension Ops {
         // it compiles and runs but currently fails full-model quality (empty
         // gen); kept for kernel iteration / microbench.
         let wantLive =
-            ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX_LIVE"] == "1"
+            ButterEnv["BUTTER_NVFP4_GATHER_NAX_LIVE"] == "1"
         let grid = MTLSize(
             width: nOut / 64,
             height: (mTotal + 63) / 64,
@@ -250,7 +250,7 @@ extension Ops {
         }() {
             do {
                 let pso = try PSOCache.shared.pipelineStateThrowing(for: psoName)
-                if ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX_VERBOSE"]
+                if ButterEnv["BUTTER_NVFP4_GATHER_NAX_VERBOSE"]
                     == "1"
                 {
                     struct Once { nonisolated(unsafe) static var printed = false }
@@ -279,7 +279,7 @@ extension Ops {
                 enc.endEncoding()
                 return
             } catch {
-                if ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX_VERBOSE"]
+                if ButterEnv["BUTTER_NVFP4_GATHER_NAX_VERBOSE"]
                     == "1"
                 {
                     fputs(
@@ -289,7 +289,7 @@ extension Ops {
             }
         }
 
-        if ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX_VERBOSE"] == "1" {
+        if ButterEnv["BUTTER_NVFP4_GATHER_NAX_VERBOSE"] == "1" {
             struct Once { nonisolated(unsafe) static var printed = false }
             if !Once.printed {
                 Once.printed = true
@@ -350,7 +350,7 @@ extension Ops {
         // Prefer live-compiled butter NAX-class kernels (hand metal under
         // Resources/kernels/). Escape iron BM64 only: BUTTER_NVFP4_GATHER_NAX_LIVE=0.
         // Default when GATHER_NAX is on: try LIVE first.
-        let liveEnv = ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX_LIVE"]
+        let liveEnv = ButterEnv["BUTTER_NVFP4_GATHER_NAX_LIVE"]
         let wantLive = liveEnv != "0" && liveEnv?.lowercased() != "false"
         let livePsoName: String?
         switch input.dtype {
@@ -361,7 +361,7 @@ extension Ops {
         if wantLive, let liveName = livePsoName {
             do {
                 let pso = try PSOCache.shared.pipelineStateThrowing(for: liveName)
-                if ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX_VERBOSE"]
+                if ButterEnv["BUTTER_NVFP4_GATHER_NAX_VERBOSE"]
                     == "1"
                 {
                     struct Once { nonisolated(unsafe) static var printed = false }
@@ -404,7 +404,7 @@ extension Ops {
                 enc.endEncoding()
                 return
             } catch {
-                if ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX_VERBOSE"]
+                if ButterEnv["BUTTER_NVFP4_GATHER_NAX_VERBOSE"]
                     == "1"
                 {
                     fputs(
@@ -430,7 +430,7 @@ extension Ops {
             return
         }
         let pso = PSOCache.shared.pipelineState(for: psoName)
-        if ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_NAX_VERBOSE"] == "1" {
+        if ButterEnv["BUTTER_NVFP4_GATHER_NAX_VERBOSE"] == "1" {
             struct Once { nonisolated(unsafe) static var printed = false }
             if !Once.printed {
                 Once.printed = true

@@ -74,7 +74,7 @@ enum LagunaMppGemm {
     /// Default ON (`!= "0"`): candidate for the F-85 campaign pivot.
     /// Escape: BUTTER_LAGUNA_MPP_GEMM=0.
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_MPP_GEMM"] != "0"
+        ButterEnv["BUTTER_LAGUNA_MPP_GEMM"] != "0"
     }
 
     /// W34 NAX2 try-first path. Default ON (=0 to disable, restoring
@@ -85,14 +85,14 @@ enum LagunaMppGemm {
     /// staged-vs-steel delta), 6/6 correctness suite vs f32 CPU
     /// reference, native bfloat operands with strict precision.
     static var nax2Enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_NAX2_GEMM"] != "0"
+        ButterEnv["BUTTER_LAGUNA_NAX2_GEMM"] != "0"
     }
 
     /// L2-locality threadgroup-ID swizzle exponent for the NAX2 kernel
     /// (0 = identity, the measured-best default at Laguna prefill
     /// shapes; exposed for A/B on longer prompts / bigger grids).
     static var nax2SwizzleLog: UInt32 {
-        UInt32(ProcessInfo.processInfo.environment["BUTTER_LAGUNA_NAX2_SWIZZLE"] ?? "0") ?? 0
+        UInt32(ButterEnv["BUTTER_LAGUNA_NAX2_SWIZZLE"] ?? "0") ?? 0
     }
 
     /// The NAX2 kernel implements ONLY the fully aligned fast path
@@ -178,7 +178,7 @@ enum LagunaMppGemm {
     /// the pre-padding behavior (`eligible(t:...)` as the sole gate, no
     /// padding) for A/B against this change.
     static var padMEnabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_MPP_PAD_M"] != "0"
+        ButterEnv["BUTTER_LAGUNA_MPP_PAD_M"] != "0"
     }
 
     /// `out[m,n] = a[m,k] @ w[n,k]^T` via `butter_dense_gemm_mpp_bf16`.

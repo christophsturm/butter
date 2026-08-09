@@ -77,7 +77,7 @@ enum Nvfp4GatherEG {
     /// path branches on this flag (see file header: the GEMM repartition
     /// itself was not shipped this session).
     static var eg1Enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_NVFP4_EG1"] == "1"
+        ButterEnv["BUTTER_NVFP4_EG1"] == "1"
     }
 
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]

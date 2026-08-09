@@ -143,7 +143,7 @@ public final class Device: @unchecked Sendable {
     // `static let`, evaluated once) plus a branch per call site — no
     // string formatting or I/O unless explicitly opted in.
     public static let allocTraceEnabled: Bool = {
-        ProcessInfo.processInfo.environment["BUTTER_ALLOC_TRACE"] == "1"
+        ButterEnv["BUTTER_ALLOC_TRACE"] == "1"
     }()
 
     /// Zero the alloc-trace counters. No-op when
@@ -392,7 +392,7 @@ public final class Device: @unchecked Sendable {
     /// `BUTTER_UNRETAINED_CB=1` to opt in once a given workload's hot
     /// path is confirmed pool-clean.
     public static let unretainedCommandBuffersEnabled: Bool = {
-        ProcessInfo.processInfo.environment["BUTTER_UNRETAINED_CB"] == "1"
+        ButterEnv["BUTTER_UNRETAINED_CB"] == "1"
     }()
 
     /// Make a new MTLCommandBuffer. Routes through
@@ -419,7 +419,7 @@ public final class Device: @unchecked Sendable {
     /// to it. Requires macOS 15+ / iOS 18+; older OSes silently
     /// no-op. Set `BUTTER_NO_RESIDENCY_SET=1` to disable for A/B.
     public func markWeightsResident(_ buffers: [MTLBuffer]) {
-        if ProcessInfo.processInfo.environment["BUTTER_NO_RESIDENCY_SET"] != nil { return }
+        if ButterEnv["BUTTER_NO_RESIDENCY_SET"] != nil { return }
         guard #available(macOS 15.0, iOS 18.0, *) else { return }
         residencyLock.lock()
         defer { residencyLock.unlock() }

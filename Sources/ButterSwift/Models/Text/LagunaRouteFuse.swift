@@ -64,7 +64,7 @@ enum LagunaRouteFuse {
     /// `BUTTER_LAGUNA_FUSED_ROUTE=1`; the stock
     /// sigmoid / +bias / top-k / x-scale four-dispatch chain.
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_FUSED_ROUTE"] == "1"
+        ButterEnv["BUTTER_LAGUNA_FUSED_ROUTE"] == "1"
     }
 
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]

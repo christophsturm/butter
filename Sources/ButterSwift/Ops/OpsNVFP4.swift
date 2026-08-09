@@ -88,7 +88,7 @@ extension Ops {
         let gridTG = MTLSize(width: outDim, height: 1, depth: 1)
         let tg = MTLSize(width: tpg, height: 1, depth: 1)
         let useConcurrent =
-            ProcessInfo.processInfo.environment["BUTTER_MOE_SERIAL_EXPERT_GEMV"] == nil
+            ButterEnv["BUTTER_MOE_SERIAL_EXPERT_GEMV"] == nil
         let enc: MTLComputeCommandEncoder?
         if useConcurrent {
             enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
@@ -140,31 +140,30 @@ extension Ops {
     /// - GATHER_NAX / GATHER_BK64 also want 64-tile geometry (skip fused BM16 gateup).
     public static func nvfp4MoeGatherPrefersBm64(mTotal: Int, nOut: Int, kIn: Int) -> Bool {
         guard mTotal >= 64, nOut % 64 == 0, kIn % 32 == 0 else { return false }
-        let env = ProcessInfo.processInfo.environment
-        if env["BUTTER_NVFP4_GATHER_BM"] == "16" { return false }
+        if ButterEnv["BUTTER_NVFP4_GATHER_BM"] == "16" { return false }
         // NAX-class path also needs fused BM16 skipped (64-tile outs).
-        if env["BUTTER_NVFP4_GATHER_NAX"] == "1"
-            || env["BUTTER_NVFP4_GATHER_NAX"]?.lowercased() == "true"
+        if ButterEnv["BUTTER_NVFP4_GATHER_NAX"] == "1"
+            || ButterEnv["BUTTER_NVFP4_GATHER_NAX"]?.lowercased() == "true"
         {
             return true
         }
         // NAX64 (T22 true-BK64 stage) also needs the 64-tile materialise path.
-        if env["BUTTER_NVFP4_GATHER_NAX64"] == "1"
-            || env["BUTTER_NVFP4_GATHER_NAX64"]?.lowercased() == "true"
+        if ButterEnv["BUTTER_NVFP4_GATHER_NAX64"] == "1"
+            || ButterEnv["BUTTER_NVFP4_GATHER_NAX64"]?.lowercased() == "true"
         {
             return kIn % 64 == 0
         }
         // Board-class BK=64 stage (BM=BN=64) — opt-in, needs k_in % 64.
-        if env["BUTTER_NVFP4_GATHER_BK64"] == "1"
-            || env["BUTTER_NVFP4_GATHER_BK64"]?.lowercased() == "true"
+        if ButterEnv["BUTTER_NVFP4_GATHER_BK64"] == "1"
+            || ButterEnv["BUTTER_NVFP4_GATHER_BK64"]?.lowercased() == "true"
         {
             return kIn % 64 == 0
         }
-        if env["BUTTER_NVFP4_MOE_BM64"] == "1" { return true }
-        if env["BUTTER_NVFP4_GATHER_BM"] == "64" { return true }
+        if ButterEnv["BUTTER_NVFP4_MOE_BM64"] == "1" { return true }
+        if ButterEnv["BUTTER_NVFP4_GATHER_BM"] == "64" { return true }
         // Hybrid BM64 for wide-N: OPT-IN only. Default all-BM16 (see header).
-        let hybridOn = env["BUTTER_NVFP4_HYBRID_BM"] == "1"
-            || env["BUTTER_NVFP4_HYBRID_BM"]?.lowercased() == "true"
+        let hybridOn = ButterEnv["BUTTER_NVFP4_HYBRID_BM"] == "1"
+            || ButterEnv["BUTTER_NVFP4_HYBRID_BM"]?.lowercased() == "true"
         if hybridOn, nOut >= 1024 { return true }
         return false
     }
@@ -174,9 +173,8 @@ extension Ops {
         mTotal: Int, nOut: Int, kIn: Int
     ) -> Bool {
         guard mTotal >= 64, nOut % 64 == 0, kIn % 64 == 0 else { return false }
-        let env = ProcessInfo.processInfo.environment
-        return env["BUTTER_NVFP4_GATHER_BK64"] == "1"
-            || env["BUTTER_NVFP4_GATHER_BK64"]?.lowercased() == "true"
+        return ButterEnv["BUTTER_NVFP4_GATHER_BK64"] == "1"
+            || ButterEnv["BUTTER_NVFP4_GATHER_BK64"]?.lowercased() == "true"
     }
 
     /// Prefill MoE gather BGEMM NVFP4.
@@ -266,7 +264,7 @@ extension Ops {
         // Escape: BUTTER_NVFP4_MPP_BF16=1 or preferNativeBf16=true (early layers).
         let forceBf16Mpp =
             preferNativeBf16
-            || ProcessInfo.processInfo.environment["BUTTER_NVFP4_MPP_BF16"] == "1"
+            || ButterEnv["BUTTER_NVFP4_MPP_BF16"] == "1"
         if input.dtype == .bf16 && !forceBf16Mpp {
             // Reuse persistent slabs — Tensor.empty every call was ~3×
             // (gate/up/down) × 39 layers of fresh Metal buffer allocs per
@@ -376,7 +374,7 @@ extension Ops {
                 depth: 1)
             let tg = MTLSize(width: 32, height: 1, depth: 1)
             let forceBk16 =
-                ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_BK"] == "16"
+                ButterEnv["BUTTER_NVFP4_GATHER_BK"] == "16"
             let useBk32 = !forceBk16 && kIn % 32 == 0
             if useBk32 {
                 switch input.dtype {
@@ -486,7 +484,7 @@ extension Ops {
             rows = Tensor(buffer: idBuf, offset: 0, shape: [mTotal], dtype: .u32)
         }
         let wantFusedKernel =
-            ProcessInfo.processInfo.environment["BUTTER_NVFP4_MPP_FUSED_GATEUP"] == "1"
+            ButterEnv["BUTTER_NVFP4_MPP_FUSED_GATEUP"] == "1"
         if wantFusedKernel, input.dtype == .f32 || input.dtype == .bf16 {
             let psoName =
                 input.dtype == .f32
@@ -525,7 +523,7 @@ extension Ops {
         // (half K-loop vs classic BK16; skips butter xrows path).
         // Escape xrows: BUTTER_NVFP4_MPP_XROWS=1 (prior default).
         let wantXrows =
-            ProcessInfo.processInfo.environment["BUTTER_NVFP4_MPP_XROWS"] == "1"
+            ButterEnv["BUTTER_NVFP4_MPP_XROWS"] == "1"
         if wantXrows {
             nvfp4MoeGatherBm16XRowsPair(
                 input: input, xRows: rows,
@@ -756,7 +754,7 @@ extension Ops {
         let useBk64 = useBm64
             && nvfp4MoeGatherPrefersBm64Bk64(mTotal: mTotal, nOut: nOut, kIn: kIn)
         let forceBk16 =
-            ProcessInfo.processInfo.environment["BUTTER_NVFP4_GATHER_BK"] == "16"
+            ButterEnv["BUTTER_NVFP4_GATHER_BK"] == "16"
         let useBk32 = !useBm64 && !forceBk16 && kIn % 32 == 0
         let psoName: String
         switch (input.dtype, useBm64, useBk64, useBk32) {
@@ -1037,9 +1035,9 @@ extension Ops {
 
         // NAX: BM=BN=32, TPG 128 (4 SG × 32). Huge win vs reduction at
         // prefill shapes (T=512, mid=512, hidden multiple of 32).
-        let naxEnv = ProcessInfo.processInfo.environment["BUTTER_NVFP4_QMM_NAX"]
+        let naxEnv = ButterEnv["BUTTER_NVFP4_QMM_NAX"]
         let naxOn = naxEnv != "0" && naxEnv != "false"
-        let padEnv = ProcessInfo.processInfo.environment["BUTTER_NVFP4_QMM_NAX_PAD"]
+        let padEnv = ButterEnv["BUTTER_NVFP4_QMM_NAX_PAD"]
         let padEnabled = padEnv != "0"
 
         if padEnabled, naxOn, m >= 32, m % 32 != 0, outDim % 32 == 0, inDim % 32 == 0 {
@@ -1161,7 +1159,7 @@ extension Ops {
         let dtype = inputs[0].dtype
         let outDim = weights[0].shape[0]
         let inDim = weights[0].shape[1] * 8
-        let naxEnv = ProcessInfo.processInfo.environment["BUTTER_NVFP4_QMM_NAX"]
+        let naxEnv = ButterEnv["BUTTER_NVFP4_QMM_NAX"]
         let naxOn = naxEnv != "0" && naxEnv != "false"
         let dimsNax = naxOn && outDim % 32 == 0 && inDim % 32 == 0
         var naxIdx: [Int] = []

@@ -345,6 +345,54 @@ public enum Ops {
         return result
     }
 
+    /// Broadcast head-gate multiply: `out[i] = attn[i] * gate[i / headDim]`.
+    ///
+    /// Fuses the `gather(expand_ids) + mul` pair the softplus head-gate used
+    /// (host-built `[n]` expand-id buffer → general `iron_gather` → separate
+    /// `iron_mul`) into ONE `iron_head_gate_mul` broadcast pass. `gate` is the
+    /// flat `[rows * nHeads]` pre-activated per-head scalar buffer; `attn` is
+    /// the flat `[rows * nHeads * headDim]` attention output. Byte-identical
+    /// to the gather+mul it replaces (the gather is a bit-exact copy of
+    /// `gate[i / headDim]` and the product is the same native-`T` multiply).
+    public static func headGateMul(
+        attn: Tensor, gate: Tensor, headDim: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(attn.dtype == gate.dtype, "headGateMul: dtype mismatch")
+        precondition(
+            attn.elementCount % headDim == 0,
+            "headGateMul: attn count \(attn.elementCount) not a multiple of headDim \(headDim)")
+        let result = out ?? Tensor.empty(shape: attn.shape, dtype: attn.dtype)
+        let n = attn.elementCount
+        let (grid, tg) = elementwiseGrid(n)
+        switch attn.dtype {
+        case .f32:
+            IronKernels.iron_head_gate_mul_f32(
+                attn: attn.buffer, attnOffset: attn.offset,
+                gate: gate.buffer, gateOffset: gate.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_head_gate_mul_f16(
+                attn: attn.buffer, attnOffset: attn.offset,
+                gate: gate.buffer, gateOffset: gate.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_head_gate_mul_bf16(
+                attn: attn.buffer, attnOffset: attn.offset,
+                gate: gate.buffer, gateOffset: gate.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.headGateMul: unsupported dtype \(attn.dtype)")
+        }
+        return result
+    }
+
     public static func silu(
         _ x: Tensor, on cmd: MTLCommandBuffer,
         into out: Tensor? = nil
@@ -2886,7 +2934,7 @@ public enum Ops {
         // Concurrent default: gate‖up and multi-expert gemvs write distinct
         // outs (Hy3 int2 path). Serial escape: BUTTER_MOE_SERIAL_EXPERT_GEMV=1.
         let useConcurrent =
-            ProcessInfo.processInfo.environment["BUTTER_MOE_SERIAL_EXPERT_GEMV"] == nil
+            ButterEnv["BUTTER_MOE_SERIAL_EXPERT_GEMV"] == nil
         let enc: MTLComputeCommandEncoder?
         if useConcurrent {
             enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
@@ -2964,7 +3012,7 @@ public enum Ops {
         // BUTTER_HY3_SERIAL_EXPERT_GEMV=1 forces serial encoder.
         let useConcurrent =
             concurrent
-            && ProcessInfo.processInfo.environment["BUTTER_HY3_SERIAL_EXPERT_GEMV"] == nil
+            && ButterEnv["BUTTER_HY3_SERIAL_EXPERT_GEMV"] == nil
         let enc: MTLComputeCommandEncoder?
         if useConcurrent {
             enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
@@ -4607,7 +4655,7 @@ public enum Ops {
     /// layer per prefill chunk and once per attention layer per decode
     /// token on the batched decode path.
     private static let sdpaBK16Enabled: Bool =
-        ProcessInfo.processInfo.environment["BUTTER_SDPA_BK16"] != "0"
+        ButterEnv["BUTTER_SDPA_BK16"] != "0"
 
     public static func sdpaPrefillMmaD256(
         q: Tensor, k: Tensor, v: Tensor,
@@ -5871,7 +5919,7 @@ public enum Ops {
         // be validated on real hardware exactly as it would run on a paravirt
         // CI GPU (Family < 9) that cannot build cooperative-tensor PSOs.
         // Default off; genuine hardware detection below is unchanged.
-        if let raw = ProcessInfo.processInfo.environment["BUTTER_FORCE_NO_MPP"],
+        if let raw = ButterEnv["BUTTER_FORCE_NO_MPP"],
             raw == "1" || raw.lowercased() == "true"
         {
             return false
@@ -5941,14 +5989,13 @@ public enum Ops {
         // not route M1–M2 or pre-Metal-4 into a live-compile that cannot
         // find the MPP header (same .apple9 gate the MPP tests use).
         // Force-on skips the gate: explicit opt-in owns unsupported HW.
-        let env = ProcessInfo.processInfo.environment
         let useMpp: Bool
-        if env["BUTTER_MOE_BGEMM_NO_MPP"] != nil {
+        if ButterEnv["BUTTER_MOE_BGEMM_NO_MPP"] != nil {
             useMpp = false
-        } else if env["BUTTER_MOE_BGEMM_MPP"] != nil {
+        } else if ButterEnv["BUTTER_MOE_BGEMM_MPP"] != nil {
             useMpp = true
         } else {
-            let mppMin = Int(env["BUTTER_MOE_BGEMM_MPP_MIN"] ?? "") ?? 0
+            let mppMin = Int(ButterEnv["BUTTER_MOE_BGEMM_MPP_MIN"] ?? "") ?? 0
             useMpp = mTotal >= mppMin && Self.mppAutoCapable
         }
         let tgWidth = useMpp ? 32 : 64
@@ -8474,7 +8521,7 @@ public enum Ops {
         // flags like `qmmSmallMMax` cache at process start, which breaks
         // toggling the env mid-process from in-process tests.
         if bits == 4, nOut % 32 == 0, kIn % 32 == 0, t >= 1, t <= 16,
-            ProcessInfo.processInfo.environment["BUTTER_QMM_MMA_BM8"] == "1"
+            ButterEnv["BUTTER_QMM_MMA_BM8"] == "1"
         {
             let mPadded8 = ((t + 7) / 8) * 8
             let grid = MTLSize(width: nOut / 32, height: mPadded8 / 8, depth: 1)
@@ -8551,7 +8598,7 @@ public enum Ops {
         // start, which breaks toggling this env mid-process from
         // in-process tests).
         if bits == 4, t >= 5, t <= Self.qmmSmallMMax, nOut % 8 == 0,
-            ProcessInfo.processInfo.environment["BUTTER_QMM_BM8_SCALAR"] == "1"
+            ButterEnv["BUTTER_QMM_BM8_SCALAR"] == "1"
         {
             let mSmall8 = ((t + 7) / 8) * 8
             let grid = MTLSize(width: nOut / 8, height: mSmall8 / 8, depth: 1)
@@ -8789,9 +8836,9 @@ public enum Ops {
     /// dictionary that often was pure overhead once the tier decision
     /// stabilizes for the life of the process.
     private static let qmmMppEnvRaw: String? =
-        ProcessInfo.processInfo.environment["BUTTER_QMM_MPP"]
+        ButterEnv["BUTTER_QMM_MPP"]
     private static let qmmCoopEnvRaw: String? =
-        ProcessInfo.processInfo.environment["BUTTER_QMM_COOP"]
+        ButterEnv["BUTTER_QMM_COOP"]
 
     /// Inner dispatcher for `dequantGemmDynamicM`. Grid is `[N/32, M/32, 1]`
     /// × tg `[128, 1, 1]` (4 SGs WM=WN=2 per the canonical `iron_qmm_mma`).
@@ -8831,7 +8878,7 @@ public enum Ops {
     /// Max T routed to the BM=2 / BM=4 small-M quantized matmul kernels.
     /// 0 disables the fast path (BUTTER_QMM_SMALL_M=0).
     static let qmmSmallMMax: Int = {
-        if let raw = ProcessInfo.processInfo.environment["BUTTER_QMM_SMALL_M"] {
+        if let raw = ButterEnv["BUTTER_QMM_SMALL_M"] {
             return Int(raw) ?? 8
         }
         return 8
@@ -9140,7 +9187,7 @@ public enum Ops {
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .f32):
             // Prefer MPP/NAX int8 (live-compile) unless BUTTER_HY3_QMM_MMA=1.
-            if ProcessInfo.processInfo.environment["BUTTER_HY3_QMM_MMA"] == nil {
+            if ButterEnv["BUTTER_HY3_QMM_MMA"] == nil {
                 IronKernels.iron_qmm_mma_mpp_int8_f32_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -9160,7 +9207,7 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             }
         case (8, .f16):
-            if ProcessInfo.processInfo.environment["BUTTER_HY3_QMM_MMA"] == nil {
+            if ButterEnv["BUTTER_HY3_QMM_MMA"] == nil {
                 IronKernels.iron_qmm_mma_mpp_int8_f16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -9180,7 +9227,7 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             }
         case (8, .bf16):
-            if ProcessInfo.processInfo.environment["BUTTER_HY3_QMM_MMA"] == nil {
+            if ButterEnv["BUTTER_HY3_QMM_MMA"] == nil {
                 IronKernels.iron_qmm_mma_mpp_int8_bf16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -10479,26 +10526,26 @@ public enum Ops {
         // disables; BUTTER_HY3_EXPERT_GRID=1 forces.
         let useExpertGrid: Bool = {
             guard nExperts > 0 else { return false }
-            if ProcessInfo.processInfo.environment["BUTTER_HY3_NO_EXPERT_GRID"] != nil {
+            if ButterEnv["BUTTER_HY3_NO_EXPERT_GRID"] != nil {
                 return false
             }
-            if ProcessInfo.processInfo.environment["BUTTER_HY3_EXPERT_GRID"] != nil {
+            if ButterEnv["BUTTER_HY3_EXPERT_GRID"] != nil {
                 return true
             }
             return mTotal >= 1536
         }()
         let useBm64 =
             !useExpertGrid
-            && ProcessInfo.processInfo.environment["BUTTER_HY3_MOE_BM64"] != nil
+            && ButterEnv["BUTTER_HY3_MOE_BM64"] != nil
             && nOut % 64 == 0
             && kIn % 32 == 0
             && mTotal >= 64
         let useBm8 =
             !useExpertGrid && !useBm64
-            && ProcessInfo.processInfo.environment["BUTTER_HY3_MOE_BM8"] != nil
+            && ButterEnv["BUTTER_HY3_MOE_BM8"] != nil
         let useMma =
             !useExpertGrid && !useBm64 && !useBm8
-            && ProcessInfo.processInfo.environment["BUTTER_HY3_MOE_MMA"] != nil
+            && ButterEnv["BUTTER_HY3_MOE_MMA"] != nil
         // BM64: 4 SG; BM16 MMA: 2 SG; expert-grid/BM16/BM8 MPP: 1 SG.
         let tgWidth = useBm64 ? 128 : (useMma ? 64 : 32)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)

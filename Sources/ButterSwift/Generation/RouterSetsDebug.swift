@@ -55,7 +55,7 @@ import Foundation
 
 public enum RouterSetsDebug {
     public static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_DEBUG_ROUTER_SETS"] == "1"
+        ButterEnv["BUTTER_DEBUG_ROUTER_SETS"] == "1"
     }
 
     /// Current generated-token index, 1-based (t=0 is the prefill-seed

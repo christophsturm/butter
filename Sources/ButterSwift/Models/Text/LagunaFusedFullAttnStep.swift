@@ -167,7 +167,7 @@ enum LagunaFusedFullAttnStep {
     /// hardware gate below (mppAutoCapable) still declines on
     /// non-target devices regardless of this flag.
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP"] != "0"
+        ButterEnv["BUTTER_LAGUNA_FUSED_FULL_ATTN_STEP"] != "0"
     }
 
     /// Full-attention-layer decode only: partial rotary via YaRN,

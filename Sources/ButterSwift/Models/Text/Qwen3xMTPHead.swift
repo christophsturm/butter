@@ -560,7 +560,7 @@ public final class Qwen3xMTPHead: Module {
             hidden: hidden)
 
         let cacheCapacity =
-            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_CACHE"]
+            ButterEnv["BUTTER_QWEN_MTP_CACHE"]
             .flatMap(Int.init) ?? defaultCacheCapacity
         let kvCache = KVCache(
             nKVHeads: nKVHeads, headDim: headDim, maxSeq: cacheCapacity,
@@ -580,7 +580,7 @@ public final class Qwen3xMTPHead: Module {
         // is therefore gated on an EXPLICIT env var so the common "no
         // sidecar built for this checkpoint" case stays silent.
         let draftLmHead3BitEnv =
-            ProcessInfo.processInfo.environment["BUTTER_QWEN_MTP_DRAFT_LMHEAD_3BIT"]
+            ButterEnv["BUTTER_QWEN_MTP_DRAFT_LMHEAD_3BIT"]
         let draftLmHeadMode = DraftLmHead3BitMode.parse(draftLmHead3BitEnv)
         var draftLmHead: AnyLinear?
         if draftLmHeadMode != .off {

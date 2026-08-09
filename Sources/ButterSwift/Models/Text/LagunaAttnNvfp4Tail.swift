@@ -106,7 +106,7 @@ enum LagunaAttnNvfp4Tail {
     /// opt-in for smaller/more-aggressive tail configurations or a
     /// future re-A/B.
     static var fromLayer: Int {
-        guard let raw = ProcessInfo.processInfo.environment["BUTTER_LAGUNA_ATTN_NVFP4_FROM"],
+        guard let raw = ButterEnv["BUTTER_LAGUNA_ATTN_NVFP4_FROM"],
             let v = Int(raw)
         else { return 99 }
         return v

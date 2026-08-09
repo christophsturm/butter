@@ -55,7 +55,7 @@ enum LagunaGatedOProjFuse {
     /// Default ON; set `BUTTER_LAGUNA_FUSED_GATED_OPROJ=0` to restore the
     /// stock per-dispatch softplus/gather/mul (+ separate o_proj) chain.
     static var enabled: Bool {
-        ProcessInfo.processInfo.environment["BUTTER_LAGUNA_FUSED_GATED_OPROJ"] != "0"
+        ButterEnv["BUTTER_LAGUNA_FUSED_GATED_OPROJ"] != "0"
     }
 
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]
