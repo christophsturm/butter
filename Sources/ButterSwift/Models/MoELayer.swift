@@ -2658,14 +2658,27 @@ public final class MoELayer: Module, DecoderLayer {
                         buffer: prefInvPermScratch!.buffer,
                         offset: prefInvPermScratch!.offset,
                         shape: [mTotal], dtype: .u32)
-                    // MPP path: always classic sort (counting-sort has been
-                    // correlated with full-model NaNs; smoke with classic is
-                    // cos=1). Escape: BUTTER_MOE_COUNTING_SORT=1 forces count.
-                    let useCounting =
-                        !useGatherMpp && self.sortPlanCountingEnabled
-                        || (useGatherMpp
-                            && ProcessInfo.processInfo.environment[
-                                "BUTTER_MOE_COUNTING_SORT"] == "1")
+                    // MPP path: default-ON counting-sort (F-85, same gate as
+                    // DEVPLAN2). The prior classic-only forcing here dated
+                    // from ccbbd6fd (#76, Jul 31) — counting-sort was
+                    // correlated with full-model NaNs on the MPP gather-QMM
+                    // consumer at that time. Root-caused: not a bug in the
+                    // sort itself (its isolated GPU-correctness suite —
+                    // deterministic repeat-dispatch, Zipf-skewed routing,
+                    // production-scale uniform, block-size-non-multiple,
+                    // zero-count-expert edge cases — all pass, and the two
+                    // kernels write a byte-identical permutation for a given
+                    // topk_ids input). The NaN traced back to the MPP NVFP4
+                    // gather-QMM kernel it fed, since fixed by iron's
+                    // expert-aligned A-device-direct gather QMM (register-
+                    // direct masked C store, vectorized NVFP4 decode — all
+                    // merged after ccbbd6fd). Reverified: `--dump-prefill-logits`
+                    // cos=1.0 / maxdiff=0.0 vs classic sort at T=512 and
+                    // T=2048, byte-identical 256-tok greedy "The capital of
+                    // France is" generation. Escape hatch unchanged:
+                    // BUTTER_MOE_COUNTING_SORT=0 reverts to classic sort
+                    // everywhere (this path + DEVPLAN2).
+                    let useCounting = self.sortPlanCountingEnabled
                     if useCounting {
                         Ops.moeSortPlanCounting(
                             topkIds: indicesTok, sortedExperts: se, sourceTokens: st,
