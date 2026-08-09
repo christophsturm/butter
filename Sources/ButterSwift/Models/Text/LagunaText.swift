@@ -1394,7 +1394,7 @@ final class LagunaLayer {
         let q: Tensor
         let k: Tensor
         let v: Tensor
-        if let bank = attnNvfp4QKVBank, xNorm().dtype == .bf16 {
+        if let bank = attnNvfp4QKVBank, residual.dtype == .bf16 {
             let qDim = nHeads * headDim
             let kDim = nKVHeads * headDim
             let vDim = nKVHeads * headDim
@@ -1420,8 +1420,17 @@ final class LagunaLayer {
                         shape: [nHeads], dtype: .bf16)
                 }
             }
-            LagunaAttnNvfp4Tail.qmv(
-                input: xNorm(), bank: bank, on: work, device: device, into: attnInt8Scratch!)
+            // DECODE_QMV_V2: norm-folded single-dispatch QKV first
+            // (the NVFP4 twin of the INT8 branch's `qmvNormFolded`
+            // below); on decline (flag off, misaligned hidden) the
+            // pre-existing `xNorm()` + `qmv` chain runs unchanged.
+            let normFolded = LagunaAttnNvfp4Tail.normQmvV2(
+                residual: residual, normWeight: inputNorm.weight, eps: inputNorm.eps,
+                bank: bank, on: work, device: device, into: attnInt8Scratch!)
+            if !normFolded {
+                LagunaAttnNvfp4Tail.qmv(
+                    input: xNorm(), bank: bank, on: work, device: device, into: attnInt8Scratch!)
+            }
             q = attnInt8QScratch!
             k = attnInt8KScratch!
             v = attnInt8VScratch!

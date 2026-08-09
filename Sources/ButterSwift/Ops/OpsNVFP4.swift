@@ -209,6 +209,17 @@ extension Ops {
         //         butter_nvfp4_moe_gather_eg_mpp_bf16, default ON
         //         (escape BUTTER_NVFP4_MPP_GATHER=0). See
         //         `LagunaNvfp4MppGather.swift` for the full design.
+        // BUTTER_LAGUNA_GATHER_V2 (default ON, escape =0):
+        // expert-aligned A-device-direct iron kernel, checked ahead of
+        // EG-MPP. See `LagunaNvfp4ExpertGather.swift`.
+        if LagunaNvfp4ExpertGather.eligible(dtype: input.dtype, nOut: nOut, kIn: kIn, blockSize: blockSize) {
+            LagunaNvfp4ExpertGather.callGather(
+                input: input, weight: weight, scales: scales, indices: indices,
+                mTotal: mTotal, nOut: nOut, kIn: kIn,
+                blockSize: blockSize, global: global,
+                on: cmd, device: Device.shared, into: out)
+            return
+        }
         if LagunaNvfp4MppGather.eligible(dtype: input.dtype, nOut: nOut, kIn: kIn, blockSize: blockSize) {
             LagunaNvfp4MppGather.callGather(
                 input: input, weight: weight, scales: scales, indices: indices,
@@ -697,6 +708,20 @@ extension Ops {
         // `LagunaNvfp4MppGather.swift`. Default ON (escape
         // BUTTER_NVFP4_MPP_GATHER=0), checked ahead of steel/NAX/NAX64/BM16
         // same as the serial path above.
+        // BUTTER_LAGUNA_GATHER_V2 (default ON, escape =0):
+        // expert-aligned A-device-direct iron kernel, checked ahead of
+        // EG-MPP. See `LagunaNvfp4ExpertGather.swift`.
+        if LagunaNvfp4ExpertGather.eligible(dtype: input.dtype, nOut: nOut, kIn: kIn, blockSize: blockSize) {
+            LagunaNvfp4ExpertGather.callGatherPair(
+                input: input,
+                weight0: weight0, scales0: scales0, out0: out0,
+                weight1: weight1, scales1: scales1, out1: out1,
+                indices: indices,
+                mTotal: mTotal, nOut: nOut, kIn: kIn,
+                blockSize: blockSize, global: global,
+                on: cmd, device: Device.shared)
+            return
+        }
         if LagunaNvfp4MppGather.eligible(dtype: input.dtype, nOut: nOut, kIn: kIn, blockSize: blockSize) {
             LagunaNvfp4MppGather.callGatherPair(
                 input: input,
