@@ -17,18 +17,31 @@
 // the gated split-K V2 kernel + the V2 fast-dequant helpers):
 //
 // 1. Exhaustive dequant equivalence: `iron_nvfp4_e4m3_scale22_v2` /
-//    `iron_nvfp4_pack_dot_v2` vs the V1 `iron_nvfp4_e4m3_scale` /
-//    `iron_nvfp4_nibble_value` over ALL 256 E4M3 scale bytes x 16 E2M1
-//    nibbles, bit-exact (this is the mutation gate for the bit-trick
-//    decode — any wrong mask/shift flips at least one of the 4096
-//    combinations).
+//    `iron_nvfp4_pack_dot_v2` vs a CPU `Double`-precision ground-truth
+//    oracle (hardware-invariant by construction — see the derivation
+//    comment on `dequantEquivalenceExhaustive` below) over ALL 256 E4M3
+//    scale bytes x 16 E2M1 nibbles, bit-exact (this is the mutation
+//    gate for the bit-trick decode — any wrong mask/shift flips at
+//    least one of the 4096 combinations). This used to compare against
+//    a second *GPU* dispatch of V1's `iron_nvfp4_e4m3_scale` /
+//    `iron_nvfp4_nibble_value`, but V1's `exp2()`-based scale decode is
+//    itself hardware-variable (Metal does not require `exp2` to be
+//    correctly rounded) — retargeted 2026-08-09 after a CI-only 2-ULP
+//    mismatch at scaleByte=8 traced to exactly that.
 // 2. Norm-folded V2 QKV vs the separate `Ops.rmsNorm` + plain
 //    (non-split-K) QMV chain at Laguna XS's exact decode shapes —
 //    bit-exact primary assertion, tight-cosine fallback with a report,
 //    same contract as `LagunaQkvNormFoldTests` (the INT8 twin).
 // 3. Gated split-K V2 vs V1 at the exact o_proj shapes — bit-exact
 //    strict (same geometry, same rounding points; only the dequant
-//    encoding and where the softplus is computed differ).
+//    encoding and where the softplus is computed differ). NOTE: this
+//    still compares against a live V1 GPU dispatch, so it inherits the
+//    same latent hardware-exp2 risk documented on test 1 above — it
+//    just hasn't been observed to trip on real (non-exhaustive) random
+//    weight banks. If CI ever flags `gatedSliding`/`gatedFull`, apply
+//    the same CPU-f64-oracle retarget rather than assuming a real
+//    kernel bug.
+
 // 4. Magnitude sweep (T23 class): finite + accurate at real late-layer
 //    activation magnitudes.
 // 5. Decline hygiene: V2 off or misaligned hidden must decline so the
@@ -82,26 +95,85 @@ struct LagunaAttnNvfp4V2Tests {
     }
 
     // MARK: - 1. Exhaustive dequant equivalence (the mutation gate)
+    //
+    // Ground truth here is computed on the CPU in double precision --
+    // hardware-invariant by construction -- rather than by dispatching a
+    // second *GPU* kernel that runs V1's `iron_nvfp4_e4m3_scale`. That
+    // used to be the reference, but V1's "normal" branch calls Metal's
+    // `exp2()` intrinsic, which the Metal Shading Language spec does
+    // NOT require to be correctly rounded (unlike float/double
+    // conversion, which IEEE 754 pins to round-to-nearest-even): it is
+    // a hardware transcendental-function-unit approximation, and Apple
+    // Silicon generations are free to disagree on the exact result even
+    // for an *integer* exponent input whose true answer is an exactly
+    // representable power of two.
+    //
+    // Root-caused 2026-08-09 (CI failure: 9/4096 mismatches, all at
+    // scaleByte=8 which is exp4=1/mant3=0, i.e. scale = exp2(1-7) with
+    // no mantissa to mask the transcendental's error): the true product
+    // for scaleByte=8, nib=1 is 0.5 * 2^-6 = 2^-7 = 0.0078125 exactly
+    // (bits 1_006_632_960). V2 (`iron_nvfp4_e4m3_scale22_v2` +
+    // `iron_nvfp4_pack_dot_v2`) reproduces that value bit-for-bit on
+    // both M5 Max and the CI runner -- it never calls a transcendental,
+    // it lands the E4M3 exponent field directly into an IEEE half's
+    // exponent bits via `(bits + (bits & 128)) << 7` and reinterprets,
+    // an exact bit construction. V1's GPU `exp2(-6.0f)` matched that on
+    // M5 Max but returned a value 2 ULP low (0.007812499, bits
+    // 1_006_632_958) on the CI runner's Apple Silicon generation. So
+    // V1 -- not V2 -- was the hardware-variable side of the old
+    // comparison; V2 is unchanged and ships as-is, and this test now
+    // checks V2 against ground truth instead of against V1's GPU
+    // output. (Cross-checked against `Nvfp4FastDequantTests
+    // .e4m3SignFoldExhaustive256`, which independently validates the
+    // same V2-style E4M3 bit-fold against a CPU Swift `pow()`-based
+    // reference for all 256 scale bytes and already passes.)
 
-    @Test("V2 fast dequant == V1 dequant, all 256 scale bytes x 16 nibbles, bit-exact")
+    /// True E4M3 scale value for `bits`, computed in `Double` with no
+    /// transcendental call anywhere in the path: the power-of-two factor
+    /// is constructed directly via `Double.init(sign:exponent:significand:)`
+    /// (an exact IEEE 754 construction, not a function approximation), and
+    /// every other step (integer mantissa scaled by an exact power of two)
+    /// is exact in binary floating point. This is the ground-truth oracle;
+    /// narrowing to `Float` below is the only rounding step, and Swift's
+    /// `Float(Double)` narrowing is correctly rounded (round-to-nearest,
+    /// ties-to-even) per IEEE 754 / the language spec.
+    private static func trueE4M3Scale(_ bits: UInt8) -> Double {
+        let b = UInt32(bits)
+        let exp4 = Int((b >> 3) & 15)
+        let mant3 = Double(b & 7)
+        let mag: Double
+        if exp4 == 0 {
+            mag = mant3 * 0.001953125  // 2^-9, exact (integer x exact power of two)
+        } else {
+            let p = Double(sign: .plus, exponent: exp4 - 7, significand: 1.0)  // exact 2^(exp4-7)
+            mag = (1.0 + mant3 * 0.125) * p  // exact: mant3/8 exact, x power-of-two exact
+        }
+        return ((b >> 7) & 1) != 0 ? -mag : mag
+    }
+
+    private static let e2m1MagnitudeLut: [Double] = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
+
+    /// True E2M1 nibble value, computed in `Double` (every LUT entry and
+    /// the sign flip are exact in binary floating point).
+    private static func trueE2M1Nibble(_ nib: UInt32) -> Double {
+        let mag = Self.e2m1MagnitudeLut[Int(nib & 7)]
+        return (nib & 8) != 0 ? -mag : mag
+    }
+
+    @Test("V2 fast dequant == CPU f64 ground truth, all 256 scale bytes x 16 nibbles, bit-exact")
     func dequantEquivalenceExhaustive() {
         let probeSrc = """
             #include <metal_stdlib>
             using namespace metal;
 
-            \(LagunaAttnNvfp4Tail.helperSrcForTesting)
-
             \(LagunaAttnNvfp4Tail.helperV2Src)
 
             kernel void laguna_nvfp4_v2_dequant_probe(
-                device float *ref [[buffer(0)]],
-                device float *v2 [[buffer(1)]],
+                device float *v2 [[buffer(0)]],
                 uint tid [[thread_position_in_grid]])
             {
                 uint scaleByte = tid >> 4;   // 0..255
                 uint nib = tid & 0xFu;       // 0..15
-                ref[tid] = iron_nvfp4_e4m3_scale(uchar(scaleByte))
-                    * iron_nvfp4_nibble_value(nib);
                 // V2 path exactly as a QMV lane computes one term: the
                 // pack word carries `nib` in nibble slot 0 and the
                 // activation vector selects slot 0 only.
@@ -116,35 +188,37 @@ struct LagunaAttnNvfp4V2Tests {
         let pso = try! device.makeComputePipelineState(function: fn)
 
         let n = 256 * 16
-        let refT = Tensor.empty(shape: [n], dtype: .f32)
         let v2T = Tensor.empty(shape: [n], dtype: .f32)
         runAndWait { cb in
             let enc = cb.makeComputeCommandEncoder()!
             enc.setComputePipelineState(pso)
-            enc.setBuffer(refT.buffer, offset: refT.offset, index: 0)
-            enc.setBuffer(v2T.buffer, offset: v2T.offset, index: 1)
+            enc.setBuffer(v2T.buffer, offset: v2T.offset, index: 0)
             enc.dispatchThreads(
                 MTLSize(width: n, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
             enc.endEncoding()
         }
-        let a = refT.toFloatArray()
         let b = v2T.toFloatArray()
-        #expect(a.count == n && b.count == n)
+        #expect(b.count == n)
         var mismatches = 0
-        for i in 0 ..< n where a[i].bitPattern != b[i].bitPattern {
+        for i in 0 ..< n {
+            let scaleByte = UInt8(i >> 4)
+            let nib = UInt32(i & 15)
+            let truth = Self.trueE4M3Scale(scaleByte) * Self.trueE2M1Nibble(nib)
+            let a = Float(truth)  // correctly-rounded double -> float32 narrowing
+            guard a.bitPattern != b[i].bitPattern else { continue }
             // -0.0 vs +0.0 both encode "zero code x some scale sign";
-            // treat signed zero as equal only if V1 itself produced the
-            // sign V2 did — i.e. require true bit equality, and record
-            // the combination on failure.
+            // treat signed zero as equal only if the ground truth itself
+            // has the sign V2 did — i.e. require true bit equality, and
+            // record the combination on failure.
             mismatches += 1
             if mismatches <= 8 {
                 let msg =
-                    "scaleByte=\(i >> 4) nib=\(i & 15): ref=\(a[i]) (\(a[i].bitPattern)) v2=\(b[i]) (\(b[i].bitPattern))"
+                    "scaleByte=\(i >> 4) nib=\(i & 15): truth=\(a) (\(a.bitPattern)) v2=\(b[i]) (\(b[i].bitPattern))"
                 Issue.record(Comment(rawValue: msg))
             }
         }
-        #expect(mismatches == 0, "V2 dequant diverges from V1 on \(mismatches)/\(n) combinations")
+        #expect(mismatches == 0, "V2 dequant diverges from CPU f64 ground truth on \(mismatches)/\(n) combinations")
     }
 
     // MARK: - 2. Norm-folded V2 QKV vs separate chain
