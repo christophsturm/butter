@@ -117,11 +117,25 @@ enum LagunaNvfp4ExpertGather {
         var any: Bool { skipSort || fusedSilu || f16Inner }
     }
 
+    // Default ON. These three levers shipped byte-identical-but-opt-in
+    // since W6.5. The byte-census wave traced the default MoE path's
+    // fattest excess round trip to a redundant double gather/sort/scatter:
+    // MoELayer materializes a device-plan-sorted gather, then this file's
+    // gather chain independently re-sorts + gather-casts + scatters the
+    // GEMM output back through an identity inverse-permutation — even
+    // though the caller's rows are already sorted. skipSort drops that
+    // redundant machinery; fusedSilu/f16Inner ride along on the same
+    // fused path. Byte-identical by construction (LagunaExpertGatherLever
+    // oracles pass unchanged; 802-token prefill + 80-token greedy stream
+    // token-ID-identical vs the pre-flip chain). Wired A/B (same session,
+    // n=16/arm, both orders interleaved, full separation): +11.5–13.7%
+    // prefill. Escape `BUTTER_LAGUNA_V2_SKIP_SORT=0` / `_FUSED_SILU=0` /
+    // `_F16_INNER=0` to restore the pre-flip per-lever chain.
     static var levers: Levers {
         Levers(
-            skipSort: ButterEnv["BUTTER_LAGUNA_V2_SKIP_SORT"] == "1",
-            fusedSilu: ButterEnv["BUTTER_LAGUNA_V2_FUSED_SILU"] == "1",
-            f16Inner: ButterEnv["BUTTER_LAGUNA_V2_F16_INNER"] == "1")
+            skipSort: ButterEnv["BUTTER_LAGUNA_V2_SKIP_SORT"] != "0",
+            fusedSilu: ButterEnv["BUTTER_LAGUNA_V2_FUSED_SILU"] != "0",
+            f16Inner: ButterEnv["BUTTER_LAGUNA_V2_F16_INNER"] != "0")
     }
 
     /// Same MPP capability gate as every other `matmul2d` kernel here.
