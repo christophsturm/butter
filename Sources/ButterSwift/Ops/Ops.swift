@@ -7506,6 +7506,121 @@ public enum Ops {
         }
     }
 
+    /// W57: fused MoE combine tail — `moeUnpermute` + shared-expert add +
+    /// residual add in ONE dispatch, replacing the Laguna prefill sorted-MoE
+    /// tail's three separate `[T, hidden]` passes (`moeUnpermute` ->
+    /// `Ops.add` shared -> `Ops.add` residual) with one read of each input
+    /// and one write of `out`. Flag-gated via
+    /// `BUTTER_LAGUNA_FUSED_MOE_TAIL` (see `LagunaFusedMoeTail`); default OFF
+    /// for the W57 A/B, zero behavior change unless set.
+    ///
+    /// `sharedExpert` is optional — pass `nil` on paths/layers with no
+    /// shared expert (e.g. `MoEEnvFlags.noShared`, or a model variant
+    /// without one). When `nil`, `residual` is bound at the kernel's
+    /// `shared_expert_out` slot as a same-shape dummy buffer and
+    /// `has_shared=0` guards the load so it is never read — matching the
+    /// iron kernel's documented dummy-buffer contract
+    /// (`iron_moe_unpermute_tail` in `moe/moe_unpermute_tail.rs`).
+    ///
+    /// Accumulation order matches the unfused call sites exactly (unpermute
+    /// -> += shared -> += residual, kept in one f32 accumulator instead of
+    /// round-tripping through `T` between steps) — see that kernel's file
+    /// header for why this is not a reassociation and should be
+    /// byte-identical, not just within-tolerance.
+    public static func moeUnpermuteTail(
+        expertOutputs: Tensor,
+        invPerm: Tensor,
+        topKWeights: Tensor,
+        sharedExpert: Tensor?,
+        residual: Tensor,
+        into out: Tensor,
+        nRows: Int, hidden: Int, k: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            invPerm.dtype == .u32,
+            "Ops.moeUnpermuteTail: invPerm must be u32 (got \(invPerm.dtype))")
+        precondition(
+            expertOutputs.dtype == topKWeights.dtype && topKWeights.dtype == out.dtype
+                && residual.dtype == out.dtype,
+            "Ops.moeUnpermuteTail: expertOutputs/topKWeights/residual/out must share dtype")
+        if let shared = sharedExpert {
+            precondition(
+                shared.dtype == out.dtype,
+                "Ops.moeUnpermuteTail: sharedExpert must share dtype with out")
+            precondition(
+                shared.elementCount == nRows * hidden,
+                "Ops.moeUnpermuteTail: sharedExpert has \(shared.elementCount) elements, expected nRows·hidden = \(nRows * hidden)"
+            )
+        }
+        precondition(
+            expertOutputs.elementCount == nRows * k * hidden,
+            "Ops.moeUnpermuteTail: expertOutputs has \(expertOutputs.elementCount) elements, expected nRows·k·hidden = \(nRows * k * hidden)"
+        )
+        precondition(
+            invPerm.elementCount == nRows * k,
+            "Ops.moeUnpermuteTail: invPerm has \(invPerm.elementCount) elements, expected nRows·k = \(nRows * k)"
+        )
+        precondition(
+            topKWeights.elementCount == nRows * k,
+            "Ops.moeUnpermuteTail: topKWeights has \(topKWeights.elementCount) elements, expected nRows·k = \(nRows * k)"
+        )
+        precondition(
+            residual.elementCount == nRows * hidden,
+            "Ops.moeUnpermuteTail: residual has \(residual.elementCount) elements, expected nRows·hidden = \(nRows * hidden)"
+        )
+        precondition(
+            out.elementCount == nRows * hidden,
+            "Ops.moeUnpermuteTail: out has \(out.elementCount) elements, expected nRows·hidden = \(nRows * hidden)"
+        )
+
+        let tgWidth = 128
+        let grid = MTLSize(width: nRows * tgWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let hiddenU = UInt32(hidden)
+        let kU = UInt32(k)
+        let hasSharedU: UInt32 = sharedExpert != nil ? 1 : 0
+        // Dummy buffer for the shared_expert_out slot when there is no
+        // shared expert: same-shape `residual` is a safe bind (correct
+        // size, never read — has_shared=0 guards the kernel's load).
+        let sharedBuf = sharedExpert ?? residual
+
+        switch out.dtype {
+        case .f32:
+            IronKernels.iron_moe_unpermute_tail_f32(
+                expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
+                inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+                top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
+                shared_expert_out: sharedBuf.buffer, shared_expert_outOffset: sharedBuf.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU, k: kU, has_shared: hasSharedU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_moe_unpermute_tail_f16(
+                expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
+                inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+                top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
+                shared_expert_out: sharedBuf.buffer, shared_expert_outOffset: sharedBuf.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU, k: kU, has_shared: hasSharedU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_moe_unpermute_tail_bf16(
+                expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
+                inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+                top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
+                shared_expert_out: sharedBuf.buffer, shared_expert_outOffset: sharedBuf.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU, k: kU, has_shared: hasSharedU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.moeUnpermuteTail: unsupported dtype \(out.dtype)")
+        }
+    }
+
     public static func moeGatherDequantGemmInt4Bm8(
         input: Tensor,
         weight: Tensor, scales: Tensor, biases: Tensor,

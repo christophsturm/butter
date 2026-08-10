@@ -506,6 +506,18 @@ public final class MoELayer: Module, DecoderLayer {
     /// `LagunaMppGemm.swift`'s header.
     let gateWeightT: Tensor?
 
+    /// W57: set by `decodeMany`/`decodeManyNvfp4` immediately after each
+    /// call to record whether a `fusedResidual` passed to that call was
+    /// actually folded into the MoE combine tail (`Ops.moeUnpermuteTail`)
+    /// vs left for the caller to add itself. Side-channel rather than a
+    /// tuple return so `decodeMany`'s signature/behavior stays unchanged
+    /// for its other callers (Qwen3x*, MTP head) — only the one Laguna
+    /// call site (`LagunaText.forwardMulti`'s `.moe` case) reads this,
+    /// immediately after its `decodeMany` call, before any other call on
+    /// this instance can race it (prefill is sequential per layer). See
+    /// `LagunaFusedMoeTail` for the full fusion rationale/gate.
+    public private(set) var lastResidualFused: Bool = false
+
     /// Stacked-expert weight handles for the batched gather BGEMM fast
     /// path. When set, `decode` dispatches `iron_moe_gather_qmm_mma_int4_bm16`
     /// instead of running `topK` sequential per-expert SwiGLU triplets —
@@ -1641,12 +1653,14 @@ public final class MoELayer: Module, DecoderLayer {
     public func decodeMany(
         _ hFlat: Tensor, t: Int,
         cmd: MTLCommandBuffer, device: Device,
-        commitAtEnd: Bool = true
+        commitAtEnd: Bool = true,
+        fusedResidual: Tensor? = nil
     ) -> Tensor {
         precondition(
             hFlat.elementCount == t * hidden,
             "MoELayer.decodeMany: hFlat size \(hFlat.elementCount) ≠ T·hidden = \(t * hidden)")
         precondition(t > 0, "MoELayer.decodeMany: T must be positive")
+        lastResidualFused = false
 
         let dt = hFlat.dtype
 
@@ -1666,6 +1680,7 @@ public final class MoELayer: Module, DecoderLayer {
                 routings: [], sortedExpertsHost: [],
                 sourceTokensHost: [], invPermHost: [],
                 weightsTokenOrderHost: [],
+                fusedResidual: fusedResidual,
                 cmd: cmd, device: device, commitAtEnd: commitAtEnd,
                 useDevicePlan: true)
         }
@@ -1875,6 +1890,7 @@ public final class MoELayer: Module, DecoderLayer {
                 routings: routings, sortedExpertsHost: sortedExpertsHost,
                 sourceTokensHost: sourceTokensHost, invPermHost: invPermHost,
                 weightsTokenOrderHost: weightsTokenOrderHost,
+                fusedResidual: fusedResidual,
                 cmd: cmd, device: device, commitAtEnd: commitAtEnd,
                 useDevicePlan: d2Indices != nil)
         }
@@ -2442,6 +2458,7 @@ public final class MoELayer: Module, DecoderLayer {
         routings: [MoERouter.Routing],
         sortedExpertsHost: [UInt32], sourceTokensHost: [UInt32],
         invPermHost: [UInt32], weightsTokenOrderHost: [Float],
+        fusedResidual: Tensor? = nil,
         cmd: MTLCommandBuffer, device: Device,
         commitAtEnd: Bool, useDevicePlan: Bool
     ) -> Tensor {
@@ -3514,12 +3531,32 @@ public final class MoELayer: Module, DecoderLayer {
                         blockSize: stacked.blockSize, global: stacked.global, on: work)
                 }
 
+                // W57: fused combine+shared+residual tail eligibility.
+                // Only the sorted/MPP `Ops.moeUnpermute` path (not the
+                // token-order FMA `else` below, not the
+                // `LagunaSortedCombine` numerics-audit alternative — a
+                // separate, orthogonal experiment; that flag takes
+                // priority when both happen to be set — see
+                // `LagunaFusedMoeTail`'s file header for the full
+                // rationale). `tailFused` records whether the fused
+                // kernel actually ran this call, so the unfused
+                // shared-expert block below (and `lastResidualFused`,
+                // read by the caller) can key off it.
+                let fuseTailWanted =
+                    LagunaFusedMoeTail.enabled && fusedResidual != nil
+                    && !(LagunaSortedCombine.enabled && topK <= 8)
+                var tailFused = false
+
                 // Weighted sum: FMA when outputs are token-order; unpermute
                 // when expert-sorted (MPP path).
                 if let inv = sortedInvPerm {
                     // Zero outFlat so any unpermute gap is 0 not NaN garbage.
                     // GPU blit (not host memset) — avoids CPU↔GPU sync on
-                    // shared storage mid-cmdbuf under swap pressure.
+                    // shared storage mid-cmdbuf under swap pressure. Not
+                    // needed by the fused kernel (it writes every element
+                    // unconditionally) but kept unconditional for
+                    // simplicity — cheap relative to the tail's other
+                    // dispatches and harmless when overwritten right after.
                     if let blit = work.makeBlitCommandEncoder() {
                         let o0 = outFlat.offset
                         let o1 = o0 + outFlat.elementCount * dtBytes
@@ -3552,6 +3589,46 @@ public final class MoELayer: Module, DecoderLayer {
                             topKWeights: weightsTok, into: outFlat,
                             nRows: t, hidden: hidden, k: topK,
                             on: work, device: device)
+                    } else if fuseTailWanted {
+                        // Resolve the shared-expert output as ONE
+                        // [T,hidden] tensor (or nil) first — same three
+                        // sub-cases the unfused shared-add block below
+                        // handles, just without doing the add yet. The
+                        // per-row swiGLU fallback (no batched QMM) can't
+                        // produce one [T,hidden] tensor up front without
+                        // its own scratch-buffer restructuring — that
+                        // sub-case is out of scope for this bounded lever
+                        // (rare/slow path already), so it falls through to
+                        // the unfused sequence below instead.
+                        let sharedIsFallbackOnly =
+                            !MoEEnvFlags.noShared && sharedGateProj != nil
+                            && !MoEEnvFlags.sharedQmmOn && prefillSharedDone == nil
+                        if sharedIsFallbackOnly {
+                            Ops.moeUnpermute(
+                                expertOutputs: downOut, invPerm: inv,
+                                topKWeights: weightsTok, into: outFlat,
+                                nRows: t, hidden: hidden, k: topK, on: work)
+                        } else {
+                            var sharedTensor: Tensor?
+                            if let done = prefillSharedDone, let sOut = prefillSharedOut {
+                                work.encodeWaitForEvent(device.syncEvent, value: done)
+                                sharedTensor = sOut
+                            } else if !MoEEnvFlags.noShared,
+                                let sg = sharedGateProj, let su = sharedUpProj,
+                                let sd = sharedDownProj, MoEEnvFlags.sharedQmmOn
+                            {
+                                sharedTensor = prefillSharedExpertNvfp4(
+                                    hRows: hRows, t: t, gate: sg, up: su, down: sd,
+                                    dtype: dt, on: work, device: device)
+                            }
+                            Ops.moeUnpermuteTail(
+                                expertOutputs: downOut, invPerm: inv,
+                                topKWeights: weightsTok, sharedExpert: sharedTensor,
+                                residual: fusedResidual!, into: outFlat,
+                                nRows: t, hidden: hidden, k: topK, on: work)
+                            tailFused = true
+                            lastResidualFused = true
+                        }
                     } else {
                         Ops.moeUnpermute(
                             expertOutputs: downOut, invPerm: inv,
@@ -3586,34 +3663,38 @@ public final class MoELayer: Module, DecoderLayer {
                     }
                 }
 
-                // Shared expert: dual-queue (MPP path) or batched QMM on `work`.
-                if let done = prefillSharedDone, let sOut = prefillSharedOut {
-                    work.encodeWaitForEvent(device.syncEvent, value: done)
-                    _ = Ops.add(outFlat, sOut, on: work, into: outFlat)
-                } else if !MoEEnvFlags.noShared,
-                    let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj
-                {
-                    let useSharedQmm =
-                        MoEEnvFlags.sharedQmmOn
-                    if useSharedQmm,
-                        let shared = prefillSharedExpertNvfp4(
-                            hRows: hRows, t: t, gate: sg, up: su, down: sd,
-                            dtype: dt, on: work, device: device)
+                // Shared expert: dual-queue (MPP path) or batched QMM on
+                // `work`. Skipped when the W57 fused kernel already folded
+                // shared (+ residual) into the combine dispatch above.
+                if !tailFused {
+                    if let done = prefillSharedDone, let sOut = prefillSharedOut {
+                        work.encodeWaitForEvent(device.syncEvent, value: done)
+                        _ = Ops.add(outFlat, sOut, on: work, into: outFlat)
+                    } else if !MoEEnvFlags.noShared,
+                        let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj
                     {
-                        _ = Ops.add(outFlat, shared, on: work, into: outFlat)
-                    } else if !useSharedQmm {
-                        for r in 0 ..< t {
-                            let hRow = Tensor(
-                                buffer: hFlat.buffer,
-                                offset: hFlat.offset + r * hidden * dtBytes,
-                                shape: [hidden], dtype: dt)
-                            let shared = swiGLU(
-                                hRow, gateProj: sg, upProj: su, downProj: sd, on: work)
-                            let outRow = Tensor(
-                                buffer: outFlat.buffer,
-                                offset: outFlat.offset + r * hidden * dtBytes,
-                                shape: [hidden], dtype: dt)
-                            _ = Ops.add(outRow, shared, on: work, into: outRow)
+                        let useSharedQmm =
+                            MoEEnvFlags.sharedQmmOn
+                        if useSharedQmm,
+                            let shared = prefillSharedExpertNvfp4(
+                                hRows: hRows, t: t, gate: sg, up: su, down: sd,
+                                dtype: dt, on: work, device: device)
+                        {
+                            _ = Ops.add(outFlat, shared, on: work, into: outFlat)
+                        } else if !useSharedQmm {
+                            for r in 0 ..< t {
+                                let hRow = Tensor(
+                                    buffer: hFlat.buffer,
+                                    offset: hFlat.offset + r * hidden * dtBytes,
+                                    shape: [hidden], dtype: dt)
+                                let shared = swiGLU(
+                                    hRow, gateProj: sg, upProj: su, downProj: sd, on: work)
+                                let outRow = Tensor(
+                                    buffer: outFlat.buffer,
+                                    offset: outFlat.offset + r * hidden * dtBytes,
+                                    shape: [hidden], dtype: dt)
+                                _ = Ops.add(outRow, shared, on: work, into: outRow)
+                            }
                         }
                     }
                 }
