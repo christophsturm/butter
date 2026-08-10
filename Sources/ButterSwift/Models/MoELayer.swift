@@ -2751,6 +2751,13 @@ public final class MoELayer: Module, DecoderLayer {
                 var sortedExperts: Tensor? = nil
                 var sortedSource: Tensor? = nil
                 var sortedInvPerm: Tensor? = nil
+                // W52 byte-hunt: when the f32Promote branch below skips
+                // the castF32ToBf16->downOut materialise (see
+                // LagunaF32PromoteCombineFuse), it stashes the raw f32
+                // down-projection output here so the combine call site
+                // can read it directly instead of the (unwritten)
+                // downOut bf16 buffer.
+                var pendingCombineF32: Tensor? = nil
                 // Sort when MPP, expert-group, or gather-QMM with SORT=1.
                 let sortGather =
                     MoEEnvFlags.gatherSort
@@ -3219,7 +3226,21 @@ public final class MoELayer: Module, DecoderLayer {
                                 blockSize: stacked.blockSize, global: stacked.global,
                                 on: work, into: downF)
                             moeMagScan("down_output", downF)
-                            Ops.castF32ToBf16(downF, into: downOut, on: work)
+                            // W52 byte-hunt: skip the castF32ToBf16 ->
+                            // downOut materialise (write-once-read-once
+                            // bf16 round trip) and let the combine call
+                            // site below read `downF` (f32) directly —
+                            // see LagunaF32PromoteCombineFuse. Escape
+                            // BUTTER_LAGUNA_F32_COMBINE_FUSE=0 restores
+                            // the stock cast-then-combine chain (needed
+                            // whenever sortedInvPerm is nil, since that
+                            // path combines via scalarFMAChain8 on
+                            // downOut directly, not moeUnpermute).
+                            if LagunaF32PromoteCombineFuse.enabled, sortedInvPerm != nil {
+                                pendingCombineF32 = downF
+                            } else {
+                                Ops.castF32ToBf16(downF, into: downOut, on: work)
+                            }
                             moePhaseCheckpoint("down")
                         } else if useSteelRoute {
                             // W54: L38 (the excluded layer). Measured via
@@ -3514,7 +3535,18 @@ public final class MoELayer: Module, DecoderLayer {
                     // visible in this repo to audit for the numerics risk
                     // the mission flags). Default OFF, zero behavior
                     // change unless BUTTER_LAGUNA_SORTED_COMBINE=1.
-                    if LagunaSortedCombine.enabled, topK <= 8 {
+                    if let f32Down = pendingCombineF32 {
+                        // W52 byte-hunt: f32Promote layer, downOut was
+                        // never materialised — combine straight off the
+                        // f32 down-GEMM output (see
+                        // LagunaF32PromoteCombineFuse's header for the
+                        // byte-identical double-round argument).
+                        LagunaF32PromoteCombineFuse.combine(
+                            expertOutputsF32: f32Down, invPerm: inv,
+                            topKWeights: weightsTok, into: outFlat,
+                            nRows: t, hidden: hidden, k: topK,
+                            on: work, device: device)
+                    } else if LagunaSortedCombine.enabled, topK <= 8 {
                         LagunaSortedCombine.combine(
                             expertOutputs: downOut, invPerm: inv,
                             topKWeights: weightsTok, into: outFlat,
