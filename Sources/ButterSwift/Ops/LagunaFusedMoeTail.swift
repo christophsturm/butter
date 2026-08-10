@@ -43,6 +43,6 @@
 // zero behavior change unless set).
 enum LagunaFusedMoeTail {
     static var enabled: Bool {
-        ButterEnv["BUTTER_LAGUNA_FUSED_MOE_TAIL"] == "1"
+        ButterEnv["BUTTER_LAGUNA_FUSED_MOE_TAIL"] != "0"
     }
 }

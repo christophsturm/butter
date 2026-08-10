@@ -58,7 +58,7 @@ enum LagunaSdpa {
     // in the transpose-cast). Default OFF; opt-in
     // `BUTTER_LAGUNA_PREFILL_FUSED_EPILOGUE=1`.
     static var prefillFusedEpilogueEnabled: Bool {
-        ButterEnv["BUTTER_LAGUNA_PREFILL_FUSED_EPILOGUE"] == "1"
+        ButterEnv["BUTTER_LAGUNA_PREFILL_FUSED_EPILOGUE"] != "0"
     }
 
     // ─── Prefill SDPA mask block-map (opt-in) ────────────────────────

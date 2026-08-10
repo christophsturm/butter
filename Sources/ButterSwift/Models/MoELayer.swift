@@ -1148,7 +1148,7 @@ public final class MoELayer: Module, DecoderLayer {
     /// `BUTTER_LAGUNA_ROUTER_V2` still only fuses the sort-plan, not the
     /// router.
     public var routerV2Enabled: Bool {
-        routerV2EnvRaw == "1"
+        routerV2EnvRaw != "0"
     }
 
     /// F-85 parallelized tile-plan builder gate (small-M follow-up to the
