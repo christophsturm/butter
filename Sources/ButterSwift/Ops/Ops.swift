@@ -7295,6 +7295,61 @@ public enum Ops {
         return result
     }
 
+    /// W58 fused-epilogue prefill SDPA: f16 q/k/v in, **transposed bf16**
+    /// out. Identical MMA math to `sdpaPrefillMma`, but the store epilogue
+    /// writes each element straight to the transposed row-major layout
+    /// `out[t, q_head*head_dim + d]` (shape `[qLen, nQHeads*headDim]`) and
+    /// narrows f32→f16→bf16 in-register — folding the separate
+    /// `transposeHTDCastToBf16` dispatch (and the `outHTD` round trip: a full
+    /// write + read of the `[nHeads, qLen, headDim]` f16 attn output per
+    /// layer) into the producer kernel.
+    ///
+    /// The f32→f16→bf16 double-round is bit-identical to the native-layout
+    /// path (`sdpaPrefillMma` stores f16 via `.cast::<f16>()`, then
+    /// `transposeHTDCastToBf16` does `bfloat(float(x))`).
+    ///
+    /// `out` must be `[qLen, nQHeads*headDim]` bf16 (caller slices the first
+    /// `nRows` rows). Same grid/tpg contract as `sdpaPrefillMma`.
+    public static func sdpaPrefillMmaTransBf16(
+        q: Tensor, k: Tensor, v: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        qLen: Int, kLen: Int, scale: Float,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(
+            qLen > 0 && qLen % 32 == 0,
+            "Ops.sdpaPrefillMmaTransBf16: qLen \(qLen) must be a positive multiple of 32")
+        precondition(
+            kLen >= qLen,
+            "Ops.sdpaPrefillMmaTransBf16: kLen \(kLen) must be >= qLen \(qLen)")
+        precondition(
+            nQHeads % nKVHeads == 0,
+            "Ops.sdpaPrefillMmaTransBf16: nQHeads \(nQHeads) must be a multiple of nKVHeads \(nKVHeads)")
+        precondition(
+            q.dtype == .f16 && k.dtype == .f16 && v.dtype == .f16,
+            "Ops.sdpaPrefillMmaTransBf16: q/k/v must be f16")
+        precondition(
+            out.dtype == .bf16, "Ops.sdpaPrefillMmaTransBf16: out must be bf16")
+        precondition(
+            headDim == 128, "Ops.sdpaPrefillMmaTransBf16: kernel is head_dim=128 only")
+        let threadsPerGroup = 128
+        let bq = 32
+        let tgGrid = MTLSize(width: qLen / bq, height: nQHeads, depth: 1)
+        let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+        let gqaFactor = nQHeads / nKVHeads
+        IronKernels.iron_sdpa_prefill_mma_transbf16_f16_threadgroups(
+            q: q.buffer, qOffset: q.offset,
+            k: k.buffer, kOffset: k.offset,
+            v: v.buffer, vOffset: v.offset,
+            out: out.buffer, outOffset: out.offset,
+            q_len: UInt32(qLen), k_len: UInt32(kLen),
+            gqa_factor: UInt32(gqaFactor),
+            n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
+            scale: scale,
+            gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+    }
+
     // ─── MoE gather BGEMM int4 — BM=8 MPP variant ────────────────────
     //
     // Half-height counterpart of `moeGatherDequantGemmInt4` tuned for

@@ -41,6 +41,26 @@ enum LagunaSdpa {
         ButterEnv["BUTTER_LAGUNA_SDPA_NATIVE_LAYOUT"] != "0"
     }
 
+    // ─── W58: fused SDPA output epilogue (opt-in A/B lever) ───────────
+    //
+    // One level deeper than `sdpaNativeLayoutEnabled`: instead of a SEPARATE
+    // `laguna_transpose_htd_cast_bf16` dispatch that reads the MMA output
+    // `outHTD` and writes the transposed bf16 `outBf`, the MMA prefill kernel
+    // itself writes O straight to the transposed bf16 layout in its store
+    // epilogue (in-register f32→f16→bf16 narrowing). This keeps the attn
+    // output ON-CHIP — the `[nHeads, tPad, headDim]` f16 `outHTD` intermediate
+    // is never written to (or read back from) global memory at all
+    // (~2 MB/layer read+write eliminated).
+    //
+    // BYTE-IDENTICAL to the `sdpaNativeLayoutEnabled` path: the fused store
+    // does `bfloat(static_cast<half>(o·is_row))`, the exact double-round the
+    // stock chain paid (`.cast::<f16>()` in the MMA store + `bfloat(float(x))`
+    // in the transpose-cast). Default OFF; opt-in
+    // `BUTTER_LAGUNA_PREFILL_FUSED_EPILOGUE=1`.
+    static var prefillFusedEpilogueEnabled: Bool {
+        ButterEnv["BUTTER_LAGUNA_PREFILL_FUSED_EPILOGUE"] == "1"
+    }
+
     // ─── Prefill SDPA mask block-map (opt-in) ────────────────────────
     //
     // `prefillMmaBf16`'s causal MMA path (`Ops.sdpaPrefillMma`) always
@@ -1664,11 +1684,9 @@ enum LagunaSdpa {
         let kPad = position + tPad
         precondition(kPad <= maxSeq, "prefillMmaTailFromHTD: kPad \(kPad) > maxSeq \(maxSeq)")
 
-        let outHTD = scratch(
-            tag: "laguna_sdpa_outhtd", shape: [nHeads, tPad, headDim],
-            dtype: .f16, device: device, slot: slot)
-        let outBf = Tensor.empty(
-            shape: [nRows, nHeads * headDim], dtype: .bf16, device: device)
+        // W58 fused epilogue eligibility: f16 MMA path, head_dim=128.
+        let useFusedEpilogue =
+            prefillFusedEpilogueEnabled && qHTD.dtype == .f16 && headDim == 128
         let kPacked = scratch(
             tag: "laguna_sdpa_kpack", shape: [nKVHeads, kPad, headDim],
             dtype: .f16, device: device, slot: slot)
@@ -1734,6 +1752,30 @@ enum LagunaSdpa {
             }
         }
         if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_kv_compact", cmd) }
+
+        if useFusedEpilogue {
+            // W58: the MMA kernel writes O straight to the transposed bf16
+            // layout — no `outHTD` round trip, no separate transpose+cast
+            // dispatch. The kernel iterates all `tPad` query rows, so
+            // allocate a padded output and return a view of the first
+            // `nRows` rows.
+            let outBfPad = Tensor.empty(
+                shape: [tPad, nHeads * headDim], dtype: .bf16, device: device)
+            Ops.sdpaPrefillMmaTransBf16(
+                q: qHTD, k: kPacked, v: vPacked,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                qLen: tPad, kLen: kPad, scale: scale, on: cmd, into: outBfPad)
+            if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_mma_fused_epilogue", cmd) }
+            return Tensor(
+                buffer: outBfPad.buffer, offset: outBfPad.offset,
+                shape: [nRows, nHeads * headDim], dtype: .bf16)
+        }
+
+        let outHTD = scratch(
+            tag: "laguna_sdpa_outhtd", shape: [nHeads, tPad, headDim],
+            dtype: .f16, device: device, slot: slot)
+        let outBf = Tensor.empty(
+            shape: [nRows, nHeads * headDim], dtype: .bf16, device: device)
 
         _ = Ops.sdpaPrefillMma(
             q: qHTD, k: kPacked, v: vPacked,
