@@ -37,6 +37,15 @@
 // eligibility is exactly kIn ∈ {2048, 512}: precisely Laguna's two
 // routed-expert projections. Every other shape falls through to the
 // existing chain untouched.
+//
+// KERNEL RETILE (2026-08, default ON): the GEMM above dispatches a
+// retiled variant of the expert-aligned kernel by default — a 4×1 SG
+// grid with dual-N32 MPP accumulators in place of the original 2×2
+// grid (`moe_gather_qmm_expert_mpp_bn64wn1.rs` in the iron tree). It is
+// a drop-in: identical buffer layout and dispatch grid, byte-identical
+// output, measured +14.6% wired prefill on the production Laguna
+// gather-QMM shape. Escape `BUTTER_LAGUNA_BN64WN1=0` to fall back to
+// the original kernel. See `kernelName` below for the wiring.
 
 import Foundation
 import Metal
@@ -126,8 +135,27 @@ enum LagunaNvfp4ExpertGather {
             && (kIn == 2048 || kIn == 512) && blockSize == 16
     }
 
+    /// DEFAULT ON: use the BN64/WN1 retile of the expert-aligned gather-QMM
+    /// kernel (`moe_gather_qmm_expert_mpp_bn64wn1.rs` in the iron tree —
+    /// 4×1 SG grid, dual-N32 MPP accumulators in place of the original
+    /// 2×2 grid). It is a drop-in for the kernel it replaces: identical
+    /// buffer layout (x/w/scales/indices/out @ 0..4, m_total/n_out/
+    /// block_size/global @ 5..8) and identical dispatch grid (nOut/64 ×
+    /// nExperts TGs, 128 threads/TG) — every call site below needs no
+    /// changes beyond the PSO name. Measured byte-identical output and
+    /// +14.6% wired prefill on the production Laguna gather-QMM shape.
+    /// Escape `=0` to fall back to the original kernel.
+    private static var useRetiledKernel: Bool {
+        ButterEnv["BUTTER_LAGUNA_BN64WN1"] != "0"
+    }
+
     private static func kernelName(kIn: Int) -> String {
-        kIn == 2048
+        if useRetiledKernel {
+            return kIn == 2048
+                ? "iron_nvfp4_moe_gather_qmm_expert_mpp_bn64wn1_k2048_bf16"
+                : "iron_nvfp4_moe_gather_qmm_expert_mpp_bn64wn1_k512_bf16"
+        }
+        return kIn == 2048
             ? "iron_nvfp4_moe_gather_qmm_expert_mpp_k2048_bf16"
             : "iron_nvfp4_moe_gather_qmm_expert_mpp_k512_bf16"
     }
