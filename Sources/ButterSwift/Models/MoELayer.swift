@@ -396,12 +396,55 @@ private enum MoEEnvFlags {
     static let gatherSort = ButterEnv["BUTTER_NVFP4_GATHER_SORT"] == "1"
     static let expertGroupAsync = ButterEnv["BUTTER_NVFP4_EXPERT_GROUP_ASYNC"] != "0"
     static let mppForceAllBf16 = ButterEnv["BUTTER_NVFP4_MPP_BF16"] == "1"
-    static let mppBf16MaxLayer = Int(ButterEnv["BUTTER_NVFP4_MPP_BF16_MAX_LAYER"] ?? "") ?? 36
+    // W53: late-layer nvfp4 fast-path extension. Numerically measured
+    // (BUTTER_LAGUNA_MOE_MAGNITUDE_SCAN, real laguna-xs-2.1-nvfp4
+    // prefill, two unrelated prompts, BUTTER_LAGUNA_LASTROW_PREFILL=0
+    // so every row of every late layer is actually exercised): L37 and
+    // L39's swiglu-inner / down-GEMM activations top out ~1970 / ~1110
+    // (33-59x under half's 65504 ceiling — same order of magnitude as
+    // the f16Inner lever's existing "~800, 80x headroom" calibration).
+    // L38 is a structural outlier: swiglu-inner ~446,362, down-output
+    // ~461,888 — reproducibly IDENTICAL (bit-for-bit) across a 6-token
+    // and a 461-token prompt of unrelated content, i.e. a fixed
+    // "massive activation" feature, not routing noise — 6.8-7.0x OVER
+    // the f16 ceiling. That's exactly the ~1e6 half-coop-tile overflow
+    // class flagged at W50 (post-L38 residual maxAbs measured ~1.1M
+    // here, matching W50's 1,130,496 reference point). So L38 alone
+    // stays on the f32 fallback; L37 and L39 move to the fast
+    // bf16/nvfp4 path. Default ON. Escape to the pre-W53 threshold
+    // (bf16MaxLayer=36, no late layers fast, matches the shipped
+    // behavior through #120) with BUTTER_NVFP4_MPP_LATE_LAYER_FAST=0.
+    static let mppLateLayerFast = ButterEnv["BUTTER_NVFP4_MPP_LATE_LAYER_FAST"] != "0"
+    static let mppBf16MaxLayer =
+        Int(ButterEnv["BUTTER_NVFP4_MPP_BF16_MAX_LAYER"] ?? "")
+        ?? (mppLateLayerFast ? 39 : 36)
+    // Layers forced to stay on the f32 fallback even when they fall
+    // within bf16MaxLayer's range — L38's measured f16 overflow (see
+    // above). Comma-separated layer indices; empty string forces every
+    // layer up to bf16MaxLayer fast (NOT recommended — reintroduces the
+    // W50 failure mode at L38 on this model).
+    static let mppBf16ExcludeLayers: Set<Int> = {
+        if let raw = ButterEnv["BUTTER_NVFP4_MPP_BF16_EXCLUDE_LAYERS"] {
+            return Set(raw.split(separator: ",").compactMap { Int($0) })
+        }
+        return mppLateLayerFast ? [38] : []
+    }()
     static let mppNoSharedCast = ButterEnv["BUTTER_NVFP4_MPP_NO_SHARED_CAST"] == "1"
     static let mppFusedGateUp = ButterEnv["BUTTER_NVFP4_MPP_FUSED_GATEUP"] != "0"
     static let mppSerialGateUp = ButterEnv["BUTTER_NVFP4_MPP_SERIAL_GATEUP"] == "1"
     static let pathBMode = ButterEnv["BUTTER_LAGUNA_PATHB"] ?? "full"
     static let pathBFused = ButterEnv["BUTTER_LAGUNA_PATHB_FUSED"] != "0"
+    // W53 numerics-first measurement: dump per-stage f32 max|activation|
+    // for the f32-fallback (useF32Promote) MoE branch, gated to late
+    // layers only. Diagnostic-only, off by default, forces sync
+    // read-back (breaks pipelining) so never left on in perf runs.
+    // See benchmarks/laguna-xs/README.md W53 (or the campaign compendium)
+    // for the decision this measurement gates: whether layers 37-39 can
+    // safely leave the f32 fallback for the fast nvfp4/f16-device-direct
+    // expert path.
+    static let moeMagnitudeScan = ButterEnv["BUTTER_LAGUNA_MOE_MAGNITUDE_SCAN"] == "1"
+    static let moeMagnitudeScanMinLayer =
+        Int(ButterEnv["BUTTER_LAGUNA_MOE_MAGNITUDE_SCAN_MIN_LAYER"] ?? "") ?? 34
 }
 
 public final class MoELayer: Module, DecoderLayer {
@@ -2405,6 +2448,31 @@ public final class MoELayer: Module, DecoderLayer {
             work = device.makeCommandBuffer()
             moePhaseT0 = CFAbsoluteTimeGetCurrent()
         }
+        // W53: forced sync read-back of one f32 activation tensor's
+        // max|value| (+ nan/inf census), stderr-logged. Off by default
+        // (MoEEnvFlags.moeMagnitudeScan); when on, scoped to
+        // layerIndex >= moeMagnitudeScanMinLayer so it's cheap even for
+        // a full-model prefill run. Breaks command-buffer pipelining by
+        // design — diagnostic only, never in a perf measurement.
+        func moeMagScan(_ label: String, _ tensor: Tensor) {
+            guard MoEEnvFlags.moeMagnitudeScan,
+                layerIndex >= MoEEnvFlags.moeMagnitudeScanMinLayer
+            else { return }
+            if work.status != .committed && work.status != .completed
+                && work.status != .error
+            {
+                work.commit()
+            }
+            work.waitUntilCompleted()
+            let vals = tensor.toFloatArray()
+            let nan = vals.filter { $0.isNaN }.count
+            let inf = vals.filter { $0.isInfinite }.count
+            let mx = vals.filter { $0.isFinite }.map(abs).max() ?? -1
+            fputs(
+                "[moe-mag-scan] L\(layerIndex) \(label) maxAbs=\(mx) "
+                    + "nan=\(nan) inf=\(inf) n=\(vals.count)\n", stderr)
+            work = device.makeCommandBuffer()
+        }
         let hRows = hFlat.reshaped(to: [t, hidden])
         if prefOutFlatScratch == nil
             || prefOutFlatScratch!.dtype != dt
@@ -2947,10 +3015,12 @@ public final class MoELayer: Module, DecoderLayer {
                     // (skip materializing bf16 xGathered).
                     let forceAllBf16 = MoEEnvFlags.mppForceAllBf16
                     let bf16MaxLayer = MoEEnvFlags.mppBf16MaxLayer
+                    let bf16ExcludeLayers = MoEEnvFlags.mppBf16ExcludeLayers
                     let useNativeBf16Mpp =
                         forceAllBf16
                         || (layerIndex >= 0 && layerIndex <= bf16MaxLayer
-                            && bf16MaxLayer >= 0)
+                            && bf16MaxLayer >= 0
+                            && !bf16ExcludeLayers.contains(layerIndex))
                     let noSharedCast = MoEEnvFlags.mppNoSharedCast
                     let useF32Promote =
                         useGatherMpp && dt == .bf16 && !useNativeBf16Mpp && !noSharedCast
@@ -3042,6 +3112,7 @@ public final class MoELayer: Module, DecoderLayer {
                                     buffer: hFBuf, offset: 0,
                                     shape: [t, hidden], dtype: .f32)
                                 Ops.castToF32(hRows, into: hF, on: work)
+                                moeMagScan("gateup_input", hF)
                                 Ops.nvfp4MoeGatherBm16GateUp(
                                     input: hF, xRows: srcTok,
                                     weightGate: stacked.gateWeight,
@@ -3063,6 +3134,7 @@ public final class MoELayer: Module, DecoderLayer {
                                     table: hRows, tokenIds: srcTok,
                                     mTotal: mTotal, hidden: hidden,
                                     on: work, into: xF)
+                                moeMagScan("gateup_input", xF)
                                 // Concurrent gate+up; BM64 when env opts in
                                 // (grid/TPG match iron BM64 contract).
                                 Ops.nvfp4MoeGatherBm16Pair(
@@ -3076,15 +3148,19 @@ public final class MoELayer: Module, DecoderLayer {
                                     blockSize: stacked.blockSize, global: stacked.global,
                                     on: work)
                             }
+                            moeMagScan("gate_pre_swiglu", gateF)
+                            moeMagScan("up_pre_swiglu", upF)
                             // In-place SwiGLU into gateF (skip separate mid buffer).
                             _ = Ops.swiglu(gate: gateF, up: upF, on: work, into: gateF)
                             moePhaseCheckpoint("gateup")
+                            moeMagScan("swiglu_inner", gateF)
                             Ops.nvfp4MoeGatherBm16(
                                 input: gateF, weight: stacked.downWeight,
                                 scales: stacked.downScales, indices: expIds,
                                 mTotal: mTotal, nOut: hidden, kIn: moeIntermediate,
                                 blockSize: stacked.blockSize, global: stacked.global,
                                 on: work, into: downF)
+                            moeMagScan("down_output", downF)
                             Ops.castF32ToBf16(downF, into: downOut, on: work)
                             moePhaseCheckpoint("down")
                         } else if useFusedGateUp {
