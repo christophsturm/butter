@@ -41,6 +41,26 @@ enum LagunaSdpa {
         ButterEnv["BUTTER_LAGUNA_SDPA_NATIVE_LAYOUT"] != "0"
     }
 
+    // ─── W58: fused SDPA output epilogue (opt-in A/B lever) ───────────
+    //
+    // One level deeper than `sdpaNativeLayoutEnabled`: instead of a SEPARATE
+    // `laguna_transpose_htd_cast_bf16` dispatch that reads the MMA output
+    // `outHTD` and writes the transposed bf16 `outBf`, the MMA prefill kernel
+    // itself writes O straight to the transposed bf16 layout in its store
+    // epilogue (in-register f32→f16→bf16 narrowing). This keeps the attn
+    // output ON-CHIP — the `[nHeads, tPad, headDim]` f16 `outHTD` intermediate
+    // is never written to (or read back from) global memory at all
+    // (~2 MB/layer read+write eliminated).
+    //
+    // BYTE-IDENTICAL to the `sdpaNativeLayoutEnabled` path: the fused store
+    // does `bfloat(static_cast<half>(o·is_row))`, the exact double-round the
+    // stock chain paid (`.cast::<f16>()` in the MMA store + `bfloat(float(x))`
+    // in the transpose-cast). Default OFF; opt-in
+    // `BUTTER_LAGUNA_PREFILL_FUSED_EPILOGUE=1`.
+    static var prefillFusedEpilogueEnabled: Bool {
+        ButterEnv["BUTTER_LAGUNA_PREFILL_FUSED_EPILOGUE"] != "0"
+    }
+
     // ─── Prefill SDPA mask block-map (opt-in) ────────────────────────
     //
     // `prefillMmaBf16`'s causal MMA path (`Ops.sdpaPrefillMma`) always
@@ -364,6 +384,140 @@ enum LagunaSdpa {
         enc.endEncoding()
     }
 
+    // ─── W48: direct-KV prefill SDPA (sdpa_kv_compact elimination) ──
+    //
+    // See Laguna Parity compendium §16-TargetA. `prefillMmaBf16`'s hot
+    // path pays a `compactKvBf16ToF16` dispatch (strided bf16 KV cache
+    // → packed f16) purely so the MMA kernel can address K/V by a
+    // fixed, tightly-packed stride. iron's `iron_sdpa_prefill_mma` now
+    // takes the addressing stride (`kLen`) and the real KV length
+    // (`kReal`) as independent runtime params (W48 iron change), so it
+    // can read the RAW strided bf16 cache directly — `kLen = maxSeq`,
+    // `kReal` masks the `[kReal, maxSeq)` tail to -inf alongside the
+    // existing causal test. This drops the compact pass entirely.
+    //
+    // Q still needs the HTD layout the MMA kernel expects, so the
+    // pad+transpose step stays, but goes STRAIGHT to bf16 (no more
+    // `Ops.castBf16ToF16` en route to f16) — the MMA runs the bf16
+    // monomorphization of `iron_sdpa_prefill_mma` (`T=bf16`) instead of
+    // the f16 one, per the compendium's route (ii) ("all-bf16 MMA").
+    //
+    // NOT byte-identical vs the f16-compact default: bf16-native Q/K/V
+    // operands are a small precision DELTA from today's f16-packed
+    // path (bf16 has fewer mantissa bits than f16 but a wider exponent
+    // — neither strictly dominates elementwise, but bf16 avoids an
+    // extra intermediate rounding step the f16 path pays, so this is
+    // arguably no worse and sometimes more accurate, same class as
+    // W44's QMV_V2). Opt-in pending an A/B: BUTTER_LAGUNA_SDPA_DIRECT_KV=1
+    // (default OFF).
+    static var directKvEnabled: Bool {
+        ButterEnv["BUTTER_LAGUNA_SDPA_DIRECT_KV"] == "1"
+    }
+
+    // `[T, H, D]` bf16 → `[H, T, D]` bf16. Pure layout permute (no
+    // rounding) — same index math as `iron_transpose_thd_f16`, bf16
+    // in/out instead of f16.
+    private static let transposeThdBf16Src = """
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void laguna_transpose_thd_bf16(
+        device const bfloat *inp [[buffer(0)]],   // [t, h, d]
+        device bfloat *out [[buffer(1)]],          // [h, t, d]
+        constant uint &t_len [[buffer(2)]],
+        constant uint &h_len [[buffer(3)]],
+        constant uint &d_len [[buffer(4)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        uint t = gid.x;
+        uint hd = gid.y;
+        if (t >= t_len || hd >= h_len * d_len) return;
+        uint h = hd / d_len;
+        uint d = hd % d_len;
+        out[(h * t_len + t) * d_len + d] = inp[(t * h_len + h) * d_len + d];
+    }
+    """
+
+    /// Dispatch `laguna_transpose_thd_bf16`: `[tPad, nHeads, headDim]`
+    /// bf16 (THD, padded Q) → `[nHeads, tPad, headDim]` bf16 (HTD, MMA
+    /// input). Byte-identical layout permute, no cast.
+    static func transposeTHDToBf16(
+        _ input: Tensor, t: Int, h: Int, d: Int,
+        into out: Tensor, on cmd: MTLCommandBuffer, device: Device
+    ) {
+        precondition(input.dtype == .bf16 && out.dtype == .bf16)
+        let p = pso(
+            "laguna_transpose_thd_bf16", source: transposeThdBf16Src, device: device.mtlDevice)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 1)
+        var tU = UInt32(t), hU = UInt32(h), dU = UInt32(d)
+        enc.setBytes(&tU, length: 4, index: 2)
+        enc.setBytes(&hU, length: 4, index: 3)
+        enc.setBytes(&dU, length: 4, index: 4)
+        let hd = h * d
+        enc.dispatchThreads(
+            MTLSize(width: t, height: hd, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(t, 32), height: min(hd, 32), depth: 1))
+        enc.endEncoding()
+    }
+
+    // Fused transpose `[nHeads, tPad, headDim]` bf16 (HTD, direct-KV MMA
+    // output) → `[nRows, nHeads*headDim]` bf16 (THD token-major, o_proj
+    // input), real rows only. Same index math as
+    // `laguna_transpose_htd_cast_bf16` (W10) MINUS the cast — the
+    // direct-KV MMA already emits bf16, so this is a pure layout
+    // permute, not a narrowing.
+    private static let transposeHtdToBf16Src = """
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void laguna_transpose_htd_to_bf16(
+        device const bfloat *inp [[buffer(0)]],  // [n_heads, t_pad, head_dim]
+        device bfloat *out [[buffer(1)]],         // [n_rows, n_heads*head_dim]
+        constant uint &t_pad [[buffer(2)]],
+        constant uint &n_heads [[buffer(3)]],
+        constant uint &head_dim [[buffer(4)]],
+        constant uint &total [[buffer(5)]],
+        uint tid [[thread_position_in_grid]]
+    ) {
+        if (tid >= total) return;
+        uint d = tid % head_dim;
+        uint hh = tid / head_dim;
+        uint h = hh % n_heads;
+        uint t = hh / n_heads;
+        out[tid] = inp[(h * t_pad + t) * head_dim + d];
+    }
+    """
+
+    /// Dispatch `laguna_transpose_htd_to_bf16` (direct-KV out-layout,
+    /// no cast). `input` = `[nHeads, tPad, headDim]` bf16; `out` =
+    /// `[nRows, nHeads*headDim]` bf16 (real rows).
+    static func transposeHTDToBf16Direct(
+        _ input: Tensor, nRows: Int, tPad: Int, nHeads: Int, headDim: Int,
+        into out: Tensor, on cmd: MTLCommandBuffer, device: Device
+    ) {
+        precondition(input.dtype == .bf16 && out.dtype == .bf16)
+        let total = nRows * nHeads * headDim
+        precondition(out.elementCount == total)
+        let p = pso(
+            "laguna_transpose_htd_to_bf16", source: transposeHtdToBf16Src,
+            device: device.mtlDevice)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(p)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+        enc.setBuffer(out.buffer, offset: out.offset, index: 1)
+        var tPadU = UInt32(tPad), hU = UInt32(nHeads)
+        var dU = UInt32(headDim), totU = UInt32(total)
+        enc.setBytes(&tPadU, length: 4, index: 2)
+        enc.setBytes(&hU, length: 4, index: 3)
+        enc.setBytes(&dU, length: 4, index: 4)
+        enc.setBytes(&totU, length: 4, index: 5)
+        enc.dispatchThreads(
+            MTLSize(width: total, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(total, 256), height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
     static func castF16ToBf16(
         _ input: Tensor, into out: Tensor, on cmd: MTLCommandBuffer, device: Device
     ) {
@@ -667,6 +821,42 @@ enum LagunaSdpa {
             blit.endEncoding()
         }
         if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_qpad", cmd) }
+
+        // W48 direct-KV path (see the header comment above
+        // `directKvEnabled`): skip `compactKvBf16ToF16` entirely and
+        // read `cacheK`/`cacheV` raw+strided by `maxSeq`. Q goes
+        // straight to bf16 HTD (no f16 cast) so the MMA runs its bf16
+        // monomorphization end to end. Mutually exclusive with the
+        // scalar block-map path (that kernel is f16-only) — falls
+        // through to the default compact path if both are requested.
+        if directKvEnabled && !prefillBlockmapEnabled {
+            let qHTDBf = scratch(
+                tag: "laguna_sdpa_qhtd_bf", shape: [nHeads, tPad, headDim],
+                dtype: .bf16, device: device, slot: slot)
+            transposeTHDToBf16(
+                qPadBf, t: tPad, h: nHeads, d: headDim, into: qHTDBf, on: cmd, device: device)
+            if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_qcast_transpose", cmd) }
+            // No compact/blit pass — this checkpoint is kept so phase-
+            // timing probes (BUTTER_LAGUNA_ATTN_PHASE_TIMING=1) still see
+            // the same stage sequence, now ~free.
+            if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_kv_compact", cmd) }
+
+            let outHTDBf = scratch(
+                tag: "laguna_sdpa_outhtd_bf", shape: [nHeads, tPad, headDim],
+                dtype: .bf16, device: device, slot: slot)
+            _ = Ops.sdpaPrefillMma(
+                q: qHTDBf, k: cacheK, v: cacheV,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                qLen: tPad, kLen: maxSeq, scale: scale, on: cmd, into: outHTDBf,
+                position: position, kReal: kReal)
+            if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_mma_kernel", cmd) }
+
+            transposeHTDToBf16Direct(
+                outHTDBf, nRows: nRows, tPad: tPad, nHeads: nHeads, headDim: headDim,
+                into: outBf, on: cmd, device: device)
+            if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_out_transpose_cast", cmd) }
+            return outBf
+        }
 
         // Q: bf16 [Tpad,H,D] → f16 → transpose → [H,Tpad,D]
         _ = Ops.castBf16ToF16(
@@ -1494,11 +1684,9 @@ enum LagunaSdpa {
         let kPad = position + tPad
         precondition(kPad <= maxSeq, "prefillMmaTailFromHTD: kPad \(kPad) > maxSeq \(maxSeq)")
 
-        let outHTD = scratch(
-            tag: "laguna_sdpa_outhtd", shape: [nHeads, tPad, headDim],
-            dtype: .f16, device: device, slot: slot)
-        let outBf = Tensor.empty(
-            shape: [nRows, nHeads * headDim], dtype: .bf16, device: device)
+        // W58 fused epilogue eligibility: f16 MMA path, head_dim=128.
+        let useFusedEpilogue =
+            prefillFusedEpilogueEnabled && qHTD.dtype == .f16 && headDim == 128
         let kPacked = scratch(
             tag: "laguna_sdpa_kpack", shape: [nKVHeads, kPad, headDim],
             dtype: .f16, device: device, slot: slot)
@@ -1564,6 +1752,30 @@ enum LagunaSdpa {
             }
         }
         if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_kv_compact", cmd) }
+
+        if useFusedEpilogue {
+            // W58: the MMA kernel writes O straight to the transposed bf16
+            // layout — no `outHTD` round trip, no separate transpose+cast
+            // dispatch. The kernel iterates all `tPad` query rows, so
+            // allocate a padded output and return a view of the first
+            // `nRows` rows.
+            let outBfPad = Tensor.empty(
+                shape: [tPad, nHeads * headDim], dtype: .bf16, device: device)
+            Ops.sdpaPrefillMmaTransBf16(
+                q: qHTD, k: kPacked, v: vPacked,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                qLen: tPad, kLen: kPad, scale: scale, on: cmd, into: outBfPad)
+            if let phaseCheckpoint { cmd = phaseCheckpoint("sdpa_mma_fused_epilogue", cmd) }
+            return Tensor(
+                buffer: outBfPad.buffer, offset: outBfPad.offset,
+                shape: [nRows, nHeads * headDim], dtype: .bf16)
+        }
+
+        let outHTD = scratch(
+            tag: "laguna_sdpa_outhtd", shape: [nHeads, tPad, headDim],
+            dtype: .f16, device: device, slot: slot)
+        let outBf = Tensor.empty(
+            shape: [nRows, nHeads * headDim], dtype: .bf16, device: device)
 
         _ = Ops.sdpaPrefillMma(
             q: qHTD, k: kPacked, v: vPacked,

@@ -506,6 +506,18 @@ public final class MoELayer: Module, DecoderLayer {
     /// `LagunaMppGemm.swift`'s header.
     let gateWeightT: Tensor?
 
+    /// W57: set by `decodeMany`/`decodeManyNvfp4` immediately after each
+    /// call to record whether a `fusedResidual` passed to that call was
+    /// actually folded into the MoE combine tail (`Ops.moeUnpermuteTail`)
+    /// vs left for the caller to add itself. Side-channel rather than a
+    /// tuple return so `decodeMany`'s signature/behavior stays unchanged
+    /// for its other callers (Qwen3x*, MTP head) — only the one Laguna
+    /// call site (`LagunaText.forwardMulti`'s `.moe` case) reads this,
+    /// immediately after its `decodeMany` call, before any other call on
+    /// this instance can race it (prefill is sequential per layer). See
+    /// `LagunaFusedMoeTail` for the full fusion rationale/gate.
+    public private(set) var lastResidualFused: Bool = false
+
     /// Stacked-expert weight handles for the batched gather BGEMM fast
     /// path. When set, `decode` dispatches `iron_moe_gather_qmm_mma_int4_bm16`
     /// instead of running `topK` sequential per-expert SwiGLU triplets —
@@ -647,6 +659,23 @@ public final class MoELayer: Module, DecoderLayer {
     /// gate). Raw env string cached at init; `sortPlanCountingEnabled`
     /// below is the single place that interprets it.
     let sortPlanCountingEnvRaw: String?
+    /// Single-dispatch fusion of the counting-sort three-pass chain (W61
+    /// Stage-1 fusion #1 A/B gate). Raw env string cached at init;
+    /// `sortPlanFusedEnabled` below is the single place that interprets
+    /// it. Default OFF (opt-in via `BUTTER_MOE_FUSED_SORT_PLAN=1`) until
+    /// the wired A/B gate lands.
+    let sortPlanFusedEnvRaw: String?
+    /// W69 coherent-unit gate: Laguna Path B prefill router+scaffold port
+    /// (fused sigmoid+bias+topk router — `Ops.moeRouterTopKBiasedRowsFused`
+    /// — combined with the W61 fused sort-plan). Raw env string cached at
+    /// init; `routerV2Enabled` below is the single place that interprets
+    /// it. Default OFF (opt-in via `BUTTER_LAGUNA_ROUTER_V2=1`); when on,
+    /// it also takes the W61 fused sort-plan path regardless of
+    /// `sortPlanFusedEnabled` (see `routerV2Enabled`'s doc) — the two
+    /// fusions are wired as ONE unit for this gate, not two independent
+    /// knobs, per the coherent-unit measurement rationale (single-slice
+    /// fusions measure sub-noise; only a big-enough unit clears the floor).
+    let routerV2EnvRaw: String?
     /// Parallelized tile-plan builder gate (F-85 small-M follow-up). Raw
     /// env string cached at init; `parallelPlanEnabled` below is the
     /// single place that interprets it.
@@ -1039,6 +1068,8 @@ public final class MoELayer: Module, DecoderLayer {
         self.pairedIndirectEnvRaw = env["BUTTER_MOE_PAIRED_INDIRECT"]
         self.coopIndirectEnvRaw = env["BUTTER_MOE_COOP_INDIRECT"]
         self.sortPlanCountingEnvRaw = env["BUTTER_MOE_COUNTING_SORT"]
+        self.sortPlanFusedEnvRaw = env["BUTTER_MOE_FUSED_SORT_PLAN"]
+        self.routerV2EnvRaw = env["BUTTER_LAGUNA_ROUTER_V2"]
         self.parallelPlanEnvRaw = env["BUTTER_MOE_PARALLEL_PLAN"]
     }
 
@@ -1074,6 +1105,50 @@ public final class MoELayer: Module, DecoderLayer {
     /// `iron_moe_sort_plan` at all.
     public var sortPlanCountingEnabled: Bool {
         sortPlanCountingEnvRaw != "0"
+    }
+
+    /// W61 Stage-1 fusion #1: single-dispatch fusion of the counting-sort
+    /// three-pass chain (`Ops.moeSortPlanFused`,
+    /// `moe_route_sort_plan_fused.rs`). Same stable order as
+    /// `moeSortPlanCounting` (byte-identical `--dump-prefill-logits`,
+    /// oracle-checked against both a CPU stable sort and the three-pass
+    /// chain's own GPU output across uniform/Zipf/empty-expert/production
+    /// shapes — see `moe_route_sort_plan_fused_correctness.rs`), ONE
+    /// dispatch instead of three. Default OFF pending the wired A/B gate;
+    /// `BUTTER_MOE_FUSED_SORT_PLAN=1` opts in. Only takes effect where
+    /// `sortPlanCountingEnabled` would otherwise fire (the DEVPLAN2
+    /// device-sorted-plan path) — this flag selects between the fused
+    /// kernel and the three-pass chain, not between counting-sort and the
+    /// original O(mTotal^2) kernel.
+    public var sortPlanFusedEnabled: Bool {
+        sortPlanFusedEnvRaw == "1"
+    }
+
+    /// W69 coherent-unit gate: Laguna Path B (sigmoid+bias) prefill
+    /// router+scaffold port. Default OFF; `BUTTER_LAGUNA_ROUTER_V2=1` opts
+    /// in. When on, the Path B routing branch (see `decodeManyImpl`'s
+    /// `usePathBGPURouter` case):
+    ///   1. Replaces `Ops.moeSigmoidBiasRows` + `Ops.moeRouterTopKBiasedMany`
+    ///      (two dispatches, materializes `[T, nExperts]` unbiased/biased
+    ///      score tensors) with `Ops.moeRouterTopKBiasedRowsFused` (one
+    ///      dispatch, reads raw logits, no intermediate materialization) —
+    ///      see `iron_moe_router_topk_biased_rows_fused`'s module doc for
+    ///      the bit-exactness argument (per-stage rounding replicated,
+    ///      following `LagunaRouterTop8Fuse`'s decode-side precedent).
+    ///   2. ALSO takes the W61 fused sort-plan
+    ///      (`Ops.moeSortPlanFused`) for the resulting token-order ids,
+    ///      same as `sortPlanFusedEnabled` would — wired together as one
+    ///      unit rather than as two independent flags, because W61 shipped
+    ///      measuring FLAT alone (too small to clear run-to-run noise) and
+    ///      the router fusion is the same story in isolation; only the
+    ///      combined router+scaffold unit is large enough to be worth a
+    ///      dedicated wired A/B (see the W69 commit message for that gate).
+    /// `sortPlanFusedEnabled` (`BUTTER_MOE_FUSED_SORT_PLAN`) remains its
+    /// own independent ablation knob — setting it without
+    /// `BUTTER_LAGUNA_ROUTER_V2` still only fuses the sort-plan, not the
+    /// router.
+    public var routerV2Enabled: Bool {
+        routerV2EnvRaw != "0"
     }
 
     /// F-85 parallelized tile-plan builder gate (small-M follow-up to the
@@ -1641,12 +1716,14 @@ public final class MoELayer: Module, DecoderLayer {
     public func decodeMany(
         _ hFlat: Tensor, t: Int,
         cmd: MTLCommandBuffer, device: Device,
-        commitAtEnd: Bool = true
+        commitAtEnd: Bool = true,
+        fusedResidual: Tensor? = nil
     ) -> Tensor {
         precondition(
             hFlat.elementCount == t * hidden,
             "MoELayer.decodeMany: hFlat size \(hFlat.elementCount) ≠ T·hidden = \(t * hidden)")
         precondition(t > 0, "MoELayer.decodeMany: T must be positive")
+        lastResidualFused = false
 
         let dt = hFlat.dtype
 
@@ -1666,6 +1743,7 @@ public final class MoELayer: Module, DecoderLayer {
                 routings: [], sortedExpertsHost: [],
                 sourceTokensHost: [], invPermHost: [],
                 weightsTokenOrderHost: [],
+                fusedResidual: fusedResidual,
                 cmd: cmd, device: device, commitAtEnd: commitAtEnd,
                 useDevicePlan: true)
         }
@@ -1726,7 +1804,14 @@ public final class MoELayer: Module, DecoderLayer {
             // BUTTER_MOE_COUNTING_SORT=0 reverts to the O(mTotal^2) original).
             // Block size 256 - see `moe_sort_plan_counting.rs`'s isolated
             // bench sweep at production mTotal.
-            if self.sortPlanCountingEnabled {
+            // W61: fused single-dispatch plan (opt-in, see
+            // `sortPlanFusedEnabled`) takes precedence over the three-pass
+            // chain when enabled.
+            if self.sortPlanFusedEnabled {
+                Ops.moeSortPlanFused(
+                    topkIds: idsFlat, sortedExperts: se, sourceTokens: st, invPerm: ip,
+                    mTotal: mTot, k: topK, nExperts: nExperts, blockSize: 256, on: cmd)
+            } else if self.sortPlanCountingEnabled {
                 Ops.moeSortPlanCounting(
                     topkIds: idsFlat, sortedExperts: se, sourceTokens: st, invPerm: ip,
                     mTotal: mTot, k: topK, nExperts: nExperts, blockSize: 256, on: cmd)
@@ -1765,19 +1850,30 @@ public final class MoELayer: Module, DecoderLayer {
             let mTot = t * topK
             let scoreDt = gateLogitsAll.dtype
             let flatN = t * nExperts
-            let unbiased = Tensor.empty(shape: [flatN], dtype: scoreDt, device: device)
-            let biased = Tensor.empty(shape: [flatN], dtype: scoreDt, device: device)
-            Ops.moeSigmoidBiasRows(
-                logits: gateLogitsAll.reshaped(to: [flatN]),
-                bias: biasGPU,
-                unbiased: unbiased, biased: biased,
-                tRows: t, nExperts: nExperts, on: cmd)
             let indicesBuf = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
             let weightsBuf = Tensor.empty(shape: [mTot], dtype: scoreDt, device: device)
-            Ops.moeRouterTopKBiasedMany(
-                scoreBiased: biased, scoreUnbiased: unbiased,
-                indicesOut: indicesBuf, weightsOut: weightsBuf,
-                t: t, nExperts: nExperts, k: topK, on: cmd)
+            // W69: fused sigmoid+bias+topk (single dispatch, no
+            // materialized [T, nExperts] score tensors) replaces the
+            // stock two-dispatch sigmoid_bias_rows -> router_topk_biased
+            // chain when `routerV2Enabled` (BUTTER_LAGUNA_ROUTER_V2=1).
+            if self.routerV2Enabled {
+                Ops.moeRouterTopKBiasedRowsFused(
+                    logits: gateLogitsAll.reshaped(to: [flatN]), bias: biasGPU,
+                    indicesOut: indicesBuf, weightsOut: weightsBuf,
+                    t: t, nExperts: nExperts, k: topK, on: cmd)
+            } else {
+                let unbiased = Tensor.empty(shape: [flatN], dtype: scoreDt, device: device)
+                let biased = Tensor.empty(shape: [flatN], dtype: scoreDt, device: device)
+                Ops.moeSigmoidBiasRows(
+                    logits: gateLogitsAll.reshaped(to: [flatN]),
+                    bias: biasGPU,
+                    unbiased: unbiased, biased: biased,
+                    tRows: t, nExperts: nExperts, on: cmd)
+                Ops.moeRouterTopKBiasedMany(
+                    scoreBiased: biased, scoreUnbiased: unbiased,
+                    indicesOut: indicesBuf, weightsOut: weightsBuf,
+                    t: t, nExperts: nExperts, k: topK, on: cmd)
+            }
             let scale = router.routedScalingFactor
             if scale != 1.0 {
                 let scaleVec = Tensor.filled(
@@ -1787,7 +1883,18 @@ public final class MoELayer: Module, DecoderLayer {
             let se = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
             let st = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
             let ip = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
-            if self.sortPlanCountingEnabled {
+            // W61: fused single-dispatch plan (opt-in, see
+            // `sortPlanFusedEnabled`) takes precedence over the three-pass
+            // chain when enabled. This is Laguna's Path B (sigmoid+bias)
+            // route. W69: `routerV2Enabled` also takes this path — the
+            // router fusion and the sort-plan fusion are wired as ONE
+            // coherent unit under `BUTTER_LAGUNA_ROUTER_V2` (see that
+            // property's doc).
+            if self.routerV2Enabled || self.sortPlanFusedEnabled {
+                Ops.moeSortPlanFused(
+                    topkIds: indicesBuf, sortedExperts: se, sourceTokens: st, invPerm: ip,
+                    mTotal: mTot, k: topK, nExperts: nExperts, blockSize: 256, on: cmd)
+            } else if self.sortPlanCountingEnabled {
                 Ops.moeSortPlanCounting(
                     topkIds: indicesBuf, sortedExperts: se, sourceTokens: st, invPerm: ip,
                     mTotal: mTot, k: topK, nExperts: nExperts, blockSize: 256, on: cmd)
@@ -1875,6 +1982,7 @@ public final class MoELayer: Module, DecoderLayer {
                 routings: routings, sortedExpertsHost: sortedExpertsHost,
                 sourceTokensHost: sourceTokensHost, invPermHost: invPermHost,
                 weightsTokenOrderHost: weightsTokenOrderHost,
+                fusedResidual: fusedResidual,
                 cmd: cmd, device: device, commitAtEnd: commitAtEnd,
                 useDevicePlan: d2Indices != nil)
         }
@@ -2442,6 +2550,7 @@ public final class MoELayer: Module, DecoderLayer {
         routings: [MoERouter.Routing],
         sortedExpertsHost: [UInt32], sourceTokensHost: [UInt32],
         invPermHost: [UInt32], weightsTokenOrderHost: [Float],
+        fusedResidual: Tensor? = nil,
         cmd: MTLCommandBuffer, device: Device,
         commitAtEnd: Bool, useDevicePlan: Bool
     ) -> Tensor {
@@ -2633,28 +2742,6 @@ public final class MoELayer: Module, DecoderLayer {
 
                 let nExperts = router.nExperts
                 let flatN = t * nExperts
-                if prefUnbiasedScratch == nil
-                    || prefUnbiasedScratch!.dtype != dt
-                    || prefUnbiasedScratch!.elementCount < flatN
-                {
-                    prefUnbiasedScratch = Tensor.empty(
-                        shape: [flatN], dtype: dt, device: device)
-                    prefBiasedScratch = Tensor.empty(
-                        shape: [flatN], dtype: dt, device: device)
-                }
-                let unbiased = Tensor(
-                    buffer: prefUnbiasedScratch!.buffer,
-                    offset: prefUnbiasedScratch!.offset,
-                    shape: [flatN], dtype: dt)
-                let biased = Tensor(
-                    buffer: prefBiasedScratch!.buffer,
-                    offset: prefBiasedScratch!.offset,
-                    shape: [flatN], dtype: dt)
-                Ops.moeSigmoidBiasRows(
-                    logits: logitsAll.reshaped(to: [flatN]),
-                    bias: biasGPU,
-                    unbiased: unbiased, biased: biased,
-                    tRows: t, nExperts: nExperts, on: work)
                 if prefIndicesTokScratch == nil
                     || prefIndicesTokScratch!.elementCount < mTotal
                 {
@@ -2676,10 +2763,51 @@ public final class MoELayer: Module, DecoderLayer {
                     buffer: prefWeightsTokScratch!.buffer,
                     offset: prefWeightsTokScratch!.offset,
                     shape: [mTotal], dtype: dt)
-                Ops.moeRouterTopKBiasedMany(
-                    scoreBiased: biased, scoreUnbiased: unbiased,
-                    indicesOut: indicesTok, weightsOut: weightsTok,
-                    t: t, nExperts: nExperts, k: topK, on: work)
+                // W69: fused sigmoid+bias+topk (single dispatch, no
+                // materialized [T, nExperts] unbiased/biased score
+                // tensors) replaces the stock two-dispatch
+                // sigmoid_bias_rows -> router_topk_biased chain when
+                // `routerV2Enabled` (BUTTER_LAGUNA_ROUTER_V2=1). THIS is
+                // the real default NVFP4 prefill router site (`decodeMany`
+                // returns early into `decodeManyNvfp4` unless
+                // `BUTTER_NVFP4_GATHER=1`) — the sibling wiring in
+                // `decodeMany`'s own `usePathBGPURouter` branch above
+                // covers the non-default `BUTTER_NVFP4_GATHER=1` gather
+                // path so both are consistent, but THIS site is what the
+                // wired A/B gate actually measures.
+                if self.routerV2Enabled {
+                    Ops.moeRouterTopKBiasedRowsFused(
+                        logits: logitsAll.reshaped(to: [flatN]), bias: biasGPU,
+                        indicesOut: indicesTok, weightsOut: weightsTok,
+                        t: t, nExperts: nExperts, k: topK, on: work)
+                } else {
+                    if prefUnbiasedScratch == nil
+                        || prefUnbiasedScratch!.dtype != dt
+                        || prefUnbiasedScratch!.elementCount < flatN
+                    {
+                        prefUnbiasedScratch = Tensor.empty(
+                            shape: [flatN], dtype: dt, device: device)
+                        prefBiasedScratch = Tensor.empty(
+                            shape: [flatN], dtype: dt, device: device)
+                    }
+                    let unbiased = Tensor(
+                        buffer: prefUnbiasedScratch!.buffer,
+                        offset: prefUnbiasedScratch!.offset,
+                        shape: [flatN], dtype: dt)
+                    let biased = Tensor(
+                        buffer: prefBiasedScratch!.buffer,
+                        offset: prefBiasedScratch!.offset,
+                        shape: [flatN], dtype: dt)
+                    Ops.moeSigmoidBiasRows(
+                        logits: logitsAll.reshaped(to: [flatN]),
+                        bias: biasGPU,
+                        unbiased: unbiased, biased: biased,
+                        tRows: t, nExperts: nExperts, on: work)
+                    Ops.moeRouterTopKBiasedMany(
+                        scoreBiased: biased, scoreUnbiased: unbiased,
+                        indicesOut: indicesTok, weightsOut: weightsTok,
+                        t: t, nExperts: nExperts, k: topK, on: work)
+                }
                 let scale = router.routedScalingFactor
                 if scale != 1.0 {
                     let scaleVec = Tensor.filled(
@@ -2751,6 +2879,13 @@ public final class MoELayer: Module, DecoderLayer {
                 var sortedExperts: Tensor? = nil
                 var sortedSource: Tensor? = nil
                 var sortedInvPerm: Tensor? = nil
+                // W52 byte-hunt: when the f32Promote branch below skips
+                // the castF32ToBf16->downOut materialise (see
+                // LagunaF32PromoteCombineFuse), it stashes the raw f32
+                // down-projection output here so the combine call site
+                // can read it directly instead of the (unwritten)
+                // downOut bf16 buffer.
+                var pendingCombineF32: Tensor? = nil
                 // Sort when MPP, expert-group, or gather-QMM with SORT=1.
                 let sortGather =
                     MoEEnvFlags.gatherSort
@@ -2799,8 +2934,21 @@ public final class MoELayer: Module, DecoderLayer {
                     // France is" generation. Escape hatch unchanged:
                     // BUTTER_MOE_COUNTING_SORT=0 reverts to classic sort
                     // everywhere (this path + DEVPLAN2).
+                    // W61: fused single-dispatch plan (opt-in, see
+                    // `sortPlanFusedEnabled`) takes precedence over the
+                    // three-pass chain when enabled; same gate scope as
+                    // `useCounting` above (this path + DEVPLAN2). W69:
+                    // `routerV2Enabled` also takes this path — wired as
+                    // ONE coherent unit with the router fusion above (see
+                    // `routerV2Enabled`'s doc).
+                    let useFused = self.routerV2Enabled || self.sortPlanFusedEnabled
                     let useCounting = self.sortPlanCountingEnabled
-                    if useCounting {
+                    if useFused {
+                        Ops.moeSortPlanFused(
+                            topkIds: indicesTok, sortedExperts: se, sourceTokens: st,
+                            invPerm: ip, mTotal: mTotal, k: topK, nExperts: nExperts,
+                            blockSize: 256, on: work)
+                    } else if useCounting {
                         Ops.moeSortPlanCounting(
                             topkIds: indicesTok, sortedExperts: se, sourceTokens: st,
                             invPerm: ip, mTotal: mTotal, k: topK, nExperts: nExperts,
@@ -3219,7 +3367,21 @@ public final class MoELayer: Module, DecoderLayer {
                                 blockSize: stacked.blockSize, global: stacked.global,
                                 on: work, into: downF)
                             moeMagScan("down_output", downF)
-                            Ops.castF32ToBf16(downF, into: downOut, on: work)
+                            // W52 byte-hunt: skip the castF32ToBf16 ->
+                            // downOut materialise (write-once-read-once
+                            // bf16 round trip) and let the combine call
+                            // site below read `downF` (f32) directly —
+                            // see LagunaF32PromoteCombineFuse. Escape
+                            // BUTTER_LAGUNA_F32_COMBINE_FUSE=0 restores
+                            // the stock cast-then-combine chain (needed
+                            // whenever sortedInvPerm is nil, since that
+                            // path combines via scalarFMAChain8 on
+                            // downOut directly, not moeUnpermute).
+                            if LagunaF32PromoteCombineFuse.enabled, sortedInvPerm != nil {
+                                pendingCombineF32 = downF
+                            } else {
+                                Ops.castF32ToBf16(downF, into: downOut, on: work)
+                            }
                             moePhaseCheckpoint("down")
                         } else if useSteelRoute {
                             // W54: L38 (the excluded layer). Measured via
@@ -3493,12 +3655,32 @@ public final class MoELayer: Module, DecoderLayer {
                         blockSize: stacked.blockSize, global: stacked.global, on: work)
                 }
 
+                // W57: fused combine+shared+residual tail eligibility.
+                // Only the sorted/MPP `Ops.moeUnpermute` path (not the
+                // token-order FMA `else` below, not the
+                // `LagunaSortedCombine` numerics-audit alternative — a
+                // separate, orthogonal experiment; that flag takes
+                // priority when both happen to be set — see
+                // `LagunaFusedMoeTail`'s file header for the full
+                // rationale). `tailFused` records whether the fused
+                // kernel actually ran this call, so the unfused
+                // shared-expert block below (and `lastResidualFused`,
+                // read by the caller) can key off it.
+                let fuseTailWanted =
+                    LagunaFusedMoeTail.enabled && fusedResidual != nil
+                    && !(LagunaSortedCombine.enabled && topK <= 8)
+                var tailFused = false
+
                 // Weighted sum: FMA when outputs are token-order; unpermute
                 // when expert-sorted (MPP path).
                 if let inv = sortedInvPerm {
                     // Zero outFlat so any unpermute gap is 0 not NaN garbage.
                     // GPU blit (not host memset) — avoids CPU↔GPU sync on
-                    // shared storage mid-cmdbuf under swap pressure.
+                    // shared storage mid-cmdbuf under swap pressure. Not
+                    // needed by the fused kernel (it writes every element
+                    // unconditionally) but kept unconditional for
+                    // simplicity — cheap relative to the tail's other
+                    // dispatches and harmless when overwritten right after.
                     if let blit = work.makeBlitCommandEncoder() {
                         let o0 = outFlat.offset
                         let o1 = o0 + outFlat.elementCount * dtBytes
@@ -3514,12 +3696,63 @@ public final class MoELayer: Module, DecoderLayer {
                     // visible in this repo to audit for the numerics risk
                     // the mission flags). Default OFF, zero behavior
                     // change unless BUTTER_LAGUNA_SORTED_COMBINE=1.
-                    if LagunaSortedCombine.enabled, topK <= 8 {
+                    if let f32Down = pendingCombineF32 {
+                        // W52 byte-hunt: f32Promote layer, downOut was
+                        // never materialised — combine straight off the
+                        // f32 down-GEMM output (see
+                        // LagunaF32PromoteCombineFuse's header for the
+                        // byte-identical double-round argument).
+                        LagunaF32PromoteCombineFuse.combine(
+                            expertOutputsF32: f32Down, invPerm: inv,
+                            topKWeights: weightsTok, into: outFlat,
+                            nRows: t, hidden: hidden, k: topK,
+                            on: work, device: device)
+                    } else if LagunaSortedCombine.enabled, topK <= 8 {
                         LagunaSortedCombine.combine(
                             expertOutputs: downOut, invPerm: inv,
                             topKWeights: weightsTok, into: outFlat,
                             nRows: t, hidden: hidden, k: topK,
                             on: work, device: device)
+                    } else if fuseTailWanted {
+                        // Resolve the shared-expert output as ONE
+                        // [T,hidden] tensor (or nil) first — same three
+                        // sub-cases the unfused shared-add block below
+                        // handles, just without doing the add yet. The
+                        // per-row swiGLU fallback (no batched QMM) can't
+                        // produce one [T,hidden] tensor up front without
+                        // its own scratch-buffer restructuring — that
+                        // sub-case is out of scope for this bounded lever
+                        // (rare/slow path already), so it falls through to
+                        // the unfused sequence below instead.
+                        let sharedIsFallbackOnly =
+                            !MoEEnvFlags.noShared && sharedGateProj != nil
+                            && !MoEEnvFlags.sharedQmmOn && prefillSharedDone == nil
+                        if sharedIsFallbackOnly {
+                            Ops.moeUnpermute(
+                                expertOutputs: downOut, invPerm: inv,
+                                topKWeights: weightsTok, into: outFlat,
+                                nRows: t, hidden: hidden, k: topK, on: work)
+                        } else {
+                            var sharedTensor: Tensor?
+                            if let done = prefillSharedDone, let sOut = prefillSharedOut {
+                                work.encodeWaitForEvent(device.syncEvent, value: done)
+                                sharedTensor = sOut
+                            } else if !MoEEnvFlags.noShared,
+                                let sg = sharedGateProj, let su = sharedUpProj,
+                                let sd = sharedDownProj, MoEEnvFlags.sharedQmmOn
+                            {
+                                sharedTensor = prefillSharedExpertNvfp4(
+                                    hRows: hRows, t: t, gate: sg, up: su, down: sd,
+                                    dtype: dt, on: work, device: device)
+                            }
+                            Ops.moeUnpermuteTail(
+                                expertOutputs: downOut, invPerm: inv,
+                                topKWeights: weightsTok, sharedExpert: sharedTensor,
+                                residual: fusedResidual!, into: outFlat,
+                                nRows: t, hidden: hidden, k: topK, on: work)
+                            tailFused = true
+                            lastResidualFused = true
+                        }
                     } else {
                         Ops.moeUnpermute(
                             expertOutputs: downOut, invPerm: inv,
@@ -3554,34 +3787,38 @@ public final class MoELayer: Module, DecoderLayer {
                     }
                 }
 
-                // Shared expert: dual-queue (MPP path) or batched QMM on `work`.
-                if let done = prefillSharedDone, let sOut = prefillSharedOut {
-                    work.encodeWaitForEvent(device.syncEvent, value: done)
-                    _ = Ops.add(outFlat, sOut, on: work, into: outFlat)
-                } else if !MoEEnvFlags.noShared,
-                    let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj
-                {
-                    let useSharedQmm =
-                        MoEEnvFlags.sharedQmmOn
-                    if useSharedQmm,
-                        let shared = prefillSharedExpertNvfp4(
-                            hRows: hRows, t: t, gate: sg, up: su, down: sd,
-                            dtype: dt, on: work, device: device)
+                // Shared expert: dual-queue (MPP path) or batched QMM on
+                // `work`. Skipped when the W57 fused kernel already folded
+                // shared (+ residual) into the combine dispatch above.
+                if !tailFused {
+                    if let done = prefillSharedDone, let sOut = prefillSharedOut {
+                        work.encodeWaitForEvent(device.syncEvent, value: done)
+                        _ = Ops.add(outFlat, sOut, on: work, into: outFlat)
+                    } else if !MoEEnvFlags.noShared,
+                        let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj
                     {
-                        _ = Ops.add(outFlat, shared, on: work, into: outFlat)
-                    } else if !useSharedQmm {
-                        for r in 0 ..< t {
-                            let hRow = Tensor(
-                                buffer: hFlat.buffer,
-                                offset: hFlat.offset + r * hidden * dtBytes,
-                                shape: [hidden], dtype: dt)
-                            let shared = swiGLU(
-                                hRow, gateProj: sg, upProj: su, downProj: sd, on: work)
-                            let outRow = Tensor(
-                                buffer: outFlat.buffer,
-                                offset: outFlat.offset + r * hidden * dtBytes,
-                                shape: [hidden], dtype: dt)
-                            _ = Ops.add(outRow, shared, on: work, into: outRow)
+                        let useSharedQmm =
+                            MoEEnvFlags.sharedQmmOn
+                        if useSharedQmm,
+                            let shared = prefillSharedExpertNvfp4(
+                                hRows: hRows, t: t, gate: sg, up: su, down: sd,
+                                dtype: dt, on: work, device: device)
+                        {
+                            _ = Ops.add(outFlat, shared, on: work, into: outFlat)
+                        } else if !useSharedQmm {
+                            for r in 0 ..< t {
+                                let hRow = Tensor(
+                                    buffer: hFlat.buffer,
+                                    offset: hFlat.offset + r * hidden * dtBytes,
+                                    shape: [hidden], dtype: dt)
+                                let shared = swiGLU(
+                                    hRow, gateProj: sg, upProj: su, downProj: sd, on: work)
+                                let outRow = Tensor(
+                                    buffer: outFlat.buffer,
+                                    offset: outFlat.offset + r * hidden * dtBytes,
+                                    shape: [hidden], dtype: dt)
+                                _ = Ops.add(outRow, shared, on: work, into: outRow)
+                            }
                         }
                     }
                 }

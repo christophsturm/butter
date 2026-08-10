@@ -728,6 +728,37 @@ public enum Ops {
             on: cmd)
     }
 
+    /// Single-dispatch fusion of `moeSortPlanCounting`'s three-pass chain
+    /// (F-85 Stage-1 fusion #1 / W61). Same stable-order output contract,
+    /// same no-sync DEVPLAN2 property, ONE dispatch instead of three — no
+    /// `blockCounts`/`blockOffsets` intermediate buffers at all, since
+    /// every threadgroup recomputes what it needs directly from
+    /// `topkIds` (see `iron_moe_route_sort_plan_fused`'s module doc for
+    /// why that recompute is cheap and why the algorithm still needs zero
+    /// cross-threadgroup synchronization). Same grid shape as
+    /// `moeSortPlanCounting`'s pass 1 (`nBlocks` threadgroups, `nExperts`
+    /// lanes) — this fusion trades away the two intermediate-buffer round
+    /// trips and two dispatch/encoder overheads, not occupancy.
+    public static func moeSortPlanFused(
+        topkIds: Tensor, sortedExperts: Tensor, sourceTokens: Tensor, invPerm: Tensor,
+        mTotal: Int, k: Int, nExperts: Int, blockSize: Int, on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            nExperts <= 256,
+            "moeSortPlanFused: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let nBlocks = (mTotal + blockSize - 1) / blockSize
+        IronKernels.iron_moe_route_sort_plan_fused_f32_threadgroups(
+            topk_ids: topkIds.buffer, topk_idsOffset: topkIds.offset,
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            source_tokens: sourceTokens.buffer, source_tokensOffset: sourceTokens.offset,
+            inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+            m_total: UInt32(mTotal), k: UInt32(k), n_experts: UInt32(nExperts), block_size: UInt32(blockSize),
+            gridSize: MTLSize(width: max(nBlocks, 1), height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: nExperts, height: 1, depth: 1),
+            on: cmd)
+    }
+
     /// Dequantize an mlx int4 affine-quantized `[outDim, inDim]` weight to a
     /// dense `[outDim, inDim]` tensor in one dispatch (one thread per packed
     /// u32 = 8 nibbles). Used to batch narrow-outDim projections (e.g. a
@@ -3164,6 +3195,69 @@ public enum Ops {
         default:
             fatalError(
                 "Ops.moeRouterTopKBiasedMany: unsupported dtype \(scoreBiased.dtype)")
+        }
+    }
+
+    /// W69: single-dispatch fusion of `moeSigmoidBiasRows` +
+    /// `moeRouterTopKBiasedMany` (`iron_moe_router_topk_biased_rows_fused`).
+    /// Reads RAW router GEMV `logits` directly — no precomputed
+    /// `unbiased`/`biased` score tensors — and computes sigmoid+bias inline
+    /// per masked-argmax candidate, replicating the two-kernel chain's
+    /// per-stage rounding exactly (see the kernel's module doc). Does NOT
+    /// apply `routedScalingFactor` — same contract as
+    /// `moeRouterTopKBiasedMany`, caller multiplies after.
+    public static func moeRouterTopKBiasedRowsFused(
+        logits: Tensor, bias: Tensor,
+        indicesOut: Tensor, weightsOut: Tensor,
+        t: Int, nExperts: Int, k: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(t > 0, "Ops.moeRouterTopKBiasedRowsFused: t must be positive")
+        precondition(
+            logits.elementCount == t * nExperts,
+            "Ops.moeRouterTopKBiasedRowsFused: logits must be [T·nExperts]")
+        precondition(
+            bias.elementCount == nExperts,
+            "Ops.moeRouterTopKBiasedRowsFused: bias must be [nExperts]")
+        precondition(
+            indicesOut.elementCount == t * k && indicesOut.dtype == .u32,
+            "Ops.moeRouterTopKBiasedRowsFused: indicesOut must be [T·k] u32")
+        precondition(
+            weightsOut.elementCount == t * k && weightsOut.dtype == logits.dtype,
+            "Ops.moeRouterTopKBiasedRowsFused: weightsOut must be [T·k] matching logits")
+        precondition(
+            logits.dtype == bias.dtype,
+            "Ops.moeRouterTopKBiasedRowsFused: logits/bias dtype mismatch")
+        let grd = MTLSize(width: t * 32, height: 1, depth: 1)
+        let tg = MTLSize(width: 32, height: 1, depth: 1)
+        switch logits.dtype {
+        case .f32:
+            IronKernels.iron_moe_router_topk_biased_rows_fused_f32(
+                logits: logits.buffer, logitsOffset: logits.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k),
+                gridSize: grd, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_moe_router_topk_biased_rows_fused_f16(
+                logits: logits.buffer, logitsOffset: logits.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k),
+                gridSize: grd, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_moe_router_topk_biased_rows_fused_bf16(
+                logits: logits.buffer, logitsOffset: logits.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k),
+                gridSize: grd, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError(
+                "Ops.moeRouterTopKBiasedRowsFused: unsupported dtype \(logits.dtype)")
         }
     }
 
@@ -7202,12 +7296,28 @@ public enum Ops {
     ///
     /// Grid: `(qLen / 32, n_q_heads, 1)` threadgroups, 128 threads per
     /// group (4 simdgroups). Reduction-mode kernel.
+    /// - Parameters position/kReal: W48 direct-KV extension (see
+    ///   `iron_sdpa_prefill_mma`'s doc comment in iron's
+    ///   `steel_attention_mma.rs`). `kLen` is now the K/V ADDRESSING
+    ///   STRIDE (buffer row pitch) rather than necessarily the real
+    ///   length — `position` (absolute sequence offset of this Q
+    ///   chunk) and `kReal` (real, non-pad KV length; any k >= kReal
+    ///   is masked to -inf alongside causal) are explicit params
+    ///   instead of being implicitly derived. Both default to the
+    ///   legacy compacted-KV contract when omitted (`position = kLen -
+    ///   qLen`, `kReal = kLen`) — every existing call site (Hy3Text,
+    ///   LagunaSdpa's compacted path) is byte-identical without
+    ///   changes. Pass them explicitly only for a direct (uncompacted)
+    ///   raw-strided K/V read where `kLen` (the cache's `maxSeq`) may
+    ///   exceed the real content length.
     public static func sdpaPrefillMma(
         q: Tensor, k: Tensor, v: Tensor,
         nQHeads: Int, nKVHeads: Int, headDim: Int,
         qLen: Int, kLen: Int, scale: Float,
         on cmd: MTLCommandBuffer,
-        into out: Tensor? = nil
+        into out: Tensor? = nil,
+        position: Int? = nil,
+        kReal: Int? = nil
     ) -> Tensor {
         precondition(
             qLen > 0 && qLen % 32 == 0,
@@ -7230,6 +7340,11 @@ public enum Ops {
         let tgGrid = MTLSize(width: qLen / bq, height: nQHeads, depth: 1)
         let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
         let gqaFactor = nQHeads / nKVHeads
+        let positionV = position ?? (kLen - qLen)
+        let kRealV = kReal ?? kLen
+        precondition(positionV >= 0, "Ops.sdpaPrefillMma: position \(positionV) must be >= 0")
+        precondition(
+            kRealV <= kLen, "Ops.sdpaPrefillMma: kReal \(kRealV) must be <= kLen \(kLen)")
 
         switch q.dtype {
         case .f32:
@@ -7242,6 +7357,7 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor),
                 n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
                 scale: scale,
+                position: UInt32(positionV), k_real: UInt32(kRealV),
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         case .f16:
             IronKernels.iron_sdpa_prefill_mma_f16_threadgroups(
@@ -7253,6 +7369,7 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor),
                 n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
                 scale: scale,
+                position: UInt32(positionV), k_real: UInt32(kRealV),
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         case .bf16:
             IronKernels.iron_sdpa_prefill_mma_bf16_threadgroups(
@@ -7264,11 +7381,67 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor),
                 n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
                 scale: scale,
+                position: UInt32(positionV), k_real: UInt32(kRealV),
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.sdpaPrefillMma: unsupported dtype \(q.dtype)")
         }
         return result
+    }
+
+    /// W58 fused-epilogue prefill SDPA: f16 q/k/v in, **transposed bf16**
+    /// out. Identical MMA math to `sdpaPrefillMma`, but the store epilogue
+    /// writes each element straight to the transposed row-major layout
+    /// `out[t, q_head*head_dim + d]` (shape `[qLen, nQHeads*headDim]`) and
+    /// narrows f32→f16→bf16 in-register — folding the separate
+    /// `transposeHTDCastToBf16` dispatch (and the `outHTD` round trip: a full
+    /// write + read of the `[nHeads, qLen, headDim]` f16 attn output per
+    /// layer) into the producer kernel.
+    ///
+    /// The f32→f16→bf16 double-round is bit-identical to the native-layout
+    /// path (`sdpaPrefillMma` stores f16 via `.cast::<f16>()`, then
+    /// `transposeHTDCastToBf16` does `bfloat(float(x))`).
+    ///
+    /// `out` must be `[qLen, nQHeads*headDim]` bf16 (caller slices the first
+    /// `nRows` rows). Same grid/tpg contract as `sdpaPrefillMma`.
+    public static func sdpaPrefillMmaTransBf16(
+        q: Tensor, k: Tensor, v: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        qLen: Int, kLen: Int, scale: Float,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(
+            qLen > 0 && qLen % 32 == 0,
+            "Ops.sdpaPrefillMmaTransBf16: qLen \(qLen) must be a positive multiple of 32")
+        precondition(
+            kLen >= qLen,
+            "Ops.sdpaPrefillMmaTransBf16: kLen \(kLen) must be >= qLen \(qLen)")
+        precondition(
+            nQHeads % nKVHeads == 0,
+            "Ops.sdpaPrefillMmaTransBf16: nQHeads \(nQHeads) must be a multiple of nKVHeads \(nKVHeads)")
+        precondition(
+            q.dtype == .f16 && k.dtype == .f16 && v.dtype == .f16,
+            "Ops.sdpaPrefillMmaTransBf16: q/k/v must be f16")
+        precondition(
+            out.dtype == .bf16, "Ops.sdpaPrefillMmaTransBf16: out must be bf16")
+        precondition(
+            headDim == 128, "Ops.sdpaPrefillMmaTransBf16: kernel is head_dim=128 only")
+        let threadsPerGroup = 128
+        let bq = 32
+        let tgGrid = MTLSize(width: qLen / bq, height: nQHeads, depth: 1)
+        let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+        let gqaFactor = nQHeads / nKVHeads
+        IronKernels.iron_sdpa_prefill_mma_transbf16_f16_threadgroups(
+            q: q.buffer, qOffset: q.offset,
+            k: k.buffer, kOffset: k.offset,
+            v: v.buffer, vOffset: v.offset,
+            out: out.buffer, outOffset: out.offset,
+            q_len: UInt32(qLen), k_len: UInt32(kLen),
+            gqa_factor: UInt32(gqaFactor),
+            n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
+            scale: scale,
+            gridSize: tgGrid, threadgroupSize: tg, on: cmd)
     }
 
     // ─── MoE gather BGEMM int4 — BM=8 MPP variant ────────────────────
@@ -7503,6 +7676,121 @@ public enum Ops {
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.moeUnpermute: unsupported dtype \(out.dtype)")
+        }
+    }
+
+    /// W57: fused MoE combine tail — `moeUnpermute` + shared-expert add +
+    /// residual add in ONE dispatch, replacing the Laguna prefill sorted-MoE
+    /// tail's three separate `[T, hidden]` passes (`moeUnpermute` ->
+    /// `Ops.add` shared -> `Ops.add` residual) with one read of each input
+    /// and one write of `out`. Flag-gated via
+    /// `BUTTER_LAGUNA_FUSED_MOE_TAIL` (see `LagunaFusedMoeTail`); default OFF
+    /// for the W57 A/B, zero behavior change unless set.
+    ///
+    /// `sharedExpert` is optional — pass `nil` on paths/layers with no
+    /// shared expert (e.g. `MoEEnvFlags.noShared`, or a model variant
+    /// without one). When `nil`, `residual` is bound at the kernel's
+    /// `shared_expert_out` slot as a same-shape dummy buffer and
+    /// `has_shared=0` guards the load so it is never read — matching the
+    /// iron kernel's documented dummy-buffer contract
+    /// (`iron_moe_unpermute_tail` in `moe/moe_unpermute_tail.rs`).
+    ///
+    /// Accumulation order matches the unfused call sites exactly (unpermute
+    /// -> += shared -> += residual, kept in one f32 accumulator instead of
+    /// round-tripping through `T` between steps) — see that kernel's file
+    /// header for why this is not a reassociation and should be
+    /// byte-identical, not just within-tolerance.
+    public static func moeUnpermuteTail(
+        expertOutputs: Tensor,
+        invPerm: Tensor,
+        topKWeights: Tensor,
+        sharedExpert: Tensor?,
+        residual: Tensor,
+        into out: Tensor,
+        nRows: Int, hidden: Int, k: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            invPerm.dtype == .u32,
+            "Ops.moeUnpermuteTail: invPerm must be u32 (got \(invPerm.dtype))")
+        precondition(
+            expertOutputs.dtype == topKWeights.dtype && topKWeights.dtype == out.dtype
+                && residual.dtype == out.dtype,
+            "Ops.moeUnpermuteTail: expertOutputs/topKWeights/residual/out must share dtype")
+        if let shared = sharedExpert {
+            precondition(
+                shared.dtype == out.dtype,
+                "Ops.moeUnpermuteTail: sharedExpert must share dtype with out")
+            precondition(
+                shared.elementCount == nRows * hidden,
+                "Ops.moeUnpermuteTail: sharedExpert has \(shared.elementCount) elements, expected nRows·hidden = \(nRows * hidden)"
+            )
+        }
+        precondition(
+            expertOutputs.elementCount == nRows * k * hidden,
+            "Ops.moeUnpermuteTail: expertOutputs has \(expertOutputs.elementCount) elements, expected nRows·k·hidden = \(nRows * k * hidden)"
+        )
+        precondition(
+            invPerm.elementCount == nRows * k,
+            "Ops.moeUnpermuteTail: invPerm has \(invPerm.elementCount) elements, expected nRows·k = \(nRows * k)"
+        )
+        precondition(
+            topKWeights.elementCount == nRows * k,
+            "Ops.moeUnpermuteTail: topKWeights has \(topKWeights.elementCount) elements, expected nRows·k = \(nRows * k)"
+        )
+        precondition(
+            residual.elementCount == nRows * hidden,
+            "Ops.moeUnpermuteTail: residual has \(residual.elementCount) elements, expected nRows·hidden = \(nRows * hidden)"
+        )
+        precondition(
+            out.elementCount == nRows * hidden,
+            "Ops.moeUnpermuteTail: out has \(out.elementCount) elements, expected nRows·hidden = \(nRows * hidden)"
+        )
+
+        let tgWidth = 128
+        let grid = MTLSize(width: nRows * tgWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let hiddenU = UInt32(hidden)
+        let kU = UInt32(k)
+        let hasSharedU: UInt32 = sharedExpert != nil ? 1 : 0
+        // Dummy buffer for the shared_expert_out slot when there is no
+        // shared expert: same-shape `residual` is a safe bind (correct
+        // size, never read — has_shared=0 guards the kernel's load).
+        let sharedBuf = sharedExpert ?? residual
+
+        switch out.dtype {
+        case .f32:
+            IronKernels.iron_moe_unpermute_tail_f32(
+                expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
+                inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+                top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
+                shared_expert_out: sharedBuf.buffer, shared_expert_outOffset: sharedBuf.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU, k: kU, has_shared: hasSharedU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_moe_unpermute_tail_f16(
+                expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
+                inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+                top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
+                shared_expert_out: sharedBuf.buffer, shared_expert_outOffset: sharedBuf.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU, k: kU, has_shared: hasSharedU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_moe_unpermute_tail_bf16(
+                expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
+                inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+                top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
+                shared_expert_out: sharedBuf.buffer, shared_expert_outOffset: sharedBuf.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU, k: kU, has_shared: hasSharedU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.moeUnpermuteTail: unsupported dtype \(out.dtype)")
         }
     }
 

@@ -2410,9 +2410,26 @@ final class LagunaLayer {
             }
             // Stay on work when device plan keeps cmd open; residual on
             // same CB then commit without wait (model prefill pipe fences).
+            //
+            // W57: BUTTER_LAGUNA_FUSED_MOE_TAIL=1 folds this residual add
+            // (+ the shared-expert add, inside MoELayer) into the MoE
+            // combine-tail kernel itself (`Ops.moeUnpermuteTail`) — one
+            // dispatch instead of combine + 2 separate `Ops.add` passes.
+            // `moe.lastResidualFused` (set by `decodeMany` right before
+            // returning) reports whether that actually happened for THIS
+            // call; when false (flag off, token-order FMA path, or the
+            // per-row swiGLU shared-expert fallback — see
+            // `LagunaFusedMoeTail`'s file header), `ffnOutFlat` is the
+            // plain unfused MoE output exactly as before and the residual
+            // add below still runs, unchanged. Default OFF: passing
+            // `fusedResidual` only changes behavior when the flag is set;
+            // `decodeMany` itself gates on `LagunaFusedMoeTail.enabled`.
+            let h2Flat = h2.reshaped(to: [nRows * hidden])
             let ffnOutFlat = moe.decodeMany(
                 ffnIn.reshaped(to: [nRows * hidden]),
-                t: nRows, cmd: work, device: device, commitAtEnd: false)
+                t: nRows, cmd: work, device: device, commitAtEnd: false,
+                fusedResidual: h2Flat)
+            let residualFused = moe.lastResidualFused
             let out: Tensor
             if work.status == .committed || work.status == .completed
                 || work.status == .error
@@ -2420,9 +2437,20 @@ final class LagunaLayer {
                 // MoE committed the layer CB (e.g. isolated MPP path). Residual
                 // must land on a fresh CB and be waited (or at least committed
                 // into the prefill pipe) so the next layer does not race.
+                if residualFused {
+                    // Already added inside the fused tail kernel, on
+                    // whatever (possibly rotated) command buffer produced
+                    // `ffnOutFlat` — that buffer was necessarily committed
+                    // ahead of `work` showing committed here (same queue,
+                    // submission order), so waiting on `work` itself gives
+                    // the same host-side completion guarantee the fresh
+                    // `addCmd` below exists for, with no separate dispatch.
+                    work.waitUntilCompleted()
+                    return ffnOutFlat.reshaped(to: [nRows, hidden])
+                }
                 let addCmd = device.makeCommandBuffer()
                 out = Ops.add(
-                    h2.reshaped(to: [nRows * hidden]),
+                    h2Flat,
                     ffnOutFlat,
                     on: addCmd
                 ).reshaped(to: [nRows, hidden])
@@ -2431,11 +2459,15 @@ final class LagunaLayer {
                 addCmd.waitUntilCompleted()
                 return out
             }
-            out = Ops.add(
-                h2.reshaped(to: [nRows * hidden]),
-                ffnOutFlat,
-                on: work
-            ).reshaped(to: [nRows, hidden])
+            if residualFused {
+                out = ffnOutFlat.reshaped(to: [nRows, hidden])
+            } else {
+                out = Ops.add(
+                    h2Flat,
+                    ffnOutFlat,
+                    on: work
+                ).reshaped(to: [nRows, hidden])
+            }
             if work.status != .committed && work.status != .completed
                 && work.status != .error
             {
