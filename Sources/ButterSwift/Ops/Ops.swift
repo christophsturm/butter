@@ -3198,6 +3198,69 @@ public enum Ops {
         }
     }
 
+    /// W69: single-dispatch fusion of `moeSigmoidBiasRows` +
+    /// `moeRouterTopKBiasedMany` (`iron_moe_router_topk_biased_rows_fused`).
+    /// Reads RAW router GEMV `logits` directly — no precomputed
+    /// `unbiased`/`biased` score tensors — and computes sigmoid+bias inline
+    /// per masked-argmax candidate, replicating the two-kernel chain's
+    /// per-stage rounding exactly (see the kernel's module doc). Does NOT
+    /// apply `routedScalingFactor` — same contract as
+    /// `moeRouterTopKBiasedMany`, caller multiplies after.
+    public static func moeRouterTopKBiasedRowsFused(
+        logits: Tensor, bias: Tensor,
+        indicesOut: Tensor, weightsOut: Tensor,
+        t: Int, nExperts: Int, k: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(t > 0, "Ops.moeRouterTopKBiasedRowsFused: t must be positive")
+        precondition(
+            logits.elementCount == t * nExperts,
+            "Ops.moeRouterTopKBiasedRowsFused: logits must be [T·nExperts]")
+        precondition(
+            bias.elementCount == nExperts,
+            "Ops.moeRouterTopKBiasedRowsFused: bias must be [nExperts]")
+        precondition(
+            indicesOut.elementCount == t * k && indicesOut.dtype == .u32,
+            "Ops.moeRouterTopKBiasedRowsFused: indicesOut must be [T·k] u32")
+        precondition(
+            weightsOut.elementCount == t * k && weightsOut.dtype == logits.dtype,
+            "Ops.moeRouterTopKBiasedRowsFused: weightsOut must be [T·k] matching logits")
+        precondition(
+            logits.dtype == bias.dtype,
+            "Ops.moeRouterTopKBiasedRowsFused: logits/bias dtype mismatch")
+        let grd = MTLSize(width: t * 32, height: 1, depth: 1)
+        let tg = MTLSize(width: 32, height: 1, depth: 1)
+        switch logits.dtype {
+        case .f32:
+            IronKernels.iron_moe_router_topk_biased_rows_fused_f32(
+                logits: logits.buffer, logitsOffset: logits.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k),
+                gridSize: grd, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_moe_router_topk_biased_rows_fused_f16(
+                logits: logits.buffer, logitsOffset: logits.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k),
+                gridSize: grd, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_moe_router_topk_biased_rows_fused_bf16(
+                logits: logits.buffer, logitsOffset: logits.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k),
+                gridSize: grd, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError(
+                "Ops.moeRouterTopKBiasedRowsFused: unsupported dtype \(logits.dtype)")
+        }
+    }
+
     /// MoE top-K router. Reads `[nExperts]` raw logits and writes
     /// `[k]` u32 expert indices + `[k]` weights of the same dtype.
     /// `normTopkProb` matches Qwen3-MoE convention when `true`

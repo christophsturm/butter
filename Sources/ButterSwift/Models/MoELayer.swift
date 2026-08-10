@@ -665,6 +665,17 @@ public final class MoELayer: Module, DecoderLayer {
     /// it. Default OFF (opt-in via `BUTTER_MOE_FUSED_SORT_PLAN=1`) until
     /// the wired A/B gate lands.
     let sortPlanFusedEnvRaw: String?
+    /// W69 coherent-unit gate: Laguna Path B prefill router+scaffold port
+    /// (fused sigmoid+bias+topk router — `Ops.moeRouterTopKBiasedRowsFused`
+    /// — combined with the W61 fused sort-plan). Raw env string cached at
+    /// init; `routerV2Enabled` below is the single place that interprets
+    /// it. Default OFF (opt-in via `BUTTER_LAGUNA_ROUTER_V2=1`); when on,
+    /// it also takes the W61 fused sort-plan path regardless of
+    /// `sortPlanFusedEnabled` (see `routerV2Enabled`'s doc) — the two
+    /// fusions are wired as ONE unit for this gate, not two independent
+    /// knobs, per the coherent-unit measurement rationale (single-slice
+    /// fusions measure sub-noise; only a big-enough unit clears the floor).
+    let routerV2EnvRaw: String?
     /// Parallelized tile-plan builder gate (F-85 small-M follow-up). Raw
     /// env string cached at init; `parallelPlanEnabled` below is the
     /// single place that interprets it.
@@ -1058,6 +1069,7 @@ public final class MoELayer: Module, DecoderLayer {
         self.coopIndirectEnvRaw = env["BUTTER_MOE_COOP_INDIRECT"]
         self.sortPlanCountingEnvRaw = env["BUTTER_MOE_COUNTING_SORT"]
         self.sortPlanFusedEnvRaw = env["BUTTER_MOE_FUSED_SORT_PLAN"]
+        self.routerV2EnvRaw = env["BUTTER_LAGUNA_ROUTER_V2"]
         self.parallelPlanEnvRaw = env["BUTTER_MOE_PARALLEL_PLAN"]
     }
 
@@ -1110,6 +1122,33 @@ public final class MoELayer: Module, DecoderLayer {
     /// original O(mTotal^2) kernel.
     public var sortPlanFusedEnabled: Bool {
         sortPlanFusedEnvRaw == "1"
+    }
+
+    /// W69 coherent-unit gate: Laguna Path B (sigmoid+bias) prefill
+    /// router+scaffold port. Default OFF; `BUTTER_LAGUNA_ROUTER_V2=1` opts
+    /// in. When on, the Path B routing branch (see `decodeManyImpl`'s
+    /// `usePathBGPURouter` case):
+    ///   1. Replaces `Ops.moeSigmoidBiasRows` + `Ops.moeRouterTopKBiasedMany`
+    ///      (two dispatches, materializes `[T, nExperts]` unbiased/biased
+    ///      score tensors) with `Ops.moeRouterTopKBiasedRowsFused` (one
+    ///      dispatch, reads raw logits, no intermediate materialization) —
+    ///      see `iron_moe_router_topk_biased_rows_fused`'s module doc for
+    ///      the bit-exactness argument (per-stage rounding replicated,
+    ///      following `LagunaRouterTop8Fuse`'s decode-side precedent).
+    ///   2. ALSO takes the W61 fused sort-plan
+    ///      (`Ops.moeSortPlanFused`) for the resulting token-order ids,
+    ///      same as `sortPlanFusedEnabled` would — wired together as one
+    ///      unit rather than as two independent flags, because W61 shipped
+    ///      measuring FLAT alone (too small to clear run-to-run noise) and
+    ///      the router fusion is the same story in isolation; only the
+    ///      combined router+scaffold unit is large enough to be worth a
+    ///      dedicated wired A/B (see the W69 commit message for that gate).
+    /// `sortPlanFusedEnabled` (`BUTTER_MOE_FUSED_SORT_PLAN`) remains its
+    /// own independent ablation knob — setting it without
+    /// `BUTTER_LAGUNA_ROUTER_V2` still only fuses the sort-plan, not the
+    /// router.
+    public var routerV2Enabled: Bool {
+        routerV2EnvRaw == "1"
     }
 
     /// F-85 parallelized tile-plan builder gate (small-M follow-up to the
@@ -1811,19 +1850,30 @@ public final class MoELayer: Module, DecoderLayer {
             let mTot = t * topK
             let scoreDt = gateLogitsAll.dtype
             let flatN = t * nExperts
-            let unbiased = Tensor.empty(shape: [flatN], dtype: scoreDt, device: device)
-            let biased = Tensor.empty(shape: [flatN], dtype: scoreDt, device: device)
-            Ops.moeSigmoidBiasRows(
-                logits: gateLogitsAll.reshaped(to: [flatN]),
-                bias: biasGPU,
-                unbiased: unbiased, biased: biased,
-                tRows: t, nExperts: nExperts, on: cmd)
             let indicesBuf = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
             let weightsBuf = Tensor.empty(shape: [mTot], dtype: scoreDt, device: device)
-            Ops.moeRouterTopKBiasedMany(
-                scoreBiased: biased, scoreUnbiased: unbiased,
-                indicesOut: indicesBuf, weightsOut: weightsBuf,
-                t: t, nExperts: nExperts, k: topK, on: cmd)
+            // W69: fused sigmoid+bias+topk (single dispatch, no
+            // materialized [T, nExperts] score tensors) replaces the
+            // stock two-dispatch sigmoid_bias_rows -> router_topk_biased
+            // chain when `routerV2Enabled` (BUTTER_LAGUNA_ROUTER_V2=1).
+            if self.routerV2Enabled {
+                Ops.moeRouterTopKBiasedRowsFused(
+                    logits: gateLogitsAll.reshaped(to: [flatN]), bias: biasGPU,
+                    indicesOut: indicesBuf, weightsOut: weightsBuf,
+                    t: t, nExperts: nExperts, k: topK, on: cmd)
+            } else {
+                let unbiased = Tensor.empty(shape: [flatN], dtype: scoreDt, device: device)
+                let biased = Tensor.empty(shape: [flatN], dtype: scoreDt, device: device)
+                Ops.moeSigmoidBiasRows(
+                    logits: gateLogitsAll.reshaped(to: [flatN]),
+                    bias: biasGPU,
+                    unbiased: unbiased, biased: biased,
+                    tRows: t, nExperts: nExperts, on: cmd)
+                Ops.moeRouterTopKBiasedMany(
+                    scoreBiased: biased, scoreUnbiased: unbiased,
+                    indicesOut: indicesBuf, weightsOut: weightsBuf,
+                    t: t, nExperts: nExperts, k: topK, on: cmd)
+            }
             let scale = router.routedScalingFactor
             if scale != 1.0 {
                 let scaleVec = Tensor.filled(
@@ -1836,8 +1886,11 @@ public final class MoELayer: Module, DecoderLayer {
             // W61: fused single-dispatch plan (opt-in, see
             // `sortPlanFusedEnabled`) takes precedence over the three-pass
             // chain when enabled. This is Laguna's Path B (sigmoid+bias)
-            // route.
-            if self.sortPlanFusedEnabled {
+            // route. W69: `routerV2Enabled` also takes this path — the
+            // router fusion and the sort-plan fusion are wired as ONE
+            // coherent unit under `BUTTER_LAGUNA_ROUTER_V2` (see that
+            // property's doc).
+            if self.routerV2Enabled || self.sortPlanFusedEnabled {
                 Ops.moeSortPlanFused(
                     topkIds: indicesBuf, sortedExperts: se, sourceTokens: st, invPerm: ip,
                     mTotal: mTot, k: topK, nExperts: nExperts, blockSize: 256, on: cmd)
@@ -2689,28 +2742,6 @@ public final class MoELayer: Module, DecoderLayer {
 
                 let nExperts = router.nExperts
                 let flatN = t * nExperts
-                if prefUnbiasedScratch == nil
-                    || prefUnbiasedScratch!.dtype != dt
-                    || prefUnbiasedScratch!.elementCount < flatN
-                {
-                    prefUnbiasedScratch = Tensor.empty(
-                        shape: [flatN], dtype: dt, device: device)
-                    prefBiasedScratch = Tensor.empty(
-                        shape: [flatN], dtype: dt, device: device)
-                }
-                let unbiased = Tensor(
-                    buffer: prefUnbiasedScratch!.buffer,
-                    offset: prefUnbiasedScratch!.offset,
-                    shape: [flatN], dtype: dt)
-                let biased = Tensor(
-                    buffer: prefBiasedScratch!.buffer,
-                    offset: prefBiasedScratch!.offset,
-                    shape: [flatN], dtype: dt)
-                Ops.moeSigmoidBiasRows(
-                    logits: logitsAll.reshaped(to: [flatN]),
-                    bias: biasGPU,
-                    unbiased: unbiased, biased: biased,
-                    tRows: t, nExperts: nExperts, on: work)
                 if prefIndicesTokScratch == nil
                     || prefIndicesTokScratch!.elementCount < mTotal
                 {
@@ -2732,10 +2763,51 @@ public final class MoELayer: Module, DecoderLayer {
                     buffer: prefWeightsTokScratch!.buffer,
                     offset: prefWeightsTokScratch!.offset,
                     shape: [mTotal], dtype: dt)
-                Ops.moeRouterTopKBiasedMany(
-                    scoreBiased: biased, scoreUnbiased: unbiased,
-                    indicesOut: indicesTok, weightsOut: weightsTok,
-                    t: t, nExperts: nExperts, k: topK, on: work)
+                // W69: fused sigmoid+bias+topk (single dispatch, no
+                // materialized [T, nExperts] unbiased/biased score
+                // tensors) replaces the stock two-dispatch
+                // sigmoid_bias_rows -> router_topk_biased chain when
+                // `routerV2Enabled` (BUTTER_LAGUNA_ROUTER_V2=1). THIS is
+                // the real default NVFP4 prefill router site (`decodeMany`
+                // returns early into `decodeManyNvfp4` unless
+                // `BUTTER_NVFP4_GATHER=1`) — the sibling wiring in
+                // `decodeMany`'s own `usePathBGPURouter` branch above
+                // covers the non-default `BUTTER_NVFP4_GATHER=1` gather
+                // path so both are consistent, but THIS site is what the
+                // wired A/B gate actually measures.
+                if self.routerV2Enabled {
+                    Ops.moeRouterTopKBiasedRowsFused(
+                        logits: logitsAll.reshaped(to: [flatN]), bias: biasGPU,
+                        indicesOut: indicesTok, weightsOut: weightsTok,
+                        t: t, nExperts: nExperts, k: topK, on: work)
+                } else {
+                    if prefUnbiasedScratch == nil
+                        || prefUnbiasedScratch!.dtype != dt
+                        || prefUnbiasedScratch!.elementCount < flatN
+                    {
+                        prefUnbiasedScratch = Tensor.empty(
+                            shape: [flatN], dtype: dt, device: device)
+                        prefBiasedScratch = Tensor.empty(
+                            shape: [flatN], dtype: dt, device: device)
+                    }
+                    let unbiased = Tensor(
+                        buffer: prefUnbiasedScratch!.buffer,
+                        offset: prefUnbiasedScratch!.offset,
+                        shape: [flatN], dtype: dt)
+                    let biased = Tensor(
+                        buffer: prefBiasedScratch!.buffer,
+                        offset: prefBiasedScratch!.offset,
+                        shape: [flatN], dtype: dt)
+                    Ops.moeSigmoidBiasRows(
+                        logits: logitsAll.reshaped(to: [flatN]),
+                        bias: biasGPU,
+                        unbiased: unbiased, biased: biased,
+                        tRows: t, nExperts: nExperts, on: work)
+                    Ops.moeRouterTopKBiasedMany(
+                        scoreBiased: biased, scoreUnbiased: unbiased,
+                        indicesOut: indicesTok, weightsOut: weightsTok,
+                        t: t, nExperts: nExperts, k: topK, on: work)
+                }
                 let scale = router.routedScalingFactor
                 if scale != 1.0 {
                     let scaleVec = Tensor.filled(
@@ -2865,8 +2937,11 @@ public final class MoELayer: Module, DecoderLayer {
                     // W61: fused single-dispatch plan (opt-in, see
                     // `sortPlanFusedEnabled`) takes precedence over the
                     // three-pass chain when enabled; same gate scope as
-                    // `useCounting` above (this path + DEVPLAN2).
-                    let useFused = self.sortPlanFusedEnabled
+                    // `useCounting` above (this path + DEVPLAN2). W69:
+                    // `routerV2Enabled` also takes this path — wired as
+                    // ONE coherent unit with the router fusion above (see
+                    // `routerV2Enabled`'s doc).
+                    let useFused = self.routerV2Enabled || self.sortPlanFusedEnabled
                     let useCounting = self.sortPlanCountingEnabled
                     if useFused {
                         Ops.moeSortPlanFused(
