@@ -429,6 +429,32 @@ private enum MoEEnvFlags {
         }
         return mppLateLayerFast ? [38] : []
     }()
+    // W54: for layers excluded from the fast bf16-MPP path above (L38 by
+    // default — see mppBf16ExcludeLayers), route through the T33 "steel"
+    // structure NVFP4 gather kernel (Nvfp4GatherSteel.swift /
+    // butter_nvfp4_gather_steel_bgemm_*.metal) instead of falling all the
+    // way back to the f32-promote chain. Steel stages BOTH the
+    // dequantized weight and the activation as native `bfloat` in
+    // per-lane MMA fragments (plain simdgroup_matrix, no
+    // mpp::tensor_ops, no threadgroup half staging) — see that file's
+    // header: "keeps the full f32-width exponent range, so that
+    // overflow class structurally cannot occur". That is the correct
+    // fix for L38's ~446K swiglu-inner / ~462K down-output (both far
+    // past half's 65504 ceiling, trivially inside bf16's ~3.4e38
+    // range) — NOT the half-coop-tile MPP kernels the fast path above
+    // uses (bf16 MPP) nor the ExpertGather V2 path (explicit bf16→f16
+    // cast of the A operand), both of which stage through half and
+    // would reproduce the exact overflow this layer was excluded for.
+    // Steel was previously opt-in only (BUTTER_NVFP4_GATHER_STEEL=1)
+    // because a whole-model A/B lost (T35: -6.5%, see
+    // LagunaNvfp4MppGather.swift's header) — but here it only has to
+    // beat the f32 fallback for ONE layer's 3 GEMMs, not the shipped
+    // bf16-MPP fast path model-wide, so that prior loss doesn't apply.
+    // Default ON for exactly the excluded-layer set. Escape to the
+    // pre-W54 W53 behavior (f32 fallback for excluded layers) with
+    // BUTTER_NVFP4_MPP_STEEL_EXCLUDED=0.
+    static let mppSteelForExcludedLayers =
+        ButterEnv["BUTTER_NVFP4_MPP_STEEL_EXCLUDED"] != "0"
     static let mppNoSharedCast = ButterEnv["BUTTER_NVFP4_MPP_NO_SHARED_CAST"] == "1"
     static let mppFusedGateUp = ButterEnv["BUTTER_NVFP4_MPP_FUSED_GATEUP"] != "0"
     static let mppSerialGateUp = ButterEnv["BUTTER_NVFP4_MPP_SERIAL_GATEUP"] == "1"
@@ -3022,8 +3048,26 @@ public final class MoELayer: Module, DecoderLayer {
                             && bf16MaxLayer >= 0
                             && !bf16ExcludeLayers.contains(layerIndex))
                     let noSharedCast = MoEEnvFlags.mppNoSharedCast
+                    // W54: layers excluded from the fast bf16-MPP path take
+                    // the T33 steel-structure kernel instead of the f32
+                    // fallback below (see MoEEnvFlags.mppSteelForExcludedLayers'
+                    // doc) — shape-eligible for both Laguna GEMM legs
+                    // (nOut%64==0, kIn%16==0/%blockSize==0 hold for
+                    // moeIntermediate=512/hidden=2048 either way round).
+                    // Only bf16 input can use it; the f32-forced escapes
+                    // (BUTTER_NVFP4_MPP_BF16_MAX_LAYER=-1 etc.) still fall
+                    // through to useF32Promote below untouched.
+                    let useSteelRoute =
+                        useGatherMpp && dt == .bf16 && !useNativeBf16Mpp
+                        && bf16ExcludeLayers.contains(layerIndex)
+                        && MoEEnvFlags.mppSteelForExcludedLayers
+                        && Ops.nvfp4GatherSteelGatherEligible(
+                            nOut: moeIntermediate, kIn: hidden)
+                        && Ops.nvfp4GatherSteelGatherEligible(
+                            nOut: hidden, kIn: moeIntermediate)
                     let useF32Promote =
                         useGatherMpp && dt == .bf16 && !useNativeBf16Mpp && !noSharedCast
+                        && !useSteelRoute
 
                     // Fused gate+up MPP (default BM16): x_rows + shared X load.
                     // Escape: BUTTER_NVFP4_MPP_FUSED_GATEUP=0
@@ -3038,7 +3082,21 @@ public final class MoELayer: Module, DecoderLayer {
                         !wantBm64GateUp
                         && MoEEnvFlags.mppFusedGateUp
                     let xGathered: Tensor
-                    if useF32Promote || (useGatherMpp && useFusedGateUp) {
+                    if useSteelRoute {
+                        // Steel needs a real materialized [mTotal, kIn] bf16
+                        // gather (no xRows/gatherCast fusion support) —
+                        // always take the materialize branch below.
+                        let xBytes = mTotal * hidden * dtBytes
+                        let xBuf = device.intermediateScratch(
+                            tag: "laguna_mpp_x_gathered", minBytes: xBytes)
+                        let gathered = Tensor(
+                            buffer: xBuf, offset: 0,
+                            shape: [mTotal, hidden], dtype: dt)
+                        _ = Ops.gather(
+                            table: hRows, tokenIds: srcTok, on: work,
+                            into: gathered)
+                        xGathered = gathered
+                    } else if useF32Promote || (useGatherMpp && useFusedGateUp) {
                         // Fused paths read hRows via x_rows / gatherCast.
                         xGathered = hRows
                     } else {
@@ -3162,6 +3220,73 @@ public final class MoELayer: Module, DecoderLayer {
                                 on: work, into: downF)
                             moeMagScan("down_output", downF)
                             Ops.castF32ToBf16(downF, into: downOut, on: work)
+                            moePhaseCheckpoint("down")
+                        } else if useSteelRoute {
+                            // W54: L38 (the excluded layer). Measured via
+                            // BUTTER_LAGUNA_MOE_MAGNITUDE_SCAN at this
+                            // layer: gate/up's OWN input (the residual
+                            // gather, maxAbs ~3) and output (gate/up
+                            // pre-swiglu, maxAbs ~556/1384) both sit
+                            // comfortably under half's 65504 ceiling — only
+                            // the SwiGLU-amplified product feeding `down`
+                            // (~446K-770K depending on prompt) overflows.
+                            // So gate/up stay on the shipped fast native-
+                            // bf16 path (byte-identical to L37/L39's route,
+                            // preferNativeBf16 forced true here since this
+                            // layer's own useNativeBf16Mpp is false by
+                            // construction) and ONLY `down` pays for the
+                            // T33 steel-structure kernel (native bfloat MMA
+                            // fragments, no MPP tensor-ops, no half staging
+                            // anywhere — structurally overflow-safe here).
+                            // See MoEEnvFlags.mppSteelForExcludedLayers'
+                            // header comment for the full rationale +
+                            // Nvfp4GatherSteel.swift / that file's .metal
+                            // sibling for the kernel itself. `down`'s
+                            // BM16-vs-BM64 run-length heuristic mirrors the
+                            // shipped steel dispatcher directly (bypassing
+                            // its automatic priority chain, which would
+                            // otherwise hit ExpertGather's f16-cast A
+                            // operand first).
+                            moeMagScan("gateup_input", xGathered)
+                            Ops.nvfp4MoeGatherBm16(
+                                input: xGathered, weight: stacked.gateWeight,
+                                scales: stacked.gateScales, indices: expIds,
+                                mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                                blockSize: stacked.blockSize, global: stacked.global,
+                                preferNativeBf16: true,
+                                on: work, into: gateOut)
+                            Ops.nvfp4MoeGatherBm16(
+                                input: xGathered, weight: stacked.upWeight,
+                                scales: stacked.upScales, indices: expIds,
+                                mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+                                blockSize: stacked.blockSize, global: stacked.global,
+                                preferNativeBf16: true,
+                                on: work, into: upOut)
+                            let nExperts = stacked.gateWeight.shape[0]
+                            let steelBm16 = Ops.nvfp4GatherSteelPrefersBm16(
+                                mTotal: mTotal, nExperts: nExperts)
+                            moeMagScan("gate_pre_swiglu", gateOut)
+                            moeMagScan("up_pre_swiglu", upOut)
+                            let steelInner = Ops.swiglu(
+                                gate: gateOut, up: upOut, on: work, into: gateOut)
+                            moePhaseCheckpoint("gateup")
+                            moeMagScan("swiglu_inner", steelInner)
+                            if steelBm16 {
+                                Ops.nvfp4GatherSteelBm16(
+                                    input: steelInner, weight: stacked.downWeight,
+                                    scales: stacked.downScales, indices: expIds,
+                                    mTotal: mTotal, nOut: hidden, kIn: moeIntermediate,
+                                    blockSize: stacked.blockSize, global: stacked.global,
+                                    on: work, into: downOut)
+                            } else {
+                                Ops.nvfp4GatherSteel(
+                                    input: steelInner, weight: stacked.downWeight,
+                                    scales: stacked.downScales, indices: expIds,
+                                    mTotal: mTotal, nOut: hidden, kIn: moeIntermediate,
+                                    blockSize: stacked.blockSize, global: stacked.global,
+                                    on: work, into: downOut)
+                            }
+                            moeMagScan("down_output", downOut)
                             moePhaseCheckpoint("down")
                         } else if useFusedGateUp {
                             // Follow-on lever chain (skip identity
