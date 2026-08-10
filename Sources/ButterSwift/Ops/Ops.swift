@@ -7202,12 +7202,28 @@ public enum Ops {
     ///
     /// Grid: `(qLen / 32, n_q_heads, 1)` threadgroups, 128 threads per
     /// group (4 simdgroups). Reduction-mode kernel.
+    /// - Parameters position/kReal: W48 direct-KV extension (see
+    ///   `iron_sdpa_prefill_mma`'s doc comment in iron's
+    ///   `steel_attention_mma.rs`). `kLen` is now the K/V ADDRESSING
+    ///   STRIDE (buffer row pitch) rather than necessarily the real
+    ///   length — `position` (absolute sequence offset of this Q
+    ///   chunk) and `kReal` (real, non-pad KV length; any k >= kReal
+    ///   is masked to -inf alongside causal) are explicit params
+    ///   instead of being implicitly derived. Both default to the
+    ///   legacy compacted-KV contract when omitted (`position = kLen -
+    ///   qLen`, `kReal = kLen`) — every existing call site (Hy3Text,
+    ///   LagunaSdpa's compacted path) is byte-identical without
+    ///   changes. Pass them explicitly only for a direct (uncompacted)
+    ///   raw-strided K/V read where `kLen` (the cache's `maxSeq`) may
+    ///   exceed the real content length.
     public static func sdpaPrefillMma(
         q: Tensor, k: Tensor, v: Tensor,
         nQHeads: Int, nKVHeads: Int, headDim: Int,
         qLen: Int, kLen: Int, scale: Float,
         on cmd: MTLCommandBuffer,
-        into out: Tensor? = nil
+        into out: Tensor? = nil,
+        position: Int? = nil,
+        kReal: Int? = nil
     ) -> Tensor {
         precondition(
             qLen > 0 && qLen % 32 == 0,
@@ -7230,6 +7246,11 @@ public enum Ops {
         let tgGrid = MTLSize(width: qLen / bq, height: nQHeads, depth: 1)
         let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
         let gqaFactor = nQHeads / nKVHeads
+        let positionV = position ?? (kLen - qLen)
+        let kRealV = kReal ?? kLen
+        precondition(positionV >= 0, "Ops.sdpaPrefillMma: position \(positionV) must be >= 0")
+        precondition(
+            kRealV <= kLen, "Ops.sdpaPrefillMma: kReal \(kRealV) must be <= kLen \(kLen)")
 
         switch q.dtype {
         case .f32:
@@ -7242,6 +7263,7 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor),
                 n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
                 scale: scale,
+                position: UInt32(positionV), k_real: UInt32(kRealV),
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         case .f16:
             IronKernels.iron_sdpa_prefill_mma_f16_threadgroups(
@@ -7253,6 +7275,7 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor),
                 n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
                 scale: scale,
+                position: UInt32(positionV), k_real: UInt32(kRealV),
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         case .bf16:
             IronKernels.iron_sdpa_prefill_mma_bf16_threadgroups(
@@ -7264,6 +7287,7 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor),
                 n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
                 scale: scale,
+                position: UInt32(positionV), k_real: UInt32(kRealV),
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.sdpaPrefillMma: unsupported dtype \(q.dtype)")
