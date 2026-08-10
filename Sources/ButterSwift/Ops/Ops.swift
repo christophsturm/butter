@@ -728,6 +728,37 @@ public enum Ops {
             on: cmd)
     }
 
+    /// Single-dispatch fusion of `moeSortPlanCounting`'s three-pass chain
+    /// (F-85 Stage-1 fusion #1 / W61). Same stable-order output contract,
+    /// same no-sync DEVPLAN2 property, ONE dispatch instead of three — no
+    /// `blockCounts`/`blockOffsets` intermediate buffers at all, since
+    /// every threadgroup recomputes what it needs directly from
+    /// `topkIds` (see `iron_moe_route_sort_plan_fused`'s module doc for
+    /// why that recompute is cheap and why the algorithm still needs zero
+    /// cross-threadgroup synchronization). Same grid shape as
+    /// `moeSortPlanCounting`'s pass 1 (`nBlocks` threadgroups, `nExperts`
+    /// lanes) — this fusion trades away the two intermediate-buffer round
+    /// trips and two dispatch/encoder overheads, not occupancy.
+    public static func moeSortPlanFused(
+        topkIds: Tensor, sortedExperts: Tensor, sourceTokens: Tensor, invPerm: Tensor,
+        mTotal: Int, k: Int, nExperts: Int, blockSize: Int, on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            nExperts <= 256,
+            "moeSortPlanFused: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let nBlocks = (mTotal + blockSize - 1) / blockSize
+        IronKernels.iron_moe_route_sort_plan_fused_f32_threadgroups(
+            topk_ids: topkIds.buffer, topk_idsOffset: topkIds.offset,
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            source_tokens: sourceTokens.buffer, source_tokensOffset: sourceTokens.offset,
+            inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+            m_total: UInt32(mTotal), k: UInt32(k), n_experts: UInt32(nExperts), block_size: UInt32(blockSize),
+            gridSize: MTLSize(width: max(nBlocks, 1), height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: nExperts, height: 1, depth: 1),
+            on: cmd)
+    }
+
     /// Dequantize an mlx int4 affine-quantized `[outDim, inDim]` weight to a
     /// dense `[outDim, inDim]` tensor in one dispatch (one thread per packed
     /// u32 = 8 nibbles). Used to batch narrow-outDim projections (e.g. a

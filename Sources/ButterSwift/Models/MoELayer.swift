@@ -659,6 +659,12 @@ public final class MoELayer: Module, DecoderLayer {
     /// gate). Raw env string cached at init; `sortPlanCountingEnabled`
     /// below is the single place that interprets it.
     let sortPlanCountingEnvRaw: String?
+    /// Single-dispatch fusion of the counting-sort three-pass chain (W61
+    /// Stage-1 fusion #1 A/B gate). Raw env string cached at init;
+    /// `sortPlanFusedEnabled` below is the single place that interprets
+    /// it. Default OFF (opt-in via `BUTTER_MOE_FUSED_SORT_PLAN=1`) until
+    /// the wired A/B gate lands.
+    let sortPlanFusedEnvRaw: String?
     /// Parallelized tile-plan builder gate (F-85 small-M follow-up). Raw
     /// env string cached at init; `parallelPlanEnabled` below is the
     /// single place that interprets it.
@@ -1051,6 +1057,7 @@ public final class MoELayer: Module, DecoderLayer {
         self.pairedIndirectEnvRaw = env["BUTTER_MOE_PAIRED_INDIRECT"]
         self.coopIndirectEnvRaw = env["BUTTER_MOE_COOP_INDIRECT"]
         self.sortPlanCountingEnvRaw = env["BUTTER_MOE_COUNTING_SORT"]
+        self.sortPlanFusedEnvRaw = env["BUTTER_MOE_FUSED_SORT_PLAN"]
         self.parallelPlanEnvRaw = env["BUTTER_MOE_PARALLEL_PLAN"]
     }
 
@@ -1086,6 +1093,23 @@ public final class MoELayer: Module, DecoderLayer {
     /// `iron_moe_sort_plan` at all.
     public var sortPlanCountingEnabled: Bool {
         sortPlanCountingEnvRaw != "0"
+    }
+
+    /// W61 Stage-1 fusion #1: single-dispatch fusion of the counting-sort
+    /// three-pass chain (`Ops.moeSortPlanFused`,
+    /// `moe_route_sort_plan_fused.rs`). Same stable order as
+    /// `moeSortPlanCounting` (byte-identical `--dump-prefill-logits`,
+    /// oracle-checked against both a CPU stable sort and the three-pass
+    /// chain's own GPU output across uniform/Zipf/empty-expert/production
+    /// shapes — see `moe_route_sort_plan_fused_correctness.rs`), ONE
+    /// dispatch instead of three. Default OFF pending the wired A/B gate;
+    /// `BUTTER_MOE_FUSED_SORT_PLAN=1` opts in. Only takes effect where
+    /// `sortPlanCountingEnabled` would otherwise fire (the DEVPLAN2
+    /// device-sorted-plan path) — this flag selects between the fused
+    /// kernel and the three-pass chain, not between counting-sort and the
+    /// original O(mTotal^2) kernel.
+    public var sortPlanFusedEnabled: Bool {
+        sortPlanFusedEnvRaw == "1"
     }
 
     /// F-85 parallelized tile-plan builder gate (small-M follow-up to the
@@ -1741,7 +1765,14 @@ public final class MoELayer: Module, DecoderLayer {
             // BUTTER_MOE_COUNTING_SORT=0 reverts to the O(mTotal^2) original).
             // Block size 256 - see `moe_sort_plan_counting.rs`'s isolated
             // bench sweep at production mTotal.
-            if self.sortPlanCountingEnabled {
+            // W61: fused single-dispatch plan (opt-in, see
+            // `sortPlanFusedEnabled`) takes precedence over the three-pass
+            // chain when enabled.
+            if self.sortPlanFusedEnabled {
+                Ops.moeSortPlanFused(
+                    topkIds: idsFlat, sortedExperts: se, sourceTokens: st, invPerm: ip,
+                    mTotal: mTot, k: topK, nExperts: nExperts, blockSize: 256, on: cmd)
+            } else if self.sortPlanCountingEnabled {
                 Ops.moeSortPlanCounting(
                     topkIds: idsFlat, sortedExperts: se, sourceTokens: st, invPerm: ip,
                     mTotal: mTot, k: topK, nExperts: nExperts, blockSize: 256, on: cmd)
@@ -1802,7 +1833,15 @@ public final class MoELayer: Module, DecoderLayer {
             let se = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
             let st = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
             let ip = Tensor.empty(shape: [mTot], dtype: .u32, device: device)
-            if self.sortPlanCountingEnabled {
+            // W61: fused single-dispatch plan (opt-in, see
+            // `sortPlanFusedEnabled`) takes precedence over the three-pass
+            // chain when enabled. This is Laguna's Path B (sigmoid+bias)
+            // route.
+            if self.sortPlanFusedEnabled {
+                Ops.moeSortPlanFused(
+                    topkIds: indicesBuf, sortedExperts: se, sourceTokens: st, invPerm: ip,
+                    mTotal: mTot, k: topK, nExperts: nExperts, blockSize: 256, on: cmd)
+            } else if self.sortPlanCountingEnabled {
                 Ops.moeSortPlanCounting(
                     topkIds: indicesBuf, sortedExperts: se, sourceTokens: st, invPerm: ip,
                     mTotal: mTot, k: topK, nExperts: nExperts, blockSize: 256, on: cmd)
@@ -2823,8 +2862,18 @@ public final class MoELayer: Module, DecoderLayer {
                     // France is" generation. Escape hatch unchanged:
                     // BUTTER_MOE_COUNTING_SORT=0 reverts to classic sort
                     // everywhere (this path + DEVPLAN2).
+                    // W61: fused single-dispatch plan (opt-in, see
+                    // `sortPlanFusedEnabled`) takes precedence over the
+                    // three-pass chain when enabled; same gate scope as
+                    // `useCounting` above (this path + DEVPLAN2).
+                    let useFused = self.sortPlanFusedEnabled
                     let useCounting = self.sortPlanCountingEnabled
-                    if useCounting {
+                    if useFused {
+                        Ops.moeSortPlanFused(
+                            topkIds: indicesTok, sortedExperts: se, sourceTokens: st,
+                            invPerm: ip, mTotal: mTotal, k: topK, nExperts: nExperts,
+                            blockSize: 256, on: work)
+                    } else if useCounting {
                         Ops.moeSortPlanCounting(
                             topkIds: indicesTok, sortedExperts: se, sourceTokens: st,
                             invPerm: ip, mTotal: mTotal, k: topK, nExperts: nExperts,
