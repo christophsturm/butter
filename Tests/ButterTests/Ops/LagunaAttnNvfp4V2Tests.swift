@@ -32,15 +32,23 @@
 //    (non-split-K) QMV chain at Laguna XS's exact decode shapes —
 //    bit-exact primary assertion, tight-cosine fallback with a report,
 //    same contract as `LagunaQkvNormFoldTests` (the INT8 twin).
-// 3. Gated split-K V2 vs V1 at the exact o_proj shapes — bit-exact
-//    strict (same geometry, same rounding points; only the dequant
-//    encoding and where the softplus is computed differ). NOTE: this
-//    still compares against a live V1 GPU dispatch, so it inherits the
-//    same latent hardware-exp2 risk documented on test 1 above — it
-//    just hasn't been observed to trip on real (non-exhaustive) random
-//    weight banks. If CI ever flags `gatedSliding`/`gatedFull`, apply
-//    the same CPU-f64-oracle retarget rather than assuming a real
-//    kernel bug.
+// 3. Gated split-K V2 vs a CPU `Double`-precision ground-truth oracle
+//    at the exact o_proj shapes — bit-exact primary assertion,
+//    tight-cosine fallback with a report (same contract as test 2 /
+//    `LagunaQkvNormFoldTests`: a K=inDim-wide accumulation compared
+//    against a `Double` oracle is not guaranteed bit-exact on every row
+//    of real random data, since float32 GPU accumulation order and a
+//    `Double` CPU sum can round to adjacent bf16 values on a row whose
+//    true sum sits very close to a bf16 halfway point). Retargeted
+//    2026-08-09 (same fix as test 1, applied per this file's own prior
+//    NOTE below): this used to compare against a live V1 GPU dispatch,
+//    which inherits the same latent hardware-`exp2()` risk documented
+//    on test 1 -- and it did eventually trip CI on the
+//    `gatedSliding`/`gatedFull` shapes, on a GPU generation where V1's
+//    scale decode disagreed with V2's exact bit-trick decode. V1 is
+//    still computed and reported (see `compareGated`) as an
+//    INFORMATIONAL divergence count only -- it is not the load-bearing
+//    reference and must not be hard-asserted against.
 
 // 4. Magnitude sweep (T23 class): finite + accurate at real late-layer
 //    activation magnitudes.
@@ -338,7 +346,93 @@ struct LagunaAttnNvfp4V2Tests {
             label: "splitk-mag50")
     }
 
-    // MARK: - 3. Gated split-K V2 vs V1 (bit-exact strict)
+    // MARK: - 3. Gated split-K V2 vs CPU f64 ground truth (bit-exact strict)
+
+    /// Round a `Float` through bf16 and widen back to `Float`
+    /// (round-to-nearest-even on the truncated low 16 bits) -- the same
+    /// bias-add trick `Tensor.filled`'s bf16 case and `GPTOSSText`'s
+    /// `bf16Bits` already use elsewhere in this codebase. Used to
+    /// reproduce, on the CPU, the two intermediate bf16 rounding points
+    /// the gated split-K kernels both apply on the GPU (softplus gate
+    /// value, then gate*activation product) -- see `qmvGatedSplitKV2Src`'s
+    /// "ROUNDING POINT 1" / "ROUNDING POINT 2" comments.
+    private static func roundToBf16(_ v: Float) -> Float {
+        let bits = v.bitPattern
+        let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
+        let bf16 = UInt16(truncatingIfNeeded: rounded >> 16)
+        return Float(bitPattern: UInt32(bf16) << 16)
+    }
+
+    /// CPU `Double`-precision ground truth for `qmvGatedSplitK`'s output:
+    /// per-head softplus gate (rounded through bf16, ROUNDING POINT 1),
+    /// gate*activation product (rounded through bf16 per lane, ROUNDING
+    /// POINT 2), dequantized bank row via the same `trueE4M3Scale` x
+    /// `trueE2M1Nibble` oracle test 1 uses, dot-accumulated in `Double`
+    /// (order-insensitive at this precision -- unlike the kernel's
+    /// float32 accumulator, `Double` has ~9 more decimal digits of
+    /// headroom than bf16's ~2-3 significant digits, so any GPU
+    /// reduction-order difference washes out well below the final bf16
+    /// rounding step for realistic random weight/activation magnitudes),
+    /// narrowed to the output dtype the same two-step way the GPU does
+    /// (float32 accumulator -> bf16 store): `Float(acc)` (Swift's
+    /// `Double` -> `Float` narrowing is correctly rounded) then
+    /// `roundToBf16`.
+    ///
+    /// Softplus itself is computed with Swift's `Foundation` `log`/`exp`
+    /// in `Double`, not Metal's `log`/`exp` -- those are, like `exp2` (see
+    /// test 1's header comment), not required to be correctly rounded on
+    /// every Apple Silicon generation. Unlike test 1's exhaustive sweep,
+    /// this oracle is not claiming hardware-invariant bit-exactness of
+    /// the softplus step itself; it relies on the two bf16 roundings
+    /// either side of it (and the ~1e-3 relative bf16 quantization step)
+    /// to absorb any few-ULP float32-transcendental-vs-Double gap for
+    /// realistic (non-adversarial, non-exhaustive) random gate logits --
+    /// the same trust level `compareNormFold`'s bit-exact primary
+    /// assertion already places in this file for its own reference
+    /// chain.
+    private static func gatedTruth(
+        x: [Float], gateLogits: [Float], packed: [UInt32], scales: [UInt8],
+        heads: Int, headDim: Int, hidden: Int, inDim: Int
+    ) -> [Float] {
+        let packsPerRow = inDim / 8
+        let groupsPerRow = inDim / 16  // GROUP = 16
+        let packsPerHead = headDim / 8
+
+        var gate = [Double](repeating: 0, count: heads)
+        for h in 0 ..< heads {
+            let gl = Double(gateLogits[h])
+            let ax = gl > 0 ? gl : -gl
+            let softplus = (gl > 0 ? gl : 0.0) + log(1.0 + exp(-ax))
+            gate[h] = Double(roundToBf16(Float(softplus)))
+        }
+
+        var out = [Float](repeating: 0, count: hidden)
+        for row in 0 ..< hidden {
+            var acc = 0.0
+            for packIdx in 0 ..< packsPerRow {
+                let xBase = packIdx * 8
+                let head = packIdx / packsPerHead
+                let g = gate[head]
+                var xf = [Double](repeating: 0, count: 8)
+                for i in 0 ..< 8 {
+                    let prod = Double(x[xBase + i]) * g
+                    xf[i] = Double(roundToBf16(Float(prod)))
+                }
+                let group = xBase / 16
+                let scaleByte = scales[row * groupsPerRow + group]
+                let trueScale = Self.trueE4M3Scale(scaleByte)
+                let p = packed[row * packsPerRow + packIdx]
+                var qd = 0.0
+                for i in 0 ..< 8 {
+                    let nib = (p >> (4 * UInt32(i))) & 0xF
+                    qd += Self.trueE2M1Nibble(nib) * xf[i]
+                }
+                acc += trueScale * qd
+            }
+            out[row] = roundToBf16(Float(acc))
+        }
+        return out
+    }
 
     private func compareGated(heads: Int, headDim: Int, hidden: Int, label: String) {
         autoreleasepool {
@@ -373,9 +467,68 @@ struct LagunaAttnNvfp4V2Tests {
                 Issue.record("\(label): gated split-K declined (v1=\(okV1) v2=\(okV2))")
                 return
             }
+
+            let truth = Self.gatedTruth(
+                x: x.toFloatArray(), gateLogits: gateLogits.toFloatArray(),
+                packed: bank.packed.toArray(as: UInt32.self),
+                scales: bank.scales.toArray(as: UInt8.self),
+                heads: heads, headDim: headDim, hidden: hidden, inDim: inDim)
+
             let a = v1Out.toFloatArray()
             let b = v2Out.toFloatArray()
-            #expect(a == b, "\(label): V2 gated split-K must be bit-exact vs V1")
+            #expect(b.count == truth.count)
+            guard b.count == truth.count, a.count == truth.count else { return }
+
+            // V1 is informational only here -- see the header comment
+            // above test 3 and test 1's derivation comment. Its
+            // divergence count is folded into the diagnostic comment
+            // below (only reached if V2 itself needs the fallback path)
+            // rather than reported via a standalone `Issue.record`,
+            // which would fail the test on its own regardless of
+            // outcome -- V1 disagreeing with ground truth is expected
+            // and must never be load-bearing.
+            var v1Mismatches = 0
+            for i in 0 ..< a.count where a[i].bitPattern != truth[i].bitPattern {
+                v1Mismatches += 1
+            }
+
+            var mismatches = 0
+            var firstMismatch = ""
+            var maxAbsDiff: Float = 0
+            var dot = 0.0, nb = 0.0, nt = 0.0
+            for i in 0 ..< b.count {
+                if b[i].bitPattern != truth[i].bitPattern {
+                    mismatches += 1
+                    if firstMismatch.isEmpty {
+                        firstMismatch =
+                            "row \(i): truth=\(truth[i]) (\(truth[i].bitPattern)) v2=\(b[i]) (\(b[i].bitPattern))"
+                    }
+                }
+                maxAbsDiff = max(maxAbsDiff, abs(b[i] - truth[i]))
+                dot += Double(b[i]) * Double(truth[i])
+                nb += Double(b[i]) * Double(b[i])
+                nt += Double(truth[i]) * Double(truth[i])
+            }
+            if mismatches == 0 {
+                #expect(b == truth, "\(label): expected bit-exact")
+            } else {
+                // Bit-exact primary / tight-cosine fallback, same
+                // contract `compareNormFold` above uses: a K=inDim-wide
+                // accumulation compared against a `Double` oracle is not
+                // guaranteed bit-exact on every row even when both sides
+                // are "correct" -- float32 GPU accumulation order vs a
+                // `Double` CPU sum can round to adjacent bf16 values on
+                // the rare row whose true sum sits very close to a bf16
+                // halfway point (observed: 1/2048 rows, ~1 bf16 ULP,
+                // magnitude ~0.001 -- exactly this class of boundary).
+                let cos = (nb > 0 && nt > 0) ? dot / (nb.squareRoot() * nt.squareRoot()) : 1.0
+                #expect(
+                    cos > 0.999999,
+                    Comment(
+                        rawValue:
+                            "\(label): NOT bit-exact on \(mismatches)/\(b.count) rows (maxAbsDiff=\(maxAbsDiff), cos=\(cos), v1Mismatches=\(v1Mismatches)/\(a.count) [informational], first: \(firstMismatch))"
+                    ))
+            }
         }
     }
 
