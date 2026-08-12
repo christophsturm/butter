@@ -96,7 +96,14 @@ public struct MuseGlimmerDense: MuseGlimmerVariant {
         let outputMultiplier = Float(config.float("output_multiplier") ?? 1.0)
         let finalLogitSoftcap = Float(config.float("final_logit_softcapping") ?? 0)
         let tieEmbed = config.tieWordEmbeddings
-        let quant = config.quantization
+        // Quantization metadata lives at the TOP LEVEL of the VLM
+        // checkpoint's config.json, NOT inside `text_config` — reading
+        // it only from the scoped view left `quant` nil, which wrapped
+        // the 4-bit-packed (u32-storage) tables in plain
+        // Embedding/Linear and crashed the very first embed gather
+        // (`Ops.gather: unsupported dtype u32`). Prefer the scoped key
+        // if a future revision moves it, fall back to the root.
+        let quant = config.quantization ?? rawConfig.quantization
 
         // `layer_types[i] == "sliding_attention"` vs `"full_attention"`
         // — full layers are NoPE (no rotary embedding at all) and run
