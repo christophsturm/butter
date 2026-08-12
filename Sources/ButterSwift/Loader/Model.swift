@@ -490,6 +490,23 @@ public enum ModelRegistry {
                     defaultGenerationParameters: SmolVLM2Dense.defaultGenerationParameters,
                     availableCapabilities: SmolVLM2Dense.availableCapabilities)
             }
+            // Muse Glimmer — Meta's 30B dense agentic decoder + a
+            // ~1.8B ViT-G/14 perception encoder. TEXT-ONLY first light:
+            // route straight to the text backbone (`MuseGlimmerDense`)
+            // and skip the vision tower entirely — no `VisionModel`
+            // wiring yet, so no `vlModel` / `.imageIn` capability.
+            // `MuseGlimmerDense.loadModel` reads `text_config` and only
+            // the `language_model.`-prefixed tensors; vision-tower /
+            // adapter / projection weights are simply never touched.
+            if let arch = config.architecture, MuseGlimmer.architectures.contains(arch) {
+                let engine = try MuseGlimmerDense.loadModel(
+                    config: config, weights: weights,
+                    options: options, device: device)
+                return Loaded(
+                    engine: engine,
+                    defaultGenerationParameters: MuseGlimmerDense.defaultGenerationParameters,
+                    availableCapabilities: MuseGlimmerDense.availableCapabilities)
+            }
             // Other VL families — the Butter vision foundation
             // (VisionEncoder, ImagePreprocessing, VisionModel splice,
             // conv2d/patch_embed/rope_2d Ops) is in tree, but these
@@ -497,6 +514,11 @@ public enum ModelRegistry {
             // an actionable error rather than a generic "unsupported".
             throw ModelError.visionModelNotIntegrated(
                 config.architecture ?? config.modelType ?? "<unknown>")
+        }
+        if let mt = config.modelType, MuseGlimmer.modelTypes.contains(mt) {
+            return try loadMuseGlimmer(
+                config: config, weights: weights,
+                options: options, device: device)
         }
         if let arch = config.architecture, Llama.architectures.contains(arch) {
             return try loadLlama(
@@ -865,6 +887,28 @@ public enum ModelRegistry {
         options: LoadOptions, device: Device
     ) throws -> Loaded {
         let variant = try Gemma4.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(
+            engine: engine,
+            defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
+
+    /// Text-only entry point — used when a config's `model_type` is
+    /// `muse_glimmer`/`muse_glimmer_text` but `architecture` didn't match
+    /// (e.g. a hypothetical `config.json` pointed straight at the
+    /// language model, with no VL wrapper / `vision_config` at all, so
+    /// the `dispatchAndLoad` VL branch above never fires). The normal
+    /// checkpoint path goes through the VL-branch case in
+    /// `dispatchAndLoad` instead, since Muse Glimmer's `architectures`
+    /// is always the multimodal wrapper string.
+    public static func loadMuseGlimmer(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try MuseGlimmer.variant(for: config)
         let engine = try variant.loadModel(
             config: config, weights: weights,
             options: options, device: device
