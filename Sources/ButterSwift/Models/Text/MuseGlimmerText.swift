@@ -321,6 +321,185 @@ public final class MuseGlimmerLayer: Module {
         return out
     }
 
+    /// Chunked forward — process `nRows` tokens at once. `h` is the
+    /// `[nRows, hidden]` residual stream; `position` is the absolute
+    /// sequence index of the FIRST row. Returns the `[nRows, hidden]`
+    /// updated residual stream.
+    ///
+    /// Mirrors `LlamaLayer.forwardMulti`'s collapse (batched
+    /// `AnyLinear.callMany` projections + `Ops.rmsNormRows` + ONE
+    /// `Ops.sdpaMulti(causal: true)` per layer instead of `nRows`
+    /// `Ops.sdpaDecode` dispatches), plus this family's two extra
+    /// wrinkles:
+    ///
+    ///   - **NoPE full layers** skip the RoPE step entirely (both the
+    ///     per-row loop below AND the batched Q/K norm still run — only
+    ///     the rotation is skipped), matching `forward(tokenId:)`.
+    ///   - **Sigmoid attention-output gate** — `gateProj(xNorm)` is
+    ///     batched via `callMany` same as every other projection, then
+    ///     `Ops.sigmoidMul` runs once over the `[nRows, nHeads*headDim]`
+    ///     tensor (shape-agnostic elementwise kernel — no per-row loop
+    ///     needed).
+    ///
+    /// **Caller contract — window bound.** This function assumes the
+    /// caller (`MuseGlimmerModel.forwardMulti`) has already verified
+    /// `position + nRows <= slidingWindow` for sliding-attention layers'
+    /// KV cache. Below that bound, a `.window`-evicting `KVCache`'s ring
+    /// buffer has not wrapped yet (`KVEvictionState.reserveNextSlot`
+    /// only wraps once `absoluteCount >= maxSize`), so physical slot ==
+    /// logical position for every row in this cache, and a single
+    /// whole-chunk `causal: true` `sdpaMulti` is bit-for-bit the same
+    /// windowed attention `Ops.sdpaDecode`'s per-token loop would
+    /// compute. Full (NoPE) layers have no such bound — their cache is
+    /// `.unbounded`, so plain causal attention is correct at any
+    /// position.
+    func forwardMulti(
+        _ h: Tensor, startingAt position: Int,
+        cache: any KVCacheProtocol,
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let nRows = h.shape[0]
+        precondition(
+            h.shape == [nRows, hidden],
+            "MuseGlimmerLayer.forwardMulti: h shape \(h.shape) ≠ [nRows, hidden]")
+
+        // ── Attention ───────────────────────────────────────────────
+        let xNorm = Ops.rmsNormRows(
+            h.reshaped(to: [nRows * hidden]),
+            weight: inputNorm.weight, eps: inputNorm.eps,
+            nRows: nRows, rowSize: hidden, on: cmd
+        ).reshaped(to: [nRows, hidden])
+
+        let q = qProj.callMany(xNorm, t: nRows, on: cmd, device: device)  // [nRows, nHeads*headDim]
+        let k = kProj.callMany(xNorm, t: nRows, on: cmd, device: device)  // [nRows, nKVHeads*headDim]
+        let v = vProj.callMany(xNorm, t: nRows, on: cmd, device: device)  // [nRows, nKVHeads*headDim]
+
+        // Per-head Q/K norm — ONE batched dispatch each over
+        // `nRows * {nHeads,nKVHeads}` rows of width `headDim` (the flat
+        // [nRows, nHeads*headDim] layout reshapes losslessly into
+        // [nRows*nHeads, headDim]: row-major index r*(nHeads*headDim) +
+        // h*headDim + d == (r*nHeads+h)*headDim + d). Q's synthesized
+        // weight already carries `qkScaleFactor`; K's is a plain `1.0`
+        // broadcast — same as the single-token path.
+        let qNormAll = Ops.rmsNormRows(
+            q.reshaped(to: [nRows * nHeads, headDim]),
+            weight: qNorm.weight, eps: qNorm.eps,
+            nRows: nRows * nHeads, rowSize: headDim, on: cmd)
+        let kNormAll = Ops.rmsNormRows(
+            k.reshaped(to: [nRows * nKVHeads, headDim]),
+            weight: kNorm.weight, eps: kNorm.eps,
+            nRows: nRows * nKVHeads, rowSize: headDim, on: cmd)
+
+        // RoPE (sliding layers only) + cache append — single-position
+        // kernels, looped per row on the same cmd (same discipline as
+        // LlamaLayer.forwardMulti: the CPU cost is just enqueueing, the
+        // GPU pipelines the dispatches back-to-back).
+        let qForAttn: Tensor
+        if isSliding {
+            let qRot = Tensor.empty(
+                shape: [nRows * nHeads, headDim], dtype: qNormAll.dtype, device: device)
+            let kRot = Tensor.empty(
+                shape: [nRows * nKVHeads, headDim], dtype: kNormAll.dtype, device: device)
+            for i in 0 ..< nRows {
+                let qRow = qNormAll.slicedRows(start: i * nHeads, count: nHeads)
+                let qOut = qRot.slicedRows(start: i * nHeads, count: nHeads)
+                _ = Ops.rope(
+                    qRow, position: position + i, headDim: headDim,
+                    thetaBase: ropeTheta, scaling: .none, on: cmd, into: qOut)
+                let kRow = kNormAll.slicedRows(start: i * nKVHeads, count: nKVHeads)
+                let kOut = kRot.slicedRows(start: i * nKVHeads, count: nKVHeads)
+                _ = Ops.rope(
+                    kRow, position: position + i, headDim: headDim,
+                    thetaBase: ropeTheta, scaling: .none, on: cmd, into: kOut)
+                cache.appendOnGPU(
+                    kFlat: kOut.reshaped(to: [nKVHeads, headDim]),
+                    vFlat: v.slicedRows(start: i, count: 1).reshaped(to: [nKVHeads, headDim]),
+                    on: cmd)
+            }
+            qForAttn = qRot
+        } else {
+            // NoPE: append the (already qk-normed, un-rotated) K rows
+            // straight through — matches the reference model's
+            // `position_embeddings=None` short-circuit for full layers.
+            for i in 0 ..< nRows {
+                let kRow = kNormAll.slicedRows(start: i * nKVHeads, count: nKVHeads)
+                    .reshaped(to: [nKVHeads, headDim])
+                cache.appendOnGPU(
+                    kFlat: kRow,
+                    vFlat: v.slicedRows(start: i, count: 1).reshaped(to: [nKVHeads, headDim]),
+                    on: cmd)
+            }
+            qForAttn = qNormAll
+        }
+
+        // SDPA — ONE dispatch over the chunk.
+        let qForSdpa = qForAttn.reshaped(to: [nRows, nHeads, headDim])
+        let (cacheK, cacheV) = cache.prepareForAttention(on: cmd)
+        let attnOut = Ops.sdpaMulti(
+            q: qForSdpa, k: cacheK, v: cacheV,
+            nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+            baseKV: position, nQuery: nRows, kvStride: cache.maxSeq,
+            causal: true, scale: scale, on: cmd
+        )
+        let attnFlat = attnOut.reshaped(to: [nRows, nHeads * headDim])
+
+        // Sigmoid gate on the SDPA output, computed from `xNorm` (same
+        // input Q/K/V read) — batched `callMany` + one shape-agnostic
+        // `Ops.sigmoidMul` dispatch, no per-row loop needed.
+        let gateLogits = gateProj.callMany(xNorm, t: nRows, on: cmd, device: device)
+        let gatedAttn = Ops.sigmoidMul(attnFlat, gateLogits, on: cmd)
+        let oOut = oProj.callMany(gatedAttn, t: nRows, on: cmd, device: device)
+
+        // Gemma-style post-norm placement: normalize the branch output
+        // BEFORE adding to the residual.
+        let normedAttn = Ops.rmsNormRows(
+            oOut.reshaped(to: [nRows * hidden]),
+            weight: postAttnNorm.weight, eps: postAttnNorm.eps,
+            nRows: nRows, rowSize: hidden, on: cmd
+        ).reshaped(to: [nRows, hidden])
+
+        let postAttn: Tensor
+        let mlpNorm: Tensor
+        if OpsValidation.validateAddRmsNorm(n: hidden) == nil {
+            let fused = Ops.addAndRmsNorm(
+                h.reshaped(to: [nRows * hidden]),
+                normedAttn.reshaped(to: [nRows * hidden]),
+                weight: preFFNorm.weight, eps: preFFNorm.eps,
+                nRows: nRows, rowSize: hidden, on: cmd)
+            postAttn = fused.residual.reshaped(to: [nRows, hidden])
+            mlpNorm = fused.normed.reshaped(to: [nRows, hidden])
+        } else {
+            postAttn = Ops.add(
+                h.reshaped(to: [nRows * hidden]),
+                normedAttn.reshaped(to: [nRows * hidden]),
+                on: cmd
+            ).reshaped(to: [nRows, hidden])
+            mlpNorm = Ops.rmsNormRows(
+                postAttn.reshaped(to: [nRows * hidden]),
+                weight: preFFNorm.weight, eps: preFFNorm.eps,
+                nRows: nRows, rowSize: hidden, on: cmd
+            ).reshaped(to: [nRows, hidden])
+        }
+
+        // SwiGLU MLP (SiLU gate, not Gemma's GELU) — fully batched.
+        let gate = mlpGateProj.callMany(mlpNorm, t: nRows, on: cmd, device: device)
+        let up = upProj.callMany(mlpNorm, t: nRows, on: cmd, device: device)
+        let siluGate = Ops.silu(gate, on: cmd)
+        let mlpInner = Ops.mul(siluGate, up, on: cmd)
+        let mlpOut = downProj.callMany(mlpInner, t: nRows, on: cmd, device: device)
+        let normedMLP = Ops.rmsNormRows(
+            mlpOut.reshaped(to: [nRows * hidden]),
+            weight: postFFNorm.weight, eps: postFFNorm.eps,
+            nRows: nRows, rowSize: hidden, on: cmd
+        ).reshaped(to: [nRows, hidden])
+
+        return Ops.add(
+            postAttn.reshaped(to: [nRows * hidden]),
+            normedMLP.reshaped(to: [nRows * hidden]),
+            on: cmd
+        ).reshaped(to: [nRows, hidden])
+    }
+
     /// Single-token forward. `position` is the absolute sequence index
     /// (used for RoPE on sliding layers only — full layers are NoPE).
     func forward(
@@ -572,26 +751,95 @@ public final class MuseGlimmerModel: LanguageModel {
         return rawLogits
     }
 
-    /// Multi-token forward — prefill fast path. Loops `forward(tokenId:)`
-    /// per row, same as Gemma3Model's first-light override. Muse
-    /// Glimmer mixes sliding-window vs full attention every 4th layer
-    /// (like Gemma 3/4), so collapsing to one `sdpaMulti(causal: true)`
-    /// dispatch per layer needs the same per-layer sliding/full split
-    /// those families haven't done yet either. No perf work this wave —
-    /// correctness + baseline numbers only.
+    /// Multi-token forward — prefill fast path. Batches the embedding
+    /// gather, embed-norm, and every layer's projections/norms/SDPA via
+    /// `MuseGlimmerLayer.forwardMulti` (see its doc comment for the
+    /// per-op collapse), then runs the final norm + LM head on the
+    /// TAIL position only — `Generate.swift` only samples the last row.
+    ///
+    /// **Fast-path window bound.** `MuseGlimmerLayer.forwardMulti`'s
+    /// batched `sdpaMulti` is only correct for a sliding-attention
+    /// layer while its `.window`-evicting KV cache's ring buffer hasn't
+    /// wrapped — i.e. while `position + tokenIds.count <= slidingWindow`
+    /// (see that function's doc comment for the exact
+    /// `KVEvictionState.reserveNextSlot` reasoning). All 39 sliding
+    /// layers share one `slidingWindow` value, so this is a single
+    /// model-level check. Below the bound, EVERY layer (sliding + the
+    /// 13 NoPE full layers, whose `.unbounded` cache has no such bound)
+    /// takes the fully batched path. At/above it — a single prompt
+    /// chunk that already straddles or exceeds one window's worth of
+    /// context — this falls back to the per-token loop for full
+    /// correctness, same as the pre-existing baseline. With the default
+    /// `prefillStepSize` (1024) at half of `slidingWindow` (2048), the
+    /// fast path covers every chunk of any prompt up to 2048 tokens,
+    /// and every chunk short of the window boundary in longer prompts.
+    ///
+    /// A further follow-up could keep the 13 full layers on the batched
+    /// path unconditionally (their `.unbounded` cache has no window
+    /// bound at all) and only fall back per-chunk on the 39 sliding
+    /// layers — not done here to keep the fallback a single well-tested
+    /// code path (the pre-existing per-token loop) rather than a new
+    /// mixed-batching one.
     public func forwardMulti(
         tokenIds: [Int], startingAt position: Int,
         caches: [any LayerCacheProtocol],
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
         precondition(!tokenIds.isEmpty, "MuseGlimmerModel.forwardMulti: tokenIds must be non-empty")
-        var logits: Tensor!
-        for (i, tok) in tokenIds.enumerated() {
-            logits = forward(
-                tokenId: tok, position: position + i,
-                caches: caches, on: cmd, device: device)
+        let n = tokenIds.count
+
+        let fastPathEligible = position + n <= slidingWindow
+        guard fastPathEligible else {
+            var logits: Tensor!
+            for (i, tok) in tokenIds.enumerated() {
+                logits = forward(
+                    tokenId: tok, position: position + i,
+                    caches: caches, on: cmd, device: device)
+            }
+            return logits
         }
-        return logits
+
+        // Same private-command-buffer contract as `forward(tokenId:...)`
+        // — the soft-capped LM head resolves host-side and must
+        // commit+wait its OWN buffer, never the caller's `cmd` (see that
+        // function's doc comment). `cmd` stays untouched throughout;
+        // the caller's later `cmd.commit()` is a true no-op.
+        let workCmd = device.makeCommandBuffer()
+
+        let idsBuf = device.makeBuffer(length: n * 4)
+        idsBuf.contents().withMemoryRebound(to: UInt32.self, capacity: n) { p in
+            for (i, t) in tokenIds.enumerated() { p[i] = UInt32(t) }
+        }
+        let idsTensor = Tensor(buffer: idsBuf, offset: 0, shape: [n], dtype: .u32)
+        let h0 = embedTokens(idsTensor, on: workCmd)
+        precondition(
+            h0.shape == [n, hidden],
+            "MuseGlimmerModel.forwardMulti: embedding shape \(h0.shape) ≠ [\(n), \(hidden)]")
+        var h = Ops.rmsNormRows(
+            h0.reshaped(to: [n * hidden]),
+            weight: embedNorm.weight, eps: embedNorm.eps,
+            nRows: n, rowSize: hidden, on: workCmd
+        ).reshaped(to: [n, hidden])
+
+        for (i, layer) in layers.enumerated() {
+            h = layer.forwardMulti(
+                h, startingAt: position,
+                cache: caches[i] as! any KVCacheProtocol,
+                on: workCmd, device: device)
+        }
+
+        // Final norm + LM head on the LAST row only.
+        let tail = h.slicedRows(start: n - 1, count: 1).reshaped(to: [hidden])
+        let normed = finalNorm(tail, on: workCmd)
+        let rawLogits = lmHead(normed, on: workCmd)
+
+        if finalLogitSoftcap > 0 {
+            return MuseGlimmerOps.softcap(
+                rawLogits, multiplier: outputMultiplier, cap: finalLogitSoftcap, on: workCmd)
+        }
+        workCmd.commit()
+        workCmd.waitUntilCompleted()
+        return rawLogits
     }
 }
 
