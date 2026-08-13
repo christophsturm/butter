@@ -510,6 +510,20 @@ public final class NemotronHNvfp4MoELayer: Module, DecoderLayer {
     /// weights the CPU reference wouldn't.
     var usesGpuRouter: Bool { Self.gpuRouterEnabled && normTopkProb && topK > 1 }
 
+    /// Whether this instance takes the fused routed-expert dispatch
+    /// path (`NemotronLightningNvfp4Fuse.moeRoutedRelu2Qmv` +
+    /// `moeRoutedDownReduce`) instead of the per-slot GEMV/relu/square/
+    /// GEMV/headGateMul/add loop. The two fused kernels hardcode
+    /// Lightning's shapes (hidden=2688, moeIntermediate=1856, topK=6,
+    /// bf16) — guard every dimension explicitly so a future NemotronH
+    /// NVFP4 checkpoint with different shapes safely falls back to the
+    /// generic per-slot loop instead of reading out of bounds.
+    var usesFusedExperts: Bool {
+        NemotronLightningNvfp4Fuse.fusedExpertsEnabled
+            && dtype == .bf16 && topK == 6 && hidden == 2688
+            && stacked.moeIntermediate == 1856
+    }
+
     /// `DecoderLayer.commitsMidDecode` — see the protocol doc. `true`
     /// only when the CPU-router fallback is active (it still needs a
     /// host readback of the router logits, exactly like the sibling
@@ -671,60 +685,91 @@ public final class NemotronHNvfp4MoELayer: Module, DecoderLayer {
         }
 
         let moeIntermediate = stacked.moeIntermediate
-        var idxTensors: [Tensor] = []
-        idxTensors.reserveCapacity(topK)
-        for slot in 0 ..< topK {
-            idxTensors.append(
-                Tensor(
-                    buffer: routerIndicesScratch.buffer,
-                    offset: routerIndicesScratch.offset + slot * DType.u32.byteSize,
-                    shape: [1], dtype: .u32))
-        }
-
-        // ── Routed experts — two batched gather-GEMV dispatches ──────
-        let upIns = Array(repeating: xNorm, count: topK)
-        var upOuts: [Tensor] = []
-        for _ in 0 ..< topK {
-            upOuts.append(Tensor.empty(shape: [moeIntermediate], dtype: dtype, device: device))
-        }
-        let upWeights = Array(repeating: stacked.upWeight, count: topK)
-        let upScalesArr = Array(repeating: stacked.upScales, count: topK)
-        Ops.nvfp4DequantGemvExpertIndexedMany(
-            weightsStacked: upWeights, scalesStacked: upScalesArr,
-            inputs: upIns, expertIndices: idxTensors, outputs: upOuts,
-            blockSize: stacked.blockSize, global: 1.0, on: workCmd)
-
-        // relu(up)^2 per slot, in place into a fresh "inner" buffer.
-        var innerOuts: [Tensor] = []
-        for slot in 0 ..< topK {
-            let r = Ops.relu(upOuts[slot], on: workCmd)
-            innerOuts.append(Ops.mul(r, r, on: workCmd))
-        }
-
-        var downOuts: [Tensor] = []
-        for _ in 0 ..< topK {
-            downOuts.append(Tensor.empty(shape: [hidden], dtype: dtype, device: device))
-        }
-        let downWeights = Array(repeating: stacked.downWeight, count: topK)
-        let downScalesArr = Array(repeating: stacked.downScales, count: topK)
-        Ops.nvfp4DequantGemvExpertIndexedMany(
-            weightsStacked: downWeights, scalesStacked: downScalesArr,
-            inputs: innerOuts, expertIndices: idxTensors, outputs: downOuts,
-            blockSize: stacked.blockSize, global: 1.0, on: workCmd)
-
-        // ── Weighted sum over the topK selected experts — per-slot
-        //    scale reads straight from the GPU router-weights buffer,
-        //    no host float involved. ─────────────────────────────────
         var accumulator: Tensor?
-        for slot in 0 ..< topK {
-            let wSlot = Tensor(
-                buffer: routerWeightsScratch.buffer,
-                offset: routerWeightsScratch.offset + slot * dtype.byteSize,
-                shape: [1], dtype: dtype)
-            let scaled = Ops.headGateMul(
-                attn: downOuts[slot], gate: wSlot, headDim: hidden, on: workCmd)
-            accumulator =
-                accumulator.map { Ops.add($0, scaled, on: workCmd) } ?? scaled
+
+        if usesFusedExperts {
+            // ── F-127 perf wave: fused routed-expert dispatch pair ────
+            // Replaces the 6x up-GEMV + 6x relu + 6x square + 6x
+            // down-GEMV + 6x headGateMul + 5x accumulate-add per-slot
+            // loop (35 dispatches) with 2 — see
+            // NemotronLightningNvfp4Fuse.swift. `routerIndicesScratch`/
+            // `routerWeightsScratch` are consumed device-side as whole
+            // [topK] buffers (no per-slot view tensors needed).
+            var upOuts: [Tensor] = []
+            upOuts.reserveCapacity(topK)
+            for _ in 0 ..< topK {
+                upOuts.append(Tensor.empty(shape: [moeIntermediate], dtype: .bf16, device: device))
+            }
+            NemotronLightningNvfp4Fuse.moeRoutedRelu2Qmv(
+                input: xNorm, upWeight: stacked.upWeight, upScales: stacked.upScales,
+                expertIndices: routerIndicesScratch, outputs: upOuts,
+                global: 1.0, on: workCmd, device: device)
+
+            let routedCombine = Tensor.empty(shape: [hidden], dtype: .bf16, device: device)
+            NemotronLightningNvfp4Fuse.moeRoutedDownReduce(
+                mids: upOuts, expertIndices: routerIndicesScratch,
+                slotWeights: routerWeightsScratch,
+                downWeight: stacked.downWeight, downScales: stacked.downScales,
+                output: routedCombine, global: 1.0, on: workCmd, device: device)
+            accumulator = routedCombine
+        } else {
+            // ── Escape path (BUTTER_NEMOTRON_NVFP4_FUSED_EXPERTS=0, or
+            //    a checkpoint shape the fused kernels don't cover) —
+            //    original per-slot loop, byte-for-byte. ────────────────
+            var idxTensors: [Tensor] = []
+            idxTensors.reserveCapacity(topK)
+            for slot in 0 ..< topK {
+                idxTensors.append(
+                    Tensor(
+                        buffer: routerIndicesScratch.buffer,
+                        offset: routerIndicesScratch.offset + slot * DType.u32.byteSize,
+                        shape: [1], dtype: .u32))
+            }
+
+            // ── Routed experts — two batched gather-GEMV dispatches ──────
+            let upIns = Array(repeating: xNorm, count: topK)
+            var upOuts: [Tensor] = []
+            for _ in 0 ..< topK {
+                upOuts.append(Tensor.empty(shape: [moeIntermediate], dtype: dtype, device: device))
+            }
+            let upWeights = Array(repeating: stacked.upWeight, count: topK)
+            let upScalesArr = Array(repeating: stacked.upScales, count: topK)
+            Ops.nvfp4DequantGemvExpertIndexedMany(
+                weightsStacked: upWeights, scalesStacked: upScalesArr,
+                inputs: upIns, expertIndices: idxTensors, outputs: upOuts,
+                blockSize: stacked.blockSize, global: 1.0, on: workCmd)
+
+            // relu(up)^2 per slot, in place into a fresh "inner" buffer.
+            var innerOuts: [Tensor] = []
+            for slot in 0 ..< topK {
+                let r = Ops.relu(upOuts[slot], on: workCmd)
+                innerOuts.append(Ops.mul(r, r, on: workCmd))
+            }
+
+            var downOuts: [Tensor] = []
+            for _ in 0 ..< topK {
+                downOuts.append(Tensor.empty(shape: [hidden], dtype: dtype, device: device))
+            }
+            let downWeights = Array(repeating: stacked.downWeight, count: topK)
+            let downScalesArr = Array(repeating: stacked.downScales, count: topK)
+            Ops.nvfp4DequantGemvExpertIndexedMany(
+                weightsStacked: downWeights, scalesStacked: downScalesArr,
+                inputs: innerOuts, expertIndices: idxTensors, outputs: downOuts,
+                blockSize: stacked.blockSize, global: 1.0, on: workCmd)
+
+            // ── Weighted sum over the topK selected experts — per-slot
+            //    scale reads straight from the GPU router-weights buffer,
+            //    no host float involved. ─────────────────────────────────
+            for slot in 0 ..< topK {
+                let wSlot = Tensor(
+                    buffer: routerWeightsScratch.buffer,
+                    offset: routerWeightsScratch.offset + slot * dtype.byteSize,
+                    shape: [1], dtype: dtype)
+                let scaled = Ops.headGateMul(
+                    attn: downOuts[slot], gate: wSlot, headDim: hidden, on: workCmd)
+                accumulator =
+                    accumulator.map { Ops.add($0, scaled, on: workCmd) } ?? scaled
+            }
         }
 
         // ── Shared expert — always-on, plain NVFP4 GEMV pair ──────────
