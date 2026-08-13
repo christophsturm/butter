@@ -279,6 +279,16 @@ extension Model {
         // sessions, another process squeezing this one). See
         // `Device.refreshWeightResidency` for the full rationale.
         Device.shared.refreshWeightResidency()
+        // Cross-arm/cross-generation retention fix: drop residency for
+        // the PREVIOUS generation's KV/conv/GDN-state cache buffers
+        // before building this generation's fresh set below. Safe here
+        // — nothing in Butter carries a cache object across separate
+        // `generate()` calls, every call rebuilds via `makeLayerCaches`
+        // — and required: without it, `markCacheResident` (called from
+        // each cache's initializer) accumulates a strong GPU-residency
+        // reference per generation for the life of the process. See
+        // `Device.releaseGenerationCaches` for the full writeup.
+        Device.shared.releaseGenerationCaches()
         let caches = engine.makeLayerCaches()
         // Gemma 3+, several Qwen variants, and a few llama-tuned models
         // publish `eos_token_id` as a *list* (model EOS plus end-of-turn

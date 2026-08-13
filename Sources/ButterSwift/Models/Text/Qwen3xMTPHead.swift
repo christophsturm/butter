@@ -562,9 +562,18 @@ public final class Qwen3xMTPHead: Module {
         let cacheCapacity =
             ButterEnv["BUTTER_QWEN_MTP_CACHE"]
             .flatMap(Int.init) ?? defaultCacheCapacity
+        // `.weight` residency: this cache is built ONCE here (at head
+        // load) and lives for the head's entire lifetime — every
+        // `generate()` call on the owning model calls `resetCache()`
+        // (a logical position reset), never rebuilds this object. It
+        // must NOT be in the per-generation residency set that
+        // `Device.releaseGenerationCaches()` bulk-drops between arms/
+        // generations, or it would silently lose its residency-set
+        // fast path the first time any generation on this model ends.
+        // See `Device.CacheResidencyKind`'s doc comment.
         let kvCache = KVCache(
             nKVHeads: nKVHeads, headDim: headDim, maxSeq: cacheCapacity,
-            dtype: dtype, device: device)
+            dtype: dtype, device: device, residency: .weight)
 
         // Optional cheaper draft-only lm_head (see `draftLmHead`'s doc
         // comment). Lives beside the model checkpoint (a sibling of

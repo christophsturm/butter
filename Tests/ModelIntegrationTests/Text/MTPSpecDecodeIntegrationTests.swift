@@ -131,6 +131,10 @@ struct MTPSpecDecodeIntegrationTests {
         // ── Baseline arm per length (compute once per count) ──────────
         var baselines: [Int: (tokens: [Int], decodeSeconds: Double)] = [:]
         for count in Set(runs.map(\.count)) {
+            // Cross-arm retention fix — drop the previous iteration's
+            // cache residency before allocating a fresh one; see
+            // `Device.releaseGenerationCaches` for the full writeup.
+            device.releaseGenerationCaches()
             let caches = qwen.makeLayerCaches()
             let seed = prefill(
                 qwen, promptTokens: promptTokens, caches: caches, device: device)
@@ -146,6 +150,7 @@ struct MTPSpecDecodeIntegrationTests {
         // ── Spec arm per (count, γ) ───────────────────────────────────
         for (count, gamma) in runs {
             let baseline = baselines[count]!
+            device.releaseGenerationCaches()
             let caches = qwen.makeLayerCaches()
             let seed = prefill(
                 qwen, promptTokens: promptTokens, caches: caches, device: device)
@@ -323,6 +328,8 @@ struct MTPSpecDecodeIntegrationTests {
             allPrompts.first(where: { $0.name == n })
         }) {
             let promptTokens = m.tokenizer.encode(text: text)
+            // Cross-arm retention fix — see `Device.releaseGenerationCaches`.
+            device.releaseGenerationCaches()
             let caches = qwen.makeLayerCaches()
             let seed = autoreleasepool {
                 prefill(qwen, promptTokens: promptTokens, caches: caches, device: device)
@@ -339,6 +346,7 @@ struct MTPSpecDecodeIntegrationTests {
             let n = promptTokens.count
             let baseline = baselines[prompt.name]!
 
+            device.releaseGenerationCaches()
             let caches = qwen.makeLayerCaches()
             let seed = autoreleasepool {
                 prefill(qwen, promptTokens: promptTokens, caches: caches, device: device)
@@ -519,6 +527,8 @@ struct MTPSpecDecodeIntegrationTests {
             allPrompts.first(where: { $0.name == n })
         }) {
             let promptTokens = m.tokenizer.encode(text: text)
+            // Cross-arm retention fix — see `Device.releaseGenerationCaches`.
+            device.releaseGenerationCaches()
             let caches = qwen.makeLayerCaches()
             let seed = autoreleasepool {
                 prefill(qwen, promptTokens: promptTokens, caches: caches, device: device)
@@ -564,6 +574,16 @@ struct MTPSpecDecodeIntegrationTests {
                 // message). See the repo's Metal-autoreleasepool-leak
                 // note: wrap any `makeBuffer`-heavy loop.
                 autoreleasepool {
+                    // Cross-arm retention fix — see
+                    // `Device.releaseGenerationCaches`. Complements the
+                    // `autoreleasepool` wrap this comment block already
+                    // documents: that drains transient ObjC/Metal
+                    // objects, this drops the residency-set strong
+                    // reference the old `markWeightsResident` call left
+                    // on every prior (case, config) triple's cache
+                    // buffers — the two are independent leaks that
+                    // happened to compound in this test.
+                    device.releaseGenerationCaches()
                     let caches = qwen.makeLayerCaches()
                     let seed = autoreleasepool {
                         prefill(qwen, promptTokens: promptTokens, caches: caches, device: device)
