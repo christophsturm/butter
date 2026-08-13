@@ -1197,12 +1197,60 @@ extension SpecDecode {
             // rows.
             // Greedy-only diagnostic: "batched vs single-token argmax"
             // parity has no meaning once tokens are drawn probabilistically.
+            //
+            // SIDE-EFFECT HAZARD (found + fixed by the adversarial audit
+            // on this branch): the block below truncates the backbone
+            // caches to `snap` (pre-verify) and replays `plan.committed`
+            // through the single-token forward — a kernel path that is
+            // NUMERICALLY DIFFERENT from the batched verify pass (that
+            // gap is the entire point of the measurement). That replay
+            // writes real K/V into the SAME physical attention-cache
+            // slots the batched pass already filled. `caches.restoreAll`
+            // only undoes this for GDN/conv state (a true tensor-content
+            // restore — see `CacheSnapshot.swift`'s `.gdnLayer`/`.gdn`
+            // cases); its KVCache case is LENGTH-ONLY BY DESIGN (correct
+            // for the reject/replay path elsewhere in this loop, where
+            // the truncated tail gets reappended with identical content
+            // — see the case's doc comment), so restoring `saved`
+            // afterward is a no-op on KV bytes and silently leaves the
+            // probe's single-token-computed K/V sitting where the
+            // batched pass's K/V used to be. Every later decode step
+            // attends over those slots, so the drift compounds forward
+            // until it flips an argmax — confirmed on
+            // `mtpSpecMatchesBaselineOnAdversarialPrompts` case 0
+            // (γ=2, creative-highentropy): exact match with the flag
+            // off, diverges at token 86/180 with it on. Fix: snapshot
+            // the ACTUAL K/V bytes for the verified range up front via
+            // `KVCache.snapshotRangeEncode` (content-level, not the
+            // composite's length-only snapshot) and blit them back with
+            // `restoreRangeEncode` after the probe, so the probe's own
+            // replay never leaks into what the fast path reads next.
             if parityProbe, mode.isGreedy, !plan.needsReplay {
                 // Recomputed locally (not read from the `.greedy` accept-plan
                 // branch's own local) — this diagnostic block only runs in
                 // greedy mode, where it equals the batched trailing row's
                 // argmax, same value `planMTPAccept`'s caller derived.
                 let batchedBonus = argmax(flat, offset: (rows - 1) * vocab, count: vocab)
+                // Content-level KV snapshot over the verified range —
+                // see the SIDE-EFFECT HAZARD note above. `pos` is the
+                // batched verify pass's startPosition and `plan.committed
+                // .count` is its row count, so `[pos, pos+count)` is
+                // exactly the slot range that pass just filled.
+                let rangeStart = pos
+                let rangeCount = plan.committed.count
+                var kvRangeSnaps: [(cache: KVCache, k: Tensor, v: Tensor)] = []
+                let kvSnapCmd = device.makeCommandBuffer()
+                for c in caches {
+                    if let kv = c as? KVCache {
+                        let s = kv.snapshotRangeEncode(
+                            start: rangeStart, count: rangeCount,
+                            on: kvSnapCmd, device: device)
+                        kvRangeSnaps.append((kv, s.k, s.v))
+                    }
+                }
+                kvSnapCmd.commit()
+                kvSnapCmd.waitUntilCompleted()
+
                 let saved = caches.snapshotAll(device: device)
                 caches.restoreAll(from: snap, device: device)
                 var truthLogits: Tensor!
@@ -1253,6 +1301,18 @@ extension SpecDecode {
                     parityMatchMargin += Double(margin)
                 }
                 caches.restoreAll(from: saved, device: device)
+                // Undo the probe's KV pollution: blit the batched pass's
+                // ACTUAL K/V bytes back over the range the replay just
+                // overwrote (composite restoreAll above only fixed
+                // length + GDN/conv content, not this).
+                let kvRestoreCmd = device.makeCommandBuffer()
+                for entry in kvRangeSnaps {
+                    entry.cache.restoreRangeEncode(
+                        from: (k: entry.k, v: entry.v),
+                        start: rangeStart, count: rangeCount, on: kvRestoreCmd)
+                }
+                kvRestoreCmd.commit()
+                kvRestoreCmd.waitUntilCompleted()
             }
 
             // ── Commit + emit (stop tokens and budget respected) ──────
