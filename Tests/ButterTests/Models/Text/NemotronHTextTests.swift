@@ -124,4 +124,50 @@ struct NemotronHTextTests {
             }
         }
     }
+
+    // ─── layers_block_type (JSON string-array schedule) ──────────────
+    //
+    // Nemotron-3.5-Lightning-30B-A3B ships its layer schedule as
+    // `layers_block_type: ["mamba", "moe", "attention", ...]` instead
+    // of the packed `hybrid_override_pattern` char-string every older
+    // NemotronH checkpoint uses. Same schedule, different config
+    // schema — mirrors Granite4's `layer_types` string-array parsing.
+
+    @Test("layers_block_type names map to the right layer kind")
+    func layerKindStringParsing() throws {
+        #expect(try NemotronHLayerKind(fromBlockTypeName: "mamba") == .mamba)
+        #expect(try NemotronHLayerKind(fromBlockTypeName: "attention") == .attention)
+        #expect(try NemotronHLayerKind(fromBlockTypeName: "mlp") == .mlp)
+        #expect(try NemotronHLayerKind(fromBlockTypeName: "moe") == .moe)
+    }
+
+    @Test("an unknown layers_block_type entry throws unsupportedConfig")
+    func layerKindStringRejectsUnknown() {
+        #expect(throws: NemotronHError.self) {
+            _ = try NemotronHLayerKind(fromBlockTypeName: "sliding_attention")
+        }
+    }
+
+    @Test("the published Nemotron-3.5-Lightning layers_block_type parses to the expected kind counts")
+    func lightningPatternParses() throws {
+        // The published Nemotron-3.5-Lightning-30B-A3B
+        // `layers_block_type` — 52 layers: 23 mamba / 23 moe / 6
+        // attention, no dense MLP layers.
+        let blockTypes: [String] = [
+            "mamba", "moe", "mamba", "moe", "mamba", "attention", "moe",
+            "mamba", "moe", "mamba", "moe", "mamba", "attention", "moe",
+            "mamba", "moe", "mamba", "moe", "mamba", "attention", "moe",
+            "mamba", "moe", "mamba", "moe", "mamba", "attention", "moe",
+            "mamba", "moe", "mamba", "moe", "mamba", "attention", "moe",
+            "mamba", "moe", "mamba", "moe", "mamba", "moe", "mamba",
+            "attention", "moe", "mamba", "moe", "mamba", "moe", "mamba",
+            "moe", "mamba", "moe",
+        ]
+        let kinds = try blockTypes.map { try NemotronHLayerKind(fromBlockTypeName: $0) }
+        #expect(kinds.count == 52)
+        #expect(kinds.filter { $0 == .attention }.count == 6)
+        #expect(kinds.filter { $0 == .mamba }.count == 23)
+        #expect(kinds.filter { $0 == .moe }.count == 23)
+        #expect(kinds.filter { $0 == .mlp }.count == 0)
+    }
 }

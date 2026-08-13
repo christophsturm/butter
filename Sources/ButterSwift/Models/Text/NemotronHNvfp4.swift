@@ -1,0 +1,557 @@
+// Copyright 2026 Eric Kryski (@ekryski)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// NemotronH mixed-precision quantization — Nemotron-3.5-Lightning-
+// 30B-A3B-NVFP4 port.
+//
+// The published checkpoint is NOT uniformly quantized. Per
+// `hf_quant_config.json` (`modelopt` MIXED_PRECISION):
+//
+//   • MoE routed experts (`experts.N.{up,down}_proj`), the MoE shared
+//     expert (`shared_experts.{up,down}_proj`), and `lm_head` — NVFP4
+//     weight-only, group_size 16. Raw HF layout per tensor:
+//       `<base>.weight`         u8  [out, in/2]   — 2 e2m1 codes/byte
+//       `<base>.weight_scale`   f8_e4m3 [out, in/16] — per-block scale
+//       `<base>.weight_scale_2` f32 []            — per-tensor global scale
+//   • Mamba mixer `in_proj`/`out_proj` (all 23 mamba layers) — static
+//     FP8 W8A8. Raw HF layout:
+//       `<base>.weight`       f8_e4m3 [out, in]
+//       `<base>.weight_scale` f32 []              — single scalar
+//       `<base>.input_scale`  f32 [1]             — activation scale
+//                                                    (unused — Butter
+//                                                    keeps activations
+//                                                    in bf16 end to end)
+//   • Everything else (attention q/k/v/o proj, embeddings, mamba SSM
+//     params + conv1d + gated-norm weight, MoE router gate +
+//     correction bias, all RMSNorm weights) — plain bf16, untouched.
+//     Attention `k_proj`/`v_proj` additionally carry `.k_scale`/
+//     `.v_scale` (KV-cache FP8 scales for the reference TensorRT-LLM
+//     serving stack) — Butter ignores these; its KV cache stays bf16.
+//
+// Butter's own NVFP4 kernels (`Nvfp4Linear`, `Ops.nvfp4DequantGemvExpertIndexedMany`,
+// `Ops.nvfp4GatherSteel`) expect a DIFFERENT on-disk shape than HF ships:
+//   `<base>.weight`  u32 [out, in/8]  — 8 e2m1 codes/lane
+//   `<base>.scales`  u8  [out, in/16] — per-block E4M3 scale, with any
+//                                        per-tensor global scale ALREADY
+//                                        folded in (every existing
+//                                        caller in this repo passes
+//                                        `global: 1.0`; there is no
+//                                        live path that reads a second,
+//                                        per-tensor scale tensor).
+// This file bridges the two: `repackNvfp4Weight` reinterprets the
+// nibble-packed HF byte layout as Butter's u32-lane layout (pure
+// bit-reinterpretation — HF's `torch.uint8 [out, in/2]` and Butter's
+// `u32 [out, in/8]` cover the identical bytes in the identical
+// little-endian order, four u8 nibble-pairs concatenated into one
+// u32 lane), and `foldGlobalIntoScales` bakes each tensor's own
+// `weight_scale_2` into its per-block `weight_scale` bytes via an
+// E4M3 decode → multiply → re-encode round trip, so every downstream
+// kernel call can pass `global: 1.0` unmodified.
+//
+// FP8 mamba projections have no Butter kernel to dispatch through at
+// all (`Ops/OpsCoverageNotes.swift` — Butter's `DType` has no f8 case,
+// and the one FP8 kernel that exists, `dsv4Fp8BlockDequant`, is
+// unwired 128×128-block-scale scaffolding that doesn't fit this
+// scalar-scale scheme). `dequantFp8ToDType` decodes the 46 mamba
+// in_proj/out_proj tensors to bf16 on the CPU at load time instead —
+// a one-time cost, and a small fraction of the checkpoint's total
+// weight (the MoE experts dominate both parameter count and compute).
+
+import Foundation
+import Metal
+
+// ─── E4M3 (float8_e4m3fn) scalar codec ────────────────────────────────
+//
+// 1 sign / 4 exponent (bias 7) / 3 mantissa, no infinities, NaN only at
+// S.1111.111 (0x7F / 0xFF). Max finite magnitude 448 (exp=15, mant=6),
+// min positive subnormal 2^-9 (exp=0, mant=1).
+
+enum E4M3 {
+    /// Decode one E4M3 byte to Float32. Built as a 256-entry LUT the
+    /// first time it's needed — decode is called per-weight-element for
+    /// the FP8 mamba dequant path (millions of calls), so paying the
+    /// closed-form formula once per byte value (not per element) matters.
+    static let decodeLUT: [Float] = (0 ..< 256).map { decodeSlow(UInt8($0)) }
+
+    @inline(__always)
+    static func decode(_ byte: UInt8) -> Float { decodeLUT[Int(byte)] }
+
+    private static func decodeSlow(_ byte: UInt8) -> Float {
+        let negative = (byte & 0x80) != 0
+        let exp = Int((byte >> 3) & 0x0F)
+        let mant = Int(byte & 0x07)
+        var mag: Float
+        if exp == 0 {
+            // Subnormal: 2^-6 * (mant/8).
+            mag = Float(mant) / 8.0 * exp2Float(-6)
+        } else if exp == 15 && mant == 7 {
+            return Float.nan
+        } else {
+            // Normal: 2^(exp-7) * (1 + mant/8).
+            mag = (1.0 + Float(mant) / 8.0) * exp2Float(exp - 7)
+        }
+        return negative ? -mag : mag
+    }
+
+    @inline(__always)
+    private static func exp2Float(_ e: Int) -> Float {
+        Float(sign: .plus, exponent: e, significand: 1.0)
+    }
+
+    /// Encode a Float32 to the nearest representable E4M3 byte
+    /// (round-half-away-from-zero on the 3 mantissa bits; ties don't
+    /// materially matter here — this only re-quantizes values that are
+    /// already E4M3-precision, folding in a per-tensor global scale).
+    /// Overflow saturates to the max finite magnitude (448) rather than
+    /// producing NaN, since a saturated micro-scale is a far smaller
+    /// error than corrupting the whole block with NaN.
+    static func encodeNearest(_ v: Float) -> UInt8 {
+        if v.isNaN { return 0x7F }
+        let signBit: UInt8 = v < 0 ? 0x80 : 0x00
+        let av = Double(abs(v))
+        if av == 0 { return signBit }
+        let maxFinite = 448.0
+        if av >= maxFinite {
+            return signBit | 0x7E  // exp=15 (0b1111), mant=6 (0b110) = 448
+        }
+        var e = Int(floor(log2(av)))
+        if e < -6 {
+            // Subnormal range: value = 2^-6 * (m/8), m in 0...7.
+            let m = (av / exp2Double(-6) * 8.0).rounded()
+            let mInt = max(0, min(7, Int(m)))
+            return signBit | UInt8(mInt)
+        }
+        if e > 8 { e = 8 }
+        let sig = av / exp2Double(e)
+        var mInt = Int(((sig - 1.0) * 8.0).rounded())
+        if mInt >= 8 {
+            mInt = 0
+            e += 1
+        }
+        if e > 8 {
+            // Overflowed while rounding up — saturate to max finite.
+            return signBit | 0x7E
+        }
+        if e + 7 == 15 && mInt == 7 {
+            // Would land exactly on the NaN pattern — clamp to max finite.
+            mInt = 6
+        }
+        let expStored = UInt8(e + 7)
+        return signBit | (expStored << 3) | UInt8(mInt & 0x07)
+    }
+
+    @inline(__always)
+    private static func exp2Double(_ e: Int) -> Double { Foundation.exp2(Double(e)) }
+}
+
+// ─── Byte-level tensor helpers ────────────────────────────────────────
+
+/// Reinterpret an HF NVFP4 packed weight — `u8 [out, in/2]` (2 e2m1
+/// codes/byte, sequential input-channel order) — as Butter's expected
+/// layout — `u32 [out, in/8]` (8 codes/lane). Every row's `in/2` bytes
+/// are already contiguous and little-endian on Apple Silicon, so this
+/// is a pure reinterpretation: no code needs to move, only the dtype
+/// tag and the trailing-dimension size change. `outDim`/`inDim` are the
+/// LOGICAL (unpacked) dimensions.
+func repackNvfp4Weight(
+    _ hfWeight: Tensor, outDim: Int, inDim: Int, device: Device
+) -> Tensor {
+    precondition(hfWeight.dtype == .u8, "repackNvfp4Weight: expected u8, got \(hfWeight.dtype)")
+    precondition(
+        hfWeight.elementCount == outDim * (inDim / 2),
+        "repackNvfp4Weight: element count \(hfWeight.elementCount) != \(outDim)*\(inDim / 2)")
+    precondition(inDim % 8 == 0, "repackNvfp4Weight: inDim \(inDim) must be a multiple of 8")
+    let packed = inDim / 8
+    let out = Tensor.empty(shape: [outDim, packed], dtype: .u32, device: device)
+    // Byte-for-byte copy — same underlying bytes, different dtype tag.
+    let byteCount = outDim * (inDim / 2)
+    memcpy(
+        out.buffer.contents().advanced(by: out.offset),
+        hfWeight.buffer.contents().advanced(by: hfWeight.offset),
+        byteCount)
+    return out
+}
+
+/// Fold a per-tensor global scale (HF's `weight_scale_2`, f32 scalar)
+/// into a per-block E4M3 micro-scale tensor (HF's `weight_scale`, read
+/// as raw `.u8` bytes via the `F8_E4M3`→`.u8` DType mapping), producing
+/// a new `.u8` tensor of the same shape whose values already include
+/// the global factor — so every kernel call site can pass `global: 1.0`.
+func foldNvfp4GlobalIntoScales(
+    _ blockScaleU8: Tensor, global: Float, device: Device
+) -> Tensor {
+    precondition(
+        blockScaleU8.dtype == .u8,
+        "foldNvfp4GlobalIntoScales: expected u8 (raw E4M3 bytes), got \(blockScaleU8.dtype)")
+    if global == 1.0 {
+        // No-op fold — still materialize a fresh tensor so callers never
+        // alias the source bundle's backing buffer.
+        let out = Tensor.empty(shape: blockScaleU8.shape, dtype: .u8, device: device)
+        memcpy(
+            out.buffer.contents().advanced(by: out.offset),
+            blockScaleU8.buffer.contents().advanced(by: blockScaleU8.offset),
+            blockScaleU8.byteCount)
+        return out
+    }
+    let n = blockScaleU8.elementCount
+    let src = blockScaleU8.toArray(as: UInt8.self)
+    var dst = [UInt8](repeating: 0, count: n)
+    for i in 0 ..< n {
+        let folded = E4M3.decode(src[i]) * global
+        dst[i] = E4M3.encodeNearest(folded)
+    }
+    let out = Tensor.empty(shape: blockScaleU8.shape, dtype: .u8, device: device)
+    out.copyIn(from: dst)
+    return out
+}
+
+/// Dequantize a static-FP8 weight (`F8_E4M3` read as raw `.u8` bytes,
+/// scaled by one per-tensor scalar) to a dense tensor in `dtype`
+/// (bf16/f16/f32). Used for the 46 NemotronH-Lightning mamba mixer
+/// `in_proj`/`out_proj` tensors — Butter has no FP8 GEMM/GEMV kernel
+/// (see file header), so these get dequantized once at load time and
+/// run through the ordinary bf16 `Linear` path.
+func dequantFp8ToDType(
+    _ f8AsU8: Tensor, scale: Float, outDim: Int, inDim: Int,
+    dtype: DType, device: Device
+) -> Tensor {
+    precondition(f8AsU8.dtype == .u8, "dequantFp8ToDType: expected u8 (raw E4M3 bytes)")
+    precondition(f8AsU8.elementCount == outDim * inDim, "dequantFp8ToDType: shape mismatch")
+    let bytes = f8AsU8.toArray(as: UInt8.self)
+    var floats = [Float](repeating: 0, count: bytes.count)
+    for i in 0 ..< bytes.count {
+        floats[i] = E4M3.decode(bytes[i]) * scale
+    }
+    let out = Tensor.empty(shape: [outDim, inDim], dtype: dtype, device: device)
+    switch dtype {
+    case .f32:
+        out.copyIn(from: floats)
+    case .f16:
+        out.copyIn(from: floats.map { Float16($0) })
+    case .bf16:
+        out.copyIn(
+            from: floats.map { v -> UInt16 in
+                let bits = v.bitPattern
+                let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
+                return UInt16(rounded >> 16)
+            })
+    default:
+        preconditionFailure("dequantFp8ToDType: unsupported output dtype \(dtype)")
+    }
+    return out
+}
+
+/// Load a projection weight that MAY be static-FP8 quantized (HF's
+/// `<base>.weight` (f8_e4m3, read as raw `.u8`) + `<base>.weight_scale`
+/// (f32 scalar) + `<base>.input_scale` (f32, unused — Butter keeps
+/// activations bf16)), dequantizing to `dtype` at load time. Falls
+/// back to a plain tensor read when the checkpoint doesn't quantize
+/// this base (every other NemotronH checkpoint, and any future
+/// Lightning weight that ships unquantized).
+func loadMaybeFp8WeightNH(
+    base: String, outDim: Int, inDim: Int,
+    weights: SafeTensorsBundle, dtype: DType, device: Device
+) throws -> Tensor {
+    guard weights.has("\(base).weight_scale"), weights.has("\(base).input_scale"),
+        !weights.has("\(base).weight_scale_2")  // NVFP4 uses this suffix too — disambiguate.
+    else {
+        return try weights.tensor(named: "\(base).weight")
+    }
+    let f8Bytes = try weights.tensor(named: "\(base).weight")
+    let scaleT = try weights.tensor(named: "\(base).weight_scale")
+    precondition(
+        scaleT.elementCount == 1,
+        "loadMaybeFp8WeightNH: \(base).weight_scale expected a scalar, got \(scaleT.shape)")
+    let scale = scaleT.toFloatArray()[0]
+    return dequantFp8ToDType(
+        f8Bytes, scale: scale, outDim: outDim, inDim: inDim, dtype: dtype, device: device)
+}
+
+// ─── NVFP4 linear / stacked-expert loaders (HF raw layout) ───────────
+
+/// Load one NVFP4-quantized dense projection (lm_head, or a single
+/// non-batched expert like the MoE shared expert) from HF's raw
+/// `<base>.weight` / `<base>.weight_scale` / `<base>.weight_scale_2`
+/// triplet into a Butter `Nvfp4Linear`.
+func loadNemotronHNvfp4Linear(
+    base: String, outDim: Int, inDim: Int,
+    weights: SafeTensorsBundle, device: Device
+) throws -> Nvfp4Linear {
+    let hfWeight = try weights.tensor(named: "\(base).weight")
+    let blockScale = try weights.tensor(named: "\(base).weight_scale")
+    let globalScaleT = try weights.tensor(named: "\(base).weight_scale_2")
+    precondition(
+        globalScaleT.elementCount == 1,
+        "loadNemotronHNvfp4Linear: \(base).weight_scale_2 expected a scalar, "
+            + "got shape \(globalScaleT.shape)")
+    let global = globalScaleT.toFloatArray()[0]
+    let repacked = repackNvfp4Weight(hfWeight, outDim: outDim, inDim: inDim, device: device)
+    let folded = foldNvfp4GlobalIntoScales(blockScale, global: global, device: device)
+    return Nvfp4Linear(weight: repacked, scales: folded, blockSize: 16, global: 1.0)
+}
+
+/// Stacked NVFP4 routed experts for a NemotronH MoE layer — the
+/// up_proj/down_proj analogue of `MoELayer.StackedNvfp4Experts`, minus
+/// the gate projection (NemotronH experts are `down(relu(up(x))^2)`,
+/// no SwiGLU gate). Each expert's own `weight_scale_2` is folded into
+/// its slice of the stacked per-block scale tensor at load time (see
+/// file header) — `global` is therefore always `1.0` at the call site.
+public struct NemotronHStackedNvfp4Experts: Sendable {
+    public let upWeight: Tensor  // [E, moeIntermediate, hidden/8]      u32
+    public let upScales: Tensor  // [E, moeIntermediate, hidden/16]     u8
+    public let downWeight: Tensor  // [E, hidden, moeIntermediate/8]    u32
+    public let downScales: Tensor  // [E, hidden, moeIntermediate/16]   u8
+    public let numExperts: Int
+    public let moeIntermediate: Int
+    public let hidden: Int
+    public let blockSize: Int
+    public let dtype: DType
+}
+
+/// Load all `nExperts` routed experts for one NemotronH MoE layer from
+/// HF's per-expert tensor layout into one stacked pair of buffers, so
+/// `Ops.nvfp4DequantGemvExpertIndexedMany` can gather-index by expert
+/// ID in a single dispatch. This is a load-time-only host loop (one
+/// pass per checkpoint load, not per token) — copies + E4M3 fold each
+/// expert's weight/scale slice into its offset in the stacked tensor.
+func loadNemotronHStackedNvfp4Experts(
+    prefix p: String, nExperts: Int, moeIntermediate: Int, hidden: Int,
+    weights: SafeTensorsBundle, dtype: DType, device: Device
+) throws -> NemotronHStackedNvfp4Experts {
+    let blockSize = 16
+    let upPacked = hidden / 8
+    let upScaleCols = hidden / blockSize
+    let downPacked = moeIntermediate / 8
+    let downScaleCols = moeIntermediate / blockSize
+
+    let upWeight = Tensor.empty(
+        shape: [nExperts, moeIntermediate, upPacked], dtype: .u32, device: device)
+    let upScales = Tensor.empty(
+        shape: [nExperts, moeIntermediate, upScaleCols], dtype: .u8, device: device)
+    let downWeight = Tensor.empty(
+        shape: [nExperts, hidden, downPacked], dtype: .u32, device: device)
+    let downScales = Tensor.empty(
+        shape: [nExperts, hidden, downScaleCols], dtype: .u8, device: device)
+
+    let upWeightRowBytes = moeIntermediate * upPacked * DType.u32.byteSize
+    let upScaleRowBytes = moeIntermediate * upScaleCols
+    let downWeightRowBytes = hidden * downPacked * DType.u32.byteSize
+    let downScaleRowBytes = hidden * downScaleCols
+
+    for e in 0 ..< nExperts {
+        let ep = "\(p).experts.\(e)"
+
+        let upLinear = try loadNemotronHNvfp4Linear(
+            base: "\(ep).up_proj", outDim: moeIntermediate, inDim: hidden,
+            weights: weights, device: device)
+        precondition(upLinear.weight.byteCount == upWeightRowBytes)
+        memcpy(
+            upWeight.buffer.contents().advanced(by: upWeight.offset + e * upWeightRowBytes),
+            upLinear.weight.buffer.contents().advanced(by: upLinear.weight.offset),
+            upWeightRowBytes)
+        precondition(upLinear.scales.byteCount == upScaleRowBytes)
+        memcpy(
+            upScales.buffer.contents().advanced(by: upScales.offset + e * upScaleRowBytes),
+            upLinear.scales.buffer.contents().advanced(by: upLinear.scales.offset),
+            upScaleRowBytes)
+
+        let downLinear = try loadNemotronHNvfp4Linear(
+            base: "\(ep).down_proj", outDim: hidden, inDim: moeIntermediate,
+            weights: weights, device: device)
+        precondition(downLinear.weight.byteCount == downWeightRowBytes)
+        memcpy(
+            downWeight.buffer.contents().advanced(by: downWeight.offset + e * downWeightRowBytes),
+            downLinear.weight.buffer.contents().advanced(by: downLinear.weight.offset),
+            downWeightRowBytes)
+        precondition(downLinear.scales.byteCount == downScaleRowBytes)
+        memcpy(
+            downScales.buffer.contents().advanced(by: downScales.offset + e * downScaleRowBytes),
+            downLinear.scales.buffer.contents().advanced(by: downLinear.scales.offset),
+            downScaleRowBytes)
+    }
+
+    return NemotronHStackedNvfp4Experts(
+        upWeight: upWeight, upScales: upScales,
+        downWeight: downWeight, downScales: downScales,
+        numExperts: nExperts, moeIntermediate: moeIntermediate, hidden: hidden,
+        blockSize: blockSize, dtype: dtype)
+}
+
+// ─── NemotronHNvfp4MoELayer — "E" with NVFP4 routed/shared experts ───
+//
+// Same routing math and residual/shared-expert composition as the
+// plain `NemotronHMoELayer` (`NemotronHText.swift`) — only the expert
+// FFN math is quantized. Deliberately does NOT reuse any of
+// `MoELayer.swift`'s Laguna-tuned fused SwiGLU dispatch chains (those
+// are shaped for a gate+up SwiGLU topology and hard-code Laguna's own
+// `hidden`/`moeIntermediate`/`topK`); this layer calls the generic
+// `Ops.nvfp4DequantGemvExpertIndexedMany` primitive directly, twice
+// per token (once for up_proj across the topK selected experts, once
+// for down_proj), which is correct for ANY per-expert weight shape —
+// prioritizing correctness-first port fidelity over decode throughput.
+public final class NemotronHNvfp4MoELayer: Module, DecoderLayer {
+    let norm: RMSNorm
+    let gate: AnyLinear
+    let eScoreCorrectionBiasHost: [Float]
+    let stacked: NemotronHStackedNvfp4Experts
+    /// Shared expert — NVFP4, but a single (non-batched) expert, so a
+    /// plain `Nvfp4Linear` GEMV pair suffices (no gather-by-index).
+    let sharedUp: Nvfp4Linear?
+    let sharedDown: Nvfp4Linear?
+
+    public let hidden, nRouted, topK: Int
+    public let routedScalingFactor: Float
+    public let normTopkProb: Bool
+    let dtype: DType
+
+    init(
+        norm: RMSNorm, gate: AnyLinear, eScoreCorrectionBias: [Float],
+        stacked: NemotronHStackedNvfp4Experts,
+        sharedUp: Nvfp4Linear?, sharedDown: Nvfp4Linear?,
+        hidden: Int, topK: Int,
+        routedScalingFactor: Float, normTopkProb: Bool, dtype: DType
+    ) {
+        precondition(
+            topK > 0 && topK <= stacked.numExperts,
+            "NemotronHNvfp4MoELayer: topK \(topK) out of range 1…\(stacked.numExperts)")
+        self.norm = norm
+        self.gate = gate
+        self.eScoreCorrectionBiasHost = eScoreCorrectionBias
+        self.stacked = stacked
+        self.sharedUp = sharedUp
+        self.sharedDown = sharedDown
+        self.hidden = hidden
+        self.nRouted = stacked.numExperts
+        self.topK = topK
+        self.routedScalingFactor = routedScalingFactor
+        self.normTopkProb = normTopkProb
+        self.dtype = dtype
+    }
+
+    public func parameters() -> [(String, Tensor)] {
+        var out: [(String, Tensor)] = []
+        for (k, v) in norm.parameters() { out.append(("norm.\(k)", v)) }
+        for (k, v) in gate.parameters() { out.append(("mixer.gate.\(k)", v)) }
+        out.append(("mixer.experts.up_proj.weight", stacked.upWeight))
+        out.append(("mixer.experts.up_proj.scales", stacked.upScales))
+        out.append(("mixer.experts.down_proj.weight", stacked.downWeight))
+        out.append(("mixer.experts.down_proj.scales", stacked.downScales))
+        return out
+    }
+
+    /// `DecoderLayer` conformance. Commits `cmd` and returns a
+    /// fully-resident tensor produced on a fresh internal buffer — same
+    /// command-buffer contract as `NemotronHMoELayer.decode`.
+    public func decode(
+        _ h: Tensor, position _: Int,
+        cache _: any LayerCacheProtocol,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        // ── Pre-mixer RMSNorm + router GEMV on the caller's buffer ───
+        let xNorm = norm(h, on: cmd)
+        let logitsTensor = gate(xNorm, on: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        // ── CPU routing — identical to `NemotronHMoELayer.decode` ────
+        let logits = logitsTensor.toFloatArray()
+        var origScores = [Float](repeating: 0, count: nRouted)
+        var selectionScores = [Float](repeating: 0, count: nRouted)
+        for i in 0 ..< nRouted {
+            let s = 1.0 / (1.0 + Foundation.exp(-logits[i]))
+            origScores[i] = s
+            selectionScores[i] = s + eScoreCorrectionBiasHost[i]
+        }
+        let order = (0 ..< nRouted).sorted { a, b in
+            if selectionScores[a] != selectionScores[b] {
+                return selectionScores[a] > selectionScores[b]
+            }
+            return a < b
+        }
+        let inds = Array(order.prefix(topK))
+        var finalScores = inds.map { origScores[$0] }
+        if topK > 1 && normTopkProb {
+            let sum = finalScores.reduce(0, +) + 1e-20
+            finalScores = finalScores.map { $0 / sum }
+        }
+        finalScores = finalScores.map { $0 * routedScalingFactor }
+
+        // ── Routed experts — two batched gather-GEMV dispatches ──────
+        let workCmd = device.makeCommandBuffer()
+        let moeIntermediate = stacked.moeIntermediate
+
+        var idxTensors: [Tensor] = []
+        idxTensors.reserveCapacity(topK)
+        for ei in inds {
+            var v = UInt32(ei)
+            let buf = device.makeBuffer(length: 4)
+            memcpy(buf.contents(), &v, 4)
+            idxTensors.append(Tensor(buffer: buf, offset: 0, shape: [1], dtype: .u32))
+        }
+        let upIns = Array(repeating: xNorm, count: topK)
+        var upOuts: [Tensor] = []
+        for _ in 0 ..< topK {
+            upOuts.append(Tensor.empty(shape: [moeIntermediate], dtype: dtype, device: device))
+        }
+        let upWeights = Array(repeating: stacked.upWeight, count: topK)
+        let upScalesArr = Array(repeating: stacked.upScales, count: topK)
+        Ops.nvfp4DequantGemvExpertIndexedMany(
+            weightsStacked: upWeights, scalesStacked: upScalesArr,
+            inputs: upIns, expertIndices: idxTensors, outputs: upOuts,
+            blockSize: stacked.blockSize, global: 1.0, on: workCmd)
+
+        // relu(up)^2 per slot, in place into a fresh "inner" buffer.
+        var innerOuts: [Tensor] = []
+        for slot in 0 ..< topK {
+            let r = Ops.relu(upOuts[slot], on: workCmd)
+            innerOuts.append(Ops.mul(r, r, on: workCmd))
+        }
+
+        var downOuts: [Tensor] = []
+        for _ in 0 ..< topK {
+            downOuts.append(Tensor.empty(shape: [hidden], dtype: dtype, device: device))
+        }
+        let downWeights = Array(repeating: stacked.downWeight, count: topK)
+        let downScalesArr = Array(repeating: stacked.downScales, count: topK)
+        Ops.nvfp4DequantGemvExpertIndexedMany(
+            weightsStacked: downWeights, scalesStacked: downScalesArr,
+            inputs: innerOuts, expertIndices: idxTensors, outputs: downOuts,
+            blockSize: stacked.blockSize, global: 1.0, on: workCmd)
+
+        // ── Weighted sum over the topK selected experts ───────────────
+        var accumulator: Tensor?
+        for slot in 0 ..< topK {
+            let w = Tensor.filled(finalScores[slot], shape: [hidden], dtype: dtype, device: device)
+            let scaled = Ops.mul(downOuts[slot], w, on: workCmd)
+            accumulator =
+                accumulator.map { Ops.add($0, scaled, on: workCmd) } ?? scaled
+        }
+
+        // ── Shared expert — always-on, plain NVFP4 GEMV pair ──────────
+        if let su = sharedUp, let sd = sharedDown {
+            let sUp = su(xNorm, on: workCmd)
+            let sR = Ops.relu(sUp, on: workCmd)
+            let sInner = Ops.mul(sR, sR, on: workCmd)
+            let sharedOut = sd(sInner, on: workCmd)
+            accumulator =
+                accumulator.map { Ops.add($0, sharedOut, on: workCmd) } ?? sharedOut
+        }
+
+        let routedOut = accumulator!
+        let result = Ops.add(h, routedOut, on: workCmd)
+        workCmd.commit()
+        workCmd.waitUntilCompleted()
+        return result
+    }
+}

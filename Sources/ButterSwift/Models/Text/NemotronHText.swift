@@ -117,6 +117,34 @@ enum NemotronHLayerKind: Equatable {
                 "unknown hybrid_override_pattern character '\(char)'")
         }
     }
+
+    /// Newer NemotronH checkpoints (e.g. Nemotron-3.5-Lightning-30B-A3B)
+    /// ship the layer schedule as a JSON array of names —
+    /// `layers_block_type: ["mamba", "moe", "attention", ...]` — rather
+    /// than the packed `hybrid_override_pattern` character string.
+    /// Same schedule, different config schema; mirrors Granite4's
+    /// `layer_types` string-array parsing (`Granite4Text.swift`).
+    ///
+    /// Deliberately NOT `init(from: String)`: overloading `init(from:)`
+    /// on `Character` vs `String` makes every existing bare-string-
+    /// literal call site (`NemotronHLayerKind(from: "M")`, used
+    /// throughout `NemotronHTextTests.swift`) resolve to THIS
+    /// initializer instead of the `Character` one — Swift's default
+    /// literal inference picks `String` over `Character` when both
+    /// overloads are viable, silently breaking every existing
+    /// single-character call site. A distinctly-labeled initializer
+    /// sidesteps the ambiguity entirely.
+    init(fromBlockTypeName name: String) throws {
+        switch name {
+        case "mamba": self = .mamba
+        case "attention": self = .attention
+        case "mlp": self = .mlp
+        case "moe": self = .moe
+        default:
+            throw NemotronHError.unsupportedConfig(
+                "unknown layers_block_type entry '\(name)'")
+        }
+    }
 }
 
 // ─── NemotronHHybrid — the single variant ────────────────────────────
@@ -161,9 +189,20 @@ public struct NemotronHHybrid: NemotronHVariant {
         let tieEmbed = config.tieWordEmbeddings
 
         // ── Hybrid layer schedule ─────────────────────────────────────
-        guard let pattern = config.string("hybrid_override_pattern"), !pattern.isEmpty
-        else { throw NemotronHError.missingConfig("hybrid_override_pattern") }
-        let kinds = try Array(pattern).map { try NemotronHLayerKind(from: $0) }
+        // Two config schemas carry the identical semantic schedule:
+        // the older packed `hybrid_override_pattern` char-string
+        // (NemotronH-4B-Base, Cascade-2), and the newer
+        // `layers_block_type` JSON string-array (Nemotron-3.5-
+        // Lightning). Try the array form first since it's unambiguous;
+        // fall back to the char-string.
+        let kinds: [NemotronHLayerKind]
+        if let blockTypes = config.raw["layers_block_type"] as? [String], !blockTypes.isEmpty {
+            kinds = try blockTypes.map { try NemotronHLayerKind(fromBlockTypeName: $0) }
+        } else if let pattern = config.string("hybrid_override_pattern"), !pattern.isEmpty {
+            kinds = try Array(pattern).map { try NemotronHLayerKind(from: $0) }
+        } else {
+            throw NemotronHError.missingConfig("hybrid_override_pattern / layers_block_type")
+        }
         let nLayers = kinds.count
         // MoE ("E") layer support — Cascade-2 / Nemotron-3 Nano/Super/
         // Ultra. Built by `buildNemotronHMoELayer` below. Grouped
@@ -338,7 +377,14 @@ public struct NemotronHHybrid: NemotronHVariant {
             weight: try weights.tensor(named: "backbone.norm_f.weight"), eps: eps)
 
         let lmHead: AnyLinear
-        if !tieEmbed, weights.has("lm_head.weight") {
+        if !tieEmbed, weights.has("lm_head.weight_scale_2") {
+            // NVFP4-quantized lm_head (Nemotron-3.5-Lightning) — huge
+            // (vocab × hidden), quantized same as the MoE experts.
+            lmHead = AnyLinear(
+                try loadNemotronHNvfp4Linear(
+                    base: "lm_head", outDim: vocab, inDim: hidden,
+                    weights: weights, device: device))
+        } else if !tieEmbed, weights.has("lm_head.weight") {
             lmHead = AnyLinear(Linear(weight: try weights.tensor(named: "lm_head.weight")))
         } else {
             lmHead = AnyLinear(Linear(weight: embedWRaw))
@@ -367,12 +413,24 @@ public struct NemotronHHybrid: NemotronHVariant {
         tsMin: Float, tsMax: Float,
         dtype: DType, device: Device
     ) throws -> NemotronHMambaLayer {
+        // Nemotron-3.5-Lightning ships mamba mixer in_proj/out_proj as
+        // static FP8 (W8A8, scalar weight_scale + input_scale) — see
+        // `NemotronHNvfp4.swift` header. Butter has no FP8 GEMM/GEMV
+        // kernel, so dequantize to the activation dtype once at load
+        // time and run these through the ordinary bf16 `Linear` path.
+        // Non-quantized checkpoints (NemotronH-4B-Base, Cascade-2) hit
+        // the plain-tensor branch unchanged.
+        let inProjOutDim = dInner + convDim + nHeads
         let inProj = AnyLinear(
             Linear(
-                weight: try weights.tensor(named: "\(p).in_proj.weight")))
+                weight: try loadMaybeFp8WeightNH(
+                    base: "\(p).in_proj", outDim: inProjOutDim, inDim: hidden,
+                    weights: weights, dtype: dtype, device: device)))
         let outProj = AnyLinear(
             Linear(
-                weight: try weights.tensor(named: "\(p).out_proj.weight")))
+                weight: try loadMaybeFp8WeightNH(
+                    base: "\(p).out_proj", outDim: hidden, inDim: dInner,
+                    weights: weights, dtype: dtype, device: device)))
 
         // conv1d.weight ships [conv_dim, 1, kernel]; the iron kernel
         // wants [kernel, conv_dim].
@@ -912,13 +970,18 @@ private func buildNemotronHMoELayer(
     nSharedExperts: Int, sharedExpertIntermediate: Int,
     routedScalingFactor: Float, normTopkProb: Bool,
     dtype: DType, device: Device
-) throws -> NemotronHMoELayer {
-    // Router: hidden → nRouted logits. NemotronH MoE checkpoints ship
-    // these projections as plain (non-quantized) Linear (the family
-    // rejects quantized configs at load), so we read the raw weight.
-    let gate = AnyLinear(
-        Linear(
-            weight: try weights.tensor(named: "\(p).gate.weight")))
+) throws -> any DecoderLayer {
+    // Router: hidden → nRouted logits. The gate/router projection and
+    // its correction bias are NEVER NVFP4/FP8-quantized on any shipped
+    // NemotronH MoE checkpoint (including Nemotron-3.5-Lightning-
+    // NVFP4 — verified against the checkpoint's safetensors index), so
+    // this read is unconditional. It IS, however, stored in plain F32
+    // on Nemotron-3.5-Lightning specifically (every other unquantized
+    // weight — attention proj, norms, embeddings — is BF16) — cast to
+    // the activation dtype so `Ops.gemv`'s `weight.dtype == input.dtype`
+    // precondition doesn't crash the first forward pass.
+    let gateWRaw = try weights.tensor(named: "\(p).gate.weight")
+    let gate = AnyLinear(Linear(weight: castMatrixNH(gateWRaw, dtype: dtype, device: device)))
     // The correction bias is per-expert; mlx-lm keeps it in fp32 — we
     // do the same (the bias is the only thing the cast-predicate
     // protects from being cast down to bf16/f16).
@@ -927,6 +990,40 @@ private func buildNemotronHMoELayer(
         eSCBRaw.elementCount == nRoutedExperts,
         "NemotronH MoE: e_score_correction_bias has "
             + "\(eSCBRaw.elementCount) entries, expected \(nRoutedExperts)")
+
+    // NVFP4-quantized routed experts (Nemotron-3.5-Lightning) — detect
+    // via expert 0's down_proj carrying a `weight_scale_2` (the NVFP4
+    // per-tensor global scale; see `NemotronHNvfp4.swift`). Every other
+    // shipped NemotronH MoE checkpoint (Cascade-2, Nemotron-3
+    // Nano/Super/Ultra) ships plain bf16 experts and falls through to
+    // the unquantized path below unchanged.
+    if weights.has("\(p).experts.0.down_proj.weight_scale_2") {
+        let eScoreCorrectionBiasHost = readFloatsNH(eSCBRaw)
+        let stacked = try loadNemotronHStackedNvfp4Experts(
+            prefix: p, nExperts: nRoutedExperts, moeIntermediate: moeIntermediate,
+            hidden: hidden, weights: weights, dtype: dtype, device: device)
+        var sharedUp: Nvfp4Linear?
+        var sharedDown: Nvfp4Linear?
+        if nSharedExperts > 0 {
+            precondition(
+                nSharedExperts == 1,
+                "NemotronH MoE: n_shared_experts \(nSharedExperts) > 1 not supported.")
+            let sharedIntermediate =
+                sharedExpertIntermediate > 0 ? sharedExpertIntermediate : moeIntermediate
+            sharedUp = try loadNemotronHNvfp4Linear(
+                base: "\(p).shared_experts.up_proj", outDim: sharedIntermediate, inDim: hidden,
+                weights: weights, device: device)
+            sharedDown = try loadNemotronHNvfp4Linear(
+                base: "\(p).shared_experts.down_proj", outDim: hidden, inDim: sharedIntermediate,
+                weights: weights, device: device)
+        }
+        return NemotronHNvfp4MoELayer(
+            norm: norm, gate: gate, eScoreCorrectionBias: eScoreCorrectionBiasHost,
+            stacked: stacked, sharedUp: sharedUp, sharedDown: sharedDown,
+            hidden: hidden, topK: topK,
+            routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb,
+            dtype: dtype)
+    }
 
     // Routed experts: each is a squared-ReLU 2-layer MLP. The published
     // checkpoint ships them as `mixer.experts.<e>.{up_proj,down_proj}.weight`
@@ -1032,6 +1129,7 @@ public final class NemotronHModel: LanguageModel {
             case is NemotronHAttentionLayer: return .attention
             case is NemotronHMLPLayer: return .mlp
             case is NemotronHMoELayer: return .moe
+            case is NemotronHNvfp4MoELayer: return .moe
             default:
                 fatalError(
                     "NemotronHModel: unknown DecoderLayer "
@@ -1052,6 +1150,7 @@ public final class NemotronHModel: LanguageModel {
             case let l as NemotronHAttentionLayer: params = l.parameters()
             case let l as NemotronHMLPLayer: params = l.parameters()
             case let l as NemotronHMoELayer: params = l.parameters()
+            case let l as NemotronHNvfp4MoELayer: params = l.parameters()
             default: params = []
             }
             for (k, v) in params { out.append(("backbone.layers.\(i).\(k)", v)) }
@@ -1292,6 +1391,22 @@ private func castVectorNH(
     let floats = readFloatsNH(src)
     precondition(floats.count == count, "NemotronH: vector size mismatch")
     return writeFloatsNH(floats, shape: [count], dtype: dtype, device: device)
+}
+
+/// Cast a tensor of any shape to `dtype`, preserving shape. No-op if
+/// already `dtype`. Nemotron-3.5-Lightning ships the MoE router
+/// `gate.weight` in F32 while every other unquantized weight (attn
+/// proj, norms, embeddings) is BF16 — `Ops.gemv` hard-preconditions
+/// `weight.dtype == input.dtype`, so a mismatched router weight
+/// crashes the very first forward pass. Cast at load time so the
+/// router always matches the activation dtype, regardless of what
+/// dtype a given checkpoint happens to store it in.
+private func castMatrixNH(
+    _ src: Tensor, dtype: DType, device: Device
+) -> Tensor {
+    if src.dtype == dtype { return src }
+    let floats = readFloatsNH(src)
+    return writeFloatsNH(floats, shape: src.shape, dtype: dtype, device: device)
 }
 
 /// Tile `D[h]` across `head_dim` channels → `[n_heads * head_dim]`.
