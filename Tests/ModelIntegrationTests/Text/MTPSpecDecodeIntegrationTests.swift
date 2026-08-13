@@ -192,6 +192,196 @@ struct MTPSpecDecodeIntegrationTests {
                     + "lockstep=\(stats.lockstepSteps)")
         }
     }
+
+    // ── Adversarial exactness coverage ─────────────────────────────────
+    //
+    // `mtpSpecMatchesBaselineExactly` above only exercises ONE prompt —
+    // a low-entropy fibonacci continuation, where the backbone is
+    // extremely confident at nearly every position. That is exactly the
+    // condition under which two kernel paths (the batched
+    // `forwardManyHiddenAndLogits` verify pass vs. the single-token
+    // `forward` decode pass) are LEAST likely to disagree: a wide
+    // top1/top2 logit margin swallows small ULP-level drift before it
+    // can flip an argmax. It cannot rule out drift on lower-margin,
+    // higher-entropy content — the exact failure mode confirmed on Muse
+    // Glimmer's DFlash path (see `DFlashSpecDecode.swift`'s file header,
+    // EXACTNESS DISCIPLINE section): full accept there trusted the
+    // batched pass's cache writes directly, token-identity agreement on
+    // full accept did NOT guarantee bit-identical cache, and accumulated
+    // drift eventually flipped an argmax on a high-entropy creative
+    // prompt. `MTPSpecDecode.swift`'s full-accept path (see this file's
+    // `mtpDecodeLoop`, the `// Full accept: backbone caches already hold
+    // the verified block` comment) inherits the identical shortcut.
+    //
+    // These 3 prompts mirror the adversarial half of
+    // `GlimmerDFlashSpecDecodeIntegrationTests`'s 5-prompt matrix
+    // (`creative-highentropy`, `150-tok-multitopic`, `factual-list` —
+    // copied verbatim from that file so both gates are stressing the
+    // same content) plus the two γ values most likely to differ in how
+    // often the full-accept shortcut actually fires: γ=2 (the value
+    // profiled for the shipped decode-speed figure) and γ=4 (a longer
+    // burst gives ULP drift more positions to accumulate over per
+    // full-accept cycle before the next verify pass resets against a
+    // fresh snapshot). 180 new tokens per run — generous runway for
+    // drift to compound into a flipped argmax, matching DFlash's
+    // adversarial-prompt budget.
+    //
+    // Optional single-(prompt,gamma) selector, same shape as
+    // `GlimmerDFlashSpecDecodeIntegrationTests`'s
+    // `BUTTER_DFLASH_GATE_PROMPT` — set `BUTTER_MTP_GATE_CASE=<n>` to run
+    // just one (prompt, gamma) pair as its own process. Exists for the
+    // same reason: keeping a single process's model-load + KV-cache
+    // footprint bounded when other model jobs may be sharing this box.
+    private var gateCaseIndex: Int? {
+        guard let raw = ProcessInfo.processInfo.environment["BUTTER_MTP_GATE_CASE"] else {
+            return nil
+        }
+        guard let idx = Int(raw) else {
+            preconditionFailure("BUTTER_MTP_GATE_CASE=\(raw) is not an integer")
+        }
+        return idx
+    }
+
+    @Test("spec on == spec off: adversarial high-entropy prompts, γ ∈ {2, 4}, 180 tokens")
+    func mtpSpecMatchesBaselineOnAdversarialPrompts() async throws {
+        let device = Device.shared
+        var optsBuilder = LoadOptions()
+        optsBuilder.prewarm = false
+        let opts = optsBuilder
+        let m: Model = try await ModelLoadLock.shared.loadSerially {
+            try await Model.load(mtpModelPath, options: opts)
+        }
+        let qwen = try #require(m.qwen35, "expected Qwen35Model engine")
+        let head = try #require(
+            qwen.mtpHead, "expected the mtp-sidecar to attach an MTP head")
+
+        // Prompt texts copied verbatim from
+        // `GlimmerDFlashSpecDecodeIntegrationTests.dflashSpecMatchesBaselineExactly`'s
+        // `allPrompts` — same adversarial content, different model/driver.
+        let allPrompts: [(name: String, text: String)] = [
+            (
+                "creative-highentropy",
+                """
+                Write a short surreal story, about 150 words, about a
+                lighthouse keeper who discovers the ocean itself is
+                alive and dreaming. Make it strange, unpredictable, and
+                richly imagistic — avoid clichés and generic phrasing.
+                """
+            ),
+            (
+                "150-tok-multitopic",
+                """
+                Give a brief overview of three unrelated topics: first,
+                explain how photosynthesis converts light energy into
+                chemical energy in plant cells, mentioning chlorophyll
+                and the role of chloroplasts. Second, describe the
+                economic causes that are commonly cited for the fall of
+                the Roman Empire, including currency debasement and
+                overextension of the military. Third, explain at a high
+                level how a hash table achieves average O(1) lookup
+                time, mentioning collision resolution strategies like
+                chaining and open addressing. Keep each explanation to
+                a couple of sentences.
+                """
+            ),
+            (
+                "factual-list",
+                """
+                List 25 distinct countries and their capital cities,
+                one pair per line, formatted as "Country: Capital".
+                Cover a mix of continents and avoid repeating any
+                country.
+                """
+            ),
+        ]
+        let gammas = [2, 4]
+        var allCases: [(prompt: (name: String, text: String), gamma: Int)] = []
+        for p in allPrompts { for g in gammas { allCases.append((p, g)) } }
+
+        let cases: [(prompt: (name: String, text: String), gamma: Int)]
+        if let idx = gateCaseIndex {
+            precondition(
+                allCases.indices.contains(idx),
+                "BUTTER_MTP_GATE_CASE=\(idx) out of range 0..<\(allCases.count)")
+            cases = [allCases[idx]]
+        } else {
+            cases = allCases
+        }
+        let count = 180
+
+        // Baseline is per-PROMPT (gamma-independent) — compute once and
+        // reuse across both γ values for the same prompt.
+        var baselines: [String: (tokens: [Int], decodeSeconds: Double)] = [:]
+        for (name, text) in Set(cases.map { $0.prompt.name }).sorted().compactMap({ n in
+            allPrompts.first(where: { $0.name == n })
+        }) {
+            let promptTokens = m.tokenizer.encode(text: text)
+            let caches = qwen.makeLayerCaches()
+            let seed = autoreleasepool {
+                prefill(qwen, promptTokens: promptTokens, caches: caches, device: device)
+            }
+            baselines[name] = autoreleasepool {
+                baselineGreedy(
+                    qwen, seed: seed, position: promptTokens.count, count: count,
+                    caches: caches, device: device)
+            }
+        }
+
+        for (prompt, gamma) in cases {
+            let promptTokens = m.tokenizer.encode(text: prompt.text)
+            let n = promptTokens.count
+            let baseline = baselines[prompt.name]!
+
+            let caches = qwen.makeLayerCaches()
+            let seed = autoreleasepool {
+                prefill(qwen, promptTokens: promptTokens, caches: caches, device: device)
+            }
+            #expect(
+                seed == baseline.tokens[0],
+                "\(prompt.name): prefill seed must match between arms")
+
+            head.resetCache()
+            var history = promptTokens
+            let t0 = Date()
+            let stats = autoreleasepool {
+                SpecDecode.generateGreedyMTP(
+                    model: qwen, head: head, gamma: gamma,
+                    lastToken: seed, position: n,
+                    caches: caches, history: &history,
+                    maxNewTokens: count, device: device)
+            }
+            let specSeconds = Date().timeIntervalSince(t0)
+
+            let specTokens = Array(history[n...])
+            #expect(stats.tokensGenerated == count)
+            #expect(specTokens.count == count)
+
+            // ── THE EXACTNESS GATE ────────────────────────────────────
+            let matchPrefix = zip(baseline.tokens, specTokens)
+                .prefix(while: { $0 == $1 }).count
+            let baseCtx = Array(
+                baseline.tokens.dropFirst(max(0, matchPrefix - 2)).prefix(6))
+            let specCtx = Array(
+                specTokens.dropFirst(max(0, matchPrefix - 2)).prefix(6))
+            #expect(
+                specTokens == baseline.tokens,
+                "\(prompt.name) γ=\(gamma) count=\(count): spec stream diverged from baseline at index \(matchPrefix)/\(count) — baseline \(baseCtx) vs spec \(specCtx)"
+            )
+
+            let specTps = Double(count) / specSeconds
+            let baseTps = Double(count) / baseline.decodeSeconds
+            print(
+                "MTPSpec-adversarial \(prompt.name) γ=\(gamma) count=\(count): "
+                    + "exact_match=\(specTokens == baseline.tokens) "
+                    + "(prefix \(matchPrefix)/\(count)), "
+                    + "tps=\(String(format: "%.2f", specTps)) "
+                    + "(\(String(format: "%.2fx", specTps / baseTps)) vs baseline), "
+                    + "accepted=\(stats.candidatesAccepted)/\(stats.candidatesProposed) "
+                    + "(\(String(format: "%.1f", stats.acceptanceRate * 100))%), "
+                    + "verify=\(stats.verifySteps), replay=\(stats.replaySingleSteps), "
+                    + "lockstep=\(stats.lockstepSteps)")
+        }
+    }
 }
 
 @inline(__always)
