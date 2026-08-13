@@ -307,6 +307,107 @@ func loadMaybeFp8WeightNH(
         f8Bytes, scale: scale, outDim: outDim, inDim: inDim, dtype: dtype, device: device)
 }
 
+// ─── F-128 bandwidth wave: mamba in_proj/out_proj FP8 → int4 requant ─
+//
+// `loadMaybeFp8WeightNH` above dequantizes the 46 Lightning mamba
+// mixer `in_proj`/`out_proj` tensors to dense `dtype` (bf16) at load
+// time — 2 bytes/param, read fresh every decode token (Butter has no
+// FP8 GEMV kernel, see that function's doc). That is the largest
+// attributed dense per-token weight-traffic slice left in the decode
+// path (F-127's fused-expert wave exhausted the MoE dispatch-fusion
+// lever; these mamba projections were untouched).
+//
+// The reference TensorRT-LLM serving stack for this exact checkpoint
+// is oracle-proven at 4-bit (Q4_K_M) for these same weights — Butter's
+// own greedy-decode outputs already match that oracle word-for-word
+// at bf16 precision, so re-quantizing this slice from bf16 down to
+// 4-bit is *matching* the oracle's own precision, not degrading below
+// a proven-good baseline. See `Tests/.../NemotronHNvfp4Tests.swift`
+// for the roundtrip-tolerance unit coverage and the port's decode-gate
+// notes for the end-to-end coherence check.
+//
+// Reuses Butter's own affine-int4 quantize kernels
+// (`QuantizedOps.quantizeAffine` — the same primitive `butter convert`
+// uses to build every other int4 checkpoint in this repo) rather than
+// inventing a new kernel: `QuantizedLinear` already has a decode GEMV
+// (`Ops.dequantGemv`, one dispatch) and a batched-prefill GEMM
+// (`Ops.dequantGemmDynamicM`), so wiring these two tensors through it
+// costs zero new Metal.
+enum NemotronHMambaProjQ4 {
+    /// Default ON. Set `BUTTER_NEMOTRON_MAMBA_PROJ_Q4=0` to fall back
+    /// to the original dense-bf16 `Linear` path (F-125's initial port)
+    /// for A/B comparison or quality-regression triage.
+    static let enabled = ButterEnv["BUTTER_NEMOTRON_MAMBA_PROJ_Q4"] != "0"
+}
+
+/// Load one NemotronH mamba mixer projection (`in_proj` or `out_proj`),
+/// auto-detecting the checkpoint's FP8 static quantization (identical
+/// detection to `loadMaybeFp8WeightNH`) and, when found and
+/// `NemotronHMambaProjQ4.enabled`, requantizing the dequantized dense
+/// weight down to Butter's affine int4 `QuantizedLinear` format
+/// (group_size 64 — see `requantizeDenseToInt4NH`'s doc for why 64 is
+/// the only width available) instead of leaving it as a dense bf16
+/// `Linear`.
+///
+/// Falls back to plain `AnyLinear(Linear(...))` when: the checkpoint
+/// doesn't ship this base as FP8 (every non-Lightning NemotronH
+/// checkpoint), the escape flag is off, or `inDim` isn't a multiple of
+/// 64 (the group-alignment requirement — never true for the shipped
+/// Lightning shapes, `hidden=2688`/`d_inner=4096`, both multiples of
+/// 64, but guarded rather than assumed for a future checkpoint with
+/// different dimensions).
+func loadMambaProjNH(
+    base: String, outDim: Int, inDim: Int,
+    weights: SafeTensorsBundle, dtype: DType, device: Device
+) throws -> AnyLinear {
+    let wasFp8 =
+        weights.has("\(base).weight_scale") && weights.has("\(base).input_scale")
+        && !weights.has("\(base).weight_scale_2")
+    let dense = try loadMaybeFp8WeightNH(
+        base: base, outDim: outDim, inDim: inDim,
+        weights: weights, dtype: dtype, device: device)
+    guard wasFp8, NemotronHMambaProjQ4.enabled, inDim % 64 == 0 else {
+        return AnyLinear(Linear(weight: dense))
+    }
+    return AnyLinear(
+        requantizeDenseToInt4NH(dense, outDim: outDim, inDim: inDim, device: device))
+}
+
+/// Affine-int4-requantize a dense `[outDim, inDim]` weight into a
+/// `QuantizedLinear` (group_size 64 — `QuantizedOps.quantizeAffine`'s
+/// underlying `iron_affine_quantize_int4_*` kernels hardcode a
+/// one-simdgroup × 2-elements/lane reduction shape, so 64 is the only
+/// group size those kernels emit; see
+/// `QuantizedOpsValidation.validateAffineQuantize`'s doc). One GPU
+/// dispatch + a commit/wait — load-time only (one call per tensor per
+/// checkpoint load), replacing the FP8→bf16 CPU dequant loop this
+/// layers on top of at the same call site (`loadMambaProjNH`).
+func requantizeDenseToInt4NH(
+    _ dense: Tensor, outDim: Int, inDim: Int, device: Device
+) -> QuantizedLinear {
+    precondition(
+        dense.shape == [outDim, inDim],
+        "requantizeDenseToInt4NH: shape mismatch \(dense.shape) vs [\(outDim), \(inDim)]")
+    let bits = 4
+    let groupSize = 64
+    precondition(
+        inDim % groupSize == 0,
+        "requantizeDenseToInt4NH: inDim \(inDim) must be a multiple of groupSize \(groupSize)")
+    let packedCols = inDim * bits / 32
+    let scaleCols = inDim / groupSize
+    let packed = Tensor.empty(shape: [outDim, packedCols], dtype: .u32, device: device)
+    let scales = Tensor.empty(shape: [outDim, scaleCols], dtype: dense.dtype, device: device)
+    let biases = Tensor.empty(shape: [outDim, scaleCols], dtype: dense.dtype, device: device)
+    let cmd = device.makeCommandBuffer()
+    QuantizedOps.quantizeAffine(
+        weight: dense, packed: packed, scales: scales, biases: biases,
+        bits: bits, groupSize: groupSize, on: cmd)
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    return QuantizedLinear(
+        weight: packed, scales: scales, biases: biases, bits: bits, groupSize: groupSize)
+}
+
 // ─── NVFP4 linear / stacked-expert loaders (HF raw layout) ───────────
 
 /// Load one NVFP4-quantized dense projection (lm_head, or a single

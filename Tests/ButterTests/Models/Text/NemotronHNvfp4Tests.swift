@@ -167,6 +167,159 @@ struct NemotronHNvfp4Tests {
         }
     }
 
+    // ─── F-128: mamba in_proj/out_proj FP8→int4 requant ───────────────
+
+    @Test("requantizeDenseToInt4NH round-trips a dense weight within int4 quantization tolerance")
+    func mambaProjInt4RoundTrips() {
+        autoreleasepool {
+            let device = Device.shared
+            let outDim = 8
+            let inDim = 64  // exactly one group_size=64 group per row.
+
+            // Synthetic weight with a realistic spread of values per
+            // row (not all zero/uniform, so the per-group affine
+            // scale+bias is actually exercised) plus a small per-row
+            // offset so rows don't share identical quantization
+            // parameters.
+            var floats = [Float](repeating: 0, count: outDim * inDim)
+            for i in 0 ..< floats.count {
+                let row = i / inDim
+                let x = Float(i % 37) - 18.0
+                floats[i] = x * 0.037 + Float(row) * 0.01
+            }
+            func toBF16(_ v: Float) -> UInt16 {
+                let bits = v.bitPattern
+                let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
+                return UInt16(rounded >> 16)
+            }
+            let dense = Tensor.empty(shape: [outDim, inDim], dtype: .bf16, device: device)
+            dense.copyIn(from: floats.map(toBF16))
+
+            let quant = requantizeDenseToInt4NH(dense, outDim: outDim, inDim: inDim, device: device)
+            #expect(quant.bits == 4)
+            #expect(quant.groupSize == 64)
+            #expect(quant.weight.shape == [outDim, inDim * 4 / 32])
+            #expect(quant.scales.shape == [outDim, inDim / 64])
+            #expect(quant.biases.shape == [outDim, inDim / 64])
+
+            // Dequantize back with the same kernel family
+            // `QuantizedLinear`'s decode GEMV drives
+            // (`QuantizedOps.dequantizeAffine`'s int4 path), and check
+            // the per-element error stays within a typical int4
+            // quantization step relative to this synthetic weight's
+            // spread (~1.33 per row / 15 int4 steps ≈ 0.089, plus
+            // negligible bf16 rounding on top).
+            let dequant = Tensor.empty(shape: [outDim, inDim], dtype: .bf16, device: device)
+            let cmd = device.makeCommandBuffer()
+            QuantizedOps.dequantizeAffine(
+                weight: quant.weight, scales: quant.scales, biases: quant.biases,
+                into: dequant, bits: 4, groupSize: 64, on: cmd)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+            let original = dense.toFloatArray()
+            let roundtrip = dequant.toFloatArray()
+            var maxAbsErr: Float = 0
+            for i in 0 ..< original.count {
+                maxAbsErr = max(maxAbsErr, abs(original[i] - roundtrip[i]))
+            }
+            #expect(
+                maxAbsErr < 0.15,
+                Comment(rawValue: "max abs roundtrip error \(maxAbsErr) exceeds int4 tolerance"))
+        }
+    }
+
+    @Test(
+        "loadMambaProjNH's inDim%64 guard is load-bearing: bypassing it lets groups span row boundaries"
+    )
+    func mambaProjInt4GuardPreventsRowSpillover() {
+        autoreleasepool {
+            // `loadMambaProjNH` only takes the int4 requant path when
+            // `inDim % 64 == 0` — NOT because the flattened `numel`
+            // fails `QuantizedOps.quantizeAffine`'s own validation
+            // (numel can still be a clean multiple of 64 even when a
+            // single row isn't, e.g. outDim=2/inDim=96 -> numel=192 =
+            // 3*64), but because group_size=64 groups the WEIGHT'S
+            // FLAT BUFFER, and a non-64-aligned row width lets one
+            // group's 64 elements straddle two logically unrelated
+            // rows. This test bypasses `loadMambaProjNH`'s guard on
+            // purpose to prove that danger is real, not defensive
+            // paranoia: row 0 oscillates tightly around +1.0, row 1
+            // tightly around -1.0 (each row's OWN natural quantization
+            // step would be tiny, ~0.0004). The second group (elements
+            // 64..127) straddles row boundary 96, forcing that group's
+            // shared affine scale/bias to cover the full [-1,1] span —
+            // ~330x coarser than either row's natural step — so values
+            // in that straddled group must read back far worse than
+            // the equivalent elements in a properly-aligned group
+            // (NOT just the two exact extremes, which affine quant
+            // always reproduces exactly regardless of grouping — this
+            // uses oscillating, non-extremal values specifically so
+            // that trivial case can't mask the corruption).
+            let device = Device.shared
+            let outDim = 2
+            let inDim = 96  // NOT a multiple of 64 — the guarded case.
+            let numel = outDim * inDim
+            #expect(inDim % 64 != 0)
+            #expect(numel % 64 == 0, "numel alone looks aligned — that's the trap")
+
+            func toBF16(_ v: Float) -> UInt16 {
+                let bits = v.bitPattern
+                let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
+                return UInt16(rounded >> 16)
+            }
+            var floats = [Float](repeating: 0, count: numel)
+            for i in 0 ..< numel {
+                // ±0.2 wobble — well above bf16's own ~0.008 ulp near
+                // magnitude 1.0, so bf16 storage rounding doesn't
+                // dominate the signal this test is isolating.
+                let osc = Float(i % 7 - 3) * 0.0667
+                floats[i] = (i < inDim ? 1.0 : -1.0) + osc
+            }
+            let dense = Tensor.empty(shape: [outDim, inDim], dtype: .bf16, device: device)
+            dense.copyIn(from: floats.map(toBF16))
+
+            let groupSize = 64
+            let nGroups = numel / groupSize
+            let packed = Tensor.empty(shape: [nGroups * groupSize * 4 / 32], dtype: .u32, device: device)
+            let scales = Tensor.empty(shape: [nGroups], dtype: .bf16, device: device)
+            let biases = Tensor.empty(shape: [nGroups], dtype: .bf16, device: device)
+            let cmd = device.makeCommandBuffer()
+            QuantizedOps.quantizeAffine(
+                weight: dense, packed: packed, scales: scales, biases: biases,
+                bits: 4, groupSize: groupSize, on: cmd)
+            let dequant = Tensor.empty(shape: [outDim, inDim], dtype: .bf16, device: device)
+            QuantizedOps.dequantizeAffine(
+                weight: packed, scales: scales, biases: biases,
+                into: dequant, bits: 4, groupSize: groupSize, on: cmd)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+            let original = floats
+            let roundtrip = dequant.toFloatArray()
+            var perElemErr = [Float](repeating: 0, count: numel)
+            for i in 0 ..< numel { perElemErr[i] = abs(roundtrip[i] - original[i]) }
+
+            // Group 0 (elements 0..63) sits entirely inside row 0 —
+            // clean, tightly-clustered ~1.0±0.003 values, so its
+            // natural quantization step is tiny.
+            let cleanGroupErr = perElemErr[0 ..< 64].max()!
+            // Group 1 (elements 64..127) straddles the row-96
+            // boundary — its shared scale/bias must span roughly
+            // [-1.003, 1.003] instead of either row's true ~0.006
+            // range, so its worst-case error should be dramatically
+            // larger than the clean group's.
+            let straddledGroupErr = perElemErr[64 ..< 128].max()!
+            #expect(
+                straddledGroupErr > cleanGroupErr * 3,
+                Comment(
+                    rawValue: "expected the row-96-straddling group's max error (\(straddledGroupErr)) "
+                        + "to dwarf the clean group's (\(cleanGroupErr)) — if this fails, "
+                        + "group_size=64 stopped requiring inDim%64==0 alignment and "
+                        + "loadMambaProjNH's guard may be stale"))
+        }
+    }
+
     // ─── F-126: GPU-resident router vs the CPU reference ──────────────
     //
     // `NemotronHNvfp4MoELayer.decodeGPURouted` replaces the per-layer

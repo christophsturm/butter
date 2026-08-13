@@ -416,21 +416,20 @@ public struct NemotronHHybrid: NemotronHVariant {
         // Nemotron-3.5-Lightning ships mamba mixer in_proj/out_proj as
         // static FP8 (W8A8, scalar weight_scale + input_scale) — see
         // `NemotronHNvfp4.swift` header. Butter has no FP8 GEMM/GEMV
-        // kernel, so dequantize to the activation dtype once at load
-        // time and run these through the ordinary bf16 `Linear` path.
-        // Non-quantized checkpoints (NemotronH-4B-Base, Cascade-2) hit
-        // the plain-tensor branch unchanged.
+        // kernel, so `loadMambaProjNH` dequantizes to the activation
+        // dtype at load time and then (F-128 bandwidth wave, default
+        // on) requantizes down to affine int4 — see that function's
+        // doc for the oracle-precision justification and the
+        // `BUTTER_NEMOTRON_MAMBA_PROJ_Q4=0` escape hatch. Non-quantized
+        // checkpoints (NemotronH-4B-Base, Cascade-2) hit the
+        // plain-tensor / plain-bf16-Linear branch unchanged.
         let inProjOutDim = dInner + convDim + nHeads
-        let inProj = AnyLinear(
-            Linear(
-                weight: try loadMaybeFp8WeightNH(
-                    base: "\(p).in_proj", outDim: inProjOutDim, inDim: hidden,
-                    weights: weights, dtype: dtype, device: device)))
-        let outProj = AnyLinear(
-            Linear(
-                weight: try loadMaybeFp8WeightNH(
-                    base: "\(p).out_proj", outDim: hidden, inDim: dInner,
-                    weights: weights, dtype: dtype, device: device)))
+        let inProj = try loadMambaProjNH(
+            base: "\(p).in_proj", outDim: inProjOutDim, inDim: hidden,
+            weights: weights, dtype: dtype, device: device)
+        let outProj = try loadMambaProjNH(
+            base: "\(p).out_proj", outDim: hidden, inDim: dInner,
+            weights: weights, dtype: dtype, device: device)
 
         // conv1d.weight ships [conv_dim, 1, kernel]; the iron kernel
         // wants [kernel, conv_dim].
