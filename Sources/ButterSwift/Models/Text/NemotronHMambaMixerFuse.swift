@@ -30,7 +30,8 @@
 //   addMul       — `y_skip = y_flat + d_tiled * x`           (2 -> 1)
 //
 // 3 dispatches/layer x 23 mamba layers = 69 fewer dispatches/token if
-// all three are on; 2/layer = 46 fewer with the default gate below.
+// all three are on; 1/layer = 23 fewer with the default gate below (see
+// the CI note — this shrank from 2/layer after addSoftplus's demotion).
 //
 // Bit-exactness: every op this replaces reads/writes its operands at
 // `T` precision (f32/f16/bf16), computing in a float accumulator (or,
@@ -44,31 +45,53 @@
 // `T(...)` round-trip, matching the documented contract in
 // `NemotronLightningNvfp4Fuse.swift` / `LagunaGatedOProjFuse.swift`.
 //
-// `addSoftplus` and `addMul` verified bit-identical to their unfused
-// chain across f32/f16/bf16 (`NemotronHMambaMixerFuseTests`) — default
-// ON, gated by `BUTTER_NEMOTRON_MIXER_FUSE` (`=0` restores the
-// original add+softplus / mul+add chain byte-for-byte).
+// Only `addMul` is verified bit-identical to its unfused chain across
+// f32/f16/bf16 on BOTH this M5 Max and CI's runner
+// (`NemotronHMambaMixerFuseTests`) — it's the sole fusion default ON,
+// gated by `BUTTER_NEMOTRON_MIXER_FUSE` (`=0` restores the original
+// mul+add chain byte-for-byte). Pure mul+add, no transcendentals — the
+// class of op that's actually safe to assume portable.
 //
-// `mulSilu` is NOT bit-exact and stays default OFF behind its own gate,
-// `BUTTER_NEMOTRON_MIXER_FUSE_SILU=1`. Measured: a consistent ~20% of
-// elements land 1-2 ULP off the unfused `Ops.silu` + `Ops.mul` chain,
-// unchanged across four independently-tried source shapes (inline vs.
-// a separate helper function matching iron's own `template<T> iron_silu`
-// shape; float-cast-up vs. f16-native compute matching `iron_silu_f16`
-// exactly; `fastMathEnabled` true/false; bare `exp` vs. explicit
-// `metal::fast::exp`). The residual doesn't move with any source-level
-// or compile-flag lever tried, which points at the GPU's transcendental
-// unit picking a context-dependent approximation (register pressure /
-// instruction scheduling around the fused kernel's extra multiply)
-// rather than anything controllable from here — the same class of
-// non-reproducibility documented for `exp`/`log`-heavy fused kernels on
-// other GPU compilers. Since the mamba SSM state is recurrent (carries
-// across every decoded token), even this small a drift risks flipping
-// an argmax somewhere over a long decode and breaking the byte-identical
-// greedy-stream gate, so it is NOT safe as a default. Kept implemented
-// + tested for future investigation (e.g. hand-written assembly-level
-// control, or accepting a tolerance-gated variant) and for opt-in A/B
-// benchmarking.
+// `addSoftplus` and `mulSilu` are IMPLEMENTED + TESTED but stay default
+// OFF, gated separately behind their own opt-in flags
+// (`BUTTER_NEMOTRON_MIXER_FUSE_SOFTPLUS=1` /
+// `BUTTER_NEMOTRON_MIXER_FUSE_SILU=1`), because neither is portably
+// bit-exact — both hit the same class of GPU transcendental-unit
+// hazard, just discovered at different times:
+//
+//   - `addSoftplus` was bit-exact on this M5 Max in local development,
+//     which is what shipped it default-ON in PR #128's first revision.
+//     CI (a different GPU/driver) then recorded 142/512 bf16 mismatches
+//     for the exact same test (`gh run view 31712976150` —
+//     NemotronHMambaMixerFuseTests.swift:119). f32/f16 stayed exact on
+//     CI; only bf16's extra float-promotion-then-round step exposed it.
+//     The lesson: "bit-exact on the box I happened to build on" is
+//     compile-context luck for an `exp`/`log`-bearing fused kernel, not
+//     a property of the source — never re-promote a transcendental
+//     fusion to default-ON off a single machine's test run again.
+//   - `mulSilu` was never bit-exact anywhere it was tried, including
+//     locally: a consistent ~20% of elements land 1-2 ULP off the
+//     unfused `Ops.silu` + `Ops.mul` chain, unchanged across four
+//     independently-tried source shapes (inline vs. a separate helper
+//     function matching iron's own `template<T> iron_silu` shape;
+//     float-cast-up vs. f16-native compute matching `iron_silu_f16`
+//     exactly; `fastMathEnabled` true/false; bare `exp` vs. explicit
+//     `metal::fast::exp`).
+//
+// Neither residual moves with any source-level or compile-flag lever
+// tried, which points at the GPU's transcendental unit picking a
+// context-dependent approximation (register pressure / instruction
+// scheduling around the fused kernel, and apparently also GPU
+// generation/driver) rather than anything controllable from here — the
+// same class of non-reproducibility documented for `exp`/`log`-heavy
+// fused kernels on other GPU compilers. Since the mamba SSM state is
+// recurrent (carries across every decoded token), even this small a
+// drift risks flipping an argmax somewhere over a long decode and
+// breaking the byte-identical greedy-stream gate, so NEITHER is safe
+// as a default. Both stay implemented + tested for future investigation
+// (e.g. hand-written assembly-level control, or accepting a
+// tolerance-gated variant) and for opt-in A/B benchmarking on hardware
+// where bit-exactness has been independently re-confirmed.
 //
 // Kernel packaging: deliberately NOT registered under
 // Sources/IronSwift/Resources/kernel_overlays/ (unlike
@@ -88,7 +111,10 @@
 //     iron's own `iron_softplus_*` (the reference) is compiled by `iron
 //     build --emit` under Metal's default fast-math too, which picks a
 //     faster/lower-accuracy `exp`/`log` than fast-math-off's strict-IEEE
-//     ones. Matches empirically (see `NemotronHMambaMixerFuseTests`).
+//     ones. Matched empirically on this M5 Max — but NOT on CI's GPU
+//     (see the "Bit-exactness" section above for the CI run), which is
+//     exactly why this compile-mode choice alone isn't sufficient and
+//     the fusion stays opt-in-only regardless of which mode is picked.
 //   - `mulSilu` needs BOTH at once: `fastMathEnabled = false` (silu's
 //     `zf / (1 + exp(-zf))` immediately feeding a multiply is exactly
 //     the division-into-multiply pattern fast-math's algebraic
@@ -105,14 +131,29 @@ import Metal
 import IronSwift
 
 enum NemotronHMambaMixerFuse {
-    /// Gates `addSoftplus` + `addMul` — both verified bit-identical to
-    /// the unfused chain, default ON. `BUTTER_NEMOTRON_MIXER_FUSE=0`
-    /// falls back to the original add+softplus / mul+add chain.
+    /// Gates `addMul` only — the one fusion verified bit-identical to
+    /// its unfused chain on BOTH the M5 Max this was developed on AND
+    /// CI's runner (pure mul+add, no transcendentals — see the file
+    /// header). Default ON. `BUTTER_NEMOTRON_MIXER_FUSE=0` falls back
+    /// to the original mul+add chain.
     static let enabled: Bool =
         ButterEnv["BUTTER_NEMOTRON_MIXER_FUSE"] != "0"
 
-    /// Gates `mulSilu` separately — NOT verified bit-identical (see the
-    /// file header), so default OFF. Opt in with
+    /// Gates `addSoftplus` separately — bit-exact on the M5 Max this was
+    /// developed on, but CI (a different GPU/driver) recorded 142/512
+    /// bf16 mismatches for the SAME test (`gh run view 31712976150`).
+    /// That means the "bit-exact" result was this box's compile-context
+    /// luck, not a property of the kernel — the exact class of hazard
+    /// already documented for `mulSilu` below. Default OFF. Opt in with
+    /// `BUTTER_NEMOTRON_MIXER_FUSE_SOFTPLUS=1` for A/B benchmarking on
+    /// hardware where it's been independently re-verified; do not flip
+    /// the default without CI (or the target box) proving bit-exactness
+    /// itself.
+    static let softplusEnabled: Bool =
+        ButterEnv["BUTTER_NEMOTRON_MIXER_FUSE_SOFTPLUS"] == "1"
+
+    /// Gates `mulSilu` separately — NOT verified bit-identical anywhere
+    /// (see the file header), so default OFF. Opt in with
     /// `BUTTER_NEMOTRON_MIXER_FUSE_SILU=1` for A/B benchmarking only;
     /// do not flip the default without re-establishing bit-exactness.
     static let siluEnabled: Bool =

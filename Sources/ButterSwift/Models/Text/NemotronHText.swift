@@ -586,12 +586,16 @@ public final class NemotronHMambaLayer: Module, DecoderLayer {
         )
         .reshaped(to: [nGroups, stateDim])
 
-        // (5) dt = softplus(dt_raw + dt_bias). F-129 mixer-fuse: default
-        // ON, one dispatch instead of two — see NemotronHMambaMixerFuse
-        // for the bit-exactness contract. `BUTTER_NEMOTRON_MIXER_FUSE=0`
-        // restores the original add + softplus chain.
+        // (5) dt = softplus(dt_raw + dt_bias). F-129 mixer-fuse: one
+        // dispatch instead of two — see NemotronHMambaMixerFuse for the
+        // bit-exactness contract. Default OFF: bit-exact in local dev
+        // but CI's GPU recorded 142/512 bf16 mismatches for the same
+        // test (gh run 31712976150) — a transcendental-unit hazard, not
+        // a formula bug. Opt in with `BUTTER_NEMOTRON_MIXER_FUSE_SOFTPLUS
+        // =1` only where bit-exactness has been independently
+        // reconfirmed.
         let dt: Tensor
-        if NemotronHMambaMixerFuse.enabled {
+        if NemotronHMambaMixerFuse.softplusEnabled {
             dt = NemotronHMambaMixerFuse.addSoftplus(dtRaw, dtBias, on: cmd, device: device)
         } else {
             let dtSum = Ops.add(dtRaw, dtBias, on: cmd)
@@ -638,7 +642,9 @@ public final class NemotronHMambaLayer: Module, DecoderLayer {
         }
         let yFlat = y.reshaped(to: [dInner])
 
-        // (7) skip: y += D_tiled * x. F-129 mixer-fuse (see note above).
+        // (7) skip: y += D_tiled * x. F-129 mixer-fuse: default ON —
+        //     pure mul+add, no transcendentals, bit-exact on both local
+        //     dev and CI (unlike addSoftplus above).
         let ySkip: Tensor
         if NemotronHMambaMixerFuse.enabled {
             ySkip = NemotronHMambaMixerFuse.addMul(base: yFlat, dTiled, x, on: cmd, device: device)
@@ -650,10 +656,11 @@ public final class NemotronHMambaLayer: Module, DecoderLayer {
         // (8) gated mixer RMSNorm: y *= silu(z), then per-group
         //     (unweighted) RMSNorm, then scale by the learned weight.
         //     Matches mlx-lm's NemotronHRMSNormGated exactly. F-129
-        //     mixer-fuse: `mulSilu` is measured NOT bit-exact (see
-        //     NemotronHMambaMixerFuse's header) so it stays behind its
-        //     own opt-in gate, default OFF, separate from the two
-        //     verified-exact fusions above.
+        //     mixer-fuse: `mulSilu` is measured NOT bit-exact anywhere
+        //     it's been tried (see NemotronHMambaMixerFuse's header) so
+        //     it stays behind its own opt-in gate, default OFF — same
+        //     transcendental-unit hazard class as addSoftplus above,
+        //     just never bit-exact even locally rather than only on CI.
         let yGated: Tensor
         if NemotronHMambaMixerFuse.siluEnabled {
             yGated = NemotronHMambaMixerFuse.mulSilu(ySkip, z, on: cmd, device: device)

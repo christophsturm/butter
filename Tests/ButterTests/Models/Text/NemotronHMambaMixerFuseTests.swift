@@ -17,12 +17,22 @@
 // fused kernel against the exact unfused `Ops.*` chain it replaces, at
 // all three floating dtypes. These are pure one-thread-per-element ops
 // with no reduction, so unlike the F-127 MoE fuse (whose GPU reduction
-// order can legitimately differ between fused/unfused), `addSoftplus`
-// and `addMul` are held to EXACT bit-for-bit equality — and hit it.
-// `mulSilu` is the one exception: measured NOT bit-exact (a GPU
-// transcendental-precision quirk, not a formula bug — see
-// `NemotronHMambaMixerFuse`'s header) and tested to a tolerance
-// envelope instead, matching its default-OFF gate.
+// order can legitimately differ between fused/unfused), `addMul` is
+// held to EXACT bit-for-bit equality — and hits it, on both local
+// hardware and CI.
+//
+// `addSoftplus` and `mulSilu` are tested to a tolerance envelope
+// instead, NOT exact equality, matching their default-OFF gates:
+// `mulSilu` was never bit-exact anywhere it was tried (see
+// `NemotronHMambaMixerFuse`'s header). `addSoftplus` WAS bit-exact in
+// local development on an M5 Max — this file originally asserted exact
+// equality for it — but CI's GPU (a different device/driver) recorded
+// 142/512 bf16 mismatches for that same assertion
+// (`gh run view 31712976150`, thewafflehaus/butter PR #128). Both are
+// the same underlying hazard: an `exp`/`log`-bearing fused kernel's
+// bit-exactness is compile-context- and hardware-dependent, not a
+// portable property of the source, so neither gets to claim "exact"
+// from a single machine's green run again.
 
 import Foundation
 import Metal
@@ -88,8 +98,19 @@ struct NemotronHMambaMixerFuseTests {
     private static let dtypes: [DType] = [.f32, .f16, .bf16]
     private static let n = 512  // covers dInner-shaped ops; nHeads (64) below n
 
-    @Test("addSoftplus matches Ops.add + Ops.softplus exactly, all dtypes")
-    func addSoftplusExact() {
+    /// `addSoftplus` is NOT portably bit-exact — it matched on this M5
+    /// Max in local development, but CI's GPU (thewafflehaus/butter PR
+    /// #128, `gh run view 31712976150`) recorded 142/512 bf16
+    /// mismatches for what was originally a strict-equality assertion
+    /// here. Same class of hazard as `mulSilu` below (an `exp`/`log`
+    /// fused kernel whose bit pattern depends on hardware/compile
+    /// context, not just source), discovered later because it happened
+    /// to round-trip exactly on the specific GPU this was developed on.
+    /// Tested to a tolerance envelope as a regression guard — NOT proof
+    /// of bit-exactness — matching its default-OFF gate
+    /// (`BUTTER_NEMOTRON_MIXER_FUSE_SOFTPLUS=1` to opt in).
+    @Test("addSoftplus matches Ops.add + Ops.softplus within the known ULP envelope, all dtypes")
+    func addSoftplusWithinKnownTolerance() {
         for dtype in Self.dtypes {
             autoreleasepool {
                 var seed: UInt64 = 0x9E37_79B9_7F4A_7C15
@@ -109,14 +130,23 @@ struct NemotronHMambaMixerFuseTests {
 
                 let a = unfused.toFloatArray()
                 let b = fused.toFloatArray()
-                var mismatches = 0
-                for i in 0 ..< Self.n where a[i] != b[i] {
-                    mismatches += 1
-                    if mismatches <= 3 {
-                        print("[addSoftplus \(dtype)] mismatch at \(i): unfused=\(a[i]) fused=\(b[i])")
+                // Same generous envelope as mulSilu's tolerance test —
+                // a regression guard against a real formula bug, not a
+                // re-litigation of the known hardware-dependent ULP
+                // noise.
+                let rtol: Float = 1e-2
+                let atol: Float = 1e-3
+                var outOfBand = 0
+                for i in 0 ..< Self.n {
+                    let bound = atol + rtol * abs(a[i])
+                    if abs(a[i] - b[i]) > bound {
+                        outOfBand += 1
+                        if outOfBand <= 3 {
+                            print("[addSoftplus \(dtype)] out-of-band at \(i): unfused=\(a[i]) fused=\(b[i])")
+                        }
                     }
                 }
-                #expect(mismatches == 0, "addSoftplus (\(dtype)): \(mismatches)/\(Self.n) mismatches")
+                #expect(outOfBand == 0, "addSoftplus (\(dtype)): \(outOfBand)/\(Self.n) outside atol+rtol envelope")
             }
         }
     }
@@ -211,5 +241,12 @@ struct NemotronHMambaMixerFuseTests {
         setenv("BUTTER_NEMOTRON_MIXER_FUSE", "0", 1)
         defer { unsetenv("BUTTER_NEMOTRON_MIXER_FUSE") }
         #expect(ButterEnv["BUTTER_NEMOTRON_MIXER_FUSE"] == "0")
+    }
+
+    @Test("BUTTER_NEMOTRON_MIXER_FUSE_SOFTPLUS=1 opt-in reads live via ButterEnv")
+    func softplusOptInReadsLive() {
+        setenv("BUTTER_NEMOTRON_MIXER_FUSE_SOFTPLUS", "1", 1)
+        defer { unsetenv("BUTTER_NEMOTRON_MIXER_FUSE_SOFTPLUS") }
+        #expect(ButterEnv["BUTTER_NEMOTRON_MIXER_FUSE_SOFTPLUS"] == "1")
     }
 }
