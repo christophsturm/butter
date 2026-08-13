@@ -1178,6 +1178,9 @@ public final class Model: @unchecked Sendable {
         engine as? NemotronDiffusionModel
     }
 
+    /// Convenience accessor for the Muse Glimmer engine.
+    public var museGlimmer: MuseGlimmerModel? { engine as? MuseGlimmerModel }
+
     private let stateLock = NSLock()
     private var _currentState: ModelLifecycleState = .ready
 
