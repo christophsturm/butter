@@ -41,6 +41,29 @@ public final class Device: @unchecked Sendable {
     private var weightResidencySet: Any?
     private let residencyLock = NSLock()
 
+    /// Separate MTLResidencySet for GENERATION-scoped caches (KV /
+    /// conv-state / GDN-state buffers) — deliberately NOT the same set
+    /// as `weightResidencySet`. Weights are genuinely process-lifetime
+    /// (loaded once, kept forever), but caches are not: every
+    /// `generate()` call and every spec-decode arm calls
+    /// `*.makeLayerCaches(...)` to build a BRAND NEW set of cache
+    /// buffers — nothing in Butter ever reuses a `KVCache`/
+    /// `ConvStateCache`/`GDNStateCache` object across generations. Before
+    /// this split, cache buffers were pinned into `weightResidencySet`
+    /// (see the old call sites, now `markCacheResident` below), which
+    /// only ever grows (`addAllocation` with no matching remove) — so
+    /// every generation's cache buffers stayed strongly referenced and
+    /// GPU-resident for the rest of the PROCESS lifetime, not just the
+    /// generation that made them. Measured on Muse Glimmer 30B: ~6.6GB
+    /// phys_footprint growth per arm, 15 arms (5 prompts x 3 spec-decode
+    /// arms) in one process -> Metal submit-queue wedge around ~100GB.
+    /// `releaseGenerationCaches()` below is the fix's other half: call
+    /// it once the previous generation's caches are provably done being
+    /// used (top of the next `driveGeneration`/`driveDiffusion`, or
+    /// explicitly between arms in a test that builds caches directly).
+    private var cacheResidencySet: Any?
+    private let cacheResidencyLock = NSLock()
+
     public static let shared: Device = {
         // Reuse the same MTLDevice + queue IronSwift uses, so PSOs
         // and buffers are guaranteed compatible.
@@ -471,5 +494,66 @@ public final class Device: @unchecked Sendable {
         defer { residencyLock.unlock() }
         guard let set = weightResidencySet as? MTLResidencySet else { return }
         set.requestResidency()
+    }
+
+    /// Cross-arm retention fix: pin generation-scoped cache buffers
+    /// (KV / conv-state / GDN-state) into their OWN residency set,
+    /// never `weightResidencySet`. Same shape as `markWeightsResident`
+    /// (lazy create, `addAllocation` + `commit` + `requestResidency`)
+    /// but the set this adds to is torn down wholesale by
+    /// `releaseGenerationCaches()` between generations, instead of
+    /// growing forever. `KVCache`/`ConvStateCache`/`GDNStateCache` call
+    /// this from their initializers instead of `markWeightsResident`.
+    public func markCacheResident(_ buffers: [MTLBuffer]) {
+        if ButterEnv["BUTTER_NO_RESIDENCY_SET"] != nil { return }
+        guard #available(macOS 15.0, iOS 18.0, *) else { return }
+        cacheResidencyLock.lock()
+        defer { cacheResidencyLock.unlock() }
+        if cacheResidencySet == nil {
+            let descriptor = MTLResidencySetDescriptor()
+            descriptor.label = "Butter generation caches"
+            descriptor.initialCapacity = max(buffers.count, 256)
+            do {
+                let set = try mtlDevice.makeResidencySet(descriptor: descriptor)
+                commandQueue.addResidencySet(set)
+                commandQueueB.addResidencySet(set)
+                cacheResidencySet = set
+            } catch {
+                // Driver refused to create the set; fall back to default
+                // residency tracking. Not fatal — just slower.
+                cacheResidencySet = nil
+                return
+            }
+        }
+        guard let set = cacheResidencySet as? MTLResidencySet else { return }
+        for buf in buffers {
+            set.addAllocation(buf)
+        }
+        set.commit()
+        set.requestResidency()
+    }
+
+    /// Drop residency for every cache buffer registered via
+    /// `markCacheResident` since the last call. Safe to call whenever
+    /// no in-flight GPU work still references the previous generation's
+    /// caches — i.e. right before building a fresh cache set for a NEW
+    /// generation/arm — because Butter never carries a KVCache/
+    /// ConvStateCache/GDNStateCache object across `generate()` calls;
+    /// every call site rebuilds via `makeLayerCaches(...)`. This is the
+    /// other half of the cross-arm retention fix (see
+    /// `cacheResidencySet`'s doc comment): without it, cache buffers
+    /// accumulate in GPU-resident memory for the life of the process.
+    /// No-op if the set was never created or `BUTTER_NO_RESIDENCY_SET=1`.
+    /// `removeAllAllocations()` + `commit()` release the driver-side
+    /// residency pin; ARC then frees the underlying `MTLBuffer`s once
+    /// the last Swift reference (the now-discarded cache objects) drops,
+    /// same as any other buffer.
+    public func releaseGenerationCaches() {
+        guard #available(macOS 15.0, iOS 18.0, *) else { return }
+        cacheResidencyLock.lock()
+        defer { cacheResidencyLock.unlock() }
+        guard let set = cacheResidencySet as? MTLResidencySet else { return }
+        set.removeAllAllocations()
+        set.commit()
     }
 }

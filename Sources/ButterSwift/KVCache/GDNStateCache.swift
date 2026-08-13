@@ -100,10 +100,12 @@ public final class GDNStateCache: LayerCacheProtocol, @unchecked Sendable {
         self.current.zero()
         self.next.zero()
         // Recurrent state buffers persist across every decode step; pin
-        // them in the residency set so the driver skips per-dispatch
-        // residency validation on the read/write/swap that fires each
-        // token through the GDN layer.
-        device.markWeightsResident([self.current.buffer, self.next.buffer])
+        // them in the GENERATION cache residency set (not the weight
+        // set — this state is rebuilt fresh every generation) so the
+        // driver skips per-dispatch residency validation on the
+        // read/write/swap that fires each token through the GDN layer.
+        // See `Device.markCacheResident`/`releaseGenerationCaches`.
+        device.markCacheResident([self.current.buffer, self.next.buffer])
     }
 
     /// Exchange `current` and `next`. Call this after `Ops.gatedDeltaStep`

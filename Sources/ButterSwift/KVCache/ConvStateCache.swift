@@ -49,9 +49,12 @@ public final class ConvStateCache: @unchecked Sendable {
             dtype: dtype, device: device)
         self.state.zero()
         // Conv rolling window persists across every decode step; pin it
-        // in the residency set so the driver skips per-dispatch
-        // residency validation on the read+shift that fires each token.
-        device.markWeightsResident([self.state.buffer])
+        // in the GENERATION cache residency set (not the weight set —
+        // this state is rebuilt fresh every generation) so the driver
+        // skips per-dispatch residency validation on the read+shift
+        // that fires each token. See `Device.markCacheResident`/
+        // `releaseGenerationCaches`.
+        device.markCacheResident([self.state.buffer])
     }
 
     /// Reset to zero. Used between sessions; cheap (small fp16/bf16 buffer).

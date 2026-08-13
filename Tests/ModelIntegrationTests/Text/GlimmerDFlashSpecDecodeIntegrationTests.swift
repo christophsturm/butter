@@ -179,6 +179,15 @@ struct GlimmerDFlashSpecDecodeIntegrationTests {
         for (k, v) in envVars { setenv(k, v, 1) }
         defer { for k in envVars.keys { unsetenv(k) } }
 
+        // Cross-arm retention fix (see `Device.releaseGenerationCaches`):
+        // drop residency for whichever arm's caches were built last
+        // before allocating this arm's. Each arm's `caches`/`draftCaches`
+        // are local to this function and go out of scope at return, so
+        // by the time the NEXT arm calls this again their only
+        // remaining strong reference was the (now-released) residency
+        // set — this is what makes the 15-arm/5-prompt gate flat instead
+        // of growing ~6.6GB/arm.
+        device.releaseGenerationCaches()
         let caches = glimmer.makeLayerCaches(maxSeq: nil, device: device)
         let (seed, seedFeatures) = prefill(
             glimmer, promptTokens: promptTokens, targetLayerIDs: targetLayerIDs,
@@ -231,6 +240,10 @@ struct GlimmerDFlashSpecDecodeIntegrationTests {
         print("physFootprint before baseline arm=\(String(format: "%.2f", physFootprintGB()))GB")
         let baseline = autoreleasepool {
             () -> (tokens: [Int], decodeSeconds: Double) in
+            // See `runDFlashArm`'s matching call — this arm doesn't go
+            // through that helper, so it needs its own release before
+            // building a fresh cache set (`Device.releaseGenerationCaches`).
+            device.releaseGenerationCaches()
             let baseCaches = glimmer.makeLayerCaches(maxSeq: nil, device: device)
             let (baseSeed, _) = prefill(
                 glimmer, promptTokens: promptTokens, targetLayerIDs: targetLayerIDs,
@@ -260,6 +273,90 @@ struct GlimmerDFlashSpecDecodeIntegrationTests {
         #expect(
             adaptiveTokens == baseline.tokens,
             "bail-then-reenter diverged from baseline at prefix \(matchPrefix)/\(count)")
+    }
+
+    // Cross-arm retention MINIMAL REPRO — see `Device.markCacheResident`/
+    // `releaseGenerationCaches` in Device.swift for the fix this
+    // verifies. Runs the SAME arm (fixed-block DFlash spec-decode
+    // against the SAME prompt) `reps` times in one process and prints
+    // phys_footprint before/after each repetition. This isolates the
+    // leak's SIGNATURE from any prompt- or arm-type-dependence: the
+    // original 15-arm gate varied both prompt and arm kind per
+    // iteration, which left open whether the growth was keyed on the
+    // (prompt, arm) pair or was arm-count-only. Root cause was the
+    // opposite of prompt-keyed — the leak is `Device.shared`'s weight
+    // MTLResidencySet gaining one KV/GDN/conv cache buffer set per
+    // `makeLayerCaches()` call with no matching removal, so ANY repeated
+    // cache allocation reproduces it, same-arm-repeated included. Before
+    // the fix this test's footprint delta grows ~linearly rep over rep;
+    // after, it is flat once warmup settles (reps 0-1).
+    @Test("cross-arm retention: same arm repeated 6x stays footprint-flat")
+    func sameArmRepeatedStaysFootprintFlat() async throws {
+        let device = Device.shared
+        var optsBuilder = LoadOptions()
+        optsBuilder.prewarm = false
+        let opts = optsBuilder
+
+        let m: Model = try await ModelLoadLock.shared.loadSerially {
+            try await Model.load(glimmerModelPath, options: opts)
+        }
+        let glimmer = try #require(m.museGlimmer, "expected MuseGlimmerModel engine")
+        let draft = try DFlashDraftModel.loadModel(path: glimmerDFlashPath, device: device)
+        let targetLayerIDs = draft.config.targetLayerIDs
+        let count = 16
+        let reps = 6
+
+        let promptTokens = m.tokenizer.encode(
+            text: "The quick brown fox jumps over the lazy dog and then")
+
+        var footprints: [Double] = []
+        var lastTokens: [Int]?
+        for i in 0 ..< reps {
+            let before = physFootprintGB()
+            let (tokens, _) = autoreleasepool {
+                runDFlashArm(
+                    glimmer, draft: draft, promptTokens: promptTokens,
+                    targetLayerIDs: targetLayerIDs, count: count, envVars: [:], device: device)
+            }
+            let after = physFootprintGB()
+            footprints.append(after)
+            print(
+                "[repeat-arm] rep\(i): before=\(String(format: "%.3f", before))GB "
+                    + "after=\(String(format: "%.3f", after))GB "
+                    + "delta=\(String(format: "%+.3f", after - before))GB")
+            // Determinism sanity: greedy decode, same prompt, same arm —
+            // every repetition must emit the exact same tokens. A
+            // mismatch here would mean cross-arm STATE bleed (a
+            // correctness bug), not just a memory leak — the residency
+            // fix only touches which residency set buffers are pinned
+            // in, never the buffers' contents, so this must keep
+            // passing.
+            if let last = lastTokens {
+                #expect(
+                    tokens == last,
+                    "rep\(i): token stream diverged from rep\(i - 1) — cross-arm state bleed, not just a memory leak"
+                )
+            }
+            lastTokens = tokens
+        }
+
+        // Leak-shape check, same discipline as
+        // `Gemma4MoEAllocTraceTests.perTokenStability`: a leak
+        // accumulates roughly monotonically across reps, so tail-vs-head
+        // growth is large relative to noise. Skip reps 0-1 (model/kernel
+        // warmup: PSO compile, first-touch paging) and compare the mean
+        // of the last 2 reps against the mean of reps 2-3.
+        let head = Array(footprints[2 ..< 4])
+        let tail = Array(footprints[(reps - 2)...])
+        let headMean = head.reduce(0, +) / Double(head.count)
+        let tailMean = tail.reduce(0, +) / Double(tail.count)
+        print(
+            "[repeat-arm] headMean(reps 2-3)=\(String(format: "%.3f", headMean))GB "
+                + "tailMean(reps \(reps - 2)-\(reps - 1))=\(String(format: "%.3f", tailMean))GB "
+                + "growth=\(String(format: "%+.3f", tailMean - headMean))GB")
+        let growthMessage =
+            "footprint grew \(tailMean - headMean)GB from reps 2-3 to reps \(reps - 2)-\(reps - 1) — cross-arm retention regression (see Device.releaseGenerationCaches)"
+        #expect(tailMean - headMean < 1.0, "\(growthMessage)")
     }
 
     /// Optional single-prompt selector for the 5-prompt gate below — set
@@ -374,6 +471,11 @@ struct GlimmerDFlashSpecDecodeIntegrationTests {
             // implicit drain point.
             let (baseline, baseTps) = autoreleasepool {
                 () -> ((tokens: [Int], decodeSeconds: Double), Double) in
+                // Cross-arm retention fix — see `runDFlashArm`'s matching
+                // call and `Device.releaseGenerationCaches`'s doc comment.
+                // This is what makes the "should be fully released"
+                // comment above actually true, instead of aspirational.
+                device.releaseGenerationCaches()
                 let baseCaches = glimmer.makeLayerCaches(maxSeq: nil, device: device)
                 let (baseSeed, _) = prefill(
                     glimmer, promptTokens: promptTokens, targetLayerIDs: targetLayerIDs,

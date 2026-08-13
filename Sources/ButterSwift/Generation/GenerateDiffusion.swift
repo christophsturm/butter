@@ -143,6 +143,10 @@ extension Model {
         // Cache depth = prompt + all generated tokens + one block of
         // scratch headroom for the denoise forward.
         let cacheDepth = promptTokens.count + params.maxNewTokens + blockLength
+        // See `Generate.swift`'s `driveGeneration` for why this must run
+        // before building a fresh cache set (cross-generation residency
+        // leak fix, `Device.releaseGenerationCaches`).
+        Device.shared.releaseGenerationCaches()
         let caches = m.makeLayerCaches(maxSeq: cacheDepth)
         var nfe = 0
 
@@ -222,6 +226,10 @@ extension Model {
         // Self-speculation may overshoot maxNewTokens by up to one block
         // (a fully-accepted draft) and stages a block of scratch K/V.
         let cacheDepth = promptTokens.count + params.maxNewTokens + 2 * blockLength
+        // See `driveDiffusion` above / `Generate.swift`'s
+        // `driveGeneration` for why this must run before building a
+        // fresh cache set (`Device.releaseGenerationCaches`).
+        Device.shared.releaseGenerationCaches()
         let caches = m.makeLayerCaches(maxSeq: cacheDepth)
         let rawCaches: [KVCache] = caches.map { $0 as! KVCache }
         var nfe = 0
