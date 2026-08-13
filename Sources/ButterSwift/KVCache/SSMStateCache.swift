@@ -62,6 +62,76 @@ public final class SSMStateCache: @unchecked Sendable {
     public var bytesAllocated: Int {
         nHeads * stateDim * headDim * DType.f32.byteSize
     }
+
+    /// Cached snapshot tensor. Reused across snapshot calls, mirroring
+    /// `ConvStateCache.snapshotEncode`'s scratch-reuse discipline —
+    /// avoids churning `nHeads*stateDim*headDim*4` bytes per spec-decode
+    /// verify cycle.
+    private var cachedSnapshot: Tensor?
+
+    /// Encode-only content snapshot: queues the blit on `cmd` and
+    /// returns the destination WITHOUT committing. Mirrors
+    /// `ConvStateCache.snapshotEncode` / `GDNStateCache.snapshotEncode`
+    /// so a composite (`Mamba2LayerCache`) — and, above it,
+    /// `CacheSnapshot.snapshotAll` — can batch every layer's SSM +
+    /// conv blit onto ONE command buffer instead of one round-trip per
+    /// layer per cache.
+    ///
+    /// Unlike `ConvStateCache` (fixed length-only cost per
+    /// `Mamba2LayerCache`), the SSM state is the recurrent Mamba 2
+    /// scan's accumulator (`h`) — content-level (not length-only)
+    /// restore is required because, unlike attention KV, a rejected
+    /// speculative token's contribution to `h` cannot be undone by
+    /// truncating a growing buffer; the state must be blitted back to
+    /// its pre-step value.
+    public func snapshotEncode(on cmd: MTLCommandBuffer, device: Device = .shared) -> Tensor {
+        let shape = [nHeads, stateDim, headDim]
+        if cachedSnapshot == nil {
+            cachedSnapshot = Tensor.empty(shape: shape, dtype: .f32, device: device)
+        }
+        let snap = cachedSnapshot!
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure("SSMStateCache.snapshotEncode: makeBlitCommandEncoder failed")
+        }
+        blit.copy(
+            from: h.buffer, sourceOffset: h.offset,
+            to: snap.buffer, destinationOffset: snap.offset, size: bytesAllocated)
+        blit.endEncoding()
+        return snap
+    }
+
+    /// Encode-only restore; see `snapshotEncode`.
+    public func restoreEncode(from snapshot: Tensor, on cmd: MTLCommandBuffer) {
+        precondition(
+            snapshot.elementCount == h.elementCount,
+            "SSMStateCache.restoreEncode: snapshot has \(snapshot.elementCount) elements, "
+                + "expected \(h.elementCount)")
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure("SSMStateCache.restoreEncode: makeBlitCommandEncoder failed")
+        }
+        blit.copy(
+            from: snapshot.buffer, sourceOffset: snapshot.offset,
+            to: h.buffer, destinationOffset: h.offset, size: bytesAllocated)
+        blit.endEncoding()
+    }
+
+    /// Committing snapshot/restore pair — convenience wrappers around
+    /// the encode-only variants for callers outside a shared
+    /// command-buffer batch (e.g. unit tests). Each commits and waits.
+    public func snapshot(device: Device = .shared) -> Tensor {
+        let cmd = device.makeCommandBuffer()
+        let snap = snapshotEncode(on: cmd, device: device)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return snap
+    }
+
+    public func restore(from snapshot: Tensor, device: Device = .shared) {
+        let cmd = device.makeCommandBuffer()
+        restoreEncode(from: snapshot, on: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+    }
 }
 
 extension Array where Element == SSMStateCache {
