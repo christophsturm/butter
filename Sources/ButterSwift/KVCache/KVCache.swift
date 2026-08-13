@@ -373,6 +373,94 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
         return (kBuffer, vBuffer)
     }
 
+    // ─── Content-level range snapshot (diagnostic use only) ───────────
+    //
+    // `CacheSnapshot.swift`'s composite `snapshotAll`/`restoreAll` treat
+    // KVCache as LENGTH-ONLY: restoring means truncating back to a
+    // shorter fill count, on the assumption that the caller will
+    // reappend IDENTICAL content when it grows the cache again (true
+    // for the speculative-decode reject/replay path — the "rejected"
+    // tail never gets reappended with different data than the accepted
+    // prefix would have produced).
+    //
+    // That assumption breaks for a caller that truncates, replays
+    // through a DIFFERENT kernel than the one that originally filled
+    // those slots, and expects the ORIGINAL bytes back afterward — the
+    // `BUTTER_QWEN_MTP_PARITY` diagnostic in `MTPSpecDecode.swift` does
+    // exactly this: it rewinds to the pre-verify length and replays the
+    // committed prefix through the single-token forward (numerically
+    // distinct from the batched verify pass — that gap is the thing
+    // being measured), which overwrites the same physical slots the
+    // batched pass wrote. A length-only restore afterward is a no-op on
+    // content, silently leaving the probe's single-token K/V sitting
+    // where the batched pass's K/V used to be — every later decode step
+    // attends over those slots, so the drift compounds forward instead
+    // of staying contained to the diagnostic.
+    //
+    // These two methods give such a caller a true content-level
+    // snapshot/restore over an explicit `[start, start+count)` position
+    // range, encoded onto the caller's own command buffer (mirrors
+    // `GDNStateCache`/`ConvStateCache`'s `snapshotEncode`/
+    // `restoreEncode` pattern). Not part of the composite
+    // `LayerCacheSnapshot` — deliberately opt-in and diagnostic-only so
+    // the hot spec-decode path keeps the cheap length-only contract.
+    public func snapshotRangeEncode(
+        start: Int, count: Int, on cmd: MTLCommandBuffer, device: Device = .shared
+    ) -> (k: Tensor, v: Tensor) {
+        let rowBytes = headDim * dtype.byteSize
+        let kSnap = Tensor.empty(shape: [nKVHeads, count, headDim], dtype: dtype, device: device)
+        let vSnap = Tensor.empty(shape: [nKVHeads, count, headDim], dtype: dtype, device: device)
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure("KVCache.snapshotRangeEncode: makeBlitCommandEncoder failed")
+        }
+        for h in 0 ..< nKVHeads {
+            let srcOff = kBuffer.offset + (h * maxSeq + start) * rowBytes
+            let dstOff = kSnap.offset + h * count * rowBytes
+            blit.copy(
+                from: kBuffer.buffer, sourceOffset: srcOff,
+                to: kSnap.buffer, destinationOffset: dstOff, size: count * rowBytes)
+            let srcOffV = vBuffer.offset + (h * maxSeq + start) * rowBytes
+            let dstOffV = vSnap.offset + h * count * rowBytes
+            blit.copy(
+                from: vBuffer.buffer, sourceOffset: srcOffV,
+                to: vSnap.buffer, destinationOffset: dstOffV, size: count * rowBytes)
+        }
+        blit.endEncoding()
+        return (kSnap, vSnap)
+    }
+
+    /// Encode-only restore; see `snapshotRangeEncode`. `snapshot` must
+    /// have been produced by a prior `snapshotRangeEncode(start:count:)`
+    /// call with the SAME `count` (shape-checked); `start` may differ
+    /// only if the caller intends to relocate the range, which no
+    /// current caller does.
+    public func restoreRangeEncode(
+        from snapshot: (k: Tensor, v: Tensor), start: Int, count: Int, on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            snapshot.k.shape == [nKVHeads, count, headDim]
+                && snapshot.v.shape == [nKVHeads, count, headDim],
+            "KVCache.restoreRangeEncode: snapshot shape \(snapshot.k.shape)/\(snapshot.v.shape) "
+                + "does not match [\(nKVHeads), \(count), \(headDim)]")
+        let rowBytes = headDim * dtype.byteSize
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure("KVCache.restoreRangeEncode: makeBlitCommandEncoder failed")
+        }
+        for h in 0 ..< nKVHeads {
+            let dstOff = kBuffer.offset + (h * maxSeq + start) * rowBytes
+            let srcOff = snapshot.k.offset + h * count * rowBytes
+            blit.copy(
+                from: snapshot.k.buffer, sourceOffset: srcOff,
+                to: kBuffer.buffer, destinationOffset: dstOff, size: count * rowBytes)
+            let dstOffV = vBuffer.offset + (h * maxSeq + start) * rowBytes
+            let srcOffV = snapshot.v.offset + h * count * rowBytes
+            blit.copy(
+                from: snapshot.v.buffer, sourceOffset: srcOffV,
+                to: vBuffer.buffer, destinationOffset: dstOffV, size: count * rowBytes)
+        }
+        blit.endEncoding()
+    }
+
     // ─── Memory accounting (used by --stats / bench harness) ─────────
 
     /// Bytes the K + V buffers physically occupy in device memory. Set
