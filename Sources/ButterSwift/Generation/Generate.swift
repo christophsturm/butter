@@ -648,6 +648,23 @@ extension Model {
             && (mtpModel?.mtpHead) != nil
         let useMTPSpec = useMTPSpecGreedy || useMTPSpecSampled
 
+        // F-131: NemotronH MTP self-speculative decode. Opt-in via
+        // BUTTER_NEMOTRON_MTP_SPEC=1 (default OFF — measured a
+        // throughput LOSS on this codebase's NemotronH forward path;
+        // see `NemotronHMTPSpecDecode.swift`'s file header for why it's
+        // architectural, not a tuning gap). Greedy-only — the driver
+        // doesn't support temperature > 0 (unlike Qwen3x's MTP path).
+        // Requires BUTTER_NEMOTRON_MTP=1 at load time too (separate
+        // gate — see `NemotronHMTPHead.swift`), which is what makes
+        // `nemotronModel?.mtpHead` non-nil here.
+        let nemotronMTPSpecEnabled =
+            ButterEnv["BUTTER_NEMOTRON_MTP_SPEC"] == "1"
+        let nemotronModel = engine as? NemotronHModel
+        let useNemotronMTPSpec =
+            nemotronMTPSpecEnabled && path == .greedyGPU && !capturePPL
+            && params.temperature == 0
+            && (nemotronModel?.mtpHead) != nil
+
         if useMTPSpec, let qwen = mtpModel, let mtpHead = qwen.mtpHead {
             try Task.checkCancellation()
             if params.maxTokens > 0, !stopSet.contains(nextToken) {
@@ -704,6 +721,45 @@ extension Model {
                 Debug.log(
                     .generate,
                     "MTP spec decode: γ=\(gamma), "
+                        + "accepted \(stats.candidatesAccepted)/\(stats.candidatesProposed) "
+                        + "(\(String(format: "%.1f", stats.acceptanceRate * 100))%), "
+                        + "verify=\(stats.verifySteps), replay=\(stats.replaySingleSteps), "
+                        + "lockstep=\(stats.lockstepSteps)")
+            }
+        } else if useNemotronMTPSpec, let nemotron = nemotronModel, let mtpHead = nemotron.mtpHead {
+            try Task.checkCancellation()
+            if params.maxTokens > 0, !stopSet.contains(nextToken) {
+                let gamma = max(
+                    1,
+                    Int(ButterEnv["BUTTER_NEMOTRON_MTP_GAMMA"] ?? "") ?? 2)
+                mtpHead.resetCache()
+                let mtpEntryPosition = pos
+                let stats = profile.signpost("decode_nemotron_mtp_spec") {
+                    let emitToken: (Int) -> Void = { tokenId in
+                        generated.append(tokenId)
+                        let text = self.tokenizer.decode(
+                            tokens: [tokenId], skipSpecialTokens: true)
+                        continuation.yield(
+                            GenerationChunk(
+                                text: text, tokens: [tokenId],
+                                position: pos + 1, stats: nil))
+                        memTracker.sample()
+                        let now = Date()
+                        perTokenWallclock.append(now.timeIntervalSince(lastStep))
+                        lastStep = now
+                        pos += 1
+                    }
+                    return NemotronHMTPSpecDecode.generateGreedy(
+                        model: nemotron, head: mtpHead, gamma: gamma,
+                        lastToken: nextToken, position: mtpEntryPosition,
+                        caches: caches, history: &tokenHistory,
+                        maxNewTokens: params.maxTokens,
+                        stopTokens: stopSet, device: Device.shared,
+                        emit: emitToken)
+                }
+                Debug.log(
+                    .generate,
+                    "NemotronH MTP spec decode: γ=\(gamma), "
                         + "accepted \(stats.candidatesAccepted)/\(stats.candidatesProposed) "
                         + "(\(String(format: "%.1f", stats.acceptanceRate * 100))%), "
                         + "verify=\(stats.verifySteps), replay=\(stats.replaySingleSteps), "

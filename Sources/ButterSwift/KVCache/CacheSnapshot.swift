@@ -44,6 +44,20 @@ public enum LayerCacheSnapshot {
     case gdn(currentState: Tensor, length: Int)
     case conv(state: Tensor)
     case gdnLayer(conv: Tensor, gdnState: Tensor, length: Int)
+    /// `Mamba2LayerCache` (NemotronH's Mamba 2 mixer): content-level
+    /// snapshot of BOTH the SSM recurrent state and the conv rolling
+    /// window, plus the step-counter `length`. Recurrent state can't be
+    /// rolled back by length truncation the way KV can — restoring the
+    /// actual tensor content is the only correct rollback for a
+    /// rejected speculative token (see `SSMStateCache.snapshotEncode`'s
+    /// doc).
+    case mamba2(ssm: Tensor, conv: Tensor, length: Int)
+    /// `StatelessLayerCache` (a pure MLP/MoE feed-forward layer — no
+    /// per-token state at all). Nothing to snapshot or restore; this
+    /// case exists purely so a heterogeneous hybrid stack with
+    /// stateless layer slots (e.g. NemotronH's MLP/MoE "-"/"E" layers)
+    /// doesn't hit `snapshotAll`'s catch-all `preconditionFailure`.
+    case stateless
 }
 
 extension Array where Element == any LayerCacheProtocol {
@@ -72,6 +86,13 @@ extension Array where Element == any LayerCacheProtocol {
                 return .kv(
                     length: kv.length,
                     absolutePosition: kv.absolutePosition)
+            }
+            if let mamba = cache as? Mamba2LayerCache {
+                let snap = mamba.snapshotEncode(on: cmd, device: device)
+                return .mamba2(ssm: snap.ssm, conv: snap.conv, length: mamba.length)
+            }
+            if cache is StatelessLayerCache {
+                return .stateless
             }
             preconditionFailure(
                 "CacheSnapshot: unhandled LayerCacheProtocol subtype \(type(of: cache)). Add a case if a new cache kind ships."
@@ -115,6 +136,11 @@ extension Array where Element == any LayerCacheProtocol {
                 gdn.setLength(length)
             case let (kv as KVCache, .kv(length, _)):
                 if !recurrentOnly { kv.truncate(toLength: length) }
+            case let (mamba as Mamba2LayerCache, .mamba2(ssmT, convT, length)):
+                mamba.restoreEncode(ssm: ssmT, conv: convT, on: cmd)
+                mamba.setLength(length)
+            case (is StatelessLayerCache, .stateless):
+                break
             default:
                 preconditionFailure(
                     "CacheSnapshot.restoreAll: cache/snapshot mismatch at layer — cache=\(type(of: cache)), snapshot=\(snap)"

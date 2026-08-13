@@ -73,4 +73,33 @@ public final class Mamba2LayerCache: LayerCacheProtocol, @unchecked Sendable {
         // once any step has executed, zero before then.
         length == 0 ? 0 : bytesAllocated
     }
+
+    /// Set the step counter directly without touching `ssm`/`conv`
+    /// storage. Mirrors `GDNStateCache.setLength` — the spec-decode
+    /// restore path writes the snapshot tensors into `ssm.h` /
+    /// `conv.state` itself (via `restoreEncode`) and then calls this to
+    /// resync the accounting counter, without the zero-fill `reset()`
+    /// would do.
+    public func setLength(_ length: Int) {
+        precondition(length >= 0, "Mamba2LayerCache.setLength: must be ≥ 0")
+        self.length = length
+    }
+
+    /// Composite content-level snapshot: both `ssm.h` and `conv.state`,
+    /// queued on the caller's shared command buffer (see
+    /// `CacheSnapshot.snapshotAll`'s per-layer batching rationale).
+    public func snapshotEncode(on cmd: MTLCommandBuffer, device: Device = .shared)
+        -> (ssm: Tensor, conv: Tensor)
+    {
+        (ssm: ssm.snapshotEncode(on: cmd, device: device), conv: conv.snapshotEncode(on: cmd, device: device))
+    }
+
+    /// Composite content-level restore; see `snapshotEncode`. Does NOT
+    /// touch `length` — callers pair this with `setLength(_:)`, same
+    /// two-call contract `CacheSnapshot.restoreAll` uses for
+    /// `GDNStateCache`/`Qwen35GDNLayerCache`.
+    public func restoreEncode(ssm: Tensor, conv: Tensor, on cmd: MTLCommandBuffer) {
+        self.ssm.restoreEncode(from: ssm, on: cmd)
+        self.conv.restoreEncode(from: conv, on: cmd)
+    }
 }
