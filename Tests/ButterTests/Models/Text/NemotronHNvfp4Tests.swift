@@ -166,4 +166,241 @@ struct NemotronHNvfp4Tests {
             }
         }
     }
+
+    // ─── F-126: GPU-resident router vs the CPU reference ──────────────
+    //
+    // `NemotronHNvfp4MoELayer.decodeGPURouted` replaces the per-layer
+    // CPU commit+wait router (`decodeCPURouted`) with
+    // `Ops.moeRouterTopKBiasedRowsFused` — this test exercises just the
+    // routing math (sigmoid + correction-bias top-K, sum-to-1 renorm,
+    // routed_scaling_factor) in isolation, at the real Lightning shape
+    // (128 experts, top-6), without needing a full NVFP4 expert stack.
+
+    @Test("GPU sigmoid+bias top-K router matches the CPU reference (ids as a set, weights cos-tight)")
+    func gpuRouterMatchesCPUReference() {
+        autoreleasepool {
+            let device = Device.shared
+            let nExperts = 128
+            let topK = 6
+            let routedScalingFactor: Float = 2.5
+
+            // Deterministic pseudo-random logits/bias — reproducible
+            // without a PRNG dependency, and spread enough to exercise
+            // the sort (including near-ties).
+            func pseudoRandom(_ seed: Int) -> Float {
+                var x = UInt64(bitPattern: Int64(seed)) &* 2_654_435_761 &+ 0x9E37_79B9_7F4A_7C15
+                x ^= x >> 33
+                x &*= 0xff51_afd7_ed55_8ccd
+                x ^= x >> 33
+                let u = Double(x % 1_000_000) / 1_000_000.0
+                return Float(u * 6.0 - 3.0)  // spread over [-3, 3]
+            }
+            let logitsHost = (0 ..< nExperts).map { pseudoRandom($0) }
+            let biasHost = (0 ..< nExperts).map { pseudoRandom($0 + 10_000) * 0.1 }
+
+            func toBF16(_ v: Float) -> UInt16 {
+                let bits = v.bitPattern
+                let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
+                return UInt16(rounded >> 16)
+            }
+            func fromBF16(_ b: UInt16) -> Float { Float(bitPattern: UInt32(b) << 16) }
+
+            let logitsBF = logitsHost.map(toBF16)
+            let biasBF = biasHost.map(toBF16)
+
+            let logitsT = Tensor.empty(shape: [nExperts], dtype: .bf16, device: device)
+            logitsT.copyIn(from: logitsBF)
+            let biasT = Tensor.empty(shape: [nExperts], dtype: .bf16, device: device)
+            biasT.copyIn(from: biasBF)
+
+            // CPU reference — identical math to
+            // `NemotronHNvfp4MoELayer.decodeCPURouted`, reading back the
+            // SAME bf16-rounded values the GPU kernel sees (matches
+            // `logitsTensor.toFloatArray()` in the real decode path).
+            let logitsRef = logitsBF.map(fromBF16)
+            let biasRef = biasBF.map(fromBF16)
+            var origScores = [Float](repeating: 0, count: nExperts)
+            var selectionScores = [Float](repeating: 0, count: nExperts)
+            for i in 0 ..< nExperts {
+                let s = 1.0 / (1.0 + Foundation.exp(-logitsRef[i]))
+                origScores[i] = s
+                selectionScores[i] = s + biasRef[i]
+            }
+            let order = (0 ..< nExperts).sorted { a, b in
+                if selectionScores[a] != selectionScores[b] {
+                    return selectionScores[a] > selectionScores[b]
+                }
+                return a < b
+            }
+            let indsRef = Array(order.prefix(topK))
+            var weightsRef = indsRef.map { origScores[$0] }
+            let sum = weightsRef.reduce(0, +) + 1e-20
+            weightsRef = weightsRef.map { $0 / sum * routedScalingFactor }
+
+            // GPU — the exact dispatch chain `decodeGPURouted` uses.
+            let idxOut = Tensor.empty(shape: [topK], dtype: .u32, device: device)
+            let wOut = Tensor.empty(shape: [topK], dtype: .bf16, device: device)
+            let scaleVec = Tensor.filled(
+                routedScalingFactor, shape: [topK], dtype: .bf16, device: device)
+            let cmd = device.makeCommandBuffer()
+            Ops.moeRouterTopKBiasedRowsFused(
+                logits: logitsT, bias: biasT,
+                indicesOut: idxOut, weightsOut: wOut,
+                t: 1, nExperts: nExperts, k: topK, on: cmd)
+            _ = Ops.mul(wOut, scaleVec, on: cmd, into: wOut)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+            let idxGPU = idxOut.toArray(as: UInt32.self).map { Int($0) }
+            let wGPU = wOut.toFloatArray()
+
+            // ids: same SET. Slot order may legitimately differ from
+            // the CPU stable sort (the summed weighted contribution
+            // across experts is order-independent), but the chosen
+            // experts themselves must match exactly.
+            #expect(
+                Set(idxGPU) == Set(indsRef),
+                Comment(
+                    rawValue: "GPU ids \(idxGPU.sorted()) vs CPU ids \(indsRef.sorted())"))
+
+            // weights: match by expert id, cosine-tight — the fused
+            // kernel's bf16 intermediate rounding (see its module doc)
+            // can differ slightly from the CPU path's pure-f32 sigmoid,
+            // even though both read the identical bf16 input tensor.
+            var refByID: [Int: Float] = [:]
+            for (i, id) in indsRef.enumerated() { refByID[id] = weightsRef[i] }
+            for (i, id) in idxGPU.enumerated() {
+                guard let expected = refByID[id] else { continue }
+                #expect(
+                    abs(wGPU[i] - expected) < 5e-3,
+                    Comment(rawValue: "expert \(id): gpu \(wGPU[i]) vs cpu \(expected)"))
+            }
+        }
+    }
+
+    /// Regression test for the exact bug the F-126 perf wave hit
+    /// against the real Lightning checkpoint: `e_score_correction_bias`
+    /// sits on a large common-mode offset (~40.7, an auxiliary-load-
+    /// balancing bias that drifted well off zero during training) with
+    /// per-expert deltas of only ~0.01 riding on top. bf16 (~8 mantissa
+    /// bits) can't resolve deltas that small at that magnitude — every
+    /// bias value rounds to the SAME bf16 bucket, and top-K selection
+    /// degenerates to near-arbitrary. Reproduced live: the bf16-typed
+    /// router (`gpuRouterMatchesCPUReference` above, whose synthetic
+    /// bias is small/zero-mean) matched the CPU reference perfectly in
+    /// isolation, yet a real-checkpoint decode picked a completely
+    /// different expert set at layer 0 of token 0 — `bias[0..8]` read
+    /// back as `[40.75, 40.75, ...]` (all equal) instead of the true
+    /// `[40.687637, 40.693634, ...]`.
+    ///
+    /// This test exercises the ACTUAL production dispatch chain
+    /// (`NemotronHNvfp4MoELayer.decodeGPURouted`'s routing math): logits
+    /// upcast bf16→f32 (`Ops.castToF32`), bias held in f32 throughout
+    /// (never bf16), the f32 kernel variant of
+    /// `Ops.moeRouterTopKBiasedRowsFused` (no internal `bfloat(...)`
+    /// rounding — see that kernel's `.metal` source vs. the bf16
+    /// variant's), scaling in f32, and only the FINAL combine weight
+    /// downcast to bf16 (`Ops.castF32ToBf16`) — precision-sensitive
+    /// math never touches bf16 until after the expert selection is
+    /// already locked in.
+    @Test("GPU router survives a large common-mode bias offset (the real Lightning bias shape)")
+    func gpuRouterMatchesCPUReferenceWithLargeCommonModeBias() {
+        autoreleasepool {
+            let device = Device.shared
+            let nExperts = 128
+            let topK = 6
+            let routedScalingFactor: Float = 2.5
+            let commonModeOffset: Float = 40.69  // matches the real checkpoint's magnitude.
+
+            func pseudoRandom(_ seed: Int) -> Float {
+                var x = UInt64(bitPattern: Int64(seed)) &* 2_654_435_761 &+ 0x9E37_79B9_7F4A_7C15
+                x ^= x >> 33
+                x &*= 0xff51_afd7_ed55_8ccd
+                x ^= x >> 33
+                let u = Double(x % 1_000_000) / 1_000_000.0
+                return Float(u * 6.0 - 3.0)
+            }
+            let logitsHost = (0 ..< nExperts).map { pseudoRandom($0) }
+            // Deltas of ~0.01 on top of the common-mode offset — the
+            // exact shape that broke bf16 (an LSB spacing of ~0.16-0.3
+            // at this magnitude swallows deltas this small).
+            let biasHost = (0 ..< nExperts).map {
+                commonModeOffset + pseudoRandom($0 + 10_000) * 0.01
+            }
+
+            func toBF16(_ v: Float) -> UInt16 {
+                let bits = v.bitPattern
+                let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
+                return UInt16(rounded >> 16)
+            }
+            func fromBF16(_ b: UInt16) -> Float { Float(bitPattern: UInt32(b) << 16) }
+
+            // Router GEMV output is bf16 in production (the activation
+            // dtype) — round-trip the logits through bf16 exactly as
+            // the real `gate(xNorm, on: cmd)` GEMV would.
+            let logitsBF = logitsHost.map(toBF16)
+            let logitsT = Tensor.empty(shape: [nExperts], dtype: .bf16, device: device)
+            logitsT.copyIn(from: logitsBF)
+            // Bias stays f32 end to end — this IS the fix under test.
+            let biasT = Tensor.empty(shape: [nExperts], dtype: .f32, device: device)
+            biasT.copyIn(from: biasHost)
+
+            // CPU reference — identical math to `decodeCPURouted`.
+            let logitsRef = logitsBF.map(fromBF16)
+            var origScores = [Float](repeating: 0, count: nExperts)
+            var selectionScores = [Float](repeating: 0, count: nExperts)
+            for i in 0 ..< nExperts {
+                let s = 1.0 / (1.0 + Foundation.exp(-logitsRef[i]))
+                origScores[i] = s
+                selectionScores[i] = s + biasHost[i]
+            }
+            let order = (0 ..< nExperts).sorted { a, b in
+                if selectionScores[a] != selectionScores[b] {
+                    return selectionScores[a] > selectionScores[b]
+                }
+                return a < b
+            }
+            let indsRef = Array(order.prefix(topK))
+            var weightsRef = indsRef.map { origScores[$0] }
+            let sum = weightsRef.reduce(0, +) + 1e-20
+            weightsRef = weightsRef.map { $0 / sum * routedScalingFactor }
+
+            // GPU — mirrors `decodeGPURouted` exactly: upcast logits,
+            // f32 router kernel, f32 scale, THEN downcast the weight.
+            let logitsF32 = Tensor.empty(shape: [nExperts], dtype: .f32, device: device)
+            let idxOut = Tensor.empty(shape: [topK], dtype: .u32, device: device)
+            let wOutF32 = Tensor.empty(shape: [topK], dtype: .f32, device: device)
+            let wOutBF16 = Tensor.empty(shape: [topK], dtype: .bf16, device: device)
+            let scaleVec = Tensor.filled(
+                routedScalingFactor, shape: [topK], dtype: .f32, device: device)
+            let cmd = device.makeCommandBuffer()
+            Ops.castToF32(logitsT, into: logitsF32, on: cmd)
+            Ops.moeRouterTopKBiasedRowsFused(
+                logits: logitsF32, bias: biasT,
+                indicesOut: idxOut, weightsOut: wOutF32,
+                t: 1, nExperts: nExperts, k: topK, on: cmd)
+            _ = Ops.mul(wOutF32, scaleVec, on: cmd, into: wOutF32)
+            Ops.castF32ToBf16(wOutF32, into: wOutBF16, on: cmd)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+            let idxGPU = idxOut.toArray(as: UInt32.self).map { Int($0) }
+            let wGPU = wOutBF16.toFloatArray()
+
+            #expect(
+                Set(idxGPU) == Set(indsRef),
+                Comment(
+                    rawValue: "GPU ids \(idxGPU.sorted()) vs CPU ids \(indsRef.sorted()) "
+                        + "(large common-mode bias case)"))
+
+            var refByID: [Int: Float] = [:]
+            for (i, id) in indsRef.enumerated() { refByID[id] = weightsRef[i] }
+            for (i, id) in idxGPU.enumerated() {
+                guard let expected = refByID[id] else { continue }
+                #expect(
+                    abs(wGPU[i] - expected) < 5e-3,
+                    Comment(rawValue: "expert \(id): gpu \(wGPU[i]) vs cpu \(expected)"))
+            }
+        }
+    }
 }

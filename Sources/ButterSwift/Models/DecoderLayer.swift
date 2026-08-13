@@ -56,6 +56,25 @@ public protocol DecoderLayer: Module {
         cmd: MTLCommandBuffer, device: Device
     ) -> Tensor
 
+    /// Whether `decode(...)` deviates from the "does not commit"
+    /// contract above and commits (+ waits on) `cmd` internally.
+    /// Default `false`. A hybrid model's decode loop (e.g.
+    /// `NemotronHModel.forward`) checks this per layer to decide
+    /// whether it's safe to keep batching dispatches onto one shared
+    /// command buffer across a layer boundary, or whether it must
+    /// hand the layer a fresh buffer because the previous one is
+    /// already spent.
+    ///
+    /// The only layers that need `true` are ones whose routing (or
+    /// other per-token control flow) genuinely requires a host
+    /// readback mid-layer — e.g. a CPU top-K MoE router that reads
+    /// logits back with `toFloatArray()`. Prefer keeping this `false`
+    /// (GPU-resident routing/control-flow) wherever the kernels exist
+    /// to do so; a layer whose commit is load-bearing today may be a
+    /// candidate for the same GPU-router treatment `NemotronHNvfp4MoELayer`
+    /// went through — see its `usesGpuRouter` / `decodeGPURouted`.
+    var commitsMidDecode: Bool { get }
+
     /// Layer-local **multi-token** decode — process `nRows` consecutive
     /// positions in one logical call. `h` is `[nRows, hidden]`; the
     /// returned tensor is `[nRows, hidden]`. The starting absolute
@@ -78,6 +97,11 @@ public protocol DecoderLayer: Module {
 }
 
 extension DecoderLayer {
+    /// Default: matches the protocol's stated `decode` contract — no
+    /// internal commit. Override to `true` for the documented
+    /// exception (see the requirement's doc above).
+    public var commitsMidDecode: Bool { false }
+
     /// Default `decodeMulti`: loop `decode(...)` per row on the same
     /// `cmd`. Correct + commit-count-batched, but every dispatch
     /// inside `decode(...)` still runs per-token. Attention layers

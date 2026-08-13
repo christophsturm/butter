@@ -252,6 +252,35 @@ func dequantFp8ToDType(
     return out
 }
 
+/// Write a host `[Float]` array into a fresh tensor of the requested
+/// dtype — same round-to-nearest-even bf16 scheme as
+/// `dequantFp8ToDType` above (and `NemotronHText.swift`'s private
+/// `writeFloatsNH`, which this mirrors but can't call directly across
+/// files). Used to build the GPU-resident router correction-bias and
+/// routed-scaling-factor tensors the NVFP4 MoE layer's GPU router
+/// needs (see `NemotronHNvfp4MoELayer.decode`).
+private func writeFloatsAsDType(
+    _ values: [Float], shape: [Int], dtype: DType, device: Device
+) -> Tensor {
+    let out = Tensor.empty(shape: shape, dtype: dtype, device: device)
+    switch dtype {
+    case .f32:
+        out.copyIn(from: values)
+    case .f16:
+        out.copyIn(from: values.map { Float16($0) })
+    case .bf16:
+        out.copyIn(
+            from: values.map { v -> UInt16 in
+                let bits = v.bitPattern
+                let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
+                return UInt16(rounded >> 16)
+            })
+    default:
+        preconditionFailure("writeFloatsAsDType: unsupported dtype \(dtype)")
+    }
+    return out
+}
+
 /// Load a projection weight that MAY be static-FP8 quantized (HF's
 /// `<base>.weight` (f8_e4m3, read as raw `.u8`) + `<base>.weight_scale`
 /// (f32 scalar) + `<base>.input_scale` (f32, unused — Butter keeps
@@ -415,12 +444,86 @@ public final class NemotronHNvfp4MoELayer: Module, DecoderLayer {
     public let normTopkProb: Bool
     let dtype: DType
 
+    // ─── GPU-resident routing (F-126 perf wave) ───────────────────────
+    // Allocated once at load time — topK/nRouted/dtype are fixed for
+    // the lifetime of a loaded model, so these are plain `let` scratch
+    // buffers rather than the lazily-reallocated pattern `MoELayer`
+    // uses for its more configuration-varied Laguna paths. See
+    // `decode` for how they replace the CPU commit+wait router.
+    //
+    // The whole routing chain (logits, bias, biased-score comparison,
+    // unbiased-weight sum) runs in **f32**, not the model's bf16
+    // activation dtype — measured, not assumed: this checkpoint's
+    // `e_score_correction_bias` sits on a ~40.7 common-mode offset
+    // with per-expert deltas of ~0.01 riding on top (an auxiliary-
+    // load-balancing bias that drifted well off zero during
+    // training). bf16 has ~8 mantissa bits (~0.4% relative precision)
+    // — at a base of ~40.7 that's an LSB spacing around 0.16-0.3,
+    // completely swallowing the ~0.01 deltas that actually
+    // discriminate between experts, so the bf16-typed fused router
+    // kernel (which itself rounds the biased score to `bfloat` before
+    // comparing — see its module doc) was picking essentially
+    // *arbitrary* experts. mlx-lm and this file's own CPU path both
+    // keep the correction bias in f32 for exactly this reason (see
+    // `loadNemotronHStackedNvfp4Experts`'s prefix doc / the "kept in
+    // fp32" comment on `NemotronHMoELayer.eScoreCorrectionBias`) — the
+    // GPU path has to match that precision, not just the activation
+    // dtype, to select the SAME experts. The f32 `iron_moe_router
+    // _topk_biased_rows_fused_f32` kernel variant has no such
+    // intermediate rounding.
+    let eScoreCorrectionBiasGPU: Tensor  // [nRouted] f32.
+    let routerLogitsF32Scratch: Tensor  // [nRouted] f32 — upcast of the bf16 router GEMV output.
+    let routerIndicesScratch: Tensor  // [topK] u32 — GPU top-K output.
+    let routerWeightsF32Scratch: Tensor  // [topK] f32 — GPU top-K output (pre-scaling).
+    let routerWeightsScratch: Tensor  // [topK], dtype-matched — final scaled weights, downcast for the combine.
+    let routedScaleVecF32: Tensor?  // [topK] f32, filled with routedScalingFactor; nil when 1.0.
+
+    /// GPU-resident sigmoid+bias top-K routing, default ON. Set
+    /// `BUTTER_NEMOTRON_NVFP4_GPU_ROUTER=0` to fall back to the
+    /// original per-layer CPU commit+wait router (46 waits/token on
+    /// the published Lightning 23-MoE-layer stack) for A/B comparison
+    /// or regression triage. `decode`'s branch and `commitsMidDecode`
+    /// below must stay in lockstep with this flag — the outer decode
+    /// loop (`NemotronHModel.forward`) uses `commitsMidDecode` to
+    /// decide whether it's safe to batch this layer onto the same
+    /// command buffer as its neighbours.
+    static let gpuRouterEnabled = ButterEnv["BUTTER_NEMOTRON_NVFP4_GPU_ROUTER"] != "0"
+
+    /// Diagnostic only — `BUTTER_NEMOTRON_DEBUG_ROUTING=1` prints each
+    /// layer's chosen expert-id set (GPU or CPU path, whichever is
+    /// active) to stderr in call order, for direct A/B diffing between
+    /// a GPU-routed run and a `BUTTON_NEMOTRON_NVFP4_GPU_ROUTER=0`
+    /// CPU-routed run of the identical prompt. Forces an extra
+    /// mid-decode commit+wait when on the GPU path (see
+    /// `decodeGPURouted`) — never enable for a perf measurement.
+    static let debugRoutingEnabled = ButterEnv["BUTTER_NEMOTRON_DEBUG_ROUTING"] == "1"
+    nonisolated(unsafe) static var debugCallCounter = 0
+
+    /// Whether this instance actually takes the GPU-router branch.
+    /// `iron_moe_router_topk_biased_rows_fused` always renormalizes the
+    /// chosen weights to sum-to-1 (see its kernel doc) — the exact
+    /// behaviour of the CPU path's `if topK > 1 && normTopkProb`
+    /// branch. Every shipped Lightning checkpoint sets `normTopkProb`
+    /// and `topK == 6`, but guard both explicitly rather than assume:
+    /// a future checkpoint with `normTopkProb == false` or `topK == 1`
+    /// falls back to the CPU router instead of silently renormalizing
+    /// weights the CPU reference wouldn't.
+    var usesGpuRouter: Bool { Self.gpuRouterEnabled && normTopkProb && topK > 1 }
+
+    /// `DecoderLayer.commitsMidDecode` — see the protocol doc. `true`
+    /// only when the CPU-router fallback is active (it still needs a
+    /// host readback of the router logits, exactly like the sibling
+    /// `NemotronHMoELayer`); the default GPU-routed path never commits
+    /// `cmd` internally.
+    public var commitsMidDecode: Bool { !usesGpuRouter || Self.debugRoutingEnabled }
+
     init(
         norm: RMSNorm, gate: AnyLinear, eScoreCorrectionBias: [Float],
         stacked: NemotronHStackedNvfp4Experts,
         sharedUp: Nvfp4Linear?, sharedDown: Nvfp4Linear?,
         hidden: Int, topK: Int,
-        routedScalingFactor: Float, normTopkProb: Bool, dtype: DType
+        routedScalingFactor: Float, normTopkProb: Bool, dtype: DType,
+        device: Device
     ) {
         precondition(
             topK > 0 && topK <= stacked.numExperts,
@@ -437,6 +540,16 @@ public final class NemotronHNvfp4MoELayer: Module, DecoderLayer {
         self.routedScalingFactor = routedScalingFactor
         self.normTopkProb = normTopkProb
         self.dtype = dtype
+        self.eScoreCorrectionBiasGPU = writeFloatsAsDType(
+            eScoreCorrectionBias, shape: [stacked.numExperts], dtype: .f32, device: device)
+        self.routerLogitsF32Scratch = Tensor.empty(shape: [stacked.numExperts], dtype: .f32, device: device)
+        self.routerIndicesScratch = Tensor.empty(shape: [topK], dtype: .u32, device: device)
+        self.routerWeightsF32Scratch = Tensor.empty(shape: [topK], dtype: .f32, device: device)
+        self.routerWeightsScratch = Tensor.empty(shape: [topK], dtype: dtype, device: device)
+        self.routedScaleVecF32 =
+            routedScalingFactor == 1.0
+            ? nil
+            : Tensor.filled(routedScalingFactor, shape: [topK], dtype: .f32, device: device)
     }
 
     public func parameters() -> [(String, Tensor)] {
@@ -450,13 +563,198 @@ public final class NemotronHNvfp4MoELayer: Module, DecoderLayer {
         return out
     }
 
-    /// `DecoderLayer` conformance. Commits `cmd` and returns a
-    /// fully-resident tensor produced on a fresh internal buffer — same
-    /// command-buffer contract as `NemotronHMoELayer.decode`.
+    /// `DecoderLayer` conformance. Dispatches to the GPU-routed fast
+    /// path (default) or the CPU-routed fallback
+    /// (`BUTTER_NEMOTRON_NVFP4_GPU_ROUTER=0`) — see `usesGpuRouter`.
     public func decode(
         _ h: Tensor, position _: Int,
         cache _: any LayerCacheProtocol,
         cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        if usesGpuRouter {
+            return decodeGPURouted(h, cmd: cmd, device: device)
+        }
+        return decodeCPURouted(h, cmd: cmd, device: device)
+    }
+
+    /// F-126 perf wave: sigmoid+bias top-K routing stays entirely on
+    /// the GPU — no host readback, no mid-decode commit. Everything
+    /// queues onto the caller's `cmd`; the caller (the outer
+    /// `NemotronHModel.forward` loop, or a unit test) commits once at
+    /// the end of the token. Mirrors the Mamba/Attention/MLP layers'
+    /// contract exactly (see `DecoderLayer.decode`'s doc: "does not
+    /// commit").
+    ///
+    /// Routing chain:
+    ///   1. `Ops.moeRouterTopKBiasedRowsFused` — one dispatch computes
+    ///      `sigmoid(logit) + bias` per expert, top-K by the biased
+    ///      score, and writes `topK` indices/weights (weights =
+    ///      unbiased sigmoid, renormalized to sum-to-1 — same
+    ///      `normTopkProb` semantics as the CPU path's `finalScores /
+    ///      sum` branch; see `usesGpuRouter`'s doc for why that guard
+    ///      exists).
+    ///   2. Multiply the weights buffer in place by
+    ///      `routedScalingFactor` (`Ops.mul`, GPU-resident constant
+    ///      vector) — replaces the CPU path's
+    ///      `finalScores.map { $0 * routedScalingFactor }`.
+    ///   3. Per-slot expert-id tensors are zero-copy VIEWS into
+    ///      `routerIndicesScratch` (different byte offset, same
+    ///      buffer) — `Ops.nvfp4DequantGemvExpertIndexedMany` reads
+    ///      the expert id device-side per dispatch, so no per-slot
+    ///      host `memcpy` into a fresh 4-byte buffer is needed (the
+    ///      CPU path's `idxTensors` loop).
+    ///   4. The weighted combine reads each slot's scalar weight the
+    ///      same way — a `[1]`-shaped view into `routerWeightsScratch`
+    ///      — via `Ops.headGateMul` (broadcast multiply: `head_dim ==
+    ///      hidden` makes every element of the `[hidden]` down output
+    ///      read the same single gate scalar), instead of the CPU
+    ///      path's `Tensor.filled(hostFloat, shape: [hidden], ...)`.
+    private func decodeGPURouted(
+        _ h: Tensor, cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let xNorm = norm(h, on: cmd)
+        let logitsTensor = gate(xNorm, on: cmd)
+
+        // Routing math runs in f32 throughout (logits upcast, bias
+        // already f32, biased-score compare + unbiased-weight sum both
+        // in the f32 kernel variant) — see the file-scope doc on
+        // `eScoreCorrectionBiasGPU` for why bf16 silently breaks
+        // selection on this checkpoint's correction-bias distribution.
+        Ops.castToF32(logitsTensor, into: routerLogitsF32Scratch, on: cmd)
+        Ops.moeRouterTopKBiasedRowsFused(
+            logits: routerLogitsF32Scratch, bias: eScoreCorrectionBiasGPU,
+            indicesOut: routerIndicesScratch, weightsOut: routerWeightsF32Scratch,
+            t: 1, nExperts: nRouted, k: topK, on: cmd)
+        if let scaleVec = routedScaleVecF32 {
+            _ = Ops.mul(
+                routerWeightsF32Scratch, scaleVec, on: cmd, into: routerWeightsF32Scratch)
+        }
+        // Final combine weights only need to match `dtype` (the down-
+        // projection output's precision) — downcast once here, after
+        // all the precision-sensitive routing math is done.
+        if dtype == .f32 {
+            Ops.copy(routerWeightsF32Scratch, into: routerWeightsScratch, on: cmd)
+        } else if dtype == .bf16 {
+            Ops.castF32ToBf16(routerWeightsF32Scratch, into: routerWeightsScratch, on: cmd)
+        } else {
+            fatalError(
+                "NemotronHNvfp4MoELayer.decodeGPURouted: unsupported activation dtype \(dtype) "
+                    + "(only f32/bf16 have a routing-weights downcast wired)")
+        }
+
+        // DEBUG ONLY (`BUTTER_NEMOTRON_DEBUG_ROUTING=1`): force a sync
+        // to print the chosen expert-id set for cross-checking against
+        // `decodeCPURouted`'s CPU router, call-for-call. This is the
+        // ONE place the GPU path ever commits `cmd` — doing so forces
+        // `commitsMidDecode` to report `true` while the flag is set
+        // (see below), so the outer forward loop hands every following
+        // layer a fresh buffer, exactly like the CPU-routed layer kind.
+        // `workCmd` is `cmd` unchanged when the flag is off (the normal,
+        // zero-commit fast path).
+        var workCmd = cmd
+        if Self.debugRoutingEnabled {
+            workCmd.commit()
+            workCmd.waitUntilCompleted()
+            let n = Self.debugCallCounter
+            Self.debugCallCounter += 1
+            let ids = routerIndicesScratch.toArray(as: UInt32.self).sorted()
+            FileHandle.standardError.write("[route-gpu] call=\(n) ids=\(ids)\n".data(using: .utf8)!)
+            if n == 0 {
+                let l8 = logitsTensor.toFloatArray().prefix(8)
+                let b8 = eScoreCorrectionBiasGPU.toFloatArray().prefix(8)
+                let w6 = routerWeightsScratch.toFloatArray()
+                FileHandle.standardError.write(
+                    "[route-gpu] call=0 logits[0..8]=\(Array(l8)) bias[0..8]=\(Array(b8)) weights=\(w6)\n"
+                        .data(using: .utf8)!)
+            }
+            workCmd = device.makeCommandBuffer()
+        }
+
+        let moeIntermediate = stacked.moeIntermediate
+        var idxTensors: [Tensor] = []
+        idxTensors.reserveCapacity(topK)
+        for slot in 0 ..< topK {
+            idxTensors.append(
+                Tensor(
+                    buffer: routerIndicesScratch.buffer,
+                    offset: routerIndicesScratch.offset + slot * DType.u32.byteSize,
+                    shape: [1], dtype: .u32))
+        }
+
+        // ── Routed experts — two batched gather-GEMV dispatches ──────
+        let upIns = Array(repeating: xNorm, count: topK)
+        var upOuts: [Tensor] = []
+        for _ in 0 ..< topK {
+            upOuts.append(Tensor.empty(shape: [moeIntermediate], dtype: dtype, device: device))
+        }
+        let upWeights = Array(repeating: stacked.upWeight, count: topK)
+        let upScalesArr = Array(repeating: stacked.upScales, count: topK)
+        Ops.nvfp4DequantGemvExpertIndexedMany(
+            weightsStacked: upWeights, scalesStacked: upScalesArr,
+            inputs: upIns, expertIndices: idxTensors, outputs: upOuts,
+            blockSize: stacked.blockSize, global: 1.0, on: workCmd)
+
+        // relu(up)^2 per slot, in place into a fresh "inner" buffer.
+        var innerOuts: [Tensor] = []
+        for slot in 0 ..< topK {
+            let r = Ops.relu(upOuts[slot], on: workCmd)
+            innerOuts.append(Ops.mul(r, r, on: workCmd))
+        }
+
+        var downOuts: [Tensor] = []
+        for _ in 0 ..< topK {
+            downOuts.append(Tensor.empty(shape: [hidden], dtype: dtype, device: device))
+        }
+        let downWeights = Array(repeating: stacked.downWeight, count: topK)
+        let downScalesArr = Array(repeating: stacked.downScales, count: topK)
+        Ops.nvfp4DequantGemvExpertIndexedMany(
+            weightsStacked: downWeights, scalesStacked: downScalesArr,
+            inputs: innerOuts, expertIndices: idxTensors, outputs: downOuts,
+            blockSize: stacked.blockSize, global: 1.0, on: workCmd)
+
+        // ── Weighted sum over the topK selected experts — per-slot
+        //    scale reads straight from the GPU router-weights buffer,
+        //    no host float involved. ─────────────────────────────────
+        var accumulator: Tensor?
+        for slot in 0 ..< topK {
+            let wSlot = Tensor(
+                buffer: routerWeightsScratch.buffer,
+                offset: routerWeightsScratch.offset + slot * dtype.byteSize,
+                shape: [1], dtype: dtype)
+            let scaled = Ops.headGateMul(
+                attn: downOuts[slot], gate: wSlot, headDim: hidden, on: workCmd)
+            accumulator =
+                accumulator.map { Ops.add($0, scaled, on: workCmd) } ?? scaled
+        }
+
+        // ── Shared expert — always-on, plain NVFP4 GEMV pair ──────────
+        if let su = sharedUp, let sd = sharedDown {
+            let sUp = su(xNorm, on: workCmd)
+            let sR = Ops.relu(sUp, on: workCmd)
+            let sInner = Ops.mul(sR, sR, on: workCmd)
+            let sharedOut = sd(sInner, on: workCmd)
+            accumulator =
+                accumulator.map { Ops.add($0, sharedOut, on: workCmd) } ?? sharedOut
+        }
+
+        let routedOut = accumulator!
+        let result = Ops.add(h, routedOut, on: workCmd)
+        if Self.debugRoutingEnabled {
+            workCmd.commit()
+            workCmd.waitUntilCompleted()
+        }
+        return result
+    }
+
+    /// Original CPU-routed path — commits `cmd` and returns a
+    /// fully-resident tensor produced on a fresh internal buffer, same
+    /// command-buffer contract as `NemotronHMoELayer.decode`. Kept as
+    /// the `BUTTER_NEMOTRON_NVFP4_GPU_ROUTER=0` fallback (see
+    /// `usesGpuRouter`) — untouched by the F-126 perf wave, so it
+    /// remains a ground-truth reference for A/B token-match checks
+    /// against `decodeGPURouted` above.
+    private func decodeCPURouted(
+        _ h: Tensor, cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
         // ── Pre-mixer RMSNorm + router GEMV on the caller's buffer ───
         let xNorm = norm(h, on: cmd)
@@ -480,6 +778,18 @@ public final class NemotronHNvfp4MoELayer: Module, DecoderLayer {
             return a < b
         }
         let inds = Array(order.prefix(topK))
+        if Self.debugRoutingEnabled {
+            let n = Self.debugCallCounter
+            Self.debugCallCounter += 1
+            FileHandle.standardError.write(
+                "[route-cpu] call=\(n) ids=\(inds.sorted())\n".data(using: .utf8)!)
+            if n == 0 {
+                let msg =
+                    "[route-cpu] call=0 logits[0..8]=\(Array(logits.prefix(8))) "
+                    + "bias[0..8]=\(Array(eScoreCorrectionBiasHost.prefix(8)))\n"
+                FileHandle.standardError.write(msg.data(using: .utf8)!)
+            }
+        }
         var finalScores = inds.map { origScores[$0] }
         if topK > 1 && normTopkProb {
             let sum = finalScores.reduce(0, +) + 1e-20
