@@ -58,11 +58,22 @@ extension MuseGlimmerModel {
     /// concatenated in the order given) alongside the usual logits.
     /// Mirrors `forward(tokenId:position:...)` exactly (same private-
     /// command-buffer discipline, same cache append) plus the capture.
+    ///
+    /// OWNERSHIP: never encodes onto `cmd` — allocates and commits its
+    /// own internal buffer(s), returning only once both results are
+    /// host-resident. Callers must NOT `cmd.commit()` /
+    /// `cmd.waitUntilCompleted()` the buffer they passed in (a
+    /// diagnosed cause of a wedged Metal queue in `DFlashSpecDecode`'s
+    /// prefill/verify/replay loop — see that file's header).
     public func forwardOneWithFeatures(
         tokenId: Int, position: Int, targetLayerIDs: [Int],
         caches: [any LayerCacheProtocol],
         on cmd: MTLCommandBuffer, device: Device
     ) -> (logits: Tensor, features: Tensor) {
+        precondition(
+            cmd.status == .notEnqueued,
+            "MuseGlimmerModel.forwardOneWithFeatures: cmd must be a fresh, uncommitted buffer — "
+                + "this function never encodes onto it and commits its own internal buffer instead")
         let tap = InspectTap.fromEnvironment
         let targetSet = Set(targetLayerIDs)
 
@@ -117,11 +128,150 @@ extension MuseGlimmerModel {
         return (logits, features)
     }
 
+    /// Chained sibling of `forwardOneWithFeatures` for REPLAYING a
+    /// sequence of single-token steps — same per-token single-token
+    /// kernel path (`layer.forward`, NOT the batched `forwardMulti`
+    /// path — see `DFlashSpecDecode.swift`'s EXACTNESS DISCIPLINE
+    /// section for why replay specifically needs the single-token
+    /// kernel), but all `tokens.count` steps' work is encoded onto ONE
+    /// command buffer with ONE commit+wait at the end, instead of
+    /// `tokens.count` separate self-committing calls.
+    ///
+    /// Correctness: each step's KV cache append only depends on
+    /// PRECEDING steps' appends already being encoded earlier on the
+    /// SAME command buffer — Metal executes one buffer's encoded
+    /// commands in encode order, so this needs no inter-step host
+    /// synchronization (unlike, say, the bail loop, where each step's
+    /// INPUT token depends on the PREVIOUS step's own OUTPUT argmax —
+    /// a genuine data dependency that can't be chained this way).
+    /// `tokens` here must already be the exact resolved (tokenId,
+    /// position) sequence to replay.
+    ///
+    /// Returns the LAST step's logits (softcap applied, matching
+    /// `forwardOneWithFeatures`) and one features row per step, in
+    /// input order.
+    ///
+    /// OWNERSHIP: allocates and commits its own internal buffer,
+    /// exactly once for the whole chain — never touches the caller's
+    /// `cmd`. Motivation: collapsing N self-committing round trips
+    /// into 1 cuts this driver's total command-buffer submission count
+    /// dramatically once every DFlash cycle replays unconditionally
+    /// (see `DFlashSpecDecode.swift`'s EXACTNESS DISCIPLINE section) —
+    /// a diagnosed contributor to a sustained-load Metal queue wedge
+    /// (`IOGPUCommandQueueSubmitCommandBuffers` never returning) on
+    /// long gate runs. Reducing round-trip COUNT is the lever; per-call
+    /// `autoreleasepool` wrapping (also applied at every call site)
+    /// only bounds ARC/ObjC object lifetime, not GPU-driver-side
+    /// command-buffer tracking state, so it alone did not resolve the
+    /// wedge — this does the actual work of cutting submission volume.
+    public func forwardManySingleStepChained(
+        tokens: [(tokenId: Int, position: Int)], targetLayerIDs: [Int],
+        caches: [any LayerCacheProtocol],
+        device: Device
+    ) -> (lastLogits: Tensor, featureRows: [Tensor]) {
+        precondition(
+            !tokens.isEmpty,
+            "MuseGlimmerModel.forwardManySingleStepChained: tokens must be non-empty")
+        let tap = InspectTap.fromEnvironment
+        let featureCount = targetLayerIDs.count
+        // layer index -> its position within targetLayerIDs (matching
+        // `concatFeatures`' `order.enumerated()` — needed since a
+        // layer's OWN index and its rank among the target layers can
+        // differ, e.g. targetLayerIDs = [1, 13, 25, 37, 49]).
+        var layerToFeatureIndex: [Int: Int] = [:]
+        for (k, layerIdx) in targetLayerIDs.enumerated() { layerToFeatureIndex[layerIdx] = k }
+
+        // Pre-allocate ONE destination for every step's feature capture
+        // — `[tokens.count, featureCount, hidden]`, written directly
+        // (row = step, no per-step scratch tensor / no per-step
+        // concatFeatures call) so the whole chain, including feature
+        // bookkeeping, stays on the SAME command buffer.
+        var featuresDestBuf: Tensor?
+
+        var workCmd = device.makeCommandBuffer()
+        var lastRawLogits: Tensor!
+
+        for (stepIdx, step) in tokens.enumerated() {
+            let tokenBuf = device.makeBuffer(length: 4)
+            var tid = UInt32(step.tokenId)
+            memcpy(tokenBuf.contents(), &tid, 4)
+            let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
+
+            let h0 = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
+            var h = embedNorm(h0, on: workCmd)
+
+            if featuresDestBuf == nil {
+                featuresDestBuf = Tensor.empty(
+                    shape: [tokens.count, featureCount, hidden], dtype: h.dtype, device: device)
+            }
+            let featuresDest = featuresDestBuf!
+            let bytesPerRow = hidden * h.dtype.byteSize
+
+            for (i, layer) in layers.enumerated() {
+                h = layer.forward(
+                    h, position: step.position,
+                    cache: caches[i] as! any KVCacheProtocol,
+                    on: workCmd, device: device)
+                if let k = layerToFeatureIndex[i] {
+                    let dstOffset =
+                        featuresDest.offset
+                        + (stepIdx * featureCount + k) * bytesPerRow
+                    let dst = Tensor(
+                        buffer: featuresDest.buffer, offset: dstOffset, shape: [1, hidden],
+                        dtype: h.dtype)
+                    Ops.copy(h.reshaped(to: [1, hidden]), into: dst, on: workCmd)
+                }
+                if tap.shouldDump(layer: i) {
+                    workCmd.commit()
+                    workCmd.waitUntilCompleted()
+                    _ = tap.dumpLayerBoundary(
+                        h, label: "layer_out", layer: i, cmd: device.makeCommandBuffer(),
+                        device: device)
+                    workCmd = device.makeCommandBuffer()
+                }
+            }
+
+            let normed = finalNorm(h, on: workCmd)
+            let rawLogits = lmHead(normed, on: workCmd)
+            if stepIdx == tokens.count - 1 {
+                lastRawLogits = rawLogits
+            }
+        }
+
+        // `MuseGlimmerOps.softcap` ALWAYS commits+waits whatever `cmd`
+        // it's given (see its doc comment) — committing `workCmd`
+        // OURSELVES first and then handing it to `softcap` would be a
+        // double-commit (`-[IOGPUMetalCommandBuffer validate]: commit
+        // an already committed command buffer`, a hard Metal validation
+        // crash, not a silent no-op — confirmed the hard way). Exactly
+        // one of these two branches may commit `workCmd`.
+        let lastLogits: Tensor
+        if finalLogitSoftcap > 0 {
+            lastLogits = MuseGlimmerOps.softcap(
+                lastRawLogits, multiplier: outputMultiplier, cap: finalLogitSoftcap, on: workCmd)
+        } else {
+            workCmd.commit()
+            workCmd.waitUntilCompleted()
+            lastLogits = lastRawLogits
+        }
+
+        let featuresFlat = featuresDestBuf!.reshaped(to: [tokens.count, featureCount * hidden])
+        var featureRows: [Tensor] = []
+        featureRows.reserveCapacity(tokens.count)
+        for r in 0 ..< tokens.count { featureRows.append(featuresFlat.slicedRows(start: r, count: 1)) }
+        return (lastLogits, featureRows)
+    }
+
     /// Batched sibling of `forwardOneWithFeatures` — returns logits AND
     /// `targetLayerIDs` features for EVERY input row (not just the
     /// tail), needed by `DFlashSpecDecode`'s batched verify step. See
     /// this file's header for the fast-path window bound shared with
     /// `forwardMulti`.
+    ///
+    /// OWNERSHIP: same contract as `forwardOneWithFeatures` above —
+    /// never encodes onto `cmd`, commits its own internal buffer(s)
+    /// instead. Callers must NOT commit/wait `cmd` (diagnosed
+    /// queue-wedge risk — see that function's doc comment).
     public func forwardManyLogitsAndFeatures(
         tokenIds: [Int], startingAt position: Int, targetLayerIDs: [Int],
         caches: [any LayerCacheProtocol],
@@ -130,6 +280,11 @@ extension MuseGlimmerModel {
         precondition(
             !tokenIds.isEmpty,
             "MuseGlimmerModel.forwardManyLogitsAndFeatures: tokenIds must be non-empty")
+        precondition(
+            cmd.status == .notEnqueued,
+            "MuseGlimmerModel.forwardManyLogitsAndFeatures: cmd must be a fresh, uncommitted "
+                + "buffer — this function never encodes onto it and commits its own internal "
+                + "buffer instead")
         let n = tokenIds.count
         let fastPathEligible = position + n <= slidingWindow
         guard fastPathEligible else {
@@ -138,21 +293,32 @@ extension MuseGlimmerModel {
             logitsRows.reserveCapacity(n)
             featureRows.reserveCapacity(n)
             for (i, tok) in tokenIds.enumerated() {
-                let fCmd = device.makeCommandBuffer()
-                let (l, f) = forwardOneWithFeatures(
-                    tokenId: tok, position: position + i, targetLayerIDs: targetLayerIDs,
-                    caches: caches, on: fCmd, device: device)
-                fCmd.commit()
-                fCmd.waitUntilCompleted()
+                // `forwardOneWithFeatures` self-commits+waits its own
+                // private buffer and never touches `fCmd` — do NOT
+                // commit/wait `fCmd` here (see that function's doc
+                // comment above; this was the same double-commit
+                // pattern diagnosed in `DFlashSpecDecode`'s call sites).
+                //
+                // `autoreleasepool` per token — same cooperative-
+                // executor rationale as `forwardMulti`'s sibling
+                // fallback loop.
+                let (l, f) = autoreleasepool { () -> (Tensor, Tensor) in
+                    let fCmd = device.makeCommandBuffer()
+                    return forwardOneWithFeatures(
+                        tokenId: tok, position: position + i, targetLayerIDs: targetLayerIDs,
+                        caches: caches, on: fCmd, device: device)
+                }
                 logitsRows.append(l)
                 featureRows.append(f)
             }
-            let stackCmd = device.makeCommandBuffer()
-            let logits = stackRows(logitsRows, device: device, on: stackCmd)
-            let features = stackRows(featureRows, device: device, on: stackCmd)
-            stackCmd.commit()
-            stackCmd.waitUntilCompleted()
-            return (logits, features)
+            return autoreleasepool { () -> (Tensor, Tensor) in
+                let stackCmd = device.makeCommandBuffer()
+                let logits = stackRows(logitsRows, device: device, on: stackCmd)
+                let features = stackRows(featureRows, device: device, on: stackCmd)
+                stackCmd.commit()
+                stackCmd.waitUntilCompleted()
+                return (logits, features)
+            }
         }
 
         let workCmd = device.makeCommandBuffer()

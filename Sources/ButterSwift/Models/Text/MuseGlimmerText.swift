@@ -696,12 +696,27 @@ public final class MuseGlimmerModel: LanguageModel {
     /// reads it. `cmd` stays pristine throughout; the caller's later
     /// `cmd.commit()` (in `forwardSample` / the `LanguageModel` default
     /// `forward(...)`) is a true no-op over the already-resident return
-    /// value — never a double-commit.
+    /// value.
+    ///
+    /// OWNERSHIP: this function NEVER encodes onto the caller's `cmd` —
+    /// it allocates and commits its own internal buffer(s) and returns
+    /// only once the result is host-resident. Callers must NOT
+    /// `cmd.commit()` / `cmd.waitUntilCompleted()` the buffer they
+    /// passed in — an idle, never-committed buffer is fine to just let
+    /// go, but explicitly committing it later risks violating
+    /// `MTLCommandQueue`'s per-queue commit-ordering guarantee relative
+    /// to the internal buffers this call already committed (a
+    /// diagnosed cause of a wedged queue in `DFlashSpecDecode`'s
+    /// prefill/verify/replay loop — see that file's header).
     public func forward(
         tokenId: Int, position: Int,
         caches: [any LayerCacheProtocol],
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
+        precondition(
+            cmd.status == .notEnqueued,
+            "MuseGlimmerModel.forward: cmd must be a fresh, uncommitted buffer — "
+                + "this function never encodes onto it and commits its own internal buffer instead")
         let tap = InspectTap.fromEnvironment
 
         let tokenBuf = device.makeBuffer(length: 4)
@@ -786,15 +801,30 @@ public final class MuseGlimmerModel: LanguageModel {
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
         precondition(!tokenIds.isEmpty, "MuseGlimmerModel.forwardMulti: tokenIds must be non-empty")
+        precondition(
+            cmd.status == .notEnqueued,
+            "MuseGlimmerModel.forwardMulti: cmd must be a fresh, uncommitted buffer — "
+                + "this function never encodes onto it and commits its own internal buffer instead")
         let n = tokenIds.count
 
         let fastPathEligible = position + n <= slidingWindow
         guard fastPathEligible else {
             var logits: Tensor!
             for (i, tok) in tokenIds.enumerated() {
-                logits = forward(
-                    tokenId: tok, position: position + i,
-                    caches: caches, on: cmd, device: device)
+                // `autoreleasepool` per token — `forward(tokenId:...)`
+                // self-commits its own private buffer per call, so this
+                // loop (the long-context fallback, taken once position
+                // crosses the sliding-window bound) creates one fresh
+                // set of ObjC-bridged Metal objects per token with no
+                // implicit drain on Swift concurrency's cooperative
+                // executor — see `DFlashSpecDecode.swift`'s EXACTNESS
+                // DISCIPLINE section for the incident this guards
+                // against.
+                logits = autoreleasepool {
+                    forward(
+                        tokenId: tok, position: position + i,
+                        caches: caches, on: cmd, device: device)
+                }
             }
             return logits
         }
@@ -804,6 +834,9 @@ public final class MuseGlimmerModel: LanguageModel {
         // commit+wait its OWN buffer, never the caller's `cmd` (see that
         // function's doc comment). `cmd` stays untouched throughout;
         // the caller's later `cmd.commit()` is a true no-op.
+        //
+        // OWNERSHIP: callers must NOT commit/wait `cmd` — diagnosed
+        // queue-wedge risk, see `forward(tokenId:...)`'s doc comment.
         let workCmd = device.makeCommandBuffer()
 
         let idsBuf = device.makeBuffer(length: n * 4)
