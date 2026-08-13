@@ -64,6 +64,32 @@ public final class Device: @unchecked Sendable {
     private var cacheResidencySet: Any?
     private let cacheResidencyLock = NSLock()
 
+    /// Which residency set a `KVCache`/`ConvStateCache`/`GDNStateCache`
+    /// buffer belongs in. Both kinds are pinned for the same reason
+    /// (skip per-dispatch residency revalidation on hot decode-step
+    /// reads/writes) — the distinction is entirely about LIFETIME:
+    ///
+    /// - `.generation`: rebuilt fresh every generation/spec-decode arm
+    ///   (the overwhelming majority — every `makeLayerCaches()`
+    ///   implementation). Safe, and necessary, to bulk-release via
+    ///   `releaseGenerationCaches()` between generations, because
+    ///   nothing else in Butter holds a reference to last generation's
+    ///   cache objects once a new `makeLayerCaches()` call has run.
+    /// - `.weight`: created ONCE at model/sidecar load and reused —
+    ///   `reset()`, not recreated — across MANY generations for the
+    ///   life of the loaded model. `Qwen3xMTPHead`'s own draft KV cache
+    ///   is the one example today: it lives on the head object built at
+    ///   `Model.load` time, and every `generate()` call on that model
+    ///   calls `head.resetCache()` rather than rebuilding it. Releasing
+    ///   `.generation` residency between arms would silently drop this
+    ///   cache's driver-side fast path after the FIRST such release,
+    ///   since nothing re-adds it — so this case pins it in the same
+    ///   process-lifetime set as weights instead.
+    public enum CacheResidencyKind {
+        case generation
+        case weight
+    }
+
     public static let shared: Device = {
         // Reuse the same MTLDevice + queue IronSwift uses, so PSOs
         // and buffers are guaranteed compatible.

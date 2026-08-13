@@ -172,17 +172,29 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
 
     public convenience init(
         nKVHeads: Int, headDim: Int, maxSeq: Int, dtype: DType,
-        device: Device = .shared
+        device: Device = .shared,
+        residency: Device.CacheResidencyKind = .generation
     ) {
         self.init(
             nKVHeads: nKVHeads, headDim: headDim, maxSeq: maxSeq,
-            dtype: dtype, eviction: .unbounded, device: device)
+            dtype: dtype, eviction: .unbounded, device: device, residency: residency)
     }
 
     public init(
         nKVHeads: Int, headDim: Int, maxSeq: Int, dtype: DType,
         eviction: KVEviction,
-        device: Device = .shared
+        device: Device = .shared,
+        // Default `.generation` matches every `makeLayerCaches()`
+        // implementation (the overwhelming majority of call sites) —
+        // this cache is rebuilt fresh every generation/arm, so it's
+        // correct AND necessary for it to be bulk-released between them
+        // (see `Device.releaseGenerationCaches`). Pass `.weight`
+        // explicitly for a cache created once and reused (`reset()`,
+        // not recreated) across many generations — e.g.
+        // `Qwen3xMTPHead`'s own draft cache, built once at model load —
+        // so it stays pinned in the process-lifetime weight set instead
+        // of getting silently dropped the first time a generation ends.
+        residency: Device.CacheResidencyKind = .generation
     ) {
         self.nKVHeads = nKVHeads
         self.headDim = headDim
@@ -195,14 +207,19 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
         self.kBuffer.zero()
         self.vBuffer.zero()
         self._evictionState = KVEvictionState(policy: eviction, bufferCapacity: maxSeq)
-        // KV buffers live for the entire generation — pin them in the
-        // device's GENERATION cache residency set (NOT the weight
-        // residency set — this cache is rebuilt fresh every generation,
-        // weights are not) so per-dispatch residency tracking doesn't
-        // fire on the thousands of decode-step appends + reads. See
-        // `Device.markCacheResident`/`releaseGenerationCaches` for why
-        // this is a separate set from `markWeightsResident`.
-        device.markCacheResident([self.kBuffer.buffer, self.vBuffer.buffer])
+        // KV buffers live for the entire generation (or, for `.weight`
+        // caches, the entire process) — pin them in the appropriate
+        // residency set so per-dispatch residency tracking doesn't fire
+        // on the thousands of decode-step appends + reads. See
+        // `Device.markCacheResident`/`releaseGenerationCaches` and
+        // `Device.CacheResidencyKind` for why this is a separate set
+        // from `markWeightsResident` and why the split exists at all.
+        switch residency {
+        case .generation:
+            device.markCacheResident([self.kBuffer.buffer, self.vBuffer.buffer])
+        case .weight:
+            device.markWeightsResident([self.kBuffer.buffer, self.vBuffer.buffer])
+        }
     }
 
     /// CPU-side legacy append. Caller must have already sync'd the
