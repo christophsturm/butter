@@ -598,27 +598,43 @@ public final class NemotronHMambaLayer: Module, DecoderLayer {
             dt = Ops.softplus(dtSum, on: cmd)
         }
 
-        // (6) selective scan — dispatched per group so the shipped
-        //     single-group ssm_step kernel handles grouped B/C. Each
-        //     group owns a contiguous head sub-slab in x / state / y.
+        // (6) selective scan. F-130 grouped-SSM fuse: default ON, one
+        //     dispatch spanning every (head, channel) pair instead of
+        //     `nGroups` separate per-group dispatches — see
+        //     NemotronHMambaGroupedSSMFuse for the bit-exactness
+        //     contract. `BUTTER_NEMOTRON_SSM_GROUPED=0` restores the
+        //     original per-group loop (the shipped single-group
+        //     `ssm_step` kernel dispatched once per group, each on a
+        //     host-sliced sub-view).
         let y = Tensor.empty(shape: [nHeads, headDim], dtype: dtype, device: device)
         let xHeads = x.reshaped(to: [nHeads, headDim])
         let stateHeads = layerCache.ssm.h  // [nHeads, headDim, stateDim]
-        for g in 0 ..< nGroups {
-            let h0 = g * headsPerGroup
-            let xg = xHeads.slicedRows(start: h0, count: headsPerGroup)
-                .reshaped(to: [headsPerGroup * headDim])
-            let yg = y.slicedRows(start: h0, count: headsPerGroup)
-            let stateG = stateHeads.slicedRows(start: h0, count: headsPerGroup)
-            let aG = aEff.slicedRows(start: h0, count: headsPerGroup)
-            let dtG = dt.slicedRows(start: h0, count: headsPerGroup)
-            let bG = bAll.slicedRows(start: g, count: 1).reshaped(to: [stateDim])
-            let cG = cAll.slicedRows(start: g, count: 1).reshaped(to: [stateDim])
-            Ops.ssmStep(
-                x: xg, a: aG, b: bG, c: cG, dt: dtG,
-                state: stateG, into: yg,
-                nHeads: headsPerGroup, headDim: headDim, stateDim: stateDim,
-                on: cmd)
+        let bFlat = bAll.reshaped(to: [nGroups * stateDim])
+        let cFlat = cAll.reshaped(to: [nGroups * stateDim])
+        if NemotronHMambaGroupedSSMFuse.enabled {
+            NemotronHMambaGroupedSSMFuse.ssmStepGrouped(
+                x: x, a: aEff, b: bFlat, c: cFlat, dt: dt,
+                state: stateHeads, into: y,
+                nHeads: nHeads, headDim: headDim, stateDim: stateDim,
+                headsPerGroup: headsPerGroup,
+                on: cmd, device: device)
+        } else {
+            for g in 0 ..< nGroups {
+                let h0 = g * headsPerGroup
+                let xg = xHeads.slicedRows(start: h0, count: headsPerGroup)
+                    .reshaped(to: [headsPerGroup * headDim])
+                let yg = y.slicedRows(start: h0, count: headsPerGroup)
+                let stateG = stateHeads.slicedRows(start: h0, count: headsPerGroup)
+                let aG = aEff.slicedRows(start: h0, count: headsPerGroup)
+                let dtG = dt.slicedRows(start: h0, count: headsPerGroup)
+                let bG = bAll.slicedRows(start: g, count: 1).reshaped(to: [stateDim])
+                let cG = cAll.slicedRows(start: g, count: 1).reshaped(to: [stateDim])
+                Ops.ssmStep(
+                    x: xg, a: aG, b: bG, c: cG, dt: dtG,
+                    state: stateG, into: yg,
+                    nHeads: headsPerGroup, headDim: headDim, stateDim: stateDim,
+                    on: cmd)
+            }
         }
         let yFlat = y.reshaped(to: [dInner])
 
