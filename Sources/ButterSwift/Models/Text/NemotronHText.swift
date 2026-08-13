@@ -586,43 +586,88 @@ public final class NemotronHMambaLayer: Module, DecoderLayer {
         )
         .reshaped(to: [nGroups, stateDim])
 
-        // (5) dt = softplus(dt_raw + dt_bias).
-        let dtSum = Ops.add(dtRaw, dtBias, on: cmd)
-        let dt = Ops.softplus(dtSum, on: cmd)
+        // (5) dt = softplus(dt_raw + dt_bias). F-129 mixer-fuse: one
+        // dispatch instead of two — see NemotronHMambaMixerFuse for the
+        // bit-exactness contract. Default OFF: bit-exact in local dev
+        // but CI's GPU recorded 142/512 bf16 mismatches for the same
+        // test (gh run 31712976150) — a transcendental-unit hazard, not
+        // a formula bug. Opt in with `BUTTER_NEMOTRON_MIXER_FUSE_SOFTPLUS
+        // =1` only where bit-exactness has been independently
+        // reconfirmed.
+        let dt: Tensor
+        if NemotronHMambaMixerFuse.softplusEnabled {
+            dt = NemotronHMambaMixerFuse.addSoftplus(dtRaw, dtBias, on: cmd, device: device)
+        } else {
+            let dtSum = Ops.add(dtRaw, dtBias, on: cmd)
+            dt = Ops.softplus(dtSum, on: cmd)
+        }
 
-        // (6) selective scan — dispatched per group so the shipped
-        //     single-group ssm_step kernel handles grouped B/C. Each
-        //     group owns a contiguous head sub-slab in x / state / y.
+        // (6) selective scan. F-130 grouped-SSM fuse: default ON, one
+        //     dispatch spanning every (head, channel) pair instead of
+        //     `nGroups` separate per-group dispatches — see
+        //     NemotronHMambaGroupedSSMFuse for the bit-exactness
+        //     contract. `BUTTER_NEMOTRON_SSM_GROUPED=0` restores the
+        //     original per-group loop (the shipped single-group
+        //     `ssm_step` kernel dispatched once per group, each on a
+        //     host-sliced sub-view).
         let y = Tensor.empty(shape: [nHeads, headDim], dtype: dtype, device: device)
         let xHeads = x.reshaped(to: [nHeads, headDim])
         let stateHeads = layerCache.ssm.h  // [nHeads, headDim, stateDim]
-        for g in 0 ..< nGroups {
-            let h0 = g * headsPerGroup
-            let xg = xHeads.slicedRows(start: h0, count: headsPerGroup)
-                .reshaped(to: [headsPerGroup * headDim])
-            let yg = y.slicedRows(start: h0, count: headsPerGroup)
-            let stateG = stateHeads.slicedRows(start: h0, count: headsPerGroup)
-            let aG = aEff.slicedRows(start: h0, count: headsPerGroup)
-            let dtG = dt.slicedRows(start: h0, count: headsPerGroup)
-            let bG = bAll.slicedRows(start: g, count: 1).reshaped(to: [stateDim])
-            let cG = cAll.slicedRows(start: g, count: 1).reshaped(to: [stateDim])
-            Ops.ssmStep(
-                x: xg, a: aG, b: bG, c: cG, dt: dtG,
-                state: stateG, into: yg,
-                nHeads: headsPerGroup, headDim: headDim, stateDim: stateDim,
-                on: cmd)
+        let bFlat = bAll.reshaped(to: [nGroups * stateDim])
+        let cFlat = cAll.reshaped(to: [nGroups * stateDim])
+        if NemotronHMambaGroupedSSMFuse.enabled {
+            NemotronHMambaGroupedSSMFuse.ssmStepGrouped(
+                x: x, a: aEff, b: bFlat, c: cFlat, dt: dt,
+                state: stateHeads, into: y,
+                nHeads: nHeads, headDim: headDim, stateDim: stateDim,
+                headsPerGroup: headsPerGroup,
+                on: cmd, device: device)
+        } else {
+            for g in 0 ..< nGroups {
+                let h0 = g * headsPerGroup
+                let xg = xHeads.slicedRows(start: h0, count: headsPerGroup)
+                    .reshaped(to: [headsPerGroup * headDim])
+                let yg = y.slicedRows(start: h0, count: headsPerGroup)
+                let stateG = stateHeads.slicedRows(start: h0, count: headsPerGroup)
+                let aG = aEff.slicedRows(start: h0, count: headsPerGroup)
+                let dtG = dt.slicedRows(start: h0, count: headsPerGroup)
+                let bG = bAll.slicedRows(start: g, count: 1).reshaped(to: [stateDim])
+                let cG = cAll.slicedRows(start: g, count: 1).reshaped(to: [stateDim])
+                Ops.ssmStep(
+                    x: xg, a: aG, b: bG, c: cG, dt: dtG,
+                    state: stateG, into: yg,
+                    nHeads: headsPerGroup, headDim: headDim, stateDim: stateDim,
+                    on: cmd)
+            }
         }
         let yFlat = y.reshaped(to: [dInner])
 
-        // (7) skip: y += D_tiled * x.
-        let dx = Ops.mul(dTiled, x, on: cmd)
-        let ySkip = Ops.add(yFlat, dx, on: cmd)
+        // (7) skip: y += D_tiled * x. F-129 mixer-fuse: default ON —
+        //     pure mul+add, no transcendentals, bit-exact on both local
+        //     dev and CI (unlike addSoftplus above).
+        let ySkip: Tensor
+        if NemotronHMambaMixerFuse.enabled {
+            ySkip = NemotronHMambaMixerFuse.addMul(base: yFlat, dTiled, x, on: cmd, device: device)
+        } else {
+            let dx = Ops.mul(dTiled, x, on: cmd)
+            ySkip = Ops.add(yFlat, dx, on: cmd)
+        }
 
         // (8) gated mixer RMSNorm: y *= silu(z), then per-group
         //     (unweighted) RMSNorm, then scale by the learned weight.
-        //     Matches mlx-lm's NemotronHRMSNormGated exactly.
-        let zAct = Ops.silu(z, on: cmd)
-        let yGated = Ops.mul(ySkip, zAct, on: cmd)
+        //     Matches mlx-lm's NemotronHRMSNormGated exactly. F-129
+        //     mixer-fuse: `mulSilu` is measured NOT bit-exact anywhere
+        //     it's been tried (see NemotronHMambaMixerFuse's header) so
+        //     it stays behind its own opt-in gate, default OFF — same
+        //     transcendental-unit hazard class as addSoftplus above,
+        //     just never bit-exact even locally rather than only on CI.
+        let yGated: Tensor
+        if NemotronHMambaMixerFuse.siluEnabled {
+            yGated = NemotronHMambaMixerFuse.mulSilu(ySkip, z, on: cmd, device: device)
+        } else {
+            let zAct = Ops.silu(z, on: cmd)
+            yGated = Ops.mul(ySkip, zAct, on: cmd)
+        }
         let yNormed = Ops.rmsNormRows(
             yGated, weight: onesWeight,
             eps: mixerNorm.eps, nRows: nGroups, rowSize: groupSize, on: cmd)
