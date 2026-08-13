@@ -18,9 +18,21 @@
 //
 // The gate: greedy decode is deterministic, so the DFlash speculative
 // path MUST emit the exact same token stream as the plain single-token
-// greedy loop, on every prompt. Also reports acceptance rate + decode
-// tok/s (informational — Meta's own reference reports ~1.8x on this
-// exact model/hardware pairing at block_size=16).
+// greedy loop, on every prompt — in BOTH the original fixed-block
+// configuration AND the adaptive-control configuration
+// (BUTTER_GLIMMER_DFLASH_PMIN + BUTTER_GLIMMER_DFLASH_ADAPTIVE, see
+// `DFlashSpecDecode.swift`'s ADAPTIVE CONTROL header section). Also
+// reports acceptance rate + decode tok/s for all three arms
+// (informational — Meta's own reference reports ~1.8x on this exact
+// model/hardware pairing at block_size=16, though that's on templated
+// text; the adaptive arm exists specifically to fix the fixed-block
+// arm's measured worst-case NET SLOWDOWN on open-ended prompts).
+//
+// 5 prompts: the original 3 (short continuation, templated
+// multi-topic, codeish) plus 2 adversarial ones added for the adaptive
+// wave — a high-entropy creative prompt and a long factual list — which
+// together span the acceptance-rate range from the templated ceiling
+// down to the open-ended floor.
 
 import Foundation
 import Metal
@@ -45,6 +57,29 @@ private let glimmerDFlashAvailable =
 )
 struct GlimmerDFlashSpecDecodeIntegrationTests {
 
+    /// Adaptive-control knobs shared by every arm/test in this suite —
+    /// see DFlashSpecDecode.swift's file header (ADAPTIVE CONTROL
+    /// section) for the rationale, and its EXACTNESS DISCIPLINE section
+    /// for why `lo`/`hi` were retuned well above their original
+    /// 0.45/0.70: once every cycle unconditionally replays (the
+    /// bail-bug fix), a drafting cycle's cost is ALWAYS verify-overhead
+    /// PLUS a full plain-decode-equivalent replay of whatever gets
+    /// committed — there is no more "full accept is free" fast path —
+    /// so a cycle only pays for itself when its committed length
+    /// amortizes that overhead, which the measured per-arm timings in
+    /// dflash_fix_run.log (12-tok's 81.9%-accept 1.43x win vs
+    /// 150-tok/60-tok's 68.9%/73.8%-accept 0.52x/0.72x LOSSES at
+    /// blockSize=16) show only holds at raw acceptance rates well
+    /// above the old lo=0.45/hi=0.70 band.
+    private let adaptiveEnv: [String: String] = [
+        "BUTTER_GLIMMER_DFLASH_PMIN": "0.7",
+        "BUTTER_GLIMMER_DFLASH_ADAPTIVE": "1",
+        "BUTTER_GLIMMER_DFLASH_ADAPT_WINDOW": "24",
+        "BUTTER_GLIMMER_DFLASH_ADAPT_LO": "0.75",
+        "BUTTER_GLIMMER_DFLASH_ADAPT_HI": "0.90",
+        "BUTTER_GLIMMER_DFLASH_BAIL_TOKENS": "32",
+    ]
+
     /// Chunked prefill (`forwardMulti`, all but the last prompt token)
     /// + one `forwardOneWithFeatures` call for the LAST prompt token —
     /// gives us the seed token AND the `targetLayerIDs` features DFlash
@@ -61,22 +96,40 @@ struct GlimmerDFlashSpecDecodeIntegrationTests {
             let chunkSize = glimmer.defaultPrefillStepSize
             while pos < bulk.count {
                 let end = min(pos + chunkSize, bulk.count)
-                let cmd = device.makeCommandBuffer()
-                _ = glimmer.forwardMulti(
-                    tokenIds: Array(bulk[pos ..< end]), startingAt: pos,
-                    caches: caches, on: cmd, device: device)
-                cmd.commit()
-                cmd.waitUntilCompleted()
+                // `autoreleasepool` per chunk — Swift concurrency's
+                // cooperative-executor threads (this whole test runs
+                // inside an `async` test function) have NO implicit
+                // per-iteration autorelease-pool drain the way a
+                // traditional run-loop-driven thread would; without an
+                // explicit pool here, every chunk's transient ObjC-
+                // bridged Metal objects (MTLCommandBuffer, encoders,
+                // etc.) accumulate for the whole PROCESS lifetime, not
+                // just this loop — see `ffai-metal-autoreleasepool-leak`
+                // / `DFlashSpecDecode.swift`'s EXACTNESS DISCIPLINE
+                // section for the full incident writeup.
+                autoreleasepool {
+                    // `forwardMulti` self-commits+waits its OWN internal
+                    // command buffer and never touches `cmd` — do NOT
+                    // commit/wait `cmd` here (see that function's doc
+                    // comment; double-committing wedged the Metal queue
+                    // — see this suite's file header history).
+                    let cmd = device.makeCommandBuffer()
+                    _ = glimmer.forwardMulti(
+                        tokenIds: Array(bulk[pos ..< end]), startingAt: pos,
+                        caches: caches, on: cmd, device: device)
+                }
                 pos = end
             }
         }
-        let cmd = device.makeCommandBuffer()
-        let (logits, features) = glimmer.forwardOneWithFeatures(
-            tokenId: promptTokens.last!, position: pos, targetLayerIDs: targetLayerIDs,
-            caches: caches, on: cmd, device: device)
-        cmd.commit()
-        cmd.waitUntilCompleted()
-        return (argmaxHost(logits), features)
+        return autoreleasepool { () -> (seed: Int, features: Tensor) in
+            // Same self-commit contract as `forwardMulti` above — see
+            // `forwardOneWithFeatures`'s doc comment.
+            let cmd = device.makeCommandBuffer()
+            let (logits, features) = glimmer.forwardOneWithFeatures(
+                tokenId: promptTokens.last!, position: pos, targetLayerIDs: targetLayerIDs,
+                caches: caches, on: cmd, device: device)
+            return (argmaxHost(logits), features)
+        }
     }
 
     /// Baseline greedy stream of `count` tokens starting from `seed`.
@@ -90,18 +143,149 @@ struct GlimmerDFlashSpecDecodeIntegrationTests {
         let t0 = Date()
         for _ in 0 ..< count {
             tokens.append(prev)
-            let cmd = device.makeCommandBuffer()
-            let logits = glimmer.forward(
-                tokenId: prev, position: pos, caches: caches, on: cmd, device: device)
-            cmd.commit()
-            cmd.waitUntilCompleted()
-            prev = argmaxHost(logits)
+            // `autoreleasepool` per token — see `prefill`'s comment
+            // above for why this matters on Swift concurrency's
+            // cooperative executor. This loop runs `count` times per
+            // arm (80 in the full gate) — the single highest-volume
+            // Metal-object-creation site of the baseline arm.
+            let nextTok = autoreleasepool { () -> Int in
+                // `forward(tokenId:...)` self-commits+waits its own
+                // private buffer too — do NOT commit/wait `cmd` (same
+                // contract as `forwardMulti`/`forwardOneWithFeatures`
+                // above).
+                let cmd = device.makeCommandBuffer()
+                let logits = glimmer.forward(
+                    tokenId: prev, position: pos, caches: caches, on: cmd, device: device)
+                return argmaxHost(logits)
+            }
+            prev = nextTok
             pos += 1
         }
         return (tokens, Date().timeIntervalSince(t0))
     }
 
-    @Test("DFlash spec == baseline greedy: 3 prompts (12/150/60-tok), 80 new tokens each")
+    /// Run one DFlash spec-decode arm (fixed-block when `envVars` is
+    /// empty, adaptive-control when it carries the
+    /// BUTTER_GLIMMER_DFLASH_* knobs) against a fresh cache/prompt pair
+    /// and return the token stream + stats. Env vars are set for the
+    /// duration of the call and restored (unset) afterward — `ButterEnv`
+    /// reads live via `getenv(3)`, so this toggles the feature without
+    /// needing a subprocess per arm.
+    private func runDFlashArm(
+        _ glimmer: MuseGlimmerModel, draft: DFlashDraftModel,
+        promptTokens: [Int], targetLayerIDs: [Int], count: Int,
+        envVars: [String: String], device: Device
+    ) -> (tokens: [Int], stats: DFlashSpecDecodeStats) {
+        for (k, v) in envVars { setenv(k, v, 1) }
+        defer { for k in envVars.keys { unsetenv(k) } }
+
+        let caches = glimmer.makeLayerCaches(maxSeq: nil, device: device)
+        let (seed, seedFeatures) = prefill(
+            glimmer, promptTokens: promptTokens, targetLayerIDs: targetLayerIDs,
+            caches: caches, device: device)
+        let draftCaches = draft.makeCache(maxSeq: 4096, device: device)
+        var history = promptTokens
+        let stats = DFlashSpecDecode.generateGreedy(
+            model: glimmer, draft: draft, draftCaches: draftCaches,
+            lastToken: seed, position: promptTokens.count, seedFeatures: seedFeatures,
+            caches: caches, history: &history,
+            maxNewTokens: count, device: device)
+        return (Array(history[promptTokens.count...]), stats)
+    }
+
+    // Bail-then-reenter regression: the creative-highentropy prompt is
+    // the smallest/cheapest natural trigger for the adaptive
+    // controller's bail path (see DFlashSpecDecode.swift's file header,
+    // EXACTNESS DISCIPLINE section, for the root cause this guards
+    // against — a batched-vs-single-token-kernel ULP drift that a
+    // "trust the batch on full accept" shortcut used to let leak into
+    // the cache, discovered via exactly this bail-then-reenter shape).
+    // 40 tokens (not the full suite's 80) is enough to walk through
+    // several drafting cycles, ONE full bail span, AND re-entry —
+    // proven sufficient to reproduce/verify the original failure — at
+    // roughly a tenth of the full 5-prompt gate's wall-clock cost, so
+    // this can run standalone as a fast, targeted regression check.
+    @Test("DFlash adaptive bail-then-reenter == baseline greedy (fast, targeted)")
+    func adaptiveBailThenReenterMatchesBaseline() async throws {
+        let device = Device.shared
+        var optsBuilder = LoadOptions()
+        optsBuilder.prewarm = false
+        let opts = optsBuilder
+
+        let m: Model = try await ModelLoadLock.shared.loadSerially {
+            try await Model.load(glimmerModelPath, options: opts)
+        }
+        let glimmer = try #require(m.museGlimmer, "expected MuseGlimmerModel engine")
+        let draft = try DFlashDraftModel.loadModel(path: glimmerDFlashPath, device: device)
+        let targetLayerIDs = draft.config.targetLayerIDs
+        let count = 40
+
+        let promptTokens = m.tokenizer.encode(
+            text: """
+                Write a short surreal story, about 150 words, about a
+                lighthouse keeper who discovers the ocean itself is
+                alive and dreaming. Make it strange, unpredictable, and
+                richly imagistic — avoid clichés and generic phrasing.
+                """)
+
+        print("physFootprint before baseline arm=\(String(format: "%.2f", physFootprintGB()))GB")
+        let baseline = autoreleasepool {
+            () -> (tokens: [Int], decodeSeconds: Double) in
+            let baseCaches = glimmer.makeLayerCaches(maxSeq: nil, device: device)
+            let (baseSeed, _) = prefill(
+                glimmer, promptTokens: promptTokens, targetLayerIDs: targetLayerIDs,
+                caches: baseCaches, device: device)
+            return baselineGreedy(
+                glimmer, seed: baseSeed, position: promptTokens.count, count: count,
+                caches: baseCaches, device: device)
+        }
+        print("physFootprint after baseline arm=\(String(format: "%.2f", physFootprintGB()))GB")
+
+        let (adaptiveTokens, stats) = autoreleasepool {
+            runDFlashArm(
+                glimmer, draft: draft, promptTokens: promptTokens,
+                targetLayerIDs: targetLayerIDs, count: count, envVars: adaptiveEnv, device: device)
+        }
+        print("physFootprint after adaptive arm=\(String(format: "%.2f", physFootprintGB()))GB")
+
+        let matchPrefix = zip(baseline.tokens, adaptiveTokens).prefix(while: { $0 == $1 }).count
+        print(
+            "DFlash bail-regression: exact_match=\(adaptiveTokens == baseline.tokens) "
+                + "prefix=\(matchPrefix)/\(count) bailSteps=\(stats.bailSteps) "
+                + "bailEntries=\(stats.bailEntries)")
+        #expect(
+            stats.bailEntries > 0,
+            "this regression test is only meaningful if it actually exercises the bail path — it didn't; the adaptive thresholds may have drifted"
+        )
+        #expect(
+            adaptiveTokens == baseline.tokens,
+            "bail-then-reenter diverged from baseline at prefix \(matchPrefix)/\(count)")
+    }
+
+    /// Optional single-prompt selector for the 5-prompt gate below — set
+    /// to an index 0-4 (`BUTTER_DFLASH_GATE_PROMPT=<n>`) to run just
+    /// that one prompt (still all 3 arms) as its own process; unset runs
+    /// the full 5-prompt sweep, preserving prior behavior. Exists
+    /// because 5 prompts × 3 arms in a single process leaks ~6.6GB of
+    /// physical footprint PER ARM (retention across arms — root cause
+    /// not yet found, separate investigation filed): 15 arms ≈ +100GB,
+    /// which wedges the Metal queue (submit thread stuck in
+    /// `iokit_user_client_trap`) around the 50-70 min mark. Splitting
+    /// into 5 sequential single-prompt processes keeps each run's
+    /// footprint and wall-clock bounded until the leak itself is fixed.
+    private var gatePromptIndex: Int? {
+        guard let raw = ProcessInfo.processInfo.environment["BUTTER_DFLASH_GATE_PROMPT"] else {
+            return nil
+        }
+        guard let idx = Int(raw) else {
+            preconditionFailure("BUTTER_DFLASH_GATE_PROMPT=\(raw) is not an integer")
+        }
+        return idx
+    }
+
+    @Test(
+        "DFlash spec (fixed-block AND adaptive-control) == baseline greedy: 5 prompts, 80 new tokens each"
+    )
     func dflashSpecMatchesBaselineExactly() async throws {
         let device = Device.shared
         var optsBuilder = LoadOptions()
@@ -114,7 +298,7 @@ struct GlimmerDFlashSpecDecodeIntegrationTests {
         let glimmer = try #require(m.museGlimmer, "expected MuseGlimmerModel engine")
         let draft = try DFlashDraftModel.loadModel(path: glimmerDFlashPath, device: device)
 
-        let prompts: [(name: String, text: String)] = [
+        let allPrompts: [(name: String, text: String)] = [
             ("12-tok", "The quick brown fox jumps over"),
             (
                 "150-tok-multitopic",
@@ -141,71 +325,117 @@ struct GlimmerDFlashSpecDecodeIntegrationTests {
                 for n less than 2.
                 """
             ),
+            (
+                "creative-highentropy",
+                """
+                Write a short surreal story, about 150 words, about a
+                lighthouse keeper who discovers the ocean itself is
+                alive and dreaming. Make it strange, unpredictable, and
+                richly imagistic — avoid clichés and generic phrasing.
+                """
+            ),
+            (
+                "factual-list",
+                """
+                List 25 distinct countries and their capital cities,
+                one pair per line, formatted as "Country: Capital".
+                Cover a mix of continents and avoid repeating any
+                country.
+                """
+            ),
         ]
+        let prompts: [(name: String, text: String)]
+        if let idx = gatePromptIndex {
+            precondition(
+                allPrompts.indices.contains(idx),
+                "BUTTER_DFLASH_GATE_PROMPT=\(idx) out of range 0..<\(allPrompts.count)")
+            prompts = [allPrompts[idx]]
+        } else {
+            prompts = allPrompts
+        }
         let count = 80
         let targetLayerIDs = draft.config.targetLayerIDs
 
         for (name, text) in prompts {
             let promptTokens = m.tokenizer.encode(text: text)
             let n = promptTokens.count
-            print("DFlash prompt=\(name) tokens=\(n)")
+            print(
+                "DFlash prompt=\(name) tokens=\(n) "
+                    + "physFootprint=\(String(format: "%.2f", physFootprintGB()))GB")
 
             // ── Baseline arm ────────────────────────────────────────
-            let baseCaches = glimmer.makeLayerCaches(maxSeq: nil, device: device)
-            let (baseSeed, _) = prefill(
-                glimmer, promptTokens: promptTokens, targetLayerIDs: targetLayerIDs,
-                caches: baseCaches, device: device)
-            let baseline = baselineGreedy(
-                glimmer, seed: baseSeed, position: n, count: count,
-                caches: baseCaches, device: device)
-            let baseTps = Double(count) / baseline.decodeSeconds
+            // `autoreleasepool` per ARM (not just per inner loop) — see
+            // `prefill`'s comment for the cooperative-executor
+            // rationale. 15 arms run in this suite (5 prompts × 3
+            // arms); each allocates a fresh `caches` array (KVCache
+            // buffers for all 52 layers) that should be fully released,
+            // Metal-side, before the NEXT arm starts, not just when the
+            // Swift reference count hits zero on a thread with no
+            // implicit drain point.
+            let (baseline, baseTps) = autoreleasepool {
+                () -> ((tokens: [Int], decodeSeconds: Double), Double) in
+                let baseCaches = glimmer.makeLayerCaches(maxSeq: nil, device: device)
+                let (baseSeed, _) = prefill(
+                    glimmer, promptTokens: promptTokens, targetLayerIDs: targetLayerIDs,
+                    caches: baseCaches, device: device)
+                let result = baselineGreedy(
+                    glimmer, seed: baseSeed, position: n, count: count,
+                    caches: baseCaches, device: device)
+                return (result, Double(count) / result.decodeSeconds)
+            }
             print(
                 "DFlash baseline \(name): "
-                    + "\(String(format: "%.2f", baseTps)) tok/s")
+                    + "\(String(format: "%.2f", baseTps)) tok/s "
+                    + "physFootprint=\(String(format: "%.2f", physFootprintGB()))GB")
 
-            // ── DFlash spec arm ──────────────────────────────────────
-            let specCaches = glimmer.makeLayerCaches(maxSeq: nil, device: device)
-            let (specSeed, seedFeatures) = prefill(
-                glimmer, promptTokens: promptTokens, targetLayerIDs: targetLayerIDs,
-                caches: specCaches, device: device)
-            #expect(specSeed == baseSeed, "prefill seed must match between arms")
-
-            let draftCaches = draft.makeCache(maxSeq: 4096, device: device)
-            var history = promptTokens
-            let stats = DFlashSpecDecode.generateGreedy(
-                model: glimmer, draft: draft, draftCaches: draftCaches,
-                lastToken: specSeed, position: n, seedFeatures: seedFeatures,
-                caches: specCaches, history: &history,
-                maxNewTokens: count, device: device)
-
-            let specTokens = Array(history[n...])
-            #expect(stats.tokensGenerated == count)
-            #expect(specTokens.count == count)
-
-            // ── THE EXACTNESS GATE ────────────────────────────────────
-            let matchPrefix = zip(baseline.tokens, specTokens)
-                .prefix(while: { $0 == $1 }).count
-            let baseCtx = Array(
-                baseline.tokens.dropFirst(max(0, matchPrefix - 2)).prefix(6))
-            let specCtx = Array(
-                specTokens.dropFirst(max(0, matchPrefix - 2)).prefix(6))
+            // ── DFlash fixed-block arm (original, no adaptive knobs) ──
+            let (fixedTokens, fixedStats) = autoreleasepool {
+                runDFlashArm(
+                    glimmer, draft: draft, promptTokens: promptTokens,
+                    targetLayerIDs: targetLayerIDs, count: count, envVars: [:], device: device)
+            }
+            #expect(fixedStats.tokensGenerated == count)
+            let fixedMatchPrefix = zip(baseline.tokens, fixedTokens).prefix(while: { $0 == $1 }).count
             #expect(
-                specTokens == baseline.tokens,
-                "\(name): DFlash spec stream diverged from baseline at index \(matchPrefix) — baseline \(baseCtx) vs spec \(specCtx)"
+                fixedTokens == baseline.tokens,
+                "\(name): DFlash FIXED spec stream diverged from baseline (prefix \(fixedMatchPrefix)/\(count))"
             )
-
-            let specTps = stats.tps
+            let fixedTps = fixedStats.tps
             print(
-                "DFlash \(name): exact_match=\(specTokens == baseline.tokens) "
-                    + "(prefix \(matchPrefix)/\(count)), "
-                    + "tps=\(String(format: "%.2f", specTps)) "
-                    + "(\(String(format: "%.2fx", specTps / baseTps)) vs baseline), "
-                    + "accepted=\(stats.candidatesAccepted)/\(stats.candidatesProposed) "
-                    + "(\(String(format: "%.1f", stats.acceptanceRate * 100))%), "
-                    + "verify=\(stats.verifySteps), replay=\(stats.replaySingleSteps), "
-                    + "draft=\(String(format: "%.2f", stats.draftSeconds))s "
-                    + "verifyT=\(String(format: "%.2f", stats.verifySeconds))s "
-                    + "replayT=\(String(format: "%.2f", stats.replaySeconds))s")
+                "DFlash-fixed \(name): exact_match=\(fixedTokens == baseline.tokens) "
+                    + "tps=\(String(format: "%.2f", fixedTps)) "
+                    + "(\(String(format: "%.2fx", fixedTps / baseTps)) vs baseline), "
+                    + "accepted=\(fixedStats.candidatesAccepted)/\(fixedStats.candidatesProposed) "
+                    + "(\(String(format: "%.1f", fixedStats.acceptanceRate * 100))%), "
+                    + "verify=\(fixedStats.verifySteps), replay=\(fixedStats.replaySingleSteps) "
+                    + "physFootprint=\(String(format: "%.2f", physFootprintGB()))GB")
+
+            // ── DFlash adaptive-control arm ───────────────────────────
+            let (adaptiveTokens, adaptiveStats) = autoreleasepool {
+                runDFlashArm(
+                    glimmer, draft: draft, promptTokens: promptTokens,
+                    targetLayerIDs: targetLayerIDs, count: count, envVars: adaptiveEnv,
+                    device: device)
+            }
+            #expect(adaptiveStats.tokensGenerated == count)
+            let adaptiveMatchPrefix =
+                zip(baseline.tokens, adaptiveTokens).prefix(while: { $0 == $1 }).count
+            #expect(
+                adaptiveTokens == baseline.tokens,
+                "\(name): DFlash ADAPTIVE spec stream diverged from baseline (prefix \(adaptiveMatchPrefix)/\(count))"
+            )
+            let adaptiveTps = adaptiveStats.tps
+            print(
+                "DFlash-adaptive \(name): exact_match=\(adaptiveTokens == baseline.tokens) "
+                    + "tps=\(String(format: "%.2f", adaptiveTps)) "
+                    + "(\(String(format: "%.2fx", adaptiveTps / baseTps)) vs baseline), "
+                    + "accepted=\(adaptiveStats.candidatesAccepted)/\(adaptiveStats.candidatesProposed) "
+                    + "(\(String(format: "%.1f", adaptiveStats.acceptanceRate * 100))%), "
+                    + "verify=\(adaptiveStats.verifySteps), replay=\(adaptiveStats.replaySingleSteps), "
+                    + "avgBlock=\(String(format: "%.2f", adaptiveStats.avgBlockSize)), "
+                    + "truncated=\(adaptiveStats.truncatedCycles), "
+                    + "bailSteps=\(adaptiveStats.bailSteps), bailEntries=\(adaptiveStats.bailEntries) "
+                    + "physFootprint=\(String(format: "%.2f", physFootprintGB()))GB")
         }
     }
 }
@@ -222,4 +452,25 @@ private func argmaxHost(_ logits: Tensor) -> Int {
         }
     }
     return bestIdx
+}
+
+/// This process's `phys_footprint` in GiB — the same figure Instruments
+/// / `sample`'s "Physical footprint" line reports, and (unlike RSS)
+/// what actually accounts for Metal/IOSurface GPU-resident allocations
+/// on Apple Silicon's unified memory. Printed between arms so a gate
+/// log shows whether footprint stays flat (autoreleasepool coverage
+/// working) or climbs across arms (a leak) — see
+/// `DFlashSpecDecode.swift`'s EXACTNESS DISCIPLINE section for the
+/// incident this instruments.
+private func physFootprintGB() -> Double {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let result = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    guard result == KERN_SUCCESS else { return -1 }
+    return Double(info.phys_footprint) / 1_073_741_824.0
 }
