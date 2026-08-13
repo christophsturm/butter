@@ -242,6 +242,51 @@ struct MTPSpecDecodeIntegrationTests {
         return idx
     }
 
+    // Prompt texts copied verbatim from
+    // `GlimmerDFlashSpecDecodeIntegrationTests.dflashSpecMatchesBaselineExactly`'s
+    // `allPrompts` — same adversarial content, different model/driver.
+    // Shared between `mtpSpecMatchesBaselineOnAdversarialPrompts` and
+    // `mtpSpecMatchesBaselineUnderBoostedRegime` below (same (prompt,
+    // gamma) matrix — the boosted-regime gate only adds env-configured
+    // PMIN/ADAPTIVE promotion configs on top).
+    private static let adversarialPrompts: [(name: String, text: String)] = [
+        (
+            "creative-highentropy",
+            """
+            Write a short surreal story, about 150 words, about a
+            lighthouse keeper who discovers the ocean itself is
+            alive and dreaming. Make it strange, unpredictable, and
+            richly imagistic — avoid clichés and generic phrasing.
+            """
+        ),
+        (
+            "150-tok-multitopic",
+            """
+            Give a brief overview of three unrelated topics: first,
+            explain how photosynthesis converts light energy into
+            chemical energy in plant cells, mentioning chlorophyll
+            and the role of chloroplasts. Second, describe the
+            economic causes that are commonly cited for the fall of
+            the Roman Empire, including currency debasement and
+            overextension of the military. Third, explain at a high
+            level how a hash table achieves average O(1) lookup
+            time, mentioning collision resolution strategies like
+            chaining and open addressing. Keep each explanation to
+            a couple of sentences.
+            """
+        ),
+        (
+            "factual-list",
+            """
+            List 25 distinct countries and their capital cities,
+            one pair per line, formatted as "Country: Capital".
+            Cover a mix of continents and avoid repeating any
+            country.
+            """
+        ),
+    ]
+    private static let adversarialGammas = [2, 4]
+
     @Test("spec on == spec off: adversarial high-entropy prompts, γ ∈ {2, 4}, 180 tokens")
     func mtpSpecMatchesBaselineOnAdversarialPrompts() async throws {
         let device = Device.shared
@@ -255,46 +300,8 @@ struct MTPSpecDecodeIntegrationTests {
         let head = try #require(
             qwen.mtpHead, "expected the mtp-sidecar to attach an MTP head")
 
-        // Prompt texts copied verbatim from
-        // `GlimmerDFlashSpecDecodeIntegrationTests.dflashSpecMatchesBaselineExactly`'s
-        // `allPrompts` — same adversarial content, different model/driver.
-        let allPrompts: [(name: String, text: String)] = [
-            (
-                "creative-highentropy",
-                """
-                Write a short surreal story, about 150 words, about a
-                lighthouse keeper who discovers the ocean itself is
-                alive and dreaming. Make it strange, unpredictable, and
-                richly imagistic — avoid clichés and generic phrasing.
-                """
-            ),
-            (
-                "150-tok-multitopic",
-                """
-                Give a brief overview of three unrelated topics: first,
-                explain how photosynthesis converts light energy into
-                chemical energy in plant cells, mentioning chlorophyll
-                and the role of chloroplasts. Second, describe the
-                economic causes that are commonly cited for the fall of
-                the Roman Empire, including currency debasement and
-                overextension of the military. Third, explain at a high
-                level how a hash table achieves average O(1) lookup
-                time, mentioning collision resolution strategies like
-                chaining and open addressing. Keep each explanation to
-                a couple of sentences.
-                """
-            ),
-            (
-                "factual-list",
-                """
-                List 25 distinct countries and their capital cities,
-                one pair per line, formatted as "Country: Capital".
-                Cover a mix of continents and avoid repeating any
-                country.
-                """
-            ),
-        ]
-        let gammas = [2, 4]
+        let allPrompts = Self.adversarialPrompts
+        let gammas = Self.adversarialGammas
         var allCases: [(prompt: (name: String, text: String), gamma: Int)] = []
         for p in allPrompts { for g in gammas { allCases.append((p, g)) } }
 
@@ -380,6 +387,233 @@ struct MTPSpecDecodeIntegrationTests {
                     + "(\(String(format: "%.1f", stats.acceptanceRate * 100))%), "
                     + "verify=\(stats.verifySteps), replay=\(stats.replaySingleSteps), "
                     + "lockstep=\(stats.lockstepSteps)")
+        }
+    }
+
+    // ── Boosted-regime exactness coverage (phase 2) ──────────────────────
+    //
+    // `mtpSpecMatchesBaselineOnAdversarialPrompts` above proved the
+    // SHIPPED config (fixed γ, no confidence truncation, no adaptive
+    // gamma) holds exact despite real batched-vs-single-token argmax
+    // drift on full-accept bonus positions (see `BUTTER_QWEN_MTP_PARITY`,
+    // now side-effect-free per the KVCache range-snapshot fix this file's
+    // sibling commit added). The working theory there: frequent
+    // partial/zero-accept cycles force a single-token replay that resets
+    // the cache before drift compounds, and the shipped config's
+    // acceptance rates (40-73%) keep those resets frequent.
+    //
+    // `BUTTER_QWEN_MTP_PMIN` (confidence-gated draft truncation) and
+    // `BUTTER_QWEN_MTP_ADAPTIVE` (trailing-acceptance gamma controller)
+    // are exactly the two levers a throughput-chasing config would flip
+    // to shrink bursts and raise full-accept frequency — the DANGER
+    // regime, since DFlash (Muse Glimmer) diverged in precisely this
+    // regime (see `DFlashSpecDecode.swift`'s EXACTNESS DISCIPLINE
+    // header). This gate runs the same adversarial (prompt, gamma)
+    // matrix under three plausible promotion configs someone chasing
+    // decode speed would pick:
+    //
+    //   - `pmin-moderate` (BUTTER_QWEN_MTP_PMIN=0.8): empirically a
+    //     NO-OP on this checkpoint — the MTP head's own top-1 probability
+    //     saturates at (float) 1.0 on essentially every draft step, so
+    //     no threshold below 1.0 (verified up to 0.999) ever trips the
+    //     gate. Kept in the matrix as documentation of that finding
+    //     rather than removed, since a future checkpoint or head
+    //     retraining could un-saturate it.
+    //   - `adaptive-default` (BUTTER_QWEN_MTP_ADAPTIVE=1, file defaults:
+    //     window=32 lo=0.55 hi=0.70): raises full-accept frequency
+    //     materially over the fixed-γ baseline on some (prompt, γ=4)
+    //     cases (e.g. 24 → 52 full-accepts on creative-highentropy) by
+    //     holding gamma near its cap once trailing acceptance clears hi.
+    //   - `adaptive-aggressive` (lo=0.3 hi=0.4): pins gamma at its cap
+    //     almost immediately (typical acceptance here is 45-73%, well
+    //     above hi=0.4) — the largest-burst-per-full-accept regime this
+    //     file can reach, maximizing how many drifted positions a single
+    //     full-accept cycle can commit before the next verify pass.
+    //
+    // Audit result (2026-08-13, 27B checkpoint, all 3 configs × all 6
+    // (prompt, γ) cases): EXACT MATCH throughout — 18/18 runs — despite
+    // full-accept counts up to 56/89 cycles and per-run parity mismatch
+    // rates up to 20% (margins 0.25-7.6, not all tie-breaks). The hazard
+    // proven real by `BUTTER_QWEN_MTP_PARITY` (batched-vs-single-token
+    // drift on full-accept bonus positions) stays THEORETICAL on this
+    // checkpoint even under the boosted regime: the same
+    // partial/zero-accept replay frequency that protected the shipped
+    // config continues to reset the cache often enough to interrupt
+    // drift before it compounds into a flipped argmax, across every
+    // config tested. No production fix applied — see the commit message
+    // for the full per-config/per-case numbers.
+    private static let boostedRegimeConfigs:
+        [(name: String, env: [String: String])] = [
+            ("pmin-moderate", ["BUTTER_QWEN_MTP_PMIN": "0.8"]),
+            ("adaptive-default", ["BUTTER_QWEN_MTP_ADAPTIVE": "1"]),
+            (
+                "adaptive-aggressive",
+                [
+                    "BUTTER_QWEN_MTP_ADAPTIVE": "1",
+                    "BUTTER_QWEN_MTP_ADAPT_LO": "0.3",
+                    "BUTTER_QWEN_MTP_ADAPT_HI": "0.4",
+                ]
+            ),
+        ]
+
+    // MEMORY FOOTPRINT: `BUTTER_MTP_GATE_CASE` is MANDATORY for this
+    // test (unlike the fixed-config gate above, where it's optional) —
+    // see the precondition in the test body. This test allocates a
+    // fresh `makeLayerCaches()` per (case, config) triple — up to 6
+    // cases x 3 configs = 18, plus 3 per-prompt baselines, all in ONE
+    // process if every case ran together. Confirmed by direct repro
+    // during this audit: even with every per-config body wrapped in its
+    // own `autoreleasepool` (see below), running the full unscoped
+    // matrix in one process drove `vm.swapusage` to 48.7/50GB and then
+    // to single-digit-thousands of free VM pages (near-OOM) — twice,
+    // once before the `autoreleasepool` wrap and once after, so the
+    // wrap alone does not bound this test's footprint (the per-prompt
+    // baseline loop and/or the 27B checkpoint's own load-time working
+    // set are the likelier culprits, not just the per-config cache
+    // allocations). Rather than chase that further, this test requires
+    // the same one-process-per-case discipline the shell loop this
+    // audit used already relied on: run cases 0..5 as separate process
+    // invocations (see the commit message for the exact loop).
+    @Test(
+        "spec on == spec off: adversarial prompts under PMIN/ADAPTIVE promotion configs, γ ∈ {2, 4}, 180 tokens"
+    )
+    func mtpSpecMatchesBaselineUnderBoostedRegime() async throws {
+        let device = Device.shared
+        var optsBuilder = LoadOptions()
+        optsBuilder.prewarm = false
+        let opts = optsBuilder
+        let m: Model = try await ModelLoadLock.shared.loadSerially {
+            try await Model.load(mtpModelPath, options: opts)
+        }
+        let qwen = try #require(m.qwen35, "expected Qwen35Model engine")
+        let head = try #require(
+            qwen.mtpHead, "expected the mtp-sidecar to attach an MTP head")
+
+        let allPrompts = Self.adversarialPrompts
+        let gammas = Self.adversarialGammas
+        var allCases: [(prompt: (name: String, text: String), gamma: Int)] = []
+        for p in allPrompts { for g in gammas { allCases.append((p, g)) } }
+
+        // `BUTTER_MTP_GATE_CASE` selects one (prompt, gamma) pair; this
+        // test then runs it under every config in `boostedRegimeConfigs`
+        // in turn. MANDATORY here (unlike the fixed-config gate above) —
+        // see the MEMORY FOOTPRINT note on this test's declaration.
+        guard let idx = gateCaseIndex else {
+            preconditionFailure(
+                "mtpSpecMatchesBaselineUnderBoostedRegime requires BUTTER_MTP_GATE_CASE=<0..\(allCases.count - 1)> "
+                    + "— this test's per-case x per-config cache footprint is NOT safe to run "
+                    + "unscoped in one process (confirmed: drives this box to near-OOM). "
+                    + "Run each case as its own process invocation.")
+        }
+        precondition(
+            allCases.indices.contains(idx),
+            "BUTTER_MTP_GATE_CASE=\(idx) out of range 0..<\(allCases.count)")
+        let cases = [allCases[idx]]
+        let count = 180
+
+        // Baseline is per-PROMPT (gamma- and config-independent) —
+        // compute once and reuse across every (gamma, config) combo for
+        // the same prompt.
+        var baselines: [String: (tokens: [Int], decodeSeconds: Double)] = [:]
+        for (name, text) in Set(cases.map { $0.prompt.name }).sorted().compactMap({ n in
+            allPrompts.first(where: { $0.name == n })
+        }) {
+            let promptTokens = m.tokenizer.encode(text: text)
+            let caches = qwen.makeLayerCaches()
+            let seed = autoreleasepool {
+                prefill(qwen, promptTokens: promptTokens, caches: caches, device: device)
+            }
+            baselines[name] = autoreleasepool {
+                baselineGreedy(
+                    qwen, seed: seed, position: promptTokens.count, count: count,
+                    caches: caches, device: device)
+            }
+        }
+
+        for (prompt, gamma) in cases {
+            let promptTokens = m.tokenizer.encode(text: prompt.text)
+            let n = promptTokens.count
+            let baseline = baselines[prompt.name]!
+
+            for config in Self.boostedRegimeConfigs {
+                // ── Apply this config's env, always alongside the
+                // side-effect-free parity probe (full-accept frequency +
+                // drift stats) — `ButterEnv` reads live via `getenv(3)`,
+                // so `setenv`/`unsetenv` from here is observed on the
+                // very next `mtpDecodeLoop` call (see `ButterEnv.swift`).
+                var appliedKeys = Array(config.env.keys)
+                appliedKeys.append("BUTTER_QWEN_MTP_PARITY")
+                for (key, value) in config.env {
+                    setenv(key, value, 1)
+                }
+                setenv("BUTTER_QWEN_MTP_PARITY", "1", 1)
+                defer { for key in appliedKeys { unsetenv(key) } }
+
+                // Whole per-config body (cache allocation through the
+                // spec run) in ONE autoreleasepool — this loop allocates
+                // a fresh `makeLayerCaches()` per (case, config) triple
+                // (up to 6 cases x 3 configs = 18, plus 3 baselines, in a
+                // single process when `BUTTER_MTP_GATE_CASE` is unset).
+                // Without this, the 27B checkpoint's KV/GDN cache MTLBuffers
+                // only get released at the next autoreleasepool drain,
+                // which without an explicit pool here is the run loop's
+                // own (much coarser) drain point — 21 undrained cache
+                // sets is enough to swap-thrash this box (confirmed:
+                // vm.swapusage hit 48.7/50GB and the run stalled for
+                // 40+ minutes before being killed, see the commit
+                // message). See the repo's Metal-autoreleasepool-leak
+                // note: wrap any `makeBuffer`-heavy loop.
+                autoreleasepool {
+                    let caches = qwen.makeLayerCaches()
+                    let seed = autoreleasepool {
+                        prefill(qwen, promptTokens: promptTokens, caches: caches, device: device)
+                    }
+                    #expect(
+                        seed == baseline.tokens[0],
+                        "\(prompt.name)/\(config.name): prefill seed must match between arms")
+
+                    head.resetCache()
+                    var history = promptTokens
+                    let t0 = Date()
+                    let stats = autoreleasepool {
+                        SpecDecode.generateGreedyMTP(
+                            model: qwen, head: head, gamma: gamma,
+                            lastToken: seed, position: n,
+                            caches: caches, history: &history,
+                            maxNewTokens: count, device: device)
+                    }
+                    let specSeconds = Date().timeIntervalSince(t0)
+
+                    let specTokens = Array(history[n...])
+                    #expect(stats.tokensGenerated == count)
+                    #expect(specTokens.count == count)
+
+                    // ── THE EXACTNESS GATE (boosted regime) ────────────
+                    let matchPrefix = zip(baseline.tokens, specTokens)
+                        .prefix(while: { $0 == $1 }).count
+                    let baseCtx = Array(
+                        baseline.tokens.dropFirst(max(0, matchPrefix - 2)).prefix(6))
+                    let specCtx = Array(
+                        specTokens.dropFirst(max(0, matchPrefix - 2)).prefix(6))
+                    #expect(
+                        specTokens == baseline.tokens,
+                        "\(prompt.name) γ=\(gamma) config=\(config.name) count=\(count): spec stream diverged from baseline at index \(matchPrefix)/\(count) — baseline \(baseCtx) vs spec \(specCtx)"
+                    )
+
+                    let specTps = Double(count) / specSeconds
+                    let baseTps = Double(count) / baseline.decodeSeconds
+                    print(
+                        "MTPSpec-boosted \(prompt.name) γ=\(gamma) config=\(config.name) count=\(count): "
+                            + "exact_match=\(specTokens == baseline.tokens) "
+                            + "(prefix \(matchPrefix)/\(count)), "
+                            + "tps=\(String(format: "%.2f", specTps)) "
+                            + "(\(String(format: "%.2fx", specTps / baseTps)) vs baseline), "
+                            + "accepted=\(stats.candidatesAccepted)/\(stats.candidatesProposed) "
+                            + "(\(String(format: "%.1f", stats.acceptanceRate * 100))%), "
+                            + "verify=\(stats.verifySteps), replay=\(stats.replaySingleSteps), "
+                            + "lockstep=\(stats.lockstepSteps)")
+                }
+            }
         }
     }
 }
