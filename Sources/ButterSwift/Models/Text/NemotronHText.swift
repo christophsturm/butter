@@ -391,7 +391,7 @@ public struct NemotronHHybrid: NemotronHVariant {
         }
 
         let maxSeq = config.int("max_position_embeddings") ?? 8192
-        return NemotronHModel(
+        let model = NemotronHModel(
             embedTokens: embedTokens, layers: layers,
             finalNorm: finalNorm, lmHead: lmHead,
             hidden: hidden, nLayers: nLayers,
@@ -400,6 +400,25 @@ public struct NemotronHHybrid: NemotronHVariant {
             stateDim: stateDim, convDim: convDim, convKernel: convKernel,
             nGroups: nGroups, dInner: dInner,
             vocab: vocab, maxSeq: maxSeq, dtype: activationDtype)
+
+        // F-131 MTP self-speculative decode — opt-in (BUTTER_NEMOTRON_MTP=1)
+        // load of the checkpoint's optional 53rd "nextn" block. Gated on
+        // BOTH the env var and the tensor actually being present, so a
+        // checkpoint without an MTP block (every non-Lightning NemotronH
+        // release) is completely unaffected regardless of the env var.
+        // See `NemotronHMTPHead.swift` for the architecture + loader.
+        if ButterEnv["BUTTER_NEMOTRON_MTP"] == "1", weights.has("mtp.layers.0.eh_proj.weight") {
+            model.mtpHead = try NemotronHMTPHead.load(
+                weights: weights, embedTokens: embedTokens, lmHead: lmHead,
+                hidden: hidden, vocab: vocab,
+                nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                moeIntermediate: moeIntermediate, nRoutedExperts: nRoutedExperts,
+                moeTopK: moeTopK, nSharedExperts: nSharedExperts,
+                sharedExpertIntermediate: sharedExpertIntermediate,
+                routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb,
+                eps: eps, dtype: activationDtype, device: device)
+        }
+        return model
     }
 
     /// Build one Mamba 2 mixer layer (`"M"`). Reads + derives the
@@ -1014,7 +1033,15 @@ public final class NemotronHMoELayer: Module, DecoderLayer {
 
 /// Build one MoE layer for a NemotronH checkpoint. The shared expert
 /// is constructed when `nSharedExperts > 0`.
-private func buildNemotronHMoELayer(
+///
+/// Not `private`: `NemotronHMTPHead.swift` (F-131, MTP self-speculative
+/// decode) reuses this unchanged to build the MTP block's own MoE
+/// sublayer (`mtp.layers.1`, `mtp_layers_block_type: ["attention",
+/// "moe"]`) — the MTP checkpoint tensors are always plain BF16 (see
+/// that file's header), so this always takes the unquantized branch
+/// below for that call site, but the NVFP4 branch is left reachable
+/// unmodified for a future quantized-MTP checkpoint.
+func buildNemotronHMoELayer(
     prefix p: String, norm: RMSNorm, weights: SafeTensorsBundle,
     hidden: Int, moeIntermediate: Int,
     nRoutedExperts: Int, topK: Int,
@@ -1144,6 +1171,18 @@ public final class NemotronHModel: LanguageModel {
     public let mambaNHeads, mambaHeadDim, stateDim, convDim, convKernel, nGroups, dInner: Int
     public let dtype: DType
 
+    /// F-131 MTP self-speculative decode: the checkpoint's optional
+    /// 53rd "nextn" block (`mtp.*` tensors), loaded when
+    /// `BUTTER_NEMOTRON_MTP=1` AND the checkpoint ships one (see
+    /// `NemotronHMTPHead.swift`). `nil` for every checkpoint without an
+    /// MTP block, and for MTP-bearing checkpoints when the env var is
+    /// unset — the extra ~2.6 GB of BF16 expert weights simply never
+    /// gets loaded/resident in that case. Settable post-init (not an
+    /// init parameter) so `NemotronHHybrid.loadModel` can attach it
+    /// after the backbone (whose `embedTokens`/`lmHead` the head shares
+    /// by reference) already exists.
+    public var mtpHead: NemotronHMTPHead?
+
     /// Layer kinds, index-aligned with `layers` — drives `makeLayerCaches`.
     let layerKinds: [NemotronHLayerKind]
 
@@ -1254,6 +1293,23 @@ public final class NemotronHModel: LanguageModel {
         caches: [any LayerCacheProtocol],
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
+        let (_, logits) = forwardHiddenAndLogits(
+            tokenId: tokenId, position: position, caches: caches, on: cmd, device: device)
+        return logits
+    }
+
+    /// Same single-token forward as `forward(tokenId:)`, but also
+    /// returns the PRE-final-norm backbone hidden state — the seed an
+    /// MTP draft head's `hnorm`/first `draftStep` needs (F-131,
+    /// `NemotronHMTPHead`/`NemotronHMTPSpecDecode`; mirrors Qwen3x's
+    /// `forwardManyHiddenAndLogits` returning both for the same reason).
+    /// Identical body to `forward(tokenId:)` otherwise — that method is
+    /// now a thin wrapper discarding the hidden half.
+    public func forwardHiddenAndLogits(
+        tokenId: Int, position: Int,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> (hidden: Tensor, logits: Tensor) {
         let tokenBuf = device.makeBuffer(length: 4)
         var tid = UInt32(tokenId)
         memcpy(tokenBuf.contents(), &tid, 4)
@@ -1272,7 +1328,7 @@ public final class NemotronHModel: LanguageModel {
                     cmd: cmd, device: device)
             }
             let normed = finalNorm(h, on: cmd)
-            return lmHead(normed, on: cmd)
+            return (hidden: h, logits: lmHead(normed, on: cmd))
         }
 
         // Checkpoint has ≥1 committing layer: run every layer on a
@@ -1299,7 +1355,7 @@ public final class NemotronHModel: LanguageModel {
         workCmd.commit()
         workCmd.waitUntilCompleted()
         let normed = finalNorm(h, on: cmd)
-        return lmHead(normed, on: cmd)
+        return (hidden: h, logits: lmHead(normed, on: cmd))
     }
 
     /// Multi-token forward — prefill fast path. Loops
