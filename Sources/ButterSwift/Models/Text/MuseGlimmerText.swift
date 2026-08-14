@@ -874,29 +874,36 @@ public final class MuseGlimmerModel: LanguageModel {
     /// per-op collapse), then runs the final norm + LM head on the
     /// TAIL position only — `Generate.swift` only samples the last row.
     ///
-    /// **Fast-path window bound.** `MuseGlimmerLayer.forwardMulti`'s
-    /// batched `sdpaMulti` is only correct for a sliding-attention
-    /// layer while its `.window`-evicting KV cache's ring buffer hasn't
-    /// wrapped — i.e. while `position + tokenIds.count <= slidingWindow`
-    /// (see that function's doc comment for the exact
-    /// `KVEvictionState.reserveNextSlot` reasoning). All 39 sliding
-    /// layers share one `slidingWindow` value, so this is a single
-    /// model-level check. Below the bound, EVERY layer (sliding + the
-    /// 13 NoPE full layers, whose `.unbounded` cache has no such bound)
-    /// takes the fully batched path. At/above it — a single prompt
-    /// chunk that already straddles or exceeds one window's worth of
-    /// context — this falls back to the per-token loop for full
-    /// correctness, same as the pre-existing baseline. With the default
-    /// `prefillStepSize` (1024) at half of `slidingWindow` (2048), the
-    /// fast path covers every chunk of any prompt up to 2048 tokens,
-    /// and every chunk short of the window boundary in longer prompts.
+    /// **Fast-path window bound — and the past-window batched path.**
+    /// `MuseGlimmerLayer.forwardMulti`'s single whole-chunk `sdpaMulti`
+    /// is only correct for a sliding-attention layer while its
+    /// `.window`-evicting KV cache's ring buffer hasn't wrapped — i.e.
+    /// while `position + tokenIds.count <= slidingWindow` (see that
+    /// function's doc comment for the exact `KVEvictionState.reserveNextSlot`
+    /// reasoning). All 39 sliding layers share one `slidingWindow`
+    /// value, so this is a single model-level check.
     ///
-    /// A further follow-up could keep the 13 full layers on the batched
-    /// path unconditionally (their `.unbounded` cache has no window
-    /// bound at all) and only fall back per-chunk on the 39 sliding
-    /// layers — not done here to keep the fallback a single well-tested
-    /// code path (the pre-existing per-token loop) rather than a new
-    /// mixed-batching one.
+    /// Below the bound, EVERY layer (sliding + the 13 NoPE full layers,
+    /// whose `.unbounded` cache has no such bound) takes the fully
+    /// batched path, unchanged from before this doc comment.
+    ///
+    /// At/above the bound — a single prompt chunk that already straddles
+    /// or exceeds one window's worth of context — this used to fall back
+    /// to the whole-MODEL per-token loop (every layer, every projection,
+    /// re-run from scratch per token, with a host commit/wait between
+    /// each). With `MuseGlimmerEnvFlags.longPrefillEnabled`
+    /// (`BUTTER_GLIMMER_LONG_PREFILL`, default on) this function instead
+    /// ALWAYS takes the batched per-layer call below: NoPE layers are
+    /// unaffected (no window bound), and each sliding layer decides for
+    /// itself, per `MuseGlimmerLayer.forwardMulti`'s internal
+    /// `windowWraps` check, whether to take its existing single-dispatch
+    /// `sdpaMulti` (still within window) or the new interleaved
+    /// per-row `sdpaDecode` path (window wrapped) — see that function's
+    /// doc comment for why the latter can't just batch-append-then-
+    /// batch-attend. `BUTTER_GLIMMER_LONG_PREFILL=0` restores the exact
+    /// pre-existing behavior: `fastPathEligible` gates the whole call
+    /// between the fully-batched path and the whole-model per-token
+    /// fallback loop below, same as before this path existed.
     public func forwardMulti(
         tokenIds: [Int], startingAt position: Int,
         caches: [any LayerCacheProtocol],
@@ -910,7 +917,8 @@ public final class MuseGlimmerModel: LanguageModel {
         let n = tokenIds.count
 
         let fastPathEligible = position + n <= slidingWindow
-        guard fastPathEligible else {
+        let takeBatchedPath = fastPathEligible || MuseGlimmerEnvFlags.longPrefillEnabled
+        guard takeBatchedPath else {
             var logits: Tensor!
             for (i, tok) in tokenIds.enumerated() {
                 // `autoreleasepool` per token — `forward(tokenId:...)`
