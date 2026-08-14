@@ -768,6 +768,83 @@ public final class NemotronHAttentionLayer: Module, DecoderLayer {
         let oOut = oProj(attnOut.reshaped(to: [nHeads * headDim]), on: cmd)
         return Ops.add(h, oOut, on: cmd)
     }
+
+    /// F-132 batched prefill: T-batched attention. `h` is `[T, hidden]`;
+    /// returns `[T, hidden]`. Collapses the T-token per-row loop into
+    /// batched Q/K/V projections + one KV-cache range append + one
+    /// `Ops.sdpaMulti(causal: true)` dispatch + a batched output
+    /// projection — mirrors `Qwen35AttentionMixer.forwardMany`, minus
+    /// RoPE and the per-head Q/K RMSNorm (NemotronH attention has
+    /// neither — see the file header's "Attention has no RoPE" note).
+    /// All work queues onto `cmd`; no commit inside (matches `decode`'s
+    /// contract — `commitsMidDecode` is `false` for this layer).
+    public func decodeMulti(
+        _ h: Tensor, startingAt position: Int,
+        cache: any LayerCacheProtocol,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        guard let kv = cache as? KVCache else {
+            fatalError("NemotronHAttentionLayer: expected KVCache, got \(type(of: cache))")
+        }
+        let t = h.shape[0]
+        let hiddenDim = h.shape.last!
+        let qDim = nHeads * headDim
+        let kvDim = nKVHeads * headDim
+
+        let xNorm = Ops.rmsNormRows(
+            h, weight: norm.weight, eps: norm.eps,
+            nRows: t, rowSize: hiddenDim, on: cmd)
+
+        // Batched Q/K/V — one gemm each instead of T gemvs.
+        let qOut = qProj.callMany(xNorm, t: t, on: cmd, device: device)
+        let kOut = kProj.callMany(xNorm, t: t, on: cmd, device: device)
+        let vOut = vProj.callMany(xNorm, t: t, on: cmd, device: device)
+
+        // No RoPE — straight into the cache, unrotated (same as `decode`).
+        let appendPositions = Tensor.empty(shape: [t], dtype: .u32, device: device)
+        kv.reserveSlotsManyOnHost(t: t, into: appendPositions)
+        kv.appendRangeOnGPUMany(
+            kFlat: kOut.reshaped(to: [t, nKVHeads, headDim]),
+            vFlat: vOut.reshaped(to: [t, nKVHeads, headDim]),
+            t: t, positions: appendPositions, on: cmd)
+
+        let (cacheK, cacheV) = kv.prepareForAttention(on: cmd)
+        let attnAll: Tensor
+        if headDim == 128 || headDim == 256 {
+            let qBlock = qOut.reshaped(to: [t, nHeads, headDim])
+            attnAll = Ops.sdpaMulti(
+                q: qBlock, k: cacheK, v: cacheV,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                baseKV: position, nQuery: t, kvStride: kv.maxSeq,
+                causal: true, scale: scale, on: cmd
+            ).reshaped(to: [t * qDim])
+        } else {
+            // Escape path for a hypothetical NemotronH checkpoint whose
+            // head_dim isn't 128/256 (every shipped checkpoint, including
+            // Nemotron-3.5-Lightning, uses 128) — per-row sdpaDecode loop,
+            // still batched everywhere else in this method.
+            let scratch = Tensor.empty(shape: [t * qDim], dtype: xNorm.dtype, device: device)
+            let dtBytes = xNorm.dtype.byteSize
+            for r in 0 ..< t {
+                let qRow = Tensor(
+                    buffer: qOut.buffer, offset: qOut.offset + r * qDim * dtBytes,
+                    shape: [nHeads, headDim], dtype: xNorm.dtype)
+                let outRow = Tensor(
+                    buffer: scratch.buffer, offset: scratch.offset + r * qDim * dtBytes,
+                    shape: [nHeads, headDim], dtype: xNorm.dtype)
+                _ = Ops.sdpaDecode(
+                    q: qRow, k: cacheK, v: cacheV,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    nKV: position + r + 1, kvStride: kv.maxSeq,
+                    scale: scale, on: cmd, into: outRow)
+            }
+            attnAll = scratch
+        }
+        _ = kvDim  // silence unused-var warning on the RoPE-free path
+        let attnRows = attnAll.reshaped(to: [t, qDim])
+        let oOut = oProj.callMany(attnRows, t: t, on: cmd, device: device)
+        return Ops.add(h, oOut, on: cmd)
+    }
 }
 
 // ─── NemotronHMLPLayer — "-" ─────────────────────────────────────────
@@ -813,6 +890,28 @@ public final class NemotronHMLPLayer: Module, DecoderLayer {
         let r = Ops.relu(up, on: cmd)
         let r2 = Ops.mul(r, r, on: cmd)
         let mlpOut = downProj(r2, on: cmd)
+        return Ops.add(h, mlpOut, on: cmd)
+    }
+
+    /// F-132 batched prefill: T-batched dense MLP. `h` is `[T, hidden]`;
+    /// returns `[T, hidden]`. A dense MLP has no per-token state, so this
+    /// is a pure batched-GEMM win — one `up.callMany` + one `down.callMany`
+    /// instead of T single-row GEMVs, with the squared-ReLU activation
+    /// unchanged (elementwise, already shape-agnostic).
+    public func decodeMulti(
+        _ h: Tensor, startingAt _: Int,
+        cache _: any LayerCacheProtocol,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let t = h.shape[0]
+        let rowSize = h.shape.last!
+        let xNorm = Ops.rmsNormRows(
+            h, weight: norm.weight, eps: norm.eps,
+            nRows: t, rowSize: rowSize, on: cmd)
+        let up = upProj.callMany(xNorm, t: t, on: cmd, device: device)
+        let r = Ops.relu(up, on: cmd)
+        let r2 = Ops.mul(r, r, on: cmd)
+        let mlpOut = downProj.callMany(r2, t: t, on: cmd, device: device)
         return Ops.add(h, mlpOut, on: cmd)
     }
 }
@@ -1157,6 +1256,16 @@ func buildNemotronHMoELayer(
         dtype: dtype)
 }
 
+// ─── F-132 batched prefill (M>1 forward) ──────────────────────────────
+//
+// Default ON. `BUTTER_NEMOTRON_BATCHED_PREFILL=0` reverts
+// `NemotronHModel.forwardMulti` to the original per-token loop — the
+// escape hatch for bisection / a regression that only reproduces on
+// the batched path.
+enum NemotronHBatchedPrefill {
+    static let enabled = ButterEnv["BUTTER_NEMOTRON_BATCHED_PREFILL"] != "0"
+}
+
 // ─── NemotronHModel ──────────────────────────────────────────────────
 
 public final class NemotronHModel: LanguageModel {
@@ -1358,14 +1467,33 @@ public final class NemotronHModel: LanguageModel {
         return (hidden: h, logits: lmHead(normed, on: cmd))
     }
 
-    /// Multi-token forward — prefill fast path. Loops
-    /// `forward(tokenId:)` per row on the supplied `cmd`.
+    /// Multi-token forward — prefill fast path.
     ///
-    /// NemotronH is a layer-type-string hybrid (`M`/`*`/`E`/`-`
-    /// alternation). Per-attention-layer chunked path needs a
-    /// `decodeMulti` override on the attention DecoderLayer slot; the
-    /// Mamba 2 / MLP / nothing layer kinds keep the per-token default.
-    /// Today this override is commit-count-batched only.
+    /// F-132 batched prefill (default ON, `BUTTER_NEMOTRON_BATCHED_
+    /// PREFILL=0` reverts to the per-token loop below): embeds all `T`
+    /// prompt tokens in one gather, then walks the heterogeneous layer
+    /// stack calling each layer's `decodeMulti(_:startingAt:cache:cmd:
+    /// device:)` — attention (`NemotronHAttentionLayer`) and dense MLP
+    /// (`NemotronHMLPLayer`) layers take a real batched-T
+    /// implementation (batched projections + one `sdpaMulti` /
+    /// `gemm` dispatch instead of T single-row ones); Mamba 2
+    /// (`NemotronHMambaLayer`) keeps `DecoderLayer`'s default per-row
+    /// loop — the selective-scan recurrence is inherently sequential,
+    /// v1 does not attempt a chunked-scan kernel (see the perf-wave
+    /// doc for the profiling call that decided this); the NVFP4 MoE
+    /// layer (`NemotronHNvfp4MoELayer`) gets its own `decodeMulti`
+    /// override (`NemotronHNvfp4.swift`) reusing the existing batched-
+    /// prefill gather-GEMM / sort-route MoE primitives when its GPU
+    /// router is active, falling back to the per-row default otherwise.
+    ///
+    /// Command-buffer discipline mirrors `forwardHiddenAndLogits`: a
+    /// layer whose `commitsMidDecode` is `true` (a CPU-routed MoE
+    /// layer's host readback) forces a fresh work buffer for the next
+    /// layer; every other layer queues onto the same buffer across the
+    /// whole T-token chunk. Only the LAST row's hidden state needs the
+    /// final norm + lm_head (the protocol's documented contract: return
+    /// the tail position's logits only), so that step, and it alone,
+    /// runs on the caller's `cmd`.
     public func forwardMulti(
         tokenIds: [Int], startingAt position: Int,
         caches: [any LayerCacheProtocol],
@@ -1374,13 +1502,48 @@ public final class NemotronHModel: LanguageModel {
         precondition(
             !tokenIds.isEmpty,
             "NemotronHModel.forwardMulti: tokenIds must be non-empty")
-        var logits: Tensor!
-        for (i, tok) in tokenIds.enumerated() {
-            logits = forward(
-                tokenId: tok, position: position + i,
-                caches: caches, on: cmd, device: device)
+        let t = tokenIds.count
+        guard t > 1, NemotronHBatchedPrefill.enabled else {
+            // T==1, or the escape hatch — original per-token loop.
+            var logits: Tensor!
+            for (i, tok) in tokenIds.enumerated() {
+                logits = forward(
+                    tokenId: tok, position: position + i,
+                    caches: caches, on: cmd, device: device)
+            }
+            return logits
         }
-        return logits
+
+        let idsBuf = device.makeBuffer(length: t * 4)
+        let idsHost = tokenIds.map { UInt32($0) }
+        idsHost.withUnsafeBytes { raw in
+            _ = memcpy(idsBuf.contents(), raw.baseAddress!, t * 4)
+        }
+        let idsTensor = Tensor(buffer: idsBuf, offset: 0, shape: [t], dtype: .u32)
+
+        var workCmd = device.makeCommandBuffer()
+        // `Ops.gather` (what `embedTokens` wraps) already returns
+        // `[t, hidden]` — no reshape needed.
+        var h = embedTokens(idsTensor, on: workCmd)
+        for (i, layer) in layers.enumerated() {
+            let out = autoreleasepool { () -> Tensor in
+                layer.decodeMulti(
+                    h, startingAt: position, cache: caches[i],
+                    cmd: workCmd, device: device)
+            }
+            h = out
+            if layer.commitsMidDecode {
+                workCmd = device.makeCommandBuffer()
+            }
+        }
+        // Flush every pending dispatch so the last row is resident
+        // before the caller's `cmd` reads it.
+        workCmd.commit()
+        workCmd.waitUntilCompleted()
+
+        let lastRow = h.slicedRows(start: t - 1, count: 1).reshaped(to: [hidden])
+        let normed = finalNorm(lastRow, on: cmd)
+        return lmHead(normed, on: cmd)
     }
 
     // ─── VLM embedding-input path ────────────────────────────────────
