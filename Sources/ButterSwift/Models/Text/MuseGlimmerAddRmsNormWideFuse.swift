@@ -75,22 +75,37 @@
 // (`glimmer-decode-gap` census run, 3 prompts) diverged at token 30 and
 // token 166 on two of the three prompts with `fastMathEnabled = false`.
 // Flipping to `true` made all three prompts byte-identical across the
-// full 200 tokens. Read: the precompiled `iron_rms_norm_wide_*` /
-// `vector_add_*` kernels this replaces were themselves built under
-// Metal's default (fast-math-on) compile mode, same lesson
-// `NemotronHMambaMixerFuse.swift`'s `addSoftplus` section documents —
-// "correct-looking" reasoning about compiler behavior is not a
-// substitute for measuring against the actual reference kernels.
+// full 200 tokens ON THIS M5 MAX. Read: the precompiled
+// `iron_rms_norm_wide_*` / `vector_add_*` kernels this replaces were
+// themselves built under Metal's default (fast-math-on) compile mode,
+// same lesson `NemotronHMambaMixerFuse.swift`'s `addSoftplus` section
+// documents — "correct-looking" reasoning about compiler behavior is
+// not a substitute for measuring against the actual reference kernels.
 //
-// Escape hatch: `BUTTER_MUSEGLIMMER_ADD_RMS_NORM_WIDE=0` restores the
-// unfused `Ops.add` + `Ops.rmsNorm` two-dispatch chain byte-for-byte.
-// Default ON — verified byte-identical against the unfused baseline on
-// this M5 Max across 3 prompts / 200 greedy tokens each (see
-// `MuseGlimmerAddRmsNormWideFuseTests` for the per-dtype unit coverage
-// of the same claim). If this ever regresses on different hardware (the
-// CI-vs-M5-Max hazard `NemotronHMambaMixerFuse.swift` hit with
-// `addSoftplus`), flip the default OFF rather than trusting a single
-// machine's green run.
+// **This "fix" was itself hardware-local — do not trust it either.**
+// PR #137 shipped this kernel default-ON off the M5 Max result above.
+// CI (a different GPU/driver) failed it: `MuseGlimmerAddRmsNormWideFuseTests`
+// recorded 46-195 bitwise mismatches per dtype (`gh run view
+// 31775982914`), while every one of the other 2029 tests in the run —
+// including Levers 1-3, which reuse existing shipped kernels rather
+// than compiling a new one — passed clean. This is the EXACT hazard
+// class `NemotronHMambaMixerFuse.swift`'s `addSoftplus` hit: bit-exact
+// on the machine it was developed on, then wrong on CI's GPU, because
+// `rsqrt`/transcendental rounding is compile-context- and
+// hardware-dependent, not a portable property of the kernel source.
+// One machine's green run — even a green run that itself corrected an
+// earlier wrong assumption — is still just one machine's green run.
+//
+// Escape hatch, now inverted to opt-in: `BUTTER_GLIMMER_WIDE_ADDNORM=1`
+// enables this kernel; unset/anything else keeps the unfused `Ops.add`
+// + `Ops.rmsNorm` two-dispatch chain, which is what every other
+// architecture already runs at this hidden size and what CI is green
+// on. Default OFF — the measured decode delta from this specific lever
+// was ≈0 anyway (25.35 tok/s levers 1-3 vs 25.36 tok/s with this kernel
+// also on, both within the run-to-run noise floor), so there is no
+// perf case for accepting a portability risk this kernel hasn't
+// cleared. Flip back to opt-in-tested/default-ON only after this
+// passes CI's GPU directly, the same bar `addSoftplus` never cleared.
 
 import Foundation
 import Metal
@@ -103,11 +118,18 @@ enum MuseGlimmerAddRmsNormWideFuse {
     /// `OpsValidation.addRmsNormMaxRowSize`.
     static let minRowSize = OpsValidation.addRmsNormMaxRowSize + 1
 
-    /// Pure add + RMSNorm, no transcendentals beyond the single `rsqrt`
-    /// every RMSNorm kernel in this codebase already uses (including the
-    /// unfused reference this replaces) — default ON.
+    /// Opt-in, OFF by default — CI's GPU recorded 46-195 bitwise
+    /// mismatches per dtype for this kernel (`gh run view
+    /// 31775982914`) even though it was verified byte-identical in a
+    /// live decode A/B on the M5 Max it was developed on. Same
+    /// cross-GPU `rsqrt`/transcendental hazard class as
+    /// `NemotronHMambaMixerFuse.swift`'s `addSoftplus`. See the file
+    /// header's "This fix was itself hardware-local" section.
+    /// `BUTTER_GLIMMER_WIDE_ADDNORM=1` to opt in for A/B benchmarking
+    /// on hardware where bit-exactness has been independently
+    /// re-verified; do not flip the default without CI proving it.
     static let enabled: Bool =
-        ButterEnv["BUTTER_MUSEGLIMMER_ADD_RMS_NORM_WIDE"] != "0"
+        ButterEnv["BUTTER_GLIMMER_WIDE_ADDNORM"] == "1"
 
     nonisolated(unsafe) private static var psoCache: [String: MTLComputePipelineState] = [:]
     private static let lock = NSLock()
@@ -119,8 +141,12 @@ enum MuseGlimmerAddRmsNormWideFuse {
         if let p = psoCache[name] { return p }
         // fastMathEnabled = true — empirically required to match the
         // precompiled `iron_rms_norm_wide_*` / `vector_add_*` reference
-        // kernels bit-for-bit. See the file header's "Compile flags"
-        // section: `false` measurably diverged in a live decode A/B.
+        // kernels bit-for-bit on THIS box. See the file header's
+        // "Compile flags" section: `false` measurably diverged in a
+        // live decode A/B — and even this `true` setting only proved
+        // bit-exact on the M5 Max it was tuned on, not on CI's GPU
+        // (hence `enabled` defaulting OFF; see the header's "This fix
+        // was itself hardware-local" section).
         let opts = MTLCompileOptions()
         opts.fastMathEnabled = true
         let lib = try! device.makeLibrary(source: source, options: opts)

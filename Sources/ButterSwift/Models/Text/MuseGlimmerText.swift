@@ -579,10 +579,18 @@ public final class MuseGlimmerLayer: Module {
             mlpNorm = fused.normed
         } else if MuseGlimmerAddRmsNormWideFuse.enabled && hidden >= MuseGlimmerAddRmsNormWideFuse.minRowSize {
             // hidden=6656 blows past `Ops.addAndRmsNorm`'s 4096-wide fast
-            // path — use the wide-row sibling instead of falling all the
-            // way back to two dispatches. See
-            // `MuseGlimmerAddRmsNormWideFuse.swift` for the byte-exactness
-            // design (`BUTTER_MUSEGLIMMER_ADD_RMS_NORM_WIDE=0` to disable).
+            // path — this wide-row sibling would collapse the fallback
+            // to one dispatch, but it's OPT-IN ONLY
+            // (`BUTTER_GLIMMER_WIDE_ADDNORM=1`), default OFF: CI's GPU
+            // recorded 46-195 bitwise mismatches per dtype for this
+            // kernel even though it round-tripped byte-identical in a
+            // live decode A/B on the dev box it shipped from — the same
+            // cross-GPU `rsqrt` hazard `NemotronHMambaMixerFuse.swift`
+            // hit with `addSoftplus`. See
+            // `MuseGlimmerAddRmsNormWideFuse.swift`'s file header. The
+            // measured decode win from this lever alone was ≈0 anyway
+            // (within run-to-run noise), so the unfused two-dispatch
+            // `else` branch below is the default path.
             let fused = MuseGlimmerAddRmsNormWideFuse.addAndRmsNormWide(
                 h, normedAttn, weight: preFFNorm.weight, eps: preFFNorm.eps,
                 nRows: 1, rowSize: hidden, device: device, on: cmd)

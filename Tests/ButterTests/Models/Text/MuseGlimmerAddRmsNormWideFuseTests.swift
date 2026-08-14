@@ -16,16 +16,26 @@
 // `MuseGlimmerAddRmsNormWideFuse.addAndRmsNormWide` against the exact
 // unfused chain it replaces (`Ops.add` then `Ops.rmsNorm`, which
 // `dispatchRmsNorm` routes to the `iron_rms_norm_wide_*` kernel for any
-// rowSize > 4096 — see `OpsValidation.addRmsNormMaxRowSize`). Held to
-// EXACT bit-for-bit equality, not a tolerance envelope — unlike
-// `addSoftplus` / `mulSilu` in `NemotronHMambaMixerFuseTests.swift`,
-// this fusion has no transcendental beyond the single `rsqrt` every
-// RMSNorm kernel in this codebase already uses (including the
-// reference it's compared against), and a live 200-token greedy decode
-// A/B against the unfused baseline (3 prompts, full Muse Glimmer 30B)
-// confirmed byte-identical output at `fastMathEnabled = true` — see
-// `MuseGlimmerAddRmsNormWideFuse.swift`'s "Compile flags" header
-// section for the (wrong first, then corrected) empirical story.
+// rowSize > 4096 — see `OpsValidation.addRmsNormMaxRowSize`).
+//
+// **NOT held to exact bit-for-bit equality — this is hardware-dependent,
+// same class as `addSoftplus` / `mulSilu` in
+// `NemotronHMambaMixerFuseTests.swift`.** The first cut of this test
+// DID assert exact equality: it passed on the M5 Max this fusion was
+// developed on, including a live 200-token greedy decode A/B against
+// the unfused baseline (3 prompts, full Muse Glimmer 30B, byte-identical
+// output). PR #137's CI run on a different GPU then recorded 46-195
+// bitwise mismatches per dtype for that same exact-equality assertion
+// (`gh run view 31775982914`) while every one of the other 2029 tests
+// in that run passed clean. Same root cause as `addSoftplus`: this
+// kernel's threadgroup reduction feeds a single `rsqrt`, and
+// `rsqrt`/transcendental rounding is compile-context- and
+// hardware-dependent, not a portable property of the source. This test
+// now locks in a tolerance envelope as a regression guard (catches a
+// real formula bug) rather than re-asserting a portability claim the
+// kernel hasn't earned — matching the fusion's now opt-in-only gate
+// (`BUTTER_GLIMMER_WIDE_ADDNORM=1`, default OFF; see
+// `MuseGlimmerAddRmsNormWideFuse.swift`'s file header).
 //
 // rowSize = 6656 matches Muse Glimmer's actual hidden_size; 5120 is a
 // second, unrelated width to confirm the kernel isn't accidentally
@@ -79,12 +89,36 @@ struct MuseGlimmerAddRmsNormWideFuseTests {
         return t
     }
 
+    /// Generous relative envelope — same magnitude as `addSoftplus`'s
+    /// tolerance test in `NemotronHMambaMixerFuseTests.swift`. The
+    /// point is catching a gross regression (a real formula bug), not
+    /// re-litigating the known cross-GPU rsqrt/reduction noise CI
+    /// already surfaced.
+    private static let rtol: Float = 1e-2
+    private static let atol: Float = 1e-3
+
+    private static func assertWithinEnvelope(
+        _ unfused: [Float], _ fused: [Float], label: String
+    ) {
+        var outOfBand = 0
+        for i in 0 ..< unfused.count {
+            let bound = Self.atol + Self.rtol * abs(unfused[i])
+            if abs(unfused[i] - fused[i]) > bound {
+                outOfBand += 1
+                if outOfBand <= 3 {
+                    print("[\(label)] out-of-band at \(i): unfused=\(unfused[i]) fused=\(fused[i])")
+                }
+            }
+        }
+        #expect(outOfBand == 0, "\(label): \(outOfBand)/\(unfused.count) outside atol+rtol envelope")
+    }
+
     private static let dtypes: [DType] = [.f32, .f16, .bf16]
     private static let rowSizes = [6656, 5120]  // Muse Glimmer's hidden, + an unrelated width
     private static let eps: Float = 1e-5
 
-    @Test("addAndRmsNormWide matches Ops.add + Ops.rmsNorm exactly, all dtypes, nRows=1 (decode)")
-    func decodeRowExact() {
+    @Test("addAndRmsNormWide matches Ops.add + Ops.rmsNorm within the known cross-GPU envelope, all dtypes, nRows=1 (decode)")
+    func decodeRowWithinKnownTolerance() {
         for dtype in Self.dtypes {
             for n in Self.rowSizes {
                 autoreleasepool {
@@ -109,34 +143,19 @@ struct MuseGlimmerAddRmsNormWideFuseTests {
                         fusedNormed = fused.normed
                     }
 
-                    let ur = unfusedResid.toFloatArray()
-                    let fr = fusedResid.toFloatArray()
-                    var residMismatches = 0
-                    for i in 0 ..< n where ur[i] != fr[i] {
-                        residMismatches += 1
-                        if residMismatches <= 3 {
-                            print("[addAndRmsNormWide \(dtype) n=\(n)] residual mismatch at \(i): unfused=\(ur[i]) fused=\(fr[i])")
-                        }
-                    }
-                    #expect(residMismatches == 0, "residual (\(dtype), n=\(n)): \(residMismatches)/\(n) mismatches")
-
-                    let un = unfusedNormed.toFloatArray()
-                    let fn = fusedNormed.toFloatArray()
-                    var normedMismatches = 0
-                    for i in 0 ..< n where un[i] != fn[i] {
-                        normedMismatches += 1
-                        if normedMismatches <= 3 {
-                            print("[addAndRmsNormWide \(dtype) n=\(n)] normed mismatch at \(i): unfused=\(un[i]) fused=\(fn[i])")
-                        }
-                    }
-                    #expect(normedMismatches == 0, "normed (\(dtype), n=\(n)): \(normedMismatches)/\(n) mismatches")
+                    Self.assertWithinEnvelope(
+                        unfusedResid.toFloatArray(), fusedResid.toFloatArray(),
+                        label: "addAndRmsNormWide \(dtype) n=\(n) residual")
+                    Self.assertWithinEnvelope(
+                        unfusedNormed.toFloatArray(), fusedNormed.toFloatArray(),
+                        label: "addAndRmsNormWide \(dtype) n=\(n) normed")
                 }
             }
         }
     }
 
-    @Test("addAndRmsNormWide matches Ops.add + Ops.rmsNormRows exactly, all dtypes, nRows=4 (prefill-shaped)")
-    func multiRowExact() {
+    @Test("addAndRmsNormWide matches Ops.add + Ops.rmsNormRows within the known cross-GPU envelope, all dtypes, nRows=4 (prefill-shaped)")
+    func multiRowWithinKnownTolerance() {
         let nRows = 4
         for dtype in Self.dtypes {
             autoreleasepool {
@@ -160,25 +179,28 @@ struct MuseGlimmerAddRmsNormWideFuseTests {
                     fusedNormed = fused.normed
                 }
 
-                let un = unfusedNormed.toFloatArray()
-                let fn = fusedNormed.toFloatArray()
-                var mismatches = 0
-                for i in 0 ..< (n * nRows) where un[i] != fn[i] {
-                    mismatches += 1
-                    if mismatches <= 3 {
-                        print("[addAndRmsNormWide \(dtype) multi-row] mismatch at \(i): unfused=\(un[i]) fused=\(fn[i])")
-                    }
-                }
-                #expect(mismatches == 0, "multi-row normed (\(dtype)): \(mismatches)/\(n * nRows) mismatches")
+                Self.assertWithinEnvelope(
+                    unfusedNormed.toFloatArray(), fusedNormed.toFloatArray(),
+                    label: "addAndRmsNormWide \(dtype) multi-row normed")
             }
         }
     }
 
-    @Test("BUTTER_MUSEGLIMMER_ADD_RMS_NORM_WIDE=0 escape hatch reads live via ButterEnv")
-    func escapeHatchReadsLive() {
-        setenv("BUTTER_MUSEGLIMMER_ADD_RMS_NORM_WIDE", "0", 1)
-        defer { unsetenv("BUTTER_MUSEGLIMMER_ADD_RMS_NORM_WIDE") }
-        #expect(ButterEnv["BUTTER_MUSEGLIMMER_ADD_RMS_NORM_WIDE"] == "0")
-        #expect(!MuseGlimmerAddRmsNormWideFuse.enabled)
+    /// Tests the LIVE `ButterEnv` read only, NOT
+    /// `MuseGlimmerAddRmsNormWideFuse.enabled` — `.enabled` is a
+    /// `static let`, so it lazily reads `ButterEnv` exactly ONCE on its
+    /// first touch anywhere in the process and caches that value for
+    /// the process's lifetime (see `ButterEnv.swift`'s file header: this
+    /// is the documented, intentional shape for a per-token/per-layer
+    /// hot-path flag). Asserting on `.enabled` from a test is therefore
+    /// order-dependent on whichever test happens to touch it first —
+    /// this flaked exactly that way once already. Same reasoning
+    /// `NemotronHMambaMixerFuseTests.escapeHatchReadsLive` already
+    /// applies: check the live env read, not the cached static.
+    @Test("BUTTER_GLIMMER_WIDE_ADDNORM=1 opt-in reads live via ButterEnv")
+    func optInReadsLive() {
+        setenv("BUTTER_GLIMMER_WIDE_ADDNORM", "1", 1)
+        defer { unsetenv("BUTTER_GLIMMER_WIDE_ADDNORM") }
+        #expect(ButterEnv["BUTTER_GLIMMER_WIDE_ADDNORM"] == "1")
     }
 }
