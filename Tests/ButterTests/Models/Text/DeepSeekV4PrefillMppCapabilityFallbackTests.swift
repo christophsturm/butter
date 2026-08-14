@@ -77,20 +77,22 @@ struct DeepSeekV4PrefillMppCapabilityFallbackTests {
     /// when `Ops.mppAutoCapable == false` (site 1, ~DeepSeekV4Text.swift
     /// prefillLayer's `gq8` closure).
     ///
-    /// KNOWN ISSUE (discovered by this test, NOT caused by this branch's
-    /// fix): on this Family-9+/macOS-26+ Mac (`Ops.mppAutoCapable == true`),
-    /// `Ops.gemmQ8Mpp` dispatches without crashing but writes an
-    /// all-zero `out` — verified across several shapes (64/256/40,
-    /// 64/256/64, 128/512/96), so it isn't a partial-tile edge case. This
-    /// is a correctness bug in the `iron_gemm_q8_mpp_*` kernel body
-    /// itself, orthogonal to the capability-GATING this branch adds
-    /// (`gq8`'s `n>=32` branch was the ONLY caller of `Ops.gemmQ8Mpp` in
-    /// the repo before this branch, so it had zero prior test coverage).
-    /// Wrapped in `withKnownIssue` so it's tracked without failing the
-    /// suite; the guard under test here is unaffected — it correctly
-    /// selects between the two kernels, and the scalar sibling (which IS
-    /// correct — see `scalar` assertions below) is what `gq8` now always
-    /// uses whenever `Ops.mppAutoCapable == false`.
+    /// FIXED (was a KNOWN ISSUE, discovered by this test, NOT caused by
+    /// this branch's capability-gating fix): `Ops.gemmQ8Mpp` was dispatching
+    /// via the "dispatchThreads" `IronKernels.iron_gemm_q8_mpp_*` wrapper
+    /// with a `gridSize` computed in THREADGROUP units
+    /// (`(outDim+63)/64, (nRows+63)/64`) instead of THREAD units — the
+    /// coop-tile/simdgroup-matrix generated kernels require the
+    /// `_threadgroups`-suffixed wrapper (`dispatchThreadgroups`), exactly
+    /// like every other `_mpp_`/`bgemm` bm64 dispatch in this file (see
+    /// `moeBgemmIQ2XXSViewU16Bm64`/`moeBgemmQ2KViewU16Bm64`). With the
+    /// threadgroup-count value fed to `dispatchThreads`, only a handful of
+    /// threads in the whole grid actually launched, starving the
+    /// `mpp::tensor_ops::matmul2d` cooperative tensor of its required
+    /// full-simdgroup participation — hence the all-zero `out` (verified
+    /// across several shapes: 64/256/40, 64/256/64, 128/512/96). Fixed in
+    /// `Ops.gemmQ8Mpp`/`Ops.groupedGemmQ8Mpp` (Sources/ButterSwift/Ops/OpsPrefill.swift)
+    /// by switching both to the `_threadgroups` wrapper variants.
     @Test("gemmQ8Mpp agrees with the gemmQ8 scalar sibling")
     func gemmQ8MppMatchesScalar() throws {
         let device = Device.shared
@@ -142,22 +144,35 @@ struct DeepSeekV4PrefillMppCapabilityFallbackTests {
             #expect(mpp.filter(\.isNaN).count == 0, "gemmQ8Mpp produced NaNs")
             let cos = cosine(mpp, scalar)
             print("[dsv4-mpp-fallback] gemmQ8Mpp vs gemmQ8 cos=\(cos) mppSumAbs=\(mpp.map{abs($0)}.reduce(0,+)) scalarSumAbs=\(scalar.map{abs($0)}.reduce(0,+))")
-            withKnownIssue("Ops.gemmQ8Mpp writes all-zero output on this hardware (pre-existing kernel bug, see doc comment above) — tracked, not caused by the mppAutoCapable guard under test") {
-                #expect(cos > 0.99, "gemmQ8Mpp drifted from the gemmQ8 scalar sibling, cos=\(cos)")
-            }
+            #expect(cos > 0.99, "gemmQ8Mpp drifted from the gemmQ8 scalar sibling, cos=\(cos)")
         } else {
             print("[dsv4-mpp-fallback] Ops.mppAutoCapable=false — gemmQ8Mpp not dispatched (this IS the fix: gq8's n>=32 branch now also requires Ops.mppAutoCapable, so this exact skip is what prefillLayer does too).")
         }
     }
 
     /// `groupedGemmQ8Mpp` vs `groupedGemmQ8` (site 2, O-LoRA-A). Same
-    /// KNOWN ISSUE as `gemmQ8MppMatchesScalar` above — `Ops.groupedGemmQ8Mpp`
-    /// also writes all-zero output on this hardware (same kernel-generation
-    /// family, same symptom), tracked via `withKnownIssue` below.
+    /// dispatch-wrapper root cause and fix as `gemmQ8MppMatchesScalar`
+    /// above — `Ops.groupedGemmQ8Mpp` was also dispatching via the
+    /// non-`_threadgroups` wrapper with a threadgroup-count `gridSize`.
+    ///
+    /// FIXTURE NOTE: `rowsPerGroup` MUST be a multiple of 64 here — the
+    /// `iron_grouped_gemm_q8_mpp` kernel (crates/wh-iron-std/src/kernels/gemm/gemm_q8_mpp.rs
+    /// in the iron DSL source) computes its per-tile group offset ONCE per
+    /// 64-wide output-feature threadgroup tile (`g = n_tile_base /
+    /// rows_per_group`), documented as relying on "a 64-wide output tile is
+    /// uniform-group (rows_per_group % 64 == 0)". A smaller `rowsPerGroup`
+    /// (e.g. 16, as this fixture originally used) puts multiple groups
+    /// inside one 64-wide tile and the kernel silently reads the WRONG
+    /// group's input slice for most columns — that isn't a kernel bug, it's
+    /// violating the kernel's documented tiling contract. Real production
+    /// usage (DeepSeekV4Text.swift's O-LoRA-A `groupedGemmQ8Mpp` call)
+    /// always passes `rowsPerGroup: oLoraRank` (1024, a multiple of 64), so
+    /// this fixture now mirrors that shape family instead of a shape the
+    /// kernel was never contracted to support.
     @Test("groupedGemmQ8Mpp agrees with the groupedGemmQ8 scalar sibling")
     func groupedGemmQ8MppMatchesScalar() throws {
         let device = Device.shared
-        let nGroups = 4, rowsPerGroup = 16, kIn = 64  // outDim = nGroups*rowsPerGroup = 64 (%64==0).
+        let nGroups = 2, rowsPerGroup = 64, kIn = 64  // outDim = nGroups*rowsPerGroup = 128; rowsPerGroup%64==0 (kernel's uniform-group-tile contract).
         let outDim = nGroups * rowsPerGroup
         let nRows = 40
         let nb = outDim * kIn / 32
@@ -207,9 +222,7 @@ struct DeepSeekV4PrefillMppCapabilityFallbackTests {
             #expect(mpp.filter(\.isNaN).count == 0, "groupedGemmQ8Mpp produced NaNs")
             let cos = cosine(mpp, scalar)
             print("[dsv4-mpp-fallback] groupedGemmQ8Mpp vs groupedGemmQ8 cos=\(cos) mppSumAbs=\(mpp.map{abs($0)}.reduce(0,+)) scalarSumAbs=\(scalar.map{abs($0)}.reduce(0,+))")
-            withKnownIssue("Ops.groupedGemmQ8Mpp writes all-zero output on this hardware (pre-existing kernel bug, see doc comment above) — tracked, not caused by the mppAutoCapable guard under test") {
-                #expect(cos > 0.99, "groupedGemmQ8Mpp drifted from groupedGemmQ8, cos=\(cos)")
-            }
+            #expect(cos > 0.99, "groupedGemmQ8Mpp drifted from groupedGemmQ8, cos=\(cos)")
         } else {
             print("[dsv4-mpp-fallback] Ops.mppAutoCapable=false — groupedGemmQ8Mpp not dispatched (matches prefillLayer's N>=32 && Ops.mppAutoCapable guard).")
         }
