@@ -1225,7 +1225,8 @@ public enum Ops {
         thetaBase: Float,
         scaling: RoPEScaling = .none,
         on cmd: MTLCommandBuffer,
-        into out: Tensor? = nil
+        into out: Tensor? = nil,
+        device: Device = .shared
     ) -> Tensor {
         precondition(qk.elementCount % headDim == 0, "rope: qk size must be multiple of headDim")
         let nHeads = qk.elementCount / headDim
@@ -1235,7 +1236,7 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         // Single-token decode: 1-element positions buffer, row_stride = per-token
         // qk stride (n_heads * head_dim). See iron_rope_banded contract.
-        let posBuf = Device.shared.makeBuffer(length: 4)
+        let posBuf = device.makeBuffer(length: 4)
         var posVal = UInt32(position)
         memcpy(posBuf.contents(), &posVal, 4)
         let rowStride = UInt32(nHeads * headDim)
@@ -1311,7 +1312,8 @@ public enum Ops {
         headDim: Int, rotaryDim: Int,
         thetaBase: Float,
         scaling: RoPEScaling = .none,
-        on cmd: MTLCommandBuffer
+        on cmd: MTLCommandBuffer,
+        device: Device = .shared
     ) {
         precondition(
             qk.elementCount % headDim == 0,
@@ -1329,7 +1331,7 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         // Single-token decode: 1-element positions buffer, row_stride = per-token
         // qk stride (n_heads * head_dim). See iron_rope_banded contract.
-        let posBuf = Device.shared.makeBuffer(length: 4)
+        let posBuf = device.makeBuffer(length: 4)
         var posVal = UInt32(position)
         memcpy(posBuf.contents(), &posVal, 4)
         let rowStride = UInt32(nHeads * headDim)
@@ -1391,7 +1393,8 @@ public enum Ops {
         headDim: Int, rotaryDim: Int,
         thetaBase: Float,
         scaling: RoPEScaling = .none,
-        on cmd: MTLCommandBuffer
+        on cmd: MTLCommandBuffer,
+        device: Device = .shared
     ) {
         precondition(
             q.dtype == k.dtype,
@@ -1416,7 +1419,7 @@ public enum Ops {
         // iron_rope_banded buffer layout: qk@0, positions@1, out@2, then
         // head_dim@3, half_dim@4, row_stride@5, theta@6, scale factors@7-10.
         // Decode = 1-element positions buffer (shared across q and k).
-        let posBuf = Device.shared.makeBuffer(length: 4)
+        let posBuf = device.makeBuffer(length: 4)
         var posVal = UInt32(position)
         memcpy(posBuf.contents(), &posVal, 4)
         enc.setBuffer(posBuf, offset: 0, index: 1)
