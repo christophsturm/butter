@@ -244,7 +244,12 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
         }
     }
 
-    /// Append one timestep on the GPU via Ops.kvCacheUpdate. The dispatch
+    /// Append one timestep on the GPU via Ops.kvCacheUpdateKV — K and V
+    /// share one compute encoder (2 dispatches, 1 encoder begin/end pair)
+    /// instead of two independent `Ops.kvCacheUpdate` calls. Bit-identical
+    /// output (same `iron_kv_cache_update_*` kernel, same per-element
+    /// writes — batching only removes the second encoder's create/end
+    /// overhead, decode-path perf audit, glimmer-decode-gap). The dispatch
     /// is queued on `cmd`; no commit/wait happens here. Caller is
     /// responsible for ensuring the command buffer that produced kFlat /
     /// vFlat is the same one (or a strictly-prior one) so dependencies
@@ -257,12 +262,9 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
         precondition(kFlat.dtype == dtype && vFlat.dtype == dtype, "KVCache: dtype mismatch")
         lengthLock.withLock {
             let pos = _evictionState.reserveNextSlot()
-            Ops.kvCacheUpdate(
-                src: kFlat, into: kBuffer,
-                nKVHeads: nKVHeads, headDim: headDim,
-                maxSeq: maxSeq, position: pos, on: cmd)
-            Ops.kvCacheUpdate(
-                src: vFlat, into: vBuffer,
+            Ops.kvCacheUpdateKV(
+                kSrc: kFlat, kCache: kBuffer,
+                vSrc: vFlat, vCache: vBuffer,
                 nKVHeads: nKVHeads, headDim: headDim,
                 maxSeq: maxSeq, position: pos, on: cmd)
         }

@@ -614,27 +614,38 @@ public final class MuseGlimmerLayer: Module {
         let k = kProj(xNorm, on: cmd)
         let v = vProj(xNorm, on: cmd)
 
-        // Per-head Q/K norm — Q's synthesized weight already carries
-        // `qkScaleFactor`; K's is a plain `1.0` broadcast.
-        var qNorm2D = Ops.rmsNormRows(
-            q, weight: qNorm.weight, eps: qNorm.eps,
-            nRows: nHeads, rowSize: headDim, on: cmd
-        ).reshaped(to: [nHeads, headDim])
-        var kNorm2D = Ops.rmsNormRows(
-            k, weight: kNorm.weight, eps: kNorm.eps,
-            nRows: nKVHeads, rowSize: headDim, on: cmd
-        ).reshaped(to: [nKVHeads, headDim])
+        // Per-head Q/K norm — ONE shared compute encoder
+        // (`Ops.rmsNormRowsTwo`, the same pairing Qwen3.5's attention
+        // mixer uses for its pre-RoPE q_norm/k_norm) instead of two
+        // independent `Ops.rmsNormRows` dispatches. Bit-identical output
+        // (same `iron_rms_norm_*` kernel per row, batched into one
+        // encoder — no new arithmetic). Q's synthesized weight already
+        // carries `qkScaleFactor`; K's is a plain `1.0` broadcast. Both
+        // norms share `eps` (same config value), so the wrapper reuses
+        // one eps buffer for both.
+        let qNorm2D = Tensor.empty(shape: [nHeads, headDim], dtype: q.dtype, device: device)
+        let kNorm2D = Tensor.empty(shape: [nKVHeads, headDim], dtype: k.dtype, device: device)
+        Ops.rmsNormRowsTwo(
+            q, weight: qNorm.weight, eps1: qNorm.eps,
+            nRows1: nHeads, rowSize1: headDim, into: qNorm2D,
+            k, weight: kNorm.weight, eps2: kNorm.eps,
+            nRows2: nKVHeads, rowSize2: headDim, into: kNorm2D,
+            on: cmd)
 
         // NoPE on full-attention layers: skip RoPE entirely — do not
         // apply even a zero/identity rotation, matching the reference
-        // model's `position_embeddings=None` short-circuit.
+        // model's `position_embeddings=None` short-circuit. Sliding
+        // layers rotate Q and K in ONE shared encoder
+        // (`Ops.ropePartialTwo` with `rotaryDim == headDim` drives the
+        // exact same full-rotary `iron_rope_banded` kernel plain
+        // `Ops.rope` calls — batching only merges the two encoders and
+        // rotates in place, matching `Ops.rope`'s per-element math
+        // exactly).
         if isSliding {
-            qNorm2D = Ops.rope(
-                qNorm2D, position: position, headDim: headDim,
-                thetaBase: ropeTheta, scaling: .none, on: cmd)
-            kNorm2D = Ops.rope(
-                kNorm2D, position: position, headDim: headDim,
-                thetaBase: ropeTheta, scaling: .none, on: cmd)
+            Ops.ropePartialTwo(
+                qNorm2D, kNorm2D, position: position,
+                headDim: headDim, rotaryDim: headDim,
+                thetaBase: ropeTheta, on: cmd)
         }
 
         cache.appendOnGPU(kFlat: kNorm2D, vFlat: v.reshaped(to: [nKVHeads, headDim]), on: cmd)
@@ -666,6 +677,25 @@ public final class MuseGlimmerLayer: Module {
             let fused = Ops.addAndRmsNorm(
                 h, normedAttn, weight: preFFNorm.weight, eps: preFFNorm.eps,
                 nRows: 1, rowSize: hidden, on: cmd)
+            postAttn = fused.residual
+            mlpNorm = fused.normed
+        } else if MuseGlimmerAddRmsNormWideFuse.enabled && hidden >= MuseGlimmerAddRmsNormWideFuse.minRowSize {
+            // hidden=6656 blows past `Ops.addAndRmsNorm`'s 4096-wide fast
+            // path — this wide-row sibling would collapse the fallback
+            // to one dispatch, but it's OPT-IN ONLY
+            // (`BUTTER_GLIMMER_WIDE_ADDNORM=1`), default OFF: CI's GPU
+            // recorded 46-195 bitwise mismatches per dtype for this
+            // kernel even though it round-tripped byte-identical in a
+            // live decode A/B on the dev box it shipped from — the same
+            // cross-GPU `rsqrt` hazard `NemotronHMambaMixerFuse.swift`
+            // hit with `addSoftplus`. See
+            // `MuseGlimmerAddRmsNormWideFuse.swift`'s file header. The
+            // measured decode win from this lever alone was ≈0 anyway
+            // (within run-to-run noise), so the unfused two-dispatch
+            // `else` branch below is the default path.
+            let fused = MuseGlimmerAddRmsNormWideFuse.addAndRmsNormWide(
+                h, normedAttn, weight: preFFNorm.weight, eps: preFFNorm.eps,
+                nRows: 1, rowSize: hidden, device: device, on: cmd)
             postAttn = fused.residual
             mlpNorm = fused.normed
         } else {
