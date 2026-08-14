@@ -60,6 +60,18 @@ public struct MuseGlimmerDense: MuseGlimmerVariant {
         repetitionPenalty: 1.0
     )
 
+    /// KV-cache depth for the checkpoint's full-attention NoPE layers
+    /// (sliding layers stay bounded by `slidingWindow` regardless — see
+    /// `MuseGlimmerModel.makeLayerCaches`). `LoadOptions.maxContextLength`
+    /// overrides the checkpoint's advertised `max_position_embeddings`;
+    /// nil preserves the full window — mirrors `LagunaText`/`Hy3Text`/
+    /// `NemotronDiffusionText`'s `options.maxContextLength ?? ...` idiom.
+    /// Pulled out of `loadModel` so it's unit-testable without a weights
+    /// bundle (see `MuseGlimmerMaxSeqTests`).
+    static func resolveMaxSeq(config: ModelConfig, options: LoadOptions) -> Int {
+        options.maxContextLength ?? (config.int("max_position_embeddings") ?? 131072)
+    }
+
     public static func loadModel(
         config rawConfig: ModelConfig,
         weights rawWeights: SafeTensorsBundle,
@@ -88,7 +100,7 @@ public struct MuseGlimmerDense: MuseGlimmerVariant {
         }
         let nKVHeads = config.numKeyValueHeads ?? nHeads
         let headDim = config.headDim ?? (hidden / nHeads)
-        let maxSeq = config.int("max_position_embeddings") ?? 131072
+        let maxSeq = resolveMaxSeq(config: config, options: options)
         let slidingWindow = config.int("sliding_window") ?? 2048
         // `post_norm_eps` — the two post-* sandwich norms use a much
         // tighter eps (1e-8 on the shipped checkpoint) than the two
