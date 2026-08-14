@@ -577,6 +577,17 @@ public final class MuseGlimmerLayer: Module {
                 nRows: 1, rowSize: hidden, on: cmd)
             postAttn = fused.residual
             mlpNorm = fused.normed
+        } else if MuseGlimmerAddRmsNormWideFuse.enabled && hidden >= MuseGlimmerAddRmsNormWideFuse.minRowSize {
+            // hidden=6656 blows past `Ops.addAndRmsNorm`'s 4096-wide fast
+            // path — use the wide-row sibling instead of falling all the
+            // way back to two dispatches. See
+            // `MuseGlimmerAddRmsNormWideFuse.swift` for the byte-exactness
+            // design (`BUTTER_MUSEGLIMMER_ADD_RMS_NORM_WIDE=0` to disable).
+            let fused = MuseGlimmerAddRmsNormWideFuse.addAndRmsNormWide(
+                h, normedAttn, weight: preFFNorm.weight, eps: preFFNorm.eps,
+                nRows: 1, rowSize: hidden, device: device, on: cmd)
+            postAttn = fused.residual
+            mlpNorm = fused.normed
         } else {
             postAttn = Ops.add(h, normedAttn, on: cmd)
             mlpNorm = preFFNorm(postAttn, on: cmd)
