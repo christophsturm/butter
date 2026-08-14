@@ -32,6 +32,24 @@
 import Foundation
 import Metal
 
+/// Flag for the past-window batched-prefill path (see
+/// `MuseGlimmerLayer.forwardMulti`'s "long-prefill windowed path" doc
+/// comment). Default ON; `BUTTER_GLIMMER_LONG_PREFILL=0` reverts
+/// `MuseGlimmerModel.forwardMulti` to the pre-existing behavior — the
+/// whole-model per-token loop for any chunk that pushes a sliding layer
+/// past its window, byte-identical to dev before this path existed.
+///
+/// Deliberately a LIVE `ButterEnv[...]` read (NOT a `static let` hoisted
+/// once) — unlike Laguna's per-decode-token flags (see
+/// `LagunaEnvFlags`'s "none toggled mid-process" note, ~1.3%/var cost at
+/// decode-step granularity), this is read at most `nLayers` times per
+/// PREFILL CHUNK, never in the decode loop, so a `getenv(3)` call per
+/// layer is noise. Staying live lets tests `setenv`/`unsetenv` this flag
+/// reliably regardless of what ran earlier in the same process.
+enum MuseGlimmerEnvFlags {
+    static var longPrefillEnabled: Bool { ButterEnv["BUTTER_GLIMMER_LONG_PREFILL"] != "0" }
+}
+
 // MARK: - MuseGlimmerDense — 30B text decoder
 
 public struct MuseGlimmerDense: MuseGlimmerVariant {
@@ -341,18 +359,34 @@ public final class MuseGlimmerLayer: Module {
     ///     tensor (shape-agnostic elementwise kernel — no per-row loop
     ///     needed).
     ///
-    /// **Caller contract — window bound.** This function assumes the
-    /// caller (`MuseGlimmerModel.forwardMulti`) has already verified
-    /// `position + nRows <= slidingWindow` for sliding-attention layers'
-    /// KV cache. Below that bound, a `.window`-evicting `KVCache`'s ring
-    /// buffer has not wrapped yet (`KVEvictionState.reserveNextSlot`
-    /// only wraps once `absoluteCount >= maxSize`), so physical slot ==
-    /// logical position for every row in this cache, and a single
-    /// whole-chunk `causal: true` `sdpaMulti` is bit-for-bit the same
-    /// windowed attention `Ops.sdpaDecode`'s per-token loop would
-    /// compute. Full (NoPE) layers have no such bound — their cache is
-    /// `.unbounded`, so plain causal attention is correct at any
-    /// position.
+    /// **Window bound.** A single whole-chunk `causal: true` `sdpaMulti`
+    /// dispatch is only correct for a sliding-attention layer's
+    /// `.window`-evicting KV cache while `position + nRows <=
+    /// cache.effectiveMaxSize` — below that bound the ring buffer has
+    /// not wrapped yet (`KVEvictionState.reserveNextSlot` only wraps
+    /// once `absoluteCount >= maxSize`), so physical slot == logical
+    /// position for every row in this cache and `sdpaMulti`'s
+    /// slot-index-as-position causal mask (`ffai_sdpa_multi`'s `_t`
+    /// walk over `[0, base_kv+r+1)`) is bit-for-bit the same windowed
+    /// attention `Ops.sdpaDecode`'s per-token loop would compute.
+    ///
+    /// At/past that bound this function takes the interleaved
+    /// "windowed batched-prefill" path instead of falling back to the
+    /// caller looping single-token `forward(...)` calls — see the doc
+    /// comment on the RoPE/append/attend loop below for why a
+    /// batch-append-then-batch-attend shortcut is NOT valid there (a
+    /// causality leak) and what this function does instead. Gated by
+    /// `MuseGlimmerEnvFlags.longPrefillEnabled`
+    /// (`BUTTER_GLIMMER_LONG_PREFILL`, default on) — the caller
+    /// (`MuseGlimmerModel.forwardMulti`) only reaches this function at
+    /// all past the window when the flag is on; with it off, the
+    /// caller keeps routing past-window chunks to the old per-token
+    /// loop and this function is only ever called within-window, same
+    /// as before this path existed.
+    ///
+    /// Full (NoPE) layers have no window bound at all — their cache is
+    /// `.unbounded`, so plain causal `sdpaMulti` is correct at any
+    /// position and this function's NoPE branch is unchanged.
     func forwardMulti(
         _ h: Tensor, startingAt position: Int,
         cache: any KVCacheProtocol,
@@ -394,12 +428,54 @@ public final class MuseGlimmerLayer: Module {
         // kernels, looped per row on the same cmd (same discipline as
         // LlamaLayer.forwardMulti: the CPU cost is just enqueueing, the
         // GPU pipelines the dispatches back-to-back).
+        //
+        // Long-prefill windowed path (`MuseGlimmerEnvFlags.longPrefillEnabled`,
+        // `BUTTER_GLIMMER_LONG_PREFILL`, default on) — once this chunk
+        // pushes a sliding layer's ring cache past its window
+        // (`position + nRows > cache.effectiveMaxSize`), the single
+        // whole-chunk `sdpaMulti` below stops being valid: its kernel
+        // treats physical slot index as absolute KV position, which only
+        // holds pre-wrap. Past that point the ring's physical slots hold
+        // a COMPLETE but chronologically SCRAMBLED window's worth of K/V
+        // — correct for decode's single-query dense-read-of-all-live-slots
+        // trick (`KVCacheProtocol.sdpaSinkWindow`'s doc comment), but only
+        // because decode interleaves ONE append with ONE attend before the
+        // next append. A batch-append-then-batch-attend chunk would let
+        // query row i see rows i+1..nRows-1's K/V (already appended ahead
+        // of it) — a causality leak, not just an off-by-window-size
+        // masking gap.
+        //
+        // So `windowWraps` keeps the EXACT per-token decode sequencing
+        // (`forward(tokenId:)`'s append → prepareForAttention → sdpaDecode
+        // triple, including its `cache.sdpaSinkWindow` call) but drops the
+        // per-token commit/wait round-trip: every row's RoPE + append +
+        // sdpaDecode stays on the caller's shared `cmd`, writing straight
+        // into this chunk's `[nRows, nHeads*headDim]` accumulator via
+        // `sdpaDecode`'s `into:` param — one GPU submission for the whole
+        // chunk's attention instead of `nRows` host round-trips through
+        // the entire model (every projection + every other layer). QKV
+        // projections, qk-norm, gate, o_proj, and the MLP stay batched
+        // exactly as in the within-window fast path — only the SDPA
+        // dispatch count regresses to O(nRows) for sliding layers whose
+        // window has wrapped; full (NoPE) layers are untouched.
+        let windowWraps = isSliding && (position + nRows > cache.effectiveMaxSize)
+            && MuseGlimmerEnvFlags.longPrefillEnabled
+
         let qForAttn: Tensor
+        var windowedAttnFlat: Tensor?
         if isSliding {
             let qRot = Tensor.empty(
                 shape: [nRows * nHeads, headDim], dtype: qNormAll.dtype, device: device)
             let kRot = Tensor.empty(
                 shape: [nRows * nKVHeads, headDim], dtype: kNormAll.dtype, device: device)
+            // Only allocated/filled when `windowWraps` — the interleaved
+            // per-row accumulator each row's `sdpaDecode` writes into
+            // directly (no extra blit/copy dispatch).
+            let attnAccum: Tensor? =
+                windowWraps
+                ? Tensor.empty(
+                    shape: [nRows, nHeads * headDim], dtype: qNormAll.dtype, device: device)
+                : nil
             for i in 0 ..< nRows {
                 let qRow = qNormAll.slicedRows(start: i * nHeads, count: nHeads)
                 let qOut = qRot.slicedRows(start: i * nHeads, count: nHeads)
@@ -415,8 +491,28 @@ public final class MuseGlimmerLayer: Module {
                     kFlat: kOut.reshaped(to: [nKVHeads, headDim]),
                     vFlat: v.slicedRows(start: i, count: 1).reshaped(to: [nKVHeads, headDim]),
                     on: cmd)
+                if let attnAccum {
+                    // MUST run now — after row i's own append, before row
+                    // i+1's — for exactly the reason in the doc comment
+                    // above. Identical call shape to
+                    // `forward(tokenId:...)`'s decode SDPA.
+                    let (cacheK, cacheV) = cache.prepareForAttention(on: cmd)
+                    let nKV = cache.length
+                    let (sinkEnd, windowStart) = cache.sdpaSinkWindow(nKV: nKV)
+                    let qRowForDecode = qOut.reshaped(to: [nHeads, headDim])
+                    let outRow = attnAccum.slicedRows(start: i, count: 1)
+                        .reshaped(to: [nHeads, headDim])
+                    _ = Ops.sdpaDecode(
+                        q: qRowForDecode, k: cacheK, v: cacheV,
+                        nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                        nKV: nKV, kvStride: cache.maxSeq,
+                        scale: scale, on: cmd,
+                        sinkEnd: sinkEnd, windowStart: windowStart,
+                        into: outRow)
+                }
             }
             qForAttn = qRot
+            windowedAttnFlat = attnAccum
         } else {
             // NoPE: append the (already qk-normed, un-rotated) K rows
             // straight through — matches the reference model's
@@ -432,16 +528,22 @@ public final class MuseGlimmerLayer: Module {
             qForAttn = qNormAll
         }
 
-        // SDPA — ONE dispatch over the chunk.
-        let qForSdpa = qForAttn.reshaped(to: [nRows, nHeads, headDim])
-        let (cacheK, cacheV) = cache.prepareForAttention(on: cmd)
-        let attnOut = Ops.sdpaMulti(
-            q: qForSdpa, k: cacheK, v: cacheV,
-            nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-            baseKV: position, nQuery: nRows, kvStride: cache.maxSeq,
-            causal: true, scale: scale, on: cmd
-        )
-        let attnFlat = attnOut.reshaped(to: [nRows, nHeads * headDim])
+        // SDPA — ONE dispatch over the chunk, UNLESS the interleaved
+        // windowed path above already produced the per-row result.
+        let attnFlat: Tensor
+        if let windowedAttnFlat {
+            attnFlat = windowedAttnFlat
+        } else {
+            let qForSdpa = qForAttn.reshaped(to: [nRows, nHeads, headDim])
+            let (cacheK, cacheV) = cache.prepareForAttention(on: cmd)
+            let attnOut = Ops.sdpaMulti(
+                q: qForSdpa, k: cacheK, v: cacheV,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                baseKV: position, nQuery: nRows, kvStride: cache.maxSeq,
+                causal: true, scale: scale, on: cmd
+            )
+            attnFlat = attnOut.reshaped(to: [nRows, nHeads * headDim])
+        }
 
         // Sigmoid gate on the SDPA output, computed from `xNorm` (same
         // input Q/K/V read) — batched `callMany` + one shape-agnostic
