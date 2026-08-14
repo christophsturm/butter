@@ -361,17 +361,17 @@ extension Ops {
         let n = UInt32(nRows); let o = UInt32(outDim); let k = UInt32(inDim)
         switch out.dtype {
         case .f16:
-            IronKernels.iron_gemm_q8_mpp_f16(
+            IronKernels.iron_gemm_q8_mpp_f16_threadgroups(
                 x: input.buffer, xOffset: input.offset, qs: qs.buffer, qsOffset: qs.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset, out: out.buffer, outOffset: out.offset,
                 n_rows: n, out_dim: o, k_in: k, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            IronKernels.iron_gemm_q8_mpp_f32(
+            IronKernels.iron_gemm_q8_mpp_f32_threadgroups(
                 x: input.buffer, xOffset: input.offset, qs: qs.buffer, qsOffset: qs.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset, out: out.buffer, outOffset: out.offset,
                 n_rows: n, out_dim: o, k_in: k, gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            IronKernels.iron_gemm_q8_mpp_bf16(
+            IronKernels.iron_gemm_q8_mpp_bf16_threadgroups(
                 x: input.buffer, xOffset: input.offset, qs: qs.buffer, qsOffset: qs.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset, out: out.buffer, outOffset: out.offset,
                 n_rows: n, out_dim: o, k_in: k, gridSize: grd, threadgroupSize: tg, on: cmd)
@@ -392,19 +392,19 @@ extension Ops {
         let ng = UInt32(nGroups); let rpg = UInt32(rowsPerGroup)
         switch out.dtype {
         case .f16:
-            IronKernels.iron_grouped_gemm_q8_mpp_f16(
+            IronKernels.iron_grouped_gemm_q8_mpp_f16_threadgroups(
                 x: input.buffer, xOffset: input.offset, qs: qs.buffer, qsOffset: qs.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset, out: out.buffer, outOffset: out.offset,
                 n_rows: n, out_dim: o, k_in: k, n_groups: ng, rows_per_group: rpg,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .f32:
-            IronKernels.iron_grouped_gemm_q8_mpp_f32(
+            IronKernels.iron_grouped_gemm_q8_mpp_f32_threadgroups(
                 x: input.buffer, xOffset: input.offset, qs: qs.buffer, qsOffset: qs.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset, out: out.buffer, outOffset: out.offset,
                 n_rows: n, out_dim: o, k_in: k, n_groups: ng, rows_per_group: rpg,
                 gridSize: grd, threadgroupSize: tg, on: cmd)
         case .bf16:
-            IronKernels.iron_grouped_gemm_q8_mpp_bf16(
+            IronKernels.iron_grouped_gemm_q8_mpp_bf16_threadgroups(
                 x: input.buffer, xOffset: input.offset, qs: qs.buffer, qsOffset: qs.offset,
                 d_f32: dF32.buffer, d_f32Offset: dF32.offset, out: out.buffer, outOffset: out.offset,
                 n_rows: n, out_dim: o, k_in: k, n_groups: ng, rows_per_group: rpg,
