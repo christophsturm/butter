@@ -9475,7 +9475,15 @@ public enum Ops {
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .f32):
             // Prefer MPP/NAX int8 (live-compile) unless BUTTER_HY3_QMM_MMA=1.
-            if ButterEnv["BUTTER_HY3_QMM_MMA"] == nil {
+            // Gate on `Self.mppAutoCapable` too — same as the bits=4 tier's
+            // `useMpp4` a few lines up: unlike that tier this int8 default
+            // had no capability check at all, so on Apple GPU Family <9 /
+            // macOS <26 it unconditionally requested the `matmul2d`
+            // cooperative-tensor PSO and PSOCache.pipelineState fatalErrors
+            // compiling it. `iron_qmm_mma_int8_*` below is a plain
+            // simdgroup kernel and already the `BUTTER_HY3_QMM_MMA=1`
+            // escape — reuse it as the capability fallback too.
+            if ButterEnv["BUTTER_HY3_QMM_MMA"] == nil && Self.mppAutoCapable {
                 IronKernels.iron_qmm_mma_mpp_int8_f32_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -9495,7 +9503,15 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             }
         case (8, .f16):
-            if ButterEnv["BUTTER_HY3_QMM_MMA"] == nil {
+            // Gate on `Self.mppAutoCapable` too — same as the bits=4 tier's
+            // `useMpp4` a few lines up: unlike that tier this int8 default
+            // had no capability check at all, so on Apple GPU Family <9 /
+            // macOS <26 it unconditionally requested the `matmul2d`
+            // cooperative-tensor PSO and PSOCache.pipelineState fatalErrors
+            // compiling it. `iron_qmm_mma_int8_*` below is a plain
+            // simdgroup kernel and already the `BUTTER_HY3_QMM_MMA=1`
+            // escape — reuse it as the capability fallback too.
+            if ButterEnv["BUTTER_HY3_QMM_MMA"] == nil && Self.mppAutoCapable {
                 IronKernels.iron_qmm_mma_mpp_int8_f16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -9515,7 +9531,15 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             }
         case (8, .bf16):
-            if ButterEnv["BUTTER_HY3_QMM_MMA"] == nil {
+            // Gate on `Self.mppAutoCapable` too — same as the bits=4 tier's
+            // `useMpp4` a few lines up: unlike that tier this int8 default
+            // had no capability check at all, so on Apple GPU Family <9 /
+            // macOS <26 it unconditionally requested the `matmul2d`
+            // cooperative-tensor PSO and PSOCache.pipelineState fatalErrors
+            // compiling it. `iron_qmm_mma_int8_*` below is a plain
+            // simdgroup kernel and already the `BUTTER_HY3_QMM_MMA=1`
+            // escape — reuse it as the capability fallback too.
+            if ButterEnv["BUTTER_HY3_QMM_MMA"] == nil && Self.mppAutoCapable {
                 IronKernels.iron_qmm_mma_mpp_int8_bf16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,

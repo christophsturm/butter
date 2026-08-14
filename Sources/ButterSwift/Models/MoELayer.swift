@@ -2868,10 +2868,25 @@ public final class MoELayer: Module, DecoderLayer {
                 // GATHER_NAX rides default MPP; force MPP on even for T<4.
                 let naxOn =
                     MoEEnvFlags.gatherNax
+                // The auto-default arm (no explicit opt-in) additionally
+                // requires `Ops.mppAutoCapable`: `useGatherMpp` ultimately
+                // reaches `Ops.nvfp4MoeGatherBm16`'s default dispatch, which
+                // needs a `matmul2d` cooperative-tensor PSO (Apple GPU
+                // Family 9+ / macOS 26+). That op now self-guards and
+                // degrades to a per-row GEMV loop rather than crashing, but
+                // on incapable hardware it's strictly better to route here
+                // to `useExpertGroupQmm` below (a real batched non-MPP
+                // dense QMM) instead of paying for that emergency loop.
+                // `naxOn` / explicit `mppEnv == "1"` are unconditional
+                // force-ons (same convention as `BUTTER_MOE_BGEMM_MPP=1`
+                // elsewhere) — the user who sets them owns the hardware
+                // requirement, so they're left ungated here too (still
+                // non-crashing on incapable hardware thanks to the op-level
+                // fix, just possibly slow).
                 let useGatherMpp =
                     !useGatherQmm
                     && mppEnv != "0"
-                    && (naxOn || mppEnv == "1" || t >= 4)
+                    && (naxOn || mppEnv == "1" || (t >= 4 && Ops.mppAutoCapable))
                 let useExpertGroupQmm =
                     !useGatherQmm && !useGatherMpp
                     && MoEEnvFlags.expertGroupQmm
@@ -3872,7 +3887,17 @@ public final class MoELayer: Module, DecoderLayer {
             shape: [mTotal, moeIntermediate], dtype: dt, device: device)
         let downOut = Tensor.empty(shape: [mTotal, hidden], dtype: dt, device: device)
 
-        if useGatherQmm {
+        // This comment (below, pre-existing) calls `useGatherQmm` the
+        // "Non-MPP gather QMM" arm, but it dispatches through
+        // `Ops.nvfp4MoeGatherBm16`, whose own default branch can still
+        // reach an MPP-only kernel for shapes none of the opt-in fast
+        // paths cover. That op now self-guards, so this would no longer
+        // crash on incapable hardware either way — but the `else` branch
+        // right below is already a hand-written non-MPP per-row GEMV loop
+        // over the same primitive, so prefer it directly on incapable
+        // hardware rather than falling through the op's own (equivalent)
+        // internal fallback.
+        if useGatherQmm && Ops.mppAutoCapable {
             Ops.nvfp4MoeGatherBm16(
                 input: xGathered, weight: stacked.gateWeight, scales: stacked.gateScales,
                 indices: indices, mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,

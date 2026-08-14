@@ -264,6 +264,31 @@ extension Ops {
                 on: cmd, into: out)
             return
         }
+        // Every path above is either shape/env-gated (opt-in — the user who
+        // sets BUTTER_NVFP4_GATHER_NAX/NAX64 owns the hardware requirement,
+        // same convention as `moeGatherDequantGemmInt4`'s force-on) or
+        // already checks `Ops.mppAutoCapable` itself (`LagunaNvfp4ExpertGather`
+        // / `LagunaNvfp4MppGather`'s `.eligible`). What's left below is the
+        // DEFAULT dispatch — reached with no opt-in at all — and it
+        // unconditionally needs a `matmul2d` cooperative-tensor PSO
+        // (`iron_nvfp4_moe_gather_qmm_bm{16,64}[_bk64]_mpp_*`), which
+        // PSOCache.pipelineState fatalErrors compiling on Apple GPU Family
+        // <9 / macOS <26 ("unsupported deferred-static-alloca-size function
+        // body in metal::cooperative_tensor" — see butter PR #132's first CI
+        // run). There is no batched non-MPP kernel for this gather-GEMM
+        // family at arbitrary (mTotal, expert-run) shapes, so on incapable
+        // hardware degrade to the per-row expert-indexed GEMV loop instead
+        // of reaching that fatalError — the same primitive `MoELayer`'s own
+        // non-MPP path and `NemotronHNvfp4MoELayer.decodeMulti`'s per-row
+        // `decode()` fallback already use for exactly this situation.
+        guard Ops.mppAutoCapable else {
+            nvfp4MoeGatherBm16NonMppFallback(
+                input: input, weight: weight, scales: scales, indices: indices,
+                mTotal: mTotal, nOut: nOut, kIn: kIn,
+                blockSize: blockSize, global: global,
+                on: cmd, into: out)
+            return
+        }
         let useBm64 = nvfp4MoeGatherPrefersBm64(mTotal: mTotal, nOut: nOut, kIn: kIn)
         let mTotalU = UInt32(mTotal)
         let nOutU = UInt32(nOut)
@@ -461,6 +486,73 @@ extension Ops {
         }
     }
 
+    /// Non-MPP correctness fallback for `nvfp4MoeGatherBm16` (and its
+    /// `Pair`/`XRows`/`XRowsPair` siblings, which route here too) on
+    /// hardware/OS that cannot compile the `matmul2d` cooperative-tensor
+    /// kernels this gather-GEMM family needs (`Ops.mppAutoCapable ==
+    /// false`). There is no batched non-MPP kernel for arbitrary
+    /// (mTotal, expert-run) shapes in this family, so this degrades to a
+    /// per-row dispatch of the already-shipped `nvfp4DequantGemvExpertIndexedMany`
+    /// GEMV primitive (the same kernel `MoELayer`'s own `useGatherQmm ==
+    /// false` path already loops per-row for its non-MPP case, and the
+    /// device-side analogue of `NemotronHNvfp4MoELayer.decodeMulti`'s
+    /// per-row `decode()` fallback) — `mTotal` dispatches on one
+    /// concurrent encoder, correctness first, no host readback. Logged
+    /// once so a full prefill doesn't spam stderr.
+    nonisolated(unsafe) private static var nonMppFallbackLogged = false
+    private static func nvfp4MoeGatherBm16NonMppFallback(
+        input: Tensor, weight: Tensor, scales: Tensor, indices: Tensor,
+        mTotal: Int, nOut: Int, kIn: Int,
+        blockSize: Int, global: Float,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(
+            input.dtype == .f32 || input.dtype == .f16 || input.dtype == .bf16,
+            "nvfp4MoeGatherBm16NonMppFallback: unsupported dtype \(input.dtype)")
+        if !nonMppFallbackLogged {
+            nonMppFallbackLogged = true
+            FileHandle.standardError.write(
+                ("[nvfp4MoeGatherBm16] Ops.mppAutoCapable == false — no batched "
+                    + "non-MPP kernel exists for this gather-GEMM family; "
+                    + "degrading to a per-row expert-indexed GEMV loop "
+                    + "(mTotal dispatches/call, correctness over speed). The "
+                    + "fast MPP path needs Apple GPU Family 9+ / macOS 26+.\n")
+                    .data(using: .utf8)!)
+        }
+        let dtBytes = input.dtype.byteSize
+        var weights: [Tensor] = []
+        var scaleList: [Tensor] = []
+        var inputs: [Tensor] = []
+        var expertIdx: [Tensor] = []
+        var outputs: [Tensor] = []
+        weights.reserveCapacity(mTotal)
+        scaleList.reserveCapacity(mTotal)
+        inputs.reserveCapacity(mTotal)
+        expertIdx.reserveCapacity(mTotal)
+        outputs.reserveCapacity(mTotal)
+        for r in 0 ..< mTotal {
+            inputs.append(
+                Tensor(
+                    buffer: input.buffer, offset: input.offset + r * kIn * dtBytes,
+                    shape: [kIn], dtype: input.dtype))
+            expertIdx.append(
+                Tensor(
+                    buffer: indices.buffer, offset: indices.offset + r * 4,
+                    shape: [1], dtype: .u32))
+            outputs.append(
+                Tensor(
+                    buffer: out.buffer, offset: out.offset + r * nOut * dtBytes,
+                    shape: [nOut], dtype: out.dtype))
+            weights.append(weight)
+            scaleList.append(scales)
+        }
+        Ops.nvfp4DequantGemvExpertIndexedMany(
+            weightsStacked: weights, scalesStacked: scaleList,
+            inputs: inputs, expertIndices: expertIdx, outputs: outputs,
+            blockSize: blockSize, global: global, on: cmd)
+    }
+
     /// Gate+up BM16 MPP with fused token gather via `xRows`.
     ///
     /// Default: concurrent pair of **iron-bitexact** `xrows` kernels (same math
@@ -496,7 +588,14 @@ extension Ops {
         }
         let wantFusedKernel =
             ButterEnv["BUTTER_NVFP4_MPP_FUSED_GATEUP"] == "1"
-        if wantFusedKernel, input.dtype == .f32 || input.dtype == .bf16 {
+        // `butter_nvfp4_moe_gateup_bm16_mpp_*` is a `matmul2d` kernel —
+        // unlike BUTTER_NVFP4_GATHER_NAX/STEEL (features that are
+        // explicitly and only about MPP), BUTTER_NVFP4_MPP_FUSED_GATEUP
+        // is a fusion toggle a caller could set without realizing it
+        // forces an MPP-only kernel, so still gate on `Ops.mppAutoCapable`
+        // — when incapable, fall through to the materialise+Pair path
+        // below (self-guarded via `nvfp4MoeGatherBm16Pair`).
+        if wantFusedKernel, Ops.mppAutoCapable, input.dtype == .f32 || input.dtype == .bf16 {
             let psoName =
                 input.dtype == .f32
                 ? "butter_nvfp4_moe_gateup_bm16_mpp_f32"
@@ -593,10 +692,15 @@ extension Ops {
         precondition(xRows.dtype == .u32 && xRows.elementCount == mTotal)
         precondition(indices.dtype == .u32 && indices.elementCount == mTotal)
         precondition(out.elementCount == mTotal * nOut)
+        // `butter_nvfp4_moe_gather_bm16_mpp_xrows_*` is MPP-only, same
+        // family gap as `nvfp4MoeGatherBm16`'s default branch. Route
+        // incapable hardware through the exact same materialise+gather
+        // fallback the "other dtype" arm below already uses (that arm
+        // itself now self-guards via `nvfp4MoeGatherBm16`).
         let psoName: String
         switch input.dtype {
-        case .f32: psoName = "butter_nvfp4_moe_gather_bm16_mpp_xrows_f32"
-        case .bf16: psoName = "butter_nvfp4_moe_gather_bm16_mpp_xrows_bf16"
+        case .f32 where Ops.mppAutoCapable: psoName = "butter_nvfp4_moe_gather_bm16_mpp_xrows_f32"
+        case .bf16 where Ops.mppAutoCapable: psoName = "butter_nvfp4_moe_gather_bm16_mpp_xrows_bf16"
         default:
             let xIn = Ops.gather(table: input, tokenIds: xRows, on: cmd)
             nvfp4MoeGatherBm16(
@@ -642,10 +746,11 @@ extension Ops {
         on cmd: MTLCommandBuffer
     ) {
         precondition(input.dtype == out0.dtype && input.dtype == out1.dtype)
+        // Same MPP-only gap as the serial `nvfp4MoeGatherBm16XRows` above.
         let psoName: String
         switch input.dtype {
-        case .f32: psoName = "butter_nvfp4_moe_gather_bm16_mpp_xrows_f32"
-        case .bf16: psoName = "butter_nvfp4_moe_gather_bm16_mpp_xrows_bf16"
+        case .f32 where Ops.mppAutoCapable: psoName = "butter_nvfp4_moe_gather_bm16_mpp_xrows_f32"
+        case .bf16 where Ops.mppAutoCapable: psoName = "butter_nvfp4_moe_gather_bm16_mpp_xrows_bf16"
         default:
             nvfp4MoeGatherBm16XRows(
                 input: input, xRows: xRows, weight: weight0, scales: scales0,
@@ -773,6 +878,22 @@ extension Ops {
                 indices: indices,
                 mTotal: mTotal, nOut: nOut, kIn: kIn,
                 blockSize: blockSize, global: global, on: cmd)
+            return
+        }
+        // Same DEFAULT-dispatch / `Ops.mppAutoCapable` gap as the serial
+        // `nvfp4MoeGatherBm16` above (see its own comment at the matching
+        // point) — the raw switch below only ever builds `_mpp_` PSO
+        // names. Route through the serial entry point, which now
+        // self-guards and degrades to the per-row GEMV fallback.
+        guard Ops.mppAutoCapable else {
+            nvfp4MoeGatherBm16(
+                input: input, weight: weight0, scales: scales0, indices: indices,
+                mTotal: mTotal, nOut: nOut, kIn: kIn,
+                blockSize: blockSize, global: global, on: cmd, into: out0)
+            nvfp4MoeGatherBm16(
+                input: input, weight: weight1, scales: scales1, indices: indices,
+                mTotal: mTotal, nOut: nOut, kIn: kIn,
+                blockSize: blockSize, global: global, on: cmd, into: out1)
             return
         }
         let useBm64 = nvfp4MoeGatherPrefersBm64(mTotal: mTotal, nOut: nOut, kIn: kIn)
