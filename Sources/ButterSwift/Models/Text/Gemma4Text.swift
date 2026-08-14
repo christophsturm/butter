@@ -1117,7 +1117,7 @@ public final class Gemma4Layer: Module {
             return (
                 forwardBatched(
                     h, position: position, cache: cache,
-                    perLayerInput: perLayerInput, cmd: cmd,
+                    perLayerInput: perLayerInput, cmd: cmd, device: device,
                     donorCache: donorCache),
                 false
             )
@@ -1138,6 +1138,7 @@ public final class Gemma4Layer: Module {
         cache: any KVCacheProtocol,
         perLayerInput: Tensor?,
         cmd: MTLCommandBuffer,
+        device: Device,
         donorCache: (any KVCacheProtocol)? = nil
     )
         -> Tensor
@@ -1147,7 +1148,7 @@ public final class Gemma4Layer: Module {
             isGlobal
             ? globalAttentionBatched(
                 xNorm, position: position,
-                cache: cache, cmd: cmd,
+                cache: cache, cmd: cmd, device: device,
                 donorCache: donorCache)
             : slidingAttentionBatched(
                 xNorm, position: position,
@@ -1405,6 +1406,7 @@ public final class Gemma4Layer: Module {
         _ xNorm: Tensor, position: Int,
         cache: any KVCacheProtocol,
         cmd: MTLCommandBuffer,
+        device: Device,
         donorCache: (any KVCacheProtocol)? = nil
     )
         -> Tensor
@@ -1416,7 +1418,7 @@ public final class Gemma4Layer: Module {
             q = projectAndNormQuery(xNorm, on: cmd)
             Gemma4Ops.ropeProportional(
                 q, position: position, headDim: headDim, rotatedDim: rotatedDim,
-                thetaBase: ropeTheta, on: cmd)
+                thetaBase: ropeTheta, on: cmd, device: device)
             attnCache = donorCache
         } else {
             let (qOwn, k, v) = projectAndNorm(xNorm, on: cmd)
@@ -1426,10 +1428,10 @@ public final class Gemma4Layer: Module {
             // through.
             Gemma4Ops.ropeProportional(
                 qOwn, position: position, headDim: headDim, rotatedDim: rotatedDim,
-                thetaBase: ropeTheta, on: cmd)
+                thetaBase: ropeTheta, on: cmd, device: device)
             Gemma4Ops.ropeProportional(
                 k, position: position, headDim: headDim, rotatedDim: rotatedDim,
-                thetaBase: ropeTheta, on: cmd)
+                thetaBase: ropeTheta, on: cmd, device: device)
             cache.appendOnGPU(kFlat: k, vFlat: v, on: cmd)
             q = qOwn
             attnCache = cache
@@ -1449,12 +1451,12 @@ public final class Gemma4Layer: Module {
     /// result resident before its own host sync.
     private func globalAttention(
         _ xNorm: Tensor, position: Int,
-        cache: any KVCacheProtocol, cmd: MTLCommandBuffer, device _: Device,
+        cache: any KVCacheProtocol, cmd: MTLCommandBuffer, device: Device,
         donorCache: (any KVCacheProtocol)? = nil
     ) -> Tensor {
         let out = globalAttentionBatched(
             xNorm, position: position,
-            cache: cache, cmd: cmd,
+            cache: cache, cmd: cmd, device: device,
             donorCache: donorCache)
         cmd.commit()
         cmd.waitUntilCompleted()
@@ -1482,7 +1484,8 @@ enum Gemma4Ops {
     static func ropeProportional(
         _ qk: Tensor, position: Int,
         headDim: Int, rotatedDim: Int,
-        thetaBase: Float, on cmd: MTLCommandBuffer
+        thetaBase: Float, on cmd: MTLCommandBuffer,
+        device: Device = .shared
     ) {
         precondition(
             qk.elementCount % headDim == 0,
@@ -1499,7 +1502,7 @@ enum Gemma4Ops {
         // buffer (decode = the T=1 case: a 1-element buffer); `row_stride` is
         // the per-token stride in qk (`n_heads * head_dim`). Single-token decode
         // here so a 1-element positions buffer + grid depth 1.
-        let posBuf = Device.shared.makeBuffer(length: 4)
+        let posBuf = device.makeBuffer(length: 4)
         var posVal = UInt32(position)
         memcpy(posBuf.contents(), &posVal, 4)
         let rowStride = UInt32(nHeads * headDim)
