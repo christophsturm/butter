@@ -100,8 +100,9 @@ struct DeviceAllocCounterInterferenceTests {
 
         // Interference fires on the FIRST attempt only — models a rare,
         // one-off foreign allocation landing in a single CI run, not
-        // sustained hammering (which nothing in this codebase does; see
-        // AllocMeasurementRetry.swift for why that distinction matters).
+        // sustained hammering. (See `stableMeasurementConvergesNonConsecutively`
+        // below for the sustained/varying-interference case that PR
+        // #139's CI run 31800387587 actually showed.)
         var interferenceArmed = true
         var attempts: [Int] = []
 
@@ -125,7 +126,68 @@ struct DeviceAllocCounterInterferenceTests {
             "stableMeasurement should converge on the clean, repeatable value: \(attempts)")
         let retryCountMessage =
             "should need the contaminated attempt #1, a clean attempt #2, and a clean "
-            + "attempt #3 that agrees with #2 before returning: \(attempts)"
+            + "attempt #3 that repeats attempt #2's value before returning: \(attempts)"
         #expect(attempts.count >= 3, "\(retryCountMessage)")
+    }
+
+    @Test("stableMeasurement converges via non-consecutive agreement under persistent, varying interference")
+    func stableMeasurementConvergesNonConsecutively() {
+        let device = Device.shared
+        let ownBytes = 256
+
+        // A DIFFERENT foreign byte count on most attempts, so no two
+        // CONTAMINATED readings ever coincidentally match each other —
+        // only the clean reading (256, `nil` below) can repeat. Clean
+        // windows land at attempts #3 and #5, separated by a
+        // contaminated attempt #4. The OLD "two-CONSECUTIVE" rule would
+        // never converge here (no two ADJACENT attempts ever agree:
+        // #1≠#2, #2≠#3, #3≠#4, #4≠#5) and would exhaust maxAttempts —
+        // exactly the CI run 31800387587 failure shape, where ~285
+        // suites racing Device.shared meant most windows took a
+        // DIFFERENT foreign hit rather than the same one twice in a
+        // row. "Any two of N" converges the moment the second clean
+        // reading appears, matching non-adjacent attempt #3.
+        let foreignBytesSchedule: [Int?] = [111, 222, nil, 333, nil]
+        var idx = 0
+        var attempts: [Int] = []
+
+        let result = stableMeasurement(maxAttempts: 8) { () -> Int in
+            let foreign = foreignBytesSchedule[idx]
+            idx += 1
+            let v = rawWindow {
+                _ = device.makeBuffer(length: ownBytes)
+                if let foreign { _ = device.makeBuffer(length: foreign) }
+            }
+            attempts.append(v)
+            return v
+        }
+
+        #expect(
+            attempts == [367, 478, 256, 589, 256],
+            "unexpected attempt sequence — the fixture schedule itself may have changed: \(attempts)"
+        )
+        #expect(
+            result == 256,
+            "should converge on the clean value via non-consecutive agreement: \(attempts)")
+        let stopCountMessage =
+            "should stop as soon as the second clean reading (attempt #5) repeats attempt #3's "
+            + "value, without needing attempts #1/#2/#4 (all mutually distinct) to agree with "
+            + "anything: \(attempts)"
+        #expect(attempts.count == 5, "\(stopCountMessage)")
+    }
+
+    @Test("retryUntilAcceptable retries until an attempt's own check passes")
+    func retryUntilAcceptableRetriesUntilOwnCheckPasses() {
+        var attempts: [Int] = []
+        var callCount = 0
+
+        let result = retryUntilAcceptable(maxAttempts: 8, isAcceptable: { $0 >= 3 }) { () -> Int in
+            callCount += 1
+            attempts.append(callCount)
+            return callCount
+        }
+
+        #expect(result == 3, "should stop at the first attempt satisfying isAcceptable: \(attempts)")
+        #expect(attempts == [1, 2, 3], "should have made exactly 3 attempts: \(attempts)")
     }
 }
