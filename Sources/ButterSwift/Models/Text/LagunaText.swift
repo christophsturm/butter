@@ -2177,7 +2177,9 @@ final class LagunaLayer {
             attnPathLabel = "prefillMma+qkYarnFused"
             attnPhaseCheckpoint("sdpa[\(attnPathLabel)]")
         } else {
-        // QK-norm over T·heads rows.
+        // QK-norm over T·heads rows. Position-independent — doesn't
+        // touch the KV cache, so it's always safe to batch regardless
+        // of which attention path runs below.
         q = Ops.rmsNormRows(
             q.reshaped(to: [nRows * nHeads * headDim]),
             weight: qNorm.weight, eps: qNorm.eps,
@@ -2190,123 +2192,116 @@ final class LagunaLayer {
         ).reshaped(to: [nRows, nKVHeads * headDim])
         attnPhaseCheckpoint("qknorm")
 
-        // RoPE + KV append for the whole chunk.
-        lagunaBatchedRopeAndKV(
-            q: &q, k: &k, v: v,
-            nRows: nRows, position: position,
-            nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-            rotaryDim: rotaryDim, ropeTheta: ropeTheta,
-            isFullYarn: isFullYarn, yarn: yarn,
-            cache: cache, cmd: work, device: device)
-        attnPhaseCheckpoint("rope_kv")
-
-        // Causal multi-query SDPA over the growing cache.
-        let qForSdpa = q.reshaped(to: [nRows, nHeads, headDim])
-        let (cacheK, cacheV) = cache.prepareForAttention(on: work)
-        attnPhaseCheckpoint("kv_prep")
         // Sliding-window layers: sdpaMulti is causal-only; when window
         // applies, fall back to per-row decode SDPA (still better than a
         // full per-token layer graph for the FFN). Full layers use sdpaMulti.
         if isSliding, windowStart > 0 || sinkEnd > 0 {
-            // Concurrent per-query windowed SDPA (one encoder, all rows).
-            // Sequential sdpaDecode was 30 SWA layers × T serial kernels.
+            // DEAD ON EVERY CURRENTLY-LIVE PATH: `windowStart`/`sinkEnd`
+            // (from `cache.sdpaSinkWindow`, computed above from the
+            // pre-append `position + nRows`) are unconditionally
+            // `(0, 0)` for every cache type in production —
+            // `KVCacheProtocol`'s default (KVCache.swift ~line 133) is
+            // never overridden. See the forcing oracle in
+            // LagunaWindowedDecodeLoopTests.swift, which proves this
+            // branch's sequencing right/wrong independent of that gate
+            // ever firing.
+            //
+            // Fixed in place anyway so a future cache override doesn't
+            // silently arm a causality leak. The previous version of
+            // this branch batch-appended the WHOLE chunk's K/V via
+            // `lagunaBatchedRopeAndKV` first and only then read the
+            // cache per row — so query row i could see rows
+            // i+1..nRows-1's K/V (already appended ahead of it), which
+            // may have evicted exactly the keys row i should have
+            // attended to. The dense `[0, nKV)` physical-slot read
+            // (`KVCacheProtocol.sdpaSinkWindow`'s doc comment) is only
+            // causally exact when append-i and attend-i strictly
+            // interleave — same reasoning as
+            // `MuseGlimmerLayer.forwardMulti`'s `windowWraps` path
+            // (MuseGlimmerText.swift), which this mirrors: every row's
+            // RoPE + KV append + SDPA stays on this same shared `work`
+            // command buffer, one row at a time, never letting row i+1
+            // append before row i has attended.
+            precondition(
+                !isFullYarn,
+                "LagunaLayer.forwardMulti windowed-decode-loop: isSliding "
+                    + "layers are never isFullYarn (isFullYarn: !isSliding "
+                    + "at init) — this branch's per-row RoPE assumes plain "
+                    + "rope via applyRopeInPlace's sliding branch, not YaRN")
             let flat = Tensor.empty(
                 shape: [nRows, nHeads * headDim], dtype: q.dtype, device: device)
-            let rowBytes = nHeads * headDim * q.dtype.byteSize
-            let psoName: String?
-            switch (headDim, q.dtype) {
-            case (128, .bf16): psoName = "iron_sdpa_decode_bf16"
-            case (128, .f16): psoName = "iron_sdpa_decode_f16"
-            case (128, .f32): psoName = "iron_sdpa_decode_f32"
-            default: psoName = nil
-            }
-            if let psoName,
-                let enc = work.makeComputeCommandEncoder(dispatchType: .concurrent)
-            {
-                let pso = PSOCache.shared.pipelineState(for: psoName)
-                let threadsPerGroup = 1024
-                let headsPerGroup = nHeads / nKVHeads
-                enc.setComputePipelineState(pso)
-                enc.setBuffer(cacheK.buffer, offset: cacheK.offset, index: 1)
-                enc.setBuffer(cacheV.buffer, offset: cacheV.offset, index: 2)
-                var headDimV = UInt32(headDim)
-                var kvStrideV = UInt32(cache.maxSeq)
-                var hpgV = UInt32(headsPerGroup)
-                var hasSink: UInt32 = 0
-                var sinkLogit: Float = 0
-                var scaleV = scale
-                enc.setBytes(&headDimV, length: 4, index: 4)
-                enc.setBytes(&kvStrideV, length: 4, index: 6)
-                enc.setBytes(&hpgV, length: 4, index: 7)
-                enc.setBytes(&hasSink, length: 4, index: 10)
-                enc.setBytes(&sinkLogit, length: 4, index: 11)
-                enc.setBytes(&scaleV, length: 4, index: 12)
-                let grid = MTLSize(
-                    width: nHeads * threadsPerGroup, height: 1, depth: 1)
-                let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
-                for i in 0 ..< nRows {
-                    let nKV = min(cache.length, position + i + 1)
-                    let (sEnd, wStart) = cache.sdpaSinkWindow(nKV: nKV)
-                    enc.setBuffer(q.buffer, offset: q.offset + i * rowBytes, index: 0)
-                    enc.setBuffer(
-                        flat.buffer, offset: flat.offset + i * rowBytes, index: 3)
-                    var nKVV = UInt32(nKV)
-                    var sEndV = UInt32(sEnd)
-                    var wStartV = UInt32(wStart)
-                    enc.setBytes(&nKVV, length: 4, index: 5)
-                    enc.setBytes(&sEndV, length: 4, index: 8)
-                    enc.setBytes(&wStartV, length: 4, index: 9)
-                    enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
-                }
-                enc.endEncoding()
-            } else {
-                // Uncommon head dim: sequential Ops.sdpaDecode.
-                for i in 0 ..< nRows {
-                    let qi = q.slicedRows(start: i, count: 1)
-                        .reshaped(to: [nHeads, headDim])
-                    let nKV = min(cache.length, position + i + 1)
-                    let (sEnd, wStart) = cache.sdpaSinkWindow(nKV: nKV)
-                    let row = Ops.sdpaDecode(
-                        q: qi, k: cacheK, v: cacheV,
-                        nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-                        nKV: nKV, kvStride: cache.maxSeq,
-                        scale: scale, on: work,
-                        sinkEnd: sEnd, windowStart: wStart)
-                    let blit = work.makeBlitCommandEncoder()!
-                    blit.copy(
-                        from: row.buffer, sourceOffset: row.offset,
-                        to: flat.buffer,
-                        destinationOffset: flat.offset + i * rowBytes,
-                        size: rowBytes)
-                    blit.endEncoding()
-                }
+            for i in 0 ..< nRows {
+                var qRow = q.slicedRows(start: i, count: 1)
+                    .reshaped(to: [nHeads * headDim])
+                var kRow = k.slicedRows(start: i, count: 1)
+                    .reshaped(to: [nKVHeads * headDim])
+                let vRow = v.slicedRows(start: i, count: 1)
+                    .reshaped(to: [nKVHeads, headDim])
+                // Row-local RoPE, in place into this row's slice of the
+                // shared q/k buffers — identical primitive
+                // `forward(tokenId:...)`'s per-token decode path uses.
+                applyRopeInPlace(
+                    q: &qRow, k: &kRow, position: position + i, yarn: yarn, on: work)
+                // MUST append row i and read it back (prepareForAttention
+                // + sdpaSinkWindow + sdpaDecode) BEFORE row i+1 appends —
+                // see the doc comment above.
+                cache.appendOnGPU(
+                    kFlat: kRow.reshaped(to: [nKVHeads, headDim]), vFlat: vRow, on: work)
+                let (cacheK, cacheV) = cache.prepareForAttention(on: work)
+                let nKV = cache.length
+                let (sEnd, wStart) = cache.sdpaSinkWindow(nKV: nKV)
+                let outRow = flat.slicedRows(start: i, count: 1)
+                    .reshaped(to: [nHeads, headDim])
+                _ = Ops.sdpaDecode(
+                    q: qRow.reshaped(to: [nHeads, headDim]), k: cacheK, v: cacheV,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    nKV: nKV, kvStride: cache.maxSeq,
+                    scale: scale, on: work,
+                    sinkEnd: sEnd, windowStart: wStart,
+                    into: outRow)
             }
             attnOut = flat
             attnPathLabel = "windowed-decode-loop"
-        } else if let mmaOut = LagunaSdpa.prefillMmaBf16(
-            qTHD: qForSdpa, cacheK: cacheK, cacheV: cacheV,
-            nRows: nRows, position: position,
-            nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-            maxSeq: cache.maxSeq, scale: scale,
-            on: &work, device: device,
-            window: blockmapWindow, sinkEnd: 0,
-            phaseCheckpoint: attnPhaseTiming ? attnPhaseCheckpointBuf : nil)
-        {
-            // sdpaPrefillMma (f16 MMA via bf16 cast) — big prefill lever
-            // when T%32==0. Escape: BUTTER_LAGUNA_SDPA_PREFILL_MMA=0.
-            // `window: blockmapWindow` is 0 (pure causal, unchanged
-            // behavior) unless BUTTER_LAGUNA_PREFILL_BLOCKMAP=1 AND this
-            // is a sliding layer, per the T-blockmap comment above.
-            attnOut = mmaOut
-            attnPathLabel = blockmapWindow > 0 ? "prefillMma+blockmapWindow" : "prefillMma"
         } else {
-            attnOut = Ops.sdpaMulti(
-                q: qForSdpa, k: cacheK, v: cacheV,
-                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-                baseKV: position, nQuery: nRows, kvStride: cache.maxSeq,
-                causal: true, scale: scale, on: work
-            ).reshaped(to: [nRows, nHeads * headDim])
-            attnPathLabel = "sdpaMulti-fallback"
+            // RoPE + KV append for the whole chunk.
+            lagunaBatchedRopeAndKV(
+                q: &q, k: &k, v: v,
+                nRows: nRows, position: position,
+                nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                rotaryDim: rotaryDim, ropeTheta: ropeTheta,
+                isFullYarn: isFullYarn, yarn: yarn,
+                cache: cache, cmd: work, device: device)
+            attnPhaseCheckpoint("rope_kv")
+
+            // Causal multi-query SDPA over the growing cache.
+            let qForSdpa = q.reshaped(to: [nRows, nHeads, headDim])
+            let (cacheK, cacheV) = cache.prepareForAttention(on: work)
+            attnPhaseCheckpoint("kv_prep")
+            if let mmaOut = LagunaSdpa.prefillMmaBf16(
+                qTHD: qForSdpa, cacheK: cacheK, cacheV: cacheV,
+                nRows: nRows, position: position,
+                nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                maxSeq: cache.maxSeq, scale: scale,
+                on: &work, device: device,
+                window: blockmapWindow, sinkEnd: 0,
+                phaseCheckpoint: attnPhaseTiming ? attnPhaseCheckpointBuf : nil)
+            {
+                // sdpaPrefillMma (f16 MMA via bf16 cast) — big prefill lever
+                // when T%32==0. Escape: BUTTER_LAGUNA_SDPA_PREFILL_MMA=0.
+                // `window: blockmapWindow` is 0 (pure causal, unchanged
+                // behavior) unless BUTTER_LAGUNA_PREFILL_BLOCKMAP=1 AND this
+                // is a sliding layer, per the T-blockmap comment above.
+                attnOut = mmaOut
+                attnPathLabel = blockmapWindow > 0 ? "prefillMma+blockmapWindow" : "prefillMma"
+            } else {
+                attnOut = Ops.sdpaMulti(
+                    q: qForSdpa, k: cacheK, v: cacheV,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    baseKV: position, nQuery: nRows, kvStride: cache.maxSeq,
+                    causal: true, scale: scale, on: work
+                ).reshaped(to: [nRows, nHeads * headDim])
+                attnPathLabel = "sdpaMulti-fallback"
+            }
         }
         attnPhaseCheckpoint("sdpa[\(attnPathLabel)]")
         }
