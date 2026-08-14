@@ -74,7 +74,7 @@ struct Gemma4MoEAllocTraceTests {
         }
     }
 
-    struct Measurement {
+    struct Measurement: Equatable {
         /// Per-token total transient bytes (`bufferAllocBytes +
         /// scratchAllocBytes`), one entry per generated token.
         let perTokenBytes: [Int]
@@ -171,9 +171,43 @@ struct Gemma4MoEAllocTraceTests {
     // No `--stats`/vm_stat check is meaningful at this scale; this
     // comment documents that the arithmetic was done, not skipped.
 
+    /// The shape check `perTokenStability` asserts, factored out so
+    /// `retryUntilAcceptable` can retry until an attempt already
+    /// satisfies it. Deliberately the SAME logic as the `#expect`s
+    /// below (not a looser or stricter variant) — this isn't widening
+    /// a tolerance, it's letting an already-tolerant check decide when
+    /// to stop retrying, instead of requiring two raw measurement
+    /// vectors to agree (see AllocMeasurementRetry.swift: under CI's
+    /// ~285-suite concurrent load, distinct attempts get hit by
+    /// distinct foreign allocations, so raw-vector agreement converges
+    /// far more slowly than "is this attempt's shape already fine").
+    private func isStableShape(_ m: Measurement) -> Bool {
+        guard m.perTokenBytes.count == 8 else { return false }
+        let counts = m.perTokenBytes
+        let strictlyIncreasing = zip(counts, counts.dropFirst()).allSatisfy { $0 < $1 }
+        guard !strictlyIncreasing else { return false }
+        let tail = Array(counts.suffix(4)).map(Double.init)
+        let mean = tail.reduce(0, +) / Double(tail.count)
+        let spread = (tail.max()! - tail.min()!)
+        return spread <= mean * 0.25
+    }
+
     @Test("baseline: per-token bytes are stable across tokens (no intra-token leak)")
     func perTokenStability() throws {
-        let m = try measure(Knobs(), promptLen: 8)
+        // `retryUntilAcceptable`: see AllocMeasurementRetry.swift and
+        // `isStableShape` above. Retries until an attempt's OWN shape
+        // already satisfies the assertions below, rather than
+        // requiring two raw measurement vectors to match — under CI's
+        // ~285-suite concurrent load, per-call foreign-allocation
+        // bytes differ attempt to attempt, so raw-vector agreement is
+        // a much harder bar to clear than "already within the
+        // tolerated shape" and was observed to exhaust retries in CI
+        // run 31800387587 even though the exact `stableMeasurement`
+        // value-equality approach remains correct for the short,
+        // single-window exact-slope test below.
+        let m = try retryUntilAcceptable(maxAttempts: 8, isAcceptable: isStableShape) {
+            try measure(Knobs(), promptLen: 8)
+        }
         #expect(m.perTokenBytes.count == 8)
         for (i, b) in m.perTokenBytes.enumerated() {
             print("[alloc-trace] token\(i): \(b) bytes")
@@ -253,22 +287,38 @@ struct Gemma4MoEAllocTraceTests {
     @Test("KV cache setup scales with max_position_embeddings, not sliding_window (the real #105 term)")
     func cacheSetupScalesWithMaxPositionEmbeddings() throws {
         let device = Device.shared
-        var results: [(String, Int)] = []
-        for (label, mpe) in [("mpe=512", 512), ("mpe=2048", 2048), ("mpe=8192", 8192)] {
-            let knobs = Knobs(maxPositionEmbeddings: mpe, slidingWindow: 128)
-            let model = try loadSyntheticModel(knobs)
-            device.bufferAllocCount = 0
-            device.bufferAllocBytes = 0
-            device.scratchAllocCount = 0
-            device.scratchAllocBytes = 0
-            // Default maxSeq (nil) -> Gemma4Model.maxSeq -> config's
-            // max_position_embeddings, exactly what `GenerateCommand`'s
-            // `m.engine.makeLayerCaches()` (no explicit maxSeq) does.
-            _ = model.makeLayerCaches(maxSeq: nil, device: device)
-            let bytes = device.bufferAllocBytes + device.scratchAllocBytes
-            results.append((label, bytes))
-            print("[alloc-trace] makeLayerCaches sliding_window=128, \(label) -> \(bytes) bytes")
+        let sweeps: [(label: String, mpe: Int)] = [
+            ("mpe=512", 512), ("mpe=2048", 2048), ("mpe=8192", 8192),
+        ]
+        // `stableMeasurement`: see AllocMeasurementRetry.swift. This
+        // test asserts an EXACT slope (a regression gate, not a shape
+        // check) — widening its tolerance would defeat the point of
+        // the assertion, so the fix for cross-suite Device.shared
+        // interference has to happen around the measurement instead.
+        // Retrying the WHOLE 3-point sweep as one unit (rather than
+        // each point independently) until ANY two of up to 8 full
+        // sweeps agree byte-for-byte on all three points catches
+        // interference landing in any one of the three windows — each
+        // sweep's own window is short, so any-two-of-8 converges even
+        // under CI's ~285-suite concurrent load.
+        let bytesByMpe: [Int] = try stableMeasurement(maxAttempts: 8) {
+            try sweeps.map { (label, mpe) -> Int in
+                let knobs = Knobs(maxPositionEmbeddings: mpe, slidingWindow: 128)
+                let model = try loadSyntheticModel(knobs)
+                device.bufferAllocCount = 0
+                device.bufferAllocBytes = 0
+                device.scratchAllocCount = 0
+                device.scratchAllocBytes = 0
+                // Default maxSeq (nil) -> Gemma4Model.maxSeq -> config's
+                // max_position_embeddings, exactly what `GenerateCommand`'s
+                // `m.engine.makeLayerCaches()` (no explicit maxSeq) does.
+                _ = model.makeLayerCaches(maxSeq: nil, device: device)
+                let bytes = device.bufferAllocBytes + device.scratchAllocBytes
+                print("[alloc-trace] makeLayerCaches sliding_window=128, \(label) -> \(bytes) bytes")
+                return bytes
+            }
         }
+        let results: [(String, Int)] = zip(sweeps.map(\.label), bytesByMpe).map { ($0, $1) }
         // Regression gate. The default 2-layer synthetic config is 1
         // sliding + 1 global layer, both with the same K/V-head shape
         // (nKVHeads=1, headDim=128). Only the GLOBAL layer's physical
