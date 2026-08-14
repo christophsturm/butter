@@ -874,6 +874,100 @@ public final class MuseGlimmerModel: LanguageModel {
         workCmd.waitUntilCompleted()
         return rawLogits
     }
+
+    // MARK: - Embedding-input forward (VLM splice)
+
+    /// Muse Glimmer supports the VLM cross-modal splice — see
+    /// `Models/Vision/MuseGlimmerVision.swift` (`MuseGlimmerVL`), which
+    /// wires this text engine to the ViT-G/14 perception encoder.
+    public var supportsEmbeddingInput: Bool { true }
+
+    /// Embedding-input forward — identical to `forward(tokenId:...)`
+    /// except the `[hidden]` row is supplied directly (a vision-encoder
+    /// token, or a text-token embedding `VisionModel` looked up via
+    /// `textEmbedding(...)`).
+    ///
+    /// UNLIKE Gemma 3's `forward(inputEmbedding:...)` (which applies its
+    /// `embedScale` uniformly to every source — a harmless fixed-scalar
+    /// multiply), this family's `embedNorm` is a full RMSNorm
+    /// (normalizes to unit RMS). `embedNorm` is architecturally part of
+    /// the reference model's `MuseGlimmerTextNormedEmbedding` — i.e. a
+    /// property of the TEXT embedding-table lookup itself (see the
+    /// family-root header, point 7) — not a generic post-embedding
+    /// transform every input passes through. Re-normalizing an already
+    /// vision-projection-scaled row here would erase whatever magnitude
+    /// structure the projector encoded. `embedNorm` is therefore applied
+    /// inside `textEmbedding(...)` instead (so text-token splice
+    /// positions still get exactly the treatment `forward(tokenId:...)`
+    /// gives them), and this function passes `inputEmbedding` straight
+    /// through unmodified — correct for both text rows (pre-normalized
+    /// by `textEmbedding`) and vision rows (never renormalized).
+    ///
+    /// Same private-command-buffer ownership contract as
+    /// `forward(tokenId:...)`: never encodes onto the caller's `cmd`,
+    /// commits its own internal buffer(s), returns only once the result
+    /// is host-resident.
+    public func forward(
+        inputEmbedding: Tensor, position: Int,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        precondition(
+            inputEmbedding.elementCount == hidden,
+            "MuseGlimmerModel.forward(inputEmbedding:): expected [\(hidden)], "
+                + "got \(inputEmbedding.shape)")
+        precondition(
+            cmd.status == .notEnqueued,
+            "MuseGlimmerModel.forward(inputEmbedding:): cmd must be a fresh, "
+                + "uncommitted buffer — this function never encodes onto it "
+                + "and commits its own internal buffer instead")
+
+        let workCmd = device.makeCommandBuffer()
+        var h = inputEmbedding.reshaped(to: [hidden])
+
+        for (i, layer) in layers.enumerated() {
+            h = layer.forward(
+                h, position: position,
+                cache: caches[i] as! any KVCacheProtocol,
+                on: workCmd, device: device)
+        }
+
+        let normed = finalNorm(h, on: workCmd)
+        let rawLogits = lmHead(normed, on: workCmd)
+
+        if finalLogitSoftcap > 0 {
+            return MuseGlimmerOps.softcap(
+                rawLogits, multiplier: outputMultiplier, cap: finalLogitSoftcap, on: workCmd)
+        }
+        workCmd.commit()
+        workCmd.waitUntilCompleted()
+        return rawLogits
+    }
+
+    /// Text-token embedding-table lookup WITH `embedNorm` applied — the
+    /// same weightless RMSNorm `forward(tokenId:...)` runs right after
+    /// the table gather (this family's replacement for Gemma's
+    /// `sqrt(hidden)` embed-scale; see the family-root header, point 7).
+    /// Unlike `LanguageModel.textEmbedding(...)`'s generic doc ("no
+    /// family-specific post-scale — that's applied inside
+    /// `forward(inputEmbedding:...)`, following Gemma 3's precedent"),
+    /// this family's post-embedding transform is a full RMSNorm that
+    /// must NOT also run on vision-sourced rows (see
+    /// `forward(inputEmbedding:...)`'s doc comment) — so it is baked in
+    /// here instead, at the one call site (`VisionModel`'s splice) that
+    /// produces text rows for the embedding-input path.
+    public func textEmbedding(tokenId: Int, device: Device) -> Tensor {
+        let cmd = device.makeCommandBuffer()
+        let tokenBuf = device.makeBuffer(length: 4)
+        var tid = UInt32(tokenId)
+        memcpy(tokenBuf.contents(), &tid, 4)
+        let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
+        let raw = embedTokens(tokenTensor, on: cmd).reshaped(to: [hidden])
+        let embed = embedNorm(raw, on: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return embed
+    }
 }
 
 // MARK: - Soft-cap

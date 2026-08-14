@@ -14,7 +14,7 @@
 //
 // Muse Glimmer family root — Meta's Muse Glimmer 30B, a dense causal
 // LM distilled from Muse Spark for local agentic use, plus a ~1.8B
-// ViT-G/14 perception encoder we do NOT wire yet.
+// ViT-G/14 perception encoder.
 //
 // This file is the **main model interface** for the family:
 //   • the family enum `MuseGlimmer` (modelTypes, architectures, variant
@@ -25,21 +25,31 @@
 //
 // Concrete variants + the dense decoder + per-layer impl live under
 // `Models/Text/MuseGlimmerText.swift`:
-//   - `MuseGlimmerDense` — the (currently only) 30B text decoder.
-//   - `MuseGlimmerModel` — the full LanguageModel decoder.
+//   - `MuseGlimmerDense` — the 30B text decoder (`MuseGlimmerVariant`
+//     entry point; also the text backbone the VL path below reuses).
+//   - `MuseGlimmerModel` — the full LanguageModel decoder, now
+//     including `forward(inputEmbedding:...)` / `textEmbedding(...)`
+//     for the VLM splice.
 //
-// TEXT-ONLY first light. The checkpoint's `architectures` is always
+// VISION is wired in `Models/Vision/MuseGlimmerVision.swift`
+// (`MuseGlimmerVL`): the ViT-G/14 perception encoder + the
+// vision-adapter/vision-projection MLP, composed with `MuseGlimmerDense`
+// via `VisionModel`'s cross-modal splice. `Loader/Model.swift` routes to
+// it only when the checkpoint's safetensors actually carry a
+// `vision_tower.*` tensor — checkpoints without one (or a future
+// text-only `*ForCausalLM` release) still take the plain
+// `MuseGlimmerDense` route below, unchanged. Video and the DFlash
+// speculative drafter remain follow-ups.
+//
+// The checkpoint's `architectures` is always
 // `MuseGlimmerForConditionalGeneration` (the multimodal wrapper) even
 // for text-only use — there is no separate `*ForCausalLM` architecture
 // string the way Gemma 3 ships one. We route on that architecture (and
 // on the `muse_glimmer` / `muse_glimmer_text` model_type strings as a
-// fallback) straight to the text decoder, reading fields from the
-// checkpoint's `text_config` sub-object and reading only the
-// `language_model.*`-prefixed tensors — `model.vision_tower.*`,
-// `model.vision_adapter.*`, `model.vision_projection.*`, and
-// `model.perception_emb_norm.*` are silently ignored. Perception
-// (image/video) support is a follow-up; so is the DFlash speculative
-// drafter.
+// fallback); the text-only path reads fields from the checkpoint's
+// `text_config` sub-object and reads only the `language_model.*`-prefixed
+// tensors — `vision_tower.*` / `vision_adapter.*` / `vision_projection.*`
+// are simply never touched on that path.
 //
 // Architectural notes (verified against the HF
 // `modeling_muse_glimmer.py` / `configuration_muse_glimmer.py`, not

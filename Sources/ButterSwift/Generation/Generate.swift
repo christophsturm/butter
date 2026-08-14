@@ -863,8 +863,20 @@ extension Model {
                         tokens: [nextToken],
                         position: pos + 1, stats: nil))
                 let priorToken = nextToken
+                // `autoreleasepool` per token — `sampleNext` allocates a
+                // fresh command buffer + per-layer intermediate tensors
+                // on every call; without draining here those Metal-side
+                // allocations accumulate on the host's implicit
+                // autorelease pool for the whole decode loop instead of
+                // being freed per token. Immaterial on narrow/shallow
+                // models but grows host RSS unboundedly (tens of GB
+                // over a few hundred tokens) on a wide backbone —
+                // observed while exercising this fallback path with
+                // Muse Glimmer's 6656-hidden / 52-layer text engine.
                 nextToken = profile.signpost("decode_step") {
-                    sampleNext(tokenId: priorToken, position: pos)
+                    autoreleasepool {
+                        sampleNext(tokenId: priorToken, position: pos)
+                    }
                 }
                 tokenHistory.append(priorToken)
                 memTracker.sample()

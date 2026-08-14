@@ -491,13 +491,30 @@ public enum ModelRegistry {
                     availableCapabilities: SmolVLM2Dense.availableCapabilities)
             }
             // Muse Glimmer — Meta's 30B dense agentic decoder + a
-            // ~1.8B ViT-G/14 perception encoder. TEXT-ONLY first light:
-            // route straight to the text backbone (`MuseGlimmerDense`)
-            // and skip the vision tower entirely — no `VisionModel`
-            // wiring yet, so no `vlModel` / `.imageIn` capability.
-            // `MuseGlimmerDense.loadModel` reads `text_config` and only
-            // the `language_model.`-prefixed tensors; vision-tower /
-            // adapter / projection weights are simply never touched.
+            // ~1.8B ViT-G/14 perception encoder. Vision loads when the
+            // checkpoint actually carries the vision tower's tensors
+            // (`vision_tower.patch_embedder.patch_embedding.weight` —
+            // the ONE tensor every Muse Glimmer VL conversion must ship,
+            // checked directly rather than trusting `vision_config`'s
+            // mere presence, same disambiguation Qwen 3.5-VL uses for
+            // its vestigial-vision-config text checkpoints). Checkpoints
+            // without it fall through to the pre-existing text-only
+            // route unchanged — `MuseGlimmerDense.loadModel` reads
+            // `text_config` and only the `language_model.`-prefixed
+            // tensors either way, so text-only behaviour is bit-for-bit
+            // identical whichever branch runs.
+            if let arch = config.architecture, MuseGlimmer.architectures.contains(arch),
+                weights.has("vision_tower.patch_embedder.patch_embedding.weight")
+            {
+                let vlm = try MuseGlimmerVL.load(
+                    config: config, weights: weights,
+                    options: options, device: device)
+                return Loaded(
+                    engine: vlm.engine,
+                    defaultGenerationParameters: MuseGlimmerDense.defaultGenerationParameters,
+                    availableCapabilities: MuseGlimmerVL.availableCapabilities,
+                    vlModel: vlm)
+            }
             if let arch = config.architecture, MuseGlimmer.architectures.contains(arch) {
                 let engine = try MuseGlimmerDense.loadModel(
                     config: config, weights: weights,

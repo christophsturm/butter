@@ -352,26 +352,44 @@ public final class VisionModel: @unchecked Sendable {
 
         // Prefill: forward every spliced embedding, keeping the argmax
         // of the final position as the first decoded token.
+        //
+        // `autoreleasepool` per position — the VLM splice's image
+        // prefill run can be several hundred positions (e.g. 256+
+        // merged vision tokens for a single image) against a wide text
+        // backbone; each `engine.forward(inputEmbedding:...)` call
+        // allocates its own internal command buffer plus per-layer
+        // intermediate tensors. Without draining the autorelease pool
+        // every iteration, those Metal-side allocations pile up on the
+        // test host's implicit pool for the whole prefill instead of
+        // being freed as each position completes — observed to grow
+        // host RSS unboundedly (tens of GB) over a long prefill on a
+        // wide backbone. Same fix `MuseGlimmerLayer`'s long-context
+        // fallback loop already applies for the analogous reason.
         var nextToken = 0
         for (pos, embedding) in stream.enumerated() {
-            let cmd = device.makeCommandBuffer()
-            let logits = engine.forward(
-                inputEmbedding: embedding, position: pos,
-                caches: caches, on: cmd, device: device)
-            let outBuf = device.makeBuffer(length: 4)
-            let outT = Tensor(buffer: outBuf, offset: 0, shape: [1], dtype: .u32)
-            Ops.argmax(logits, into: outT, on: cmd)
-            cmd.commit()
-            cmd.waitUntilCompleted()
-            nextToken = Int(
-                outBuf.contents()
-                    .bindMemory(to: UInt32.self, capacity: 1).pointee)
+            nextToken = autoreleasepool {
+                let cmd = device.makeCommandBuffer()
+                let logits = engine.forward(
+                    inputEmbedding: embedding, position: pos,
+                    caches: caches, on: cmd, device: device)
+                let outBuf = device.makeBuffer(length: 4)
+                let outT = Tensor(buffer: outBuf, offset: 0, shape: [1], dtype: .u32)
+                Ops.argmax(logits, into: outT, on: cmd)
+                cmd.commit()
+                cmd.waitUntilCompleted()
+                return Int(
+                    outBuf.contents()
+                        .bindMemory(to: UInt32.self, capacity: 1).pointee)
+            }
         }
 
         // Decode: ordinary token-id forward from the prefill tail.
         // Stop on any EOS — Gemma 3+ etc. publish `eos_token_id` as a
         // list; the caller passes both `eosTokenId` (back-compat single
         // id) and the optional `eosTokenIds` list.
+        //
+        // `autoreleasepool` per token — same rationale as the prefill
+        // loop above; `maxTokens` can run into the hundreds.
         var stopSet: Set<Int> = Set(eosTokenIds)
         if let single = eosTokenId { stopSet.insert(single) }
         var generated: [Int] = []
@@ -380,8 +398,10 @@ public final class VisionModel: @unchecked Sendable {
             if stopSet.contains(nextToken) { break }
             generated.append(nextToken)
             let prior = nextToken
-            nextToken = engine.forwardSample(
-                tokenId: prior, position: pos, caches: caches, device: device)
+            nextToken = autoreleasepool {
+                engine.forwardSample(
+                    tokenId: prior, position: pos, caches: caches, device: device)
+            }
             pos += 1
         }
         return generated
