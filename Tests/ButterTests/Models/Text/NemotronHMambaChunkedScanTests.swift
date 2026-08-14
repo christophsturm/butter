@@ -400,12 +400,19 @@ struct NemotronHMambaChunkedScanTests {
 
             let yr = yRef.toFloatArray()
             let ym = yMany.toFloatArray()
-            // f16/bf16: strict bit-equality. f32: tight ULP-scale
-            // tolerance (see the test's doc comment for why f32 alone
-            // isn't bit-exact) — `Float.ulpOfOne`-relative, generous
-            // enough to absorb one FMA-contraction step but nowhere
-            // near loose enough to hide a real formula bug.
-            let atol: Float = dtype == .f32 ? 1e-5 : 0
+            // All dtypes: tight ULP-scale tolerance, generous enough to
+            // absorb one FMA-contraction step but nowhere near loose
+            // enough to hide a real formula bug. f16/bf16 originally
+            // asserted strict bit-equality, which held on the local GPU
+            // and the CI runner that validated the original change —
+            // but CI's Apple Silicon runner fleet is heterogeneous, and
+            // a later unrelated run (31800875613) hit a single f16
+            // element off by one contraction step on a different
+            // runner. Same cross-GPU hazard class documented in
+            // NemotronHMambaMixerFuse.swift; per-GPU bit-equality is
+            // not a portable claim for kernels with fused
+            // multiply-adds.
+            let atol: Float = dtype == .f32 ? 1e-5 : 2e-3
             var mismatches = 0
             for i in 0 ..< yr.count where abs(yr[i] - ym[i]) > atol {
                 mismatches += 1
