@@ -1010,4 +1010,190 @@ public final class NemotronHNvfp4MoELayer: Module, DecoderLayer {
         workCmd.waitUntilCompleted()
         return result
     }
+
+    /// F-132 batched prefill: T-batched NVFP4 MoE. `h` is `[T, hidden]`;
+    /// returns `[T, hidden]`. Only takes the batched GPU-router path
+    /// when `usesGpuRouter` (matching `decode`'s guard — the same
+    /// checkpoint-shape / config conditions apply, T-independent);
+    /// otherwise falls back to the per-row default `decodeMulti` loop
+    /// (`DecoderLayer`'s protocol extension) reusing `decode`'s existing
+    /// CPU-routed path unchanged.
+    ///
+    /// Reuses the batched-prefill MoE primitives the reusable
+    /// `MoELayer.swift` gather-GEMM / sort-route pipeline already
+    /// exercises for other model families — no new kernel families:
+    ///
+    ///   1. `Ops.moeRouterTopKBiasedRowsFused(t: T, ...)` — same fused
+    ///      sigmoid+bias top-K router as `decodeGPURouted`, run once
+    ///      over all T rows instead of T times.
+    ///   2. `Ops.moeSortPlanFused` — GPU counting-sort of the `T·topK`
+    ///      (token, slot) pairs by chosen expert id, so the gather-GEMM
+    ///      below sees expert-contiguous row runs.
+    ///   3. `Ops.gather` — expands the T-row `xNorm` into `T·topK`
+    ///      sorted rows (one row per selected expert slot).
+    ///   4. `Ops.nvfp4MoeGatherBm16` (×2 — up_proj, down_proj) — the
+    ///      same gather-GEMM primitive `NemotronLightningNvfp4Fuse`'s
+    ///      decode-time fused kernels wrap for T=1; here it runs
+    ///      natively at T·topK rows in one dispatch per projection.
+    ///   5. `Ops.moeUnpermuteTail` — un-sorts the down-projection output
+    ///      back to token order, weighted-sums the `topK` slots, adds
+    ///      the (batched, densely-computed) shared expert, and adds the
+    ///      residual — all in one dispatch.
+    ///
+    /// All work queues onto `cmd`; no commit inside on the GPU-router
+    /// branch (matches `commitsMidDecode == false` for that case).
+    /// Set once, the first time `decodeMulti` falls back to the per-row
+    /// loop because `Ops.mppAutoCapable` is false — avoids spamming
+    /// stderr once per prefill chunk. See the guard in `decodeMulti`
+    /// below for the full story.
+    nonisolated(unsafe) private static var mppFallbackLogged = false
+
+    /// Shared per-row `decode()` loop — both fallback guards in
+    /// `decodeMulti` below (CPU-routed router, MPP-incapable hardware)
+    /// use this exact body. It's `DecoderLayer`'s default `decodeMulti`,
+    /// replicated here because a type that provides its own
+    /// `decodeMulti` can't fall through to the protocol extension's
+    /// default from inside itself.
+    private static func perRowDecodeMultiFallback(
+        layer: NemotronHNvfp4MoELayer, _ h: Tensor, startingAt position: Int,
+        cache: any LayerCacheProtocol, cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let t = h.shape[0]
+        let rowSize = h.shape.last!
+        let result = Tensor.empty(shape: h.shape, dtype: h.dtype, device: device)
+        result.zero()
+        for i in 0 ..< t {
+            let row = h.slicedRows(start: i, count: 1).reshaped(to: [rowSize])
+            let out = layer.decode(
+                row, position: position + i, cache: cache, cmd: cmd, device: device)
+            let dst = result.slicedRows(start: i, count: 1).reshaped(to: [rowSize])
+            _ = Ops.add(out, dst, on: cmd, into: dst)
+        }
+        return result
+    }
+
+    public func decodeMulti(
+        _ h: Tensor, startingAt position: Int,
+        cache: any LayerCacheProtocol,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        guard usesGpuRouter else {
+            // CPU-routed fallback (BUTTER_NEMOTRON_NVFP4_GPU_ROUTER=0, or
+            // a checkpoint with normTopkProb==false / topK==1).
+            return Self.perRowDecodeMultiFallback(
+                layer: self, h, startingAt: position, cache: cache, cmd: cmd, device: device)
+        }
+        guard Ops.mppAutoCapable else {
+            // `Ops.nvfp4MoeGatherBm16`'s default dispatch path (when none
+            // of the shape/env-gated non-MPP variants — LagunaNvfp4ExpertGather
+            // / LagunaNvfp4MppGather's own `.capable` check, opt-in Steel —
+            // fire) unconditionally requests a `matmul2d` MPP cooperative-
+            // tensor PSO, which needs Apple GPU Family 9+ / macOS 26+ (same
+            // gate as `Ops.mppAutoCapable`; see its doc). Every existing
+            // MPP-touching caller in this codebase only ever ran on capable
+            // hardware; this layer's batched `decodeMulti` is default-ON,
+            // so on incapable hardware (older Macs, CI paravirt GPUs) it
+            // must not even attempt the gather-GEMM path — degrade to the
+            // per-row loop instead of a Metal-compiler fatalError on an
+            // uncompileable PSO.
+            if !Self.mppFallbackLogged {
+                Self.mppFallbackLogged = true
+                FileHandle.standardError.write(
+                    ("[nemotronh] Ops.mppAutoCapable == false — batched NVFP4 MoE "
+                        + "prefill falling back to the per-token decode() loop (MPP "
+                        + "cooperative-tensor kernels need Apple GPU Family 9+ / "
+                        + "macOS 26+).\n")
+                        .data(using: .utf8)!)
+            }
+            return Self.perRowDecodeMultiFallback(
+                layer: self, h, startingAt: position, cache: cache, cmd: cmd, device: device)
+        }
+
+        let t = h.shape[0]
+        let rowSize = h.shape.last!
+        precondition(
+            rowSize == hidden,
+            "NemotronHNvfp4MoELayer.decodeMulti: row size \(rowSize) != hidden \(hidden)")
+
+        let xNorm = Ops.rmsNormRows(
+            h, weight: norm.weight, eps: norm.eps,
+            nRows: t, rowSize: hidden, on: cmd)
+
+        // ── Batched router (f32 throughout — see `eScoreCorrectionBiasGPU`'s
+        //    doc for why bf16 silently breaks selection on this
+        //    checkpoint's correction-bias distribution). ──────────────────
+        let logitsAll = gate.callMany(xNorm, t: t, on: cmd, device: device)
+        let logitsF32 = Tensor.empty(shape: [t * nRouted], dtype: .f32, device: device)
+        Ops.castToF32(logitsAll.reshaped(to: [t * nRouted]), into: logitsF32, on: cmd)
+
+        let mTotal = t * topK
+        let indicesTok = Tensor.empty(shape: [mTotal], dtype: .u32, device: device)
+        let weightsF32 = Tensor.empty(shape: [mTotal], dtype: .f32, device: device)
+        Ops.moeRouterTopKBiasedRowsFused(
+            logits: logitsF32, bias: eScoreCorrectionBiasGPU,
+            indicesOut: indicesTok, weightsOut: weightsF32,
+            t: t, nExperts: nRouted, k: topK, on: cmd)
+        if routedScalingFactor != 1.0 {
+            let scaleVec = Tensor.filled(
+                routedScalingFactor, shape: [mTotal], dtype: .f32, device: device)
+            _ = Ops.mul(weightsF32, scaleVec, on: cmd, into: weightsF32)
+        }
+        let weightsAct = Tensor.empty(shape: [mTotal], dtype: dtype, device: device)
+        if dtype == .f32 {
+            Ops.copy(weightsF32, into: weightsAct, on: cmd)
+        } else if dtype == .bf16 {
+            Ops.castF32ToBf16(weightsF32, into: weightsAct, on: cmd)
+        } else {
+            fatalError(
+                "NemotronHNvfp4MoELayer.decodeMulti: unsupported activation dtype \(dtype)")
+        }
+
+        // ── Sort (token, slot) pairs by chosen expert ─────────────────────
+        let sortedExperts = Tensor.empty(shape: [mTotal], dtype: .u32, device: device)
+        let sourceTokens = Tensor.empty(shape: [mTotal], dtype: .u32, device: device)
+        let invPerm = Tensor.empty(shape: [mTotal], dtype: .u32, device: device)
+        Ops.moeSortPlanFused(
+            topkIds: indicesTok, sortedExperts: sortedExperts,
+            sourceTokens: sourceTokens, invPerm: invPerm,
+            mTotal: mTotal, k: topK, nExperts: nRouted, blockSize: 256, on: cmd)
+
+        // ── Gather xNorm rows into expert-sorted (token, slot) order ──────
+        let xGathered = Ops.gather(table: xNorm, tokenIds: sourceTokens, on: cmd)
+
+        // ── Routed experts: two gather-GEMM dispatches (up, down) ─────────
+        let moeIntermediate = stacked.moeIntermediate
+        let upOut = Tensor.empty(shape: [mTotal, moeIntermediate], dtype: dtype, device: device)
+        Ops.nvfp4MoeGatherBm16(
+            input: xGathered, weight: stacked.upWeight, scales: stacked.upScales,
+            indices: sortedExperts, mTotal: mTotal, nOut: moeIntermediate, kIn: hidden,
+            blockSize: stacked.blockSize, global: 1.0, on: cmd, into: upOut)
+
+        let r = Ops.relu(upOut, on: cmd)
+        let inner = Ops.mul(r, r, on: cmd)
+
+        let downOut = Tensor.empty(shape: [mTotal, hidden], dtype: dtype, device: device)
+        Ops.nvfp4MoeGatherBm16(
+            input: inner, weight: stacked.downWeight, scales: stacked.downScales,
+            indices: sortedExperts, mTotal: mTotal, nOut: hidden, kIn: moeIntermediate,
+            blockSize: stacked.blockSize, global: 1.0, on: cmd, into: downOut)
+
+        // ── Shared expert — always-on, dense (not gathered/routed),
+        //    batched over all T rows via Nvfp4Linear.callMany. ─────────────
+        var sharedOut: Tensor?
+        if let su = sharedUp, let sd = sharedDown {
+            let sUp = su.callMany(xNorm, t: t, on: cmd, device: device)
+            let sR = Ops.relu(sUp, on: cmd)
+            let sInner = Ops.mul(sR, sR, on: cmd)
+            sharedOut = sd.callMany(sInner, t: t, on: cmd, device: device)
+        }
+
+        // ── Un-sort + weighted combine + shared-expert add + residual add,
+        //    all in one dispatch. ───────────────────────────────────────────
+        let result = Tensor.empty(shape: [t, hidden], dtype: dtype, device: device)
+        Ops.moeUnpermuteTail(
+            expertOutputs: downOut, invPerm: invPerm, topKWeights: weightsAct,
+            sharedExpert: sharedOut, residual: h, into: result,
+            nRows: t, hidden: hidden, k: topK, on: cmd)
+        return result
+    }
 }
