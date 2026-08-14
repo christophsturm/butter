@@ -74,7 +74,7 @@ struct Gemma4MoEAllocTraceTests {
         }
     }
 
-    struct Measurement {
+    struct Measurement: Equatable {
         /// Per-token total transient bytes (`bufferAllocBytes +
         /// scratchAllocBytes`), one entry per generated token.
         let perTokenBytes: [Int]
@@ -173,7 +173,12 @@ struct Gemma4MoEAllocTraceTests {
 
     @Test("baseline: per-token bytes are stable across tokens (no intra-token leak)")
     func perTokenStability() throws {
-        let m = try measure(Knobs(), promptLen: 8)
+        // `stableMeasurement`: see AllocMeasurementRetry.swift. Guards
+        // against a concurrently-scheduled, unrelated suite's
+        // allocation landing inside one of this measurement's
+        // reset/read windows on Device.shared (CI's flaky full-suite
+        // run) without touching the shape assertions below.
+        let m = try stableMeasurement { try measure(Knobs(), promptLen: 8) }
         #expect(m.perTokenBytes.count == 8)
         for (i, b) in m.perTokenBytes.enumerated() {
             print("[alloc-trace] token\(i): \(b) bytes")
@@ -253,22 +258,36 @@ struct Gemma4MoEAllocTraceTests {
     @Test("KV cache setup scales with max_position_embeddings, not sliding_window (the real #105 term)")
     func cacheSetupScalesWithMaxPositionEmbeddings() throws {
         let device = Device.shared
-        var results: [(String, Int)] = []
-        for (label, mpe) in [("mpe=512", 512), ("mpe=2048", 2048), ("mpe=8192", 8192)] {
-            let knobs = Knobs(maxPositionEmbeddings: mpe, slidingWindow: 128)
-            let model = try loadSyntheticModel(knobs)
-            device.bufferAllocCount = 0
-            device.bufferAllocBytes = 0
-            device.scratchAllocCount = 0
-            device.scratchAllocBytes = 0
-            // Default maxSeq (nil) -> Gemma4Model.maxSeq -> config's
-            // max_position_embeddings, exactly what `GenerateCommand`'s
-            // `m.engine.makeLayerCaches()` (no explicit maxSeq) does.
-            _ = model.makeLayerCaches(maxSeq: nil, device: device)
-            let bytes = device.bufferAllocBytes + device.scratchAllocBytes
-            results.append((label, bytes))
-            print("[alloc-trace] makeLayerCaches sliding_window=128, \(label) -> \(bytes) bytes")
+        let sweeps: [(label: String, mpe: Int)] = [
+            ("mpe=512", 512), ("mpe=2048", 2048), ("mpe=8192", 8192),
+        ]
+        // `stableMeasurement`: see AllocMeasurementRetry.swift. This
+        // test asserts an EXACT slope (a regression gate, not a shape
+        // check) — widening its tolerance would defeat the point of
+        // the assertion, so the fix for cross-suite Device.shared
+        // interference has to happen around the measurement instead.
+        // Retrying the WHOLE 3-point sweep as one unit (rather than
+        // each point independently) until two consecutive full sweeps
+        // agree byte-for-byte on all three points catches interference
+        // landing in any one of the three windows.
+        let bytesByMpe: [Int] = try stableMeasurement {
+            try sweeps.map { (label, mpe) -> Int in
+                let knobs = Knobs(maxPositionEmbeddings: mpe, slidingWindow: 128)
+                let model = try loadSyntheticModel(knobs)
+                device.bufferAllocCount = 0
+                device.bufferAllocBytes = 0
+                device.scratchAllocCount = 0
+                device.scratchAllocBytes = 0
+                // Default maxSeq (nil) -> Gemma4Model.maxSeq -> config's
+                // max_position_embeddings, exactly what `GenerateCommand`'s
+                // `m.engine.makeLayerCaches()` (no explicit maxSeq) does.
+                _ = model.makeLayerCaches(maxSeq: nil, device: device)
+                let bytes = device.bufferAllocBytes + device.scratchAllocBytes
+                print("[alloc-trace] makeLayerCaches sliding_window=128, \(label) -> \(bytes) bytes")
+                return bytes
+            }
         }
+        let results: [(String, Int)] = zip(sweeps.map(\.label), bytesByMpe).map { ($0, $1) }
         // Regression gate. The default 2-layer synthetic config is 1
         // sliding + 1 global layer, both with the same K/V-head shape
         // (nKVHeads=1, headDim=128). Only the GLOBAL layer's physical
