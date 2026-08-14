@@ -64,6 +64,13 @@ public final class Mamba2LayerCache: LayerCacheProtocol, @unchecked Sendable {
     /// conv kernels via the wrapped caches.
     public func advance() { length += 1 }
 
+    /// Batched-prefill counterpart to `advance()` — advances the step
+    /// counter by `n` in one call instead of looping `advance()` `n`
+    /// times. Used by `NemotronHMambaLayer.decodeMulti` (F-13x chunked
+    /// scan), which processes `n` rows per call without ever calling
+    /// the per-token `decode(...)`.
+    public func advanceBy(_ n: Int) { length += n }
+
     public var bytesAllocated: Int {
         ssm.bytesAllocated + conv.bytesAllocated
     }

@@ -699,6 +699,168 @@ public final class NemotronHMambaLayer: Module, DecoderLayer {
         layerCache.advance()
         return result
     }
+
+    /// F-13x chunked-scan batched prefill: `h` is `[T, hidden]`; returns
+    /// `[T, hidden]`. Runs the WHOLE mixer batched over T rows —
+    /// RMSNorm, in_proj, conv1d+SiLU, dt=softplus, the selective scan,
+    /// D-skip, gated mixer RMSNorm, and out_proj all become one (or a
+    /// few, for the scan) dispatch spanning every row instead of T
+    /// per-row dispatches. See `NemotronHMambaChunkedScan`'s file
+    /// header for the full design (chunked-but-still-sequential v1
+    /// scan + the byte-generic column-slice/row-broadcast-tile helpers
+    /// that stitch the rest of the mixer together at batched-T shape).
+    /// `BUTTER_NEMOTRON_CHUNKED_SCAN=0` falls back to the exact
+    /// per-row default (`DecoderLayer`'s protocol-extension
+    /// implementation, duplicated below since Swift can't dispatch to
+    /// a protocol default from an overriding conformance).
+    public func decodeMulti(
+        _ h: Tensor, startingAt position: Int,
+        cache: any LayerCacheProtocol,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        guard let layerCache = cache as? Mamba2LayerCache else {
+            fatalError("NemotronHMambaLayer: expected Mamba2LayerCache, got \(type(of: cache))")
+        }
+        let t = h.shape[0]
+        guard NemotronHMambaChunkedScan.enabled else {
+            let result = Tensor.empty(shape: h.shape, dtype: h.dtype, device: device)
+            result.zero()
+            for i in 0 ..< t {
+                let row = h.slicedRows(start: i, count: 1).reshaped(to: [hidden])
+                let out = decode(
+                    row, position: position + i, cache: cache, cmd: cmd, device: device)
+                let dst = result.slicedRows(start: i, count: 1).reshaped(to: [hidden])
+                _ = Ops.add(out, dst, on: cmd, into: dst)
+            }
+            return result
+        }
+
+        // (1) pre-mixer RMSNorm, batched over T rows.
+        let xNorm = Ops.rmsNormRows(
+            h, weight: norm.weight, eps: norm.eps, nRows: t, rowSize: hidden, on: cmd)
+
+        // (2) in_proj is ONE combined GEMM (z | xBC | dt_raw) — batch
+        // it, then column-slice the three pieces back out (no per-piece
+        // Linear to call separately, unlike Qwen3.5 GDN's 4-projection
+        // layout — see NemotronHMambaChunkedScan's header).
+        let projDim = dInner + convDim + nHeads
+        let proj = inProj.callMany(xNorm, t: t, on: cmd, device: device)
+        let z = NemotronHMambaChunkedScan.sliceColumns(
+            proj, colStart: 0, colCount: dInner, totalCols: projDim,
+            t: t, device: device, on: cmd)
+        let xBC = NemotronHMambaChunkedScan.sliceColumns(
+            proj, colStart: dInner, colCount: convDim, totalCols: projDim,
+            t: t, device: device, on: cmd)
+        let dtRaw = NemotronHMambaChunkedScan.sliceColumns(
+            proj, colStart: dInner + convDim, colCount: nHeads, totalCols: projDim,
+            t: t, device: device, on: cmd)
+
+        // (3) batched conv1d + SiLU: `conv1dMany` (native-dtype output,
+        // rounds at the same point `iron_conv1d_causal_step_*` does)
+        // followed by the SAME `Ops.silu` dispatch `decode`'s per-token
+        // path calls — NOT `Ops.conv1dCausalStepSiluCastMany` (that
+        // kernel fuses conv+silu behind a single f32 accumulator with
+        // no intermediate native-dtype round, which measurably
+        // shortened the chunked-vs-sequential greedy match; see
+        // `NemotronHMambaChunkedScan.conv1dMany`'s header).
+        let convRaw = NemotronHMambaChunkedScan.conv1dMany(
+            src: xBC, w: convW, b: convB,
+            stateIn: layerCache.conv.state, stateOut: layerCache.conv.state,
+            t: t, convDim: convDim, convKernel: convKernel,
+            device: device, on: cmd)
+        let convAct = Ops.silu(convRaw, on: cmd)
+
+        // (4) split conv output -> x / B / C (same layout as `decode`'s
+        // step (4)).
+        let bcWidth = nGroups * stateDim
+        let x = NemotronHMambaChunkedScan.sliceColumns(
+            convAct, colStart: 0, colCount: dInner, totalCols: convDim,
+            t: t, device: device, on: cmd)
+        let bAll = NemotronHMambaChunkedScan.sliceColumns(
+            convAct, colStart: dInner, colCount: bcWidth, totalCols: convDim,
+            t: t, device: device, on: cmd)
+        let cAll = NemotronHMambaChunkedScan.sliceColumns(
+            convAct, colStart: dInner + bcWidth, colCount: bcWidth, totalCols: convDim,
+            t: t, device: device, on: cmd)
+
+        // (5) dt = softplus(dt_raw + dt_bias), batched. Deliberately
+        // NOT a fused add+softplus dispatch — reuses the exact same
+        // `Ops.add` + `Ops.softplus` kernels `decode`'s default
+        // (non-mixer-fuse) path calls, just over `[T, nHeads]` instead
+        // of `[nHeads]`; see NemotronHMambaChunkedScan's header for why
+        // a fresh transcendental fusion here would reopen the CI
+        // portability hazard `NemotronHMambaMixerFuse.addSoftplus`
+        // already hit.
+        let dtBiasTiled = NemotronHMambaChunkedScan.rowBroadcastTile(
+            dtBias, t: t, device: device, on: cmd)
+        let dtSum = Ops.add(dtRaw, dtBiasTiled, on: cmd)
+        let dt = Ops.softplus(dtSum, on: cmd)
+
+        // (6) chunked selective scan — the actual dispatch-count win.
+        // `ceil(T / chunkSize)` dispatches instead of T; state carries
+        // across chunks via `layerCache.ssm.h` (Metal serializes the
+        // read-after-write across encoders on this one `cmd`, no host
+        // sync needed between chunks).
+        let y = Tensor.empty(shape: [t, dInner], dtype: dtype, device: device)
+        let stateHeads = layerCache.ssm.h
+        let chunkSize = NemotronHMambaChunkedScan.chunkSize
+        var chunkStart = 0
+        while chunkStart < t {
+            let chunkLen = min(chunkSize, t - chunkStart)
+            autoreleasepool {
+                NemotronHMambaChunkedScan.scanChunk(
+                    x: x.slicedRows(start: chunkStart, count: chunkLen),
+                    a: aEff,
+                    b: bAll.slicedRows(start: chunkStart, count: chunkLen),
+                    c: cAll.slicedRows(start: chunkStart, count: chunkLen),
+                    dt: dt.slicedRows(start: chunkStart, count: chunkLen),
+                    state: stateHeads,
+                    into: y.slicedRows(start: chunkStart, count: chunkLen),
+                    nHeads: nHeads, headDim: headDim, stateDim: stateDim,
+                    headsPerGroup: headsPerGroup, chunkLen: chunkLen,
+                    dInner: dInner, bcStride: bcWidth,
+                    on: cmd, device: device)
+            }
+            chunkStart += chunkLen
+        }
+
+        // (7) skip: y += D_tiled * x, batched. F-129's `addMul` fusion
+        // (pure mul+add, no transcendentals — the one class verified
+        // bit-exact on both local dev and CI) is reused UNCHANGED on
+        // the tiled operand; only the broadcast-tile itself is new,
+        // and it does no floating-point math.
+        let dTiledTiled = NemotronHMambaChunkedScan.rowBroadcastTile(
+            dTiled, t: t, device: device, on: cmd)
+        let ySkip: Tensor
+        if NemotronHMambaMixerFuse.enabled {
+            ySkip = NemotronHMambaMixerFuse.addMul(base: y, dTiledTiled, x, on: cmd, device: device)
+        } else {
+            let dx = Ops.mul(dTiledTiled, x, on: cmd)
+            ySkip = Ops.add(y, dx, on: cmd)
+        }
+
+        // (8) gated mixer RMSNorm, batched: y *= silu(z), then per-group
+        // (unweighted) RMSNorm over `t * nGroups` rows (`Ops.rmsNormRows`
+        // already broadcasts one `[groupSize]` weight across every row —
+        // no tiling needed there, matches `decode`'s single-token call
+        // broadcasting the same `onesWeight` across `nGroups` rows).
+        let zAct = Ops.silu(z, on: cmd)
+        let yGated = Ops.mul(ySkip, zAct, on: cmd)
+        let yNormed = Ops.rmsNormRows(
+            yGated.reshaped(to: [t * nGroups, groupSize]), weight: onesWeight,
+            eps: mixerNorm.eps, nRows: t * nGroups, rowSize: groupSize, on: cmd
+        ).reshaped(to: [t, dInner])
+        let mixerNormWeightTiled = NemotronHMambaChunkedScan.rowBroadcastTile(
+            mixerNorm.weight, t: t, device: device, on: cmd)
+        let yScaled = Ops.mul(yNormed, mixerNormWeightTiled, on: cmd)
+
+        // (9) out_proj + residual, batched.
+        let yOut = outProj.callMany(yScaled, t: t, on: cmd, device: device)
+        let result = Ops.add(h, yOut, on: cmd)
+
+        layerCache.advanceBy(t)
+        return result
+    }
 }
 
 // ─── NemotronHAttentionLayer — "*" ───────────────────────────────────
