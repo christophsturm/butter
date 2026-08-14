@@ -1042,6 +1042,36 @@ public final class NemotronHNvfp4MoELayer: Module, DecoderLayer {
     ///
     /// All work queues onto `cmd`; no commit inside on the GPU-router
     /// branch (matches `commitsMidDecode == false` for that case).
+    /// Set once, the first time `decodeMulti` falls back to the per-row
+    /// loop because `Ops.mppAutoCapable` is false — avoids spamming
+    /// stderr once per prefill chunk. See the guard in `decodeMulti`
+    /// below for the full story.
+    nonisolated(unsafe) private static var mppFallbackLogged = false
+
+    /// Shared per-row `decode()` loop — both fallback guards in
+    /// `decodeMulti` below (CPU-routed router, MPP-incapable hardware)
+    /// use this exact body. It's `DecoderLayer`'s default `decodeMulti`,
+    /// replicated here because a type that provides its own
+    /// `decodeMulti` can't fall through to the protocol extension's
+    /// default from inside itself.
+    private static func perRowDecodeMultiFallback(
+        layer: NemotronHNvfp4MoELayer, _ h: Tensor, startingAt position: Int,
+        cache: any LayerCacheProtocol, cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let t = h.shape[0]
+        let rowSize = h.shape.last!
+        let result = Tensor.empty(shape: h.shape, dtype: h.dtype, device: device)
+        result.zero()
+        for i in 0 ..< t {
+            let row = h.slicedRows(start: i, count: 1).reshaped(to: [rowSize])
+            let out = layer.decode(
+                row, position: position + i, cache: cache, cmd: cmd, device: device)
+            let dst = result.slicedRows(start: i, count: 1).reshaped(to: [rowSize])
+            _ = Ops.add(out, dst, on: cmd, into: dst)
+        }
+        return result
+    }
+
     public func decodeMulti(
         _ h: Tensor, startingAt position: Int,
         cache: any LayerCacheProtocol,
@@ -1049,22 +1079,34 @@ public final class NemotronHNvfp4MoELayer: Module, DecoderLayer {
     ) -> Tensor {
         guard usesGpuRouter else {
             // CPU-routed fallback (BUTTER_NEMOTRON_NVFP4_GPU_ROUTER=0, or
-            // a checkpoint with normTopkProb==false / topK==1) — replicate
-            // `DecoderLayer`'s default per-row `decodeMulti` loop, since a
-            // type that provides its own `decodeMulti` can't fall through
-            // to the protocol extension's default from inside itself.
-            let t = h.shape[0]
-            let rowSize = h.shape.last!
-            let result = Tensor.empty(shape: h.shape, dtype: h.dtype, device: device)
-            result.zero()
-            for i in 0 ..< t {
-                let row = h.slicedRows(start: i, count: 1).reshaped(to: [rowSize])
-                let out = decode(
-                    row, position: position + i, cache: cache, cmd: cmd, device: device)
-                let dst = result.slicedRows(start: i, count: 1).reshaped(to: [rowSize])
-                _ = Ops.add(out, dst, on: cmd, into: dst)
+            // a checkpoint with normTopkProb==false / topK==1).
+            return Self.perRowDecodeMultiFallback(
+                layer: self, h, startingAt: position, cache: cache, cmd: cmd, device: device)
+        }
+        guard Ops.mppAutoCapable else {
+            // `Ops.nvfp4MoeGatherBm16`'s default dispatch path (when none
+            // of the shape/env-gated non-MPP variants — LagunaNvfp4ExpertGather
+            // / LagunaNvfp4MppGather's own `.capable` check, opt-in Steel —
+            // fire) unconditionally requests a `matmul2d` MPP cooperative-
+            // tensor PSO, which needs Apple GPU Family 9+ / macOS 26+ (same
+            // gate as `Ops.mppAutoCapable`; see its doc). Every existing
+            // MPP-touching caller in this codebase only ever ran on capable
+            // hardware; this layer's batched `decodeMulti` is default-ON,
+            // so on incapable hardware (older Macs, CI paravirt GPUs) it
+            // must not even attempt the gather-GEMM path — degrade to the
+            // per-row loop instead of a Metal-compiler fatalError on an
+            // uncompileable PSO.
+            if !Self.mppFallbackLogged {
+                Self.mppFallbackLogged = true
+                FileHandle.standardError.write(
+                    ("[nemotronh] Ops.mppAutoCapable == false — batched NVFP4 MoE "
+                        + "prefill falling back to the per-token decode() loop (MPP "
+                        + "cooperative-tensor kernels need Apple GPU Family 9+ / "
+                        + "macOS 26+).\n")
+                        .data(using: .utf8)!)
             }
-            return result
+            return Self.perRowDecodeMultiFallback(
+                layer: self, h, startingAt: position, cache: cache, cmd: cmd, device: device)
         }
 
         let t = h.shape[0]

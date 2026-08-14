@@ -255,6 +255,19 @@ struct NemotronHBatchedPrefillTests {
         // independent implementation from `decodeMulti`'s gather-GEMM +
         // sort-route path, so a match here is a real cross-check, not a
         // tautology.
+        //
+        // `decodeMulti`'s gather-GEMM path routes through
+        // `Ops.nvfp4MoeGatherBm16`, whose default dispatch requests an
+        // MPP `matmul2d` cooperative-tensor PSO (Apple GPU Family 9+ /
+        // macOS 26+ only — same gate as every other MPP-touching suite
+        // in this tree, e.g. `LagunaMppGatherTests`). Skip (not fail) on
+        // incapable hardware, matching that established pattern —
+        // `decodeMulti` itself also guards on `Ops.mppAutoCapable` at
+        // runtime and falls back to the per-row loop there, but this
+        // test specifically wants to exercise the gather-GEMM path, not
+        // its fallback, so it skips rather than degrading to a
+        // tautological pass.
+        guard Ops.mppAutoCapable else { return }
         try autoreleasepool {
             let device = Device.shared
             let hidden = 128
