@@ -582,7 +582,7 @@ dependencies = [
 [[package]]
 name = "wh-iron"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/iron?branch=dev#432499ae853a140b2f3aa4de41d0ececd31c7fc2"
+source = "git+https://github.com/thewafflehaus/iron?branch=dev#18631fbe68d3556f643ccf7f9ceab8bb4d31b872"
 dependencies = [
  "bytemuck",
  "inventory",
@@ -601,7 +601,7 @@ dependencies = [
 [[package]]
 name = "wh-iron-codegen"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/iron?branch=dev#432499ae853a140b2f3aa4de41d0ececd31c7fc2"
+source = "git+https://github.com/thewafflehaus/iron?branch=dev#18631fbe68d3556f643ccf7f9ceab8bb4d31b872"
 dependencies = [
  "inventory",
  "rustc-hash",
@@ -616,7 +616,7 @@ dependencies = [
 [[package]]
 name = "wh-iron-core"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/iron?branch=dev#432499ae853a140b2f3aa4de41d0ececd31c7fc2"
+source = "git+https://github.com/thewafflehaus/iron?branch=dev#18631fbe68d3556f643ccf7f9ceab8bb4d31b872"
 dependencies = [
  "inventory",
  "rustc-hash",
@@ -630,7 +630,7 @@ dependencies = [
 [[package]]
 name = "wh-iron-macros"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/iron?branch=dev#432499ae853a140b2f3aa4de41d0ececd31c7fc2"
+source = "git+https://github.com/thewafflehaus/iron?branch=dev#18631fbe68d3556f643ccf7f9ceab8bb4d31b872"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -640,7 +640,7 @@ dependencies = [
 [[package]]
 name = "wh-iron-runtime"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/iron?branch=dev#432499ae853a140b2f3aa4de41d0ececd31c7fc2"
+source = "git+https://github.com/thewafflehaus/iron?branch=dev#18631fbe68d3556f643ccf7f9ceab8bb4d31b872"
 dependencies = [
  "objc2",
  "objc2-foundation",
@@ -657,7 +657,7 @@ dependencies = [
 [[package]]
 name = "wh-iron-std"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/iron?branch=dev#432499ae853a140b2f3aa4de41d0ececd31c7fc2"
+source = "git+https://github.com/thewafflehaus/iron?branch=dev#18631fbe68d3556f643ccf7f9ceab8bb4d31b872"
 dependencies = [
  "half",
  "rustc-hash",
