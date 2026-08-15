@@ -1924,6 +1924,89 @@ pub fn gemv_q4_accum(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor,
     gemv_q4_dispatch(dev, "accum", qs, scales, x, Some(acc), Some(scale_buf), m_out, k_in, rpg, None)?;
     Ok(())
 }
+/// M-WAY BATCHED Q4 matvec (F-85 "final lever" attempt: MTP batched
+/// speculative-decode verify). Reads each weight row's DRAM ONCE and
+/// applies it to `cand` independent activation vectors — see
+/// `iron_gemv_q4_multi`'s doc for the full geometry + the bit-exactness
+/// contract vs calling [`gemv_q4`] `cand` times (same accumulation order
+/// per candidate, so argmax is stable — this part is SOLID).
+///
+/// ⚠️ **PERF DEAD END, NOT WIRED into any decode path** (2026-08-15
+/// microbench campaign, `qwen35_spec_gemv_multi_microbench.rs`): correct
+/// and does read the weight only once, but wall time still scales
+/// ~linearly with `cand` (measured ratio-vs-single-M 1.5-1.9x @ cand=2 up
+/// to 3.8-4.6x @ cand=5 across all 4 dominant decode shapes — gate was
+/// `<=1.4x`). THREE iterations tried, all confirming the same root cause:
+///
+/// 1. First cut: `cand` as an ordinary runtime `#[constexpr]`, `range(0,
+///    cand, 1)` looping the `acc`/`qv` `stack_alloc` slots. Non-literal
+///    trip count blocks register promotion -> every accumulator touch is a
+///    real local-memory round-trip. Ratio 1.9x-5.3x. Rejected.
+/// 2. Switched to `#[kernel(variants(...))]` (same mechanism as the GDN
+///    `d128_*` fast kernels) so `M` is a genuine per-variant literal and
+///    the loop fully unrolls/register-promotes. Real but modest
+///    improvement (ratio 1.5x-4.5x) — NOT the gate. `iron_gemv_q4_multi`'s
+///    doc has the full writeup.
+/// 3. Swept `rows_per_tg` (1/2/4/8, more warps/TG for latency-hiding
+///    occupancy — the documented lever for `iron_gemv_q4_coalesced`
+///    itself): ZERO measurable effect (<1% noise) at both cand=2 and
+///    cand=5. Rules out occupancy/latency-hiding as the bottleneck.
+///
+/// Conclusion: the per-candidate dequant+FMA cost (8 loads + 8 FMAs per
+/// word per candidate, unavoidable given the M-way GEMV math) is NOT being
+/// hidden under the weight's DRAM latency the way the M=1 `gemv_q4_coalesced`
+/// kernel's own multi-warp lever implies it should be — GB10's per-SM
+/// instruction-issue throughput for this loop shape appears to be the
+/// actual limiter once `cand>1`, not DRAM bandwidth. This mirrors
+/// `gemm_q4_mpp`'s earlier (much worse, 15-70x) small-M dead end: a
+/// second, independent confirmation that this Q4-decode shape class does
+/// not have slack to amortize multi-column reads into on this hardware.
+/// Kept committed (tested + documented, like `gemm_q4_mpp`) as the
+/// measured stopping point for whoever revisits small-M Q4 batching here.
+///
+/// `x` is `[cand, k_in]` (each candidate's own activation row, row-major —
+/// NOT `[k_in, cand]`); `out` is `[cand, m_out]`. No row-grouping (always
+/// dispatched with `rows_per_group = m_out`, matching every dense-
+/// projection call site `qwen35.rs::Q4Dense::gemv` uses for the M=1 form).
+/// `cand` must be in `2..=5` (the `#[kernel(variants(...))]` family
+/// `iron_gemv_q4_multi_cand2` .. `_cand5` — see that kernel's doc).
+pub fn gemv_q4_multi(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, cand: usize) -> Result<Tensor> {
+    use wh_iron_std::kernels::gemm::gemv_quantized::{
+        iron_gemv_q4_multi_cand2, iron_gemv_q4_multi_cand3, iron_gemv_q4_multi_cand4, iron_gemv_q4_multi_cand5,
+    };
+    let name = match cand {
+        2 => "iron_gemv_q4_multi_cand2",
+        3 => "iron_gemv_q4_multi_cand3",
+        4 => "iron_gemv_q4_multi_cand4",
+        5 => "iron_gemv_q4_multi_cand5",
+        _ => return Err(Error::Msg(format!("gemv_q4_multi: cand={cand} unsupported, only 2..=5 have a compiled variant"))),
+    };
+    let k = cached_ir(name, x.dtype, || {
+        let mut k = match cand {
+            2 => iron_gemv_q4_multi_cand2::kernel_ir_for(x.dtype),
+            3 => iron_gemv_q4_multi_cand3::kernel_ir_for(x.dtype),
+            4 => iron_gemv_q4_multi_cand4::kernel_ir_for(x.dtype),
+            _ => iron_gemv_q4_multi_cand5::kernel_ir_for(x.dtype),
+        };
+        k.mode = wh_iron_core::ir::KernelMode::Reduction;
+        k
+    });
+    let out = Tensor::empty(dev, vec![cand * m_out], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let b = vec![
+        Binding::Buffer(qs.buffer.clone()),
+        Binding::Buffer(scales.buffer.clone()),
+        Binding::Buffer(x.buffer.clone()),
+        Binding::Buffer(out.buffer.clone()),
+        u(k_in as u32),
+        u(m_out as u32),
+        u(m_out as u32), // rows_per_group = m_out: no grouping
+        u(1u32),         // rows_per_tg = 1: swept 1/2/4/8, no measurable effect (see doc)
+    ];
+    let grid = Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] };
+    dev.dispatch(&k, &b, grid)?;
+    Ok(out)
+}
 /// Quantize a row-major `[m,k]` F32 weight to Q4 blocks (block 32, symmetric int4
 /// in [-7,7], f32 scale `amax/7`). Returns `(qs_u32, scales)`: qs `[m·k/32·4]`
 /// (8 nibbles/u32, 4 u32/block), scales `[m·k/32]`. `k` must be a multiple of 32.
