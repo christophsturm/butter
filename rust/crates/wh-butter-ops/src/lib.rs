@@ -10414,11 +10414,28 @@ pub fn marlin_pick_config(
 /// (rayon) -- independent work, and the only way this is tractable at
 /// hundreds-of-millions-of-elements weight sizes.
 pub fn quantize_u4b8_gptq_g32(w: &[f32], m: usize, k: usize) -> (Vec<u32>, Vec<f32>) {
-    const GS: usize = 32;
-    assert_eq!(k % 8, 0, "quantize_u4b8_gptq_g32: k must be a multiple of 8");
-    assert_eq!(k % GS, 0, "quantize_u4b8_gptq_g32: k must be a multiple of the group size (32)");
-    assert_eq!(w.len(), m * k, "quantize_u4b8_gptq_g32: w.len() != m*k");
-    let num_groups = k / GS;
+    quantize_u4b8_gptq(w, m, k, 32)
+}
+
+/// F-85 round-12: group-size-parameterized generalization of
+/// [`quantize_u4b8_gptq_g32`] (round-8, hardwired GS=32) — same symmetric
+/// u4b8 (bias-8) packing convention, same per-(output-column,group) amax/7
+/// scale, only the scale-group width `gs` is now a caller-supplied param.
+/// `gs` must divide `k` and be a multiple of marlin's 16-wide scale-group
+/// granularity (marlin's `group_blocks = gs/16` — see kernel_selector.h;
+/// this runtime dispatches group_blocks in {2,4,8}, i.e. `gs` in
+/// {32,64,128}). Larger `gs` = fewer scale groups = fewer bytes/param
+/// (4 + 16/gs effective bits vs f16 scale) at the cost of coarser
+/// per-group amax fidelity — see the round-12 report's numerics-gate
+/// max_rel table per arm; this function makes no claim about which `gs`
+/// is safe, callers must gate on measured error, not assume monotonicity
+/// is "free".
+pub fn quantize_u4b8_gptq(w: &[f32], m: usize, k: usize, gs: usize) -> (Vec<u32>, Vec<f32>) {
+    assert_eq!(k % 8, 0, "quantize_u4b8_gptq: k must be a multiple of 8");
+    assert_eq!(k % gs, 0, "quantize_u4b8_gptq: k must be a multiple of the group size ({gs})");
+    assert_eq!(gs % 16, 0, "quantize_u4b8_gptq: group size must be a multiple of 16 (marlin group_blocks granularity)");
+    assert_eq!(w.len(), m * k, "quantize_u4b8_gptq: w.len() != m*k");
+    let num_groups = k / gs;
     let kp = k / 8; // packed K-words per column
 
     // Column-major-per-n temporaries (contiguous per n -> rayon-parallelizable),
@@ -10435,12 +10452,12 @@ pub fn quantize_u4b8_gptq_g32(w: &[f32], m: usize, k: usize) -> (Vec<u32>, Vec<f
         .for_each(|(n, (bqw_col, scale_col))| {
             let row = &w[n * k..(n + 1) * k];
             for g in 0..num_groups {
-                let grp = &row[g * GS..(g + 1) * GS];
+                let grp = &row[g * gs..(g + 1) * gs];
                 let vmax = grp.iter().fold(0f32, |acc, &v| acc.max(v.abs()));
                 let scale = (vmax / 7.0).max(1e-8);
                 scale_col[g] = scale;
                 for (j, &v) in grp.iter().enumerate() {
-                    let k_idx = g * GS + j;
+                    let k_idx = g * gs + j;
                     let q = ((v / scale).round() as i32 + 8).clamp(0, 15);
                     let k_packed = k_idx / 8;
                     let k_pos = k_idx % 8;
