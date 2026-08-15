@@ -7293,6 +7293,94 @@ pub fn strided_head_half(dev: &dyn Device, x: &Tensor, n_head: usize, head_dim: 
     Ok(out)
 }
 
+/// F-85 round-11 (fusion round): fused Qwen3.5/3.6 GDN decode step — q/k
+/// RMSNorm (weightless-scaled) + gate/beta + the gated-delta-net
+/// recurrence, in ONE dispatch instead of the 5-dispatch chain
+/// (`rms_norm`x2 + `gdn_gate_beta` + `gather`x2 + `gated_delta_step`) it
+/// replaces. See `iron_gdn_decode_fused`'s doc (wh-iron-std,
+/// `kernels/ssm/gated_delta_qwen35_decode_fused.rs`) for the numerical-
+/// match rationale (same per-lane reduction shape as the ops it inlines,
+/// so this is a redundant-recompute trade against launch/HBM overhead, not
+/// an approximation) and for why `q_raw`/`k_raw` are passed at their
+/// PRE-norm, NATIVE `[Hk,Dk]` shape (no caller-side gather/expand needed
+/// — the CYCLIC GQA mapping this checkpoint requires is baked into the
+/// kernel directly).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_fused(
+    dev: &dyn Device,
+    q_raw: &Tensor,
+    k_raw: &Tensor,
+    v: &Tensor,
+    q_scale: &Tensor,
+    k_scale: &Tensor,
+    a_raw: &Tensor,
+    b_raw: &Tensor,
+    dt_bias: &Tensor,
+    neg_exp_a_log: &Tensor,
+    state: &Tensor,
+    eps: f32,
+    dk: usize,
+    dv: usize,
+    hv: usize,
+    hk: usize,
+) -> Result<Tensor> {
+    let kernel = lookup("iron_gdn_decode_fused", DType::F32)?;
+    let y = Tensor::empty(dev, vec![hv * dv], DType::F32)?;
+    let eps_buf = scalar_buf(dev, eps.to_bits())?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(q_raw.buffer.clone()),
+            Binding::Buffer(k_raw.buffer.clone()),
+            Binding::Buffer(v.buffer.clone()),
+            Binding::Buffer(q_scale.buffer.clone()),
+            Binding::Buffer(k_scale.buffer.clone()),
+            Binding::Buffer(a_raw.buffer.clone()),
+            Binding::Buffer(b_raw.buffer.clone()),
+            Binding::Buffer(dt_bias.buffer.clone()),
+            Binding::Buffer(neg_exp_a_log.buffer.clone()),
+            Binding::Buffer(state.buffer.clone()), // state_in
+            Binding::Buffer(state.buffer.clone()), // state_out (aliased)
+            Binding::Buffer(y.buffer.clone()),
+            Binding::Buffer(eps_buf),
+            u(dk as u32),
+            u(dv as u32),
+            u(hv as u32),
+            u(hk as u32),
+        ],
+        Grid { grid: [dv as u32, hv as u32, 1], block: [32, 1, 1] },
+    )?;
+    Ok(y)
+}
+
+/// F-85 round-11 (fusion round): fused GDN output tail —
+/// `out = rmsNorm(y, ssm_norm_w) * silu(z)` (gate-AFTER-norm,
+/// `Qwen3NextRMSNormGated` convention — see `qwen35.rs`'s module doc) in
+/// ONE dispatch instead of `rms_norm` + `silu` + `mul` (3 dispatches).
+/// `y`/`z`: `[Hv, Dv]` flat, `w`: `[Dv]` (broadcast per head, matches
+/// `ops::rms_norm`'s row-wise weight convention). Same fast-path
+/// constraint as `ops::rms_norm`: `Dv` must be a multiple of 128 (`Dv=128`
+/// for Qwen3.6-27B, exactly the boundary).
+pub fn gdn_tail_gate(dev: &dyn Device, y: &Tensor, z: &Tensor, w: &Tensor, eps: f32, hv: usize, dv: usize) -> Result<Tensor> {
+    let kernel = lookup("iron_gdn_tail_gate", DType::F32)?;
+    let out = Tensor::empty(dev, vec![hv * dv], DType::F32)?;
+    let eps_buf = scalar_buf(dev, eps.to_bits())?;
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(y.buffer.clone()),
+            Binding::Buffer(z.buffer.clone()),
+            Binding::Buffer(w.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            Binding::Buffer(eps_buf),
+            Binding::Scalar((dv as u32).to_le_bytes().to_vec()),
+        ],
+        Grid { grid: [hv as u32, 1, 1], block: [(dv / 4) as u32, 1, 1] },
+    )?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{dsv4_mhc_sinkhorn_split, permute_q4_from_marlin, permute_q4_to_marlin, quantize_q4, quantize_nvfp4, dec_ue4m3, E2M1_LUT};
@@ -10275,6 +10363,12 @@ pub fn marlin_gemm_u4b8_workspace(dev: &dyn Device, prob_n: usize, sms: i32) -> 
 /// [`marlin_gemm_u4b8_workspace`] pair -- **allocate that ONCE per weight
 /// and pass the same buffers every decode step; a fresh alloc per call
 /// measured a full perf-gate wash, see that function's doc.**
+/// F-85 round-10 (lever 1): `thread_k`/`thread_n`/`blocks_per_sm` -- pass
+/// `(-1,-1,-1)` for marlin_mm's own auto-config search (the round-8
+/// behavior), or a triple from [`marlin_pick_config`] to skip it. Every
+/// routed weight class shares one shape across all layers, so callers on
+/// the decode hot path should resolve + cache the triple once at load time
+/// (see `qwen35.rs`'s `MarlinWeight`) rather than pass `-1,-1,-1` here.
 #[allow(clippy::too_many_arguments)]
 pub fn marlin_gemm_u4b8_f16(
     dev: &dyn Device,
@@ -10282,6 +10376,7 @@ pub fn marlin_gemm_u4b8_f16(
     sorted_token_ids: &Tensor, expert_ids: &Tensor, num_tokens_past_padded: &Tensor,
     workspace: &Tensor, c_tmp: &Tensor,
     prob_m: usize, prob_n: usize, prob_k: usize, group_size: usize, sms: i32,
+    thread_k: i32, thread_n: i32, blocks_per_sm: i32,
 ) -> Result<Tensor> {
     let out = Tensor::empty(dev, vec![prob_m, prob_n], DType::F16)?;
     let num_groups = prob_k / group_size;
@@ -10291,8 +10386,18 @@ pub fn marlin_gemm_u4b8_f16(
         sorted_token_ids.buffer.as_ref(), expert_ids.buffer.as_ref(), num_tokens_past_padded.buffer.as_ref(),
         workspace.buffer.as_ref(),
         prob_m, prob_n, prob_k, num_groups, group_size, sms, true,
+        thread_k, thread_n, blocks_per_sm,
     )?;
     Ok(out)
+}
+
+/// F-85 round-10 (lever 1): resolves `marlin_mm`'s auto-config once for a
+/// fixed decode shape -- see [`marlin_gemm_u4b8_f16`]'s doc comment and
+/// `wh-iron-runtime`'s `marlin_pick_config`.
+pub fn marlin_pick_config(
+    dev: &dyn Device, prob_m: usize, prob_n: usize, prob_k: usize, group_size: usize, sms: i32,
+) -> Result<(i32, i32, i32)> {
+    dev.marlin_pick_config(prob_m, prob_n, prob_k, group_size, sms)
 }
 
 /// F-85 round-8: host-side symmetric u4 (bias-8, "u4b8") GPTQ-style

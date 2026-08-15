@@ -331,8 +331,24 @@ pub trait Device: Send + Sync {
         _workspace: &dyn DeviceBuffer,
         _prob_m: usize, _prob_n: usize, _prob_k: usize, _num_groups: usize, _group_size: usize,
         _sms: i32, _use_fp32_reduce: bool,
+        _thread_k: i32, _thread_n: i32, _blocks_per_sm: i32,
     ) -> Result<()> {
         Err(Error::Msg("marlin_gemm_u4b8_f16 unsupported on this backend".into()))
+    }
+
+    /// F-85 round-10 (lever 1): host-side-only resolution of
+    /// `marlin_mm`'s auto thread-config search for a fixed decode-M=1
+    /// shape, so [`marlin_gemm_u4b8_f16`] can be called with an explicit
+    /// `(thread_k, thread_n, blocks_per_sm)` instead of `(-1,-1,-1)` and
+    /// skip the per-call `cudaFuncGetAttributes` probe loop. Callers should
+    /// resolve this ONCE per weight class at load time (every layer of a
+    /// class shares the same `prob_n`/`prob_k`) and cache the result.
+    /// Returns `(-1,-1,-1)` semantics preserved by backends that don't
+    /// implement this (falls back to marlin_mm's own auto path).
+    fn marlin_pick_config(
+        &self, _prob_m: usize, _prob_n: usize, _prob_k: usize, _group_size: usize, _sms: i32,
+    ) -> Result<(i32, i32, i32)> {
+        Err(Error::Msg("marlin_pick_config unsupported on this backend".into()))
     }
 
     /// CUTLASS grouped block-scaled NVFP4 MoE GEMM: `out[t,n] = Σ_k a[t,k]·

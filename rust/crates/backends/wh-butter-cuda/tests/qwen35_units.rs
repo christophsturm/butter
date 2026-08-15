@@ -143,6 +143,155 @@ fn qwen35_gdn_decode_composition_matches_host_oracle() {
     eprintln!("qwen35 GDN decode composition matches host oracle across {n_tokens} sequential tokens: OK");
 }
 
+/// F-85 round-11 (fusion round): same host-oracle setup as
+/// `qwen35_gdn_decode_composition_matches_host_oracle` above, but exercises
+/// the FUSED production path (`ops::gdn_decode_fused` + `ops::gdn_tail_gate`
+/// — what `qwen35::gdn_layer_full` actually calls after round-11) instead of
+/// the old unfused chain. Checks `y` across 3 sequential decode steps AND
+/// downloads the final recurrent state, so a GQA-cyclic-mapping regression,
+/// a redundant-recompute bug, or a state-carry bug in either fused kernel
+/// would show up here.
+#[test]
+fn qwen35_gdn_decode_fused_matches_host_oracle() {
+    let Some(dev) = CudaDevice::create().expect("cuda") else { eprintln!("no CUDA, skip"); return; };
+    let d = dev.as_ref();
+    use wh_butter_core::{DType, Tensor};
+
+    const HV: usize = 48;
+    const HK: usize = 16;
+    const DK: usize = 128;
+    const DV: usize = 128;
+    const EPS: f32 = 1e-6;
+    let inv_scale = 1.0f32 / (DK as f32).sqrt();
+
+    let q_scale = up(d, &vec![inv_scale * inv_scale; DK]);
+    let k_scale = up(d, &vec![inv_scale; DK]);
+
+    let dt_bias: Vec<f32> = (0..HV).map(|i| -0.3 + (i as f32) * 0.01).collect();
+    let a_log: Vec<f32> = (0..HV).map(|i| -2.0 + (i as f32) * 0.02).collect();
+    let neg_exp_a_log: Vec<f32> = a_log.iter().map(|&a| -a.exp()).collect();
+    let dt_bias_t = up(d, &dt_bias);
+    let neg_exp_a_log_t = up(d, &neg_exp_a_log);
+
+    let state_len = HV * DV * DK;
+    let state = Tensor::new(d.alloc_zeroed(state_len * 4).unwrap(), vec![state_len], DType::F32);
+    let mut host_state = vec![0.0f32; state_len];
+
+    // ssm_norm weight + z gate, needed only by the fused-tail check.
+    let ssm_norm_w: Vec<f32> = (0..DV).map(|i| 0.9 + (i as f32) * 0.0005).collect();
+    let ssm_norm_w_t = up(d, &ssm_norm_w);
+
+    let n_tokens = 3;
+    for t in 0..n_tokens {
+        let seed = (t as f32) * 97.0;
+        let q_raw: Vec<f32> = (0..HK * DK).map(|i| ((i as f32 + seed) * 0.0173).sin() * 0.5).collect();
+        let k_raw: Vec<f32> = (0..HK * DK).map(|i| ((i as f32 + seed) * 0.0211).cos() * 0.5).collect();
+        let v: Vec<f32> = (0..HV * DV).map(|i| ((i as f32 + seed) * 0.029).sin() * 0.3).collect();
+        let a_raw: Vec<f32> = (0..HV).map(|i| ((i as f32 + seed) * 0.037).sin() * 0.4).collect();
+        let b_raw: Vec<f32> = (0..HV).map(|i| ((i as f32 + seed) * 0.041).cos() * 0.4).collect();
+        let z: Vec<f32> = (0..HV * DV).map(|i| ((i as f32 + seed) * 0.013).sin() * 0.7).collect();
+
+        // ── GPU path: exactly what qwen35::gdn_layer_full calls post round-11 ──
+        let q_raw_t = up(d, &q_raw).reshaped(vec![HK, DK]);
+        let k_raw_t = up(d, &k_raw).reshaped(vec![HK, DK]);
+        let v_t = up(d, &v).reshaped(vec![HV, DV]);
+        let a_raw_t = up(d, &a_raw);
+        let b_raw_t = up(d, &b_raw);
+        let z_t = up(d, &z);
+
+        let y = wh_butter_ops::gdn_decode_fused(
+            d, &q_raw_t, &k_raw_t, &v_t, &q_scale, &k_scale, &a_raw_t, &b_raw_t, &dt_bias_t, &neg_exp_a_log_t,
+            &state, EPS, DK, DV, HV, HK,
+        ).unwrap();
+        let y_gpu = dl(d, &y, HV * DV);
+
+        let gated = wh_butter_ops::gdn_tail_gate(d, &y, &z_t, &ssm_norm_w_t, EPS, HV, DV).unwrap();
+        let gated_gpu = dl(d, &gated, HV * DV);
+
+        // ── Host oracle: independent re-derivation (same formulas as the
+        // pre-fusion composition test above), extended with the tail
+        // rmsNorm(ssm_norm)*silu(z) gate.
+        let mut q_normed = vec![0.0f32; HK * DK];
+        let mut k_normed = vec![0.0f32; HK * DK];
+        for h in 0..HK {
+            let qrow = &q_raw[h * DK..(h + 1) * DK];
+            let krow = &k_raw[h * DK..(h + 1) * DK];
+            let qms = qrow.iter().map(|x| x * x).sum::<f32>() / DK as f32;
+            let kms = krow.iter().map(|x| x * x).sum::<f32>() / DK as f32;
+            let qr = 1.0 / (qms + EPS).sqrt();
+            let kr = 1.0 / (kms + EPS).sqrt();
+            for d_ in 0..DK {
+                q_normed[h * DK + d_] = qrow[d_] * qr * (inv_scale * inv_scale);
+                k_normed[h * DK + d_] = krow[d_] * kr * inv_scale;
+            }
+        }
+        let mut g_h = vec![0.0f32; HV];
+        let mut beta_h = vec![0.0f32; HV];
+        for hv in 0..HV {
+            let dt = ((a_raw[hv] + dt_bias[hv]).exp() + 1.0).ln();
+            g_h[hv] = (neg_exp_a_log[hv] * dt).exp();
+            beta_h[hv] = 1.0 / (1.0 + (-b_raw[hv]).exp());
+        }
+        let mut y_h = vec![0.0f32; HV * DV];
+        for hv in 0..HV {
+            let hk = hv % HK; // CYCLIC — matches the checkpoint's validated mapping.
+            let gv = g_h[hv];
+            let bv = beta_h[hv];
+            for dv in 0..DV {
+                let sbase = hv * DV * DK + dv * DK;
+                let mut kv_mem = 0.0f32;
+                let mut decayed = vec![0.0f32; DK];
+                for dk_ in 0..DK {
+                    let sd = host_state[sbase + dk_] * gv;
+                    decayed[dk_] = sd;
+                    kv_mem += sd * k_normed[hk * DK + dk_];
+                }
+                let delta = (v[hv * DV + dv] - kv_mem) * bv;
+                let mut out = 0.0f32;
+                for dk_ in 0..DK {
+                    let sn = decayed[dk_] + k_normed[hk * DK + dk_] * delta;
+                    host_state[sbase + dk_] = sn;
+                    out += sn * q_normed[hk * DK + dk_];
+                }
+                y_h[hv * DV + dv] = out;
+            }
+        }
+        let mut gated_h = vec![0.0f32; HV * DV];
+        for hv in 0..HV {
+            let row = &y_h[hv * DV..(hv + 1) * DV];
+            let ms = row.iter().map(|x| x * x).sum::<f32>() / DV as f32;
+            let r = 1.0 / (ms + EPS).sqrt();
+            for dv in 0..DV {
+                let silu_z = z[hv * DV + dv] / (1.0 + (-z[hv * DV + dv]).exp());
+                gated_h[hv * DV + dv] = row[dv] * r * ssm_norm_w[dv] * silu_z;
+            }
+        }
+
+        let mut bad = 0;
+        let mut max_abs_diff = 0.0f32;
+        for i in 0..HV * DV {
+            let diff = (y_gpu[i] - y_h[i]).abs();
+            max_abs_diff = max_abs_diff.max(diff);
+            if diff > 1e-3 * y_h[i].abs().max(1.0) {
+                if bad < 8 { eprintln!("t={t} y MISMATCH i={i}: gpu={} host={}", y_gpu[i], y_h[i]); }
+                bad += 1;
+            }
+        }
+        let mut bad_gated = 0;
+        for i in 0..HV * DV {
+            let diff = (gated_gpu[i] - gated_h[i]).abs();
+            if diff > 1e-3 * gated_h[i].abs().max(1.0) {
+                if bad_gated < 8 { eprintln!("t={t} gated MISMATCH i={i}: gpu={} host={}", gated_gpu[i], gated_h[i]); }
+                bad_gated += 1;
+            }
+        }
+        eprintln!("t={t}: y bad={bad}/{} max_abs_diff={max_abs_diff}, gated bad={bad_gated}/{}", HV * DV, HV * DV);
+        assert_eq!(bad, 0, "fused GDN decode y mismatch at token {t}");
+        assert_eq!(bad_gated, 0, "fused GDN tail-gate mismatch at token {t}");
+    }
+    eprintln!("qwen35 FUSED GDN decode (gdn_decode_fused + gdn_tail_gate) matches host oracle across {n_tokens} sequential tokens: OK");
+}
+
 /// Suspect 3: `strided_head_half` de-interleave on a ramp pattern —
 /// values 0..N so any transposition/stride bug shows as an out-of-place
 /// value rather than a coincidentally-correct one.

@@ -203,6 +203,14 @@ impl Qwen35Config {
 struct MarlinWeight {
     b_repacked: Tensor, // u32 [k/16, m*2] -- ops::marlin_repack output
     b_scales: Tensor,   // f16 [k/32, m], permuted -- ops::marlin_permute_scales output
+    // F-85 round-10 (lever 1): `marlin_mm`'s auto-config search
+    // (`thread_k=thread_n=blocks_per_sm=-1`) recomputes the same result on
+    // EVERY call via a `cudaFuncGetAttributes` probe loop -- deterministic
+    // for a fixed (m,k) shape, so resolved ONCE here (`build_marlin`, via
+    // `ops::marlin_pick_config`) and reused for every decode step's call.
+    thread_k: i32,
+    thread_n: i32,
+    blocks_per_sm: i32,
 }
 
 struct Q4Dense {
@@ -249,6 +257,7 @@ impl Q4Dense {
                 &routing.0, &routing.1, &routing.2,
                 workspace, c_tmp,
                 1, self.m, self.k, MARLIN_GROUP_SIZE, GB10_SMS,
+                mw.thread_k, mw.thread_n, mw.blocks_per_sm,
             )?;
             // marlin's GEMM returns [prob_m,prob_n] = [1,m]; gemv_q4's
             // convention (and every downstream call site) is flat [m].
@@ -323,7 +332,13 @@ fn build_marlin(dev: &dyn Device, flat: &[f32], m: usize, k: usize) -> Result<Ma
     let b_repacked = ops::marlin_repack(dev, &bqw_t, k, m, GB10_SMS, MARLIN_MAX_SHARED_MEM)?;
     let num_groups = k / MARLIN_GROUP_SIZE;
     let b_scales = ops::marlin_permute_scales(dev, &scales_raw, num_groups, m)?;
-    Ok(MarlinWeight { b_repacked, b_scales })
+    // F-85 round-10 (lever 1): resolve the auto-config ONCE per weight
+    // shape at load time instead of paying marlin_mm's per-call
+    // cudaFuncGetAttributes probe loop on every one of the ~320 decode
+    // calls/step that share this (m,k).
+    let (thread_k, thread_n, blocks_per_sm) =
+        ops::marlin_pick_config(dev, 1, m, k, MARLIN_GROUP_SIZE, GB10_SMS)?;
+    Ok(MarlinWeight { b_repacked, b_scales, thread_k, thread_n, blocks_per_sm })
 }
 
 /// GGUF dims are fastest-first: a 2-D `[out, in]` weight is stored with
@@ -660,6 +675,11 @@ pub struct Qwen35Model {
     /// `ops::gather` with this constant index buffer (`idx[hv] = hv % Hk`),
     /// then call `gated_delta_step` with `hk=Hv` so its internal grouping
     /// becomes a no-op identity map.
+    // F-85 round-11: no longer read on the decode path — the CYCLIC GQA
+    // mapping it encoded is now baked directly into iron_gdn_decode_fused
+    // (see ops::gdn_decode_fused doc). Kept (not deleted) since a future
+    // chunked-prefill GDN kernel may want the same precomputed index.
+    #[allow(dead_code)]
     gdn_gqa_cyclic_idx: Tensor, // u32 [gdn_num_v_heads], idx[hv] = hv % gdn_num_k_heads
 }
 
@@ -724,10 +744,16 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
         let mixer = if cfg.is_full_layer(i) {
             Mixer::Full(FullAttnWeights {
                 attn_norm: load_f32_vec(dev, g, &format!("{p}.attn_norm.weight"))?,
+                // F-85 round-10 (lever 2): wk/wv/wo isolated-microbench
+                // marlin-vs-gemv_q4 at these exact shapes (m=1024,k=5120
+                // and m=5120,k=6144) showed marlin 2.7x-4.4x faster
+                // (10.3-16.4us vs 16.4-71.8us, see
+                // qwen35_marlin_smallproj_microbench.rs) -- routed like the
+                // round-7/8 big shapes instead of plain gemv_q4.
                 wq: load_q4dense_routed(dev, g, &format!("{p}.attn_q.weight"))?,
-                wk: load_q4dense(dev, g, &format!("{p}.attn_k.weight"))?,
-                wv: load_q4dense(dev, g, &format!("{p}.attn_v.weight"))?,
-                wo: load_q4dense(dev, g, &format!("{p}.attn_output.weight"))?,
+                wk: load_q4dense_routed(dev, g, &format!("{p}.attn_k.weight"))?,
+                wv: load_q4dense_routed(dev, g, &format!("{p}.attn_v.weight"))?,
+                wo: load_q4dense_routed(dev, g, &format!("{p}.attn_output.weight"))?,
                 q_norm: load_f32_vec(dev, g, &format!("{p}.attn_q_norm.weight"))?,
                 k_norm: load_f32_vec(dev, g, &format!("{p}.attn_k_norm.weight"))?,
             })
@@ -749,7 +775,10 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
             Mixer::Gdn(GdnWeights {
                 attn_norm: load_f32_vec(dev, g, &format!("{p}.attn_norm.weight"))?,
                 wqkv: load_q4dense_routed(dev, g, &format!("{p}.attn_qkv.weight"))?,
-                wz: load_q4dense(dev, g, &format!("{p}.attn_gate.weight"))?,
+                // F-85 round-10 (lever 2): see the wk/wv/wo comment above --
+                // gdn_wz is the same (m=6144,k=5120) shape microbenched
+                // there (marlin 16.4us vs gemv 71.7us).
+                wz: load_q4dense_routed(dev, g, &format!("{p}.attn_gate.weight"))?,
                 w_alpha: load_f32_dense(dev, g, &format!("{p}.ssm_alpha.weight"))?,
                 w_beta: load_f32_dense(dev, g, &format!("{p}.ssm_beta.weight"))?,
                 dt_bias: load_f32_vec(dev, g, &format!("{p}.ssm_dt.bias"))?,
@@ -764,7 +793,9 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
                     DType::F32,
                 ),
                 ssm_norm_w: load_f32_vec(dev, g, &format!("{p}.ssm_norm.weight"))?,
-                wo: load_q4dense(dev, g, &format!("{p}.ssm_out.weight"))?,
+                // F-85 round-10 (lever 2): gdn_wo is the wo(5120,6144)
+                // shape microbenched above (marlin 16.4us vs gemv 71.8us).
+                wo: load_q4dense_routed(dev, g, &format!("{p}.ssm_out.weight"))?,
             })
         };
         let ffn = DenseFfn {
@@ -973,6 +1004,219 @@ pub fn decode_step_ex(
     Ok((logits, xn))
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Round-9 step-time census (temporary diagnostic -- see
+// wh-butter-cuda/tests/qwen35_census.rs for the harness). Not on any hot
+// path: `decode_step`/`decode_step_ex`/`speculative_round` are untouched;
+// this is a parallel instrumented copy of the same forward, opted into
+// explicitly by calling `decode_step_census` instead.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Millisecond accumulators for one phase-bucketed decode step. Buckets:
+///   - `routed_marlin_ms`: the 5 F-85 round-7/8 marlin-routed weight
+///     classes' GEMV/GEMM (ffn_gate/up/down, full-attn wq, gdn wqkv).
+///   - `small_proj_ms`: every OTHER dense projection, still plain
+///     `gemv_q4` (full-attn wk/wv/wo, gdn wz/wo).
+///   - `gdn_chain_ms`: the GDN-specific nonlinear chain across all 48 GDN
+///     layers -- conv1d, q/k GDN-RMSNorm, alpha/beta gate projections,
+///     gate/beta activation, the `gated_delta_step` recurrence, ssm_norm,
+///     silu, mul.
+///   - `attention_ms`: the full-attn-specific chain across all 16 full-
+///     attn layers -- q/k RMSNorm, RoPE, KV-cache append, `sdpa_decode`,
+///     sigmoid output gate.
+///   - `elementwise_ms`: the glue between the buckets above -- per-layer
+///     `attn_norm`/`ffn_norm` RMSNorm, `swiglu`, residual adds.
+///   - `lm_head_ms`: final `output_norm` + lm_head GEMV.
+///   - `embed_ms`: the token-embedding gather.
+/// Host-side sync/download/argmax is deliberately NOT tracked here -- the
+/// harness measures that itself around the call (matching how the plain
+/// decode loop already spends it, see `qwen35_bench_decode.rs`), since it
+/// happens strictly after this function returns.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CensusBuckets {
+    pub embed_ms: f64,
+    pub routed_marlin_ms: f64,
+    pub small_proj_ms: f64,
+    pub gdn_chain_ms: f64,
+    pub attention_ms: f64,
+    pub elementwise_ms: f64,
+    pub lm_head_ms: f64,
+}
+
+impl CensusBuckets {
+    pub fn total_ms(&self) -> f64 {
+        self.embed_ms
+            + self.routed_marlin_ms
+            + self.small_proj_ms
+            + self.gdn_chain_ms
+            + self.attention_ms
+            + self.elementwise_ms
+            + self.lm_head_ms
+    }
+}
+
+/// Sync the device, add the elapsed time since `*t0` to `*bucket`, and
+/// reset `*t0` to now. Every call is a `dev.synchronize()` round trip
+/// (dozens per layer, ~700/step) so the ABSOLUTE per-bucket numbers carry
+/// a real instrumentation tax -- the harness reports the census total
+/// against an uninstrumented reference measurement so the tax is visible
+/// rather than silently baked in. Bucket PROPORTIONS (relative to the
+/// instrumented total) are the load-bearing number, not the absolute ms.
+fn mark(dev: &dyn Device, t0: &mut std::time::Instant, bucket: &mut f64) -> Result<()> {
+    dev.synchronize()?;
+    let now = std::time::Instant::now();
+    *bucket += now.duration_since(*t0).as_secs_f64() * 1000.0;
+    *t0 = now;
+    Ok(())
+}
+
+/// Phase-bucketed twin of [`decode_step_ex`] -- same forward, same
+/// call/dependency order, with `mark` calls dropped in at bucket
+/// boundaries. See `CensusBuckets`' doc for what's in each bucket.
+pub fn decode_step_census(
+    dev: &dyn Device,
+    model: &Qwen35Model,
+    cache: &mut Qwen35Cache,
+    token_id: u32,
+    pos: u32,
+    b: &mut CensusBuckets,
+) -> Result<(Tensor, Tensor)> {
+    let cfg = &model.cfg;
+    dev.synchronize()?; // drain anything in flight from the caller before starting the clock
+    let mut t0 = std::time::Instant::now();
+
+    let tok_buf = Tensor::new(dev.upload(&token_id.to_le_bytes())?, vec![1], DType::U32);
+    let mut x = ops::gather(dev, &model.tok_embd, &tok_buf)?.reshaped(vec![cfg.hidden]);
+    mark(dev, &mut t0, &mut b.embed_ms)?;
+
+    for (i, layer) in model.layers.iter().enumerate() {
+        x = match (&layer.mixer, &mut cache.slots[i]) {
+            (Mixer::Full(w), LayerSlot::Full(slot)) => {
+                full_attn_layer_census(dev, cfg, w, slot, &x, pos, &mut t0, b)?
+            }
+            (Mixer::Gdn(w), LayerSlot::Gdn(slot)) => {
+                gdn_layer_full_census(dev, cfg, model, w, slot, &x, pos, &mut t0, b)?
+            }
+            _ => return Err(Error::Msg(format!("qwen35: layer {i} mixer/slot kind mismatch"))),
+        };
+        let h2 = ops::rms_norm(dev, &x, &layer.ffn.ffn_norm, cfg.eps)?;
+        mark(dev, &mut t0, &mut b.elementwise_ms)?;
+        let gate = layer.ffn.gate.gemv(dev, &h2)?;
+        let up = layer.ffn.up.gemv(dev, &h2)?;
+        mark(dev, &mut t0, &mut b.routed_marlin_ms)?;
+        let act = ops::swiglu(dev, &gate, &up)?;
+        mark(dev, &mut t0, &mut b.elementwise_ms)?;
+        let ffn_out = layer.ffn.down.gemv(dev, &act)?;
+        mark(dev, &mut t0, &mut b.routed_marlin_ms)?;
+        x = ops::add(dev, &x, &ffn_out)?;
+        mark(dev, &mut t0, &mut b.elementwise_ms)?;
+    }
+
+    let xn = ops::rms_norm(dev, &x, &model.out_norm, cfg.eps)?;
+    let logits = model.lm_head.gemv(dev, &xn)?;
+    mark(dev, &mut t0, &mut b.lm_head_ms)?;
+    Ok((logits, xn))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn full_attn_layer_census(
+    dev: &dyn Device,
+    cfg: &Qwen35Config,
+    w: &FullAttnWeights,
+    slot: &mut FullAttnSlot,
+    x: &Tensor,
+    pos: u32,
+    t0: &mut std::time::Instant,
+    b: &mut CensusBuckets,
+) -> Result<Tensor> {
+    let h = ops::rms_norm(dev, x, &w.attn_norm, cfg.eps)?;
+    mark(dev, t0, &mut b.elementwise_ms)?;
+
+    let qg = w.wq.gemv(dev, &h)?;
+    mark(dev, t0, &mut b.routed_marlin_ms)?;
+    let k = w.wk.gemv(dev, &h)?;
+    let v = w.wv.gemv(dev, &h)?;
+    mark(dev, t0, &mut b.small_proj_ms)?;
+
+    let q = ops::strided_head_half(dev, &qg, cfg.n_head, cfg.head_dim, 0)?;
+    let gate = ops::strided_head_half(dev, &qg, cfg.n_head, cfg.head_dim, 1)?;
+    let q = q.reshaped(vec![cfg.n_head, cfg.head_dim]);
+    let k = k.reshaped(vec![cfg.n_kv_heads, cfg.head_dim]);
+    let v = v.reshaped(vec![cfg.n_kv_heads, cfg.head_dim]);
+    let q = ops::rms_norm(dev, &q, &w.q_norm, cfg.eps)?;
+    let k = ops::rms_norm(dev, &k, &w.k_norm, cfg.eps)?;
+    let q = ops::rope_yarn_partial(dev, &q, pos, cfg.rope_n_rot, cfg.rope_theta, 1.0, 0.0, 1.0, 32.0, 1.0, 262144)?;
+    let k = ops::rope_yarn_partial(dev, &k, pos, cfg.rope_n_rot, cfg.rope_theta, 1.0, 0.0, 1.0, 32.0, 1.0, 262144)?;
+    let posbuf = Tensor::new(dev.upload(&pos.to_le_bytes())?, vec![1], DType::U32);
+    ops::kv_append(dev, &k, &slot.k, &posbuf, cfg.head_dim, slot.cap, cfg.n_kv_heads * cfg.head_dim)?;
+    ops::kv_append(dev, &v, &slot.v, &posbuf, cfg.head_dim, slot.cap, cfg.n_kv_heads * cfg.head_dim)?;
+    let heads_per_group = (cfg.n_head / cfg.n_kv_heads) as u32;
+    let n_kv_used = pos + 1;
+    let attn = ops::sdpa_decode(
+        dev, &q, &slot.k, &slot.v, cfg.head_dim, n_kv_used, slot.cap as u32, heads_per_group, cfg.attn_scale(),
+    )?;
+    let attn_flat = attn.reshaped(vec![cfg.n_head * cfg.head_dim]);
+    let gated = ops::sigmoid_mul(dev, &attn_flat, &gate)?;
+    mark(dev, t0, &mut b.attention_ms)?;
+
+    let o = w.wo.gemv(dev, &gated)?;
+    mark(dev, t0, &mut b.small_proj_ms)?;
+    let out = ops::add(dev, x, &o)?;
+    mark(dev, t0, &mut b.elementwise_ms)?;
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gdn_layer_full_census(
+    dev: &dyn Device,
+    cfg: &Qwen35Config,
+    model: &Qwen35Model,
+    w: &GdnWeights,
+    slot: &mut GdnSlot,
+    x: &Tensor,
+    pos: u32,
+    t0: &mut std::time::Instant,
+    b: &mut CensusBuckets,
+) -> Result<Tensor> {
+    let h = ops::rms_norm(dev, x, &w.attn_norm, cfg.eps)?;
+    mark(dev, t0, &mut b.elementwise_ms)?;
+
+    let qkv = w.wqkv.gemv(dev, &h)?;
+    mark(dev, t0, &mut b.routed_marlin_ms)?;
+    let z = w.wz.gemv(dev, &h)?;
+    mark(dev, t0, &mut b.small_proj_ms)?;
+
+    let (conv_out, new_conv_state) = ops::conv1d_causal_silu_many(
+        dev, &qkv, &w.conv_w, &model.gdn_conv_zero_bias, &slot.conv_state, 1, cfg.gdn_conv_dim(),
+    )?;
+    slot.conv_state = new_conv_state;
+    let key_dim = cfg.gdn_key_dim();
+    let value_dim = cfg.gdn_value_dim();
+    let q_raw = ops::slice(dev, &conv_out, 0, key_dim)?.reshaped(vec![cfg.gdn_num_k_heads, cfg.gdn_key_head_dim]);
+    let k_raw = ops::slice(dev, &conv_out, key_dim, key_dim)?.reshaped(vec![cfg.gdn_num_k_heads, cfg.gdn_key_head_dim]);
+    let v = ops::slice(dev, &conv_out, 2 * key_dim, value_dim)?.reshaped(vec![cfg.gdn_num_v_heads, cfg.gdn_value_head_dim]);
+    let a_raw = ops::gemv(dev, &w.w_alpha, &h)?;
+    let b_raw = ops::gemv(dev, &w.w_beta, &h)?;
+    // F-85 round-11 (fusion round): fused q/k-RMSNorm + gate/beta +
+    // gated-delta-net recurrence (`ops::gdn_decode_fused`) + fused
+    // rmsNorm(ssm_norm)+silu(z)+mul tail (`ops::gdn_tail_gate`) — see
+    // their docs in wh-butter-ops. Both stay inside this function's single
+    // `gdn_chain_ms` bucket, same as the unfused chain they replace.
+    let y = ops::gdn_decode_fused(
+        dev, &q_raw, &k_raw, &v, &model.gdn_q_scale, &model.gdn_k_scale, &a_raw, &b_raw, &w.dt_bias,
+        &w.neg_exp_a_log, &slot.state, cfg.eps,
+        cfg.gdn_key_head_dim, cfg.gdn_value_head_dim, cfg.gdn_num_v_heads, cfg.gdn_num_k_heads,
+    )?;
+    let gated = ops::gdn_tail_gate(dev, &y, &z, &w.ssm_norm_w, cfg.eps, cfg.gdn_num_v_heads, cfg.gdn_value_head_dim)?;
+    mark(dev, t0, &mut b.gdn_chain_ms)?;
+
+    let o = w.wo.gemv(dev, &gated)?;
+    mark(dev, t0, &mut b.small_proj_ms)?;
+    let out = ops::add(dev, x, &o)?;
+    mark(dev, t0, &mut b.elementwise_ms)?;
+    Ok(out)
+}
+
 /// One GDN (linear-attention) layer's forward. Takes `model` (rather than
 /// bundling the shared constant buffers — `gdn_q_scale`/`gdn_k_scale`/
 /// `gdn_conv_zero_bias` — onto the per-layer `GdnWeights`, since those
@@ -1010,52 +1254,56 @@ fn gdn_layer_full(
     let v = ops::slice(dev, &conv_out, 2 * key_dim, value_dim)?.reshaped(vec![cfg.gdn_num_v_heads, cfg.gdn_value_head_dim]);
     if dbg { dbg_sum(dev, "v_conv_predelta-0", pos, &v); }
 
-    let q = ops::rms_norm(dev, &q_raw, &model.gdn_q_scale, cfg.eps)?;
-    let k = ops::rms_norm(dev, &k_raw, &model.gdn_k_scale, cfg.eps)?;
-    if dbg { dbg_sum(dev, "q_conv_predelta-0", pos, &q); }
-    if dbg { dbg_sum(dev, "k_conv_predelta-0", pos, &k); }
-
     let a_raw = ops::gemv(dev, &w.w_alpha, &h)?;
     let b_raw = ops::gemv(dev, &w.w_beta, &h)?;
-    let (g, beta) = ops::gdn_gate_beta(dev, &a_raw, &b_raw, &w.dt_bias, &w.neg_exp_a_log, cfg.gdn_num_v_heads)?;
+
+    // F-85 round-11 (fusion round, DEBUG-ONLY branch): the fused decode
+    // kernel below doesn't materialize q/k-normed or gate/beta as separate
+    // tensors, so `QWEN35_DEBUG=1`'s per-node oracle dump (layer 0 only)
+    // redundantly recomputes them via the OLD unfused ops here. Zero cost
+    // when `dbg` is false — this never runs on the hot decode path.
     if dbg {
+        let q = ops::rms_norm(dev, &q_raw, &model.gdn_q_scale, cfg.eps)?;
+        let k = ops::rms_norm(dev, &k_raw, &model.gdn_k_scale, cfg.eps)?;
+        dbg_sum(dev, "q_conv_predelta-0", pos, &q);
+        dbg_sum(dev, "k_conv_predelta-0", pos, &k);
+        let (g, beta) = ops::gdn_gate_beta(dev, &a_raw, &b_raw, &w.dt_bias, &w.neg_exp_a_log, cfg.gdn_num_v_heads)?;
         // Oracle's `gate-0` is LOG-space (ln(g) = neg_exp_a_log * softplus(...));
         // our `g` is already exp'd, so take ln() host-side for an apples-to-apples sum.
         let n = g.elem_count();
-        let mut b = vec![0u8; n * 4];
+        let mut buf = vec![0u8; n * 4];
         dev.synchronize().ok();
-        dev.download(g.buffer.as_ref(), &mut b).ok();
-        let gv: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        dev.download(g.buffer.as_ref(), &mut buf).ok();
+        let gv: Vec<f32> = buf.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
         let ln_sum: f64 = gv.iter().map(|&x| (x as f64).ln()).sum();
         eprintln!("QWEN35_DBG pos={pos} tag=gate-0(ln_g) n={n} sum={ln_sum:.6}");
         dbg_sum(dev, "beta_sigmoid-0", pos, &beta);
     }
 
-    // `iron_gated_delta_step`'s own internal GQA decomposition is
-    // `hk_idx = hv_idx / (Hv/Hk)` (contiguous blocks) — but the reference
-    // this checkpoint was actually validated against (llama.cpp's CUDA
-    // `gated_delta_net.cu`, `iq1 = fastmodulo(h_idx, neqk1)`, i.e.
-    // `hv_idx % Hk`) uses the CYCLIC/tiled mapping instead (verified by
-    // oracle checksum diff: `attn_output` matched to 0.01% only after
-    // switching to cyclic — the block mapping was ~20% off). Pre-expand
-    // q/k from `[Hk,Dk]` to `[Hv,Dk]` on-device via `ops::gather` with the
-    // constant `gdn_gqa_cyclic_idx` (`idx[hv] = hv % Hk`), then call the
-    // kernel with `hk=Hv` so its internal grouping becomes a no-op
-    // identity map — sidesteps patching the pinned iron kernel entirely.
-    let q = ops::gather(dev, &q, &model.gdn_gqa_cyclic_idx)?;
-    let k = ops::gather(dev, &k, &model.gdn_gqa_cyclic_idx)?;
-
-    let y = ops::gated_delta_step(
-        dev, &q, &k, &v, &g, &beta, &slot.state,
-        cfg.gdn_key_head_dim, cfg.gdn_value_head_dim, cfg.gdn_num_v_heads, cfg.gdn_num_v_heads,
+    // F-85 round-11: fused q/k-RMSNorm + gate/beta + gated-delta-net
+    // recurrence, ONE dispatch (`ops::gdn_decode_fused`) instead of the
+    // 5-dispatch chain (2x rms_norm + gdn_gate_beta + 2x gather) above it
+    // — see that op's doc for the numerical-match rationale. The CYCLIC
+    // GQA mapping this checkpoint requires (`hv_idx % Hk`, verified by
+    // oracle checksum diff against the kernel-default contiguous-block
+    // mapping — `attn_output` matched to 0.01% only after switching to
+    // cyclic, the block mapping was ~20% off) is baked into the fused
+    // kernel directly, so `q_raw`/`k_raw` are passed at their native
+    // `[Hk,Dk]` shape with no pre-expand gather needed.
+    let y = ops::gdn_decode_fused(
+        dev, &q_raw, &k_raw, &v, &model.gdn_q_scale, &model.gdn_k_scale, &a_raw, &b_raw, &w.dt_bias,
+        &w.neg_exp_a_log, &slot.state, cfg.eps,
+        cfg.gdn_key_head_dim, cfg.gdn_value_head_dim, cfg.gdn_num_v_heads, cfg.gdn_num_k_heads,
     )?;
     if dbg { dbg_sum(dev, "attn_output-0", pos, &y); }
 
-    let y = y.reshaped(vec![cfg.gdn_num_v_heads, cfg.gdn_value_head_dim]);
-    let normed = ops::rms_norm(dev, &y, &w.ssm_norm_w, cfg.eps)?.reshaped(vec![value_dim]);
-    if dbg { dbg_sum(dev, "node_50", pos, &normed); }
-    let silu_z = ops::silu(dev, &z)?;
-    let gated = ops::mul(dev, &normed, &silu_z)?;
+    // F-85 round-11: fused rmsNorm(ssm_norm) + silu(z) + mul, ONE dispatch
+    // (`ops::gdn_tail_gate`) instead of 3 — see that op's doc. NOTE: the
+    // pre-mul "node_50" debug tap (the old code's `normed` intermediate)
+    // is no longer separately available post-fusion and is dropped; the
+    // pre-fusion "attn_output-0" (y) and post-fusion "final_output-0"
+    // (gated) taps still bracket it.
+    let gated = ops::gdn_tail_gate(dev, &y, &z, &w.ssm_norm_w, cfg.eps, cfg.gdn_num_v_heads, cfg.gdn_value_head_dim)?;
     if dbg { dbg_sum(dev, "final_output-0", pos, &gated); }
 
     let o = w.wo.gemv(dev, &gated)?;
