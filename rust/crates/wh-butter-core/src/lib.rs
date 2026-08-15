@@ -298,6 +298,43 @@ pub trait Device: Send + Sync {
         Err(Error::Msg("marlin_build_routing unsupported on this backend".into()))
     }
 
+    /// F-85 round-8: scale-column permutation companion to [`marlin_repack`]
+    /// for the symmetric U4B8 (bias-8) small-M decode GEMM below -- required
+    /// once per weight after repack (round-7's correctness fix; un-permuted
+    /// scales silently mis-select columns, 5x-500x relative error). `in_`/
+    /// `out` are `[num_groups, size_n]` f16 device buffers; `out` may not
+    /// alias `in_`.
+    fn marlin_permute_scales(
+        &self, _in_: &dyn DeviceBuffer, _out: &dyn DeviceBuffer,
+        _num_groups: usize, _size_n: usize,
+    ) -> Result<()> {
+        Err(Error::Msg("marlin_permute_scales unsupported on this backend".into()))
+    }
+
+    /// F-85 round-8: small-M symmetric-u4 (kU4B8) W4A16 decode GEMM. `a` f16
+    /// `[m,k]`, `b_repacked` = [`marlin_repack`] output of a `[k/8,n]` u32
+    /// GPTQ-packed u4b8 weight, `b_scales` = [`marlin_permute_scales`]
+    /// output, `c` f16 `[m,n]` out, `c_tmp` f32 scratch. Routing arrays
+    /// (`sorted_token_ids`/`expert_ids`/`num_tokens_past_padded`) come from
+    /// [`marlin_build_routing`] with a trivial single-"expert" `[0,m)` range
+    /// -- this is marlin's generic grouped-GEMM driver run dense (no MoE
+    /// routing of its own). Narrower than [`moe_marlin_gemm`] (no
+    /// global_scale/topk_weights -- the u4b8 C shim hardwires those null;
+    /// see round-7/8's marlin_shim.cu). Default errors; CUDA implements it
+    /// via the AOT marlin lib (IRON_MARLIN_BUILD=1 builds).
+    #[allow(clippy::too_many_arguments)]
+    fn marlin_gemm_u4b8_f16(
+        &self,
+        _a: &dyn DeviceBuffer, _b_repacked: &dyn DeviceBuffer, _c: &dyn DeviceBuffer, _c_tmp: &dyn DeviceBuffer,
+        _b_scales: &dyn DeviceBuffer,
+        _sorted_token_ids: &dyn DeviceBuffer, _expert_ids: &dyn DeviceBuffer, _num_tokens_past_padded: &dyn DeviceBuffer,
+        _workspace: &dyn DeviceBuffer,
+        _prob_m: usize, _prob_n: usize, _prob_k: usize, _num_groups: usize, _group_size: usize,
+        _sms: i32, _use_fp32_reduce: bool,
+    ) -> Result<()> {
+        Err(Error::Msg("marlin_gemm_u4b8_f16 unsupported on this backend".into()))
+    }
+
     /// CUTLASS grouped block-scaled NVFP4 MoE GEMM: `out[t,n] = Σ_k a[t,k]·
     /// w[eid(t)][n,k]` over sorted-token groups, both operands packed e2m1 +
     /// ue4m3 block-16 scales in the canonical 512B-block swizzle. `a` packed

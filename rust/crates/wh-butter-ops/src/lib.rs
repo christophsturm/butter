@@ -2370,6 +2370,153 @@ pub fn gemm_q4_mpp(
     Ok(out)
 }
 
+/// Dense Q4 GEMM, BM=8, tensor-core MMA (`iron_gemm_q4_bm8`) -- the F-85
+/// batched-verify final lever. Tensor-core twin of `gemv_q4_multi` (which
+/// failed the batched-verify perf gate, instruction-issue-bound scalar
+/// dequant+FMA): puts the per-candidate FMAs on the MMA pipe instead.
+/// `x` is `[n_rows, k_in]` (n_rows small, real candidates <= n_rows, caller
+/// pads/zeros unused rows -- typically n_rows=8 for the gamma in {2,3,4}
+/// verify shapes); `out` is `[n_rows, out_dim]`. Same dense (non-indexed)
+/// call contract as `gemm_q4_mpp`, just BM=8 direct-input `matmul2d`
+/// instead of the 64x64 cooperative-tensor tile (which failed small-M by
+/// 15-70x on fixed tile overhead -- see that kernel's doc).
+pub fn gemm_q4_bm8(
+    dev: &dyn Device,
+    x: &Tensor,
+    qs: &Tensor,
+    scales: &Tensor,
+    n_rows: usize,
+    out_dim: usize,
+    k_in: usize,
+) -> Result<Tensor> {
+    use wh_iron_core::ir::KernelMode;
+    if k_in % 32 != 0 {
+        return Err(Error::Msg(format!("gemm_q4_bm8: k_in {k_in} must be a multiple of 32")));
+    }
+    let out = Tensor::empty(dev, vec![n_rows, out_dim], x.dtype)?;
+    let kern = cached_ir("iron_gemm_q4_bm8", x.dtype, || {
+        let mut kk = wh_iron_std::kernels::gemm::gemm_q4_bm8::iron_gemm_q4_bm8::kernel_ir_for(x.dtype);
+        kk.mode = KernelMode::Reduction;
+        kk
+    });
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let grid = Grid {
+        grid: [(out_dim as u32).div_ceil(32), (n_rows as u32).div_ceil(8), 1],
+        block: [32, 1, 1],
+    };
+    dev.dispatch(
+        &kern,
+        &[
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(qs.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(n_rows as u32),
+            u(out_dim as u32),
+            u(k_in as u32),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// Round-5 ARM B: BN=16 retile of `gemm_q4_bm8` (`iron_gemm_q4_bm8n16`) --
+/// same dense BM=8 call contract, narrower N-tile (16 output features/TG
+/// instead of 32) to characterize the threadgroup-count-vs-per-TG-overhead
+/// curve `gemm_q4_bm8`'s 4.5-8.6x gate miss was root-caused to (see that
+/// kernel's doc + `gemm_q4_bm8_narrow.rs`'s doc for the coop_tile-is-
+/// software-emulated-on-CUDA correction). Not expected to clear the gate
+/// outright -- informative dead-end characterization, not a hardened lever.
+pub fn gemm_q4_bm8n16(
+    dev: &dyn Device,
+    x: &Tensor,
+    qs: &Tensor,
+    scales: &Tensor,
+    n_rows: usize,
+    out_dim: usize,
+    k_in: usize,
+) -> Result<Tensor> {
+    use wh_iron_core::ir::KernelMode;
+    if k_in % 32 != 0 {
+        return Err(Error::Msg(format!("gemm_q4_bm8n16: k_in {k_in} must be a multiple of 32")));
+    }
+    let out = Tensor::empty(dev, vec![n_rows, out_dim], x.dtype)?;
+    let kern = cached_ir("iron_gemm_q4_bm8n16", x.dtype, || {
+        let mut kk =
+            wh_iron_std::kernels::gemm::gemm_q4_bm8_narrow::iron_gemm_q4_bm8n16::kernel_ir_for(
+                x.dtype,
+            );
+        kk.mode = KernelMode::Reduction;
+        kk
+    });
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let grid = Grid {
+        grid: [(out_dim as u32).div_ceil(16), (n_rows as u32).div_ceil(8), 1],
+        block: [32, 1, 1],
+    };
+    dev.dispatch(
+        &kern,
+        &[
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(qs.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(n_rows as u32),
+            u(out_dim as u32),
+            u(k_in as u32),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// Round-5 ARM B: BN=8 retile of `gemm_q4_bm8` (`iron_gemm_q4_bm8n8`) -- see
+/// `gemm_q4_bm8n16`'s doc; this is the narrower-still sibling (8 output
+/// features/TG, matching plain gemv's per-feature TG granularity as
+/// closely as this tile shape allows).
+pub fn gemm_q4_bm8n8(
+    dev: &dyn Device,
+    x: &Tensor,
+    qs: &Tensor,
+    scales: &Tensor,
+    n_rows: usize,
+    out_dim: usize,
+    k_in: usize,
+) -> Result<Tensor> {
+    use wh_iron_core::ir::KernelMode;
+    if k_in % 32 != 0 {
+        return Err(Error::Msg(format!("gemm_q4_bm8n8: k_in {k_in} must be a multiple of 32")));
+    }
+    let out = Tensor::empty(dev, vec![n_rows, out_dim], x.dtype)?;
+    let kern = cached_ir("iron_gemm_q4_bm8n8", x.dtype, || {
+        let mut kk =
+            wh_iron_std::kernels::gemm::gemm_q4_bm8_narrow::iron_gemm_q4_bm8n8::kernel_ir_for(
+                x.dtype,
+            );
+        kk.mode = KernelMode::Reduction;
+        kk
+    });
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let grid = Grid {
+        grid: [(out_dim as u32).div_ceil(8), (n_rows as u32).div_ceil(8), 1],
+        block: [32, 1, 1],
+    };
+    dev.dispatch(
+        &kern,
+        &[
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(qs.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(n_rows as u32),
+            u(out_dim as u32),
+            u(k_in as u32),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
 /// Routed-expert MoE Q4 grouped BGEMM via MMA (`iron_moe_bgemm_q4_bm64`). The
 /// token rows of `x` `[m_total, k_in]` MUST be pre-sorted by expert, with
 /// `indices` `[m_total]` giving each row's expert id. Expert weights are the
@@ -10076,6 +10223,141 @@ pub fn marlin_build_routing(dev:&dyn Device, off:&Tensor, n_exp:usize, blk:usize
     let ntpp=Tensor::new(dev.alloc_zeroed(4)?, vec![1], DType::U32);
     dev.marlin_build_routing(off.buffer.as_ref(), n_exp, blk, mt, stid.buffer.as_ref(), eid.buffer.as_ref(), ntpp.buffer.as_ref())?;
     Ok((stid,eid,ntpp))
+}
+
+/// F-85 round-8: scale-column permutation companion to [`marlin_repack`],
+/// required once per weight after repack (round-7's correctness fix --
+/// un-permuted scales silently mis-select columns). `scales_raw` is
+/// `[num_groups, size_n]` f16.
+pub fn marlin_permute_scales(dev: &dyn Device, scales_raw: &Tensor, num_groups: usize, size_n: usize) -> Result<Tensor> {
+    let n = (num_groups * size_n).max(1);
+    let out = Tensor::new(dev.alloc(n * 2)?, vec![n], DType::F16);
+    dev.marlin_permute_scales(scales_raw.buffer.as_ref(), out.buffer.as_ref(), num_groups, size_n)?;
+    Ok(out)
+}
+
+/// F-85 round-8 (post-perf-gate fix): allocates the `workspace`/`c_tmp`
+/// scratch [`marlin_gemm_u4b8_f16`] needs, sized exactly like the round-7
+/// probe harness (`perf_probe.cu`/`gate_probe.cu`) for a given `prob_n`.
+/// **Callers must allocate this ONCE per weight (at load time) and reuse it
+/// across every decode step** -- the first perf-gate run wired this as a
+/// fresh `alloc_zeroed` INSIDE `marlin_gemm_u4b8_f16` (one call per routed
+/// weight per decode step, 320x/step at 64 layers x 5 classes) and measured
+/// **zero speedup vs gemv_q4** (both arms flat at ~11.4 tok/s across 5
+/// interleaved A/B pairs) despite the GEMM itself being faster in
+/// isolation -- the per-step `cudaMalloc`+memset churn was eating the
+/// entire win. Hoisting these two buffers out to a load-time allocation is
+/// the fix; this function is that allocation, kept separate from
+/// `marlin_gemm_u4b8_f16` so its cost is visibly one-time.
+pub fn marlin_gemm_u4b8_workspace(dev: &dyn Device, prob_n: usize, sms: i32) -> Result<(Tensor, Tensor)> {
+    let sms_u = (sms.max(1)) as usize;
+    let max_n_tiles = prob_n / 64;
+    let mut workspace_words = max_n_tiles * 64;
+    if workspace_words > sms_u * 4 { workspace_words = sms_u * 4; }
+    if workspace_words < 1 { workspace_words = sms_u * 4; }
+    let workspace = Tensor::new(dev.alloc_zeroed(workspace_words.max(1) * 4)?, vec![workspace_words.max(1)], DType::I32);
+    let ctmp_a = prob_n * 512;
+    let ctmp_b = sms_u * 4 * 8 * 256;
+    let ctmp_words = ctmp_a.min(ctmp_b) * 2;
+    let c_tmp = Tensor::new(dev.alloc_zeroed(ctmp_words.max(1) * 4)?, vec![ctmp_words.max(1)], DType::F32);
+    Ok((workspace, c_tmp))
+}
+
+/// F-85 round-8: small-M symmetric-u4 (kU4B8) W4A16 decode GEMM -- the
+/// verified-correct (max_rel <=5.3e-4 vs f64 ref, round-7) / verified-fast
+/// (beats gemv_q4 at M=1, flat M=1..8) dense verify-GEMM, now wired for
+/// real callers. `a` f16 `[m,K]`, `b_repacked`/`b_scales` = the
+/// [`marlin_repack`]/[`marlin_permute_scales`] outputs for this weight,
+/// `sorted_token_ids`/`expert_ids`/`num_tokens_past_padded` = a
+/// [`marlin_build_routing`] triple built once with a trivial single-
+/// "expert" `off={0,m}` range (independent of the weight -- callers should
+/// cache/reuse it across weights for a given M), `workspace`/`c_tmp` = a
+/// [`marlin_gemm_u4b8_workspace`] pair -- **allocate that ONCE per weight
+/// and pass the same buffers every decode step; a fresh alloc per call
+/// measured a full perf-gate wash, see that function's doc.**
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_gemm_u4b8_f16(
+    dev: &dyn Device,
+    a: &Tensor, b_repacked: &Tensor, b_scales: &Tensor,
+    sorted_token_ids: &Tensor, expert_ids: &Tensor, num_tokens_past_padded: &Tensor,
+    workspace: &Tensor, c_tmp: &Tensor,
+    prob_m: usize, prob_n: usize, prob_k: usize, group_size: usize, sms: i32,
+) -> Result<Tensor> {
+    let out = Tensor::empty(dev, vec![prob_m, prob_n], DType::F16)?;
+    let num_groups = prob_k / group_size;
+    dev.marlin_gemm_u4b8_f16(
+        a.buffer.as_ref(), b_repacked.buffer.as_ref(), out.buffer.as_ref(), c_tmp.buffer.as_ref(),
+        b_scales.buffer.as_ref(),
+        sorted_token_ids.buffer.as_ref(), expert_ids.buffer.as_ref(), num_tokens_past_padded.buffer.as_ref(),
+        workspace.buffer.as_ref(),
+        prob_m, prob_n, prob_k, num_groups, group_size, sms, true,
+    )?;
+    Ok(out)
+}
+
+/// F-85 round-8: host-side symmetric u4 (bias-8, "u4b8") GPTQ-style
+/// requantizer, matching the round-7 reference quantizer
+/// (`gate_probe.cu::run_correctness`) packing convention bit-for-bit.
+/// Input `w` is a dense `[m,k]` row-major f32 weight (m=out_features,
+/// k=in_features -- the `dequant_f32`/`Q4Dense` convention). Output is
+/// marlin's GEMM-B convention with N=m, K=k: `bqw` = `[k/8, m]` u32
+/// (K-major, 8 nibbles/word, LSB nibble = smallest k in the group of 8),
+/// `scales` = `[k/group_size, m]` f32 (PRE-permutation -- caller converts
+/// to f16 bytes and runs [`marlin_permute_scales`] after upload). Per-
+/// (output-column,group) symmetric scale = amax/7 (clamped >=1e-8), q =
+/// round(w/scale)+8 clamped to [0,15]. Parallelized over output columns
+/// (rayon) -- independent work, and the only way this is tractable at
+/// hundreds-of-millions-of-elements weight sizes.
+pub fn quantize_u4b8_gptq_g32(w: &[f32], m: usize, k: usize) -> (Vec<u32>, Vec<f32>) {
+    const GS: usize = 32;
+    assert_eq!(k % 8, 0, "quantize_u4b8_gptq_g32: k must be a multiple of 8");
+    assert_eq!(k % GS, 0, "quantize_u4b8_gptq_g32: k must be a multiple of the group size (32)");
+    assert_eq!(w.len(), m * k, "quantize_u4b8_gptq_g32: w.len() != m*k");
+    let num_groups = k / GS;
+    let kp = k / 8; // packed K-words per column
+
+    // Column-major-per-n temporaries (contiguous per n -> rayon-parallelizable),
+    // transposed into marlin's [k/8,m] / [num_groups,m] layout afterward.
+    let mut bqw_cols = vec![0u32; m * kp];
+    let mut scale_cols = vec![0f32; m * num_groups];
+
+    use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+    use rayon::slice::ParallelSliceMut;
+    bqw_cols
+        .par_chunks_mut(kp)
+        .zip(scale_cols.par_chunks_mut(num_groups))
+        .enumerate()
+        .for_each(|(n, (bqw_col, scale_col))| {
+            let row = &w[n * k..(n + 1) * k];
+            for g in 0..num_groups {
+                let grp = &row[g * GS..(g + 1) * GS];
+                let vmax = grp.iter().fold(0f32, |acc, &v| acc.max(v.abs()));
+                let scale = (vmax / 7.0).max(1e-8);
+                scale_col[g] = scale;
+                for (j, &v) in grp.iter().enumerate() {
+                    let k_idx = g * GS + j;
+                    let q = ((v / scale).round() as i32 + 8).clamp(0, 15);
+                    let k_packed = k_idx / 8;
+                    let k_pos = k_idx % 8;
+                    bqw_col[k_packed] |= (q as u32 & 0xF) << (4 * k_pos);
+                }
+            }
+        });
+
+    // Transpose column-major -> marlin's [k/8,m] / [num_groups,m] layout.
+    let mut bqw = vec![0u32; kp * m];
+    for n in 0..m {
+        for kpi in 0..kp {
+            bqw[kpi * m + n] = bqw_cols[n * kp + kpi];
+        }
+    }
+    let mut scales = vec![0f32; num_groups * m];
+    for n in 0..m {
+        for g in 0..num_groups {
+            scales[g * m + n] = scale_cols[n * num_groups + g];
+        }
+    }
+    (bqw, scales)
 }
 
 pub fn moe_grouped_gemm_w8a8(
