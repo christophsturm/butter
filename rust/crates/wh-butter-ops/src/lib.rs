@@ -1811,11 +1811,17 @@ pub fn moe_weighted_sum(dev: &dyn Device, downs: &Tensor, wts: &Tensor, acc: &Te
 }
 
 // ── Q4 (4-bit) family, half the weight DRAM of Q8 (the decode lever). ──
-fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor, x: &Tensor, acc: Option<&Tensor>, scale_buf: Option<&Tensor>, m_out: usize, k_in: usize, rows_per_group: usize) -> Result<Tensor> {
+//
+// `two_row_override`: `None` = resolve from `BUTTER_GEMV_2ROW` env (legacy
+// opt-in behavior, unchanged). `Some(b)` = caller has already decided
+// (see `gemv_q4_auto`'s shape-conditional default below) — the env var is
+// still consulted first so `BUTTER_GEMV_2ROW=1`/`BUTTER_GEMV_VEC=1` remain a
+// hard manual override for experimentation even when a caller passes Some.
+fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor, x: &Tensor, acc: Option<&Tensor>, scale_buf: Option<&Tensor>, m_out: usize, k_in: usize, rows_per_group: usize, two_row_override: Option<bool>) -> Result<Tensor> {
     // 2-row tiling: 2 output rows per warp, shared activation read, 2 weight
     // streams in flight (more memory-level-parallelism on the latency-bound Q4 read).
     let vec = kernel == "plain" && std::env::var("BUTTER_GEMV_VEC").is_ok();
-    let two_row = !vec && kernel == "plain" && std::env::var("BUTTER_GEMV_2ROW").is_ok();
+    let two_row = !vec && kernel == "plain" && (std::env::var("BUTTER_GEMV_2ROW").is_ok() || two_row_override.unwrap_or(false));
     let name = if vec { "iron_gemv_q4_vec" } else if two_row { "iron_gemv_q4_coalesced_2row" } else { match kernel { "plain" => "iron_gemv_q4_coalesced", "relu2" => "iron_gemv_q4_coalesced_relu2", _ => "iron_gemv_q4_coalesced_accum" } };
     let k = cached_ir(name, x.dtype, || {
         let mut k = if vec {
@@ -1864,16 +1870,58 @@ fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor
 /// scales from [`quantize_q4`] with an f32-to-f16 pass before upload (raw f32
 /// bytes get silently reinterpreted as garbage f16 and inflate every output).
 pub fn gemv_q4(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rpg: usize) -> Result<Tensor> {
-    gemv_q4_dispatch(dev, "plain", qs, scales, x, None, None, m_out, k_in, rpg)
+    gemv_q4_dispatch(dev, "plain", qs, scales, x, None, None, m_out, k_in, rpg, None)
+}
+/// Q4 matvec, auto-selecting single-row vs 2-row-per-warp tiling from
+/// `m_out` (qwen3.6-27B round-2 per-shape GEMV census on GB10, block-32 Q4 +
+/// f16 scale, `BUTTER_GEMV_RPT` unset i.e. rpt=1 baseline):
+///
+/// | shape (m_out,k_in)      | plain GB/s | 2-row GB/s | delta |
+/// |--------------------------|-----------|------------|-------|
+/// | full_wk/wv (1024,5120)   | 179.5     | 286.5      | +59.6%|
+/// | full_wo (5120,6144)      | 246.6     | 388.3      | +57.5%|
+/// | gdn_wz (6144,5120)       | 246.7     | 392.6      | +59.1%|
+/// | gdn_wo (5120,6144)       | 246.6     | 386.4      | +56.7%|
+/// | gdn_wqkv (10240,5120)    | 244.2     | 251.2      | +2.9% (wash) |
+/// | full_wq (12288,5120)     | 227.0     | 178.7      | -21.3%|
+/// | ffn_gate/up (17408,5120) | 233.1     | 199.9      | -14.2%|
+/// | ffn_down (5120,17408)    | 196.8     | 160.2      | -18.6%|
+/// | lm_head_q4 (248320,5120) | 215.9     | 175.6      | -18.7%|
+///
+/// 2-row halves the grid (2 rows/warp) — a clear win while grid is still
+/// large enough to keep SMs fed (m_out up to ~6144 here), a clear loss once
+/// halving the grid starts starving occupancy (m_out >= 10240, where it's
+/// either a wash or a regression — note `ffn_down`'s long-k reduction does
+/// NOT get fixed by 2-row despite being the most latency-bound shape in the
+/// census; extra ILP from the shared read does not make up for fewer
+/// concurrent blocks there). Threshold picked below the 10240 wash point,
+/// on the high side of the 6144 confirmed win.
+///
+/// ⚠️ NOT WIRED AS A DEFAULT ANYWHERE (round-2 perf campaign, 2026-08): a
+/// full qwen3.6-27B oracle-check run using this function crashed on the
+/// very first decode_step with `cuModuleLoadData: an illegal memory access
+/// was encountered` — a context-corrupting fault not reproduced by any of
+/// the 9 individual shapes above in isolated microbench (each ran clean,
+/// giving the numbers in this table). Root cause not isolated within the
+/// campaign's time budget; suspect either a real bug in
+/// `iron_gemv_q4_coalesced_2row` that only manifests given the real model's
+/// call sequencing/buffer reuse, or a driver/JIT-cache interaction from
+/// alternating "plain" and "2row" kernel names through `cached_ir` within
+/// one process. Kept here for the measured numbers + as a documented
+/// starting point for whoever picks this back up — do NOT call it from a
+/// real decode path without re-verifying stability end-to-end first.
+pub fn gemv_q4_auto(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rpg: usize) -> Result<Tensor> {
+    let two_row = m_out <= 8192;
+    gemv_q4_dispatch(dev, "plain", qs, scales, x, None, None, m_out, k_in, rpg, Some(two_row))
 }
 /// Q4 matvec with fused ReLU² (MoE expert up).
 pub fn gemv_q4_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rpg: usize) -> Result<Tensor> {
-    gemv_q4_dispatch(dev, "relu2", qs, scales, x, None, None, m_out, k_in, rpg)
+    gemv_q4_dispatch(dev, "relu2", qs, scales, x, None, None, m_out, k_in, rpg, None)
 }
 /// Q4 matvec, scale + accumulate into `acc` in place (MoE expert down).
 #[allow(clippy::too_many_arguments)]
 pub fn gemv_q4_accum(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, acc: &Tensor, scale_buf: &Tensor, m_out: usize, k_in: usize, rpg: usize) -> Result<()> {
-    gemv_q4_dispatch(dev, "accum", qs, scales, x, Some(acc), Some(scale_buf), m_out, k_in, rpg)?;
+    gemv_q4_dispatch(dev, "accum", qs, scales, x, Some(acc), Some(scale_buf), m_out, k_in, rpg, None)?;
     Ok(())
 }
 /// Quantize a row-major `[m,k]` F32 weight to Q4 blocks (block 32, symmetric int4

@@ -189,6 +189,17 @@ struct Q4Dense {
     k: usize,
 }
 impl Q4Dense {
+    // NOTE (round-2 perf campaign, 2026-08): `ops::gemv_q4_auto` (2-row-per-
+    // warp for narrow m_out) looked like a solid win in isolated per-shape
+    // microbench (+57-59% on wk/wv/wo/gdn_wz/gdn_wo) but a full oracle-check
+    // run wired to it hit a hard crash on the very first decode_step:
+    // `Dispatch("dispatch failed: cuModuleLoadData: an illegal memory access
+    // was encountered")` — a CUDA context-corrupting fault (surfaced late,
+    // at the next module load, per the usual async-error pattern), not
+    // reproduced by any single isolated shape in the microbench harness.
+    // Root cause NOT isolated within this campaign's time budget. DO NOT
+    // wire `gemv_q4_auto` here (or anywhere in the real decode path) until
+    // that's root-caused — stays on the safe, fully-plain `gemv_q4` path.
     fn gemv(&self, dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
         ops::gemv_q4(dev, &self.qs, &self.scales, x, self.m, self.k, self.m)
     }
