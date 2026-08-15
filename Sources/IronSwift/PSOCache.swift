@@ -61,6 +61,7 @@ public final class PSOCache: @unchecked Sendable {
     /// `fatalError`s on lookup or compile failure. Use `pipelineState(for:)
     /// throws -> ...` if you want to handle errors at the call site.
     public func pipelineState(for kernelName: String) -> MTLComputePipelineState {
+        DispatchCensus.tick(kernelName)
         do {
             return try lookup(kernelName)
         } catch {
@@ -69,7 +70,8 @@ public final class PSOCache: @unchecked Sendable {
     }
 
     public func pipelineStateThrowing(for kernelName: String) throws -> MTLComputePipelineState {
-        try lookup(kernelName)
+        DispatchCensus.tick(kernelName)
+        return try lookup(kernelName)
     }
 
     private func lookup(_ name: String) throws -> MTLComputePipelineState {

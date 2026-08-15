@@ -104,7 +104,7 @@ struct GlimmerDFlashSpecDecodeIntegrationTests {
                 // explicit pool here, every chunk's transient ObjC-
                 // bridged Metal objects (MTLCommandBuffer, encoders,
                 // etc.) accumulate for the whole PROCESS lifetime, not
-                // just this loop — see `ffai-metal-autoreleasepool-leak`
+                // just this loop — cooperative threads never drain autorelease pools
                 // / `DFlashSpecDecode.swift`'s EXACTNESS DISCIPLINE
                 // section for the full incident writeup.
                 autoreleasepool {

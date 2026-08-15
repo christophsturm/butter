@@ -358,7 +358,7 @@ public enum DFlashSpecDecode {
                 // a single generateGreedy call) — the same MTLBuffer/
                 // command-buffer accumulation pattern diagnosed
                 // elsewhere as an M5 Max GPU-queue wedge under sustained
-                // load (see `ffai-metal-autoreleasepool-leak`).
+                // load (cooperative-executor threads never drain autorelease pools).
                 let (logits, features) = autoreleasepool { () -> (Tensor, Tensor) in
                     let cmd = device.makeCommandBuffer()
                     return model.forwardOneWithFeatures(

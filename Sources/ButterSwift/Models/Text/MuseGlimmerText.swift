@@ -378,7 +378,7 @@ public final class MuseGlimmerLayer: Module {
     /// not wrapped yet (`KVEvictionState.reserveNextSlot` only wraps
     /// once `absoluteCount >= maxSize`), so physical slot == logical
     /// position for every row in this cache and `sdpaMulti`'s
-    /// slot-index-as-position causal mask (`ffai_sdpa_multi`'s `_t`
+    /// slot-index-as-position causal mask (`iron_sdpa_multi`'s `_t`
     /// walk over `[0, base_kv+r+1)`) is bit-for-bit the same windowed
     /// attention `Ops.sdpaDecode`'s per-token loop would compute.
     ///
