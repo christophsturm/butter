@@ -276,7 +276,7 @@ struct GdnWeights {
     w_alpha: Tensor,       // f32 [Hv, hidden]                ("ssm_alpha" = in_proj_a)
     w_beta: Tensor,        // f32 [Hv, hidden]                ("ssm_beta"  = in_proj_b)
     dt_bias: Tensor,       // f32 [Hv]
-    neg_exp_a_log: Tensor, // f32 [Hv]  precomputed -exp(ssm_a) (= -exp(A_log))
+    neg_exp_a_log: Tensor, // f32 [Hv]  == GGUF's ssm_a directly (already -exp(A_log), see load_gguf)
     conv_w: Tensor,        // f32 [conv_kernel*conv_dim], kernel-major (repacked)
     ssm_norm_w: Tensor,    // f32 [Dv]  gated-RMSNorm weight
     wo: Q4Dense,           // [hidden, value_dim]             ("ssm_out")
@@ -325,6 +325,19 @@ pub struct Qwen35Model {
     /// Zero bias for `ops::conv1d_causal_silu_many` — Qwen3.5's GDN conv1d
     /// has `bias: false`.
     gdn_conv_zero_bias: Tensor, // f32 [conv_dim]
+    /// GQA head-expansion index for GDN's q/k: `iron_gated_delta_step`'s
+    /// OWN internal GQA decomposition is `hk_idx = hv_idx / (Hv/Hk)`
+    /// (contiguous blocks), but the actual reference kernel this checkpoint
+    /// was validated against (llama.cpp's `gated_delta_net.cu`,
+    /// `iq1 = fastmodulo(h_idx, neqk1)` i.e. `hv_idx % Hk`) uses the
+    /// CYCLIC/tiled mapping instead — verified by oracle checksum diff
+    /// (attn_output-0 aggregate matched to 0.01% only after switching to
+    /// cyclic; the block mapping was off by ~20%). Rather than patch the
+    /// pinned iron kernel, pre-expand q/k from `[Hk,Dk]` to `[Hv,Dk]` via
+    /// `ops::gather` with this constant index buffer (`idx[hv] = hv % Hk`),
+    /// then call `gated_delta_step` with `hk=Hv` so its internal grouping
+    /// becomes a no-op identity map.
+    gdn_gqa_cyclic_idx: Tensor, // u32 [gdn_num_v_heads], idx[hv] = hv % gdn_num_k_heads
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -364,6 +377,10 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
         let v = vec![0.0f32; cfg.gdn_conv_dim()];
         Tensor::new(dev.upload(&f32s_to_bytes(&v))?, vec![cfg.gdn_conv_dim()], DType::F32)
     };
+    let gdn_gqa_cyclic_idx = {
+        let idx: Vec<u32> = (0..cfg.gdn_num_v_heads as u32).map(|hv| hv % cfg.gdn_num_k_heads as u32).collect();
+        Tensor::new(dev.upload(&u32s_to_bytes(&idx))?, vec![cfg.gdn_num_v_heads], DType::U32)
+    };
 
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
@@ -379,8 +396,18 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
                 k_norm: load_f32_vec(dev, g, &format!("{p}.attn_k_norm.weight"))?,
             })
         } else {
-            let a_log = g.dequant_f32(&format!("{p}.ssm_a"))?;
-            let neg_exp_a_log: Vec<f32> = a_log.iter().map(|&a| -a.exp()).collect();
+            // NOTE: despite the GGUF tensor name mirroring HF's raw "A_log"
+            // parameter, llama.cpp's GGUF conversion for this arch BAKES IN
+            // the `-exp(A_log)` transform at conversion time — verified
+            // against the reference ggml graph (`gate-0 = MUL(a_softplus-0,
+            // blk.0.ssm_a)`, a plain elementwise multiply with NO exp/negate
+            // node applied to `ssm_a`) and against the tensor's own raw
+            // values (small negatives, O(1e-2), consistent with an
+            // already-final decay coefficient — re-applying `-exp()` to
+            // those pushes everything toward -1, which was the bug: it
+            // over-decayed the GDN state on every step, killing context
+            // retention). Use the tensor directly, no further transform.
+            let neg_exp_a_log = g.dequant_f32(&format!("{p}.ssm_a"))?;
             let conv_flat = g.dequant_f32(&format!("{p}.ssm_conv1d.weight"))?;
             let conv_repacked = repack_conv1d_weight(&conv_flat, cfg.gdn_conv_dim(), cfg.gdn_conv_kernel);
             Mixer::Gdn(GdnWeights {
@@ -415,7 +442,7 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
 
     eprintln!("Qwen35: load done in {:.2}s ({} layers)", load_t0.elapsed().as_secs_f64(), cfg.n_layers);
 
-    Ok(Qwen35Model { cfg, tok_embd, layers, out_norm, lm_head, gdn_q_scale, gdn_k_scale, gdn_conv_zero_bias })
+    Ok(Qwen35Model { cfg, tok_embd, layers, out_norm, lm_head, gdn_q_scale, gdn_k_scale, gdn_conv_zero_bias, gdn_gqa_cyclic_idx })
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -480,6 +507,22 @@ impl Qwen35Cache {
 // Decode
 // ─────────────────────────────────────────────────────────────────────────
 
+/// QWEN35_DEBUG=1: per-token, layer-0-only checksum dump for oracle diffing
+/// against `llama-eval-callback`'s per-node `sum = ...` output. Mirrors
+/// `laguna.rs`'s `BUTTER_LAGUNA_DEBUG`/`dbg_stats` pattern. TEMPORARY —
+/// gated dead weight when unset (one env read per call site).
+fn dbg_sum(dev: &dyn Device, tag: &str, pos: u32, t: &Tensor) {
+    let n = t.elem_count();
+    let mut b = vec![0u8; n * 4];
+    if dev.synchronize().is_err() || dev.download(t.buffer.as_ref(), &mut b).is_err() {
+        eprintln!("QWEN35_DBG pos={pos} tag={tag}: <download failed>");
+        return;
+    }
+    let f: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    let sum: f64 = f.iter().map(|&v| v as f64).sum();
+    eprintln!("QWEN35_DBG pos={pos} tag={tag} n={n} sum={sum:.6} head={:?}", &f[..4.min(n)]);
+}
+
 fn full_attn_layer(
     dev: &dyn Device,
     cfg: &Qwen35Config,
@@ -536,21 +579,25 @@ fn full_attn_layer(
 /// tokens included — see the module doc's "decode-only" note).
 pub fn decode_step(dev: &dyn Device, model: &Qwen35Model, cache: &mut Qwen35Cache, token_id: u32, pos: u32) -> Result<Tensor> {
     let cfg = &model.cfg;
+    let debug = std::env::var("QWEN35_DEBUG").map(|v| v == "1").unwrap_or(false);
     let tok_buf = Tensor::new(dev.upload(&token_id.to_le_bytes())?, vec![1], DType::U32);
     let mut x = ops::gather(dev, &model.tok_embd, &tok_buf)?.reshaped(vec![cfg.hidden]);
+    if debug { dbg_sum(dev, "x_embed", pos, &x); }
 
     for (i, layer) in model.layers.iter().enumerate() {
         x = match (&layer.mixer, &mut cache.slots[i]) {
             (Mixer::Full(w), LayerSlot::Full(slot)) => full_attn_layer(dev, cfg, w, slot, &x, pos)?,
-            (Mixer::Gdn(w), LayerSlot::Gdn(slot)) => gdn_layer_full(dev, cfg, model, w, slot, &x)?,
+            (Mixer::Gdn(w), LayerSlot::Gdn(slot)) => gdn_layer_full(dev, cfg, model, w, slot, &x, i, pos, debug)?,
             _ => return Err(Error::Msg(format!("qwen35: layer {i} mixer/slot kind mismatch"))),
         };
+        if debug && i == 0 { dbg_sum(dev, "attn_residual-0", pos, &x); }
         let h2 = ops::rms_norm(dev, &x, &layer.ffn.ffn_norm, cfg.eps)?;
         let gate = layer.ffn.gate.gemv(dev, &h2)?;
         let up = layer.ffn.up.gemv(dev, &h2)?;
         let act = ops::swiglu(dev, &gate, &up)?;
         let ffn_out = layer.ffn.down.gemv(dev, &act)?;
         x = ops::add(dev, &x, &ffn_out)?;
+        if debug && i == 0 { dbg_sum(dev, "l_out-0", pos, &x); }
     }
 
     let xn = ops::rms_norm(dev, &x, &model.out_norm, cfg.eps)?;
@@ -562,6 +609,7 @@ pub fn decode_step(dev: &dyn Device, model: &Qwen35Model, cache: &mut Qwen35Cach
 /// `gdn_conv_zero_bias` — onto the per-layer `GdnWeights`, since those
 /// three are identical across all 48 GDN layers and don't belong on a
 /// loaded-per-layer struct).
+#[allow(clippy::too_many_arguments)]
 fn gdn_layer_full(
     dev: &dyn Device,
     cfg: &Qwen35Config,
@@ -569,10 +617,16 @@ fn gdn_layer_full(
     w: &GdnWeights,
     slot: &mut GdnSlot,
     x: &Tensor,
+    layer_idx: usize,
+    pos: u32,
+    debug: bool,
 ) -> Result<Tensor> {
+    let dbg = debug && layer_idx == 0;
     let h = ops::rms_norm(dev, x, &w.attn_norm, cfg.eps)?;
+    if dbg { dbg_sum(dev, "attn_norm-0", pos, &h); }
 
     let qkv = w.wqkv.gemv(dev, &h)?;
+    if dbg { dbg_sum(dev, "linear_attn_qkv_mixed-0", pos, &qkv); }
     let z = w.wz.gemv(dev, &h)?;
 
     let (conv_out, new_conv_state) = ops::conv1d_causal_silu_many(
@@ -585,24 +639,57 @@ fn gdn_layer_full(
     let q_raw = ops::slice(dev, &conv_out, 0, key_dim)?.reshaped(vec![cfg.gdn_num_k_heads, cfg.gdn_key_head_dim]);
     let k_raw = ops::slice(dev, &conv_out, key_dim, key_dim)?.reshaped(vec![cfg.gdn_num_k_heads, cfg.gdn_key_head_dim]);
     let v = ops::slice(dev, &conv_out, 2 * key_dim, value_dim)?.reshaped(vec![cfg.gdn_num_v_heads, cfg.gdn_value_head_dim]);
+    if dbg { dbg_sum(dev, "v_conv_predelta-0", pos, &v); }
 
     let q = ops::rms_norm(dev, &q_raw, &model.gdn_q_scale, cfg.eps)?;
     let k = ops::rms_norm(dev, &k_raw, &model.gdn_k_scale, cfg.eps)?;
+    if dbg { dbg_sum(dev, "q_conv_predelta-0", pos, &q); }
+    if dbg { dbg_sum(dev, "k_conv_predelta-0", pos, &k); }
 
     let a_raw = ops::gemv(dev, &w.w_alpha, &h)?;
     let b_raw = ops::gemv(dev, &w.w_beta, &h)?;
     let (g, beta) = ops::gdn_gate_beta(dev, &a_raw, &b_raw, &w.dt_bias, &w.neg_exp_a_log, cfg.gdn_num_v_heads)?;
+    if dbg {
+        // Oracle's `gate-0` is LOG-space (ln(g) = neg_exp_a_log * softplus(...));
+        // our `g` is already exp'd, so take ln() host-side for an apples-to-apples sum.
+        let n = g.elem_count();
+        let mut b = vec![0u8; n * 4];
+        dev.synchronize().ok();
+        dev.download(g.buffer.as_ref(), &mut b).ok();
+        let gv: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let ln_sum: f64 = gv.iter().map(|&x| (x as f64).ln()).sum();
+        eprintln!("QWEN35_DBG pos={pos} tag=gate-0(ln_g) n={n} sum={ln_sum:.6}");
+        dbg_sum(dev, "beta_sigmoid-0", pos, &beta);
+    }
+
+    // `iron_gated_delta_step`'s own internal GQA decomposition is
+    // `hk_idx = hv_idx / (Hv/Hk)` (contiguous blocks) — but the reference
+    // this checkpoint was actually validated against (llama.cpp's CUDA
+    // `gated_delta_net.cu`, `iq1 = fastmodulo(h_idx, neqk1)`, i.e.
+    // `hv_idx % Hk`) uses the CYCLIC/tiled mapping instead (verified by
+    // oracle checksum diff: `attn_output` matched to 0.01% only after
+    // switching to cyclic — the block mapping was ~20% off). Pre-expand
+    // q/k from `[Hk,Dk]` to `[Hv,Dk]` on-device via `ops::gather` with the
+    // constant `gdn_gqa_cyclic_idx` (`idx[hv] = hv % Hk`), then call the
+    // kernel with `hk=Hv` so its internal grouping becomes a no-op
+    // identity map — sidesteps patching the pinned iron kernel entirely.
+    let q = ops::gather(dev, &q, &model.gdn_gqa_cyclic_idx)?;
+    let k = ops::gather(dev, &k, &model.gdn_gqa_cyclic_idx)?;
 
     let y = ops::gated_delta_step(
         dev, &q, &k, &v, &g, &beta, &slot.state,
-        cfg.gdn_key_head_dim, cfg.gdn_value_head_dim, cfg.gdn_num_v_heads, cfg.gdn_num_k_heads,
+        cfg.gdn_key_head_dim, cfg.gdn_value_head_dim, cfg.gdn_num_v_heads, cfg.gdn_num_v_heads,
     )?;
+    if dbg { dbg_sum(dev, "attn_output-0", pos, &y); }
 
     let y = y.reshaped(vec![cfg.gdn_num_v_heads, cfg.gdn_value_head_dim]);
     let normed = ops::rms_norm(dev, &y, &w.ssm_norm_w, cfg.eps)?.reshaped(vec![value_dim]);
+    if dbg { dbg_sum(dev, "node_50", pos, &normed); }
     let silu_z = ops::silu(dev, &z)?;
     let gated = ops::mul(dev, &normed, &silu_z)?;
+    if dbg { dbg_sum(dev, "final_output-0", pos, &gated); }
 
     let o = w.wo.gemv(dev, &gated)?;
+    if dbg { dbg_sum(dev, "linear_attn_out-0", pos, &o); }
     ops::add(dev, x, &o)
 }
