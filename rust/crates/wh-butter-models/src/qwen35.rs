@@ -133,7 +133,19 @@ impl Qwen35Config {
         let f = |k: &str, def: f32| g.meta_f32(k).unwrap_or(def);
 
         let hidden = u("qwen35.embedding_length", 5120);
-        let n_layers = u("qwen35.block_count", 64);
+        // `qwen35.block_count` on an MTP-preserved checkpoint counts the
+        // MTP sidecar block TOO (verified via `gguf-dump`: block_count=65,
+        // nextn_predict_layers=1, but only 64 trunk layers carry
+        // attn_norm/ssm_a-style mixer tensors -- layer 64 is `blk.64.nextn.*`
+        // + a full-attn-shaped block, loaded separately by `load_mtp`, NOT
+        // part of the `for i in 0..cfg.n_layers` trunk loop). Subtract
+        // `nextn_predict_layers` (0 on a non-MTP checkpoint, where this is a
+        // no-op) so `cfg.n_layers` stays "trunk layer count" everywhere else
+        // in this file, and `load_mtp`'s `blk.{cfg.n_layers}.*` indexing
+        // lands on the right block (64, not 65).
+        let raw_block_count = u("qwen35.block_count", 64);
+        let n_layer_nextn = u("qwen35.nextn_predict_layers", 0);
+        let n_layers = raw_block_count - n_layer_nextn;
         let n_head = u("qwen35.attention.head_count", 24);
         let n_kv_heads = u("qwen35.attention.head_count_kv", 4);
         let head_dim = u("qwen35.attention.key_length", 256);
@@ -506,6 +518,14 @@ pub struct Qwen35Model {
     /// then call `gated_delta_step` with `hk=Hv` so its internal grouping
     /// becomes a no-op identity map.
     gdn_gqa_cyclic_idx: Tensor, // u32 [gdn_num_v_heads], idx[hv] = hv % gdn_num_k_heads
+}
+
+impl Qwen35Model {
+    /// Whether this checkpoint carries the MTP sidecar (see `load_mtp`'s
+    /// doc) — callers must check this before calling `speculative_round`.
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1017,6 +1037,25 @@ pub struct Qwen35SpecCache {
 impl Qwen35SpecCache {
     pub fn new(dev: &dyn Device, cfg: &Qwen35Config, max_seq: usize) -> Result<Self> {
         Ok(Qwen35SpecCache { backbone: Qwen35Cache::new(dev, cfg, max_seq)?, mtp: MtpCache::new(dev, cfg, max_seq)? })
+    }
+
+    /// Runs one MTP forward at `(xn, token_id, pos)` purely to populate
+    /// MTP's own KV cache and discards the draft prediction. Needed during
+    /// PROMPT PREFILL (before any speculative round runs): `speculative_round`
+    /// only ever calls the drafter for genuinely speculative continuations,
+    /// so without this, MTP's attention would start every generation with
+    /// an empty KV cache — no context from the prompt at all, tanking
+    /// acceptance rate for reasons that have nothing to do with the
+    /// drafter's own correctness. Mirrors the invariant `speculative_round`
+    /// relies on for accepted-but-not-drafted tokens too (see its doc):
+    /// every confirmed token gets exactly one MTP forward, seeded from the
+    /// backbone's own `xn` at that position, keyed at that position.
+    pub fn warm_mtp(&mut self, dev: &dyn Device, model: &Qwen35Model, xn: &Tensor, token_id: u32, pos: u32) -> Result<()> {
+        let Some(mtp) = &model.mtp else {
+            return Err(Error::Msg("warm_mtp: model has no MTP weights (non-MTP checkpoint)".into()));
+        };
+        mtp_draft_step(dev, &model.cfg, model, mtp, &mut self.mtp.slot, xn, token_id, pos)?;
+        Ok(())
     }
 }
 
