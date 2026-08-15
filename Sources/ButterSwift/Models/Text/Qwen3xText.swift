@@ -3886,6 +3886,11 @@ public final class Qwen35Model: LanguageModel {
             embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
         }
 
+        // See `Sources/ButterSwift/Telemetry/InspectTap.swift` — no-op
+        // when BUTTER_INSPECT isn't set. `butter inspect --layer-trace`.
+        let tap = InspectTap.fromEnvironment
+        workCmd = tap.dumpLayerBoundary(h, label: "embed_out", layer: -1, cmd: workCmd, device: device)
+
         Profile.signpost("model.layer_loop") {
             for (i, layer) in layers.enumerated() {
                 h = layer.decode(
@@ -3899,6 +3904,8 @@ public final class Qwen35Model: LanguageModel {
                 default: committed = false
                 }
                 if committed { workCmd = device.makeCommandBuffer() }
+                let kind = layer is Qwen35AttentionLayer ? "attn" : (layer is Qwen35GDNLayer ? "gdn" : "other")
+                workCmd = tap.dumpLayerBoundary(h, label: "\(kind)_out", layer: i, cmd: workCmd, device: device)
             }
         }
 
@@ -4224,6 +4231,11 @@ public final class Qwen35Model: LanguageModel {
         let dt = h.dtype
         let dtBytes = dt.byteSize
 
+        // See `Sources/ButterSwift/Telemetry/InspectTap.swift` — no-op
+        // when BUTTER_INSPECT isn't set. `butter inspect --layer-trace`.
+        let tap = InspectTap.fromEnvironment
+        workCmd = tap.dumpLayerBoundary(h, label: "embed_out", layer: -1, cmd: workCmd, device: device)
+
         if profileLayers {
             workCmd.commit()
             workCmd.waitUntilCompleted()
@@ -4331,6 +4343,8 @@ public final class Qwen35Model: LanguageModel {
                     nOther += 1
                 }
             }
+            let kind = layer is Qwen35AttentionLayer ? "attn" : (layer is Qwen35GDNLayer ? "gdn" : "other")
+            workCmd = tap.dumpLayerBoundary(h, label: "\(kind)_out", layer: i, cmd: workCmd, device: device)
             }  // autoreleasepool
         }
 
