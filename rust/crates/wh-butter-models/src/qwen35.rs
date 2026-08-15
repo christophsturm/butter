@@ -675,6 +675,11 @@ pub struct Qwen35Model {
     /// `ops::gather` with this constant index buffer (`idx[hv] = hv % Hk`),
     /// then call `gated_delta_step` with `hk=Hv` so its internal grouping
     /// becomes a no-op identity map.
+    // F-85 round-11: no longer read on the decode path — the CYCLIC GQA
+    // mapping it encoded is now baked directly into iron_gdn_decode_fused
+    // (see ops::gdn_decode_fused doc). Kept (not deleted) since a future
+    // chunked-prefill GDN kernel may want the same precomputed index.
+    #[allow(dead_code)]
     gdn_gqa_cyclic_idx: Tensor, // u32 [gdn_num_v_heads], idx[hv] = hv % gdn_num_k_heads
 }
 
@@ -1190,21 +1195,19 @@ fn gdn_layer_full_census(
     let q_raw = ops::slice(dev, &conv_out, 0, key_dim)?.reshaped(vec![cfg.gdn_num_k_heads, cfg.gdn_key_head_dim]);
     let k_raw = ops::slice(dev, &conv_out, key_dim, key_dim)?.reshaped(vec![cfg.gdn_num_k_heads, cfg.gdn_key_head_dim]);
     let v = ops::slice(dev, &conv_out, 2 * key_dim, value_dim)?.reshaped(vec![cfg.gdn_num_v_heads, cfg.gdn_value_head_dim]);
-    let q = ops::rms_norm(dev, &q_raw, &model.gdn_q_scale, cfg.eps)?;
-    let k = ops::rms_norm(dev, &k_raw, &model.gdn_k_scale, cfg.eps)?;
     let a_raw = ops::gemv(dev, &w.w_alpha, &h)?;
     let b_raw = ops::gemv(dev, &w.w_beta, &h)?;
-    let (g, beta) = ops::gdn_gate_beta(dev, &a_raw, &b_raw, &w.dt_bias, &w.neg_exp_a_log, cfg.gdn_num_v_heads)?;
-    let q = ops::gather(dev, &q, &model.gdn_gqa_cyclic_idx)?;
-    let k = ops::gather(dev, &k, &model.gdn_gqa_cyclic_idx)?;
-    let y = ops::gated_delta_step(
-        dev, &q, &k, &v, &g, &beta, &slot.state,
-        cfg.gdn_key_head_dim, cfg.gdn_value_head_dim, cfg.gdn_num_v_heads, cfg.gdn_num_v_heads,
+    // F-85 round-11 (fusion round): fused q/k-RMSNorm + gate/beta +
+    // gated-delta-net recurrence (`ops::gdn_decode_fused`) + fused
+    // rmsNorm(ssm_norm)+silu(z)+mul tail (`ops::gdn_tail_gate`) — see
+    // their docs in wh-butter-ops. Both stay inside this function's single
+    // `gdn_chain_ms` bucket, same as the unfused chain they replace.
+    let y = ops::gdn_decode_fused(
+        dev, &q_raw, &k_raw, &v, &model.gdn_q_scale, &model.gdn_k_scale, &a_raw, &b_raw, &w.dt_bias,
+        &w.neg_exp_a_log, &slot.state, cfg.eps,
+        cfg.gdn_key_head_dim, cfg.gdn_value_head_dim, cfg.gdn_num_v_heads, cfg.gdn_num_k_heads,
     )?;
-    let y = y.reshaped(vec![cfg.gdn_num_v_heads, cfg.gdn_value_head_dim]);
-    let normed = ops::rms_norm(dev, &y, &w.ssm_norm_w, cfg.eps)?.reshaped(vec![value_dim]);
-    let silu_z = ops::silu(dev, &z)?;
-    let gated = ops::mul(dev, &normed, &silu_z)?;
+    let gated = ops::gdn_tail_gate(dev, &y, &z, &w.ssm_norm_w, cfg.eps, cfg.gdn_num_v_heads, cfg.gdn_value_head_dim)?;
     mark(dev, t0, &mut b.gdn_chain_ms)?;
 
     let o = w.wo.gemv(dev, &gated)?;
@@ -1251,52 +1254,56 @@ fn gdn_layer_full(
     let v = ops::slice(dev, &conv_out, 2 * key_dim, value_dim)?.reshaped(vec![cfg.gdn_num_v_heads, cfg.gdn_value_head_dim]);
     if dbg { dbg_sum(dev, "v_conv_predelta-0", pos, &v); }
 
-    let q = ops::rms_norm(dev, &q_raw, &model.gdn_q_scale, cfg.eps)?;
-    let k = ops::rms_norm(dev, &k_raw, &model.gdn_k_scale, cfg.eps)?;
-    if dbg { dbg_sum(dev, "q_conv_predelta-0", pos, &q); }
-    if dbg { dbg_sum(dev, "k_conv_predelta-0", pos, &k); }
-
     let a_raw = ops::gemv(dev, &w.w_alpha, &h)?;
     let b_raw = ops::gemv(dev, &w.w_beta, &h)?;
-    let (g, beta) = ops::gdn_gate_beta(dev, &a_raw, &b_raw, &w.dt_bias, &w.neg_exp_a_log, cfg.gdn_num_v_heads)?;
+
+    // F-85 round-11 (fusion round, DEBUG-ONLY branch): the fused decode
+    // kernel below doesn't materialize q/k-normed or gate/beta as separate
+    // tensors, so `QWEN35_DEBUG=1`'s per-node oracle dump (layer 0 only)
+    // redundantly recomputes them via the OLD unfused ops here. Zero cost
+    // when `dbg` is false — this never runs on the hot decode path.
     if dbg {
+        let q = ops::rms_norm(dev, &q_raw, &model.gdn_q_scale, cfg.eps)?;
+        let k = ops::rms_norm(dev, &k_raw, &model.gdn_k_scale, cfg.eps)?;
+        dbg_sum(dev, "q_conv_predelta-0", pos, &q);
+        dbg_sum(dev, "k_conv_predelta-0", pos, &k);
+        let (g, beta) = ops::gdn_gate_beta(dev, &a_raw, &b_raw, &w.dt_bias, &w.neg_exp_a_log, cfg.gdn_num_v_heads)?;
         // Oracle's `gate-0` is LOG-space (ln(g) = neg_exp_a_log * softplus(...));
         // our `g` is already exp'd, so take ln() host-side for an apples-to-apples sum.
         let n = g.elem_count();
-        let mut b = vec![0u8; n * 4];
+        let mut buf = vec![0u8; n * 4];
         dev.synchronize().ok();
-        dev.download(g.buffer.as_ref(), &mut b).ok();
-        let gv: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        dev.download(g.buffer.as_ref(), &mut buf).ok();
+        let gv: Vec<f32> = buf.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
         let ln_sum: f64 = gv.iter().map(|&x| (x as f64).ln()).sum();
         eprintln!("QWEN35_DBG pos={pos} tag=gate-0(ln_g) n={n} sum={ln_sum:.6}");
         dbg_sum(dev, "beta_sigmoid-0", pos, &beta);
     }
 
-    // `iron_gated_delta_step`'s own internal GQA decomposition is
-    // `hk_idx = hv_idx / (Hv/Hk)` (contiguous blocks) — but the reference
-    // this checkpoint was actually validated against (llama.cpp's CUDA
-    // `gated_delta_net.cu`, `iq1 = fastmodulo(h_idx, neqk1)`, i.e.
-    // `hv_idx % Hk`) uses the CYCLIC/tiled mapping instead (verified by
-    // oracle checksum diff: `attn_output` matched to 0.01% only after
-    // switching to cyclic — the block mapping was ~20% off). Pre-expand
-    // q/k from `[Hk,Dk]` to `[Hv,Dk]` on-device via `ops::gather` with the
-    // constant `gdn_gqa_cyclic_idx` (`idx[hv] = hv % Hk`), then call the
-    // kernel with `hk=Hv` so its internal grouping becomes a no-op
-    // identity map — sidesteps patching the pinned iron kernel entirely.
-    let q = ops::gather(dev, &q, &model.gdn_gqa_cyclic_idx)?;
-    let k = ops::gather(dev, &k, &model.gdn_gqa_cyclic_idx)?;
-
-    let y = ops::gated_delta_step(
-        dev, &q, &k, &v, &g, &beta, &slot.state,
-        cfg.gdn_key_head_dim, cfg.gdn_value_head_dim, cfg.gdn_num_v_heads, cfg.gdn_num_v_heads,
+    // F-85 round-11: fused q/k-RMSNorm + gate/beta + gated-delta-net
+    // recurrence, ONE dispatch (`ops::gdn_decode_fused`) instead of the
+    // 5-dispatch chain (2x rms_norm + gdn_gate_beta + 2x gather) above it
+    // — see that op's doc for the numerical-match rationale. The CYCLIC
+    // GQA mapping this checkpoint requires (`hv_idx % Hk`, verified by
+    // oracle checksum diff against the kernel-default contiguous-block
+    // mapping — `attn_output` matched to 0.01% only after switching to
+    // cyclic, the block mapping was ~20% off) is baked into the fused
+    // kernel directly, so `q_raw`/`k_raw` are passed at their native
+    // `[Hk,Dk]` shape with no pre-expand gather needed.
+    let y = ops::gdn_decode_fused(
+        dev, &q_raw, &k_raw, &v, &model.gdn_q_scale, &model.gdn_k_scale, &a_raw, &b_raw, &w.dt_bias,
+        &w.neg_exp_a_log, &slot.state, cfg.eps,
+        cfg.gdn_key_head_dim, cfg.gdn_value_head_dim, cfg.gdn_num_v_heads, cfg.gdn_num_k_heads,
     )?;
     if dbg { dbg_sum(dev, "attn_output-0", pos, &y); }
 
-    let y = y.reshaped(vec![cfg.gdn_num_v_heads, cfg.gdn_value_head_dim]);
-    let normed = ops::rms_norm(dev, &y, &w.ssm_norm_w, cfg.eps)?.reshaped(vec![value_dim]);
-    if dbg { dbg_sum(dev, "node_50", pos, &normed); }
-    let silu_z = ops::silu(dev, &z)?;
-    let gated = ops::mul(dev, &normed, &silu_z)?;
+    // F-85 round-11: fused rmsNorm(ssm_norm) + silu(z) + mul, ONE dispatch
+    // (`ops::gdn_tail_gate`) instead of 3 — see that op's doc. NOTE: the
+    // pre-mul "node_50" debug tap (the old code's `normed` intermediate)
+    // is no longer separately available post-fusion and is dropped; the
+    // pre-fusion "attn_output-0" (y) and post-fusion "final_output-0"
+    // (gated) taps still bracket it.
+    let gated = ops::gdn_tail_gate(dev, &y, &z, &w.ssm_norm_w, cfg.eps, cfg.gdn_num_v_heads, cfg.gdn_value_head_dim)?;
     if dbg { dbg_sum(dev, "final_output-0", pos, &gated); }
 
     let o = w.wo.gemv(dev, &gated)?;
