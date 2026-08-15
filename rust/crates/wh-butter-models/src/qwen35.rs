@@ -308,12 +308,35 @@ struct Q8Head {
     k: usize,
 }
 
+/// Perf-campaign lever (decode-perf-campaign, 2026-08): vocab 248320 x
+/// hidden 5120 makes the untied lm_head a monster single-token GEMV
+/// (~7.7% of total decode-step GPU time at Q8, measured via nsys on this
+/// port — `iron_gemv_q8_coalesced` avg ~6.5ms/step vs `iron_gemv_q4_coalesced`
+/// dominating at ~85%). Q4 roughly halves the bytes streamed for this one
+/// GEMV. Kept SWITCHABLE (env `QWEN35_LM_HEAD_Q4=1`, default remains Q8)
+/// rather than an outright replacement: Laguna deliberately keeps its lm_head
+/// at Q8 for output-quality reasons (see `laguna.rs`), and this port's oracle
+/// gate is sensitive to any argmax perturbation — Q4 must be measured for
+/// speedup AND re-gated against the oracle before it can become the default.
+enum LmHead {
+    Q8(Q8Head),
+    Q4(Q4Dense),
+}
+impl LmHead {
+    fn gemv(&self, dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
+        match self {
+            LmHead::Q8(h) => ops::gemv_q8(dev, &h.qs, &h.scales, x, h.m, h.k, h.m),
+            LmHead::Q4(h) => h.gemv(dev, x),
+        }
+    }
+}
+
 pub struct Qwen35Model {
     pub cfg: Qwen35Config,
     tok_embd: Tensor, // f32 [vocab, hidden]
     layers: Vec<Qwen35Layer>,
     out_norm: Tensor, // f32 [hidden]
-    lm_head: Q8Head,
+    lm_head: LmHead,
     /// Constant (not loaded) per-head Q/K rescale buffers for GDN, shared
     /// across all GDN layers: Qwen3.5's GDN normalizes q/k with a WEIGHTLESS
     /// RMSNorm scaled by `invScale^2` (q) / `invScale` (k), `invScale =
@@ -354,14 +377,19 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
     };
     let out_norm = load_f32_vec(dev, g, "output_norm.weight")?;
     let head_name = if g.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
-    let lm_head = {
+    // QWEN35_LM_HEAD_Q4=1: perf-campaign A/B lever, see `LmHead`'s doc.
+    // Default (unset/0) keeps the Laguna-established Q8 lm_head.
+    let lm_head_q4 = std::env::var("QWEN35_LM_HEAD_Q4").map(|v| v == "1").unwrap_or(false);
+    let lm_head = if lm_head_q4 {
+        LmHead::Q4(load_q4dense(dev, g, head_name)?)
+    } else {
         let (qs, scales, m, k) = g.q8_repack(head_name)?;
-        Q8Head {
+        LmHead::Q8(Q8Head {
             qs: Tensor::new(dev.upload(&u32s_to_bytes(&qs))?, vec![qs.len()], DType::U32),
             scales: Tensor::new(dev.upload(&f32s_to_bytes(&scales))?, vec![scales.len()], DType::F32),
             m,
             k,
-        }
+        })
     };
 
     let inv_scale = 1.0 / (cfg.gdn_key_head_dim as f32).sqrt();
@@ -601,7 +629,7 @@ pub fn decode_step(dev: &dyn Device, model: &Qwen35Model, cache: &mut Qwen35Cach
     }
 
     let xn = ops::rms_norm(dev, &x, &model.out_norm, cfg.eps)?;
-    ops::gemv_q8(dev, &model.lm_head.qs, &model.lm_head.scales, &xn, model.lm_head.m, model.lm_head.k, model.lm_head.m)
+    model.lm_head.gemv(dev, &xn)
 }
 
 /// One GDN (linear-attention) layer's forward. Takes `model` (rather than
