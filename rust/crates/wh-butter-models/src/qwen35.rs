@@ -266,6 +266,45 @@ impl Q4Dense {
         }
         ops::gemv_q4(dev, &self.qs, &self.scales, x, self.m, self.k, self.m)
     }
+
+    /// Batched (`T`-row) GEMM for the chunked-prefill path (F-85 prefill
+    /// wave): `out[t,:] = weight * x[t,:]` for all `t` rows in one
+    /// dispatch. `x` is `[t, k]` f32, returns `[t, m]` f32.
+    ///
+    /// A per-shape microbench (`qwen35_prefill_gemm_microbench.rs`) at
+    /// M=512/2048 across every routed projection shape found the batched
+    /// Marlin U4B8 GEMM (this weight's EXISTING decode-M=1 `MarlinWeight`
+    /// copy, just re-routed/re-configured for `t` instead of `1` -- see
+    /// `marlin_routing_for`/`marlin_config_for`) faster than
+    /// `gemm_q4_mpp` by 6.6x-35x at every shape tested, not a close call --
+    /// `gemm_q4_mpp`'s coop_tile software-GEMM path (see
+    /// `GDN_PREFILL_CONTRACT.md` §7.1's writeup on this same CUDA
+    /// CoopTile-lowering cost class) does not scale onto GB10's tensor
+    /// cores the way the real WMMA-class Marlin kernel does. So: use
+    /// Marlin whenever this weight has one (every routed weight class
+    /// does, per the `IRON_MARLIN_BUILD=1 QWEN35_MARLIN=1` build config
+    /// this port runs under), falling back to `gemm_q4_mpp` only for a
+    /// weight that never got a marlin build (dimension not 64/32-aligned,
+    /// or `QWEN35_MARLIN=0`).
+    fn gemm(&self, dev: &dyn Device, x: &Tensor, t: usize) -> Result<Tensor> {
+        if let Some(mw) = &self.marlin {
+            let routing = marlin_routing_for(dev, t)?;
+            let (workspace, c_tmp) = marlin_shared_scratch(dev)?;
+            let (thread_k, thread_n, blocks_per_sm) = marlin_config_for(dev, t, self.m, self.k)?;
+            let need_cast = x.dtype != DType::F16;
+            let x16 = if need_cast { ops::cast_f32_f16(dev, x)? } else { x.clone() };
+            let out16 = ops::marlin_gemm_u4b8_f16(
+                dev, &x16, &mw.b_repacked, &mw.b_scales,
+                &routing.0, &routing.1, &routing.2,
+                workspace, c_tmp,
+                t, self.m, self.k, marlin_group_size(), GB10_SMS,
+                thread_k, thread_n, blocks_per_sm,
+            )?;
+            let out16 = out16.reshaped(vec![t, self.m]);
+            return if need_cast { ops::cast_f16_f32(dev, &out16) } else { Ok(out16) };
+        }
+        ops::gemm_q4_mpp(dev, x, &self.qs, &self.scales, t, self.m, self.k)
+    }
 }
 
 /// GB10 (sm_121a) SM count -- matches the round-7/8 marlin probe harness
@@ -332,6 +371,50 @@ fn marlin_shared_scratch(dev: &dyn Device) -> Result<(&'static Tensor, &'static 
     let pair = ops::marlin_gemm_u4b8_workspace(dev, 17408, GB10_SMS)?;
     let (w, c) = MARLIN_SCRATCH.get_or_init(|| pair);
     Ok((w, c))
+}
+
+/// F-85 prefill wave: per-chunk-size cache of the marlin routing triple
+/// (`sorted_token_ids`/`expert_ids`/`num_tokens_past_padded`) for the
+/// trivial single-"expert" `off={0,t}` case, generalizing
+/// [`marlin_m1_routing`] from the fixed `t=1` decode case to whatever
+/// chunk size(s) `prefill` actually runs with (typically one entry, the
+/// chunk size, plus a second for a shorter final chunk) -- built once per
+/// distinct `t` and reused for every weight/layer/chunk of that size,
+/// mirroring `marlin_m1_routing`'s "independent of the weight" rationale.
+static MARLIN_ROUTING_BY_T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, (Tensor, Tensor, Tensor)>>> =
+    std::sync::OnceLock::new();
+
+fn marlin_routing_for(dev: &dyn Device, t: usize) -> Result<(Tensor, Tensor, Tensor)> {
+    let cache = MARLIN_ROUTING_BY_T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(r) = cache.lock().unwrap().get(&t) {
+        return Ok(r.clone());
+    }
+    let off_bytes: Vec<u8> = [0i32, t as i32].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let off = Tensor::new(dev.upload(&off_bytes)?, vec![2], DType::I32);
+    let routing = ops::marlin_build_routing(dev, &off, 1, 8, t)?;
+    cache.lock().unwrap().insert(t, routing.clone());
+    Ok(routing)
+}
+
+/// F-85 prefill wave: per-`(m, k, t)`-shape cache of `marlin_mm`'s
+/// auto-config triple, generalizing [`build_marlin`]'s load-time `t=1`
+/// resolution (round-10, lever 1) to prefill's batched `t`. Same
+/// rationale: `marlin_mm`'s own auto-config search is a
+/// `cudaFuncGetAttributes` probe loop, deterministic for a fixed
+/// `(t, m, k)` -- resolve once per distinct shape/chunk-size combination
+/// (a handful, not once per layer) and reuse.
+static MARLIN_CONFIG_BY_SHAPE_T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (i32, i32, i32)>>> =
+    std::sync::OnceLock::new();
+
+fn marlin_config_for(dev: &dyn Device, t: usize, m: usize, k: usize) -> Result<(i32, i32, i32)> {
+    let cache = MARLIN_CONFIG_BY_SHAPE_T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = (t, m, k);
+    if let Some(c) = cache.lock().unwrap().get(&key) {
+        return Ok(*c);
+    }
+    let cfg = ops::marlin_pick_config(dev, t, m, k, marlin_group_size(), GB10_SMS)?;
+    cache.lock().unwrap().insert(key, cfg);
+    Ok(cfg)
 }
 
 /// F-85 round-8: builds the marlin U4B8 repacked-weight + permuted-scale
@@ -474,6 +557,19 @@ struct GdnWeights {
     w_beta: Tensor,        // f32 [Hv, hidden]                ("ssm_beta"  = in_proj_b)
     dt_bias: Tensor,       // f32 [Hv]
     neg_exp_a_log: Tensor, // f32 [Hv]  == GGUF's ssm_a directly (already -exp(A_log), see load_gguf)
+    /// `ln(-neg_exp_a_log)` — the RAW `a_log` the GENERIC
+    /// `iron_gated_delta_prep_chunk[_fast]` kernel family expects (it
+    /// computes `g = exp(-exp(a_log)*dt)` in-kernel, unlike the qwen35-
+    /// specific decode kernel `iron_gdn_decode_fused`, which takes the
+    /// checkpoint's already-transformed `neg_exp_a_log` directly and
+    /// computes `g = exp(neg_exp_a_log*dt)` — see
+    /// `ops::gdn_prep_chunk_fast_27b`'s doc for why re-deriving this once
+    /// at load time, instead of feeding `neg_exp_a_log` straight through,
+    /// is required for prefill-then-decode continuation to match:
+    /// `neg_exp_a_log` is always < 0 (it's `-exp(x)` for real `x`), so
+    /// `ln(-neg_exp_a_log)` is always finite. Computed once, host-side, at
+    /// load time (tiny, `[Hv]`-wide) — NOT a hot-path cost.
+    a_log_raw: Tensor,     // f32 [Hv]
     conv_w: Tensor,        // f32 [conv_kernel*conv_dim], kernel-major (repacked)
     ssm_norm_w: Tensor,    // f32 [Dv]  gated-RMSNorm weight
     wo: Q4Dense,           // [hidden, value_dim]             ("ssm_out")
@@ -677,6 +773,13 @@ pub struct Qwen35Model {
     /// it with a constant reproduces the weightless-scaled form exactly.
     gdn_q_scale: Tensor, // f32 [gdn_key_head_dim], all invScale^2
     gdn_k_scale: Tensor, // f32 [gdn_key_head_dim], all invScale
+    /// F-85 prefill wave: `[Hk*Dk]`-tiled siblings of `gdn_q_scale`/
+    /// `gdn_k_scale`, for `ops::gdn_qknorm_prepass_chunk`'s per-head-shaped
+    /// `q_norm_weight`/`k_norm_weight` params — see `gdn_q_scale_tiled`'s
+    /// build-site doc (`load_gguf`) for why the untiled `[Dk]` buffer is
+    /// wrong there (an out-of-bounds read, not just a shape mismatch).
+    gdn_q_scale_tiled: Tensor, // f32 [Hk*Dk], invScale^2 repeated per head
+    gdn_k_scale_tiled: Tensor, // f32 [Hk*Dk], invScale repeated per head
     /// Zero bias for `ops::conv1d_causal_silu_many` — Qwen3.5's GDN conv1d
     /// has `bias: false`.
     gdn_conv_zero_bias: Tensor, // f32 [conv_dim]
@@ -746,6 +849,38 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
         let v = vec![inv_scale; cfg.gdn_key_head_dim];
         Tensor::new(dev.upload(&f32s_to_bytes(&v))?, vec![cfg.gdn_key_head_dim], DType::F32)
     };
+    // F-85 prefill wave: `iron_gated_delta_qknorm_prepass` (batched chunked
+    // prefill's q/k RMSNorm pre-pass) indexes its `q_norm_weight`/
+    // `k_norm_weight` params as `[Hk, Dk]` (a genuine PER-HEAD learned
+    // weight, in the generic form this kernel family was designed for) --
+    // unlike `gdn_q_scale`/`gdn_k_scale` above, which are `[Dk]`-only
+    // CONSTANT buffers (Qwen3.5's GDN q/k RMSNorm is weightless-scaled,
+    // broadcasting the SAME `invScale`/`invScale^2` pattern across every
+    // head, see those fields' doc). Feeding the `[Dk]` buffer directly
+    // into a kernel that reads `w[hk_idx*Dk + s_idx]` for `hk_idx` up to
+    // `Hk-1=15` is a 16x out-of-bounds read for every head but hk_idx=0 --
+    // caught by this port's prefill-vs-decode-loop identity test (silently
+    // wrong/erratic GDN layer-0 output, no crash since the OOB read still
+    // lands in-bounds of an adjacent device allocation). Fix: tile the
+    // constant `[Dk]` pattern `Hk` times into a real `[Hk*Dk]` buffer once
+    // at load time -- mathematically a no-op (every head gets the
+    // identical scale, exactly reproducing the broadcast this checkpoint's
+    // weightless RMSNorm wants), just in the shape this kernel's generic
+    // per-head-weight contract requires.
+    let gdn_q_scale_tiled = {
+        let mut v = vec![0.0f32; cfg.gdn_num_k_heads * cfg.gdn_key_head_dim];
+        for h in 0..cfg.gdn_num_k_heads {
+            v[h * cfg.gdn_key_head_dim..(h + 1) * cfg.gdn_key_head_dim].fill(inv_scale * inv_scale);
+        }
+        Tensor::new(dev.upload(&f32s_to_bytes(&v))?, vec![v.len()], DType::F32)
+    };
+    let gdn_k_scale_tiled = {
+        let mut v = vec![0.0f32; cfg.gdn_num_k_heads * cfg.gdn_key_head_dim];
+        for h in 0..cfg.gdn_num_k_heads {
+            v[h * cfg.gdn_key_head_dim..(h + 1) * cfg.gdn_key_head_dim].fill(inv_scale);
+        }
+        Tensor::new(dev.upload(&f32s_to_bytes(&v))?, vec![v.len()], DType::F32)
+    };
     let gdn_conv_zero_bias = {
         let v = vec![0.0f32; cfg.gdn_conv_dim()];
         Tensor::new(dev.upload(&f32s_to_bytes(&v))?, vec![cfg.gdn_conv_dim()], DType::F32)
@@ -787,6 +922,22 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
             // over-decayed the GDN state on every step, killing context
             // retention). Use the tensor directly, no further transform.
             let neg_exp_a_log = g.dequant_f32(&format!("{p}.ssm_a"))?;
+            // See `GdnWeights::a_log_raw`'s doc: the GENERIC prep-chunk
+            // kernel family (batched prefill) re-applies `-exp()` in-kernel,
+            // so it needs the RAW a_log this inverts back out of the
+            // checkpoint's already-transformed `ssm_a` tensor.
+            let a_log_raw_host: Vec<f32> = neg_exp_a_log.iter().map(|&v| (-v).ln()).collect();
+            if i == 0 && std::env::var("QWEN35_DEBUG").is_ok() {
+                let n_nan = a_log_raw_host.iter().filter(|v| v.is_nan()).count();
+                let n_pos_input = neg_exp_a_log.iter().filter(|&&v| v >= 0.0).count();
+                eprintln!(
+                    "QWEN35_DBG layer0 neg_exp_a_log min={:?} max={:?} a_log_raw min={:?} max={:?} n_nan={n_nan} n_pos_input={n_pos_input}",
+                    neg_exp_a_log.iter().cloned().fold(f32::INFINITY, f32::min),
+                    neg_exp_a_log.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                    a_log_raw_host.iter().cloned().filter(|v| !v.is_nan()).fold(f32::INFINITY, f32::min),
+                    a_log_raw_host.iter().cloned().filter(|v| !v.is_nan()).fold(f32::NEG_INFINITY, f32::max),
+                );
+            }
             let conv_flat = g.dequant_f32(&format!("{p}.ssm_conv1d.weight"))?;
             let conv_repacked = repack_conv1d_weight(&conv_flat, cfg.gdn_conv_dim(), cfg.gdn_conv_kernel);
             Mixer::Gdn(GdnWeights {
@@ -802,6 +953,11 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
                 neg_exp_a_log: Tensor::new(
                     dev.upload(&f32s_to_bytes(&neg_exp_a_log))?,
                     vec![neg_exp_a_log.len()],
+                    DType::F32,
+                ),
+                a_log_raw: Tensor::new(
+                    dev.upload(&f32s_to_bytes(&a_log_raw_host))?,
+                    vec![a_log_raw_host.len()],
                     DType::F32,
                 ),
                 conv_w: Tensor::new(
@@ -841,6 +997,8 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
         mtp,
         gdn_q_scale,
         gdn_k_scale,
+        gdn_q_scale_tiled,
+        gdn_k_scale_tiled,
         gdn_conv_zero_bias,
         gdn_gqa_cyclic_idx,
     })
@@ -922,6 +1080,27 @@ fn dbg_sum(dev: &dyn Device, tag: &str, pos: u32, t: &Tensor) {
     let f: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
     let sum: f64 = f.iter().map(|&v| v as f64).sum();
     eprintln!("QWEN35_DBG pos={pos} tag={tag} n={n} sum={sum:.6} head={:?}", &f[..4.min(n)]);
+}
+
+/// F-85 prefill wave debug aid: like `dbg_sum`, but for a batched `[T,
+/// hidden]` prefill tensor -- prints ONE line PER ROW, tagged with that
+/// row's absolute position, in the SAME `QWEN35_DBG pos=N tag=... sum=...`
+/// format `dbg_sum` (decode) uses, so a prefill run's per-position
+/// checksums can be grepped/diffed directly against a decode-loop run's
+/// over the same prompt (both gated by `QWEN35_DEBUG=1`).
+fn dbg_sum_rows(dev: &dyn Device, tag: &str, positions: &[u32], t: &Tensor, hidden: usize) {
+    let n = t.elem_count();
+    let mut b = vec![0u8; n * 4];
+    if dev.synchronize().is_err() || dev.download(t.buffer.as_ref(), &mut b).is_err() {
+        eprintln!("QWEN35_DBG(rows) tag={tag}: <download failed>");
+        return;
+    }
+    let f: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    for (row, &pos) in positions.iter().enumerate() {
+        let row_slice = &f[row * hidden..(row + 1) * hidden];
+        let sum: f64 = row_slice.iter().map(|&v| v as f64).sum();
+        eprintln!("QWEN35_DBG pos={pos} tag={tag} n={hidden} sum={sum:.6} head={:?}", &row_slice[..4.min(hidden)]);
+    }
 }
 
 fn full_attn_layer(
@@ -1019,6 +1198,328 @@ pub fn decode_step_ex(
     let xn = ops::rms_norm(dev, &x, &model.out_norm, cfg.eps)?;
     let logits = model.lm_head.gemv(dev, &xn)?;
     Ok((logits, xn))
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// F-85 prefill wave: BATCHED chunked prefill.
+//
+// Replaces "prefill via repeated decode_step" (the module doc's documented
+// v1 limitation) with a real batched forward: `T` prompt-token rows
+// processed per layer in one dispatch chain instead of `T` sequential
+// per-token calls. Mirrors `laguna.rs`'s `prefill`/`prefill_layer`
+// structure and conventions (chunked outer loop, `start`/`positions`
+// threading, `t_len`-scalar dispatch, last-row-only lm_head) -- see that
+// file's doc for the established pattern this follows.
+//
+// GDN layers: `iron_conv1d_causal_prefill` (state-continued via
+// `ops::concat_rows_f32` prepending the carried `conv_state` history, see
+// `prefill_layer_gdn`'s doc) + `ops::gdn_qknorm_prepass_chunk` +
+// `ops::gdn_prep_chunk_fast_27b` (the validated Hv=48 GDN chunk kernel,
+// see `GDN_PREFILL_CONTRACT.md`) -- state stays register-resident across
+// the whole chunk, one load/store per chunk per layer instead of per token.
+//
+// Full-attn layers: batched QKV projection + per-head RMSNorm + batched
+// partial-rotary RoPE (`ops::rope_yarn_partial_many`) + batched KV-cache
+// write (`ops::kv_append_many`) + batched causal SDPA
+// (`ops::sdpa_multi_tc_varlen`) + batched sigmoid output gate
+// (`ops::strided_head_half_many` + `ops::sigmoid_mul`).
+//
+// GEMM: every dense projection routes through `Q4Dense::gemm` ->
+// `ops::gemm_q4_mpp` (see that method's doc for the marlin-vs-mpp
+// microbench finding). Decode's separate M=1 U4B8 Marlin path
+// (`Q4Dense::gemv`) is untouched.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One BATCHED GDN prefill layer: `T` prompt-token rows processed in one
+/// forward instead of `T` sequential per-token recurrence steps. `x` is
+/// `[T, hidden]` f32.
+///
+/// State-carry across external chunks: `iron_conv1d_causal_prefill`
+/// (unlike the GDN recurrence kernel) always starts from ZERO initial
+/// conv state -- it has no `state_in` parameter, see its doc. To thread
+/// this layer's carried `conv_state` (the `conv_kernel-1` most recent RAW
+/// qkv rows) across chunks, this function PREPENDS `conv_state` onto the
+/// chunk's `T` new raw qkv rows (`ops::concat_rows_f32`) before calling
+/// the zero-state kernel over all `conv_kernel-1+T` rows, then slices off
+/// the first `conv_kernel-1` (warm-up, already-known) output rows to get
+/// this chunk's real `conv_out`, and re-derives the new `conv_state` as
+/// the LAST `conv_kernel-1` rows of the same concatenated input buffer
+/// (correct for any `T`, including `T < conv_kernel-1`, since it's just
+/// "the last `conv_kernel-1` rows of the [history; new] sequence" either
+/// way). At the very start of a fresh sequence `conv_state` is the
+/// `Qwen35Cache::new` zero-init, giving the same zero-state behavior
+/// `conv1d_causal_silu_many`'s decode-step path starts from.
+///
+/// The recurrent GDN state itself (`slot.state`, `[Hv,Dv,Dk]`) needs no
+/// such trick: `ops::gdn_prep_chunk_fast_27b` takes `state_in` directly
+/// and IS the state-carrying kernel (see its doc / `GDN_PREFILL_CONTRACT.md`).
+#[allow(clippy::too_many_arguments)]
+fn prefill_layer_gdn(
+    dev: &dyn Device,
+    cfg: &Qwen35Config,
+    model: &Qwen35Model,
+    w: &GdnWeights,
+    slot: &mut GdnSlot,
+    x: &Tensor, // [T, hidden]
+    t: usize,
+    t_len: &Tensor, // [1] u32, == t
+) -> Result<Tensor> {
+    let hidden = cfg.hidden;
+    let conv_dim = cfg.gdn_conv_dim();
+    let kc = cfg.gdn_conv_kernel;
+    let value_dim = cfg.gdn_value_dim();
+    let hv = cfg.gdn_num_v_heads;
+    let hk = cfg.gdn_num_k_heads;
+    let dk = cfg.gdn_key_head_dim;
+    let dv = cfg.gdn_value_head_dim;
+
+    let trace = std::env::var("QWEN35_PREFILL_TRACE").is_ok();
+    macro_rules! tr {
+        ($tag:expr) => {
+            if trace { dev.synchronize().map_err(|e| Error::Msg(format!("prefill_layer_gdn trace fault at {}: {e:?}", $tag)))?; eprintln!("QWEN35_PREFILL_TRACE gdn t={t} ok: {}", $tag); }
+        };
+    }
+
+    let h = ops::rms_norm(dev, x, &w.attn_norm, cfg.eps)?; // [T, hidden]
+    tr!("rms_norm(attn_norm)");
+    let qkv_raw = w.wqkv.gemm(dev, &h, t)?; // [T, conv_dim]  (PRE-conv, matches decode's w.wqkv.gemv feed)
+    tr!("wqkv.gemm");
+    let z = w.wz.gemm(dev, &h, t)?; // [T, value_dim]  (output gate, never conv'd)
+    tr!("wz.gemm");
+
+    // conv1d+SiLU, state-continued (see this fn's doc).
+    let concatenated = ops::concat_rows_f32(dev, &slot.conv_state, kc - 1, &qkv_raw.reshaped(vec![t * conv_dim]), t, conv_dim)?;
+    tr!("concat_rows_f32");
+    let conv_full = ops::conv1d_causal_prefill(dev, &concatenated, &w.conv_w, &model.gdn_conv_zero_bias, kc - 1 + t, conv_dim, kc)?;
+    tr!("conv1d_causal_prefill");
+    let conv_out = ops::slice(dev, &conv_full, (kc - 1) * conv_dim, t * conv_dim)?; // [T, conv_dim]
+    slot.conv_state = ops::slice(dev, &concatenated, t * conv_dim, (kc - 1) * conv_dim)?.reshaped(vec![kc - 1, conv_dim]);
+    tr!("slice x2");
+
+    // Batched alpha/beta raw projections: [T, hidden] -> [T, Hv].
+    let a_raw = ops::matmul(dev, &w.w_alpha, &h)?; // [T, Hv]
+    let b_raw = ops::matmul(dev, &w.w_beta, &h)?; // [T, Hv]
+    tr!("matmul(alpha/beta)");
+
+    // Hoisted q/k RMSNorm pre-pass, then the chunked GDN recurrence.
+    // NOTE: the TILED `[Hk*Dk]` scale buffers, not `gdn_q_scale`/
+    // `gdn_k_scale` (`[Dk]` only) -- see `Qwen35Model::gdn_q_scale_tiled`'s
+    // doc for why the untiled buffer is an out-of-bounds read here.
+    let (q_normed, k_normed) = ops::gdn_qknorm_prepass_chunk(
+        dev, &conv_out, &model.gdn_q_scale_tiled, &model.gdn_k_scale_tiled, t_len, t, dk, dv, hv, hk,
+    )?;
+    tr!("gdn_qknorm_prepass_chunk");
+    let y = ops::gdn_prep_chunk_fast_27b(
+        dev, &conv_out, &w.a_log_raw, &w.dt_bias, &a_raw, &b_raw, &q_normed, &k_normed, &slot.state, t_len, t,
+    )?; // [T, Hv, Dv]
+    tr!("gdn_prep_chunk_fast_27b");
+
+    // Gate-AFTER-norm tail (unfused, batched): rmsNorm(y, ssm_norm_w) *
+    // silu(z), per-`(t,hv)` row over `Dv` -- see `gdn_tail_gate`'s doc for
+    // why this is NOT `gated_group_rmsnorm`'s gate-BEFORE-norm convention.
+    // `ops::rms_norm` already normalizes per-ROW over the last axis with a
+    // per-element weight, so `[T*Hv, Dv]` batches this exactly like the
+    // full-attn q/k-norm batching above.
+    let y2 = ops::rms_norm(dev, &y.reshaped(vec![t * hv, dv]), &w.ssm_norm_w, cfg.eps)?;
+    let z_silu = ops::silu(dev, &z.reshaped(vec![t * value_dim]))?;
+    let gated = ops::mul(dev, &y2.reshaped(vec![t * value_dim]), &z_silu)?; // [T, value_dim]
+    tr!("tail gate");
+
+    let o = w.wo.gemm(dev, &gated.reshaped(vec![t, value_dim]), t)?; // [T, hidden]
+    tr!("wo.gemm");
+    let out = ops::add(dev, &x.reshaped(vec![t * hidden]), &o.reshaped(vec![t * hidden]))?;
+    tr!("add residual");
+    Ok(out.reshaped(vec![t, hidden]))
+}
+
+/// One BATCHED full-attention prefill layer: `T` prompt-token rows
+/// processed in one forward instead of `T` sequential `full_attn_layer`
+/// calls. Same op sequence as `full_attn_layer` (RMSNorm -> fused Q+gate
+/// proj -> de-interleave -> per-head QK-RMSNorm -> partial-rotary RoPE ->
+/// KV-cache write -> causal SDPA -> sigmoid gate -> o_proj -> residual),
+/// batched over `[T, ...]` tensors. No sliding window in this
+/// architecture (unlike Laguna) -- every full-attn layer attends the full
+/// causal prefix, so KV writes go straight into `cache`'s persistent
+/// growing slot (matches decode's `full_attn_layer`; no separate linear
+/// prefill scratch needed).
+#[allow(clippy::too_many_arguments)]
+fn prefill_layer_full(
+    dev: &dyn Device,
+    cfg: &Qwen35Config,
+    w: &FullAttnWeights,
+    slot: &mut FullAttnSlot,
+    x: &Tensor, // [T, hidden]
+    t: usize,
+    start: usize,
+    positions: &Tensor, // [T] u32
+) -> Result<Tensor> {
+    let hd = cfg.head_dim;
+    let hidden = cfg.hidden;
+    let n_head = cfg.n_head;
+    let n_kv_heads = cfg.n_kv_heads;
+    let heads_per_group = (n_head / n_kv_heads) as u32;
+    let trace = std::env::var("QWEN35_PREFILL_TRACE").is_ok();
+    macro_rules! tr {
+        ($tag:expr) => {
+            if trace { dev.synchronize().map_err(|e| Error::Msg(format!("prefill_layer_full trace fault at {}: {e:?}", $tag)))?; eprintln!("QWEN35_PREFILL_TRACE full t={t} ok: {}", $tag); }
+        };
+    }
+
+    let h = ops::rms_norm(dev, x, &w.attn_norm, cfg.eps)?; // [T, hidden]
+    tr!("rms_norm(attn_norm)");
+    let qg = w.wq.gemm(dev, &h, t)?; // [T, n_head*2*head_dim]
+    tr!("wq.gemm");
+    let k = w.wk.gemm(dev, &h, t)?; // [T, n_kv_heads*head_dim]
+    tr!("wk.gemm");
+    let v = w.wv.gemm(dev, &h, t)?; // [T, n_kv_heads*head_dim]
+    tr!("wv.gemm");
+
+    let q = ops::strided_head_half_many(dev, &qg.reshaped(vec![t * n_head * 2 * hd]), t, n_head, hd, 0)?; // [T, n_head*hd]
+    let gate = ops::strided_head_half_many(dev, &qg.reshaped(vec![t * n_head * 2 * hd]), t, n_head, hd, 1)?; // [T, n_head*hd]
+    tr!("strided_head_half_many x2");
+
+    let q2 = ops::rms_norm(dev, &q.reshaped(vec![t * n_head, hd]), &w.q_norm, cfg.eps)?;
+    let k2 = ops::rms_norm(dev, &k.reshaped(vec![t * n_kv_heads, hd]), &w.k_norm, cfg.eps)?;
+    tr!("q/k rms_norm");
+    // Partial-rotary RoPE, plain (YaRN disabled) -- same fixed params as
+    // `full_attn_layer`'s per-token `ops::rope_yarn_partial` call.
+    let q3 = ops::rope_yarn_partial_many(
+        dev, &q2.reshaped(vec![t, n_head, hd]), positions, n_head,
+        cfg.rope_n_rot, cfg.rope_theta, 1.0, 0.0, 1.0, 32.0, 1.0, 262144,
+    )?;
+    let k3 = ops::rope_yarn_partial_many(
+        dev, &k2.reshaped(vec![t, n_kv_heads, hd]), positions, n_kv_heads,
+        cfg.rope_n_rot, cfg.rope_theta, 1.0, 0.0, 1.0, 32.0, 1.0, 262144,
+    )?;
+    tr!("rope_yarn_partial_many x2");
+    let v3 = v.reshaped(vec![t, n_kv_heads, hd]);
+
+    ops::kv_append_many(dev, &k3, positions, &slot.k, n_kv_heads, hd, slot.cap)?;
+    ops::kv_append_many(dev, &v3, positions, &slot.v, n_kv_heads, hd, slot.cap)?;
+    tr!("kv_append_many x2");
+
+    // Every query attends the full causal prefix: seg_lo = 0 for all rows,
+    // no sliding-window skip (win=0) -- matches Laguna's full-attn-layer
+    // branch (`sdpa_varlen_1`), this architecture has no sliding layers.
+    let seg_lo = Tensor::new(dev.alloc_zeroed(t * 4)?, vec![t], DType::U32);
+    let attn = ops::sdpa_multi_tc_varlen(
+        dev, &q3, &slot.k, &slot.v, &seg_lo, 0, hd, n_head as u32,
+        start as u32, t as u32, slot.cap as u32, heads_per_group, true, cfg.attn_scale(), 0,
+    )?; // [T, n_head, hd]
+    tr!("sdpa_multi_tc_varlen");
+
+    // Sigmoid output gate (NOT swish -- see module doc), batched.
+    let attn_flat = attn.reshaped(vec![t * n_head * hd]);
+    let gated = ops::sigmoid_mul(dev, &attn_flat, &gate)?;
+    tr!("sigmoid_mul");
+
+    let o = w.wo.gemm(dev, &gated.reshaped(vec![t, n_head * hd]), t)?;
+    tr!("wo.gemm");
+    let out = ops::add(dev, &x.reshaped(vec![t * hidden]), &o.reshaped(vec![t * hidden]));
+    tr!("add residual");
+    out
+}
+
+/// One BATCHED transformer layer (GDN or full-attn per `cfg.is_full_layer`)
+/// dispatcher + the (mixer-independent) dense FFN, mirroring
+/// `laguna.rs::prefill_layer`'s structure. `x` is `[T, hidden]`.
+#[allow(clippy::too_many_arguments)]
+fn prefill_layer(
+    dev: &dyn Device,
+    cfg: &Qwen35Config,
+    model: &Qwen35Model,
+    layer_idx: usize,
+    layer: &Qwen35Layer,
+    slot: &mut LayerSlot,
+    x: &Tensor,
+    t: usize,
+    start: usize,
+    positions: &Tensor,
+    t_len: &Tensor,
+) -> Result<Tensor> {
+    let x1 = match (&layer.mixer, slot) {
+        (Mixer::Full(w), LayerSlot::Full(s)) => prefill_layer_full(dev, cfg, w, s, x, t, start, positions)?,
+        (Mixer::Gdn(w), LayerSlot::Gdn(s)) => prefill_layer_gdn(dev, cfg, model, w, s, x, t, t_len)?,
+        _ => return Err(Error::Msg(format!("qwen35: prefill layer {layer_idx} mixer/slot kind mismatch"))),
+    };
+    let x1 = x1.reshaped(vec![t, cfg.hidden]);
+    let h2 = ops::rms_norm(dev, &x1, &layer.ffn.ffn_norm, cfg.eps)?;
+    let gate = layer.ffn.gate.gemm(dev, &h2, t)?;
+    let up = layer.ffn.up.gemm(dev, &h2, t)?;
+    let act = ops::swiglu(dev, &gate, &up)?;
+    let ffn_out = layer.ffn.down.gemm(dev, &act, t)?;
+    let out = ops::add(dev, &x1.reshaped(vec![t * cfg.hidden]), &ffn_out.reshaped(vec![t * cfg.hidden]))?;
+    Ok(out.reshaped(vec![t, cfg.hidden]))
+}
+
+/// Default prefill chunk size, mirroring `laguna.rs::default_prefill_chunk`.
+/// 512 is the microbenched pp512 operating point the task's bench table
+/// reports against; kept as a plain constant here (not env-tunable) since
+/// the caller can always pass an explicit `chunk` to `prefill`.
+fn default_prefill_chunk(total: usize) -> usize {
+    total.min(512).max(1)
+}
+
+/// BATCHED chunked prefill: embed all `tokens` -> chunks of up to `chunk`
+/// rows -> every layer (GDN or full-attn) -> final RMSNorm + lm_head on
+/// the LAST token of the LAST chunk only (next-token logits). `cache` is
+/// reused unmodified in shape/convention from the decode path -- after
+/// `prefill` returns, `decode_step`/`decode_step_ex` can continue from
+/// `pos = tokens.len()` exactly as if every token had been walked through
+/// `decode_step` one at a time (see the correctness tests' identity gate).
+///
+/// `chunk == 0` picks [`default_prefill_chunk`]. Mirrors
+/// `laguna.rs::prefill`'s structure (see that fn's doc) -- no separate
+/// prefill scratch struct is needed here (no sliding-window layers in this
+/// architecture), so `cache` alone (the same `Qwen35Cache` decode uses) is
+/// threaded through both the chunk loop and the final compaction step
+/// laguna needs and this architecture doesn't.
+pub fn prefill(dev: &dyn Device, model: &Qwen35Model, cache: &mut Qwen35Cache, tokens: &[u32], chunk: usize) -> Result<Tensor> {
+    let cfg = &model.cfg;
+    let total = tokens.len();
+    if total == 0 {
+        return Err(Error::Msg("prefill: empty prompt".into()));
+    }
+    let chunk = if chunk == 0 { default_prefill_chunk(total) } else { chunk.max(1) };
+
+    let mut x_last: Option<Tensor> = None;
+    let mut t_last = 0usize;
+    let mut start = 0usize;
+    while start < total {
+        let t = chunk.min(total - start);
+        let chunk_tokens = &tokens[start..start + t];
+
+        let ids = Tensor::new(dev.upload(&u32s_to_bytes(chunk_tokens))?, vec![t], DType::U32);
+        let mut x = ops::gather(dev, &model.tok_embd, &ids)?.reshaped(vec![t, cfg.hidden]);
+
+        let pos_vec: Vec<u32> = (0..t).map(|i| (start + i) as u32).collect();
+        let positions = Tensor::new(dev.upload(&u32s_to_bytes(&pos_vec))?, vec![t], DType::U32);
+        let t_len = Tensor::new(dev.upload(&(t as u32).to_le_bytes())?, vec![1], DType::U32);
+
+        let debug = std::env::var("QWEN35_DEBUG").map(|v| v == "1").unwrap_or(false);
+        if debug {
+            dbg_sum_rows(dev, "x_embed", &pos_vec, &x, cfg.hidden);
+        }
+        for (i, layer) in model.layers.iter().enumerate() {
+            x = prefill_layer(dev, cfg, model, i, layer, &mut cache.slots[i], &x, t, start, &positions, &t_len)?;
+            if std::env::var("QWEN35_PREFILL_SYNC").is_ok() {
+                dev.synchronize().map_err(|e| Error::Msg(format!("prefill fault after layer {i}: {e:?}")))?;
+            }
+            if debug && i == 0 {
+                dbg_sum_rows(dev, "l_out-0", &pos_vec, &x, cfg.hidden);
+            }
+        }
+
+        x_last = Some(x);
+        t_last = t;
+        start += t;
+    }
+    let x = x_last.expect("prefill: total > 0 was checked above, so at least one chunk always runs");
+
+    let last_row = ops::slice(dev, &x.reshaped(vec![t_last * cfg.hidden]), (t_last - 1) * cfg.hidden, cfg.hidden)?;
+    let xn = ops::rms_norm(dev, &last_row, &model.out_norm, cfg.eps)?;
+    let logits = model.lm_head.gemv(dev, &xn)?;
+    Ok(logits)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
