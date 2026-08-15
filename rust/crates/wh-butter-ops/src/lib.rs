@@ -1811,11 +1811,17 @@ pub fn moe_weighted_sum(dev: &dyn Device, downs: &Tensor, wts: &Tensor, acc: &Te
 }
 
 // ── Q4 (4-bit) family, half the weight DRAM of Q8 (the decode lever). ──
-fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor, x: &Tensor, acc: Option<&Tensor>, scale_buf: Option<&Tensor>, m_out: usize, k_in: usize, rows_per_group: usize) -> Result<Tensor> {
+//
+// `two_row_override`: `None` = resolve from `BUTTER_GEMV_2ROW` env (legacy
+// opt-in behavior, unchanged). `Some(b)` = caller has already decided
+// (see `gemv_q4_auto`'s shape-conditional default below) — the env var is
+// still consulted first so `BUTTER_GEMV_2ROW=1`/`BUTTER_GEMV_VEC=1` remain a
+// hard manual override for experimentation even when a caller passes Some.
+fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor, x: &Tensor, acc: Option<&Tensor>, scale_buf: Option<&Tensor>, m_out: usize, k_in: usize, rows_per_group: usize, two_row_override: Option<bool>) -> Result<Tensor> {
     // 2-row tiling: 2 output rows per warp, shared activation read, 2 weight
     // streams in flight (more memory-level-parallelism on the latency-bound Q4 read).
     let vec = kernel == "plain" && std::env::var("BUTTER_GEMV_VEC").is_ok();
-    let two_row = !vec && kernel == "plain" && std::env::var("BUTTER_GEMV_2ROW").is_ok();
+    let two_row = !vec && kernel == "plain" && (std::env::var("BUTTER_GEMV_2ROW").is_ok() || two_row_override.unwrap_or(false));
     let name = if vec { "iron_gemv_q4_vec" } else if two_row { "iron_gemv_q4_coalesced_2row" } else { match kernel { "plain" => "iron_gemv_q4_coalesced", "relu2" => "iron_gemv_q4_coalesced_relu2", _ => "iron_gemv_q4_coalesced_accum" } };
     let k = cached_ir(name, x.dtype, || {
         let mut k = if vec {
@@ -1864,17 +1870,142 @@ fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor
 /// scales from [`quantize_q4`] with an f32-to-f16 pass before upload (raw f32
 /// bytes get silently reinterpreted as garbage f16 and inflate every output).
 pub fn gemv_q4(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rpg: usize) -> Result<Tensor> {
-    gemv_q4_dispatch(dev, "plain", qs, scales, x, None, None, m_out, k_in, rpg)
+    gemv_q4_dispatch(dev, "plain", qs, scales, x, None, None, m_out, k_in, rpg, None)
+}
+/// Q4 matvec, auto-selecting single-row vs 2-row-per-warp tiling from
+/// `m_out` (qwen3.6-27B round-2 per-shape GEMV census on GB10, block-32 Q4 +
+/// f16 scale, `BUTTER_GEMV_RPT` unset i.e. rpt=1 baseline):
+///
+/// | shape (m_out,k_in)      | plain GB/s | 2-row GB/s | delta |
+/// |--------------------------|-----------|------------|-------|
+/// | full_wk/wv (1024,5120)   | 179.5     | 286.5      | +59.6%|
+/// | full_wo (5120,6144)      | 246.6     | 388.3      | +57.5%|
+/// | gdn_wz (6144,5120)       | 246.7     | 392.6      | +59.1%|
+/// | gdn_wo (5120,6144)       | 246.6     | 386.4      | +56.7%|
+/// | gdn_wqkv (10240,5120)    | 244.2     | 251.2      | +2.9% (wash) |
+/// | full_wq (12288,5120)     | 227.0     | 178.7      | -21.3%|
+/// | ffn_gate/up (17408,5120) | 233.1     | 199.9      | -14.2%|
+/// | ffn_down (5120,17408)    | 196.8     | 160.2      | -18.6%|
+/// | lm_head_q4 (248320,5120) | 215.9     | 175.6      | -18.7%|
+///
+/// 2-row halves the grid (2 rows/warp) — a clear win while grid is still
+/// large enough to keep SMs fed (m_out up to ~6144 here), a clear loss once
+/// halving the grid starts starving occupancy (m_out >= 10240, where it's
+/// either a wash or a regression — note `ffn_down`'s long-k reduction does
+/// NOT get fixed by 2-row despite being the most latency-bound shape in the
+/// census; extra ILP from the shared read does not make up for fewer
+/// concurrent blocks there). Threshold picked below the 10240 wash point,
+/// on the high side of the 6144 confirmed win.
+///
+/// ⚠️ NOT WIRED AS A DEFAULT ANYWHERE (round-2 perf campaign, 2026-08): a
+/// full qwen3.6-27B oracle-check run using this function crashed on the
+/// very first decode_step with `cuModuleLoadData: an illegal memory access
+/// was encountered` — a context-corrupting fault not reproduced by any of
+/// the 9 individual shapes above in isolated microbench (each ran clean,
+/// giving the numbers in this table). Root cause not isolated within the
+/// campaign's time budget; suspect either a real bug in
+/// `iron_gemv_q4_coalesced_2row` that only manifests given the real model's
+/// call sequencing/buffer reuse, or a driver/JIT-cache interaction from
+/// alternating "plain" and "2row" kernel names through `cached_ir` within
+/// one process. Kept here for the measured numbers + as a documented
+/// starting point for whoever picks this back up — do NOT call it from a
+/// real decode path without re-verifying stability end-to-end first.
+pub fn gemv_q4_auto(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rpg: usize) -> Result<Tensor> {
+    let two_row = m_out <= 8192;
+    gemv_q4_dispatch(dev, "plain", qs, scales, x, None, None, m_out, k_in, rpg, Some(two_row))
 }
 /// Q4 matvec with fused ReLU² (MoE expert up).
 pub fn gemv_q4_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rpg: usize) -> Result<Tensor> {
-    gemv_q4_dispatch(dev, "relu2", qs, scales, x, None, None, m_out, k_in, rpg)
+    gemv_q4_dispatch(dev, "relu2", qs, scales, x, None, None, m_out, k_in, rpg, None)
 }
 /// Q4 matvec, scale + accumulate into `acc` in place (MoE expert down).
 #[allow(clippy::too_many_arguments)]
 pub fn gemv_q4_accum(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, acc: &Tensor, scale_buf: &Tensor, m_out: usize, k_in: usize, rpg: usize) -> Result<()> {
-    gemv_q4_dispatch(dev, "accum", qs, scales, x, Some(acc), Some(scale_buf), m_out, k_in, rpg)?;
+    gemv_q4_dispatch(dev, "accum", qs, scales, x, Some(acc), Some(scale_buf), m_out, k_in, rpg, None)?;
     Ok(())
+}
+/// M-WAY BATCHED Q4 matvec (F-85 "final lever" attempt: MTP batched
+/// speculative-decode verify). Reads each weight row's DRAM ONCE and
+/// applies it to `cand` independent activation vectors — see
+/// `iron_gemv_q4_multi`'s doc for the full geometry + the bit-exactness
+/// contract vs calling [`gemv_q4`] `cand` times (same accumulation order
+/// per candidate, so argmax is stable — this part is SOLID).
+///
+/// ⚠️ **PERF DEAD END, NOT WIRED into any decode path** (2026-08-15
+/// microbench campaign, `qwen35_spec_gemv_multi_microbench.rs`): correct
+/// and does read the weight only once, but wall time still scales
+/// ~linearly with `cand` (measured ratio-vs-single-M 1.5-1.9x @ cand=2 up
+/// to 3.8-4.6x @ cand=5 across all 4 dominant decode shapes — gate was
+/// `<=1.4x`). THREE iterations tried, all confirming the same root cause:
+///
+/// 1. First cut: `cand` as an ordinary runtime `#[constexpr]`, `range(0,
+///    cand, 1)` looping the `acc`/`qv` `stack_alloc` slots. Non-literal
+///    trip count blocks register promotion -> every accumulator touch is a
+///    real local-memory round-trip. Ratio 1.9x-5.3x. Rejected.
+/// 2. Switched to `#[kernel(variants(...))]` (same mechanism as the GDN
+///    `d128_*` fast kernels) so `M` is a genuine per-variant literal and
+///    the loop fully unrolls/register-promotes. Real but modest
+///    improvement (ratio 1.5x-4.5x) — NOT the gate. `iron_gemv_q4_multi`'s
+///    doc has the full writeup.
+/// 3. Swept `rows_per_tg` (1/2/4/8, more warps/TG for latency-hiding
+///    occupancy — the documented lever for `iron_gemv_q4_coalesced`
+///    itself): ZERO measurable effect (<1% noise) at both cand=2 and
+///    cand=5. Rules out occupancy/latency-hiding as the bottleneck.
+///
+/// Conclusion: the per-candidate dequant+FMA cost (8 loads + 8 FMAs per
+/// word per candidate, unavoidable given the M-way GEMV math) is NOT being
+/// hidden under the weight's DRAM latency the way the M=1 `gemv_q4_coalesced`
+/// kernel's own multi-warp lever implies it should be — GB10's per-SM
+/// instruction-issue throughput for this loop shape appears to be the
+/// actual limiter once `cand>1`, not DRAM bandwidth. This mirrors
+/// `gemm_q4_mpp`'s earlier (much worse, 15-70x) small-M dead end: a
+/// second, independent confirmation that this Q4-decode shape class does
+/// not have slack to amortize multi-column reads into on this hardware.
+/// Kept committed (tested + documented, like `gemm_q4_mpp`) as the
+/// measured stopping point for whoever revisits small-M Q4 batching here.
+///
+/// `x` is `[cand, k_in]` (each candidate's own activation row, row-major —
+/// NOT `[k_in, cand]`); `out` is `[cand, m_out]`. No row-grouping (always
+/// dispatched with `rows_per_group = m_out`, matching every dense-
+/// projection call site `qwen35.rs::Q4Dense::gemv` uses for the M=1 form).
+/// `cand` must be in `2..=5` (the `#[kernel(variants(...))]` family
+/// `iron_gemv_q4_multi_cand2` .. `_cand5` — see that kernel's doc).
+pub fn gemv_q4_multi(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, cand: usize) -> Result<Tensor> {
+    use wh_iron_std::kernels::gemm::gemv_quantized::{
+        iron_gemv_q4_multi_cand2, iron_gemv_q4_multi_cand3, iron_gemv_q4_multi_cand4, iron_gemv_q4_multi_cand5,
+    };
+    let name = match cand {
+        2 => "iron_gemv_q4_multi_cand2",
+        3 => "iron_gemv_q4_multi_cand3",
+        4 => "iron_gemv_q4_multi_cand4",
+        5 => "iron_gemv_q4_multi_cand5",
+        _ => return Err(Error::Msg(format!("gemv_q4_multi: cand={cand} unsupported, only 2..=5 have a compiled variant"))),
+    };
+    let k = cached_ir(name, x.dtype, || {
+        let mut k = match cand {
+            2 => iron_gemv_q4_multi_cand2::kernel_ir_for(x.dtype),
+            3 => iron_gemv_q4_multi_cand3::kernel_ir_for(x.dtype),
+            4 => iron_gemv_q4_multi_cand4::kernel_ir_for(x.dtype),
+            _ => iron_gemv_q4_multi_cand5::kernel_ir_for(x.dtype),
+        };
+        k.mode = wh_iron_core::ir::KernelMode::Reduction;
+        k
+    });
+    let out = Tensor::empty(dev, vec![cand * m_out], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let b = vec![
+        Binding::Buffer(qs.buffer.clone()),
+        Binding::Buffer(scales.buffer.clone()),
+        Binding::Buffer(x.buffer.clone()),
+        Binding::Buffer(out.buffer.clone()),
+        u(k_in as u32),
+        u(m_out as u32),
+        u(m_out as u32), // rows_per_group = m_out: no grouping
+        u(1u32),         // rows_per_tg = 1: swept 1/2/4/8, no measurable effect (see doc)
+    ];
+    let grid = Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] };
+    dev.dispatch(&k, &b, grid)?;
+    Ok(out)
 }
 /// Quantize a row-major `[m,k]` F32 weight to Q4 blocks (block 32, symmetric int4
 /// in [-7,7], f32 scale `amax/7`). Returns `(qs_u32, scales)`: qs `[m·k/32·4]`
@@ -6779,6 +6910,240 @@ pub fn kv_append_many(
         },
     )?;
     Ok(())
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// Qwen3.5 / Qwen3.6 (GGUF arch "qwen35") GDN + hybrid-attention support.
+//
+// Wires kernels that already existed in `wh-iron-std` (built ahead of this
+// port per their doc comments — `iron_gated_delta_step`/`iron_gdn_gate_beta`
+// name-check "Qwen3.6" explicitly) but had no `wh-butter-ops` wrapper yet.
+// `lookup()` resolves the first three by name from the iron test registry
+// (each has a `#[test_kernel]`, so its `KernelMode` comes along for free);
+// `sigmoid_mul` and `strided_head_half` are new — the former has no test
+// registration (hand-built IR mirroring `relu2`'s pattern), the latter is a
+// tiny de-interleave gather with no iron kernel at all (hand-written CUDA,
+// mirroring `rope_yarn_partial`'s `dispatch_raw_cuda` pattern).
+
+/// Qwen3.5/3.6 GDN single-token (or T-chunk-collapsed) decode step.
+/// `q`/`k`: `[Hk, Dk]` flat, `v`: `[Hv, Dv]` flat, `g`/`beta`: `[Hv]` flat,
+/// `state`: `[Hv, Dv, Dk]` flat, passed as BOTH state_in and state_out — the
+/// kernel's phase 1 fully caches the decayed state into per-lane registers
+/// before phase 2 writes state_out, so in==out aliasing is safe (same
+/// discipline as `iron_conv1d_causal_step_silu_cast_many`'s documented
+/// state aliasing). Returns `y`: `[Hv, Dv]`. f32 only (state accumulator
+/// must stay f32 per the kernel's own doc — bf16 drifts after a few dozen
+/// decode steps).
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_step(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &Tensor,
+    dk: usize,
+    dv: usize,
+    hv: usize,
+    hk: usize,
+) -> Result<Tensor> {
+    let kernel = lookup("iron_gated_delta_step", DType::F32)?;
+    let y = Tensor::empty(dev, vec![hv * dv], DType::F32)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(q.buffer.clone()),
+            Binding::Buffer(k.buffer.clone()),
+            Binding::Buffer(v.buffer.clone()),
+            Binding::Buffer(g.buffer.clone()),
+            Binding::Buffer(beta.buffer.clone()),
+            Binding::Buffer(state.buffer.clone()), // state_in
+            Binding::Buffer(state.buffer.clone()), // state_out (aliased)
+            Binding::Buffer(y.buffer.clone()),
+            u(dk as u32),
+            u(dv as u32),
+            u(hv as u32),
+            u(hk as u32),
+        ],
+        Grid { grid: [dv as u32, hv as u32, 1], block: [32, 1, 1] },
+    )?;
+    Ok(y)
+}
+
+/// Qwen3.5/3.6 GDN fused gate/beta: `g = exp(-exp(A_log) * softplus(a_raw +
+/// dt_bias))`, `beta = sigmoid(b_raw)`. `a_raw`/`b_raw`: `[rows, Hv]` flat
+/// (rows = B*T, decode = 1); `dt_bias`/`neg_exp_a_log`: `[Hv]`.
+/// `neg_exp_a_log[h] = -exp(A_log[h])` is precomputed once at load time
+/// (see `Qwen35Model::load_gguf`). Returns `(g, beta)`, each `[rows*Hv]`.
+pub fn gdn_gate_beta(
+    dev: &dyn Device,
+    a_raw: &Tensor,
+    b_raw: &Tensor,
+    dt_bias: &Tensor,
+    neg_exp_a_log: &Tensor,
+    hv: usize,
+) -> Result<(Tensor, Tensor)> {
+    let kernel = lookup("iron_gdn_gate_beta", DType::F32)?;
+    let n = a_raw.elem_count();
+    let g = Tensor::empty(dev, vec![n], DType::F32)?;
+    let beta = Tensor::empty(dev, vec![n], DType::F32)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(a_raw.buffer.clone()),
+            Binding::Buffer(b_raw.buffer.clone()),
+            Binding::Buffer(dt_bias.buffer.clone()),
+            Binding::Buffer(neg_exp_a_log.buffer.clone()),
+            Binding::Buffer(g.buffer.clone()),
+            Binding::Buffer(beta.buffer.clone()),
+            u(hv as u32),
+        ],
+        Grid::d1((n as u32).div_ceil(256), 256),
+    )?;
+    Ok((g, beta))
+}
+
+/// Batched depthwise causal conv1d (kernel=4, no bias term needed — Qwen3.5's
+/// GDN `conv1d` has `bias: false`, so callers pass a zero-filled `b`) fused
+/// with SiLU, sweeping `t_len` tokens for `conv_dim` channels in one
+/// dispatch. `src`: `[t_len, conv_dim]`, `w`: `[4, conv_dim]` (k-major —
+/// NOTE this is NOT the GGUF `ssm_conv1d.weight` tensor's native
+/// `[conv_dim, 4]`-flat (channel-major) layout; the loader must transpose,
+/// see `Qwen35Model::load_gguf`'s `repack_conv1d_weight`), `state_in`:
+/// `[3, conv_dim]`. Returns `(out_f32 [t_len*conv_dim], state_out [3*conv_dim])`.
+/// f32 only (matches this port's decision to keep GDN's small/precision-
+/// sensitive tensors — conv, alpha/beta gate projections, A_log, dt_bias,
+/// ssm_norm — unquantized; only the big GEMM weights go through Q4).
+pub fn conv1d_causal_silu_many(
+    dev: &dyn Device,
+    src: &Tensor,
+    w: &Tensor,
+    b: &Tensor,
+    state_in: &Tensor,
+    t_len: usize,
+    conv_dim: usize,
+) -> Result<(Tensor, Tensor)> {
+    let kernel = lookup("iron_conv1d_causal_step_silu_cast_many", DType::F32)?;
+    let out_f32 = Tensor::empty(dev, vec![t_len * conv_dim], DType::F32)?;
+    let state_out = Tensor::empty(dev, vec![3 * conv_dim], DType::F32)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(src.buffer.clone()),
+            Binding::Buffer(w.buffer.clone()),
+            Binding::Buffer(b.buffer.clone()),
+            Binding::Buffer(state_in.buffer.clone()),
+            Binding::Buffer(out_f32.buffer.clone()),
+            Binding::Buffer(state_out.buffer.clone()),
+            u(t_len as u32),
+            u(conv_dim as u32),
+            u(4u32),
+        ],
+        Grid { grid: [conv_dim as u32, 1, 1], block: [1, 1, 1] },
+    )?;
+    Ok((out_f32, state_out))
+}
+
+/// Elementwise `out = a * sigmoid(b)` — Qwen3.5/3.6 full-attention layers'
+/// output gate (`sigmoidMultiply` in mlx-swift-lm's `Qwen35Attention`;
+/// NOT swish/silu, despite that being GDN's convention for its own output
+/// gate — the two mixer types use different gate activations in this
+/// architecture, verified against `Libraries/MLXLLM/Models/Qwen35.swift`
+/// and `Qwen3Next.swift`'s `sigmoidMultiply`/`Qwen3NextRMSNormGated`).
+/// Dispatches `iron_sigmoid_mul` (exists in iron, un-registered — no
+/// `#[test_kernel]` — so `lookup()` can't find it; built here via manual IR,
+/// same pattern as `relu2` above).
+pub fn sigmoid_mul(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if a.shape != b.shape {
+        return Err(Error::Msg(format!(
+            "sigmoid_mul: shape mismatch {:?} vs {:?}",
+            a.shape, b.shape
+        )));
+    }
+    let mut k = Kernel::new("butter_sigmoid_mul");
+    for (pname, is_out) in [("a", false), ("b", false), ("c", true)] {
+        k.params.push(Param {
+            name: pname.into(),
+            dtype: a.dtype,
+            shape: Shape::scalar(),
+            is_output: is_out,
+            kind: ParamKind::Tensor,
+        });
+    }
+    k.body.push_op(Op::ProgramId { axis: 0 }, ValueId::new(0));
+    k.body.push_op(
+        Op::Load { src: "a".into(), indices: vec![IndexExpr::Value(ValueId::new(0))], mask: None, other: None },
+        ValueId::new(1),
+    );
+    k.body.push_op(
+        Op::Load { src: "b".into(), indices: vec![IndexExpr::Value(ValueId::new(0))], mask: None, other: None },
+        ValueId::new(2),
+    );
+    k.body.push_op(Op::Activation { kind: ActKind::Sigmoid, value: ValueId::new(2) }, ValueId::new(3));
+    k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: ValueId::new(1), rhs: ValueId::new(3) }, ValueId::new(4));
+    k.body.push_op_no_result(Op::Store {
+        dst: "c".into(),
+        indices: vec![IndexExpr::Value(ValueId::new(0))],
+        value: ValueId::new(4),
+        mask: None,
+    });
+    k.mode = wh_iron_core::ir::KernelMode::Elementwise;
+    let out = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
+    let n = out.elem_count() as u32;
+    let grid = Grid::d1(n.div_ceil(256), 256);
+    dev.dispatch(
+        &k,
+        &[Binding::Buffer(a.buffer.clone()), Binding::Buffer(b.buffer.clone()), Binding::Buffer(out.buffer.clone())],
+        grid,
+    )?;
+    Ok(out)
+}
+
+const STRIDED_HEAD_HALF_SRC: &str = r#"
+extern "C" __global__ void butter_strided_head_half(
+    const float* __restrict__ x, float* __restrict__ out,
+    int n_head, int head_dim, int half)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_head * head_dim;
+    if (i >= total) return;
+    int h = i / head_dim;
+    int d = i % head_dim;
+    out[i] = x[h * 2 * head_dim + half * head_dim + d];
+}
+"#;
+
+/// De-interleave a `[n_head, 2*head_dim]` fused Q/gate projection output
+/// into one contiguous `[n_head, head_dim]` half. Qwen3.5/3.6 full-attn
+/// `attn_q` packs `[q(head_dim); gate(head_dim)]` PER HEAD (reshape to
+/// `[heads, 2*head_dim]` then split last axis in two) — NOT all-Q rows
+/// followed by all-gate rows — so a plain contiguous `ops::slice` cannot
+/// separate them; this is a strided gather. `half=0` extracts Q, `half=1`
+/// extracts the gate. Verified against `Qwen35Attention.callAsFunction` in
+/// mlx-swift-lm (`qProjOutput.reshaped(B,L,heads,-1).split(parts:2,axis:-1)`).
+/// f32 only. Hand-written CUDA (no iron kernel covers this shape), mirrors
+/// `rope_yarn_partial`'s `dispatch_raw_cuda` pattern.
+pub fn strided_head_half(dev: &dyn Device, x: &Tensor, n_head: usize, head_dim: usize, half: u32) -> Result<Tensor> {
+    let out = Tensor::empty(dev, vec![n_head * head_dim], DType::F32)?;
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let total = (n_head * head_dim) as u32;
+    dev.dispatch_raw_cuda(
+        STRIDED_HEAD_HALF_SRC,
+        "strided_head_half.cu",
+        "butter_strided_head_half",
+        &[(x.buffer.as_ref(), x.offset), (out.buffer.as_ref(), 0)],
+        &[i(n_head as i32), i(head_dim as i32), i(half as i32)],
+        [total.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+        false,
+    )?;
+    Ok(out)
 }
 
 #[cfg(test)]
