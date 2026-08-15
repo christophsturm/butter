@@ -1115,7 +1115,7 @@ enum LagunaAttnInt8 {
     // and a multiple of 128) dispatches `iron_rms_norm_bf16` at
     // `TPG = inDim/4` real threads: each thread owns 4 elements, folds a
     // per-thread sum-of-squares, and the codegen's threadgroup-scope
-    // `reduce_sum` (see `ffai-kernels-codegen/src/msl/reduce.rs`) combines
+    // `reduce_sum` (see `wh-iron-codegen/src/msl/reduce.rs`) combines
     // it in three phases: per-simdgroup `simd_sum`, lane 0 of each
     // simdgroup stores to a 32-slot threadgroup array, then simdgroup 0
     // re-`simd_sum`s those slots (zero-padded past `n_simd`). This bank's
@@ -1130,7 +1130,7 @@ enum LagunaAttnInt8 {
     // `rsqrt(ssq/inDim + eps)` land bit-identical. `metal::rsqrt` (not
     // `precise::rsqrt`; `iron_rms_norm_bf16` doesn't use the precise
     // variant either, see `unary_intrinsic` in
-    // `ffai-kernels-codegen/src/backend.rs`).
+    // `wh-iron-codegen/src/backend.rs`).
     //
     // The K loop then recomputes each lane's normalized values inline
     // from `residual`/`norm_weight` (both L1-resident after the reduction

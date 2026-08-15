@@ -8952,7 +8952,7 @@ public enum Ops {
         // The BM=32 tile below pads M up to 32, so a 2-row spec-decode
         // verify does 16x the needed compute and flips the pass from
         // weight-bound to compute-bound. Iron already ships BM=2 / BM=4
-        // variants of the same int4 kernel (`ffai_qmm_bm2` / `_bm4`,
+        // variants of the same int4 kernel (`iron_qmm_bm2` / `_bm4`,
         // 2 SG x 32 lanes, BN=8, grid [n/8, m/BM, 1]) whose whole point
         // is exactly this shape. Route T <= smallMMax through them and
         // pad only up to BM (2 or 4) instead of 32.
