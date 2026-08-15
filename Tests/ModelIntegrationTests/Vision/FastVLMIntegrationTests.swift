@@ -35,7 +35,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("FastVLM Vision Integration", .serialized)
+@Suite("FastVLM Vision Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct FastVLMIntegrationTests {
 
     static let modelId = "ekryski/FastVLM-0.5B-4bit"

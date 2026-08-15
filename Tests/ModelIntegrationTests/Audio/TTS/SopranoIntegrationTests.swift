@@ -32,10 +32,11 @@
 
 import Foundation
 import Testing
+import TestHelpers
 
 @testable import ButterSwift
 
-@Suite("Soprano Integration", .serialized)
+@Suite("Soprano Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct SopranoIntegrationTests {
 
     // ─── Checkpoint resolution ────────────────────────────────────────

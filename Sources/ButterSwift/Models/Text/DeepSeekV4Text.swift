@@ -547,7 +547,7 @@ public final class DeepSeekV4Model: @unchecked Sendable {
         // experiments. (Follow-up: selective f32 — f32 residual only — if a
         // future kernel makes f16 activations cheaper than f32.)
         let activationDtype: DType =
-            ProcessInfo.processInfo.environment["BUTTER_DSV4_ACT_F16"] == "1" ? .f16 : .f32
+            ButterEnv["BUTTER_DSV4_ACT_F16"] == "1" ? .f16 : .f32
         // Extract the compress_ratios array from GGUF metadata. The
         // key matches the canonical DSv4 GGUF naming convention used
         // by the converter. Falls back to inferring from layer-tensor
@@ -1151,7 +1151,7 @@ extension DeepSeekV4Model {
         // q_a/q_b/kv/output_* are Q8_0 on disk — gemv straight from
         // resident Q8 (1 byte/weight) instead of the f16-expanded copy,
         // halving read bandwidth (attn is bandwidth-bound).
-        let useQ8Attn = ProcessInfo.processInfo.environment["BUTTER_DSV4_Q8ATTN"] != "0"
+        let useQ8Attn = ButterEnv["BUTTER_DSV4_Q8ATTN"] != "0"
         let qA: Tensor
         if useQ8Attn, let qaQ8 = try? bundle.residentQ8("blk.\(layer.layerIndex).attn_q_a.weight", device: device) {
             qA = Tensor.empty(shape: [qaQ8.mOut], dtype: dt)
@@ -1402,7 +1402,7 @@ extension DeepSeekV4Model {
         let gateNameF = "blk.\(layer.layerIndex).ffn_gate_exps.weight"
         let upNameF = "blk.\(layer.layerIndex).ffn_up_exps.weight"
         let downNameF = "blk.\(layer.layerIndex).ffn_down_exps.weight"
-        if ProcessInfo.processInfo.environment["BUTTER_DSV4_GPUROUTER"] != "0", topK == 6,
+        if ButterEnv["BUTTER_DSV4_GPUROUTER"] != "0", topK == 6,
             layer.ffnGateTid2Eid == nil,  // hash-routed layers select via token→expert table, not GPU top-k
             let rg = bundle.builtIQ2(gateNameF),
             let ru = bundle.builtIQ2(upNameF),
@@ -1428,7 +1428,7 @@ extension DeepSeekV4Model {
         // deviates. Round-trip xNorm through Q8_K (per-256-block,
         // iscale=-128/max) in place so the expert gemvs see the same
         // rounded activation. Router already consumed the f16 xNorm above.
-        if ProcessInfo.processInfo.environment["BUTTER_DSV4_Q8K_ACT"] == "1" {
+        if ButterEnv["BUTTER_DSV4_Q8K_ACT"] == "1" {
             var h = xNorm.toFloatArray()
             let n = h.count
             var i = 0
@@ -1517,12 +1517,11 @@ extension DeepSeekV4Model {
         let downName = "blk.\(layer.layerIndex).ffn_down_exps.weight"
         _ = intermediate
         let moeAccum = Tensor.filled(0.0, shape: [hidden], dtype: dt, device: device)
-        let env = ProcessInfo.processInfo.environment
-        let useFusedDown = topK == 6 && env["BUTTER_DSV4_FUSED_DOWN"] == "1"
+        let useFusedDown = topK == 6 && ButterEnv["BUTTER_DSV4_FUSED_DOWN"] == "1"
         let useFusedEpilogue =
             topK == 6
             && !useFusedDown
-            && env["BUTTER_DSV4_FUSED_EPILOGUE"] == "1"
+            && ButterEnv["BUTTER_DSV4_FUSED_EPILOGUE"] == "1"
         // PER-EXPERT 3-stage pipeline: gate / up / down on separate cmd
         // buffers. gate+up are independent of each other so CPU staging
         // for up can run concurrent with GPU running gate's dequant +
@@ -1663,8 +1662,8 @@ extension DeepSeekV4Model {
         // (gate, up) computing all topK experts' outputs in a single
         // dispatch each — replaces 2*topK per-expert {dequant,gemv} cmd
         // buffers (12/layer) with 2. gate/up share x=xNorm.
-        let useGather = topK == 6 && env["BUTTER_DSV4_GATHER"] != "0"
-        let useResident = env["BUTTER_DSV4_RESIDENT"] != "0"
+        let useGather = topK == 6 && ButterEnv["BUTTER_DSV4_GATHER"] != "0"
+        let useResident = ButterEnv["BUTTER_DSV4_RESIDENT"] != "0"
         // Build a u32 expert_ids tensor for a role's gather dispatch.
         func eids(_ slots: [Int]) -> Tensor {
             let t = Tensor.empty(shape: [slots.count], dtype: .u32, device: device)
@@ -1850,7 +1849,7 @@ extension DeepSeekV4Model {
         // Shared expert — independent of routing, commit first. Q8 gemv
         // straight from resident Q8 (shexp gate/up/down are Q8_0).
         let shexpCmd = device.makeCommandBuffer()
-        let q8on = ProcessInfo.processInfo.environment["BUTTER_DSV4_Q8ATTN"] != "0"
+        let q8on = ButterEnv["BUTTER_DSV4_Q8ATTN"] != "0"
         let li = layer.layerIndex
         let sGate: Tensor; let sUp: Tensor
         if q8on, let g = try? bundle.residentQ8("blk.\(li).ffn_gate_shexp.weight", device: device),
@@ -1947,7 +1946,7 @@ extension DeepSeekV4Model {
     nonisolated(unsafe) public static var profKernelEncodeCount: Int = 0
     nonisolated(unsafe) public static let profGpuLock = NSLock()
     public static let profileEnabled =
-        ProcessInfo.processInfo.environment["BUTTER_DSV4_PROFILE"] == "1"
+        ButterEnv["BUTTER_DSV4_PROFILE"] == "1"
 
     public static func resetGpuProf() {
         profGpuLock.lock()
@@ -2140,7 +2139,7 @@ extension DeepSeekV4Model {
         // LM head (output.weight is Q8_0, ~1 GB as f16) — gemv from
         // resident Q8 to halve the per-token output-projection bandwidth.
         let logits: Tensor
-        if ProcessInfo.processInfo.environment["BUTTER_DSV4_Q8ATTN"] != "0",
+        if ButterEnv["BUTTER_DSV4_Q8ATTN"] != "0",
             let lmQ8 = try? bundle.residentQ8("output.weight", device: device)
         {
             logits = Tensor.empty(shape: [lmQ8.mOut], dtype: dt)
@@ -2167,6 +2166,11 @@ struct PrefillError: Error, CustomStringConvertible {
 extension DeepSeekV4Model {
     /// One-time guard: have we pre-warmed the expert tensors into page cache?
     nonisolated(unsafe) static var dsv4Prewarmed = false
+
+    /// One-time stderr notice for the prefill MPP-capability degrade path
+    /// (see `prefillLayer`'s gate/up/down bgemm dispatch) — logged once so
+    /// a full multi-layer prefill on incapable hardware doesn't spam.
+    nonisolated(unsafe) static var dsv4PrefillMppFallbackLogged = false
 
     /// Batched prefill over `tokens`; returns the last token's logits.
     /// Single chunk (N ≤ a few hundred); KV cache is the chunk's own K/V.
@@ -2251,7 +2255,7 @@ extension DeepSeekV4Model {
             // reclaim instead of the app-quit-monitor freeze. Override the
             // floor via BUTTER_MEM_FLOOR_PCT, disable with =0.
             if let freePct = MemorySnapshot.systemFreePercent() {
-                let floor = Double(ProcessInfo.processInfo.environment["BUTTER_MEM_FLOOR_PCT"].flatMap { Int($0) } ?? 12)
+                let floor = Double(ButterEnv["BUTTER_MEM_FLOOR_PCT"].flatMap { Int($0) } ?? 12)
                 if floor > 0 && freePct < floor {
                     throw PrefillError(
                         message:
@@ -2342,7 +2346,13 @@ extension DeepSeekV4Model {
             let dT = Tensor(buffer: r.d, offset: 0, shape: [nb], dtype: .f32)
             // Cooperative-tensor MMA Q8 GEMM (~6× the scalar path) for the
             // batched case; the scalar gemmQ8 for small n where MMA doesn't pay.
-            if n >= 32 {
+            // gemmQ8Mpp is a `_mpp_`-named kernel (PSOCache.isMppKernel) —
+            // it needs Apple GPU Family 9+ / macOS 26+ to live-compile
+            // (PSOCache.pipelineState fatalErrors otherwise, see butter
+            // PR #134). Gate on Ops.mppAutoCapable too, not just the n>=32
+            // perf heuristic, so incapable hardware always takes the
+            // scalar gemmQ8 sibling below instead of crashing.
+            if n >= 32 && Ops.mppAutoCapable {
                 Ops.gemmQ8Mpp(qs: qsT, dF32: dT, input: inp, out: outT, inDim: r.kIn, outDim: r.mOut, nRows: n, on: c)
             } else {
                 Ops.gemmQ8(qs: qsT, dF32: dT, input: inp, out: outT, inDim: r.kIn, outDim: r.mOut, nRows: n, on: c)
@@ -2453,7 +2463,12 @@ extension DeepSeekV4Model {
         let oaNb = oaQ8.mOut * oaQ8.kIn / 32
         let oaQs = Tensor(buffer: oaQ8.qs, offset: 0, shape: [oaNb * 8], dtype: .u32)
         let oaD = Tensor(buffer: oaQ8.d, offset: 0, shape: [oaNb], dtype: .f32)
-        if N >= 32 {
+        // groupedGemmQ8Mpp is a `_mpp_`-named cooperative-tensor kernel
+        // (same PSOCache.isMppKernel live-compile requirement as gq8's
+        // gemmQ8Mpp above) — gate on Ops.mppAutoCapable, not just N>=32,
+        // so incapable hardware falls through to the scalar groupedGemmQ8
+        // sibling instead of fatalError-ing in PSOCache.pipelineState.
+        if N >= 32 && Ops.mppAutoCapable {
             Ops.groupedGemmQ8Mpp(
                 qs: oaQs, dF32: oaD, input: attnOut, out: oLow,
                 inDim: oaQ8.kIn, outDim: oaQ8.mOut, nRows: N,
@@ -2553,6 +2568,31 @@ extension DeepSeekV4Model {
             routedExperts.count > RESIDENT_POOL_CAP ? max(routedExperts.count, 1) : nil
         let cap = prefillPoolCap ?? RESIDENT_POOL_CAP
 
+        // The gate/up/down dispatches below (moeBgemmIQ2XXSViewU16Bm64 /
+        // moeBgemmQ2KViewU16Bm64) are cooperative-tensor `bgemm` kernels —
+        // PSOCache.isMppKernel matches ANY kernel name containing "bgemm",
+        // not just "_mpp_" (see its doc in PSOCache.swift), so these need
+        // Apple GPU Family 9+ / macOS 26+ to live-compile; PSOCache.
+        // pipelineState fatalErrors compiling them otherwise (the same
+        // class of bug butter PR #134 hardened for the NVFP4 family).
+        // There is no drop-in non-MPP kernel that reads the raw-gather view
+        // buffer at this batched (M-row) granularity, so the incapable-
+        // hardware fallback (below, at each dispatch site) degrades to the
+        // classic deinterleaved split-pool GEMV-over-rows primitives
+        // (moeGemvRowsIQ2XXS / moeGemvRowsQ2K — the same ones decode()'s
+        // own non-MPP tier already uses), which need this row→slot index
+        // instead of the raw pool's `rawX.slotOf`. Built once per
+        // layer/chunk, only when actually needed.
+        let fallbackSlotIdx: Tensor? =
+            Ops.mppAutoCapable
+            ? nil
+            : {
+                let routedSlotOf = Dictionary(uniqueKeysWithValues: routedExperts.enumerated().map { ($1, $0) })
+                let t = Tensor.empty(shape: [M], dtype: .u32, device: device)
+                t.copyIn(from: rows.map { UInt32(routedSlotOf[$0.expert] ?? 0) })
+                return t
+            }()
+
         // Permuted x and per-role packed-slot indices.
         let fcmd2 = device.makeCommandBuffer()
         // Permute-by-expert in ONE gather dispatch (was an M-row CPU copy
@@ -2566,37 +2606,68 @@ extension DeepSeekV4Model {
         let (grid, signs) = GGUFDequant.iq2xxsTables(device: device)
         let gateP = Tensor.empty(shape: [M, intermediate], dtype: dt)
         let upP = Tensor.empty(shape: [M, intermediate], dtype: dt)
-        // RAW-GATHER + u16 view-bm64: bulk-copy routed experts' raw blocks into
-        // a reliable makeBuffer (cheap bulk memcpy, not the 32768-tiny-memcpy
-        // deinterleave), then the amortized bm64 reads them via aligned u16 (no
-        // split pool, no mmap-residency-zeros bug). SLOT-indexed (the raw pool
-        // is compacted by routed expert).
-        guard
-            let rawG = try bundle.rawGatherBlocks(
-                named: gName, expertIndices: routedExperts, nExperts: nExperts, device: device, poolCap: cap,
-                reuseKey: "prefill_view_gate"),
-            let rawU = try bundle.rawGatherBlocks(
-                named: uName, expertIndices: routedExperts, nExperts: nExperts, device: device, poolCap: cap,
-                reuseKey: "prefill_view_up")
-        else {
-            throw PrefillError(
-                message: "prefill L\(li): gate/up expert tensors '\(gName)'/'\(uName)' not found in GGUF")
+        if let fallbackSlotIdx {
+            if !DeepSeekV4Model.dsv4PrefillMppFallbackLogged {
+                DeepSeekV4Model.dsv4PrefillMppFallbackLogged = true
+                FileHandle.standardError.write(
+                    ("[dsv4-prefill] Ops.mppAutoCapable == false — gate/up/down "
+                        + "batched bgemm kernels need Apple GPU Family 9+ / macOS 26+; "
+                        + "degrading to the slot-pool GEMV-over-rows fallback "
+                        + "(CPU-staged split pool, correctness over speed). The fast "
+                        + "MPP path needs Apple GPU Family 9+ / macOS 26+.\n")
+                        .data(using: .utf8)!)
+            }
+            // Correctness fallback: CPU-stage the classic deinterleaved
+            // split pool (same primitive decode()'s non-MPP tier already
+            // uses via stageGatherIQ2XXS) and drive it with the existing
+            // batched (ONE dispatch, not a per-row loop) moeGemvRowsIQ2XXS
+            // GEMV-over-rows kernel — no `bgemm`/`_mpp_` name, so it loads
+            // from the static metallib on any hardware.
+            let gPool = try bundle.stageGatherIQ2XXS(
+                named: gName, expertIndices: routedExperts, nExperts: nExperts,
+                slot: "prefill_fallback_gate", device: device)
+            let uPool = try bundle.stageGatherIQ2XXS(
+                named: uName, expertIndices: routedExperts, nExperts: nExperts,
+                slot: "prefill_fallback_up", device: device)
+            Ops.moeGemvRowsIQ2XXS(
+                x: xPerm, qsAll: gPool.qsAll, dAll: gPool.dAll, expertIds: fallbackSlotIdx,
+                grid: grid, signs: signs, out: gateP, mTotal: M, mOut: intermediate, kIn: hidden, on: fcmd2)
+            Ops.moeGemvRowsIQ2XXS(
+                x: xPerm, qsAll: uPool.qsAll, dAll: uPool.dAll, expertIds: fallbackSlotIdx,
+                grid: grid, signs: signs, out: upP, mTotal: M, mOut: intermediate, kIn: hidden, on: fcmd2)
+        } else {
+            // RAW-GATHER + u16 view-bm64: bulk-copy routed experts' raw blocks into
+            // a reliable makeBuffer (cheap bulk memcpy, not the 32768-tiny-memcpy
+            // deinterleave), then the amortized bm64 reads them via aligned u16 (no
+            // split pool, no mmap-residency-zeros bug). SLOT-indexed (the raw pool
+            // is compacted by routed expert).
+            guard
+                let rawG = try bundle.rawGatherBlocks(
+                    named: gName, expertIndices: routedExperts, nExperts: nExperts, device: device, poolCap: cap,
+                    reuseKey: "prefill_view_gate"),
+                let rawU = try bundle.rawGatherBlocks(
+                    named: uName, expertIndices: routedExperts, nExperts: nExperts, device: device, poolCap: cap,
+                    reuseKey: "prefill_view_up")
+            else {
+                throw PrefillError(
+                    message: "prefill L\(li): gate/up expert tensors '\(gName)'/'\(uName)' not found in GGUF")
+            }
+            let iq2Stride = rawG.nBlocksPerExpert * 66
+            let slotGIdx = Tensor.empty(shape: [M], dtype: .u32, device: device)
+            slotGIdx.copyIn(from: rows.map { UInt32(rawG.slotOf[$0.expert] ?? 0) })
+            let slotUIdx = Tensor.empty(shape: [M], dtype: .u32, device: device)
+            slotUIdx.copyIn(from: rows.map { UInt32(rawU.slotOf[$0.expert] ?? 0) })
+            Ops.moeBgemmIQ2XXSViewU16Bm64(
+                x: xPerm, viewBuf: rawG.buffer, viewByteOffset: 0,
+                grid: grid, signs: signs, indices: slotGIdx, out: gateP,
+                mTotal: M, nOut: intermediate, kIn: hidden,
+                tensorByteOff: 0, expertByteStride: iq2Stride, on: fcmd2)
+            Ops.moeBgemmIQ2XXSViewU16Bm64(
+                x: xPerm, viewBuf: rawU.buffer, viewByteOffset: 0,
+                grid: grid, signs: signs, indices: slotUIdx, out: upP,
+                mTotal: M, nOut: intermediate, kIn: hidden,
+                tensorByteOff: 0, expertByteStride: iq2Stride, on: fcmd2)
         }
-        let iq2Stride = rawG.nBlocksPerExpert * 66
-        let slotGIdx = Tensor.empty(shape: [M], dtype: .u32, device: device)
-        slotGIdx.copyIn(from: rows.map { UInt32(rawG.slotOf[$0.expert] ?? 0) })
-        let slotUIdx = Tensor.empty(shape: [M], dtype: .u32, device: device)
-        slotUIdx.copyIn(from: rows.map { UInt32(rawU.slotOf[$0.expert] ?? 0) })
-        Ops.moeBgemmIQ2XXSViewU16Bm64(
-            x: xPerm, viewBuf: rawG.buffer, viewByteOffset: 0,
-            grid: grid, signs: signs, indices: slotGIdx, out: gateP,
-            mTotal: M, nOut: intermediate, kIn: hidden,
-            tensorByteOff: 0, expertByteStride: iq2Stride, on: fcmd2)
-        Ops.moeBgemmIQ2XXSViewU16Bm64(
-            x: xPerm, viewBuf: rawU.buffer, viewByteOffset: 0,
-            grid: grid, signs: signs, indices: slotUIdx, out: upP,
-            mTotal: M, nOut: intermediate, kIn: hidden,
-            tensorByteOff: 0, expertByteStride: iq2Stride, on: fcmd2)
         // swiglu — element-wise over the whole [M, intermediate] tile in ONE
         // dispatch (was an M-row Swift slice loop + M dispatches/layer = ~264k
         // dispatches at N=1024 × 43 layers, the per-token CPU/encode overhead
@@ -2607,19 +2678,35 @@ extension DeepSeekV4Model {
         // kernel (no deinterleave pool), slot-indexed like the IQ2 gate/up
         // view path.
         let downP = Tensor.empty(shape: [M, hidden], dtype: dt)
-        guard
-            let rawD = try? bundle.rawGatherBlocks(
-                named: dName, expertIndices: routedExperts, nExperts: nExperts, device: device, poolCap: cap,
-                reuseKey: "prefill_view_down")
-        else {
-            throw PrefillError(message: "prefill L\(li): down expert tensor '\(dName)' not found in GGUF")
+        if let fallbackSlotIdx {
+            // Same MPP-capability gap as the gate/up block above (Q2_K's
+            // view/bm64 kernels are also `bgemm`-named coop-tensor
+            // kernels, and there is no raw-view non-MPP Q2_K gemv at all —
+            // even less than gate/up has). Degrade to the classic
+            // deinterleaved split pool + the existing batched
+            // moeGemvRowsQ2K GEMV-over-rows kernel.
+            let dPool = try bundle.stageGatherQ2K(
+                named: dName, expertIndices: routedExperts, nExperts: nExperts,
+                slot: "prefill_fallback_down", device: device)
+            Ops.moeGemvRowsQ2K(
+                x: innerP, qsAll: dPool.qsAll, scalesAll: dPool.scalesAll,
+                dAll: dPool.dAll, dminAll: dPool.dminAll, expertIds: fallbackSlotIdx,
+                out: downP, mTotal: M, mOut: hidden, kIn: intermediate, on: fcmd2)
+        } else {
+            guard
+                let rawD = try? bundle.rawGatherBlocks(
+                    named: dName, expertIndices: routedExperts, nExperts: nExperts, device: device, poolCap: cap,
+                    reuseKey: "prefill_view_down")
+            else {
+                throw PrefillError(message: "prefill L\(li): down expert tensor '\(dName)' not found in GGUF")
+            }
+            let slotDIdx = Tensor.empty(shape: [M], dtype: .u32, device: device)
+            slotDIdx.copyIn(from: rows.map { UInt32(rawD.slotOf[$0.expert] ?? 0) })
+            Ops.moeBgemmQ2KViewU16Bm64(
+                x: innerP, viewBuf: rawD.buffer, viewByteOffset: 0,
+                indices: slotDIdx, out: downP, mTotal: M, nOut: hidden, kIn: intermediate,
+                tensorByteOff: 0, expertByteStride: rawD.byteStride, on: fcmd2)
         }
-        let slotDIdx = Tensor.empty(shape: [M], dtype: .u32, device: device)
-        slotDIdx.copyIn(from: rows.map { UInt32(rawD.slotOf[$0.expert] ?? 0) })
-        Ops.moeBgemmQ2KViewU16Bm64(
-            x: innerP, viewBuf: rawD.buffer, viewByteOffset: 0,
-            indices: slotDIdx, out: downP, mTotal: M, nOut: hidden, kIn: intermediate,
-            tensorByteOff: 0, expertByteStride: rawD.byteStride, on: fcmd2)
         fcmd2.commit(); fcmd2.waitUntilCompleted()
 
         // Unpermute + weighted combine → moeAccum [N,hidden] in ONE dispatch

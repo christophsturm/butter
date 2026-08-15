@@ -49,7 +49,12 @@ public final class IronLibrary: @unchecked Sendable {
     public let commandQueue: MTLCommandQueue
     public let library: MTLLibrary
     public let metallibURL: URL
-
+    /// Optional overlay metallib (`kernels_extra.metallib`) with butter/laguna
+    /// hand-written kernels + fast-qdot replacements for a few iron entry
+    /// points. Looked up **before** `library` so overlays win on name clash
+    /// (e.g. `iron_nvfp4_dequant_gemv_expert_indexed_bf16`).
+    public let extraLibrary: MTLLibrary?
+    public let extraMetallibURL: URL?
     /// Maximum number of in-flight (uncompleted) `MTLCommandBuffer`s the
     /// shared command queue keeps before `makeCommandBuffer()` blocks on
     /// the next caller. Default 16.
@@ -87,11 +92,10 @@ public final class IronLibrary: @unchecked Sendable {
         {
             return parsed
         }
-        // 128 covers deep stacks (Hy3 = 80 layers) that fire one cmdbuf
-        // per layer without mid-stack wait. 64 was a 2-3% Qwen prefill
-        // win vs 16, but stalls Hy3 decode after layer 64. Override via
-        // BUTTER_MAX_COMMAND_BUFFERS for triage.
-        return 128
+        // 256: small decode win on Laguna NVFP4 vs 128 (~+0.2 t/s).
+        // 128 was enough for Hy3's 80-layer per-layer cmdbufs; headroom
+        // for deeper pipe + dual-queue. Override via env for triage.
+        return 256
     }()
 
     /// Process-wide singleton. Lazily initialized; throws on first access if
@@ -136,6 +140,26 @@ public final class IronLibrary: @unchecked Sendable {
         } catch {
             throw IronLibraryError.metallibLoadFailed(url, error)
         }
+        // Best-effort overlay metallib (Path B fuses + fast NVFP4 qdot eidx).
+        // Missing is fine — PSOCache falls back to main / live compile.
+        if let extraURL = Self.locateExtraMetallib() {
+            do {
+                self.extraLibrary = try device.makeLibrary(URL: extraURL)
+                self.extraMetallibURL = extraURL
+                FileHandle.standardError.write(
+                    Data("[IronLibrary] loaded kernels_extra.metallib\n".utf8))
+            } catch {
+                self.extraLibrary = nil
+                self.extraMetallibURL = nil
+                FileHandle.standardError.write(
+                    Data(
+                        "[IronLibrary] kernels_extra.metallib load failed: \(error)\n"
+                            .utf8))
+            }
+        } else {
+            self.extraLibrary = nil
+            self.extraMetallibURL = nil
+        }
     }
 
     /// Find kernels.metallib in the SPM resource bundle.
@@ -155,5 +179,38 @@ public final class IronLibrary: @unchecked Sendable {
             "Resources/kernels.metallib"
         )
         throw IronLibraryError.metallibNotFound(fallback)
+    }
+
+    /// Optional `kernels_extra.metallib` next to the main metallib.
+    private static func locateExtraMetallib() -> URL? {
+        if let url = Bundle.module.url(
+            forResource: "kernels_extra",
+            withExtension: "metallib",
+            subdirectory: "Resources"
+        ) {
+            return url
+        }
+        if let url = Bundle.module.url(
+            forResource: "kernels_extra", withExtension: "metallib"
+        ) {
+            return url
+        }
+        // Anchor off main metallib path (same directory).
+        if let main = try? locateMetallib() {
+            let sibling = main.deletingLastPathComponent()
+                .appendingPathComponent("kernels_extra.metallib")
+            if FileManager.default.fileExists(atPath: sibling.path) {
+                return sibling
+            }
+        }
+        return nil
+    }
+
+    /// Resolve a kernel function: prefer `extraLibrary` (overlays) then main.
+    public func makeFunction(name: String) -> MTLFunction? {
+        if let extra = extraLibrary, let fn = extra.makeFunction(name: name) {
+            return fn
+        }
+        return library.makeFunction(name: name)
     }
 }

@@ -34,7 +34,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Kokoro Integration", .serialized)
+@Suite("Kokoro Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct KokoroIntegrationTests {
 
     /// Canonical HF repo id. The 4-bit MLX conversion is the smallest

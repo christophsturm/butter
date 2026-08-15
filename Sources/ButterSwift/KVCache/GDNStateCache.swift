@@ -100,10 +100,12 @@ public final class GDNStateCache: LayerCacheProtocol, @unchecked Sendable {
         self.current.zero()
         self.next.zero()
         // Recurrent state buffers persist across every decode step; pin
-        // them in the residency set so the driver skips per-dispatch
-        // residency validation on the read/write/swap that fires each
-        // token through the GDN layer.
-        device.markWeightsResident([self.current.buffer, self.next.buffer])
+        // them in the GENERATION cache residency set (not the weight
+        // set — this state is rebuilt fresh every generation) so the
+        // driver skips per-dispatch residency validation on the
+        // read/write/swap that fires each token through the GDN layer.
+        // See `Device.markCacheResident`/`releaseGenerationCaches`.
+        device.markCacheResident([self.current.buffer, self.next.buffer])
     }
 
     /// Exchange `current` and `next`. Call this after `Ops.gatedDeltaStep`
@@ -197,6 +199,46 @@ public final class GDNStateCache: LayerCacheProtocol, @unchecked Sendable {
         blit.endEncoding()
         cmd.commit()
         cmd.waitUntilCompleted()
+    }
+
+    /// Encode-only snapshot: queues the blit on `cmd` and returns the
+    /// destination WITHOUT committing. The per-layer `snapshot()` above
+    /// commits and waits, which costs a full GPU round-trip per layer -
+    /// with 48 GDN layers (each also snapshotting its conv state) that
+    /// is ~96 blocking round-trips per spec-decode cycle, and it
+    /// dominates the measured snapshot cost. The composite
+    /// `snapshotAll` batches every layer onto one buffer via this.
+    public func snapshotEncode(on cmd: MTLCommandBuffer, device: Device = .shared) -> Tensor {
+        let shape = [numValueHeads, valueHeadDim, keyHeadDim]
+        if cachedSnapshot == nil {
+            cachedSnapshot = Tensor.empty(shape: shape, dtype: .f32, device: device)
+        }
+        let snap = cachedSnapshot!
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure("GDNStateCache.snapshotEncode: makeBlitCommandEncoder failed")
+        }
+        let bytes = numValueHeads * valueHeadDim * keyHeadDim * DType.f32.byteSize
+        blit.copy(
+            from: current.buffer, sourceOffset: current.offset,
+            to: snap.buffer, destinationOffset: snap.offset, size: bytes)
+        blit.endEncoding()
+        return snap
+    }
+
+    /// Encode-only restore; see `snapshotEncode`.
+    public func restoreEncode(from snapshot: Tensor, on cmd: MTLCommandBuffer) {
+        let expected = numValueHeads * valueHeadDim * keyHeadDim
+        precondition(
+            snapshot.elementCount == expected,
+            "GDNStateCache.restoreEncode: snapshot has \(snapshot.elementCount) elements, expected \(expected)")
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure("GDNStateCache.restoreEncode: makeBlitCommandEncoder failed")
+        }
+        blit.copy(
+            from: snapshot.buffer, sourceOffset: snapshot.offset,
+            to: current.buffer, destinationOffset: current.offset,
+            size: expected * DType.f32.byteSize)
+        blit.endEncoding()
     }
 
     /// Set the position counter directly without zeroing buffers.

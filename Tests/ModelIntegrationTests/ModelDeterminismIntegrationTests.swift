@@ -28,7 +28,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Model Determinism Integration", .serialized)
+@Suite("Model Determinism Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct ModelDeterminismIntegrationTests {
 
     @Test("forwardSample(BOS) returns the same token on three back-to-back calls")

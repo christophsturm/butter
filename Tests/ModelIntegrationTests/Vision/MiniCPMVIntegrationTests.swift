@@ -34,7 +34,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("MiniCPMV Vision Integration (image + video)", .serialized)
+@Suite("MiniCPMV Vision Integration (image + video)", .serialized, .enabled(if: modelTestsOptedIn))
 struct MiniCPMVIntegrationTests {
 
     static let modelId = "mlx-community/MiniCPM-V-4.6-4bit"

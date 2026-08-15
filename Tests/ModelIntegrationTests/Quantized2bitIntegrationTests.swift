@@ -43,7 +43,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Qwen3.5-VL 2-bit Integration", .serialized)
+@Suite("Qwen3.5-VL 2-bit Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Quantized2bitIntegrationTests {
 
     @Test("load + generate runs int2 kernels end-to-end (no coherence check)")

@@ -37,7 +37,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Paligemma Vision Integration", .serialized)
+@Suite("Paligemma Vision Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct PaligemmaIntegrationTests {
 
     @Test("load + image+text generation mentions dog")

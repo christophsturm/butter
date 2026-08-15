@@ -34,7 +34,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("FalconH1 Integration", .serialized)
+@Suite("FalconH1 Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct FalconH1IntegrationTests {
 
     @Test("load + greedy generate produces coherent hybrid output")

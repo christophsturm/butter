@@ -30,7 +30,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Gemma3 Vision Integration", .serialized)
+@Suite("Gemma3 Vision Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Gemma3VisionIntegrationTests {
 
     static let modelId = "mlx-community/gemma-3-4b-it-4bit"

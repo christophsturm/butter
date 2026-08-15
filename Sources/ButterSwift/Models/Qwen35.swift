@@ -70,6 +70,33 @@ public protocol Qwen35Variant {
         options: LoadOptions,
         device: Device
     ) throws -> Qwen35Model
+
+    /// GGUF entry point — parallel to `loadModel(weights:)` for the
+    /// safetensors path, mirroring `DeepSeekV4Variant.loadModelFromGGUF`.
+    /// Unlike DSv4 (whose GGUF path builds a separate lazy-per-layer
+    /// model class), `Qwen35Hybrid`'s override translates the GGUF into
+    /// an in-memory `SafeTensorsBundle` and delegates to the same
+    /// `loadModel` the safetensors path uses — see
+    /// `Qwen3xGGUFLoader.swift`. The default impl throws
+    /// `unsupportedConfig` for any variant that doesn't override it.
+    static func loadModelFromGGUF(
+        config: ModelConfig,
+        gguf: GGUFTensorBundle,
+        options: LoadOptions,
+        device: Device
+    ) throws -> Qwen35Model
+}
+
+extension Qwen35Variant {
+    public static func loadModelFromGGUF(
+        config: ModelConfig,
+        gguf: GGUFTensorBundle,
+        options: LoadOptions,
+        device: Device
+    ) throws -> Qwen35Model {
+        _ = config; _ = gguf; _ = options; _ = device
+        throw Qwen35Error.unsupportedConfig("GGUF loading is not implemented for this variant")
+    }
 }
 
 // ─── Errors ──────────────────────────────────────────────────────────

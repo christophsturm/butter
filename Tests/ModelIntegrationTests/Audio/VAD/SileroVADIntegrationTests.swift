@@ -30,7 +30,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("SileroVAD Integration", .serialized)
+@Suite("SileroVAD Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct SileroVADIntegrationTests {
 
     /// The published SileroVAD checkpoint.

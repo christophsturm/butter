@@ -128,8 +128,46 @@ public func loadModel(
     _ repoId: String,
     options: LoadOptions = LoadOptions()
 ) async throws -> Model {
-    try await ModelLoadLock.shared.loadSerially {
+    // Defense-in-depth behind the suite-level `.enabled(if:
+    // modelTestsOptedIn)` gate: even an opted-in run refuses to load a
+    // checkpoint into a memory-starved machine. 8 GiB floor ~= the
+    // smallest test checkpoint + runtime headroom; the two OOM
+    // incidents this guards against began with far less free.
+    var stats = vm_statistics64()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+    let kr = withUnsafeMutablePointer(to: &stats) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+        }
+    }
+    if kr == KERN_SUCCESS {
+        let freeBytes =
+            (UInt64(stats.free_count) + UInt64(stats.inactive_count))
+            * UInt64(sysconf(_SC_PAGESIZE))
+        let floorBytes: UInt64 = 8 << 30
+        guard freeBytes >= floorBytes else {
+            throw ButterTestGateError.insufficientMemory(
+                freeGiB: Double(freeBytes) / Double(1 << 30))
+        }
+    }
+    return try await ModelLoadLock.shared.loadSerially {
         try await Model.load(repoId, options: options)
+    }
+}
+
+/// Thrown by `loadModel` when the machine lacks the memory headroom to
+/// load a checkpoint safely. Failing fast beats OOMing the host.
+public enum ButterTestGateError: Error, CustomStringConvertible {
+    case insufficientMemory(freeGiB: Double)
+    public var description: String {
+        switch self {
+        case .insufficientMemory(let free):
+            return String(
+                format: "refusing to load a model checkpoint with only "
+                    + "%.1f GiB free memory (floor: 8 GiB) - free memory "
+                    + "or run on a quieter machine", free)
+        }
     }
 }
 
@@ -144,4 +182,24 @@ public func resourceURL(_ name: String, file: StaticString = #filePath) -> URL {
         .deletingLastPathComponent()  // Tests/
         .appendingPathComponent("Resources")
         .appendingPathComponent(name)
+}
+
+// MARK: - Model-test opt-in gate
+
+/// Integration suites load multi-gigabyte checkpoints inside the
+/// swiftpm test runner. Running one BY ACCIDENT — most easily via a
+/// `swift test --filter` string that substring-matches an integration
+/// suite name (e.g. `--filter MTPSpecDecodeTests` also matches
+/// `MTPSpecDecodeIntegrationTests`) — has exhausted system memory and
+/// swap on the development machine, twice, hard enough to freeze it.
+///
+/// Every `@Suite` in `ModelIntegrationTests` therefore carries
+/// `.enabled(if: modelTestsOptedIn)`: without the explicit opt-in the
+/// suite skips in microseconds, before any model bytes are touched.
+///
+/// Run integration tests intentionally with:
+///
+///     BUTTER_RUN_MODEL_TESTS=1 swift test --filter <ExactSuiteName>
+public var modelTestsOptedIn: Bool {
+    ProcessInfo.processInfo.environment["BUTTER_RUN_MODEL_TESTS"] == "1"
 }

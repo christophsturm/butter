@@ -31,10 +31,11 @@
 
 import Foundation
 import Testing
+import TestHelpers
 
 @testable import ButterSwift
 
-@Suite("StyleTTS2 Integration", .serialized)
+@Suite("StyleTTS2 Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct StyleTTS2IntegrationTests {
 
     /// Cached snapshot directory for `mlx-community/kitten-tts-nano-0.8-fp16`.

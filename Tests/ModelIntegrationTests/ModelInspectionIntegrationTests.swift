@@ -29,7 +29,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Model Inspection Integration", .serialized)
+@Suite("Model Inspection Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct ModelInspectionIntegrationTests {
 
     @Test("inspect path runs end-to-end on Llama 3.2 1B")

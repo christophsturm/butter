@@ -176,6 +176,19 @@ The closure passed to `Debug.log(...)` is `@autoclosure` — when the subsystem 
 Debug.log(.kvcache, "append k+v at pos \(pos), live bytes=\(caches.totalBytesInUse)")
 ```
 
+### Standalone debug env flags (outside `--debug`)
+
+A handful of env-gated probes live next to specific subsystems instead of
+under the `Debug.log` subsystem table above — same "off by default,
+near-zero cost when off" contract, but each has its own dedicated flag
+since they print a fixed diagnostic format rather than free-form
+subsystem chatter.
+
+| Env var | What it logs |
+|---|---|
+| `BUTTER_DEBUG_LOGIT_MARGIN=1` | One line per emitted greedy-decode token to stderr: `[margin] t=<i> id=<tok> gap=<float>` — the chosen token id and the top-2 logit gap (chosen logit minus the best of everything else), read from whichever tensor that decode step's argmax actually ran on (GPU chained loop, GPU synchronous fallback, or CPU sample). `=2` additionally prints `[margin-top5]` with the top-5 (id, logit) pairs. See `Sources/ButterSwift/Generation/LogitMarginDebug.swift`. On the GPU paths this forces a synchronous logits readback per step when enabled — fine for a debug probe, not perf-preserving. |
+| `BUTTER_LAGUNA_DECODE_KERNEL_TIMING=1` | Per-checkpoint forced-sync wall/GPU time breakdown for one Laguna decode token; see `LagunaDecodeKernelTiming.swift`. |
+
 ## `--profiling N`
 
 Three levels. `0` is the default (off, zero overhead anywhere).

@@ -37,7 +37,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Marvis Integration", .serialized)
+@Suite("Marvis Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct MarvisIntegrationTests {
 
     /// Canonical HF repo id. The 4-bit MLX conversion is the smallest

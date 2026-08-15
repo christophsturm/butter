@@ -115,7 +115,7 @@ public struct AURAScheme: Sendable, Equatable, Hashable {
     /// OFF — Eric's "no magic by default" stance: the caller must
     /// explicitly request the policy.
     public static let autoAsymmetricOptedIn: Bool = {
-        ProcessInfo.processInfo.environment["BUTTER_AURA_AUTO_ASYM"] == "1"
+        ButterEnv["BUTTER_AURA_AUTO_ASYM"] == "1"
     }()
 
     /// Parse a CLI / config string. Accepts:

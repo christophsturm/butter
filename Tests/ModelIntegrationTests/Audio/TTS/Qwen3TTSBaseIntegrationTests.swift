@@ -36,10 +36,11 @@
 
 import Foundation
 import Testing
+import TestHelpers
 
 @testable import ButterSwift
 
-@Suite("Qwen3TTSBase Integration", .serialized)
+@Suite("Qwen3TTSBase Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Qwen3TTSBaseIntegrationTests {
 
     /// Resolve and load the VyvoTTS checkpoint. Throws on failure so a

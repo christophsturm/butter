@@ -50,6 +50,16 @@ public enum DType: String, Sendable, Hashable, Codable {
         case "U64": return .u64
         case "I8": return .i8
         case "U8": return .u8
+        // F8_E4M3 (float8_e4m3fn) has no dedicated Butter dtype — read
+        // its raw bytes as opaque `.u8`. Two call sites decode them
+        // deliberately: NVFP4 per-block micro-scales are ALREADY u8
+        // E4M3-encoded by convention (matches `Nvfp4Linear.scales`),
+        // so those pass straight through; NemotronH-Lightning's static
+        // FP8 mamba mixer projections are genuine E4M3-encoded weight
+        // values and get host-side dequantized to bf16 at load time
+        // (see `NemotronHNvfp4.swift`). Added for the Nemotron-3.5-
+        // Lightning-30B-A3B-NVFP4 port — see `NemotronHNvfp4.swift`.
+        case "F8_E4M3": return .u8
         default: return nil
         }
     }

@@ -172,17 +172,29 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
 
     public convenience init(
         nKVHeads: Int, headDim: Int, maxSeq: Int, dtype: DType,
-        device: Device = .shared
+        device: Device = .shared,
+        residency: Device.CacheResidencyKind = .generation
     ) {
         self.init(
             nKVHeads: nKVHeads, headDim: headDim, maxSeq: maxSeq,
-            dtype: dtype, eviction: .unbounded, device: device)
+            dtype: dtype, eviction: .unbounded, device: device, residency: residency)
     }
 
     public init(
         nKVHeads: Int, headDim: Int, maxSeq: Int, dtype: DType,
         eviction: KVEviction,
-        device: Device = .shared
+        device: Device = .shared,
+        // Default `.generation` matches every `makeLayerCaches()`
+        // implementation (the overwhelming majority of call sites) —
+        // this cache is rebuilt fresh every generation/arm, so it's
+        // correct AND necessary for it to be bulk-released between them
+        // (see `Device.releaseGenerationCaches`). Pass `.weight`
+        // explicitly for a cache created once and reused (`reset()`,
+        // not recreated) across many generations — e.g.
+        // `Qwen3xMTPHead`'s own draft cache, built once at model load —
+        // so it stays pinned in the process-lifetime weight set instead
+        // of getting silently dropped the first time a generation ends.
+        residency: Device.CacheResidencyKind = .generation
     ) {
         self.nKVHeads = nKVHeads
         self.headDim = headDim
@@ -195,10 +207,19 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
         self.kBuffer.zero()
         self.vBuffer.zero()
         self._evictionState = KVEvictionState(policy: eviction, bufferCapacity: maxSeq)
-        // KV buffers live for the entire generation — pin them in the
-        // device's residency set so per-dispatch residency tracking
-        // doesn't fire on the thousands of decode-step appends + reads.
-        device.markWeightsResident([self.kBuffer.buffer, self.vBuffer.buffer])
+        // KV buffers live for the entire generation (or, for `.weight`
+        // caches, the entire process) — pin them in the appropriate
+        // residency set so per-dispatch residency tracking doesn't fire
+        // on the thousands of decode-step appends + reads. See
+        // `Device.markCacheResident`/`releaseGenerationCaches` and
+        // `Device.CacheResidencyKind` for why this is a separate set
+        // from `markWeightsResident` and why the split exists at all.
+        switch residency {
+        case .generation:
+            device.markCacheResident([self.kBuffer.buffer, self.vBuffer.buffer])
+        case .weight:
+            device.markWeightsResident([self.kBuffer.buffer, self.vBuffer.buffer])
+        }
     }
 
     /// CPU-side legacy append. Caller must have already sync'd the
@@ -223,7 +244,12 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
         }
     }
 
-    /// Append one timestep on the GPU via Ops.kvCacheUpdate. The dispatch
+    /// Append one timestep on the GPU via Ops.kvCacheUpdateKV — K and V
+    /// share one compute encoder (2 dispatches, 1 encoder begin/end pair)
+    /// instead of two independent `Ops.kvCacheUpdate` calls. Bit-identical
+    /// output (same `iron_kv_cache_update_*` kernel, same per-element
+    /// writes — batching only removes the second encoder's create/end
+    /// overhead, decode-path perf audit, glimmer-decode-gap). The dispatch
     /// is queued on `cmd`; no commit/wait happens here. Caller is
     /// responsible for ensuring the command buffer that produced kFlat /
     /// vFlat is the same one (or a strictly-prior one) so dependencies
@@ -236,12 +262,9 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
         precondition(kFlat.dtype == dtype && vFlat.dtype == dtype, "KVCache: dtype mismatch")
         lengthLock.withLock {
             let pos = _evictionState.reserveNextSlot()
-            Ops.kvCacheUpdate(
-                src: kFlat, into: kBuffer,
-                nKVHeads: nKVHeads, headDim: headDim,
-                maxSeq: maxSeq, position: pos, on: cmd)
-            Ops.kvCacheUpdate(
-                src: vFlat, into: vBuffer,
+            Ops.kvCacheUpdateKV(
+                kSrc: kFlat, kCache: kBuffer,
+                vSrc: vFlat, vCache: vBuffer,
                 nKVHeads: nKVHeads, headDim: headDim,
                 maxSeq: maxSeq, position: pos, on: cmd)
         }
@@ -251,6 +274,21 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
 
     public func truncate(toLength length: Int) {
         lengthLock.withLock { _evictionState.truncate(toLength: length) }
+    }
+
+    /// Reserve the next physical write slot WITHOUT queuing any GPU
+    /// work and without touching K/V storage -- for
+    /// `LagunaFusedSlidingAttnStep` (`BUTTER_LAGUNA_FUSED_ATTN_STEP`),
+    /// whose single fused dispatch performs the cache write itself
+    /// instead of going through `Ops.kvCacheUpdateKV`. Same
+    /// `reserveNextSlot()` bookkeeping `appendOnGPU` uses (ring
+    /// rotation, `length`/`absolutePosition` accounting), just without
+    /// the paired Metal dispatches. Callers MUST write valid K and V
+    /// rows to the returned slot before any later reader observes it
+    /// -- `length` already reports it filled the instant this returns,
+    /// same as `appendOnGPU`'s contract.
+    public func reserveSlotForFusedStep() -> Int {
+        lengthLock.withLock { _evictionState.reserveNextSlot() }
     }
 
     /// Append `kRows`/`vRows` (each `[nKVHeads, headDim]`) as consecutive
@@ -356,6 +394,94 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
     /// work is needed before SDPA.
     public func prepareForAttention(on cmd: MTLCommandBuffer) -> (k: Tensor, v: Tensor) {
         return (kBuffer, vBuffer)
+    }
+
+    // ─── Content-level range snapshot (diagnostic use only) ───────────
+    //
+    // `CacheSnapshot.swift`'s composite `snapshotAll`/`restoreAll` treat
+    // KVCache as LENGTH-ONLY: restoring means truncating back to a
+    // shorter fill count, on the assumption that the caller will
+    // reappend IDENTICAL content when it grows the cache again (true
+    // for the speculative-decode reject/replay path — the "rejected"
+    // tail never gets reappended with different data than the accepted
+    // prefix would have produced).
+    //
+    // That assumption breaks for a caller that truncates, replays
+    // through a DIFFERENT kernel than the one that originally filled
+    // those slots, and expects the ORIGINAL bytes back afterward — the
+    // `BUTTER_QWEN_MTP_PARITY` diagnostic in `MTPSpecDecode.swift` does
+    // exactly this: it rewinds to the pre-verify length and replays the
+    // committed prefix through the single-token forward (numerically
+    // distinct from the batched verify pass — that gap is the thing
+    // being measured), which overwrites the same physical slots the
+    // batched pass wrote. A length-only restore afterward is a no-op on
+    // content, silently leaving the probe's single-token K/V sitting
+    // where the batched pass's K/V used to be — every later decode step
+    // attends over those slots, so the drift compounds forward instead
+    // of staying contained to the diagnostic.
+    //
+    // These two methods give such a caller a true content-level
+    // snapshot/restore over an explicit `[start, start+count)` position
+    // range, encoded onto the caller's own command buffer (mirrors
+    // `GDNStateCache`/`ConvStateCache`'s `snapshotEncode`/
+    // `restoreEncode` pattern). Not part of the composite
+    // `LayerCacheSnapshot` — deliberately opt-in and diagnostic-only so
+    // the hot spec-decode path keeps the cheap length-only contract.
+    public func snapshotRangeEncode(
+        start: Int, count: Int, on cmd: MTLCommandBuffer, device: Device = .shared
+    ) -> (k: Tensor, v: Tensor) {
+        let rowBytes = headDim * dtype.byteSize
+        let kSnap = Tensor.empty(shape: [nKVHeads, count, headDim], dtype: dtype, device: device)
+        let vSnap = Tensor.empty(shape: [nKVHeads, count, headDim], dtype: dtype, device: device)
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure("KVCache.snapshotRangeEncode: makeBlitCommandEncoder failed")
+        }
+        for h in 0 ..< nKVHeads {
+            let srcOff = kBuffer.offset + (h * maxSeq + start) * rowBytes
+            let dstOff = kSnap.offset + h * count * rowBytes
+            blit.copy(
+                from: kBuffer.buffer, sourceOffset: srcOff,
+                to: kSnap.buffer, destinationOffset: dstOff, size: count * rowBytes)
+            let srcOffV = vBuffer.offset + (h * maxSeq + start) * rowBytes
+            let dstOffV = vSnap.offset + h * count * rowBytes
+            blit.copy(
+                from: vBuffer.buffer, sourceOffset: srcOffV,
+                to: vSnap.buffer, destinationOffset: dstOffV, size: count * rowBytes)
+        }
+        blit.endEncoding()
+        return (kSnap, vSnap)
+    }
+
+    /// Encode-only restore; see `snapshotRangeEncode`. `snapshot` must
+    /// have been produced by a prior `snapshotRangeEncode(start:count:)`
+    /// call with the SAME `count` (shape-checked); `start` may differ
+    /// only if the caller intends to relocate the range, which no
+    /// current caller does.
+    public func restoreRangeEncode(
+        from snapshot: (k: Tensor, v: Tensor), start: Int, count: Int, on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            snapshot.k.shape == [nKVHeads, count, headDim]
+                && snapshot.v.shape == [nKVHeads, count, headDim],
+            "KVCache.restoreRangeEncode: snapshot shape \(snapshot.k.shape)/\(snapshot.v.shape) "
+                + "does not match [\(nKVHeads), \(count), \(headDim)]")
+        let rowBytes = headDim * dtype.byteSize
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure("KVCache.restoreRangeEncode: makeBlitCommandEncoder failed")
+        }
+        for h in 0 ..< nKVHeads {
+            let dstOff = kBuffer.offset + (h * maxSeq + start) * rowBytes
+            let srcOff = snapshot.k.offset + h * count * rowBytes
+            blit.copy(
+                from: snapshot.k.buffer, sourceOffset: srcOff,
+                to: kBuffer.buffer, destinationOffset: dstOff, size: count * rowBytes)
+            let dstOffV = vBuffer.offset + (h * maxSeq + start) * rowBytes
+            let srcOffV = snapshot.v.offset + h * count * rowBytes
+            blit.copy(
+                from: snapshot.v.buffer, sourceOffset: srcOffV,
+                to: vBuffer.buffer, destinationOffset: dstOffV, size: count * rowBytes)
+        }
+        blit.endEncoding()
     }
 
     // ─── Memory accounting (used by --stats / bench harness) ─────────

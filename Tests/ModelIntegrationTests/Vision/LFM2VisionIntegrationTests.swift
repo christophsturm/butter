@@ -34,7 +34,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("LFM2 Vision Integration", .serialized)
+@Suite("LFM2 Vision Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct LFM2VisionIntegrationTests {
 
     static let modelId = "mlx-community/LFM2-VL-1.6B-4bit"

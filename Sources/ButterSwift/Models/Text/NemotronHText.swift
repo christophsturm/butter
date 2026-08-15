@@ -117,6 +117,34 @@ enum NemotronHLayerKind: Equatable {
                 "unknown hybrid_override_pattern character '\(char)'")
         }
     }
+
+    /// Newer NemotronH checkpoints (e.g. Nemotron-3.5-Lightning-30B-A3B)
+    /// ship the layer schedule as a JSON array of names —
+    /// `layers_block_type: ["mamba", "moe", "attention", ...]` — rather
+    /// than the packed `hybrid_override_pattern` character string.
+    /// Same schedule, different config schema; mirrors Granite4's
+    /// `layer_types` string-array parsing (`Granite4Text.swift`).
+    ///
+    /// Deliberately NOT `init(from: String)`: overloading `init(from:)`
+    /// on `Character` vs `String` makes every existing bare-string-
+    /// literal call site (`NemotronHLayerKind(from: "M")`, used
+    /// throughout `NemotronHTextTests.swift`) resolve to THIS
+    /// initializer instead of the `Character` one — Swift's default
+    /// literal inference picks `String` over `Character` when both
+    /// overloads are viable, silently breaking every existing
+    /// single-character call site. A distinctly-labeled initializer
+    /// sidesteps the ambiguity entirely.
+    init(fromBlockTypeName name: String) throws {
+        switch name {
+        case "mamba": self = .mamba
+        case "attention": self = .attention
+        case "mlp": self = .mlp
+        case "moe": self = .moe
+        default:
+            throw NemotronHError.unsupportedConfig(
+                "unknown layers_block_type entry '\(name)'")
+        }
+    }
 }
 
 // ─── NemotronHHybrid — the single variant ────────────────────────────
@@ -161,9 +189,20 @@ public struct NemotronHHybrid: NemotronHVariant {
         let tieEmbed = config.tieWordEmbeddings
 
         // ── Hybrid layer schedule ─────────────────────────────────────
-        guard let pattern = config.string("hybrid_override_pattern"), !pattern.isEmpty
-        else { throw NemotronHError.missingConfig("hybrid_override_pattern") }
-        let kinds = try Array(pattern).map { try NemotronHLayerKind(from: $0) }
+        // Two config schemas carry the identical semantic schedule:
+        // the older packed `hybrid_override_pattern` char-string
+        // (NemotronH-4B-Base, Cascade-2), and the newer
+        // `layers_block_type` JSON string-array (Nemotron-3.5-
+        // Lightning). Try the array form first since it's unambiguous;
+        // fall back to the char-string.
+        let kinds: [NemotronHLayerKind]
+        if let blockTypes = config.raw["layers_block_type"] as? [String], !blockTypes.isEmpty {
+            kinds = try blockTypes.map { try NemotronHLayerKind(fromBlockTypeName: $0) }
+        } else if let pattern = config.string("hybrid_override_pattern"), !pattern.isEmpty {
+            kinds = try Array(pattern).map { try NemotronHLayerKind(from: $0) }
+        } else {
+            throw NemotronHError.missingConfig("hybrid_override_pattern / layers_block_type")
+        }
         let nLayers = kinds.count
         // MoE ("E") layer support — Cascade-2 / Nemotron-3 Nano/Super/
         // Ultra. Built by `buildNemotronHMoELayer` below. Grouped
@@ -225,15 +264,19 @@ public struct NemotronHHybrid: NemotronHVariant {
         }()
 
         // ── Activation dtype — taken from the embedding table ─────────
+        // The quantization guard must run BEFORE the dtype precondition:
+        // a quantized checkpoint's packed-u32 embedding used to trip the
+        // precondition first, killing the process with a messageless
+        // SIGTRAP in release builds instead of this thrown error.
+        guard config.quantization == nil else {
+            throw NemotronHError.unsupportedConfig(
+                "quantized NemotronH checkpoints not yet supported — load a raw bf16/f16 variant")
+        }
         let embedWRaw = try weights.tensor(named: "backbone.embeddings.weight")
         let activationDtype = embedWRaw.dtype
         precondition(
             activationDtype == .f32 || activationDtype == .bf16 || activationDtype == .f16,
             "NemotronH: unexpected activation dtype \(activationDtype)")
-        guard config.quantization == nil else {
-            throw NemotronHError.unsupportedConfig(
-                "quantized NemotronH checkpoints not yet supported — load a raw bf16/f16 variant")
-        }
         let embedTokens = AnyEmbedding(Embedding(weight: embedWRaw))
 
         // ── MoE hyper-parameters (only read when an "E" layer exists) ─
@@ -334,14 +377,21 @@ public struct NemotronHHybrid: NemotronHVariant {
             weight: try weights.tensor(named: "backbone.norm_f.weight"), eps: eps)
 
         let lmHead: AnyLinear
-        if !tieEmbed, weights.has("lm_head.weight") {
+        if !tieEmbed, weights.has("lm_head.weight_scale_2") {
+            // NVFP4-quantized lm_head (Nemotron-3.5-Lightning) — huge
+            // (vocab × hidden), quantized same as the MoE experts.
+            lmHead = AnyLinear(
+                try loadNemotronHNvfp4Linear(
+                    base: "lm_head", outDim: vocab, inDim: hidden,
+                    weights: weights, device: device))
+        } else if !tieEmbed, weights.has("lm_head.weight") {
             lmHead = AnyLinear(Linear(weight: try weights.tensor(named: "lm_head.weight")))
         } else {
             lmHead = AnyLinear(Linear(weight: embedWRaw))
         }
 
         let maxSeq = config.int("max_position_embeddings") ?? 8192
-        return NemotronHModel(
+        let model = NemotronHModel(
             embedTokens: embedTokens, layers: layers,
             finalNorm: finalNorm, lmHead: lmHead,
             hidden: hidden, nLayers: nLayers,
@@ -350,6 +400,25 @@ public struct NemotronHHybrid: NemotronHVariant {
             stateDim: stateDim, convDim: convDim, convKernel: convKernel,
             nGroups: nGroups, dInner: dInner,
             vocab: vocab, maxSeq: maxSeq, dtype: activationDtype)
+
+        // F-131 MTP self-speculative decode — opt-in (BUTTER_NEMOTRON_MTP=1)
+        // load of the checkpoint's optional 53rd "nextn" block. Gated on
+        // BOTH the env var and the tensor actually being present, so a
+        // checkpoint without an MTP block (every non-Lightning NemotronH
+        // release) is completely unaffected regardless of the env var.
+        // See `NemotronHMTPHead.swift` for the architecture + loader.
+        if ButterEnv["BUTTER_NEMOTRON_MTP"] == "1", weights.has("mtp.layers.0.eh_proj.weight") {
+            model.mtpHead = try NemotronHMTPHead.load(
+                weights: weights, embedTokens: embedTokens, lmHead: lmHead,
+                hidden: hidden, vocab: vocab,
+                nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                moeIntermediate: moeIntermediate, nRoutedExperts: nRoutedExperts,
+                moeTopK: moeTopK, nSharedExperts: nSharedExperts,
+                sharedExpertIntermediate: sharedExpertIntermediate,
+                routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb,
+                eps: eps, dtype: activationDtype, device: device)
+        }
+        return model
     }
 
     /// Build one Mamba 2 mixer layer (`"M"`). Reads + derives the
@@ -363,12 +432,23 @@ public struct NemotronHHybrid: NemotronHVariant {
         tsMin: Float, tsMax: Float,
         dtype: DType, device: Device
     ) throws -> NemotronHMambaLayer {
-        let inProj = AnyLinear(
-            Linear(
-                weight: try weights.tensor(named: "\(p).in_proj.weight")))
-        let outProj = AnyLinear(
-            Linear(
-                weight: try weights.tensor(named: "\(p).out_proj.weight")))
+        // Nemotron-3.5-Lightning ships mamba mixer in_proj/out_proj as
+        // static FP8 (W8A8, scalar weight_scale + input_scale) — see
+        // `NemotronHNvfp4.swift` header. Butter has no FP8 GEMM/GEMV
+        // kernel, so `loadMambaProjNH` dequantizes to the activation
+        // dtype at load time and then (F-128 bandwidth wave, default
+        // on) requantizes down to affine int4 — see that function's
+        // doc for the oracle-precision justification and the
+        // `BUTTER_NEMOTRON_MAMBA_PROJ_Q4=0` escape hatch. Non-quantized
+        // checkpoints (NemotronH-4B-Base, Cascade-2) hit the
+        // plain-tensor / plain-bf16-Linear branch unchanged.
+        let inProjOutDim = dInner + convDim + nHeads
+        let inProj = try loadMambaProjNH(
+            base: "\(p).in_proj", outDim: inProjOutDim, inDim: hidden,
+            weights: weights, dtype: dtype, device: device)
+        let outProj = try loadMambaProjNH(
+            base: "\(p).out_proj", outDim: hidden, inDim: dInner,
+            weights: weights, dtype: dtype, device: device)
 
         // conv1d.weight ships [conv_dim, 1, kernel]; the iron kernel
         // wants [kernel, conv_dim].
@@ -525,43 +605,88 @@ public final class NemotronHMambaLayer: Module, DecoderLayer {
         )
         .reshaped(to: [nGroups, stateDim])
 
-        // (5) dt = softplus(dt_raw + dt_bias).
-        let dtSum = Ops.add(dtRaw, dtBias, on: cmd)
-        let dt = Ops.softplus(dtSum, on: cmd)
+        // (5) dt = softplus(dt_raw + dt_bias). F-129 mixer-fuse: one
+        // dispatch instead of two — see NemotronHMambaMixerFuse for the
+        // bit-exactness contract. Default OFF: bit-exact in local dev
+        // but CI's GPU recorded 142/512 bf16 mismatches for the same
+        // test (gh run 31712976150) — a transcendental-unit hazard, not
+        // a formula bug. Opt in with `BUTTER_NEMOTRON_MIXER_FUSE_SOFTPLUS
+        // =1` only where bit-exactness has been independently
+        // reconfirmed.
+        let dt: Tensor
+        if NemotronHMambaMixerFuse.softplusEnabled {
+            dt = NemotronHMambaMixerFuse.addSoftplus(dtRaw, dtBias, on: cmd, device: device)
+        } else {
+            let dtSum = Ops.add(dtRaw, dtBias, on: cmd)
+            dt = Ops.softplus(dtSum, on: cmd)
+        }
 
-        // (6) selective scan — dispatched per group so the shipped
-        //     single-group ssm_step kernel handles grouped B/C. Each
-        //     group owns a contiguous head sub-slab in x / state / y.
+        // (6) selective scan. F-130 grouped-SSM fuse: default ON, one
+        //     dispatch spanning every (head, channel) pair instead of
+        //     `nGroups` separate per-group dispatches — see
+        //     NemotronHMambaGroupedSSMFuse for the bit-exactness
+        //     contract. `BUTTER_NEMOTRON_SSM_GROUPED=0` restores the
+        //     original per-group loop (the shipped single-group
+        //     `ssm_step` kernel dispatched once per group, each on a
+        //     host-sliced sub-view).
         let y = Tensor.empty(shape: [nHeads, headDim], dtype: dtype, device: device)
         let xHeads = x.reshaped(to: [nHeads, headDim])
         let stateHeads = layerCache.ssm.h  // [nHeads, headDim, stateDim]
-        for g in 0 ..< nGroups {
-            let h0 = g * headsPerGroup
-            let xg = xHeads.slicedRows(start: h0, count: headsPerGroup)
-                .reshaped(to: [headsPerGroup * headDim])
-            let yg = y.slicedRows(start: h0, count: headsPerGroup)
-            let stateG = stateHeads.slicedRows(start: h0, count: headsPerGroup)
-            let aG = aEff.slicedRows(start: h0, count: headsPerGroup)
-            let dtG = dt.slicedRows(start: h0, count: headsPerGroup)
-            let bG = bAll.slicedRows(start: g, count: 1).reshaped(to: [stateDim])
-            let cG = cAll.slicedRows(start: g, count: 1).reshaped(to: [stateDim])
-            Ops.ssmStep(
-                x: xg, a: aG, b: bG, c: cG, dt: dtG,
-                state: stateG, into: yg,
-                nHeads: headsPerGroup, headDim: headDim, stateDim: stateDim,
-                on: cmd)
+        let bFlat = bAll.reshaped(to: [nGroups * stateDim])
+        let cFlat = cAll.reshaped(to: [nGroups * stateDim])
+        if NemotronHMambaGroupedSSMFuse.enabled {
+            NemotronHMambaGroupedSSMFuse.ssmStepGrouped(
+                x: x, a: aEff, b: bFlat, c: cFlat, dt: dt,
+                state: stateHeads, into: y,
+                nHeads: nHeads, headDim: headDim, stateDim: stateDim,
+                headsPerGroup: headsPerGroup,
+                on: cmd, device: device)
+        } else {
+            for g in 0 ..< nGroups {
+                let h0 = g * headsPerGroup
+                let xg = xHeads.slicedRows(start: h0, count: headsPerGroup)
+                    .reshaped(to: [headsPerGroup * headDim])
+                let yg = y.slicedRows(start: h0, count: headsPerGroup)
+                let stateG = stateHeads.slicedRows(start: h0, count: headsPerGroup)
+                let aG = aEff.slicedRows(start: h0, count: headsPerGroup)
+                let dtG = dt.slicedRows(start: h0, count: headsPerGroup)
+                let bG = bAll.slicedRows(start: g, count: 1).reshaped(to: [stateDim])
+                let cG = cAll.slicedRows(start: g, count: 1).reshaped(to: [stateDim])
+                Ops.ssmStep(
+                    x: xg, a: aG, b: bG, c: cG, dt: dtG,
+                    state: stateG, into: yg,
+                    nHeads: headsPerGroup, headDim: headDim, stateDim: stateDim,
+                    on: cmd)
+            }
         }
         let yFlat = y.reshaped(to: [dInner])
 
-        // (7) skip: y += D_tiled * x.
-        let dx = Ops.mul(dTiled, x, on: cmd)
-        let ySkip = Ops.add(yFlat, dx, on: cmd)
+        // (7) skip: y += D_tiled * x. F-129 mixer-fuse: default ON —
+        //     pure mul+add, no transcendentals, bit-exact on both local
+        //     dev and CI (unlike addSoftplus above).
+        let ySkip: Tensor
+        if NemotronHMambaMixerFuse.enabled {
+            ySkip = NemotronHMambaMixerFuse.addMul(base: yFlat, dTiled, x, on: cmd, device: device)
+        } else {
+            let dx = Ops.mul(dTiled, x, on: cmd)
+            ySkip = Ops.add(yFlat, dx, on: cmd)
+        }
 
         // (8) gated mixer RMSNorm: y *= silu(z), then per-group
         //     (unweighted) RMSNorm, then scale by the learned weight.
-        //     Matches mlx-lm's NemotronHRMSNormGated exactly.
-        let zAct = Ops.silu(z, on: cmd)
-        let yGated = Ops.mul(ySkip, zAct, on: cmd)
+        //     Matches mlx-lm's NemotronHRMSNormGated exactly. F-129
+        //     mixer-fuse: `mulSilu` is measured NOT bit-exact anywhere
+        //     it's been tried (see NemotronHMambaMixerFuse's header) so
+        //     it stays behind its own opt-in gate, default OFF — same
+        //     transcendental-unit hazard class as addSoftplus above,
+        //     just never bit-exact even locally rather than only on CI.
+        let yGated: Tensor
+        if NemotronHMambaMixerFuse.siluEnabled {
+            yGated = NemotronHMambaMixerFuse.mulSilu(ySkip, z, on: cmd, device: device)
+        } else {
+            let zAct = Ops.silu(z, on: cmd)
+            yGated = Ops.mul(ySkip, zAct, on: cmd)
+        }
         let yNormed = Ops.rmsNormRows(
             yGated, weight: onesWeight,
             eps: mixerNorm.eps, nRows: nGroups, rowSize: groupSize, on: cmd)
@@ -572,6 +697,168 @@ public final class NemotronHMambaLayer: Module, DecoderLayer {
         let result = Ops.add(h, yOut, on: cmd)
 
         layerCache.advance()
+        return result
+    }
+
+    /// F-13x chunked-scan batched prefill: `h` is `[T, hidden]`; returns
+    /// `[T, hidden]`. Runs the WHOLE mixer batched over T rows —
+    /// RMSNorm, in_proj, conv1d+SiLU, dt=softplus, the selective scan,
+    /// D-skip, gated mixer RMSNorm, and out_proj all become one (or a
+    /// few, for the scan) dispatch spanning every row instead of T
+    /// per-row dispatches. See `NemotronHMambaChunkedScan`'s file
+    /// header for the full design (chunked-but-still-sequential v1
+    /// scan + the byte-generic column-slice/row-broadcast-tile helpers
+    /// that stitch the rest of the mixer together at batched-T shape).
+    /// `BUTTER_NEMOTRON_CHUNKED_SCAN=0` falls back to the exact
+    /// per-row default (`DecoderLayer`'s protocol-extension
+    /// implementation, duplicated below since Swift can't dispatch to
+    /// a protocol default from an overriding conformance).
+    public func decodeMulti(
+        _ h: Tensor, startingAt position: Int,
+        cache: any LayerCacheProtocol,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        guard let layerCache = cache as? Mamba2LayerCache else {
+            fatalError("NemotronHMambaLayer: expected Mamba2LayerCache, got \(type(of: cache))")
+        }
+        let t = h.shape[0]
+        guard NemotronHMambaChunkedScan.enabled else {
+            let result = Tensor.empty(shape: h.shape, dtype: h.dtype, device: device)
+            result.zero()
+            for i in 0 ..< t {
+                let row = h.slicedRows(start: i, count: 1).reshaped(to: [hidden])
+                let out = decode(
+                    row, position: position + i, cache: cache, cmd: cmd, device: device)
+                let dst = result.slicedRows(start: i, count: 1).reshaped(to: [hidden])
+                _ = Ops.add(out, dst, on: cmd, into: dst)
+            }
+            return result
+        }
+
+        // (1) pre-mixer RMSNorm, batched over T rows.
+        let xNorm = Ops.rmsNormRows(
+            h, weight: norm.weight, eps: norm.eps, nRows: t, rowSize: hidden, on: cmd)
+
+        // (2) in_proj is ONE combined GEMM (z | xBC | dt_raw) — batch
+        // it, then column-slice the three pieces back out (no per-piece
+        // Linear to call separately, unlike Qwen3.5 GDN's 4-projection
+        // layout — see NemotronHMambaChunkedScan's header).
+        let projDim = dInner + convDim + nHeads
+        let proj = inProj.callMany(xNorm, t: t, on: cmd, device: device)
+        let z = NemotronHMambaChunkedScan.sliceColumns(
+            proj, colStart: 0, colCount: dInner, totalCols: projDim,
+            t: t, device: device, on: cmd)
+        let xBC = NemotronHMambaChunkedScan.sliceColumns(
+            proj, colStart: dInner, colCount: convDim, totalCols: projDim,
+            t: t, device: device, on: cmd)
+        let dtRaw = NemotronHMambaChunkedScan.sliceColumns(
+            proj, colStart: dInner + convDim, colCount: nHeads, totalCols: projDim,
+            t: t, device: device, on: cmd)
+
+        // (3) batched conv1d + SiLU: `conv1dMany` (native-dtype output,
+        // rounds at the same point `iron_conv1d_causal_step_*` does)
+        // followed by the SAME `Ops.silu` dispatch `decode`'s per-token
+        // path calls — NOT `Ops.conv1dCausalStepSiluCastMany` (that
+        // kernel fuses conv+silu behind a single f32 accumulator with
+        // no intermediate native-dtype round, which measurably
+        // shortened the chunked-vs-sequential greedy match; see
+        // `NemotronHMambaChunkedScan.conv1dMany`'s header).
+        let convRaw = NemotronHMambaChunkedScan.conv1dMany(
+            src: xBC, w: convW, b: convB,
+            stateIn: layerCache.conv.state, stateOut: layerCache.conv.state,
+            t: t, convDim: convDim, convKernel: convKernel,
+            device: device, on: cmd)
+        let convAct = Ops.silu(convRaw, on: cmd)
+
+        // (4) split conv output -> x / B / C (same layout as `decode`'s
+        // step (4)).
+        let bcWidth = nGroups * stateDim
+        let x = NemotronHMambaChunkedScan.sliceColumns(
+            convAct, colStart: 0, colCount: dInner, totalCols: convDim,
+            t: t, device: device, on: cmd)
+        let bAll = NemotronHMambaChunkedScan.sliceColumns(
+            convAct, colStart: dInner, colCount: bcWidth, totalCols: convDim,
+            t: t, device: device, on: cmd)
+        let cAll = NemotronHMambaChunkedScan.sliceColumns(
+            convAct, colStart: dInner + bcWidth, colCount: bcWidth, totalCols: convDim,
+            t: t, device: device, on: cmd)
+
+        // (5) dt = softplus(dt_raw + dt_bias), batched. Deliberately
+        // NOT a fused add+softplus dispatch — reuses the exact same
+        // `Ops.add` + `Ops.softplus` kernels `decode`'s default
+        // (non-mixer-fuse) path calls, just over `[T, nHeads]` instead
+        // of `[nHeads]`; see NemotronHMambaChunkedScan's header for why
+        // a fresh transcendental fusion here would reopen the CI
+        // portability hazard `NemotronHMambaMixerFuse.addSoftplus`
+        // already hit.
+        let dtBiasTiled = NemotronHMambaChunkedScan.rowBroadcastTile(
+            dtBias, t: t, device: device, on: cmd)
+        let dtSum = Ops.add(dtRaw, dtBiasTiled, on: cmd)
+        let dt = Ops.softplus(dtSum, on: cmd)
+
+        // (6) chunked selective scan — the actual dispatch-count win.
+        // `ceil(T / chunkSize)` dispatches instead of T; state carries
+        // across chunks via `layerCache.ssm.h` (Metal serializes the
+        // read-after-write across encoders on this one `cmd`, no host
+        // sync needed between chunks).
+        let y = Tensor.empty(shape: [t, dInner], dtype: dtype, device: device)
+        let stateHeads = layerCache.ssm.h
+        let chunkSize = NemotronHMambaChunkedScan.chunkSize
+        var chunkStart = 0
+        while chunkStart < t {
+            let chunkLen = min(chunkSize, t - chunkStart)
+            autoreleasepool {
+                NemotronHMambaChunkedScan.scanChunk(
+                    x: x.slicedRows(start: chunkStart, count: chunkLen),
+                    a: aEff,
+                    b: bAll.slicedRows(start: chunkStart, count: chunkLen),
+                    c: cAll.slicedRows(start: chunkStart, count: chunkLen),
+                    dt: dt.slicedRows(start: chunkStart, count: chunkLen),
+                    state: stateHeads,
+                    into: y.slicedRows(start: chunkStart, count: chunkLen),
+                    nHeads: nHeads, headDim: headDim, stateDim: stateDim,
+                    headsPerGroup: headsPerGroup, chunkLen: chunkLen,
+                    dInner: dInner, bcStride: bcWidth,
+                    on: cmd, device: device)
+            }
+            chunkStart += chunkLen
+        }
+
+        // (7) skip: y += D_tiled * x, batched. F-129's `addMul` fusion
+        // (pure mul+add, no transcendentals — the one class verified
+        // bit-exact on both local dev and CI) is reused UNCHANGED on
+        // the tiled operand; only the broadcast-tile itself is new,
+        // and it does no floating-point math.
+        let dTiledTiled = NemotronHMambaChunkedScan.rowBroadcastTile(
+            dTiled, t: t, device: device, on: cmd)
+        let ySkip: Tensor
+        if NemotronHMambaMixerFuse.enabled {
+            ySkip = NemotronHMambaMixerFuse.addMul(base: y, dTiledTiled, x, on: cmd, device: device)
+        } else {
+            let dx = Ops.mul(dTiledTiled, x, on: cmd)
+            ySkip = Ops.add(y, dx, on: cmd)
+        }
+
+        // (8) gated mixer RMSNorm, batched: y *= silu(z), then per-group
+        // (unweighted) RMSNorm over `t * nGroups` rows (`Ops.rmsNormRows`
+        // already broadcasts one `[groupSize]` weight across every row —
+        // no tiling needed there, matches `decode`'s single-token call
+        // broadcasting the same `onesWeight` across `nGroups` rows).
+        let zAct = Ops.silu(z, on: cmd)
+        let yGated = Ops.mul(ySkip, zAct, on: cmd)
+        let yNormed = Ops.rmsNormRows(
+            yGated.reshaped(to: [t * nGroups, groupSize]), weight: onesWeight,
+            eps: mixerNorm.eps, nRows: t * nGroups, rowSize: groupSize, on: cmd
+        ).reshaped(to: [t, dInner])
+        let mixerNormWeightTiled = NemotronHMambaChunkedScan.rowBroadcastTile(
+            mixerNorm.weight, t: t, device: device, on: cmd)
+        let yScaled = Ops.mul(yNormed, mixerNormWeightTiled, on: cmd)
+
+        // (9) out_proj + residual, batched.
+        let yOut = outProj.callMany(yScaled, t: t, on: cmd, device: device)
+        let result = Ops.add(h, yOut, on: cmd)
+
+        layerCache.advanceBy(t)
         return result
     }
 }
@@ -643,6 +930,83 @@ public final class NemotronHAttentionLayer: Module, DecoderLayer {
         let oOut = oProj(attnOut.reshaped(to: [nHeads * headDim]), on: cmd)
         return Ops.add(h, oOut, on: cmd)
     }
+
+    /// F-132 batched prefill: T-batched attention. `h` is `[T, hidden]`;
+    /// returns `[T, hidden]`. Collapses the T-token per-row loop into
+    /// batched Q/K/V projections + one KV-cache range append + one
+    /// `Ops.sdpaMulti(causal: true)` dispatch + a batched output
+    /// projection — mirrors `Qwen35AttentionMixer.forwardMany`, minus
+    /// RoPE and the per-head Q/K RMSNorm (NemotronH attention has
+    /// neither — see the file header's "Attention has no RoPE" note).
+    /// All work queues onto `cmd`; no commit inside (matches `decode`'s
+    /// contract — `commitsMidDecode` is `false` for this layer).
+    public func decodeMulti(
+        _ h: Tensor, startingAt position: Int,
+        cache: any LayerCacheProtocol,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        guard let kv = cache as? KVCache else {
+            fatalError("NemotronHAttentionLayer: expected KVCache, got \(type(of: cache))")
+        }
+        let t = h.shape[0]
+        let hiddenDim = h.shape.last!
+        let qDim = nHeads * headDim
+        let kvDim = nKVHeads * headDim
+
+        let xNorm = Ops.rmsNormRows(
+            h, weight: norm.weight, eps: norm.eps,
+            nRows: t, rowSize: hiddenDim, on: cmd)
+
+        // Batched Q/K/V — one gemm each instead of T gemvs.
+        let qOut = qProj.callMany(xNorm, t: t, on: cmd, device: device)
+        let kOut = kProj.callMany(xNorm, t: t, on: cmd, device: device)
+        let vOut = vProj.callMany(xNorm, t: t, on: cmd, device: device)
+
+        // No RoPE — straight into the cache, unrotated (same as `decode`).
+        let appendPositions = Tensor.empty(shape: [t], dtype: .u32, device: device)
+        kv.reserveSlotsManyOnHost(t: t, into: appendPositions)
+        kv.appendRangeOnGPUMany(
+            kFlat: kOut.reshaped(to: [t, nKVHeads, headDim]),
+            vFlat: vOut.reshaped(to: [t, nKVHeads, headDim]),
+            t: t, positions: appendPositions, on: cmd)
+
+        let (cacheK, cacheV) = kv.prepareForAttention(on: cmd)
+        let attnAll: Tensor
+        if headDim == 128 || headDim == 256 {
+            let qBlock = qOut.reshaped(to: [t, nHeads, headDim])
+            attnAll = Ops.sdpaMulti(
+                q: qBlock, k: cacheK, v: cacheV,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                baseKV: position, nQuery: t, kvStride: kv.maxSeq,
+                causal: true, scale: scale, on: cmd
+            ).reshaped(to: [t * qDim])
+        } else {
+            // Escape path for a hypothetical NemotronH checkpoint whose
+            // head_dim isn't 128/256 (every shipped checkpoint, including
+            // Nemotron-3.5-Lightning, uses 128) — per-row sdpaDecode loop,
+            // still batched everywhere else in this method.
+            let scratch = Tensor.empty(shape: [t * qDim], dtype: xNorm.dtype, device: device)
+            let dtBytes = xNorm.dtype.byteSize
+            for r in 0 ..< t {
+                let qRow = Tensor(
+                    buffer: qOut.buffer, offset: qOut.offset + r * qDim * dtBytes,
+                    shape: [nHeads, headDim], dtype: xNorm.dtype)
+                let outRow = Tensor(
+                    buffer: scratch.buffer, offset: scratch.offset + r * qDim * dtBytes,
+                    shape: [nHeads, headDim], dtype: xNorm.dtype)
+                _ = Ops.sdpaDecode(
+                    q: qRow, k: cacheK, v: cacheV,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    nKV: position + r + 1, kvStride: kv.maxSeq,
+                    scale: scale, on: cmd, into: outRow)
+            }
+            attnAll = scratch
+        }
+        _ = kvDim  // silence unused-var warning on the RoPE-free path
+        let attnRows = attnAll.reshaped(to: [t, qDim])
+        let oOut = oProj.callMany(attnRows, t: t, on: cmd, device: device)
+        return Ops.add(h, oOut, on: cmd)
+    }
 }
 
 // ─── NemotronHMLPLayer — "-" ─────────────────────────────────────────
@@ -688,6 +1052,28 @@ public final class NemotronHMLPLayer: Module, DecoderLayer {
         let r = Ops.relu(up, on: cmd)
         let r2 = Ops.mul(r, r, on: cmd)
         let mlpOut = downProj(r2, on: cmd)
+        return Ops.add(h, mlpOut, on: cmd)
+    }
+
+    /// F-132 batched prefill: T-batched dense MLP. `h` is `[T, hidden]`;
+    /// returns `[T, hidden]`. A dense MLP has no per-token state, so this
+    /// is a pure batched-GEMM win — one `up.callMany` + one `down.callMany`
+    /// instead of T single-row GEMVs, with the squared-ReLU activation
+    /// unchanged (elementwise, already shape-agnostic).
+    public func decodeMulti(
+        _ h: Tensor, startingAt _: Int,
+        cache _: any LayerCacheProtocol,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let t = h.shape[0]
+        let rowSize = h.shape.last!
+        let xNorm = Ops.rmsNormRows(
+            h, weight: norm.weight, eps: norm.eps,
+            nRows: t, rowSize: rowSize, on: cmd)
+        let up = upProj.callMany(xNorm, t: t, on: cmd, device: device)
+        let r = Ops.relu(up, on: cmd)
+        let r2 = Ops.mul(r, r, on: cmd)
+        let mlpOut = downProj.callMany(r2, t: t, on: cmd, device: device)
         return Ops.add(h, mlpOut, on: cmd)
     }
 }
@@ -780,6 +1166,13 @@ public final class NemotronHMoELayer: Module, DecoderLayer {
     public let routedScalingFactor: Float
     public let normTopkProb: Bool
     let dtype: DType
+
+    /// `DecoderLayer.commitsMidDecode` — always `true`: this layer's
+    /// router is CPU-side (a `toFloatArray()` readback of the router
+    /// logits), unlike `NemotronHNvfp4MoELayer`'s GPU-routed default
+    /// path. See the perf-wave doc on that sibling class for why the
+    /// NVFP4/Lightning checkpoint doesn't need this.
+    public var commitsMidDecode: Bool { true }
 
     init(
         norm: RMSNorm, gate: AnyLinear, eScoreCorrectionBias: Tensor,
@@ -901,20 +1294,33 @@ public final class NemotronHMoELayer: Module, DecoderLayer {
 
 /// Build one MoE layer for a NemotronH checkpoint. The shared expert
 /// is constructed when `nSharedExperts > 0`.
-private func buildNemotronHMoELayer(
+///
+/// Not `private`: `NemotronHMTPHead.swift` (F-131, MTP self-speculative
+/// decode) reuses this unchanged to build the MTP block's own MoE
+/// sublayer (`mtp.layers.1`, `mtp_layers_block_type: ["attention",
+/// "moe"]`) — the MTP checkpoint tensors are always plain BF16 (see
+/// that file's header), so this always takes the unquantized branch
+/// below for that call site, but the NVFP4 branch is left reachable
+/// unmodified for a future quantized-MTP checkpoint.
+func buildNemotronHMoELayer(
     prefix p: String, norm: RMSNorm, weights: SafeTensorsBundle,
     hidden: Int, moeIntermediate: Int,
     nRoutedExperts: Int, topK: Int,
     nSharedExperts: Int, sharedExpertIntermediate: Int,
     routedScalingFactor: Float, normTopkProb: Bool,
     dtype: DType, device: Device
-) throws -> NemotronHMoELayer {
-    // Router: hidden → nRouted logits. NemotronH MoE checkpoints ship
-    // these projections as plain (non-quantized) Linear (the family
-    // rejects quantized configs at load), so we read the raw weight.
-    let gate = AnyLinear(
-        Linear(
-            weight: try weights.tensor(named: "\(p).gate.weight")))
+) throws -> any DecoderLayer {
+    // Router: hidden → nRouted logits. The gate/router projection and
+    // its correction bias are NEVER NVFP4/FP8-quantized on any shipped
+    // NemotronH MoE checkpoint (including Nemotron-3.5-Lightning-
+    // NVFP4 — verified against the checkpoint's safetensors index), so
+    // this read is unconditional. It IS, however, stored in plain F32
+    // on Nemotron-3.5-Lightning specifically (every other unquantized
+    // weight — attention proj, norms, embeddings — is BF16) — cast to
+    // the activation dtype so `Ops.gemv`'s `weight.dtype == input.dtype`
+    // precondition doesn't crash the first forward pass.
+    let gateWRaw = try weights.tensor(named: "\(p).gate.weight")
+    let gate = AnyLinear(Linear(weight: castMatrixNH(gateWRaw, dtype: dtype, device: device)))
     // The correction bias is per-expert; mlx-lm keeps it in fp32 — we
     // do the same (the bias is the only thing the cast-predicate
     // protects from being cast down to bf16/f16).
@@ -923,6 +1329,40 @@ private func buildNemotronHMoELayer(
         eSCBRaw.elementCount == nRoutedExperts,
         "NemotronH MoE: e_score_correction_bias has "
             + "\(eSCBRaw.elementCount) entries, expected \(nRoutedExperts)")
+
+    // NVFP4-quantized routed experts (Nemotron-3.5-Lightning) — detect
+    // via expert 0's down_proj carrying a `weight_scale_2` (the NVFP4
+    // per-tensor global scale; see `NemotronHNvfp4.swift`). Every other
+    // shipped NemotronH MoE checkpoint (Cascade-2, Nemotron-3
+    // Nano/Super/Ultra) ships plain bf16 experts and falls through to
+    // the unquantized path below unchanged.
+    if weights.has("\(p).experts.0.down_proj.weight_scale_2") {
+        let eScoreCorrectionBiasHost = readFloatsNH(eSCBRaw)
+        let stacked = try loadNemotronHStackedNvfp4Experts(
+            prefix: p, nExperts: nRoutedExperts, moeIntermediate: moeIntermediate,
+            hidden: hidden, weights: weights, dtype: dtype, device: device)
+        var sharedUp: Nvfp4Linear?
+        var sharedDown: Nvfp4Linear?
+        if nSharedExperts > 0 {
+            precondition(
+                nSharedExperts == 1,
+                "NemotronH MoE: n_shared_experts \(nSharedExperts) > 1 not supported.")
+            let sharedIntermediate =
+                sharedExpertIntermediate > 0 ? sharedExpertIntermediate : moeIntermediate
+            sharedUp = try loadNemotronHNvfp4Linear(
+                base: "\(p).shared_experts.up_proj", outDim: sharedIntermediate, inDim: hidden,
+                weights: weights, device: device)
+            sharedDown = try loadNemotronHNvfp4Linear(
+                base: "\(p).shared_experts.down_proj", outDim: hidden, inDim: sharedIntermediate,
+                weights: weights, device: device)
+        }
+        return NemotronHNvfp4MoELayer(
+            norm: norm, gate: gate, eScoreCorrectionBias: eScoreCorrectionBiasHost,
+            stacked: stacked, sharedUp: sharedUp, sharedDown: sharedDown,
+            hidden: hidden, topK: topK,
+            routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb,
+            dtype: dtype, device: device)
+    }
 
     // Routed experts: each is a squared-ReLU 2-layer MLP. The published
     // checkpoint ships them as `mixer.experts.<e>.{up_proj,down_proj}.weight`
@@ -978,6 +1418,16 @@ private func buildNemotronHMoELayer(
         dtype: dtype)
 }
 
+// ─── F-132 batched prefill (M>1 forward) ──────────────────────────────
+//
+// Default ON. `BUTTER_NEMOTRON_BATCHED_PREFILL=0` reverts
+// `NemotronHModel.forwardMulti` to the original per-token loop — the
+// escape hatch for bisection / a regression that only reproduces on
+// the batched path.
+enum NemotronHBatchedPrefill {
+    static let enabled = ButterEnv["BUTTER_NEMOTRON_BATCHED_PREFILL"] != "0"
+}
+
 // ─── NemotronHModel ──────────────────────────────────────────────────
 
 public final class NemotronHModel: LanguageModel {
@@ -991,6 +1441,18 @@ public final class NemotronHModel: LanguageModel {
     public let hidden, nLayers, nHeads, nKVHeads, headDim, vocab, maxSeq: Int
     public let mambaNHeads, mambaHeadDim, stateDim, convDim, convKernel, nGroups, dInner: Int
     public let dtype: DType
+
+    /// F-131 MTP self-speculative decode: the checkpoint's optional
+    /// 53rd "nextn" block (`mtp.*` tensors), loaded when
+    /// `BUTTER_NEMOTRON_MTP=1` AND the checkpoint ships one (see
+    /// `NemotronHMTPHead.swift`). `nil` for every checkpoint without an
+    /// MTP block, and for MTP-bearing checkpoints when the env var is
+    /// unset — the extra ~2.6 GB of BF16 expert weights simply never
+    /// gets loaded/resident in that case. Settable post-init (not an
+    /// init parameter) so `NemotronHHybrid.loadModel` can attach it
+    /// after the backbone (whose `embedTokens`/`lmHead` the head shares
+    /// by reference) already exists.
+    public var mtpHead: NemotronHMTPHead?
 
     /// Layer kinds, index-aligned with `layers` — drives `makeLayerCaches`.
     let layerKinds: [NemotronHLayerKind]
@@ -1028,6 +1490,7 @@ public final class NemotronHModel: LanguageModel {
             case is NemotronHAttentionLayer: return .attention
             case is NemotronHMLPLayer: return .mlp
             case is NemotronHMoELayer: return .moe
+            case is NemotronHNvfp4MoELayer: return .moe
             default:
                 fatalError(
                     "NemotronHModel: unknown DecoderLayer "
@@ -1048,6 +1511,7 @@ public final class NemotronHModel: LanguageModel {
             case let l as NemotronHAttentionLayer: params = l.parameters()
             case let l as NemotronHMLPLayer: params = l.parameters()
             case let l as NemotronHMoELayer: params = l.parameters()
+            case let l as NemotronHNvfp4MoELayer: params = l.parameters()
             default: params = []
             }
             for (k, v) in params { out.append(("backbone.layers.\(i).\(k)", v)) }
@@ -1081,29 +1545,52 @@ public final class NemotronHModel: LanguageModel {
     /// Queue a single-token forward pass. Walks the heterogeneous
     /// `[any DecoderLayer]` in lockstep with the per-layer caches.
     ///
-    /// NemotronH MoE layers commit the command buffer mid-decode (the
-    /// router CPU readback forces a sync), so the forward loop runs
-    /// every layer on its own internal `workCmd` and queues ONLY the
-    /// final `norm` + `lm_head` onto the caller's pristine `cmd` — the
-    /// Jamba command-buffer discipline. Layer kinds without commits
-    /// (Mamba / Attention / MLP) still benefit: their `workCmd`
-    /// commits on the next layer transition (or at the end of the
-    /// loop) rather than fighting for the caller's buffer.
+    /// Layers are checked via `DecoderLayer.commitsMidDecode`, not
+    /// `layerKinds` — CPU-routed NemotronH MoE layers (`NemotronHMoELayer`,
+    /// the non-NVFP4 checkpoints) still commit the command buffer
+    /// mid-decode (the router readback forces a sync), but the F-126
+    /// perf wave's GPU-routed `NemotronHNvfp4MoELayer` (Lightning) does
+    /// not — it queues onto `cmd` exactly like the Mamba / Attention /
+    /// MLP layers, so a Lightning-family model with `usesGpuRouter ==
+    /// true` on every MoE layer takes the single-`cmd` fast path below
+    /// with ONE commit+wait for the whole 52-layer token, not 46 (see
+    /// `NemotronHNvfp4MoELayer`'s file doc). A model that still has at
+    /// least one committing layer (any CPU-routed MoE layer present)
+    /// falls to the private-`workCmd` path, refreshed on every
+    /// committing-layer transition — the Jamba command-buffer
+    /// discipline.
     public func forward(
         tokenId: Int, position: Int,
         caches: [any LayerCacheProtocol],
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
+        let (_, logits) = forwardHiddenAndLogits(
+            tokenId: tokenId, position: position, caches: caches, on: cmd, device: device)
+        return logits
+    }
+
+    /// Same single-token forward as `forward(tokenId:)`, but also
+    /// returns the PRE-final-norm backbone hidden state — the seed an
+    /// MTP draft head's `hnorm`/first `draftStep` needs (F-131,
+    /// `NemotronHMTPHead`/`NemotronHMTPSpecDecode`; mirrors Qwen3x's
+    /// `forwardManyHiddenAndLogits` returning both for the same reason).
+    /// Identical body to `forward(tokenId:)` otherwise — that method is
+    /// now a thin wrapper discarding the hidden half.
+    public func forwardHiddenAndLogits(
+        tokenId: Int, position: Int,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> (hidden: Tensor, logits: Tensor) {
         let tokenBuf = device.makeBuffer(length: 4)
         var tid = UInt32(tokenId)
         memcpy(tokenBuf.contents(), &tid, 4)
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
 
-        // Without any MoE layer, the entire forward queues onto `cmd`
-        // exactly like before (the workCmd path needs an internal
-        // commit per committing-layer transition). Pick the cheaper
-        // path per checkpoint.
-        let hasCommittingLayer = layerKinds.contains(.moe)
+        // Without any committing layer, the entire forward queues onto
+        // `cmd` exactly like before (the workCmd path needs an
+        // internal commit per committing-layer transition). Pick the
+        // cheaper path per checkpoint.
+        let hasCommittingLayer = layers.contains { $0.commitsMidDecode }
         if !hasCommittingLayer {
             var h = embedTokens(tokenTensor, on: cmd).reshaped(to: [hidden])
             for (i, layer) in layers.enumerated() {
@@ -1112,43 +1599,63 @@ public final class NemotronHModel: LanguageModel {
                     cmd: cmd, device: device)
             }
             let normed = finalNorm(h, on: cmd)
-            return lmHead(normed, on: cmd)
+            return (hidden: h, logits: lmHead(normed, on: cmd))
         }
 
-        // MoE-bearing checkpoint: run every layer on a private buffer
-        // so the MoE commits don't poison the caller's `cmd`. Refresh
-        // the work buffer after each layer that commits.
+        // Checkpoint has ≥1 committing layer: run every layer on a
+        // private buffer so those commits don't poison the caller's
+        // `cmd`. Refresh the work buffer after each layer that commits.
         var workCmd = device.makeCommandBuffer()
         var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
         for (i, layer) in layers.enumerated() {
             h = layer.decode(
                 h, position: position, cache: caches[i],
                 cmd: workCmd, device: device)
-            // Layers that commit `workCmd` (MoE) hand back a resident
+            // A layer that commits `workCmd` hands back a resident
             // tensor; we obtain a fresh buffer so the next layer's
             // dispatches don't land on an already-committed buffer.
-            if layerKinds[i] == .moe {
+            if layer.commitsMidDecode {
                 workCmd = device.makeCommandBuffer()
             }
         }
         // Final embedding → norm + lm_head on the caller's pristine
         // `cmd`. `h` is resident (the work buffer either committed via
-        // an MoE layer or is about to fall out of scope unused — flush
-        // it so any pending non-MoE dispatches reach the GPU).
+        // a committing layer or is about to fall out of scope unused —
+        // flush it so any pending non-committing dispatches reach the
+        // GPU).
         workCmd.commit()
         workCmd.waitUntilCompleted()
         let normed = finalNorm(h, on: cmd)
-        return lmHead(normed, on: cmd)
+        return (hidden: h, logits: lmHead(normed, on: cmd))
     }
 
-    /// Multi-token forward — prefill fast path. Loops
-    /// `forward(tokenId:)` per row on the supplied `cmd`.
+    /// Multi-token forward — prefill fast path.
     ///
-    /// NemotronH is a layer-type-string hybrid (`M`/`*`/`E`/`-`
-    /// alternation). Per-attention-layer chunked path needs a
-    /// `decodeMulti` override on the attention DecoderLayer slot; the
-    /// Mamba 2 / MLP / nothing layer kinds keep the per-token default.
-    /// Today this override is commit-count-batched only.
+    /// F-132 batched prefill (default ON, `BUTTER_NEMOTRON_BATCHED_
+    /// PREFILL=0` reverts to the per-token loop below): embeds all `T`
+    /// prompt tokens in one gather, then walks the heterogeneous layer
+    /// stack calling each layer's `decodeMulti(_:startingAt:cache:cmd:
+    /// device:)` — attention (`NemotronHAttentionLayer`) and dense MLP
+    /// (`NemotronHMLPLayer`) layers take a real batched-T
+    /// implementation (batched projections + one `sdpaMulti` /
+    /// `gemm` dispatch instead of T single-row ones); Mamba 2
+    /// (`NemotronHMambaLayer`) keeps `DecoderLayer`'s default per-row
+    /// loop — the selective-scan recurrence is inherently sequential,
+    /// v1 does not attempt a chunked-scan kernel (see the perf-wave
+    /// doc for the profiling call that decided this); the NVFP4 MoE
+    /// layer (`NemotronHNvfp4MoELayer`) gets its own `decodeMulti`
+    /// override (`NemotronHNvfp4.swift`) reusing the existing batched-
+    /// prefill gather-GEMM / sort-route MoE primitives when its GPU
+    /// router is active, falling back to the per-row default otherwise.
+    ///
+    /// Command-buffer discipline mirrors `forwardHiddenAndLogits`: a
+    /// layer whose `commitsMidDecode` is `true` (a CPU-routed MoE
+    /// layer's host readback) forces a fresh work buffer for the next
+    /// layer; every other layer queues onto the same buffer across the
+    /// whole T-token chunk. Only the LAST row's hidden state needs the
+    /// final norm + lm_head (the protocol's documented contract: return
+    /// the tail position's logits only), so that step, and it alone,
+    /// runs on the caller's `cmd`.
     public func forwardMulti(
         tokenIds: [Int], startingAt position: Int,
         caches: [any LayerCacheProtocol],
@@ -1157,13 +1664,48 @@ public final class NemotronHModel: LanguageModel {
         precondition(
             !tokenIds.isEmpty,
             "NemotronHModel.forwardMulti: tokenIds must be non-empty")
-        var logits: Tensor!
-        for (i, tok) in tokenIds.enumerated() {
-            logits = forward(
-                tokenId: tok, position: position + i,
-                caches: caches, on: cmd, device: device)
+        let t = tokenIds.count
+        guard t > 1, NemotronHBatchedPrefill.enabled else {
+            // T==1, or the escape hatch — original per-token loop.
+            var logits: Tensor!
+            for (i, tok) in tokenIds.enumerated() {
+                logits = forward(
+                    tokenId: tok, position: position + i,
+                    caches: caches, on: cmd, device: device)
+            }
+            return logits
         }
-        return logits
+
+        let idsBuf = device.makeBuffer(length: t * 4)
+        let idsHost = tokenIds.map { UInt32($0) }
+        idsHost.withUnsafeBytes { raw in
+            _ = memcpy(idsBuf.contents(), raw.baseAddress!, t * 4)
+        }
+        let idsTensor = Tensor(buffer: idsBuf, offset: 0, shape: [t], dtype: .u32)
+
+        var workCmd = device.makeCommandBuffer()
+        // `Ops.gather` (what `embedTokens` wraps) already returns
+        // `[t, hidden]` — no reshape needed.
+        var h = embedTokens(idsTensor, on: workCmd)
+        for (i, layer) in layers.enumerated() {
+            let out = autoreleasepool { () -> Tensor in
+                layer.decodeMulti(
+                    h, startingAt: position, cache: caches[i],
+                    cmd: workCmd, device: device)
+            }
+            h = out
+            if layer.commitsMidDecode {
+                workCmd = device.makeCommandBuffer()
+            }
+        }
+        // Flush every pending dispatch so the last row is resident
+        // before the caller's `cmd` reads it.
+        workCmd.commit()
+        workCmd.waitUntilCompleted()
+
+        let lastRow = h.slicedRows(start: t - 1, count: 1).reshaped(to: [hidden])
+        let normed = finalNorm(lastRow, on: cmd)
+        return lmHead(normed, on: cmd)
     }
 
     // ─── VLM embedding-input path ────────────────────────────────────
@@ -1171,9 +1713,10 @@ public final class NemotronHModel: LanguageModel {
     // NemotronH is a VL-target text backbone (Nemotron-VLM wraps it).
     // The splice supplies a `[hidden]` row directly — a vision-encoder
     // token or a text-token embedding the VL model looked up. Identical
-    // command-buffer discipline to `forward(tokenId:)`: dense
-    // checkpoints queue onto `cmd`; MoE-bearing checkpoints run layers
-    // on a private buffer that's refreshed after each MoE commit.
+    // command-buffer discipline to `forward(tokenId:)`: checkpoints
+    // with no committing layer queue onto `cmd`; checkpoints with a
+    // committing layer (CPU-routed MoE) run layers on a private buffer
+    // refreshed after each commit.
 
     public var supportsEmbeddingInput: Bool { true }
 
@@ -1187,7 +1730,7 @@ public final class NemotronHModel: LanguageModel {
             "NemotronHModel.forward(inputEmbedding:): expected [\(hidden)], "
                 + "got \(inputEmbedding.shape)")
 
-        let hasCommittingLayer = layerKinds.contains(.moe)
+        let hasCommittingLayer = layers.contains { $0.commitsMidDecode }
         if !hasCommittingLayer {
             var h = inputEmbedding.reshaped(to: [hidden])
             for (i, layer) in layers.enumerated() {
@@ -1205,7 +1748,7 @@ public final class NemotronHModel: LanguageModel {
             h = layer.decode(
                 h, position: position, cache: caches[i],
                 cmd: workCmd, device: device)
-            if layerKinds[i] == .moe {
+            if layer.commitsMidDecode {
                 workCmd = device.makeCommandBuffer()
             }
         }
@@ -1288,6 +1831,22 @@ private func castVectorNH(
     let floats = readFloatsNH(src)
     precondition(floats.count == count, "NemotronH: vector size mismatch")
     return writeFloatsNH(floats, shape: [count], dtype: dtype, device: device)
+}
+
+/// Cast a tensor of any shape to `dtype`, preserving shape. No-op if
+/// already `dtype`. Nemotron-3.5-Lightning ships the MoE router
+/// `gate.weight` in F32 while every other unquantized weight (attn
+/// proj, norms, embeddings) is BF16 — `Ops.gemv` hard-preconditions
+/// `weight.dtype == input.dtype`, so a mismatched router weight
+/// crashes the very first forward pass. Cast at load time so the
+/// router always matches the activation dtype, regardless of what
+/// dtype a given checkpoint happens to store it in.
+private func castMatrixNH(
+    _ src: Tensor, dtype: DType, device: Device
+) -> Tensor {
+    if src.dtype == dtype { return src }
+    let floats = readFloatsNH(src)
+    return writeFloatsNH(floats, shape: src.shape, dtype: dtype, device: device)
 }
 
 /// Tile `D[h]` across `head_dim` channels → `[n_heads * head_dim]`.

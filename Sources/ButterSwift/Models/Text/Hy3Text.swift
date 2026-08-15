@@ -111,7 +111,7 @@ public enum Hy3Dense: Hy3Variant {
         // (~0.67 GB) keeps SDPA/KV strides tight for short prefill; override
         // with LoadOptions.maxContextLength or BUTTER_HY3_MAX_SEQ for longer.
         let defaultMaxSeq: Int = {
-            if let s = ProcessInfo.processInfo.environment["BUTTER_HY3_MAX_SEQ"],
+            if let s = ButterEnv["BUTTER_HY3_MAX_SEQ"],
                let n = Int(s), n > 0
             {
                 return n
@@ -149,7 +149,7 @@ public enum Hy3Dense: Hy3Variant {
         // Default f16 activations for oQ2. Checkpoint scales/biases are BF16;
         // promote with in-place GPU cast (same width).
         let preferF16 =
-            ProcessInfo.processInfo.environment["BUTTER_HY3_BF16"] == nil
+            ButterEnv["BUTTER_HY3_BF16"] == nil
         let dtype: DType = preferF16 ? .f16 : (quant != nil ? .bf16 : .f16)
         let device = Device.shared
         // One CB for all in-place bf16→f16 casts at load (committed once).
@@ -340,7 +340,7 @@ public enum Hy3Dense: Hy3Variant {
             headDim: headDim, vocab: vocab, maxSeq: maxSeq, dtype: dtype)
         // Optional densify of int8 attn/shared for decode gemv (~10 GB).
         // Default OFF — thrashing on 128 GB with 75 GB oQ2 weights.
-        if ProcessInfo.processInfo.environment["BUTTER_HY3_DENSIFY_INT8"] != nil {
+        if ButterEnv["BUTTER_HY3_DENSIFY_INT8"] != nil {
             model.densifyInt8Linears(device: Device.shared)
         }
         return model
@@ -470,10 +470,10 @@ private func hy3SdpaPrefill(
     let usePrefillMma: Bool = {
         guard q.dtype == .f16, headDim == 128, nRows >= 32, nRows % 32 == 0
         else { return false }
-        if ProcessInfo.processInfo.environment["BUTTER_HY3_NO_SDPA_PREFILL_MMA"] != nil {
+        if ButterEnv["BUTTER_HY3_NO_SDPA_PREFILL_MMA"] != nil {
             return false
         }
-        if ProcessInfo.processInfo.environment["BUTTER_HY3_SDPA_PREFILL_MMA"] != nil {
+        if ButterEnv["BUTTER_HY3_SDPA_PREFILL_MMA"] != nil {
             return true
         }
         return nRows >= 32
@@ -536,7 +536,7 @@ private func hy3ConcurrentQKV(
     qProj: AnyLinear, kProj: AnyLinear, vProj: AnyLinear,
     cmd: MTLCommandBuffer, device: Device
 ) -> (Tensor, Tensor, Tensor) {
-    if ProcessInfo.processInfo.environment["BUTTER_HY3_SERIAL_QKV"] != nil {
+    if ButterEnv["BUTTER_HY3_SERIAL_QKV"] != nil {
         return (
             hy3Int8CallMany(qProj, xNorm, t: t, on: cmd, device: device),
             hy3Int8CallMany(kProj, xNorm, t: t, on: cmd, device: device),
@@ -1365,9 +1365,9 @@ final class Hy3MoELayer: Hy3LayerProtocol {
         let xNorm = xNormFlat.reshaped(to: [nRows, hidden])
 
         let skipAttn =
-            ProcessInfo.processInfo.environment["BUTTER_HY3_SKIP_ATTN"] != nil
+            ButterEnv["BUTTER_HY3_SKIP_ATTN"] != nil
         let skipSdpa =
-            ProcessInfo.processInfo.environment["BUTTER_HY3_SKIP_SDPA"] != nil
+            ButterEnv["BUTTER_HY3_SKIP_SDPA"] != nil
 
         let oOut: Tensor
         if skipAttn {
@@ -1449,14 +1449,14 @@ final class Hy3MoELayer: Hy3LayerProtocol {
         precondition(
             gateBits == 2 && upBits == 2 && downBits == 2 && router.topK == 8,
             "Hy3 forwardMulti: only int2 topK=8 Path B gather is implemented")
-        let skipMoE = ProcessInfo.processInfo.environment["BUTTER_HY3_SKIP_MOE"] != nil
-        let skipShared = ProcessInfo.processInfo.environment["BUTTER_HY3_SKIP_SHARED"] != nil
+        let skipMoE = ButterEnv["BUTTER_HY3_SKIP_MOE"] != nil
+        let skipShared = ButterEnv["BUTTER_HY3_SKIP_SHARED"] != nil
         // Default: fuse shared gate‖up onto the same concurrent encoder as
         // MoE gate‖up after gather (no dual-queue events).
         let dualQueue =
-            ProcessInfo.processInfo.environment["BUTTER_HY3_DUAL_QUEUE"] != nil
+            ButterEnv["BUTTER_HY3_DUAL_QUEUE"] != nil
         let noDual =
-            ProcessInfo.processInfo.environment["BUTTER_HY3_NO_DUAL"] != nil
+            ButterEnv["BUTTER_HY3_NO_DUAL"] != nil
         let fuseShared =
             nShared > 0 && !skipShared && !dualQueue && !noDual && !skipMoE
 
@@ -1772,18 +1772,18 @@ final class Hy3MoELayer: Hy3LayerProtocol {
             shape: [mTotal], dtype: dt)
 
         _ = Ops.gather(table: ffnIn, tokenIds: sourceT, on: cmd, into: xGathered)
-        let forceM1 = ProcessInfo.processInfo.environment["BUTTER_HY3_MOE_M1"] != nil
+        let forceM1 = ButterEnv["BUTTER_HY3_MOE_M1"] != nil
         let useBm =
             !forceM1 && (moeIntermediate % 32 == 0) && (hidden % 32 == 0)
         let skipGU =
-            ProcessInfo.processInfo.environment["BUTTER_HY3_MOE_SKIP_GU"] != nil
+            ButterEnv["BUTTER_HY3_MOE_SKIP_GU"] != nil
         let skipDown =
-            ProcessInfo.processInfo.environment["BUTTER_HY3_MOE_SKIP_DOWN"] != nil
+            ButterEnv["BUTTER_HY3_MOE_SKIP_DOWN"] != nil
         let serialGU =
-            ProcessInfo.processInfo.environment["BUTTER_HY3_MOE_SERIAL_GU"] != nil
+            ButterEnv["BUTTER_HY3_MOE_SERIAL_GU"] != nil
         let dualMoeGU =
-            ProcessInfo.processInfo.environment["BUTTER_HY3_DUAL_MOE_GU"] != nil
-            && ProcessInfo.processInfo.environment["BUTTER_HY3_DUAL_QUEUE"] == nil
+            ButterEnv["BUTTER_HY3_DUAL_MOE_GU"] != nil
+            && ButterEnv["BUTTER_HY3_DUAL_QUEUE"] == nil
         let useSerialGU = serialGU && !dualMoeGU
         let useConcurrentGU = !serialGU && !dualMoeGU
 
@@ -1838,7 +1838,7 @@ final class Hy3MoELayer: Hy3LayerProtocol {
             guard dt == .f16,
                   pfActiveExperts != nil, pfIndirectGU != nil, pfIndirectDown != nil
             else { return false }
-            return ProcessInfo.processInfo.environment["BUTTER_HY3_ACTIVE_EG"] != nil
+            return ButterEnv["BUTTER_HY3_ACTIVE_EG"] != nil
         }()
 
         // Zero-fill helper for phase skips (GPU blit, no host thrash).
@@ -2291,13 +2291,13 @@ public final class Hy3Model: LanguageModel {
                 }
             }
         }
-        let profile = ProcessInfo.processInfo.environment["BUTTER_HY3_PROFILE"] != nil
+        let profile = ButterEnv["BUTTER_HY3_PROFILE"] != nil
         // Grow-only prefill scratch slab (opt-in). Default OFF — e2e with
         // default ON added ~4 GB and regressed full prefill (~156 vs ~264)
         // under residual swap; MoE pf* workspaces already avoid per-layer
         // MoE alloc.
         let useScratch =
-            ProcessInfo.processInfo.environment["BUTTER_HY3_SCRATCH"] != nil
+            ButterEnv["BUTTER_HY3_SCRATCH"] != nil
         if useScratch {
             // ~160 KiB/token/layer + 10% headroom; MoE pf* is persistent.
             let bytesPerLayer = max(8 << 20, n * 160 * 1024)
@@ -2334,10 +2334,10 @@ public final class Hy3Model: LanguageModel {
         h = hPersist
 
         let megaCB =
-            ProcessInfo.processInfo.environment["BUTTER_HY3_MEGA_CB"] != nil
+            ButterEnv["BUTTER_HY3_MEGA_CB"] != nil
         let cbStride: Int = {
             if megaCB { return layers.count }
-            if let s = ProcessInfo.processInfo.environment["BUTTER_HY3_CB_STRIDE"],
+            if let s = ButterEnv["BUTTER_HY3_CB_STRIDE"],
                let n = Int(s), n > 0
             {
                 return n

@@ -80,7 +80,10 @@ public enum VisionLanguageArchitectures {
         if let arch = config.architecture, architectures.contains(arch) {
             return true
         }
-        if config.nested("vision_config") != nil {
+        // Some text-only mlx conversions ship an empty `vision_config: {}`
+        // (e.g. mlx-community Laguna XS). Only treat a non-empty nested
+        // block as VL signal.
+        if let vc = config.nested("vision_config"), !vc.isEmpty {
             return true
         }
         // VL-only model_types — none of these have a text-only
@@ -487,6 +490,40 @@ public enum ModelRegistry {
                     defaultGenerationParameters: SmolVLM2Dense.defaultGenerationParameters,
                     availableCapabilities: SmolVLM2Dense.availableCapabilities)
             }
+            // Muse Glimmer — Meta's 30B dense agentic decoder + a
+            // ~1.8B ViT-G/14 perception encoder. Vision loads when the
+            // checkpoint actually carries the vision tower's tensors
+            // (`vision_tower.patch_embedder.patch_embedding.weight` —
+            // the ONE tensor every Muse Glimmer VL conversion must ship,
+            // checked directly rather than trusting `vision_config`'s
+            // mere presence, same disambiguation Qwen 3.5-VL uses for
+            // its vestigial-vision-config text checkpoints). Checkpoints
+            // without it fall through to the pre-existing text-only
+            // route unchanged — `MuseGlimmerDense.loadModel` reads
+            // `text_config` and only the `language_model.`-prefixed
+            // tensors either way, so text-only behaviour is bit-for-bit
+            // identical whichever branch runs.
+            if let arch = config.architecture, MuseGlimmer.architectures.contains(arch),
+                weights.has("vision_tower.patch_embedder.patch_embedding.weight")
+            {
+                let vlm = try MuseGlimmerVL.load(
+                    config: config, weights: weights,
+                    options: options, device: device)
+                return Loaded(
+                    engine: vlm.engine,
+                    defaultGenerationParameters: MuseGlimmerDense.defaultGenerationParameters,
+                    availableCapabilities: MuseGlimmerVL.availableCapabilities,
+                    vlModel: vlm)
+            }
+            if let arch = config.architecture, MuseGlimmer.architectures.contains(arch) {
+                let engine = try MuseGlimmerDense.loadModel(
+                    config: config, weights: weights,
+                    options: options, device: device)
+                return Loaded(
+                    engine: engine,
+                    defaultGenerationParameters: MuseGlimmerDense.defaultGenerationParameters,
+                    availableCapabilities: MuseGlimmerDense.availableCapabilities)
+            }
             // Other VL families — the Butter vision foundation
             // (VisionEncoder, ImagePreprocessing, VisionModel splice,
             // conv2d/patch_embed/rope_2d Ops) is in tree, but these
@@ -494,6 +531,11 @@ public enum ModelRegistry {
             // an actionable error rather than a generic "unsupported".
             throw ModelError.visionModelNotIntegrated(
                 config.architecture ?? config.modelType ?? "<unknown>")
+        }
+        if let mt = config.modelType, MuseGlimmer.modelTypes.contains(mt) {
+            return try loadMuseGlimmer(
+                config: config, weights: weights,
+                options: options, device: device)
         }
         if let arch = config.architecture, Llama.architectures.contains(arch) {
             return try loadLlama(
@@ -771,6 +813,17 @@ public enum ModelRegistry {
                 config: config, weights: weights,
                 options: options, device: device)
         }
+
+        // Laguna (poolside) — hybrid iSWA + sigmoid-bias MoE. Config-driven
+        // for S-2.1 and XS-2.1. Routes through its own family file.
+        if Laguna.architectures.contains(config.architecture ?? "")
+            || Laguna.modelTypes.contains(config.modelType ?? "")
+        {
+            return try loadLaguna(
+                config: config, weights: weights,
+                options: options, device: device)
+        }
+
         throw ModelError.unsupportedArchitecture(
             config.architecture ?? config.modelType ?? "<unknown>"
         )
@@ -860,6 +913,28 @@ public enum ModelRegistry {
             defaultGenerationParameters: variant.defaultGenerationParameters)
     }
 
+    /// Text-only entry point — used when a config's `model_type` is
+    /// `muse_glimmer`/`muse_glimmer_text` but `architecture` didn't match
+    /// (e.g. a hypothetical `config.json` pointed straight at the
+    /// language model, with no VL wrapper / `vision_config` at all, so
+    /// the `dispatchAndLoad` VL branch above never fires). The normal
+    /// checkpoint path goes through the VL-branch case in
+    /// `dispatchAndLoad` instead, since Muse Glimmer's `architectures`
+    /// is always the multimodal wrapper string.
+    public static func loadMuseGlimmer(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try MuseGlimmer.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(
+            engine: engine,
+            defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
+
     public static func loadMamba2(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
@@ -915,6 +990,22 @@ public enum ModelRegistry {
             engine: engine,
             defaultGenerationParameters: variant.defaultGenerationParameters)
     }
+
+
+    public static func loadLaguna(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try Laguna.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(
+            engine: engine,
+            defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
+
 
     public static func loadGranite4(
         config: ModelConfig, weights: SafeTensorsBundle,
@@ -1104,6 +1195,9 @@ public final class Model: @unchecked Sendable {
         engine as? NemotronDiffusionModel
     }
 
+    /// Convenience accessor for the Muse Glimmer engine.
+    public var museGlimmer: MuseGlimmerModel? { engine as? MuseGlimmerModel }
+
     private let stateLock = NSLock()
     private var _currentState: ModelLifecycleState = .ready
 
@@ -1228,6 +1322,30 @@ public final class Model: @unchecked Sendable {
         device: Device = .shared
     ) async throws -> Model {
         Debug.log(.load, "Model.load id-or-path=\(idOrPath)")
+
+        // A bare `.gguf` file path bypasses the HF-directory pipeline
+        // entirely (no `config.json`, no `SafeTensorsBundle` — the GGUF
+        // carries its own metadata + tokenizer). Checked before the
+        // `ModelLocator` resolution below, which expects a directory or
+        // a downloadable HF repo id, neither of which a single `.gguf`
+        // file is.
+        if idOrPath.hasSuffix(".gguf"), FileManager.default.fileExists(atPath: idOrPath) {
+            let model = try await Profile.timeAsync("model_load") {
+                try await Profile.signpostAsync("model_load") {
+                    try Model.loadGGUF(path: idOrPath, options: options, device: device)
+                }
+            }
+            if options.prewarm {
+                await Profile.timeAsync("prewarm") {
+                    await Profile.signpostAsync("prewarm") {
+                        await model.prewarm()
+                    }
+                }
+            }
+            model.emit(ModelLifecycleEvent(state: .ready))
+            return model
+        }
+
         let model = try await Profile.timeAsync("model_load") {
             try await Profile.signpostAsync("model_load") {
                 let locator = ModelLocator(
@@ -1288,6 +1406,50 @@ public final class Model: @unchecked Sendable {
 
         model.emit(ModelLifecycleEvent(state: .ready))
         return model
+    }
+
+    /// GGUF entry point for `load(_:)` — parses the file, dispatches by
+    /// `general.architecture`, and builds the tokenizer straight from
+    /// the embedded `tokenizer.ggml.*` metadata (no external
+    /// `tokenizer.json` — a bare `.gguf` file has no sibling directory
+    /// to look for one in). Wraps the result exactly like the
+    /// safetensors path. Only the Qwen3.5/3.6 ("qwen35") architecture
+    /// has a `loadModelFromGGUF` override today — see
+    /// `Qwen3xGGUFLoader.swift`; every other family's default
+    /// `loadModelFromGGUF` throws `unsupportedConfig`, surfaced here as
+    /// `ModelError.unsupportedArchitecture`.
+    private static func loadGGUF(
+        path: String, options: LoadOptions, device: Device
+    ) throws -> Model {
+        let url = URL(fileURLWithPath: path)
+        let gguf = try GGUFTensorBundle(url: url)
+        guard let arch = gguf.architecture else {
+            throw ModelError.unsupportedArchitecture("(missing general.architecture)")
+        }
+        Debug.log(.load, "GGUF config: arch=\(arch) name=\(gguf.modelName ?? "?")")
+
+        let loaded: ModelRegistry.Loaded
+        let config = ModelConfig(architecture: arch, modelType: arch, raw: [:])
+        switch arch {
+        case "qwen35":
+            let engine = try Qwen35Hybrid.loadModelFromGGUF(
+                config: config, gguf: gguf, options: options, device: device)
+            loaded = ModelRegistry.Loaded(
+                engine: engine,
+                defaultGenerationParameters: Qwen35Hybrid.defaultGenerationParameters)
+        default:
+            throw ModelError.unsupportedArchitecture(arch)
+        }
+
+        let tokenizer = try gguf.tokenizer()
+        return Model(
+            engine: loaded.engine, tokenizer: tokenizer, config: config,
+            modelDirectory: url.deletingLastPathComponent(),
+            availableCapabilities: loaded.availableCapabilities,
+            enabledCapabilities: options.capabilities,
+            defaultGenerationParameters: loaded.defaultGenerationParameters,
+            vlModel: loaded.vlModel
+        )
     }
 
     /// Compile PSOs for the kernels we'll need during decode by running

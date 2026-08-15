@@ -198,3 +198,133 @@ struct SamplingTests {
         #expect(Sampling.sample(bf16, parameters: p, rng: &rng) == 1)
     }
 }
+
+// MARK: - T43: fast partial top-K vs full-sort reference equivalence
+
+/// `Sampling.buildFilteredWeights`'s fast path (bounded min-heap partial
+/// selection when top-K is active) must be byte-identical — same
+/// SURVIVING SET, same WEIGHTS, and critically same ORDER (the
+/// categorical draw in `sampleFromWeights` accumulates over `indices`/
+/// `weights` in order, so a reordering would silently change which
+/// token a given RNG draw lands on) — to the pre-T43 always-sort
+/// implementation kept as `Sampling.buildFilteredWeightsFullSort` for
+/// exactly this purpose. Covers every filter combo the task brief calls
+/// out (temp only / +top-K / +top-P / +min-P / all) across several
+/// vocab sizes and random rows, plus tie-heavy rows (mirroring
+/// `LagunaLmHeadPrune`'s -infinity-masked candidates) since ties are
+/// where a naive partial-selection rewrite is most likely to silently
+/// diverge from a stable sort's tie-break.
+@Suite("Sampling filter equivalence — fast top-K vs full-sort reference")
+struct SamplingFilterEquivalenceTests {
+
+    /// Deterministic pseudo-random logits row. `tieFraction` of entries
+    /// are pinned to `tieValue` (when set) so ties get real coverage —
+    /// generic random floats essentially never collide.
+    private static func randomRow(
+        vocab: Int, seed: UInt64, range: ClosedRange<Float> = -10 ... 10,
+        tieValue: Float? = nil, tieFraction: Double = 0.0
+    ) -> [Float] {
+        var rng = SeededRandomNumberGenerator(seed: seed)
+        var row = [Float](repeating: 0, count: vocab)
+        for i in 0 ..< vocab {
+            if let tieValue, Double.random(in: 0 ..< 1, using: &rng) < tieFraction {
+                row[i] = tieValue
+            } else {
+                row[i] = Float.random(in: range, using: &rng)
+            }
+        }
+        return row
+    }
+
+    private static func assertEquivalent(
+        _ values: [Float], _ parameters: GenerationParameters, label: String
+    ) {
+        let fast = Sampling.buildFilteredWeights(values, parameters: parameters)
+        let reference = Sampling.buildFilteredWeightsFullSort(values, parameters: parameters)
+        #expect(fast.indices == reference.indices, "\(label): surviving index set/order differs")
+        #expect(
+            fast.weights.count == reference.weights.count,
+            "\(label): weight counts differ (\(fast.weights.count) vs \(reference.weights.count))")
+        #expect(abs(fast.total - reference.total) < 1e-6, "\(label): total differs")
+        for i in 0 ..< min(fast.weights.count, reference.weights.count) {
+            #expect(
+                abs(fast.weights[i] - reference.weights[i]) < 1e-6,
+                "\(label): weight[\(i)] differs (\(fast.weights[i]) vs \(reference.weights[i]))")
+        }
+    }
+
+    private static let paramCombos: [(String, GenerationParameters)] = [
+        ("temp only", GenerationParameters().with {
+            $0.temperature = 0.6; $0.topK = 0; $0.topP = 1.0; $0.minP = 0.0
+        }),
+        ("+topK", GenerationParameters().with {
+            $0.temperature = 0.6; $0.topK = 20; $0.topP = 1.0; $0.minP = 0.0
+        }),
+        ("+topK tiny", GenerationParameters().with {
+            $0.temperature = 1.0; $0.topK = 3; $0.topP = 1.0; $0.minP = 0.0
+        }),
+        ("+topP (no topK)", GenerationParameters().with {
+            $0.temperature = 0.6; $0.topK = 0; $0.topP = 0.9; $0.minP = 0.0
+        }),
+        ("+topK+topP", GenerationParameters().with {
+            $0.temperature = 0.6; $0.topK = 20; $0.topP = 0.95; $0.minP = 0.0
+        }),
+        ("+topK+minP", GenerationParameters().with {
+            $0.temperature = 0.6; $0.topK = 20; $0.topP = 1.0; $0.minP = 0.05
+        }),
+        ("all (topK+topP+minP)", GenerationParameters().with {
+            $0.temperature = 0.6; $0.topK = 20; $0.topP = 0.95; $0.minP = 0.05
+        }),
+        ("topK >= vocab (degenerate, exercises the non-fast branch)", GenerationParameters().with {
+            $0.temperature = 0.6; $0.topK = 999_999; $0.topP = 0.95; $0.minP = 0.0
+        }),
+    ]
+
+    @Test("fast top-K path matches full-sort reference across param combos and random rows")
+    func fastPathMatchesReferenceAcrossCombos() {
+        for vocab in [8, 37, 500, 4096] {
+            for (label, params) in Self.paramCombos {
+                for seed: UInt64 in [1, 2, 3] {
+                    let row = Self.randomRow(vocab: vocab, seed: seed &+ UInt64(vocab))
+                    Self.assertEquivalent(row, params, label: "\(label) vocab=\(vocab) seed=\(seed)")
+                }
+                // ~40% of entries pinned to a shared value, simulating
+                // masked (-infinity-style) candidates.
+                let tieRow = Self.randomRow(
+                    vocab: vocab, seed: 99 &+ UInt64(vocab), tieValue: -1000, tieFraction: 0.4)
+                Self.assertEquivalent(tieRow, params, label: "\(label) vocab=\(vocab) ties")
+            }
+        }
+    }
+
+    @Test("fast top-K path matches reference when every logit is exactly tied")
+    func exactTieBreakMatchesReference() {
+        // Every entry the SAME value: the entire surviving order is
+        // decided purely by the tie-break rule (ascending index). If the
+        // heap's tie-break ever diverged from the stable-sort convention
+        // this is where `indices` would come back scrambled.
+        let vocab = 1000
+        let row = [Float](repeating: 3.0, count: vocab)
+        let params = GenerationParameters().with {
+            $0.temperature = 1.0
+            $0.topK = 17
+            $0.topP = 1.0
+            $0.minP = 0.0
+        }
+        Self.assertEquivalent(row, params, label: "all-tied")
+    }
+
+    @Test("fast top-K path matches reference at topK == 1 (boundary)")
+    func topKOneBoundary() {
+        for vocab in [1, 2, 8, 500] {
+            let row = Self.randomRow(vocab: vocab, seed: 12345 &+ UInt64(vocab))
+            let params = GenerationParameters().with {
+                $0.temperature = 0.6
+                $0.topK = 1
+                $0.topP = 1.0
+                $0.minP = 0.0
+            }
+            Self.assertEquivalent(row, params, label: "topK=1 vocab=\(vocab)")
+        }
+    }
+}

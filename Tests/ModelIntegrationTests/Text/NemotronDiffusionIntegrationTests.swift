@@ -26,7 +26,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("NemotronDiffusion Integration", .serialized)
+@Suite("NemotronDiffusion Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct NemotronDiffusionIntegrationTests {
 
     @Test("load + tri-mode generation produces coherent output")

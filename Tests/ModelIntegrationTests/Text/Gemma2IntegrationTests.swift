@@ -28,7 +28,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Gemma2 Integration", .serialized)
+@Suite("Gemma2 Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Gemma2IntegrationTests {
 
     @Test("load + greedy generate produces coherent output")

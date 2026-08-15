@@ -27,10 +27,11 @@
 
 import Foundation
 import Testing
+import TestHelpers
 
 @testable import ButterSwift
 
-@Suite("GraniteSpeech Integration", .serialized)
+@Suite("GraniteSpeech Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct GraniteSpeechIntegrationTests {
 
     // MARK: - Fixture helpers

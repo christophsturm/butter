@@ -345,6 +345,54 @@ public enum Ops {
         return result
     }
 
+    /// Broadcast head-gate multiply: `out[i] = attn[i] * gate[i / headDim]`.
+    ///
+    /// Fuses the `gather(expand_ids) + mul` pair the softplus head-gate used
+    /// (host-built `[n]` expand-id buffer → general `iron_gather` → separate
+    /// `iron_mul`) into ONE `iron_head_gate_mul` broadcast pass. `gate` is the
+    /// flat `[rows * nHeads]` pre-activated per-head scalar buffer; `attn` is
+    /// the flat `[rows * nHeads * headDim]` attention output. Byte-identical
+    /// to the gather+mul it replaces (the gather is a bit-exact copy of
+    /// `gate[i / headDim]` and the product is the same native-`T` multiply).
+    public static func headGateMul(
+        attn: Tensor, gate: Tensor, headDim: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(attn.dtype == gate.dtype, "headGateMul: dtype mismatch")
+        precondition(
+            attn.elementCount % headDim == 0,
+            "headGateMul: attn count \(attn.elementCount) not a multiple of headDim \(headDim)")
+        let result = out ?? Tensor.empty(shape: attn.shape, dtype: attn.dtype)
+        let n = attn.elementCount
+        let (grid, tg) = elementwiseGrid(n)
+        switch attn.dtype {
+        case .f32:
+            IronKernels.iron_head_gate_mul_f32(
+                attn: attn.buffer, attnOffset: attn.offset,
+                gate: gate.buffer, gateOffset: gate.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_head_gate_mul_f16(
+                attn: attn.buffer, attnOffset: attn.offset,
+                gate: gate.buffer, gateOffset: gate.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_head_gate_mul_bf16(
+                attn: attn.buffer, attnOffset: attn.offset,
+                gate: gate.buffer, gateOffset: gate.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.headGateMul: unsupported dtype \(attn.dtype)")
+        }
+        return result
+    }
+
     public static func silu(
         _ x: Tensor, on cmd: MTLCommandBuffer,
         into out: Tensor? = nil
@@ -677,6 +725,37 @@ public enum Ops {
             m_total: UInt32(mTotal), k: UInt32(k), n_experts: UInt32(nExperts), block_size: UInt32(blockSize),
             gridSize: MTLSize(width: mTotal, height: 1, depth: 1),
             threadgroupSize: MTLSize(width: tgWidth, height: 1, depth: 1),
+            on: cmd)
+    }
+
+    /// Single-dispatch fusion of `moeSortPlanCounting`'s three-pass chain
+    /// (F-85 Stage-1 fusion #1 / W61). Same stable-order output contract,
+    /// same no-sync DEVPLAN2 property, ONE dispatch instead of three — no
+    /// `blockCounts`/`blockOffsets` intermediate buffers at all, since
+    /// every threadgroup recomputes what it needs directly from
+    /// `topkIds` (see `iron_moe_route_sort_plan_fused`'s module doc for
+    /// why that recompute is cheap and why the algorithm still needs zero
+    /// cross-threadgroup synchronization). Same grid shape as
+    /// `moeSortPlanCounting`'s pass 1 (`nBlocks` threadgroups, `nExperts`
+    /// lanes) — this fusion trades away the two intermediate-buffer round
+    /// trips and two dispatch/encoder overheads, not occupancy.
+    public static func moeSortPlanFused(
+        topkIds: Tensor, sortedExperts: Tensor, sourceTokens: Tensor, invPerm: Tensor,
+        mTotal: Int, k: Int, nExperts: Int, blockSize: Int, on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            nExperts <= 256,
+            "moeSortPlanFused: nExperts (\(nExperts)) exceeds the kernel's 256-lane threadgroup scratch capacity"
+        )
+        let nBlocks = (mTotal + blockSize - 1) / blockSize
+        IronKernels.iron_moe_route_sort_plan_fused_f32_threadgroups(
+            topk_ids: topkIds.buffer, topk_idsOffset: topkIds.offset,
+            sorted_experts: sortedExperts.buffer, sorted_expertsOffset: sortedExperts.offset,
+            source_tokens: sourceTokens.buffer, source_tokensOffset: sourceTokens.offset,
+            inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+            m_total: UInt32(mTotal), k: UInt32(k), n_experts: UInt32(nExperts), block_size: UInt32(blockSize),
+            gridSize: MTLSize(width: max(nBlocks, 1), height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: nExperts, height: 1, depth: 1),
             on: cmd)
     }
 
@@ -1146,7 +1225,8 @@ public enum Ops {
         thetaBase: Float,
         scaling: RoPEScaling = .none,
         on cmd: MTLCommandBuffer,
-        into out: Tensor? = nil
+        into out: Tensor? = nil,
+        device: Device = .shared
     ) -> Tensor {
         precondition(qk.elementCount % headDim == 0, "rope: qk size must be multiple of headDim")
         let nHeads = qk.elementCount / headDim
@@ -1156,7 +1236,7 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         // Single-token decode: 1-element positions buffer, row_stride = per-token
         // qk stride (n_heads * head_dim). See iron_rope_banded contract.
-        let posBuf = Device.shared.makeBuffer(length: 4)
+        let posBuf = device.makeBuffer(length: 4)
         var posVal = UInt32(position)
         memcpy(posBuf.contents(), &posVal, 4)
         let rowStride = UInt32(nHeads * headDim)
@@ -1232,7 +1312,8 @@ public enum Ops {
         headDim: Int, rotaryDim: Int,
         thetaBase: Float,
         scaling: RoPEScaling = .none,
-        on cmd: MTLCommandBuffer
+        on cmd: MTLCommandBuffer,
+        device: Device = .shared
     ) {
         precondition(
             qk.elementCount % headDim == 0,
@@ -1250,7 +1331,7 @@ public enum Ops {
         let tg = MTLSize(width: 1, height: 1, depth: 1)
         // Single-token decode: 1-element positions buffer, row_stride = per-token
         // qk stride (n_heads * head_dim). See iron_rope_banded contract.
-        let posBuf = Device.shared.makeBuffer(length: 4)
+        let posBuf = device.makeBuffer(length: 4)
         var posVal = UInt32(position)
         memcpy(posBuf.contents(), &posVal, 4)
         let rowStride = UInt32(nHeads * headDim)
@@ -1312,7 +1393,8 @@ public enum Ops {
         headDim: Int, rotaryDim: Int,
         thetaBase: Float,
         scaling: RoPEScaling = .none,
-        on cmd: MTLCommandBuffer
+        on cmd: MTLCommandBuffer,
+        device: Device = .shared
     ) {
         precondition(
             q.dtype == k.dtype,
@@ -1337,7 +1419,7 @@ public enum Ops {
         // iron_rope_banded buffer layout: qk@0, positions@1, out@2, then
         // head_dim@3, half_dim@4, row_stride@5, theta@6, scale factors@7-10.
         // Decode = 1-element positions buffer (shared across q and k).
-        let posBuf = Device.shared.makeBuffer(length: 4)
+        let posBuf = device.makeBuffer(length: 4)
         var posVal = UInt32(position)
         memcpy(posBuf.contents(), &posVal, 4)
         enc.setBuffer(posBuf, offset: 0, index: 1)
@@ -2883,7 +2965,17 @@ public enum Ops {
         var outDimV = UInt32(outDim)
         var groupSizeV = UInt32(groupSize)
         let pso = PSOCache.shared.pipelineState(for: psoName)
-        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        // Concurrent default: gate‖up and multi-expert gemvs write distinct
+        // outs (Hy3 int2 path). Serial escape: BUTTER_MOE_SERIAL_EXPERT_GEMV=1.
+        let useConcurrent =
+            ButterEnv["BUTTER_MOE_SERIAL_EXPERT_GEMV"] == nil
+        let enc: MTLComputeCommandEncoder?
+        if useConcurrent {
+            enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
+        } else {
+            enc = cmd.makeComputeCommandEncoder()
+        }
+        guard let enc else { return }
         enc.setComputePipelineState(pso)
         // Shared constexprs (kernel buffer indices 6, 7, 8) set once.
         enc.setBytes(&inDimV, length: 4, index: 6)
@@ -2954,7 +3046,7 @@ public enum Ops {
         // BUTTER_HY3_SERIAL_EXPERT_GEMV=1 forces serial encoder.
         let useConcurrent =
             concurrent
-            && ProcessInfo.processInfo.environment["BUTTER_HY3_SERIAL_EXPERT_GEMV"] == nil
+            && ButterEnv["BUTTER_HY3_SERIAL_EXPERT_GEMV"] == nil
         let enc: MTLComputeCommandEncoder?
         if useConcurrent {
             enc = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)
@@ -3109,6 +3201,69 @@ public enum Ops {
         }
     }
 
+    /// W69: single-dispatch fusion of `moeSigmoidBiasRows` +
+    /// `moeRouterTopKBiasedMany` (`iron_moe_router_topk_biased_rows_fused`).
+    /// Reads RAW router GEMV `logits` directly — no precomputed
+    /// `unbiased`/`biased` score tensors — and computes sigmoid+bias inline
+    /// per masked-argmax candidate, replicating the two-kernel chain's
+    /// per-stage rounding exactly (see the kernel's module doc). Does NOT
+    /// apply `routedScalingFactor` — same contract as
+    /// `moeRouterTopKBiasedMany`, caller multiplies after.
+    public static func moeRouterTopKBiasedRowsFused(
+        logits: Tensor, bias: Tensor,
+        indicesOut: Tensor, weightsOut: Tensor,
+        t: Int, nExperts: Int, k: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(t > 0, "Ops.moeRouterTopKBiasedRowsFused: t must be positive")
+        precondition(
+            logits.elementCount == t * nExperts,
+            "Ops.moeRouterTopKBiasedRowsFused: logits must be [T·nExperts]")
+        precondition(
+            bias.elementCount == nExperts,
+            "Ops.moeRouterTopKBiasedRowsFused: bias must be [nExperts]")
+        precondition(
+            indicesOut.elementCount == t * k && indicesOut.dtype == .u32,
+            "Ops.moeRouterTopKBiasedRowsFused: indicesOut must be [T·k] u32")
+        precondition(
+            weightsOut.elementCount == t * k && weightsOut.dtype == logits.dtype,
+            "Ops.moeRouterTopKBiasedRowsFused: weightsOut must be [T·k] matching logits")
+        precondition(
+            logits.dtype == bias.dtype,
+            "Ops.moeRouterTopKBiasedRowsFused: logits/bias dtype mismatch")
+        let grd = MTLSize(width: t * 32, height: 1, depth: 1)
+        let tg = MTLSize(width: 32, height: 1, depth: 1)
+        switch logits.dtype {
+        case .f32:
+            IronKernels.iron_moe_router_topk_biased_rows_fused_f32(
+                logits: logits.buffer, logitsOffset: logits.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k),
+                gridSize: grd, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_moe_router_topk_biased_rows_fused_f16(
+                logits: logits.buffer, logitsOffset: logits.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k),
+                gridSize: grd, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_moe_router_topk_biased_rows_fused_bf16(
+                logits: logits.buffer, logitsOffset: logits.offset,
+                bias: bias.buffer, biasOffset: bias.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k),
+                gridSize: grd, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError(
+                "Ops.moeRouterTopKBiasedRowsFused: unsupported dtype \(logits.dtype)")
+        }
+    }
+
     /// MoE top-K router. Reads `[nExperts]` raw logits and writes
     /// `[k]` u32 expert indices + `[k]` weights of the same dtype.
     /// `normTopkProb` matches Qwen3-MoE convention when `true`
@@ -3252,9 +3407,15 @@ public enum Ops {
     /// reads `stateIn[*, c]` once at the start of the sweep and
     /// writes `stateOut[*, c]` once at the end. Passing the same
     /// buffer for both is safe.
+    /// `statePlanes` / `planesEnabled` — spec-decode rollback side channel,
+    /// same contract as `gatedDeltaPrepChunk`'s (see
+    /// `iron_conv1d_causal_step_silu_cast_many`'s "Per-token conv-state
+    /// planes" doc). `statePlanes` must be `[T, conv_kernel-1, convDim]`
+    /// when enabled; pass `Ops.disabledGdnPlanes(dtype:device:)` otherwise.
     public static func conv1dCausalStepSiluCastMany(
         src: Tensor, w: Tensor, b: Tensor,
         stateIn: Tensor, outF32: Tensor, stateOut: Tensor,
+        statePlanes: Tensor, planesEnabled: Tensor,
         t: Int, convDim: Int, convKernel: Int,
         on cmd: MTLCommandBuffer
     ) {
@@ -3263,11 +3424,15 @@ public enum Ops {
             "Ops.conv1dCausalStepSiluCastMany: requires conv_kernel = 4")
         precondition(
             src.dtype == w.dtype && src.dtype == b.dtype
-                && src.dtype == stateIn.dtype && src.dtype == stateOut.dtype,
+                && src.dtype == stateIn.dtype && src.dtype == stateOut.dtype
+                && src.dtype == statePlanes.dtype,
             "Ops.conv1dCausalStepSiluCastMany: dtype mismatch")
         precondition(
             outF32.dtype == .f32,
             "Ops.conv1dCausalStepSiluCastMany: outF32 must be .f32")
+        precondition(
+            planesEnabled.dtype == .u32 && planesEnabled.elementCount == 1,
+            "Ops.conv1dCausalStepSiluCastMany: planesEnabled must be a [1] u32 scalar buffer")
         let grid = MTLSize(width: convDim, height: 1, depth: 1)
         let tg = MTLSize(width: min(convDim, 256), height: 1, depth: 1)
         let tLenU = UInt32(t)
@@ -3282,6 +3447,8 @@ public enum Ops {
                 state_in: stateIn.buffer, state_inOffset: stateIn.offset,
                 out_f32: outF32.buffer, out_f32Offset: outF32.offset,
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
                 t_len: tLenU, conv_dim: cdU, conv_kernel: ckU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
@@ -3292,6 +3459,8 @@ public enum Ops {
                 state_in: stateIn.buffer, state_inOffset: stateIn.offset,
                 out_f32: outF32.buffer, out_f32Offset: outF32.offset,
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
                 t_len: tLenU, conv_dim: cdU, conv_kernel: ckU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
@@ -3302,6 +3471,8 @@ public enum Ops {
                 state_in: stateIn.buffer, state_inOffset: stateIn.offset,
                 out_f32: outF32.buffer, out_f32Offset: outF32.offset,
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
                 t_len: tLenU, conv_dim: cdU, conv_kernel: ckU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
@@ -4581,7 +4752,7 @@ public enum Ops {
     /// layer per prefill chunk and once per attention layer per decode
     /// token on the batched decode path.
     private static let sdpaBK16Enabled: Bool =
-        ProcessInfo.processInfo.environment["BUTTER_SDPA_BK16"] != "0"
+        ButterEnv["BUTTER_SDPA_BK16"] != "0"
 
     public static func sdpaPrefillMmaD256(
         q: Tensor, k: Tensor, v: Tensor,
@@ -5839,6 +6010,17 @@ public enum Ops {
     /// happen at the `MoELayer` call site, so it reuses this same cached
     /// check instead of re-deriving it.
     static let mppAutoCapable: Bool = {
+        // Diagnostic force-off: BUTTER_FORCE_NO_MPP=1 makes the auto-gate
+        // report incapable, so every coop-tensor path takes its non-MPP
+        // fallback and every MPP-guarded test skips. This lets the full suite
+        // be validated on real hardware exactly as it would run on a paravirt
+        // CI GPU (Family < 9) that cannot build cooperative-tensor PSOs.
+        // Default off; genuine hardware detection below is unchanged.
+        if let raw = ButterEnv["BUTTER_FORCE_NO_MPP"],
+            raw == "1" || raw.lowercased() == "true"
+        {
+            return false
+        }
         guard
             ProcessInfo.processInfo.isOperatingSystemAtLeast(
                 OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0))
@@ -5904,14 +6086,13 @@ public enum Ops {
         // not route M1–M2 or pre-Metal-4 into a live-compile that cannot
         // find the MPP header (same .apple9 gate the MPP tests use).
         // Force-on skips the gate: explicit opt-in owns unsupported HW.
-        let env = ProcessInfo.processInfo.environment
         let useMpp: Bool
-        if env["BUTTER_MOE_BGEMM_NO_MPP"] != nil {
+        if ButterEnv["BUTTER_MOE_BGEMM_NO_MPP"] != nil {
             useMpp = false
-        } else if env["BUTTER_MOE_BGEMM_MPP"] != nil {
+        } else if ButterEnv["BUTTER_MOE_BGEMM_MPP"] != nil {
             useMpp = true
         } else {
-            let mppMin = Int(env["BUTTER_MOE_BGEMM_MPP_MIN"] ?? "") ?? 0
+            let mppMin = Int(ButterEnv["BUTTER_MOE_BGEMM_MPP_MIN"] ?? "") ?? 0
             useMpp = mTotal >= mppMin && Self.mppAutoCapable
         }
         let tgWidth = useMpp ? 32 : 64
@@ -7118,12 +7299,28 @@ public enum Ops {
     ///
     /// Grid: `(qLen / 32, n_q_heads, 1)` threadgroups, 128 threads per
     /// group (4 simdgroups). Reduction-mode kernel.
+    /// - Parameters position/kReal: W48 direct-KV extension (see
+    ///   `iron_sdpa_prefill_mma`'s doc comment in iron's
+    ///   `steel_attention_mma.rs`). `kLen` is now the K/V ADDRESSING
+    ///   STRIDE (buffer row pitch) rather than necessarily the real
+    ///   length — `position` (absolute sequence offset of this Q
+    ///   chunk) and `kReal` (real, non-pad KV length; any k >= kReal
+    ///   is masked to -inf alongside causal) are explicit params
+    ///   instead of being implicitly derived. Both default to the
+    ///   legacy compacted-KV contract when omitted (`position = kLen -
+    ///   qLen`, `kReal = kLen`) — every existing call site (Hy3Text,
+    ///   LagunaSdpa's compacted path) is byte-identical without
+    ///   changes. Pass them explicitly only for a direct (uncompacted)
+    ///   raw-strided K/V read where `kLen` (the cache's `maxSeq`) may
+    ///   exceed the real content length.
     public static func sdpaPrefillMma(
         q: Tensor, k: Tensor, v: Tensor,
         nQHeads: Int, nKVHeads: Int, headDim: Int,
         qLen: Int, kLen: Int, scale: Float,
         on cmd: MTLCommandBuffer,
-        into out: Tensor? = nil
+        into out: Tensor? = nil,
+        position: Int? = nil,
+        kReal: Int? = nil
     ) -> Tensor {
         precondition(
             qLen > 0 && qLen % 32 == 0,
@@ -7146,6 +7343,11 @@ public enum Ops {
         let tgGrid = MTLSize(width: qLen / bq, height: nQHeads, depth: 1)
         let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
         let gqaFactor = nQHeads / nKVHeads
+        let positionV = position ?? (kLen - qLen)
+        let kRealV = kReal ?? kLen
+        precondition(positionV >= 0, "Ops.sdpaPrefillMma: position \(positionV) must be >= 0")
+        precondition(
+            kRealV <= kLen, "Ops.sdpaPrefillMma: kReal \(kRealV) must be <= kLen \(kLen)")
 
         switch q.dtype {
         case .f32:
@@ -7158,6 +7360,7 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor),
                 n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
                 scale: scale,
+                position: UInt32(positionV), k_real: UInt32(kRealV),
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         case .f16:
             IronKernels.iron_sdpa_prefill_mma_f16_threadgroups(
@@ -7169,6 +7372,7 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor),
                 n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
                 scale: scale,
+                position: UInt32(positionV), k_real: UInt32(kRealV),
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         case .bf16:
             IronKernels.iron_sdpa_prefill_mma_bf16_threadgroups(
@@ -7180,11 +7384,67 @@ public enum Ops {
                 gqa_factor: UInt32(gqaFactor),
                 n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
                 scale: scale,
+                position: UInt32(positionV), k_real: UInt32(kRealV),
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.sdpaPrefillMma: unsupported dtype \(q.dtype)")
         }
         return result
+    }
+
+    /// W58 fused-epilogue prefill SDPA: f16 q/k/v in, **transposed bf16**
+    /// out. Identical MMA math to `sdpaPrefillMma`, but the store epilogue
+    /// writes each element straight to the transposed row-major layout
+    /// `out[t, q_head*head_dim + d]` (shape `[qLen, nQHeads*headDim]`) and
+    /// narrows f32→f16→bf16 in-register — folding the separate
+    /// `transposeHTDCastToBf16` dispatch (and the `outHTD` round trip: a full
+    /// write + read of the `[nHeads, qLen, headDim]` f16 attn output per
+    /// layer) into the producer kernel.
+    ///
+    /// The f32→f16→bf16 double-round is bit-identical to the native-layout
+    /// path (`sdpaPrefillMma` stores f16 via `.cast::<f16>()`, then
+    /// `transposeHTDCastToBf16` does `bfloat(float(x))`).
+    ///
+    /// `out` must be `[qLen, nQHeads*headDim]` bf16 (caller slices the first
+    /// `nRows` rows). Same grid/tpg contract as `sdpaPrefillMma`.
+    public static func sdpaPrefillMmaTransBf16(
+        q: Tensor, k: Tensor, v: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        qLen: Int, kLen: Int, scale: Float,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(
+            qLen > 0 && qLen % 32 == 0,
+            "Ops.sdpaPrefillMmaTransBf16: qLen \(qLen) must be a positive multiple of 32")
+        precondition(
+            kLen >= qLen,
+            "Ops.sdpaPrefillMmaTransBf16: kLen \(kLen) must be >= qLen \(qLen)")
+        precondition(
+            nQHeads % nKVHeads == 0,
+            "Ops.sdpaPrefillMmaTransBf16: nQHeads \(nQHeads) must be a multiple of nKVHeads \(nKVHeads)")
+        precondition(
+            q.dtype == .f16 && k.dtype == .f16 && v.dtype == .f16,
+            "Ops.sdpaPrefillMmaTransBf16: q/k/v must be f16")
+        precondition(
+            out.dtype == .bf16, "Ops.sdpaPrefillMmaTransBf16: out must be bf16")
+        precondition(
+            headDim == 128, "Ops.sdpaPrefillMmaTransBf16: kernel is head_dim=128 only")
+        let threadsPerGroup = 128
+        let bq = 32
+        let tgGrid = MTLSize(width: qLen / bq, height: nQHeads, depth: 1)
+        let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+        let gqaFactor = nQHeads / nKVHeads
+        IronKernels.iron_sdpa_prefill_mma_transbf16_f16_threadgroups(
+            q: q.buffer, qOffset: q.offset,
+            k: k.buffer, kOffset: k.offset,
+            v: v.buffer, vOffset: v.offset,
+            out: out.buffer, outOffset: out.offset,
+            q_len: UInt32(qLen), k_len: UInt32(kLen),
+            gqa_factor: UInt32(gqaFactor),
+            n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
+            scale: scale,
+            gridSize: tgGrid, threadgroupSize: tg, on: cmd)
     }
 
     // ─── MoE gather BGEMM int4 — BM=8 MPP variant ────────────────────
@@ -7419,6 +7679,121 @@ public enum Ops {
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.moeUnpermute: unsupported dtype \(out.dtype)")
+        }
+    }
+
+    /// W57: fused MoE combine tail — `moeUnpermute` + shared-expert add +
+    /// residual add in ONE dispatch, replacing the Laguna prefill sorted-MoE
+    /// tail's three separate `[T, hidden]` passes (`moeUnpermute` ->
+    /// `Ops.add` shared -> `Ops.add` residual) with one read of each input
+    /// and one write of `out`. Flag-gated via
+    /// `BUTTER_LAGUNA_FUSED_MOE_TAIL` (see `LagunaFusedMoeTail`); default OFF
+    /// for the W57 A/B, zero behavior change unless set.
+    ///
+    /// `sharedExpert` is optional — pass `nil` on paths/layers with no
+    /// shared expert (e.g. `MoEEnvFlags.noShared`, or a model variant
+    /// without one). When `nil`, `residual` is bound at the kernel's
+    /// `shared_expert_out` slot as a same-shape dummy buffer and
+    /// `has_shared=0` guards the load so it is never read — matching the
+    /// iron kernel's documented dummy-buffer contract
+    /// (`iron_moe_unpermute_tail` in `moe/moe_unpermute_tail.rs`).
+    ///
+    /// Accumulation order matches the unfused call sites exactly (unpermute
+    /// -> += shared -> += residual, kept in one f32 accumulator instead of
+    /// round-tripping through `T` between steps) — see that kernel's file
+    /// header for why this is not a reassociation and should be
+    /// byte-identical, not just within-tolerance.
+    public static func moeUnpermuteTail(
+        expertOutputs: Tensor,
+        invPerm: Tensor,
+        topKWeights: Tensor,
+        sharedExpert: Tensor?,
+        residual: Tensor,
+        into out: Tensor,
+        nRows: Int, hidden: Int, k: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            invPerm.dtype == .u32,
+            "Ops.moeUnpermuteTail: invPerm must be u32 (got \(invPerm.dtype))")
+        precondition(
+            expertOutputs.dtype == topKWeights.dtype && topKWeights.dtype == out.dtype
+                && residual.dtype == out.dtype,
+            "Ops.moeUnpermuteTail: expertOutputs/topKWeights/residual/out must share dtype")
+        if let shared = sharedExpert {
+            precondition(
+                shared.dtype == out.dtype,
+                "Ops.moeUnpermuteTail: sharedExpert must share dtype with out")
+            precondition(
+                shared.elementCount == nRows * hidden,
+                "Ops.moeUnpermuteTail: sharedExpert has \(shared.elementCount) elements, expected nRows·hidden = \(nRows * hidden)"
+            )
+        }
+        precondition(
+            expertOutputs.elementCount == nRows * k * hidden,
+            "Ops.moeUnpermuteTail: expertOutputs has \(expertOutputs.elementCount) elements, expected nRows·k·hidden = \(nRows * k * hidden)"
+        )
+        precondition(
+            invPerm.elementCount == nRows * k,
+            "Ops.moeUnpermuteTail: invPerm has \(invPerm.elementCount) elements, expected nRows·k = \(nRows * k)"
+        )
+        precondition(
+            topKWeights.elementCount == nRows * k,
+            "Ops.moeUnpermuteTail: topKWeights has \(topKWeights.elementCount) elements, expected nRows·k = \(nRows * k)"
+        )
+        precondition(
+            residual.elementCount == nRows * hidden,
+            "Ops.moeUnpermuteTail: residual has \(residual.elementCount) elements, expected nRows·hidden = \(nRows * hidden)"
+        )
+        precondition(
+            out.elementCount == nRows * hidden,
+            "Ops.moeUnpermuteTail: out has \(out.elementCount) elements, expected nRows·hidden = \(nRows * hidden)"
+        )
+
+        let tgWidth = 128
+        let grid = MTLSize(width: nRows * tgWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let hiddenU = UInt32(hidden)
+        let kU = UInt32(k)
+        let hasSharedU: UInt32 = sharedExpert != nil ? 1 : 0
+        // Dummy buffer for the shared_expert_out slot when there is no
+        // shared expert: same-shape `residual` is a safe bind (correct
+        // size, never read — has_shared=0 guards the kernel's load).
+        let sharedBuf = sharedExpert ?? residual
+
+        switch out.dtype {
+        case .f32:
+            IronKernels.iron_moe_unpermute_tail_f32(
+                expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
+                inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+                top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
+                shared_expert_out: sharedBuf.buffer, shared_expert_outOffset: sharedBuf.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU, k: kU, has_shared: hasSharedU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_moe_unpermute_tail_f16(
+                expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
+                inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+                top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
+                shared_expert_out: sharedBuf.buffer, shared_expert_outOffset: sharedBuf.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU, k: kU, has_shared: hasSharedU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_moe_unpermute_tail_bf16(
+                expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
+                inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+                top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
+                shared_expert_out: sharedBuf.buffer, shared_expert_outOffset: sharedBuf.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU, k: kU, has_shared: hasSharedU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.moeUnpermuteTail: unsupported dtype \(out.dtype)")
         }
     }
 
@@ -7715,6 +8090,13 @@ public enum Ops {
     ///   - `stateIn` / `stateOut` : `[batchSize, hv, dv, dk]` fp32
     ///     recurrent state (read-once / write-once across the chunk)
     ///   - `y`         : `[batchSize, tLen, hv·dv]` output activations
+    /// `statePlanes` / `planesEnabled` — spec-decode rollback side channel
+    /// (see `iron_gated_delta_prep_chunk`'s "Per-token state planes" doc).
+    /// `statePlanes` must be `[T, batchSize·hv, dv, dk]` sized (same dtype
+    /// as everything else) when `planesEnabled` carries a nonzero u32, and
+    /// may be any nonempty buffer of the right dtype (never indexed)
+    /// otherwise — pass `Ops.disabledGdnPlanes(dtype:device:)` for the
+    /// common "planes off" case.
     public static func gatedDeltaPrepChunk(
         convOut: Tensor,
         aLog: Tensor, dtBias: Tensor,
@@ -7722,6 +8104,7 @@ public enum Ops {
         qNormed: Tensor, kNormed: Tensor,
         stateIn: Tensor, stateOut: Tensor, y: Tensor,
         tLen: Tensor,
+        statePlanes: Tensor, planesEnabled: Tensor,
         batchSize: Int, dk: Int, dv: Int, hv: Int, hk: Int,
         on cmd: MTLCommandBuffer
     ) {
@@ -7730,7 +8113,7 @@ public enum Ops {
                 && dtBias.dtype == aRaw.dtype && aRaw.dtype == bRaw.dtype
                 && bRaw.dtype == qNormed.dtype && qNormed.dtype == kNormed.dtype
                 && kNormed.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
-                && stateOut.dtype == y.dtype,
+                && stateOut.dtype == y.dtype && y.dtype == statePlanes.dtype,
             "Ops.gatedDeltaPrepChunk: every tensor must share dtype")
         precondition(
             dk % 32 == 0,
@@ -7744,6 +8127,9 @@ public enum Ops {
         precondition(
             tLen.dtype == .u32 && tLen.elementCount == 1,
             "Ops.gatedDeltaPrepChunk: tLen must be a [1] u32 scalar buffer")
+        precondition(
+            planesEnabled.dtype == .u32 && planesEnabled.elementCount == 1,
+            "Ops.gatedDeltaPrepChunk: planesEnabled must be a [1] u32 scalar buffer")
         // 4 SGs per TG pack 4 Dv slots (reference Metal GDN geometry).
         // Grid TGs: [ceil(Dv/4), batch·Hv, 1], TG 128. Kernel walks tLen
         // tokens internally with state register-resident.
@@ -7758,6 +8144,7 @@ public enum Ops {
         let dvU = UInt32(dv)
         let hvU = UInt32(hv)
         let hkU = UInt32(hk)
+        let nTotalU = UInt32(batchSize * hv)
         switch convOut.dtype {
         case .f32:
             IronKernels.iron_gated_delta_prep_chunk_f32(
@@ -7772,7 +8159,9 @@ public enum Ops {
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
-                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU, n_total: nTotalU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
             IronKernels.iron_gated_delta_prep_chunk_f16(
@@ -7787,7 +8176,9 @@ public enum Ops {
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
-                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU, n_total: nTotalU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
             IronKernels.iron_gated_delta_prep_chunk_bf16(
@@ -7802,11 +8193,31 @@ public enum Ops {
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
-                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU, n_total: nTotalU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.gatedDeltaPrepChunk: unsupported dtype \(convOut.dtype)")
         }
+    }
+
+    /// Small reusable dummy "planes off" pair for `gatedDeltaPrepChunk(Fast)`
+    /// call sites that never roll back via planes (regular decode, prefill,
+    /// the `rewindState` prefix recompute). `statePlanes` is a 1-element
+    /// buffer of `dtype` — never indexed since `planesEnabled` is 0 — and
+    /// `planesEnabled` is a 1-element zeroed u32 buffer. Allocated fresh
+    /// (4-16 bytes) rather than cached: these call sites are not hot enough
+    /// to justify a shared/tagged scratch slot.
+    public static func disabledGdnPlanes(dtype: DType, device: Device) -> (statePlanes: Tensor, planesEnabled: Tensor) {
+        // Content is never read (planesEnabled == 0 short-circuits every
+        // store in the kernel), so `statePlanes` skips the zero-fill other
+        // callers give freshly allocated tensors.
+        let planes = Tensor.empty(shape: [1], dtype: dtype, device: device)
+        let flagBuf = device.makeBuffer(length: 4)
+        memset(flagBuf.contents(), 0, 4)
+        let flag = Tensor(buffer: flagBuf, offset: 0, shape: [1], dtype: .u32)
+        return (planes, flag)
     }
 
     /// Shape-specialized fast path for `gatedDeltaPrepChunk`, valid ONLY at
@@ -7835,6 +8246,9 @@ public enum Ops {
     /// No `dk`/`dv`/`hv`/`hk` parameters. Callers must confirm the shape
     /// matches before calling (see `Qwen35GDNMixer.forwardManyChunked`'s
     /// guard). `batchSize`/`hv` are still needed for grid sizing.
+    /// `statePlanes` / `planesEnabled` — see `gatedDeltaPrepChunk`'s doc;
+    /// same contract here (`statePlanes` shape `[T, batchSize·32, 128, 128]`
+    /// when enabled).
     public static func gatedDeltaPrepChunkFast(
         convOut: Tensor,
         aLog: Tensor, dtBias: Tensor,
@@ -7842,6 +8256,7 @@ public enum Ops {
         qNormed: Tensor, kNormed: Tensor,
         stateIn: Tensor, stateOut: Tensor, y: Tensor,
         tLen: Tensor,
+        statePlanes: Tensor, planesEnabled: Tensor,
         batchSize: Int,
         on cmd: MTLCommandBuffer
     ) {
@@ -7850,11 +8265,14 @@ public enum Ops {
                 && dtBias.dtype == aRaw.dtype && aRaw.dtype == bRaw.dtype
                 && bRaw.dtype == qNormed.dtype && qNormed.dtype == kNormed.dtype
                 && kNormed.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
-                && stateOut.dtype == y.dtype,
+                && stateOut.dtype == y.dtype && y.dtype == statePlanes.dtype,
             "Ops.gatedDeltaPrepChunkFast: every tensor must share dtype")
         precondition(
             tLen.dtype == .u32 && tLen.elementCount == 1,
             "Ops.gatedDeltaPrepChunkFast: tLen must be a [1] u32 scalar buffer")
+        precondition(
+            planesEnabled.dtype == .u32 && planesEnabled.elementCount == 1,
+            "Ops.gatedDeltaPrepChunkFast: planesEnabled must be a [1] u32 scalar buffer")
         // Fixed production shape: Dv=128, Hv=32 (Dk/Hk are baked into the
         // kernel and never touch grid sizing; grid math mirrors
         // `gatedDeltaPrepChunk` exactly at dv=128/hv=32).
@@ -7867,6 +8285,7 @@ public enum Ops {
             height: batchSize * hv,
             depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let nTotalU = UInt32(batchSize * hv)
         switch convOut.dtype {
         case .f32:
             IronKernels.iron_gated_delta_prep_chunk_fast_d128_128_32_16_f32(
@@ -7881,6 +8300,9 @@ public enum Ops {
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                n_total: nTotalU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .f16:
             IronKernels.iron_gated_delta_prep_chunk_fast_d128_128_32_16_f16(
@@ -7895,6 +8317,9 @@ public enum Ops {
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                n_total: nTotalU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case .bf16:
             IronKernels.iron_gated_delta_prep_chunk_fast_d128_128_32_16_bf16(
@@ -7909,6 +8334,9 @@ public enum Ops {
                 state_out: stateOut.buffer, state_outOffset: stateOut.offset,
                 y: y.buffer, yOffset: y.offset,
                 t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                n_total: nTotalU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.gatedDeltaPrepChunkFast: unsupported dtype \(convOut.dtype)")
@@ -8370,8 +8798,225 @@ public enum Ops {
             bits == 2 || bits == 4 || bits == 8,
             "Ops.dequantGemmDynamicM: only int2/int4/int8 supported (got bits=\(bits))")
 
-        let mPadded = ((t + 31) / 32) * 32
         let gsPerRow = kIn / groupSize
+
+        // ── BM8 MMA fast path (BUTTER_QMM_MMA_BM8, default OFF — opt-in
+        // experiment) ───────────────────────────────────────────────
+        // `iron_qmm_mma_bm8` maps M=8 to exactly one 8-row frag position
+        // (bandwidth-bound marginal cost) vs the BM=2/4 small-M kernels'
+        // compute-bound marginal cost below — see the kernel's Rust doc
+        // comment for the full rationale (T≈1-8 spec-decode verify
+        // batches). Takes precedence over BOTH the small-M fast path and
+        // the padded BM=32 MMA path when enabled — checked first, before
+        // either. Env is read FRESH every call (not a static let): sibling
+        // flags like `qmmSmallMMax` cache at process start, which breaks
+        // toggling the env mid-process from in-process tests.
+        if bits == 4, nOut % 32 == 0, kIn % 32 == 0, t >= 1, t <= 16,
+            ButterEnv["BUTTER_QMM_MMA_BM8"] == "1"
+        {
+            let mPadded8 = ((t + 7) / 8) * 8
+            let grid = MTLSize(width: nOut / 32, height: mPadded8 / 8, depth: 1)
+            let tg = MTLSize(width: 64, height: 1, depth: 1)
+            if mPadded8 == t {
+                if dispatchQmmMmaBm8(
+                    weight: weight, scales: scales, biases: biases,
+                    input: input, output: out,
+                    n: nOut, k: kIn, gsPerRow: gsPerRow,
+                    grid: grid, tg: tg, on: cmd)
+                {
+                    return
+                }
+            } else {
+                // Pad up to the BM8 tile (8 or 16 for t in 1...16) rather
+                // than 32: at most 7 wasted rows instead of 31. Same
+                // blit-pad-slice shape as the small-M path just below.
+                var handled = false
+                autoreleasepool {
+                    let xPad = Tensor.empty(
+                        shape: [mPadded8, kIn], dtype: input.dtype, device: device)
+                    let oPad = Tensor.empty(
+                        shape: [mPadded8, nOut], dtype: input.dtype, device: device)
+                    let validIn = t * kIn * input.dtype.byteSize
+                    let tailIn = (mPadded8 - t) * kIn * input.dtype.byteSize
+                    guard let b1 = cmd.makeBlitCommandEncoder() else { return }
+                    b1.copy(
+                        from: input.buffer, sourceOffset: input.offset,
+                        to: xPad.buffer, destinationOffset: xPad.offset,
+                        size: validIn)
+                    if tailIn > 0 {
+                        b1.fill(
+                            buffer: xPad.buffer,
+                            range: (xPad.offset + validIn)
+                                ..< (xPad.offset + validIn + tailIn),
+                            value: 0)
+                    }
+                    b1.endEncoding()
+                    guard
+                        dispatchQmmMmaBm8(
+                            weight: weight, scales: scales, biases: biases,
+                            input: xPad, output: oPad,
+                            n: nOut, k: kIn, gsPerRow: gsPerRow,
+                            grid: grid, tg: tg, on: cmd)
+                    else { return }
+                    let validOut = t * nOut * input.dtype.byteSize
+                    guard let b2 = cmd.makeBlitCommandEncoder() else { return }
+                    b2.copy(
+                        from: oPad.buffer, sourceOffset: oPad.offset,
+                        to: out.buffer, destinationOffset: out.offset,
+                        size: validOut)
+                    b2.endEncoding()
+                    handled = true
+                }
+                if handled { return }
+            }
+        }
+
+        // ── Scalar BM8 fast path (BUTTER_QMM_BM8_SCALAR, default OFF —
+        // opt-in experiment) ───────────────────────────────────────────
+        // `iron_qmm_bm8` extends `iron_qmm_bm4`'s own W-reuse geometry
+        // (2 SG x 32 lanes, BN=8, grid [n/8, m/BM, 1]) from BM=4 to
+        // BM=8: one M-tile covers T=5..8 instead of bm4 needing two
+        // M-tiles (i.e. two full W reads) over that range, halving W
+        // traffic again relative to bm4 at the cost of ~2x per-lane
+        // register pressure (see the kernel's Rust doc comment —
+        // ~800B/lane vs bm4's ~440B, near the ~1KB Apple GPU budget).
+        // Motivated by `iron_qmm_mma_bm8` (the simdgroup-matrix MMA
+        // BM8 kernel above) losing to bm4 at T=8 — this is the scalar
+        // follow-up experiment. Takes precedence over the small-M fast
+        // path below for t in 5...qmmSmallMMax when enabled. Env is
+        // read FRESH every call — same reasoning as BUTTER_QMM_MMA_BM8
+        // above (sibling flags like `qmmSmallMMax` cache at process
+        // start, which breaks toggling this env mid-process from
+        // in-process tests).
+        if bits == 4, t >= 5, t <= Self.qmmSmallMMax, nOut % 8 == 0,
+            ButterEnv["BUTTER_QMM_BM8_SCALAR"] == "1"
+        {
+            let mSmall8 = ((t + 7) / 8) * 8
+            let grid = MTLSize(width: nOut / 8, height: mSmall8 / 8, depth: 1)
+            let tg = MTLSize(width: 64, height: 1, depth: 1)
+            if mSmall8 == t {
+                if dispatchQmmBm8Scalar(
+                    weight: weight, scales: scales, biases: biases,
+                    input: input, output: out,
+                    n: nOut, k: kIn, gsPerRow: gsPerRow,
+                    grid: grid, tg: tg, on: cmd)
+                {
+                    return
+                }
+            } else {
+                // T=5..7 pad up to 8 (a single BM tile) — at most 3
+                // wasted rows. Same blit-pad-slice shape as the
+                // small-M / BM8-MMA paths above/below.
+                var handled = false
+                autoreleasepool {
+                    let xPad = Tensor.empty(
+                        shape: [mSmall8, kIn], dtype: input.dtype, device: device)
+                    let oPad = Tensor.empty(
+                        shape: [mSmall8, nOut], dtype: input.dtype, device: device)
+                    let validIn = t * kIn * input.dtype.byteSize
+                    let tailIn = (mSmall8 - t) * kIn * input.dtype.byteSize
+                    guard let b1 = cmd.makeBlitCommandEncoder() else { return }
+                    b1.copy(
+                        from: input.buffer, sourceOffset: input.offset,
+                        to: xPad.buffer, destinationOffset: xPad.offset,
+                        size: validIn)
+                    if tailIn > 0 {
+                        b1.fill(
+                            buffer: xPad.buffer,
+                            range: (xPad.offset + validIn)
+                                ..< (xPad.offset + validIn + tailIn),
+                            value: 0)
+                    }
+                    b1.endEncoding()
+                    guard
+                        dispatchQmmBm8Scalar(
+                            weight: weight, scales: scales, biases: biases,
+                            input: xPad, output: oPad,
+                            n: nOut, k: kIn, gsPerRow: gsPerRow,
+                            grid: grid, tg: tg, on: cmd)
+                    else { return }
+                    let validOut = t * nOut * input.dtype.byteSize
+                    guard let b2 = cmd.makeBlitCommandEncoder() else { return }
+                    b2.copy(
+                        from: oPad.buffer, sourceOffset: oPad.offset,
+                        to: out.buffer, destinationOffset: out.offset,
+                        size: validOut)
+                    b2.endEncoding()
+                    handled = true
+                }
+                if handled { return }
+            }
+        }
+
+        // ── Small-M fast path (BUTTER_QMM_SMALL_M, default ON) ────────
+        // The BM=32 tile below pads M up to 32, so a 2-row spec-decode
+        // verify does 16x the needed compute and flips the pass from
+        // weight-bound to compute-bound. Iron already ships BM=2 / BM=4
+        // variants of the same int4 kernel (`iron_qmm_bm2` / `_bm4`,
+        // 2 SG x 32 lanes, BN=8, grid [n/8, m/BM, 1]) whose whole point
+        // is exactly this shape. Route T <= smallMMax through them and
+        // pad only up to BM (2 or 4) instead of 32.
+        if bits == 4, t >= 1, t <= Self.qmmSmallMMax, nOut % 8 == 0 {
+            let useBm4 = t > 2
+            let bm = useBm4 ? 4 : 2
+            let mSmall = ((t + bm - 1) / bm) * bm
+            let grid = MTLSize(width: nOut / 8, height: mSmall / bm, depth: 1)
+            let tg = MTLSize(width: 64, height: 1, depth: 1)
+            if mSmall == t {
+                if dispatchQmmSmallM(
+                    weight: weight, scales: scales, biases: biases,
+                    input: input, output: out,
+                    n: nOut, k: kIn, gsPerRow: gsPerRow, useBm4: useBm4,
+                    grid: grid, tg: tg, on: cmd)
+                {
+                    return
+                }
+            } else {
+                // Pad up to the SMALL BM (2 or 4) rather than 32: at most
+                // 3 wasted rows instead of 31. Same blit-pad-slice shape as
+                // the BM=32 path below.
+                var handled = false
+                autoreleasepool {
+                    let xPad = Tensor.empty(
+                        shape: [mSmall, kIn], dtype: input.dtype, device: device)
+                    let oPad = Tensor.empty(
+                        shape: [mSmall, nOut], dtype: input.dtype, device: device)
+                    let validIn = t * kIn * input.dtype.byteSize
+                    let tailIn = (mSmall - t) * kIn * input.dtype.byteSize
+                    guard let b1 = cmd.makeBlitCommandEncoder() else { return }
+                    b1.copy(
+                        from: input.buffer, sourceOffset: input.offset,
+                        to: xPad.buffer, destinationOffset: xPad.offset,
+                        size: validIn)
+                    if tailIn > 0 {
+                        b1.fill(
+                            buffer: xPad.buffer,
+                            range: (xPad.offset + validIn)
+                                ..< (xPad.offset + validIn + tailIn),
+                            value: 0)
+                    }
+                    b1.endEncoding()
+                    guard
+                        dispatchQmmSmallM(
+                            weight: weight, scales: scales, biases: biases,
+                            input: xPad, output: oPad,
+                            n: nOut, k: kIn, gsPerRow: gsPerRow, useBm4: useBm4,
+                            grid: grid, tg: tg, on: cmd)
+                    else { return }
+                    let validOut = t * nOut * input.dtype.byteSize
+                    guard let b2 = cmd.makeBlitCommandEncoder() else { return }
+                    b2.copy(
+                        from: oPad.buffer, sourceOffset: oPad.offset,
+                        to: out.buffer, destinationOffset: out.offset,
+                        size: validOut)
+                    b2.endEncoding()
+                    handled = true
+                }
+                if handled { return }
+            }
+        }
+
+        let mPadded = ((t + 31) / 32) * 32
 
         // Fast path: T already multiple of 32 — dispatch directly without
         // padding. The hot-loop case for Qwen3.6 prefill (T = 32, 256, 1024,
@@ -8482,9 +9127,9 @@ public enum Ops {
     /// dictionary that often was pure overhead once the tier decision
     /// stabilizes for the life of the process.
     private static let qmmMppEnvRaw: String? =
-        ProcessInfo.processInfo.environment["BUTTER_QMM_MPP"]
+        ButterEnv["BUTTER_QMM_MPP"]
     private static let qmmCoopEnvRaw: String? =
-        ProcessInfo.processInfo.environment["BUTTER_QMM_COOP"]
+        ButterEnv["BUTTER_QMM_COOP"]
 
     /// Inner dispatcher for `dequantGemmDynamicM`. Grid is `[N/32, M/32, 1]`
     /// × tg `[128, 1, 1]` (4 SGs WM=WN=2 per the canonical `iron_qmm_mma`).
@@ -8521,6 +9166,161 @@ public enum Ops {
     /// group size falls back to the simdgroup path regardless of either
     /// gate, since those kernels would silently read scales/biases at the
     /// wrong stride otherwise.
+    /// Max T routed to the BM=2 / BM=4 small-M quantized matmul kernels.
+    /// 0 disables the fast path (BUTTER_QMM_SMALL_M=0).
+    static let qmmSmallMMax: Int = {
+        if let raw = ButterEnv["BUTTER_QMM_SMALL_M"] {
+            return Int(raw) ?? 8
+        }
+        return 8
+    }()
+
+    /// Dispatch `iron_qmm_bm2` / `iron_qmm_bm4` for exact small M.
+    /// Returns false when no kernel exists for the dtype (caller falls
+    /// through to the padded BM=32 path).
+    private static func dispatchQmmSmallM(
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        input: Tensor, output: Tensor,
+        n: Int, k: Int, gsPerRow: Int, useBm4: Bool,
+        grid: MTLSize, tg: MTLSize, on cmd: MTLCommandBuffer
+    ) -> Bool {
+        let kU = UInt32(k), nU = UInt32(n), gsU = UInt32(gsPerRow)
+        switch (input.dtype, useBm4) {
+        case (.bf16, false):
+            IronKernels.iron_qmm_bm2_bf16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.bf16, true):
+            IronKernels.iron_qmm_bm4_bf16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.f16, false):
+            IronKernels.iron_qmm_bm2_f16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.f16, true):
+            IronKernels.iron_qmm_bm4_f16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            return false
+        }
+        return true
+    }
+
+    /// Dispatch `iron_qmm_mma_bm8` (BUTTER_QMM_MMA_BM8 opt-in). Same
+    /// buffer signature and quarter-height MMA geometry as `iron_qmm_mma`
+    /// / `iron_qmm_mma_m16`, just BM=8: grid `[N/32, M/8, 1]`, tg
+    /// `[64, 1, 1]`. Returns false when no kernel exists for the dtype
+    /// (caller falls through to the small-M / padded BM=32 paths).
+    private static func dispatchQmmMmaBm8(
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        input: Tensor, output: Tensor,
+        n: Int, k: Int, gsPerRow: Int,
+        grid: MTLSize, tg: MTLSize, on cmd: MTLCommandBuffer
+    ) -> Bool {
+        let kU = UInt32(k), nU = UInt32(n), gsU = UInt32(gsPerRow)
+        switch input.dtype {
+        case .f32:
+            IronKernels.iron_qmm_mma_bm8_f32_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_qmm_mma_bm8_f16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_qmm_mma_bm8_bf16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            return false
+        }
+        return true
+    }
+
+    /// Dispatch `iron_qmm_bm8` (BUTTER_QMM_BM8_SCALAR opt-in). Scalar
+    /// (non-MMA) extension of `iron_qmm_bm4`'s own geometry to BM=8:
+    /// grid `[N/8, M/8, 1]`, tg `[64, 1, 1]` — same 2 SG x 32 lane, BN=8
+    /// tile as `dispatchQmmSmallM`'s bm2/bm4, just BM=8. Returns false
+    /// when no kernel exists for the dtype (caller falls through to the
+    /// small-M / padded BM=32 paths).
+    private static func dispatchQmmBm8Scalar(
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        input: Tensor, output: Tensor,
+        n: Int, k: Int, gsPerRow: Int,
+        grid: MTLSize, tg: MTLSize, on cmd: MTLCommandBuffer
+    ) -> Bool {
+        let kU = UInt32(k), nU = UInt32(n), gsU = UInt32(gsPerRow)
+        switch input.dtype {
+        case .f32:
+            IronKernels.iron_qmm_bm8_f32_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_qmm_bm8_f16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_qmm_bm8_bf16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            return false
+        }
+        return true
+    }
+
     private static func dispatchQmmMma(
         weight: Tensor, scales: Tensor, biases: Tensor,
         input: Tensor, output: Tensor,
@@ -8678,7 +9478,15 @@ public enum Ops {
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .f32):
             // Prefer MPP/NAX int8 (live-compile) unless BUTTER_HY3_QMM_MMA=1.
-            if ProcessInfo.processInfo.environment["BUTTER_HY3_QMM_MMA"] == nil {
+            // Gate on `Self.mppAutoCapable` too — same as the bits=4 tier's
+            // `useMpp4` a few lines up: unlike that tier this int8 default
+            // had no capability check at all, so on Apple GPU Family <9 /
+            // macOS <26 it unconditionally requested the `matmul2d`
+            // cooperative-tensor PSO and PSOCache.pipelineState fatalErrors
+            // compiling it. `iron_qmm_mma_int8_*` below is a plain
+            // simdgroup kernel and already the `BUTTER_HY3_QMM_MMA=1`
+            // escape — reuse it as the capability fallback too.
+            if ButterEnv["BUTTER_HY3_QMM_MMA"] == nil && Self.mppAutoCapable {
                 IronKernels.iron_qmm_mma_mpp_int8_f32_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -8698,7 +9506,15 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             }
         case (8, .f16):
-            if ProcessInfo.processInfo.environment["BUTTER_HY3_QMM_MMA"] == nil {
+            // Gate on `Self.mppAutoCapable` too — same as the bits=4 tier's
+            // `useMpp4` a few lines up: unlike that tier this int8 default
+            // had no capability check at all, so on Apple GPU Family <9 /
+            // macOS <26 it unconditionally requested the `matmul2d`
+            // cooperative-tensor PSO and PSOCache.pipelineState fatalErrors
+            // compiling it. `iron_qmm_mma_int8_*` below is a plain
+            // simdgroup kernel and already the `BUTTER_HY3_QMM_MMA=1`
+            // escape — reuse it as the capability fallback too.
+            if ButterEnv["BUTTER_HY3_QMM_MMA"] == nil && Self.mppAutoCapable {
                 IronKernels.iron_qmm_mma_mpp_int8_f16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -8718,7 +9534,15 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             }
         case (8, .bf16):
-            if ProcessInfo.processInfo.environment["BUTTER_HY3_QMM_MMA"] == nil {
+            // Gate on `Self.mppAutoCapable` too — same as the bits=4 tier's
+            // `useMpp4` a few lines up: unlike that tier this int8 default
+            // had no capability check at all, so on Apple GPU Family <9 /
+            // macOS <26 it unconditionally requested the `matmul2d`
+            // cooperative-tensor PSO and PSOCache.pipelineState fatalErrors
+            // compiling it. `iron_qmm_mma_int8_*` below is a plain
+            // simdgroup kernel and already the `BUTTER_HY3_QMM_MMA=1`
+            // escape — reuse it as the capability fallback too.
+            if ButterEnv["BUTTER_HY3_QMM_MMA"] == nil && Self.mppAutoCapable {
                 IronKernels.iron_qmm_mma_mpp_int8_bf16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -8962,6 +9786,19 @@ public enum Ops {
         enc.setComputePipelineState(pso)
         enc.setBuffer(input.buffer, offset: input.offset, index: 0)
         enc.setBuffer(out.buffer, offset: out.offset, index: 1)
+        // T30 fix: `iron_cast_bf16_to_f16_f32` reads a bounds check
+        // `constant uint &n [[buffer(2)]]` that this call site never
+        // bound; the kernel's `n > tid` guard was reading whatever
+        // was left in that slot by an unrelated prior encoder (Metal
+        // does not zero-initialize unbound buffer slots). Usually
+        // "safe" in practice because the dispatches that typically
+        // precede this call in this codebase bind a large `n`
+        // elsewhere first, but not guaranteed: found via
+        // LagunaPrefillFusedQKRopeProbeTests where a small preceding
+        // dispatch left a residual `n` smaller than this call's actual
+        // element count, silently truncating the cast.
+        var nU = UInt32(n)
+        enc.setBytes(&nU, length: 4, index: 2)
         enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
         enc.endEncoding()
         return Tensor(
@@ -10004,26 +10841,26 @@ public enum Ops {
         // disables; BUTTER_HY3_EXPERT_GRID=1 forces.
         let useExpertGrid: Bool = {
             guard nExperts > 0 else { return false }
-            if ProcessInfo.processInfo.environment["BUTTER_HY3_NO_EXPERT_GRID"] != nil {
+            if ButterEnv["BUTTER_HY3_NO_EXPERT_GRID"] != nil {
                 return false
             }
-            if ProcessInfo.processInfo.environment["BUTTER_HY3_EXPERT_GRID"] != nil {
+            if ButterEnv["BUTTER_HY3_EXPERT_GRID"] != nil {
                 return true
             }
             return mTotal >= 1536
         }()
         let useBm64 =
             !useExpertGrid
-            && ProcessInfo.processInfo.environment["BUTTER_HY3_MOE_BM64"] != nil
+            && ButterEnv["BUTTER_HY3_MOE_BM64"] != nil
             && nOut % 64 == 0
             && kIn % 32 == 0
             && mTotal >= 64
         let useBm8 =
             !useExpertGrid && !useBm64
-            && ProcessInfo.processInfo.environment["BUTTER_HY3_MOE_BM8"] != nil
+            && ButterEnv["BUTTER_HY3_MOE_BM8"] != nil
         let useMma =
             !useExpertGrid && !useBm64 && !useBm8
-            && ProcessInfo.processInfo.environment["BUTTER_HY3_MOE_MMA"] != nil
+            && ButterEnv["BUTTER_HY3_MOE_MMA"] != nil
         // BM64: 4 SG; BM16 MMA: 2 SG; expert-grid/BM16/BM8 MPP: 1 SG.
         let tgWidth = useBm64 ? 128 : (useMma ? 64 : 32)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)

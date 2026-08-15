@@ -50,7 +50,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Qwen35 Text Integration", .serialized)
+@Suite("Qwen35 Text Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Qwen35TextIntegrationTests {
 
     @Test("dense GDN hybrid: load + greedy generate produces coherent output")

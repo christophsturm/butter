@@ -49,9 +49,12 @@ public final class ConvStateCache: @unchecked Sendable {
             dtype: dtype, device: device)
         self.state.zero()
         // Conv rolling window persists across every decode step; pin it
-        // in the residency set so the driver skips per-dispatch
-        // residency validation on the read+shift that fires each token.
-        device.markWeightsResident([self.state.buffer])
+        // in the GENERATION cache residency set (not the weight set —
+        // this state is rebuilt fresh every generation) so the driver
+        // skips per-dispatch residency validation on the read+shift
+        // that fires each token. See `Device.markCacheResident`/
+        // `releaseGenerationCaches`.
+        device.markCacheResident([self.state.buffer])
     }
 
     /// Reset to zero. Used between sessions; cheap (small fp16/bf16 buffer).
@@ -74,6 +77,38 @@ public final class ConvStateCache: @unchecked Sendable {
     /// scratch tensor. Calling `snapshot()` a second time before
     /// `restore(from:)` will overwrite the prior snapshot. Nested or
     /// concurrent snapshot usage on the same cache is not supported.
+    /// Encode-only snapshot; see `GDNStateCache.snapshotEncode` for why
+    /// the committing variant is avoided in the spec-decode hot path.
+    public func snapshotEncode(on cmd: MTLCommandBuffer, device: Device = .shared) -> Tensor {
+        let shape = [kernelSize - 1, nChannels]
+        if cachedSnapshot == nil
+            || cachedSnapshot!.shape != shape
+            || cachedSnapshot!.dtype != dtype
+        {
+            cachedSnapshot = Tensor.empty(shape: shape, dtype: dtype, device: device)
+        }
+        let snap = cachedSnapshot!
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure("ConvStateCache.snapshotEncode: makeBlitCommandEncoder failed")
+        }
+        blit.copy(
+            from: state.buffer, sourceOffset: state.offset,
+            to: snap.buffer, destinationOffset: snap.offset, size: bytesAllocated)
+        blit.endEncoding()
+        return snap
+    }
+
+    /// Encode-only restore; see `snapshotEncode`.
+    public func restoreEncode(from snapshot: Tensor, on cmd: MTLCommandBuffer) {
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure("ConvStateCache.restoreEncode: makeBlitCommandEncoder failed")
+        }
+        blit.copy(
+            from: snapshot.buffer, sourceOffset: snapshot.offset,
+            to: state.buffer, destinationOffset: state.offset, size: bytesAllocated)
+        blit.endEncoding()
+    }
+
     public func snapshot(device: Device = .shared) -> Tensor {
         let shape = [kernelSize - 1, nChannels]
         if cachedSnapshot == nil

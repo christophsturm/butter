@@ -28,7 +28,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Gemma3 Text Integration", .serialized)
+@Suite("Gemma3 Text Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Gemma3TextIntegrationTests {
 
     @Test("load + greedy generate produces coherent output")

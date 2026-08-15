@@ -31,7 +31,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("LlamaTTS Integration", .serialized)
+@Suite("LlamaTTS Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct LlamaTTSIntegrationTests {
 
     /// Canonical HF repo id. The 4-bit MLX conversion is the smallest

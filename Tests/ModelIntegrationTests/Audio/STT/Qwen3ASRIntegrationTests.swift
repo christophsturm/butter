@@ -31,7 +31,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Qwen3ASR Integration", .serialized)
+@Suite("Qwen3ASR Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Qwen3ASRIntegrationTests {
 
     /// Canonical HF repo id. The 4-bit MLX conversion is the smallest

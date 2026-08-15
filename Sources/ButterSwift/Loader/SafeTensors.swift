@@ -230,6 +230,22 @@ public final class SafeTensorsFile: @unchecked Sendable {
         }
     }
 
+    /// In-memory constructor — no `.safetensors` file on disk. Used by
+    /// non-safetensors loaders (the GGUF → `SafeTensorsBundle` adapter,
+    /// `Qwen3xGGUFLoader.swift`) that want to reuse the standard
+    /// tensor-lookup surface (`SafeTensorsBundle.tensor(named:)`,
+    /// `loadLinear`, `isQuantized`/`quantizedTriplet`, …) — and every
+    /// family loader written against it — without re-deriving that
+    /// machinery for a second on-disk format. `url` is a synthetic
+    /// marker (the source `.gguf` path) purely for diagnostics; no file
+    /// at that path is read.
+    public init(url: URL, entries: [String: Entry]) {
+        self.url = url
+        self.entries = entries
+        self.mappedBase = nil
+        self.mappedLength = 0
+    }
+
     /// Get a Tensor view over a named entry (no copy). Each tensor has
     /// its own MTLBuffer at offset 0.
     public func tensor(named: String) throws -> Tensor {
@@ -322,6 +338,17 @@ public final class SafeTensorsBundle: @unchecked Sendable {
         self.keyTranslation = keyTranslation
     }
 
+    /// In-memory constructor over a single already-built
+    /// `SafeTensorsFile` (see `SafeTensorsFile.init(url:entries:)`) —
+    /// no directory scan, no disk I/O. `directory` is a synthetic
+    /// marker for diagnostics only.
+    public init(inMemory file: SafeTensorsFile, directory: URL) {
+        self.files = [file]
+        self.directory = directory
+        self.index = Dictionary(uniqueKeysWithValues: file.entries.keys.map { ($0, 0) })
+        self.keyTranslation = [:]
+    }
+
     /// A view onto this bundle with `prefix` prepended to every lookup
     /// key — the inverse of a checkpoint that namespaces its weights
     /// under a sub-module. A VL checkpoint stores its text backbone
@@ -376,6 +403,12 @@ public final class SafeTensorsBundle: @unchecked Sendable {
     /// indicating an MLX-format quantized linear.
     public func isQuantized(_ base: String) -> Bool {
         index["\(base).scales"] != nil && index["\(base).biases"] != nil
+    }
+
+    /// NVFP4 / MXFP4 layout: weight + scales (u8), no affine biases.
+    public func isNvfp4(_ base: String) -> Bool {
+        index["\(base).weight"] != nil && index["\(base).scales"] != nil
+            && index["\(base).biases"] == nil
     }
 
     public struct QuantizedTriplet: Sendable {

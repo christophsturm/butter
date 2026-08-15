@@ -61,6 +61,7 @@ public final class PSOCache: @unchecked Sendable {
     /// `fatalError`s on lookup or compile failure. Use `pipelineState(for:)
     /// throws -> ...` if you want to handle errors at the call site.
     public func pipelineState(for kernelName: String) -> MTLComputePipelineState {
+        DispatchCensus.tick(kernelName)
         do {
             return try lookup(kernelName)
         } catch {
@@ -69,7 +70,8 @@ public final class PSOCache: @unchecked Sendable {
     }
 
     public func pipelineStateThrowing(for kernelName: String) throws -> MTLComputePipelineState {
-        try lookup(kernelName)
+        DispatchCensus.tick(kernelName)
+        return try lookup(kernelName)
     }
 
     private func lookup(_ name: String) throws -> MTLComputePipelineState {
@@ -118,7 +120,9 @@ public final class PSOCache: @unchecked Sendable {
         let function: MTLFunction
         if Self.isMppKernel(name) {
             function = try liveCompileMppFunction(name)
-        } else if let fn = library.library.makeFunction(name: name) {
+        } else if let fn = library.makeFunction(name: name) {
+            // Prefer kernels_extra.metallib overlays (fast qdot eidx, laguna
+            // Path B fuses) over the iron main metallib of the same name.
             function = fn
         } else {
             throw PSOCacheError.kernelNotFound(name)
@@ -136,7 +140,7 @@ public final class PSOCache: @unchecked Sendable {
             // not apply (and on CI the metallib is built by the same toolchain
             // that runs the tests, so there is no header skew to begin with).
             guard Self.isMppKernel(name),
-                let aot = library.library.makeFunction(name: name)
+                let aot = library.makeFunction(name: name)
             else {
                 throw PSOCacheError.psoCompileFailed(name, error)
             }

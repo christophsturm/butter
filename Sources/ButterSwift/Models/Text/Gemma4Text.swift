@@ -1117,7 +1117,7 @@ public final class Gemma4Layer: Module {
             return (
                 forwardBatched(
                     h, position: position, cache: cache,
-                    perLayerInput: perLayerInput, cmd: cmd,
+                    perLayerInput: perLayerInput, cmd: cmd, device: device,
                     donorCache: donorCache),
                 false
             )
@@ -1138,6 +1138,7 @@ public final class Gemma4Layer: Module {
         cache: any KVCacheProtocol,
         perLayerInput: Tensor?,
         cmd: MTLCommandBuffer,
+        device: Device,
         donorCache: (any KVCacheProtocol)? = nil
     )
         -> Tensor
@@ -1147,7 +1148,7 @@ public final class Gemma4Layer: Module {
             isGlobal
             ? globalAttentionBatched(
                 xNorm, position: position,
-                cache: cache, cmd: cmd,
+                cache: cache, cmd: cmd, device: device,
                 donorCache: donorCache)
             : slidingAttentionBatched(
                 xNorm, position: position,
@@ -1405,6 +1406,7 @@ public final class Gemma4Layer: Module {
         _ xNorm: Tensor, position: Int,
         cache: any KVCacheProtocol,
         cmd: MTLCommandBuffer,
+        device: Device,
         donorCache: (any KVCacheProtocol)? = nil
     )
         -> Tensor
@@ -1416,7 +1418,7 @@ public final class Gemma4Layer: Module {
             q = projectAndNormQuery(xNorm, on: cmd)
             Gemma4Ops.ropeProportional(
                 q, position: position, headDim: headDim, rotatedDim: rotatedDim,
-                thetaBase: ropeTheta, on: cmd)
+                thetaBase: ropeTheta, on: cmd, device: device)
             attnCache = donorCache
         } else {
             let (qOwn, k, v) = projectAndNorm(xNorm, on: cmd)
@@ -1426,10 +1428,10 @@ public final class Gemma4Layer: Module {
             // through.
             Gemma4Ops.ropeProportional(
                 qOwn, position: position, headDim: headDim, rotatedDim: rotatedDim,
-                thetaBase: ropeTheta, on: cmd)
+                thetaBase: ropeTheta, on: cmd, device: device)
             Gemma4Ops.ropeProportional(
                 k, position: position, headDim: headDim, rotatedDim: rotatedDim,
-                thetaBase: ropeTheta, on: cmd)
+                thetaBase: ropeTheta, on: cmd, device: device)
             cache.appendOnGPU(kFlat: k, vFlat: v, on: cmd)
             q = qOwn
             attnCache = cache
@@ -1449,12 +1451,12 @@ public final class Gemma4Layer: Module {
     /// result resident before its own host sync.
     private func globalAttention(
         _ xNorm: Tensor, position: Int,
-        cache: any KVCacheProtocol, cmd: MTLCommandBuffer, device _: Device,
+        cache: any KVCacheProtocol, cmd: MTLCommandBuffer, device: Device,
         donorCache: (any KVCacheProtocol)? = nil
     ) -> Tensor {
         let out = globalAttentionBatched(
             xNorm, position: position,
-            cache: cache, cmd: cmd,
+            cache: cache, cmd: cmd, device: device,
             donorCache: donorCache)
         cmd.commit()
         cmd.waitUntilCompleted()
@@ -1482,7 +1484,8 @@ enum Gemma4Ops {
     static func ropeProportional(
         _ qk: Tensor, position: Int,
         headDim: Int, rotatedDim: Int,
-        thetaBase: Float, on cmd: MTLCommandBuffer
+        thetaBase: Float, on cmd: MTLCommandBuffer,
+        device: Device = .shared
     ) {
         precondition(
             qk.elementCount % headDim == 0,
@@ -1499,7 +1502,7 @@ enum Gemma4Ops {
         // buffer (decode = the T=1 case: a 1-element buffer); `row_stride` is
         // the per-token stride in qk (`n_heads * head_dim`). Single-token decode
         // here so a 1-element positions buffer + grid depth 1.
-        let posBuf = Device.shared.makeBuffer(length: 4)
+        let posBuf = device.makeBuffer(length: 4)
         var posVal = UInt32(position)
         memcpy(posBuf.contents(), &posVal, 4)
         let rowStride = UInt32(nHeads * headDim)
@@ -1636,6 +1639,12 @@ public final class Gemma4Model: LanguageModel {
             preconditionFailure(
                 "Gemma4: only .raw KV cache supported today; got \(kvCacheKind)")
         }
+        // #105 telemetry: cache setup is a one-time (not per-token) cost,
+        // but on a checkpoint with a large `max_position_embeddings` it
+        // can dwarf the actual per-token forward footprint. Reported on
+        // its own boundary so it isn't misread as "per-token" — no-op
+        // unless BUTTER_ALLOC_TRACE=1.
+        device.allocTraceReset()
         var caches: [any LayerCacheProtocol] = []
         caches.reserveCapacity(nLayers)
         for (i, layer) in layers.enumerated() {
@@ -1647,12 +1656,37 @@ public final class Gemma4Model: LanguageModel {
                 layer.isGlobal
                 ? .unbounded
                 : .window(maxSize: min(params.slidingWindow, layerCap), keep: 0)
+            // Physical buffer capacity. For a windowed (sliding) layer,
+            // FIFO eviction never reads or writes past the window's
+            // `maxSize` slots — `KVEvictionState.reserveNextSlot` rotates
+            // strictly within `[keep, maxSize)`. Sizing the backing
+            // `MTLBuffer` to the full `layerCap` instead of that window
+            // is pure waste, and on a checkpoint whose
+            // `max_position_embeddings` vastly exceeds `sliding_window`
+            // (the real 26B-A4B: 262144 vs 1024, 25 of its 30 layers
+            // sliding) it was the dominant term in #105's reported
+            // footprint — ~50GB of persistent, never-touched KV-cache
+            // tail, allocated once before generation starts and easy to
+            // misattribute to "the first token" under RSS-boundary
+            // sampling. Global layers are unaffected: `.unbounded`
+            // genuinely needs the full `layerCap`. Deriving `physicalCap`
+            // from `eviction` itself (rather than recomputing
+            // `min(params.slidingWindow, layerCap)` a second time) keeps
+            // the window bound and the buffer size from ever drifting
+            // apart again.
+            let physicalCap: Int
+            if case .window(let maxSize, _) = eviction {
+                physicalCap = maxSize
+            } else {
+                physicalCap = layerCap
+            }
             caches.append(
                 KVCache(
-                    nKVHeads: layer.nKVHeads, headDim: layer.headDim, maxSeq: layerCap,
+                    nKVHeads: layer.nKVHeads, headDim: layer.headDim, maxSeq: physicalCap,
                     dtype: dtype, eviction: eviction, device: device))
             _ = i
         }
+        device.allocTraceReport("makeLayerCaches(maxSeq: \(cap))")
         return caches
     }
 
@@ -1747,6 +1781,13 @@ public final class Gemma4Model: LanguageModel {
             } else {
                 batchPending = true
             }
+            // #105 telemetry: cumulative transient bytes allocated so
+            // far THIS token, immediately after layer `i` returns.
+            // `bufferAllocBytes`/`scratchAllocBytes` tally at allocation
+            // time (not GPU-completion time), so this is accurate
+            // whether or not the layer committed. No-op unless
+            // BUTTER_ALLOC_TRACE=1.
+            device.allocTraceReport("layer\(i)")
             if tap.shouldDump(layer: i) {
                 // `h` is resident if the layer committed; otherwise the
                 // pending batch must be flushed before reading it.
@@ -1812,9 +1853,26 @@ public final class Gemma4Model: LanguageModel {
             "Gemma4Model.forwardMulti: tokenIds must be non-empty")
         var logits: Tensor!
         for (i, tok) in tokenIds.enumerated() {
-            logits = forward(
-                tokenId: tok, position: position + i,
-                caches: caches, on: cmd, device: device)
+            // Each per-token forward allocates transient MTLBuffers for
+            // every layer — gigabytes per token on the large MoE
+            // variants. Without a per-iteration drain they accumulate
+            // for the whole prompt: a 19-token prompt on the 26B-A4B
+            // reached a 124.9GB footprint and wedged the GPU in
+            // waitUntilCompleted (#105). Same discipline as every other
+            // makeBuffer loop in this codebase.
+            autoreleasepool {
+                // #105 telemetry: reset the alloc-trace counters at the
+                // top of each token so `layer\(i)` reports (inside
+                // `forward(tokenId:...)`) and the `token\(i)` report
+                // below both read a per-token-only window, not a
+                // whole-prompt cumulative total. No-op unless
+                // BUTTER_ALLOC_TRACE=1.
+                device.allocTraceReset()
+                logits = forward(
+                    tokenId: tok, position: position + i,
+                    caches: caches, on: cmd, device: device)
+                device.allocTraceReport("forwardMulti.token\(i)")
+            }
         }
         return logits
     }

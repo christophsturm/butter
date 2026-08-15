@@ -39,7 +39,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Sortformer Integration", .serialized)
+@Suite("Sortformer Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct SortformerIntegrationTests {
 
     /// Canonical HF repo id. No 4-bit MLX conversion exists at time of

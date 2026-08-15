@@ -34,7 +34,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Sliding Window KV Cache Integration", .serialized)
+@Suite("Sliding Window KV Cache Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct SlidingWindowIntegrationTests {
 
     @Test("Llama 3.2 1B with .window(maxSize: 64) produces coherent output beyond window")

@@ -24,7 +24,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Qwen3 Text Integration", .serialized)
+@Suite("Qwen3 Text Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Qwen3TextIntegrationTests {
 
     @Test("load + greedy generate produces coherent output")

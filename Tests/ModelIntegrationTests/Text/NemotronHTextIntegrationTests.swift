@@ -39,7 +39,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("NemotronH Text Integration", .serialized)
+@Suite("NemotronH Text Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct NemotronHTextIntegrationTests {
 
     @Test("load + greedy generate produces coherent stack-interleaved hybrid output")

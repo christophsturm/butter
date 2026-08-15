@@ -25,10 +25,11 @@
 
 import Foundation
 import Testing
+import TestHelpers
 
 @testable import ButterSwift
 
-@Suite("SAMAudio Integration", .serialized)
+@Suite("SAMAudio Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct SAMAudioIntegrationTests {
 
     @Test("load + segment produces correctly-shaped output")

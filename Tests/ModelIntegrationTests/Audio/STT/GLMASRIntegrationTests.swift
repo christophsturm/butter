@@ -37,7 +37,7 @@ import Tokenizers
 
 @testable import ButterSwift
 
-@Suite("GLMASR Integration", .serialized)
+@Suite("GLMASR Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct GLMASRIntegrationTests {
 
     /// Canonical HF repo id. The 4-bit MLX conversion is already the

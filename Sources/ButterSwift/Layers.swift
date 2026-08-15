@@ -340,6 +340,24 @@ public final class AnyLinear: Module {
         }
     }
 
+    public init(_ linear: Nvfp4Linear) {
+        self.inner = linear
+        self.forward = { linear($0, on: $1) }
+        self.forwardMany = { x, t, cmd, dev in
+            linear.callMany(x, t: t, on: cmd, device: dev)
+        }
+    }
+
+    public init(_ linear: Mxfp8Linear) {
+        self.inner = linear
+        self.forward = { linear($0, on: $1) }
+        // Decode-only head; prefill uses last-row single GEMV.
+        self.forwardMany = { x, t, cmd, _ in
+            precondition(t == 1, "Mxfp8Linear.callMany: only t=1 supported")
+            return linear(x, on: cmd)
+        }
+    }
+
     public func parameters() -> [(String, Tensor)] { inner.parameters() }
 
     public func callAsFunction(_ x: Tensor, on cmd: MTLCommandBuffer) -> Tensor {

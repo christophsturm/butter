@@ -39,7 +39,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("VoxtralRealtime Integration", .serialized)
+@Suite("VoxtralRealtime Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct VoxtralRealtimeIntegrationTests {
 
     /// Canonical HF repo id. The 4-bit MLX conversion is the smallest

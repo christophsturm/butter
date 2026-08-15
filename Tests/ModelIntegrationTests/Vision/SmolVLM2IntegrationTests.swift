@@ -34,7 +34,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("SmolVLM2 Vision Integration (image + video)", .serialized)
+@Suite("SmolVLM2 Vision Integration (image + video)", .serialized, .enabled(if: modelTestsOptedIn))
 struct SmolVLM2IntegrationTests {
 
     /// Number of evenly-spaced frames to pull from cat.mp4.

@@ -115,7 +115,10 @@ let package = Package(
         .testTarget(
             name: "ButterTests",
             dependencies: ["ButterSwift", "TestHelpers"],
-            path: "Tests/ButterTests"
+            path: "Tests/ButterTests",
+            // Laguna config fixtures are resolved via #filePath-relative
+            // paths (repo convention), not SwiftPM resource bundles.
+            exclude: ["Fixtures"]
         ),
         .testTarget(
             name: "ModelIntegrationTests",

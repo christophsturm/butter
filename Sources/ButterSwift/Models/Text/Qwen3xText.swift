@@ -181,6 +181,25 @@ public struct Qwen35Hybrid: Qwen35Variant {
         repetitionPenalty: 1.0
     )
 
+    /// GGUF entry point — translates the checkpoint into an in-memory
+    /// `SafeTensorsBundle` (dequant + requant to Butter's native int4)
+    /// and delegates to `loadModel` below. See `Qwen3xGGUFLoader.swift`
+    /// for the full tensor-mapping + config-derivation rationale.
+    public static func loadModelFromGGUF(
+        config: ModelConfig,
+        gguf: GGUFTensorBundle,
+        options: LoadOptions,
+        device: Device
+    ) throws -> Qwen35Model {
+        if let arch = gguf.architecture, arch != "qwen35" {
+            Debug.log(
+                .load,
+                "Qwen3xGGUF: general.architecture='\(arch)' (expected 'qwen35') — "
+                    + "attempting load anyway since the qwen35.* metadata namespace matched")
+        }
+        return try Qwen3xGGUFLoader.loadModel(gguf: gguf, options: options, device: device)
+    }
+
     public static func loadModel(
         config: ModelConfig,
         weights: SafeTensorsBundle,
@@ -411,6 +430,10 @@ public struct Qwen35Hybrid: Qwen35Variant {
         precondition(
             activationDtype == .f32 || activationDtype == .bf16 || activationDtype == .f16,
             "Qwen3.5: unexpected activation dtype \(activationDtype)")
+        Debug.log(
+            .load,
+            "Qwen3.5: activationDtype=\(activationDtype) isQuantizedEmbed="
+                + "\(weights.isQuantized("\(modelPrefix).embed_tokens")) embedW.dtype=\(embedW.dtype)")
         // `loadEmbedding` picks Embedding vs QuantizedEmbedding based on
         // the bundle's quant triplet — Qwen3.6's quantized embed is
         // routed through `dequantGather` automatically.
@@ -527,7 +550,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
             lmHead = AnyLinear(Linear(weight: embedW))
         }
 
-        return Qwen35Model(
+        let model = Qwen35Model(
             embedTokens: embedTokens, layers: layers,
             finalNorm: finalNorm, lmHead: lmHead,
             hidden: hidden, nLayers: nLayers,
@@ -536,6 +559,34 @@ public struct Qwen35Hybrid: Qwen35Variant {
             keyHeadDim: linearKeyHeadDim, valueHeadDim: linearValueHeadDim,
             convDim: convDim, convKernel: convKernel,
             vocab: vocab, maxSeq: maxSeq, dtype: activationDtype)
+
+        // ── Optional MTP draft head (spec 030 phase 1) ────────────────
+        // A `mtp-sidecar/` directory beside the checkpoint weights
+        // carries the `mtp.*` draft-head tensors (see Qwen3xMTPHead.swift
+        // for the layout). Attach it when present; a malformed sidecar
+        // logs and degrades to no-MTP rather than failing the whole
+        // backbone load. `BUTTER_QWEN_MTP=0` disables the load entirely.
+        if ButterEnv["BUTTER_QWEN_MTP"] != "0" {
+            let sidecarDir = weights.directory.appendingPathComponent("mtp-sidecar")
+            if FileManager.default.fileExists(atPath: sidecarDir.path) {
+                do {
+                    model.mtpHead = try Qwen3xMTPHead.load(
+                        sidecarDirectory: sidecarDir,
+                        embedTokens: embedTokens, lmHead: lmHead,
+                        hidden: hidden, vocab: vocab,
+                        nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                        rotaryDim: rotaryDim, ropeTheta: ropeTheta,
+                        attnOutputGate: attnOutputGate,
+                        eps: eps, dtype: activationDtype, device: device)
+                } catch {
+                    fputs(
+                        "[qwen3x] WARNING: mtp-sidecar present but failed to "
+                            + "load (\(error)); continuing without MTP head\n",
+                        stderr)
+                }
+            }
+        }
+        return model
     }
 
     /// Build one GDN mixer. Reads the split QKV / Z / B / A projections,
@@ -1135,6 +1186,39 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
     public let conv: ConvStateCache
     public let gdn: GDNStateCache
 
+    /// Speculative-decode state rewind support.
+    ///
+    /// A batched verify pass advances the conv + GDN recurrent state over
+    /// ALL T speculated tokens. When only k < T are accepted, the state
+    /// is wrong for continuing, and the only fix used to be replaying the
+    /// accepted prefix through a full forward — paying the model's entire
+    /// weight traffic purely to repair state.
+    ///
+    /// The scan is causal, so re-running it for just the first k tokens
+    /// from the restored snapshot reproduces the state exactly. Only the
+    /// WEIGHT-DERIVED inputs must be kept; conv, qk-norm and the chunk
+    /// recurrence all recompute from them with no weight traffic at all.
+    /// `zAll` is deliberately not stashed: it feeds the output norm, not
+    /// the state.
+    public var specCapture: Bool = false
+    public var specQkvAll: Tensor?
+    public var specARawF32: Tensor?
+    public var specBRawF32: Tensor?
+    public var specT: Int = 0
+
+    /// Per-token state planes captured by the last verify pass, when
+    /// `BUTTER_GDN_STATE_PLANES=1` and `specCapture` were both active for
+    /// that call (see `Qwen35GDNLayer.forwardManyChunked`). `specGdnPlanes`
+    /// is `[specPlanesT, Hv, Dv, Dk]` f32; `specConvPlanes` is
+    /// `[specPlanesT, convKernel-1, convDim]` in the layer's running
+    /// dtype. `nil` whenever the last verify pass didn't capture planes
+    /// (flag off, or `t` above the plane-eligible cap) — the rollback
+    /// path (`Qwen35GDNLayer.adoptPlaneState`) checks for `nil` and
+    /// reports ineligible so the caller falls back to `rewindState`.
+    public var specGdnPlanes: Tensor?
+    public var specConvPlanes: Tensor?
+    public var specPlanesT: Int = 0
+
     public private(set) var length: Int = 0
     public let maxSeq: Int = .max
 
@@ -1631,16 +1715,16 @@ public final class Qwen35GDNMixer: Module {
         // path lives behind `BUTTER_GDN_NO_FUSED_PREP=1` for precision
         // comparison.
         self.fused =
-            ProcessInfo.processInfo.environment["BUTTER_GDN_NO_FUSED_PREP"] == nil
+            ButterEnv["BUTTER_GDN_NO_FUSED_PREP"] == nil
         // See `wyShapeEligible`/`fastPrepChunkEligible` doc above - cached
         // once here instead of read from `forwardManyChunked` on every
         // chunk.
         self.wyShapeEligible =
-            ProcessInfo.processInfo.environment["BUTTER_GDN_WY"] != nil
+            ButterEnv["BUTTER_GDN_WY"] != nil
             && valueHeadDim % 32 == 0 && keyHeadDim % 16 == 0 && valueHeadDim % 16 == 0
         self.fastPrepChunkEligible =
             keyHeadDim == 128 && valueHeadDim == 128 && numValueHeads == 32 && numKeyHeads == 16
-            && ProcessInfo.processInfo.environment["BUTTER_GDN_NO_PREP_CHUNK_FAST"] == nil
+            && ButterEnv["BUTTER_GDN_NO_PREP_CHUNK_FAST"] == nil
 
         // Per-decode-token scratch — pre-allocated once at init so the
         // fused GDN path doesn't pay 6 × MTLBuffer allocations per call.
@@ -1679,7 +1763,7 @@ public final class Qwen35GDNMixer: Module {
                 && convDim % 8 == 0 && valueDim % 8 == 0
                 && numValueHeads % 8 == 0
                 && qQL.groupSize == 64
-                && ProcessInfo.processInfo.environment["BUTTER_NO_FUSED_GDN_4"] == nil
+                && ButterEnv["BUTTER_NO_FUSED_GDN_4"] == nil
             {
                 self.fused4Eligible = true
             }
@@ -2019,7 +2103,7 @@ public final class Qwen35GDNMixer: Module {
         // per-token T-loop body with one `Ops.gatedDeltaPrepChunk`
         // dispatch — state register-resident across the full T-sweep.
         // Opt out via BUTTER_GDN_NO_PREP_CHUNK=1 for A/B benching.
-        if ProcessInfo.processInfo.environment["BUTTER_GDN_NO_PREP_CHUNK"] == nil {
+        if ButterEnv["BUTTER_GDN_NO_PREP_CHUNK"] == nil {
             return forwardManyChunked(
                 xNormFlat, t: t, cache: cache, cmd: cmd, device: device)
         }
@@ -2130,11 +2214,53 @@ public final class Qwen35GDNMixer: Module {
         let f32Bytes = DType.f32.byteSize
         let _ = f32Bytes  // silence unused warning when conv-many path used
 
-        // ── Five T-batched projections (same as forwardMany) ─────────────
-        let qkvAll = inProjQKV.callMany(xNormFlat, t: t, on: cmd, device: device)
-        let zAll = inProjZ.callMany(xNormFlat, t: t, on: cmd, device: device)
-        let bRawAll = inProjB.callMany(xNormFlat, t: t, on: cmd, device: device)
-        let aRawAll = inProjA.callMany(xNormFlat, t: t, on: cmd, device: device)
+        // ── Four T-batched input projections ──────────────────────────────
+        // `Ops.batched4QmmFast` (the M>1 sibling of the single-token
+        // `batched4QgemvInt4Fast` fast path already used by `forward`
+        // above) reads `xNormFlat` ONCE into TG memory and produces all
+        // four `[T, out_*]` outputs in ONE dispatch, vs the 4 separate
+        // `AnyLinear.callMany` dispatches below (each re-reading
+        // `xNormFlat` and paying its own kernel-launch overhead). The
+        // spec-decode verify path calls this once per GDN layer per
+        // cycle — 48 GDN layers × 3 saved dispatches = 144 fewer
+        // dispatches per T=4 verify pass. Same eligibility gate as the
+        // single-token fast path (`fused4Eligible` — in_dim%512==0,
+        // every out_*%8==0, groupSize==64): the kernel is the same
+        // family, just M-generalized, so anything already routed
+        // through the single-token fused-4 path is safe to route here
+        // too. Opt-in via `BUTTER_GDN_BATCHED4_MANY=1` pending A/B
+        // measurement (digest + verify-cost bench) — read fresh every
+        // call, no cached global, matching the other GDN env knobs
+        // above.
+        let qkvAll: Tensor
+        let zAll: Tensor
+        let bRawAll: Tensor
+        let aRawAll: Tensor
+        if fused4Eligible, let bp = batchedInputProj,
+            ButterEnv["BUTTER_GDN_BATCHED4_MANY"] == "1"
+        {
+            let qkvBuf = Tensor.empty(shape: [t, convDim], dtype: dt, device: device)
+            let zBuf = Tensor.empty(shape: [t, valueDim], dtype: dt, device: device)
+            let bBuf = Tensor.empty(shape: [t, numValueHeads], dtype: dt, device: device)
+            let aBuf = Tensor.empty(shape: [t, numValueHeads], dtype: dt, device: device)
+            Ops.batched4QmmFast(
+                input: xNormFlat, m: t,
+                wA: bp.qW, scalesA: bp.qS, biasesA: bp.qB, outA: qkvBuf,
+                wB: bp.zW, scalesB: bp.zS, biasesB: bp.zB, outB: zBuf,
+                wC: bp.bW, scalesC: bp.bS, biasesC: bp.bB, outC: bBuf,
+                wD: bp.aW, scalesD: bp.aS, biasesD: bp.aB, outD: aBuf,
+                groupSize: bp.groupSize, on: cmd)
+            qkvAll = qkvBuf.reshaped(to: [t * convDim])
+            zAll = zBuf.reshaped(to: [t * valueDim])
+            bRawAll = bBuf.reshaped(to: [t * numValueHeads])
+            aRawAll = aBuf.reshaped(to: [t * numValueHeads])
+        } else {
+            // ── Five T-batched projections (same as forwardMany) ─────────
+            qkvAll = inProjQKV.callMany(xNormFlat, t: t, on: cmd, device: device)
+            zAll = inProjZ.callMany(xNormFlat, t: t, on: cmd, device: device)
+            bRawAll = inProjB.callMany(xNormFlat, t: t, on: cmd, device: device)
+            aRawAll = inProjA.callMany(xNormFlat, t: t, on: cmd, device: device)
+        }
 
         // a_raw / b_raw → f32 once on ONE shared encoder via
         // `castToF32Two`. Saves one encoder begin/end pair per GDN
@@ -2148,6 +2274,90 @@ public final class Qwen35GDNMixer: Module {
             bRawAll, into: bRawF32All,
             on: cmd)
 
+        // Stash the weight-derived scan inputs so a later partial accept
+        // can rewind the recurrent state without re-running any
+        // projection. See `Qwen35GDNLayerCache.specCapture`.
+        if cache.specCapture {
+            cache.specQkvAll = qkvAll
+            cache.specARawF32 = aRawF32All
+            cache.specBRawF32 = bRawF32All
+            cache.specT = t
+        }
+
+        // ── Per-token state planes (spec-decode rollback) ────────────────
+        //
+        // `BUTTER_GDN_STATE_PLANES=1` opts the fused conv+scan kernels into
+        // writing their register-resident state out to a per-token plane at
+        // every token boundary — see `iron_gated_delta_prep_chunk`'s
+        // "Per-token state planes" doc and
+        // `iron_conv1d_causal_step_silu_cast_many`'s "Per-token conv-state
+        // planes" doc. The goal: MTP partial-accept rollback becomes
+        // selecting `plane[k-1]` (a cheap blit into the live cache buffers
+        // via `GDNStateCache.restoreEncode` / `ConvStateCache.restoreEncode`
+        // — see `Qwen35GDNLayer.adoptPlaneState`) instead of restoring a
+        // pre-verify snapshot and re-running conv+scan over the accepted
+        // prefix (`rewindState`).
+        //
+        // Deliberately NOT gated on `cache.specCapture` for the WRITE side:
+        // that flag also drives the pre-existing qkv/a_raw/b_raw stash used
+        // by `rewindState` (see the doc above `specCapture`'s declaration),
+        // and piggybacking planes on it would fold that stash's cost into
+        // any plane-cost A/B measurement — `SpecDecodeVerifyCostBench`
+        // calls `forwardManyAllLogits` directly, without ever touching
+        // `setSpecCapture`, precisely so verify-cost numbers stay
+        // uncontaminated by spec-decode bookkeeping. The STASH onto the
+        // cache below (for a later `adoptPlaneState` to consume) IS gated
+        // on `specCapture`, since only an active spec-decode run has a
+        // consumer for it.
+        //
+        // Gate on a small `t` cap plus the batched-conv1d eligibility this
+        // block is nested inside: state planes only make sense at
+        // decode/verify-shaped `T` (spec-decode γ+1, realistically ≤ 8) —
+        // there is no rollback use case at prefill-chunk `T` (1024-4096),
+        // and honoring the flag there would transiently allocate `T ·
+        // Hv·Dv·Dk · 4B` per layer (e.g. ~8.6 GB at T=4096) for zero
+        // benefit. `maxPlaneT` keeps a naive/global `BUTTER_GDN_STATE_PLANES=1`
+        // safe even outside a scoped spec-decode run. Conv planes require
+        // the batched `conv1dCausalStepSiluCastMany` path specifically
+        // (the per-token fallback loop below never writes them), so the
+        // gate also requires that path's own eligibility check.
+        let maxPlaneT = 16
+        let useConv1dMany =
+            convKernel == 4
+            && ButterEnv["BUTTER_NO_CONV1D_MANY"] == nil
+        let gdnPlanesEnabled =
+            useConv1dMany
+            && t <= maxPlaneT
+            && ButterEnv["BUTTER_GDN_STATE_PLANES"] == "1"
+        let convStatePlanesBuf: Tensor
+        let convPlanesEnabledBuf: Tensor
+        let gdnStatePlanesBuf: Tensor
+        let gdnPlanesEnabledBuf: Tensor
+        if gdnPlanesEnabled {
+            convStatePlanesBuf = Tensor.empty(
+                shape: [t * (convKernel - 1) * convDim], dtype: dt, device: device)
+            gdnStatePlanesBuf = Tensor.empty(
+                shape: [t * numValueHeads * valueHeadDim * keyHeadDim],
+                dtype: .f32, device: device)
+            let flagBuf = device.makeBuffer(length: 4)
+            var flagU32: UInt32 = 1
+            memcpy(flagBuf.contents(), &flagU32, 4)
+            let flag = Tensor(buffer: flagBuf, offset: 0, shape: [1], dtype: .u32)
+            convPlanesEnabledBuf = flag
+            gdnPlanesEnabledBuf = flag
+        } else {
+            (convStatePlanesBuf, convPlanesEnabledBuf) = Ops.disabledGdnPlanes(dtype: dt, device: device)
+            (gdnStatePlanesBuf, gdnPlanesEnabledBuf) = Ops.disabledGdnPlanes(dtype: .f32, device: device)
+        }
+        if gdnPlanesEnabled && cache.specCapture {
+            cache.specGdnPlanes = gdnStatePlanesBuf
+            cache.specConvPlanes = convStatePlanesBuf
+            cache.specPlanesT = t
+        } else {
+            cache.specGdnPlanes = nil
+            cache.specConvPlanes = nil
+        }
+
         // ── Conv1d + silu+cast → `[T, convDim]` f32 staging buffer ──────
         // When conv_kernel = 4, the batched
         // `conv1dCausalStepSiluCastMany` kernel sweeps all T tokens in
@@ -2158,15 +2368,14 @@ public final class Qwen35GDNMixer: Module {
         // via BUTTER_NO_CONV1D_MANY=1.
         let convOutAllF32 = Tensor.empty(
             shape: [t * convDim], dtype: .f32, device: device)
-        if convKernel == 4
-            && ProcessInfo.processInfo.environment["BUTTER_NO_CONV1D_MANY"] == nil
-        {
+        if useConv1dMany {
             Ops.conv1dCausalStepSiluCastMany(
                 src: qkvAll.reshaped(to: [t, convDim]),
                 w: convW, b: convB,
                 stateIn: cache.conv.state,
                 outF32: convOutAllF32,
                 stateOut: cache.conv.state,
+                statePlanes: convStatePlanesBuf, planesEnabled: convPlanesEnabledBuf,
                 t: t, convDim: convDim, convKernel: convKernel,
                 on: cmd)
         } else {
@@ -2247,6 +2456,7 @@ public final class Qwen35GDNMixer: Module {
         // cached at init (`fastPrepChunkEligible`) - only the `!useWY` half
         // varies per call (`useWY` itself depends on per-call `t`).
         let useFast = !useWY && fastPrepChunkEligible
+
         if useWY {
             Ops.gatedDeltaWYPrefill(
                 convOut: convOutAllF32,
@@ -2268,6 +2478,7 @@ public final class Qwen35GDNMixer: Module {
                 stateIn: cache.gdn.current, stateOut: cache.gdn.next,
                 y: yF32All,
                 tLen: tLenScalar,
+                statePlanes: gdnStatePlanesBuf, planesEnabled: gdnPlanesEnabledBuf,
                 batchSize: 1,
                 on: cmd)
         } else {
@@ -2279,6 +2490,7 @@ public final class Qwen35GDNMixer: Module {
                 stateIn: cache.gdn.current, stateOut: cache.gdn.next,
                 y: yF32All,
                 tLen: tLenScalar,
+                statePlanes: gdnStatePlanesBuf, planesEnabled: gdnPlanesEnabledBuf,
                 batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
                 hv: numValueHeads, hk: numKeyHeads,
                 on: cmd)
@@ -2301,6 +2513,162 @@ public final class Qwen35GDNMixer: Module {
         // ── Batched output projection ───────────────────────────────────
         let yGatedRows = yGatedAll.reshaped(to: [t, valueDim])
         return outProj.callMany(yGatedRows, t: t, on: cmd, device: device)
+    }
+
+    /// Re-run ONLY the recurrent state update for the first `k` tokens of
+    /// the last batched pass, from whatever state the caches currently
+    /// hold (the caller restores the pre-verify snapshot first).
+    ///
+    /// This is the speculative-decode state rollback. The conv and chunk
+    /// scans are causal, so replaying them over the accepted prefix
+    /// reproduces exactly the state a k-token pass would have left. Both
+    /// kernels already take the token count as a parameter, and every
+    /// input they need was stashed during the verify pass, so this costs
+    /// two small dispatches per layer and touches NO weights — versus a
+    /// full forward, which re-reads all 14 GB.
+    ///
+    /// Returns false when the shape is not eligible (the per-token conv
+    /// fallback), so the caller can drop back to replaying.
+    func rewindState(
+        to k: Int, cache: Qwen35GDNLayerCache,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Bool {
+        guard k > 0, k <= cache.specT,
+            let qkvAll = cache.specQkvAll,
+            let aRawF32All = cache.specARawF32,
+            let bRawF32All = cache.specBRawF32,
+            convKernel == 4,
+            ButterEnv["BUTTER_NO_CONV1D_MANY"] == nil
+        else { return false }
+
+        // Prefix views over the stashed rows — same buffers, fewer rows.
+        let qkvPrefix = Tensor(
+            buffer: qkvAll.buffer, offset: qkvAll.offset,
+            shape: [k, convDim], dtype: qkvAll.dtype)
+        let aPrefix = Tensor(
+            buffer: aRawF32All.buffer, offset: aRawF32All.offset,
+            shape: [k * numValueHeads], dtype: .f32)
+        let bPrefix = Tensor(
+            buffer: bRawF32All.buffer, offset: bRawF32All.offset,
+            shape: [k * numValueHeads], dtype: .f32)
+
+        let convOutF32 = Tensor.empty(
+            shape: [k * convDim], dtype: .f32, device: device)
+        // Rewind never needs planes — see the matching note on the GDN
+        // prep-chunk dispatch below.
+        let (rewindConvPlanes, rewindConvPlanesEnabled) =
+            Ops.disabledGdnPlanes(dtype: qkvPrefix.dtype, device: device)
+        Ops.conv1dCausalStepSiluCastMany(
+            src: qkvPrefix, w: convW, b: convB,
+            stateIn: cache.conv.state,
+            outF32: convOutF32,
+            stateOut: cache.conv.state,
+            statePlanes: rewindConvPlanes, planesEnabled: rewindConvPlanesEnabled,
+            t: k, convDim: convDim, convKernel: convKernel,
+            on: cmd)
+
+        let kLenBuf = device.makeBuffer(length: 4)
+        var kLenU32 = UInt32(k)
+        memcpy(kLenBuf.contents(), &kLenU32, 4)
+        let kLenScalar = Tensor(
+            buffer: kLenBuf, offset: 0, shape: [1], dtype: .u32)
+
+        let qNormed = Tensor.empty(
+            shape: [k * numKeyHeads * keyHeadDim], dtype: .f32, device: device)
+        let kNormed = Tensor.empty(
+            shape: [k * numKeyHeads * keyHeadDim], dtype: .f32, device: device)
+        Ops.gatedDeltaQKNormPrepass(
+            convOut: convOutF32,
+            qNormWeight: qNormWeightF32, kNormWeight: kNormWeightF32,
+            qNormed: qNormed, kNormed: kNormed,
+            tLen: kLenScalar, tCount: k,
+            batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
+            hv: numValueHeads, hk: numKeyHeads,
+            on: cmd)
+
+        // `y` is recomputed but discarded: the verify pass's outputs for
+        // accepted rows are already correct (causal), only state matters.
+        let yScratch = Tensor.empty(
+            shape: [k * numValueHeads * valueHeadDim],
+            dtype: .f32, device: device)
+        // Rewind never needs planes — it's the fallback path planes are
+        // meant to replace, not a producer of them. Always disabled.
+        let (rewindPlanes, rewindPlanesEnabled) =
+            Ops.disabledGdnPlanes(dtype: .f32, device: device)
+        if fastPrepChunkEligible {
+            Ops.gatedDeltaPrepChunkFast(
+                convOut: convOutF32,
+                aLog: aLogTF32, dtBias: dtBiasTF32,
+                aRaw: aPrefix, bRaw: bPrefix,
+                qNormed: qNormed, kNormed: kNormed,
+                stateIn: cache.gdn.current, stateOut: cache.gdn.next,
+                y: yScratch,
+                tLen: kLenScalar,
+                statePlanes: rewindPlanes, planesEnabled: rewindPlanesEnabled,
+                batchSize: 1,
+                on: cmd)
+        } else {
+            Ops.gatedDeltaPrepChunk(
+                convOut: convOutF32,
+                aLog: aLogTF32, dtBias: dtBiasTF32,
+                aRaw: aPrefix, bRaw: bPrefix,
+                qNormed: qNormed, kNormed: kNormed,
+                stateIn: cache.gdn.current, stateOut: cache.gdn.next,
+                y: yScratch,
+                tLen: kLenScalar,
+                statePlanes: rewindPlanes, planesEnabled: rewindPlanesEnabled,
+                batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
+                hv: numValueHeads, hk: numKeyHeads,
+                on: cmd)
+        }
+        cache.gdn.swap()
+        return true
+    }
+
+    /// Roll this layer's recurrent state forward to `k` accepted tokens by
+    /// SELECTING the `(k-1)`th captured plane instead of restoring a
+    /// pre-verify snapshot and re-running conv+scan (`rewindState` above).
+    /// Requires the last verify pass to have captured planes for at least
+    /// `k` tokens (`BUTTER_GDN_STATE_PLANES=1` was active and `t` was
+    /// plane-eligible — see `Qwen35GDNLayerCache.specGdnPlanes` doc);
+    /// returns false otherwise so the caller falls back to `rewindState`.
+    ///
+    /// Cost: one blit per state (~2 MiB GDN + tens of KB conv — see
+    /// `GDNStateCache.restoreEncode` / `ConvStateCache.restoreEncode`,
+    /// which this reuses directly by handing each a Tensor VIEW into the
+    /// stashed plane buffer at the `k-1` offset) — no re-scan dispatch, no
+    /// weight traffic, and critically no pre-verify snapshot restore
+    /// first: both `restoreEncode` calls write straight into the live
+    /// `current` / `state` buffers the verify pass just left in the WRONG
+    /// (full-T) state, overwriting them directly with the correct
+    /// k-token state in one step. The caller must NOT also call
+    /// `caches.restoreAll(recurrentOnly: true)` before this — unlike
+    /// `rewindState`, which depends on that prior restore, this path
+    /// replaces the restore, not follows it.
+    func adoptPlaneState(
+        to k: Int, cache: Qwen35GDNLayerCache,
+        cmd: MTLCommandBuffer
+    ) -> Bool {
+        guard k > 0, k <= cache.specPlanesT,
+            let gdnPlanes = cache.specGdnPlanes,
+            let convPlanes = cache.specConvPlanes
+        else { return false }
+
+        let gdnPlaneElems = numValueHeads * valueHeadDim * keyHeadDim
+        let gdnSlice = Tensor(
+            buffer: gdnPlanes.buffer,
+            offset: gdnPlanes.offset + (k - 1) * gdnPlaneElems * DType.f32.byteSize,
+            shape: [numValueHeads, valueHeadDim, keyHeadDim], dtype: .f32)
+        cache.gdn.restoreEncode(from: gdnSlice, on: cmd)
+
+        let convStateRows = convKernel - 1
+        let convPlaneElems = convStateRows * convDim
+        let convSlice = Tensor(
+            buffer: convPlanes.buffer,
+            offset: convPlanes.offset + (k - 1) * convPlaneElems * convPlanes.dtype.byteSize,
+            shape: [convStateRows, convDim], dtype: convPlanes.dtype)
+        cache.conv.restoreEncode(from: convSlice, on: cmd)
+        return true
     }
 }
 
@@ -2369,7 +2737,7 @@ public final class Qwen35AttentionMixer: Module {
     private var partialLScratch: Tensor?
     private let sdpa2PassBlocks: Int = 32
     private let sdpa2PassThreshold: Int = {
-        if let raw = ProcessInfo.processInfo.environment["BUTTER_SDPA_2PASS_THRESHOLD"],
+        if let raw = ButterEnv["BUTTER_SDPA_2PASS_THRESHOLD"],
             let n = Int(raw)
         {
             return n
@@ -2413,10 +2781,10 @@ public final class Qwen35AttentionMixer: Module {
         // once here instead of read from `forwardMany` on every call.
         let qtiledD256 =
             headDim == 256
-                && ProcessInfo.processInfo.environment["BUTTER_SDPA_QTILED_D256"] == "1"
+                && ButterEnv["BUTTER_SDPA_QTILED_D256"] == "1"
         let legacyD256 =
             headDim == 256 && !qtiledD256
-                && ProcessInfo.processInfo.environment["BUTTER_SDPA_LEGACY_D256"] == "1"
+                && ButterEnv["BUTTER_SDPA_LEGACY_D256"] == "1"
         self.useQtiledD256Cached = qtiledD256
         self.useMmaD256Cached = headDim == 256 && !legacyD256 && !qtiledD256
         if attnOutputGate {
@@ -2469,7 +2837,7 @@ public final class Qwen35AttentionMixer: Module {
             if inDim % 512 == 0
                 && qDim % 8 == 0 && kDim % 8 == 0 && vDim % 8 == 0
                 && qQL.groupSize == 64
-                && ProcessInfo.processInfo.environment["BUTTER_NO_FUSED_QKV"] == nil
+                && ButterEnv["BUTTER_NO_FUSED_QKV"] == nil
             {
                 self.fusedQKVEligible = true
             }
@@ -2727,7 +3095,7 @@ public final class Qwen35AttentionMixer: Module {
         // MMA `callMany` qmms. BUTTER_FUSED_QKV_PREFILL=1 forces the old
         // routing for A/B.
         let fusedQkvAtPrefill =
-            ProcessInfo.processInfo.environment["BUTTER_FUSED_QKV_PREFILL"] != nil || t <= 8
+            ButterEnv["BUTTER_FUSED_QKV_PREFILL"] != nil || t <= 8
         let qOut: Tensor
         let kOut: Tensor
         let vOut: Tensor
@@ -2990,6 +3358,24 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
     /// rotates `workCmd`. `commitsCommandBuffer = true` always (the GDN
     /// layer's contract — MoE FFN commits inside, dense FFN ends with a
     /// fresh fully-committed addCmd).
+    /// Rewind this layer's recurrent state to `k` tokens of the last
+    /// batched pass. Forwards to the mixer; see its `rewindState`.
+    func rewindState(
+        to k: Int, cache: Qwen35GDNLayerCache,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Bool {
+        mixer.rewindState(to: k, cache: cache, cmd: cmd, device: device)
+    }
+
+    /// Adopt this layer's `k-1`th captured state plane in place of a
+    /// restore+rewind. Forwards to the mixer; see its `adoptPlaneState`.
+    func adoptPlaneState(
+        to k: Int, cache: Qwen35GDNLayerCache,
+        cmd: MTLCommandBuffer
+    ) -> Bool {
+        mixer.adoptPlaneState(to: k, cache: cache, cmd: cmd)
+    }
+
     public func decodeMany(
         _ hFlat: Tensor, t: Int, startPosition: Int,
         cache: any LayerCacheProtocol,
@@ -3035,11 +3421,27 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
             ffnNorm = nil
         }
 
-        return qwen35ApplyFFNMany(
+        let out = qwen35ApplyFFNMany(
             ffn, postMix: postMix, t: t,
             postNorm: postNorm, hidden: hidden,
             cmd: cmd, device: device,
             preNormed: ffnNorm)
+        // Honour this layer's `commitsCommandBuffer == true` contract for
+        // the dense-FFN case: `qwen35ApplyFFNMany`'s dense branch leaves
+        // the whole layer (mixer + FFN + residual) queued on `cmd`, and
+        // the model-level batched driver unconditionally REPLACES its
+        // `workCmd` after every GDN layer on the assumption the layer
+        // committed it. Without this commit the entire command buffer —
+        // including the embedding gather when this is layer 0 — was
+        // silently dropped un-executed on dense checkpoints (Qwen3.5
+        // 0.8B/4B, Qwen3.6-27B), zeroing the hidden state and collapsing
+        // batched-prefill logits to argmax token 0 ("!" loops). The MoE
+        // branch already commits inside `MoELayer/Qwen35MoEFFN.forwardMany`
+        // (which is why Qwen3.6-35B-A3B never showed the bug). Commit
+        // without wait — same pipelining contract as the single-token
+        // `qwen35ApplyFFN(commitCmd: true)` path.
+        if case .dense = ffn { cmd.commit() }
+        return out
     }
 }
 
@@ -3344,6 +3746,13 @@ public final class Qwen35Model: LanguageModel {
     public let finalNorm: RMSNorm
     public let lmHead: AnyLinear
 
+    /// Optional Multi-Token Prediction draft head (spec 030 phase 1).
+    /// Attached by `Qwen35Hybrid.loadModel` when the checkpoint carries
+    /// a `mtp-sidecar/` directory (disable with `BUTTER_QWEN_MTP=0`);
+    /// nil otherwise. References (does not copy) this model's embedding
+    /// table + lm_head.
+    public internal(set) var mtpHead: Qwen3xMTPHead?
+
     public let hidden, nLayers, nHeads, nKVHeads, headDim, vocab, maxSeq: Int
     /// GDN mixer geometry.
     public let numKeyHeads, numValueHeads, keyHeadDim, valueHeadDim: Int
@@ -3477,6 +3886,11 @@ public final class Qwen35Model: LanguageModel {
             embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
         }
 
+        // See `Sources/ButterSwift/Telemetry/InspectTap.swift` — no-op
+        // when BUTTER_INSPECT isn't set. `butter inspect --layer-trace`.
+        let tap = InspectTap.fromEnvironment
+        workCmd = tap.dumpLayerBoundary(h, label: "embed_out", layer: -1, cmd: workCmd, device: device)
+
         Profile.signpost("model.layer_loop") {
             for (i, layer) in layers.enumerated() {
                 h = layer.decode(
@@ -3490,6 +3904,8 @@ public final class Qwen35Model: LanguageModel {
                 default: committed = false
                 }
                 if committed { workCmd = device.makeCommandBuffer() }
+                let kind = layer is Qwen35AttentionLayer ? "attn" : (layer is Qwen35GDNLayer ? "gdn" : "other")
+                workCmd = tap.dumpLayerBoundary(h, label: "\(kind)_out", layer: i, cmd: workCmd, device: device)
             }
         }
 
@@ -3587,7 +4003,7 @@ public final class Qwen35Model: LanguageModel {
         // fan from T·gemv to 1·gemm, SDPA from T·sdpaDecode to 1·
         // sdpaMulti, gate-split gather from T to 1. Compounds across
         // every attention layer in the stack.
-        if ProcessInfo.processInfo.environment["BUTTER_LEGACY_FORWARDMANY"] != nil {
+        if ButterEnv["BUTTER_LEGACY_FORWARDMANY"] != nil {
             return _forwardManyPerTokenLegacy(
                 tokenIds: tokenIds,
                 startPosition: startPosition,
@@ -3599,7 +4015,8 @@ public final class Qwen35Model: LanguageModel {
             startPosition: startPosition,
             caches: caches,
             returnAllLogits: false,
-            on: cmd, device: device)
+            on: cmd, device: device
+        ).logits
     }
 
     /// Multi-token forward returning logits at EVERY position — `[T, vocab]`.
@@ -3623,7 +4040,118 @@ public final class Qwen35Model: LanguageModel {
             startPosition: startPosition,
             caches: caches,
             returnAllLogits: true,
+            on: cmd, device: device
+        ).logits
+    }
+
+    /// Multi-token forward returning the per-position logits `[T, vocab]`
+    /// AND the pre-final-norm hidden states `[T, hidden]`. Sibling of
+    /// `forwardManyAllLogits`, differing only in the extra hidden-state
+    /// snapshot (blitted into a fresh tensor on the caller's `cmd`, so
+    /// later forwards reusing per-layer scratch cannot clobber it).
+    ///
+    /// MTP driver (spec 030): the draft head consumes the backbone's
+    /// hidden state at position `i` together with the token sampled for
+    /// position `i + 1` to propose the token at `i + 2` - see
+    /// `Qwen3xMTPHead.draftStep`.
+    /// Enable/disable stashing of the GDN scan's weight-derived inputs.
+    /// The speculative loop turns this on for the duration of a run so
+    /// partial accepts can rewind state instead of replaying.
+    public func setSpecCapture(_ on: Bool, caches: [any LayerCacheProtocol]) {
+        for c in caches {
+            if let gc = c as? Qwen35GDNLayerCache { gc.specCapture = on }
+        }
+    }
+
+    /// Roll every cache back to `keep` tokens of the last batched pass.
+    ///
+    /// KV caches only need truncating: the batched pass is causal, so the
+    /// entries it wrote for accepted positions are already correct. The
+    /// GDN layers re-run their conv + chunk recurrence over the accepted
+    /// prefix (no weight traffic — see `rewindState`).
+    ///
+    /// `snapshot` must already have been restored into `caches` so the
+    /// recurrent state starts from the pre-verify value. Returns false if
+    /// any GDN layer could not rewind, in which case the caller must fall
+    /// back to replaying the prefix.
+    public func rewindCaches(
+        keep: Int, absolutePosition: Int,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Bool {
+        var ok = true
+        for (i, layer) in layers.enumerated() {
+            guard i < caches.count else { break }
+            if let gdnLayer = layer as? Qwen35GDNLayer,
+                let gc = caches[i] as? Qwen35GDNLayerCache
+            {
+                if !gdnLayer.rewindState(
+                    to: keep, cache: gc, cmd: cmd, device: device)
+                {
+                    ok = false
+                }
+            } else if let kv = caches[i] as? KVCache {
+                kv.truncate(toLength: absolutePosition + keep)
+            }
+        }
+        return ok
+    }
+
+    /// Roll every cache forward to `keep` tokens of the last batched pass
+    /// by SELECTING each GDN layer's `(keep-1)`th captured state plane —
+    /// the scan-emitted-planes alternative to `rewindCaches` (restore +
+    /// re-scan). See `Qwen35GDNLayer.adoptPlaneState` for the mechanism
+    /// and why the caller must NOT restore a snapshot first.
+    ///
+    /// KV caches truncate exactly as `rewindCaches` does (the batched
+    /// pass is causal, so entries for accepted positions are already
+    /// correct). Returns false if any GDN layer had no planes captured
+    /// (flag was off, or `t` exceeded the plane-eligible cap for that
+    /// call) — the caller must fall back to `restoreAll` + `rewindCaches`
+    /// (or a full replay) in that case, exactly like `rewindCaches`'s own
+    /// ineligible-shape fallback.
+    public func adoptPlanes(
+        keep: Int, absolutePosition: Int,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer
+    ) -> Bool {
+        var ok = true
+        for (i, layer) in layers.enumerated() {
+            guard i < caches.count else { break }
+            if let gdnLayer = layer as? Qwen35GDNLayer,
+                let gc = caches[i] as? Qwen35GDNLayerCache
+            {
+                if !gdnLayer.adoptPlaneState(to: keep, cache: gc, cmd: cmd) {
+                    ok = false
+                }
+            } else if let kv = caches[i] as? KVCache {
+                kv.truncate(toLength: absolutePosition + keep)
+            }
+        }
+        return ok
+    }
+
+    public func forwardManyHiddenAndLogits(
+        tokenIds: [Int], startPosition: Int,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> (hidden: Tensor, logits: Tensor) {
+        precondition(
+            !tokenIds.isEmpty,
+            "Qwen35Model.forwardManyHiddenAndLogits: tokenIds must not be empty")
+        let out = _forwardManyBatched(
+            tokenIds: tokenIds,
+            startPosition: startPosition,
+            caches: caches,
+            returnAllLogits: true,
+            returnHidden: true,
             on: cmd, device: device)
+        guard let hidden = out.hidden else {
+            fatalError(
+                "Qwen35Model.forwardManyHiddenAndLogits: "
+                    + "_forwardManyBatched(returnHidden: true) returned no hidden")
+        }
+        return (hidden: hidden, logits: out.logits)
     }
 
     /// Legacy per-token-loop path retained behind `BUTTER_LEGACY_FORWARDMANY=1`
@@ -3661,12 +4189,19 @@ public final class Qwen35Model: LanguageModel {
     ///     on the LAST row only → `[vocab]`.
     ///   * `true` (spec-decode verify): batched RMSNorm over T rows +
     ///     batched lm_head → `[T, vocab]`.
+    ///
+    /// When `returnHidden` is set, the tuple additionally carries a
+    /// `[T, hidden]` snapshot of the pre-final-norm hidden states
+    /// (blitted into a fresh tensor on the caller's `cmd` - the running
+    /// `h` buffer chains through per-layer/per-FFN scratch that later
+    /// forwards may reuse, so handing it out directly would race).
     private func _forwardManyBatched(
         tokenIds: [Int], startPosition: Int,
         caches: [any LayerCacheProtocol],
         returnAllLogits: Bool,
+        returnHidden: Bool = false,
         on cmd: MTLCommandBuffer, device: Device
-    ) -> Tensor {
+    ) -> (logits: Tensor, hidden: Tensor?) {
         let t = tokenIds.count
 
         // ── Embed all T tokens in one gather ─────────────────────────────
@@ -3680,10 +4215,10 @@ public final class Qwen35Model: LanguageModel {
         // GPU windows cover the outer workCmd only — layers that commit
         // internal buffers (MoE FFN paths) undercount slightly.
         let profileLayers =
-            ProcessInfo.processInfo.environment["BUTTER_PROFILE_LAYERS"] == "1"
-                || ProcessInfo.processInfo.environment["BUTTER_PROFILE_LAYERS"] == "2"
+            ButterEnv["BUTTER_PROFILE_LAYERS"] == "1"
+                || ButterEnv["BUTTER_PROFILE_LAYERS"] == "2"
         let profilePerLayer =
-            ProcessInfo.processInfo.environment["BUTTER_PROFILE_LAYERS"] == "2"
+            ButterEnv["BUTTER_PROFILE_LAYERS"] == "2"
 
         var workCmd = device.makeCommandBuffer()
         let embWall0 = profileLayers ? CFAbsoluteTimeGetCurrent() : 0
@@ -3695,6 +4230,11 @@ public final class Qwen35Model: LanguageModel {
         // QuantizedEmbedding variants.
         let dt = h.dtype
         let dtBytes = dt.byteSize
+
+        // See `Sources/ButterSwift/Telemetry/InspectTap.swift` — no-op
+        // when BUTTER_INSPECT isn't set. `butter inspect --layer-trace`.
+        let tap = InspectTap.fromEnvironment
+        workCmd = tap.dumpLayerBoundary(h, label: "embed_out", layer: -1, cmd: workCmd, device: device)
 
         if profileLayers {
             workCmd.commit()
@@ -3803,6 +4343,8 @@ public final class Qwen35Model: LanguageModel {
                     nOther += 1
                 }
             }
+            let kind = layer is Qwen35AttentionLayer ? "attn" : (layer is Qwen35GDNLayer ? "gdn" : "other")
+            workCmd = tap.dumpLayerBoundary(h, label: "\(kind)_out", layer: i, cmd: workCmd, device: device)
             }  // autoreleasepool
         }
 
@@ -3843,6 +4385,28 @@ public final class Qwen35Model: LanguageModel {
             workCmd.waitUntilCompleted()
         }
 
+        // ── Pre-final-norm hidden snapshot (MTP driver) ──────────────────
+        // Blit `h` into a fresh `[T, hidden]` tensor on the caller's
+        // `cmd` BEFORE the final norm queues. `h` lives in per-layer
+        // scratch chains a subsequent forward may overwrite; the copy
+        // decouples the returned hidden from that reuse.
+        // BUTTER_QWEN_MTP_POSTNORM=1 snapshots the POST-final-norm hidden
+        // instead (see the all-logits branch below). The reference MTP
+        // implementation feeds its draft head the same tensor that feeds
+        // `lm_head`, i.e. post-norm; `pre_fc_norm_hidden` inside the head
+        // is scale-invariant, so the two differ by the final norm's
+        // per-channel weight, not by magnitude. Flagged so both arms are
+        // measurable from one build.
+        let mtpPostNormHidden =
+            ButterEnv["BUTTER_QWEN_MTP_POSTNORM"] == "1"
+        var hiddenSnapshot: Tensor?
+        if returnHidden && !(mtpPostNormHidden && returnAllLogits) {
+            let snap = Tensor.empty(
+                shape: [t, hidden], dtype: dt, device: device)
+            Ops.copy(h, into: snap, on: cmd)
+            hiddenSnapshot = snap
+        }
+
         // ── Final norm + lm_head ─────────────────────────────────────────
         // Two output shapes (see _forwardManyBatched docstring):
         //   * returnAllLogits == false: logits of the LAST row only,
@@ -3855,16 +4419,24 @@ public final class Qwen35Model: LanguageModel {
                 buffer: h.buffer,
                 offset: h.offset + (t - 1) * hidden * dtBytes,
                 shape: [hidden], dtype: dt)
-            return qwen35FinalNormLmHead(
+            let logits = qwen35FinalNormLmHead(
                 h: lastRow, finalNorm: finalNorm, lmHead: lmHead, on: cmd)
+            return (logits: logits, hidden: hiddenSnapshot)
         }
         // All-T path: batched RMSNorm over T rows + batched lm_head.
         let normedAll = Ops.rmsNormRows(
             h, weight: finalNorm.weight, eps: finalNorm.eps,
             nRows: t, rowSize: hidden, on: cmd)
-        return lmHead.callMany(
+        if returnHidden && mtpPostNormHidden {
+            let snap = Tensor.empty(
+                shape: [t, hidden], dtype: dt, device: device)
+            Ops.copy(normedAll.reshaped(to: [t, hidden]), into: snap, on: cmd)
+            hiddenSnapshot = snap
+        }
+        let logits = lmHead.callMany(
             normedAll.reshaped(to: [t, hidden]),
             t: t, on: cmd, device: device)
+        return (logits: logits, hidden: hiddenSnapshot)
     }
 
     // ─── VLM embedding-input path ────────────────────────────────────
@@ -3958,7 +4530,13 @@ private func zeroVector35(_ n: Int, dtype: DType, device: Device) -> Tensor {
 /// Transpose HF conv1d.weight `[C, K, 1]` → `[K, C]` for the iron
 /// conv kernel. The trailing `1` is the depthwise group dim; row-major
 /// the source is `[c][k]`-ordered.
-private func transposeConv1dWeight35(
+///
+/// `internal` (not `private`) so `Qwen3xGGUFLoader.swift` can reuse it:
+/// GGUF's `ssm_conv1d.weight` ships in the same raw `[c][k]`-ordered
+/// row-major layout as unsanitized HF safetensors (K contiguous, C
+/// outer — see `Qwen3xGGUFLoader`'s tensor-mapping notes), so the exact
+/// same transpose applies unchanged.
+func transposeConv1dWeight35(
     src: Tensor, kernel K: Int, channels C: Int,
     dtype: DType, device: Device
 ) -> Tensor {

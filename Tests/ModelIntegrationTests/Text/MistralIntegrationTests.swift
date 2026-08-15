@@ -26,7 +26,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Mistral Integration", .serialized)
+@Suite("Mistral Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct MistralIntegrationTests {
 
     @Test("load + greedy generate produces coherent output")

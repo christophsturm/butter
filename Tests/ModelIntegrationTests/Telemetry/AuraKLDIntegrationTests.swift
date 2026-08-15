@@ -42,7 +42,7 @@ private let qwen3LocalPath =
     ProcessInfo.processInfo.environment["BUTTER_AURA_KLD_MODEL_PATH"]
     ?? "<BUTTER_AURA_KLD_MODEL_PATH unset>"
 
-@Suite("AURA KL-divergence regression gate", .serialized)
+@Suite("AURA KL-divergence regression gate", .serialized, .enabled(if: modelTestsOptedIn))
 struct AuraKLDIntegrationTests {
 
     /// Fixed sample prompt. Chosen for diversity (en-prose + rare

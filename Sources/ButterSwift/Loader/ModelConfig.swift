@@ -143,6 +143,13 @@ public struct ModelConfig: @unchecked Sendable {
     public struct QuantizationConfig: Sendable {
         public let bits: Int
         public let groupSize: Int
+        /// `"affine"` (default MLX), `"nvfp4"`, etc.
+        public let mode: String
+        public init(bits: Int, groupSize: Int, mode: String = "affine") {
+            self.bits = bits
+            self.groupSize = groupSize
+            self.mode = mode
+        }
     }
 
     public var quantization: QuantizationConfig? {
@@ -150,7 +157,8 @@ public struct ModelConfig: @unchecked Sendable {
             let bits = q["bits"] as? Int,
             let group = q["group_size"] as? Int
         else { return nil }
-        return QuantizationConfig(bits: bits, groupSize: group)
+        let mode = (q["mode"] as? String) ?? "affine"
+        return QuantizationConfig(bits: bits, groupSize: group, mode: mode)
     }
 }
 

@@ -43,7 +43,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Jamba Integration", .serialized)
+@Suite("Jamba Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct JambaIntegrationTests {
 
     @Test("load + greedy generate produces coherent hybrid output")

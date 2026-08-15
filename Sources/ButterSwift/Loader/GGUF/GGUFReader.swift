@@ -64,7 +64,7 @@ public final class GGUFReader {
     /// Default ON (resident) — set BUTTER_MADV_FREE=1 to restore the
     /// streaming behaviour for memory-constrained runs.
     static let keepResident: Bool =
-        ProcessInfo.processInfo.environment["BUTTER_MADV_FREE"] != "1"
+        ButterEnv["BUTTER_MADV_FREE"] != "1"
 
     // ─── Init ──────────────────────────────────────────────────────────
 

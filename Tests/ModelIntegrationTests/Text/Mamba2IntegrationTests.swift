@@ -27,7 +27,7 @@ import Testing
 
 @testable import ButterSwift
 
-@Suite("Mamba2 Integration", .serialized)
+@Suite("Mamba2 Integration", .serialized, .enabled(if: modelTestsOptedIn))
 struct Mamba2IntegrationTests {
 
     @Test("load + greedy generate produces non-degenerate text")
