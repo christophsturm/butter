@@ -25,3 +25,4 @@ pub mod gguf_tokenizer;
 pub mod laguna;
 pub mod llama;
 pub mod moe;
+pub mod qwen35;

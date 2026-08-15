@@ -6781,6 +6781,240 @@ pub fn kv_append_many(
     Ok(())
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────
+// Qwen3.5 / Qwen3.6 (GGUF arch "qwen35") GDN + hybrid-attention support.
+//
+// Wires kernels that already existed in `wh-iron-std` (built ahead of this
+// port per their doc comments — `iron_gated_delta_step`/`iron_gdn_gate_beta`
+// name-check "Qwen3.6" explicitly) but had no `wh-butter-ops` wrapper yet.
+// `lookup()` resolves the first three by name from the iron test registry
+// (each has a `#[test_kernel]`, so its `KernelMode` comes along for free);
+// `sigmoid_mul` and `strided_head_half` are new — the former has no test
+// registration (hand-built IR mirroring `relu2`'s pattern), the latter is a
+// tiny de-interleave gather with no iron kernel at all (hand-written CUDA,
+// mirroring `rope_yarn_partial`'s `dispatch_raw_cuda` pattern).
+
+/// Qwen3.5/3.6 GDN single-token (or T-chunk-collapsed) decode step.
+/// `q`/`k`: `[Hk, Dk]` flat, `v`: `[Hv, Dv]` flat, `g`/`beta`: `[Hv]` flat,
+/// `state`: `[Hv, Dv, Dk]` flat, passed as BOTH state_in and state_out — the
+/// kernel's phase 1 fully caches the decayed state into per-lane registers
+/// before phase 2 writes state_out, so in==out aliasing is safe (same
+/// discipline as `iron_conv1d_causal_step_silu_cast_many`'s documented
+/// state aliasing). Returns `y`: `[Hv, Dv]`. f32 only (state accumulator
+/// must stay f32 per the kernel's own doc — bf16 drifts after a few dozen
+/// decode steps).
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_step(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &Tensor,
+    dk: usize,
+    dv: usize,
+    hv: usize,
+    hk: usize,
+) -> Result<Tensor> {
+    let kernel = lookup("iron_gated_delta_step", DType::F32)?;
+    let y = Tensor::empty(dev, vec![hv * dv], DType::F32)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(q.buffer.clone()),
+            Binding::Buffer(k.buffer.clone()),
+            Binding::Buffer(v.buffer.clone()),
+            Binding::Buffer(g.buffer.clone()),
+            Binding::Buffer(beta.buffer.clone()),
+            Binding::Buffer(state.buffer.clone()), // state_in
+            Binding::Buffer(state.buffer.clone()), // state_out (aliased)
+            Binding::Buffer(y.buffer.clone()),
+            u(dk as u32),
+            u(dv as u32),
+            u(hv as u32),
+            u(hk as u32),
+        ],
+        Grid { grid: [dv as u32, hv as u32, 1], block: [32, 1, 1] },
+    )?;
+    Ok(y)
+}
+
+/// Qwen3.5/3.6 GDN fused gate/beta: `g = exp(-exp(A_log) * softplus(a_raw +
+/// dt_bias))`, `beta = sigmoid(b_raw)`. `a_raw`/`b_raw`: `[rows, Hv]` flat
+/// (rows = B*T, decode = 1); `dt_bias`/`neg_exp_a_log`: `[Hv]`.
+/// `neg_exp_a_log[h] = -exp(A_log[h])` is precomputed once at load time
+/// (see `Qwen35Model::load_gguf`). Returns `(g, beta)`, each `[rows*Hv]`.
+pub fn gdn_gate_beta(
+    dev: &dyn Device,
+    a_raw: &Tensor,
+    b_raw: &Tensor,
+    dt_bias: &Tensor,
+    neg_exp_a_log: &Tensor,
+    hv: usize,
+) -> Result<(Tensor, Tensor)> {
+    let kernel = lookup("iron_gdn_gate_beta", DType::F32)?;
+    let n = a_raw.elem_count();
+    let g = Tensor::empty(dev, vec![n], DType::F32)?;
+    let beta = Tensor::empty(dev, vec![n], DType::F32)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(a_raw.buffer.clone()),
+            Binding::Buffer(b_raw.buffer.clone()),
+            Binding::Buffer(dt_bias.buffer.clone()),
+            Binding::Buffer(neg_exp_a_log.buffer.clone()),
+            Binding::Buffer(g.buffer.clone()),
+            Binding::Buffer(beta.buffer.clone()),
+            u(hv as u32),
+        ],
+        Grid::d1((n as u32).div_ceil(256), 256),
+    )?;
+    Ok((g, beta))
+}
+
+/// Batched depthwise causal conv1d (kernel=4, no bias term needed — Qwen3.5's
+/// GDN `conv1d` has `bias: false`, so callers pass a zero-filled `b`) fused
+/// with SiLU, sweeping `t_len` tokens for `conv_dim` channels in one
+/// dispatch. `src`: `[t_len, conv_dim]`, `w`: `[4, conv_dim]` (k-major —
+/// NOTE this is NOT the GGUF `ssm_conv1d.weight` tensor's native
+/// `[conv_dim, 4]`-flat (channel-major) layout; the loader must transpose,
+/// see `Qwen35Model::load_gguf`'s `repack_conv1d_weight`), `state_in`:
+/// `[3, conv_dim]`. Returns `(out_f32 [t_len*conv_dim], state_out [3*conv_dim])`.
+/// f32 only (matches this port's decision to keep GDN's small/precision-
+/// sensitive tensors — conv, alpha/beta gate projections, A_log, dt_bias,
+/// ssm_norm — unquantized; only the big GEMM weights go through Q4).
+pub fn conv1d_causal_silu_many(
+    dev: &dyn Device,
+    src: &Tensor,
+    w: &Tensor,
+    b: &Tensor,
+    state_in: &Tensor,
+    t_len: usize,
+    conv_dim: usize,
+) -> Result<(Tensor, Tensor)> {
+    let kernel = lookup("iron_conv1d_causal_step_silu_cast_many", DType::F32)?;
+    let out_f32 = Tensor::empty(dev, vec![t_len * conv_dim], DType::F32)?;
+    let state_out = Tensor::empty(dev, vec![3 * conv_dim], DType::F32)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(src.buffer.clone()),
+            Binding::Buffer(w.buffer.clone()),
+            Binding::Buffer(b.buffer.clone()),
+            Binding::Buffer(state_in.buffer.clone()),
+            Binding::Buffer(out_f32.buffer.clone()),
+            Binding::Buffer(state_out.buffer.clone()),
+            u(t_len as u32),
+            u(conv_dim as u32),
+            u(4u32),
+        ],
+        Grid { grid: [conv_dim as u32, 1, 1], block: [1, 1, 1] },
+    )?;
+    Ok((out_f32, state_out))
+}
+
+/// Elementwise `out = a * sigmoid(b)` — Qwen3.5/3.6 full-attention layers'
+/// output gate (`sigmoidMultiply` in mlx-swift-lm's `Qwen35Attention`;
+/// NOT swish/silu, despite that being GDN's convention for its own output
+/// gate — the two mixer types use different gate activations in this
+/// architecture, verified against `Libraries/MLXLLM/Models/Qwen35.swift`
+/// and `Qwen3Next.swift`'s `sigmoidMultiply`/`Qwen3NextRMSNormGated`).
+/// Dispatches `iron_sigmoid_mul` (exists in iron, un-registered — no
+/// `#[test_kernel]` — so `lookup()` can't find it; built here via manual IR,
+/// same pattern as `relu2` above).
+pub fn sigmoid_mul(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if a.shape != b.shape {
+        return Err(Error::Msg(format!(
+            "sigmoid_mul: shape mismatch {:?} vs {:?}",
+            a.shape, b.shape
+        )));
+    }
+    let mut k = Kernel::new("butter_sigmoid_mul");
+    for (pname, is_out) in [("a", false), ("b", false), ("c", true)] {
+        k.params.push(Param {
+            name: pname.into(),
+            dtype: a.dtype,
+            shape: Shape::scalar(),
+            is_output: is_out,
+            kind: ParamKind::Tensor,
+        });
+    }
+    k.body.push_op(Op::ProgramId { axis: 0 }, ValueId::new(0));
+    k.body.push_op(
+        Op::Load { src: "a".into(), indices: vec![IndexExpr::Value(ValueId::new(0))], mask: None, other: None },
+        ValueId::new(1),
+    );
+    k.body.push_op(
+        Op::Load { src: "b".into(), indices: vec![IndexExpr::Value(ValueId::new(0))], mask: None, other: None },
+        ValueId::new(2),
+    );
+    k.body.push_op(Op::Activation { kind: ActKind::Sigmoid, value: ValueId::new(2) }, ValueId::new(3));
+    k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: ValueId::new(1), rhs: ValueId::new(3) }, ValueId::new(4));
+    k.body.push_op_no_result(Op::Store {
+        dst: "c".into(),
+        indices: vec![IndexExpr::Value(ValueId::new(0))],
+        value: ValueId::new(4),
+        mask: None,
+    });
+    k.mode = wh_iron_core::ir::KernelMode::Elementwise;
+    let out = Tensor::empty(dev, a.shape.clone(), a.dtype)?;
+    let n = out.elem_count() as u32;
+    let grid = Grid::d1(n.div_ceil(256), 256);
+    dev.dispatch(
+        &k,
+        &[Binding::Buffer(a.buffer.clone()), Binding::Buffer(b.buffer.clone()), Binding::Buffer(out.buffer.clone())],
+        grid,
+    )?;
+    Ok(out)
+}
+
+const STRIDED_HEAD_HALF_SRC: &str = r#"
+extern "C" __global__ void butter_strided_head_half(
+    const float* __restrict__ x, float* __restrict__ out,
+    int n_head, int head_dim, int half)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_head * head_dim;
+    if (i >= total) return;
+    int h = i / head_dim;
+    int d = i % head_dim;
+    out[i] = x[h * 2 * head_dim + half * head_dim + d];
+}
+"#;
+
+/// De-interleave a `[n_head, 2*head_dim]` fused Q/gate projection output
+/// into one contiguous `[n_head, head_dim]` half. Qwen3.5/3.6 full-attn
+/// `attn_q` packs `[q(head_dim); gate(head_dim)]` PER HEAD (reshape to
+/// `[heads, 2*head_dim]` then split last axis in two) — NOT all-Q rows
+/// followed by all-gate rows — so a plain contiguous `ops::slice` cannot
+/// separate them; this is a strided gather. `half=0` extracts Q, `half=1`
+/// extracts the gate. Verified against `Qwen35Attention.callAsFunction` in
+/// mlx-swift-lm (`qProjOutput.reshaped(B,L,heads,-1).split(parts:2,axis:-1)`).
+/// f32 only. Hand-written CUDA (no iron kernel covers this shape), mirrors
+/// `rope_yarn_partial`'s `dispatch_raw_cuda` pattern.
+pub fn strided_head_half(dev: &dyn Device, x: &Tensor, n_head: usize, head_dim: usize, half: u32) -> Result<Tensor> {
+    let out = Tensor::empty(dev, vec![n_head * head_dim], DType::F32)?;
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let total = (n_head * head_dim) as u32;
+    dev.dispatch_raw_cuda(
+        STRIDED_HEAD_HALF_SRC,
+        "strided_head_half.cu",
+        "butter_strided_head_half",
+        &[(x.buffer.as_ref(), x.offset), (out.buffer.as_ref(), 0)],
+        &[i(n_head as i32), i(head_dim as i32), i(half as i32)],
+        [total.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+        false,
+    )?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{dsv4_mhc_sinkhorn_split, permute_q4_from_marlin, permute_q4_to_marlin, quantize_q4, quantize_nvfp4, dec_ue4m3, E2M1_LUT};
