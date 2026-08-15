@@ -256,7 +256,7 @@ impl Q4Dense {
                 dev, &x16, &mw.b_repacked, &mw.b_scales,
                 &routing.0, &routing.1, &routing.2,
                 workspace, c_tmp,
-                1, self.m, self.k, MARLIN_GROUP_SIZE, GB10_SMS,
+                1, self.m, self.k, marlin_group_size(), GB10_SMS,
                 mw.thread_k, mw.thread_n, mw.blocks_per_sm,
             )?;
             // marlin's GEMM returns [prob_m,prob_n] = [1,m]; gemv_q4's
@@ -275,8 +275,24 @@ const GB10_SMS: i32 = 48;
 /// (a repack-kernel occupancy hint, not correctness-critical, but kept
 /// bit-identical to the verified-working recipe).
 const MARLIN_MAX_SHARED_MEM: i32 = 101376;
-/// K-dimension group size for the u4b8 requant -- matches round-7's GS=32.
-const MARLIN_GROUP_SIZE: usize = 32;
+/// K-dimension group size for the u4b8 requant -- round-7's fixed GS=32,
+/// now round-12-overridable via `QWEN35_MARLIN_G` (32/64/128; anything else
+/// falls back to 32) so the g=64/g=128 bytes-per-token levers are a same-
+/// process env toggle, not a reload -- mirrors `QWEN35_MARLIN`'s pattern.
+/// Read ONCE (weight-load and decode-hot-path both call `marlin_group_size()`
+/// many times/step; env var lookups are not free).
+static MARLIN_GROUP_SIZE_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn marlin_group_size() -> usize {
+    *MARLIN_GROUP_SIZE_CELL.get_or_init(|| match std::env::var("QWEN35_MARLIN_G").ok().as_deref() {
+        Some("64") => 64,
+        Some("128") => 128,
+        Some("32") | None => 32,
+        Some(other) => {
+            eprintln!("qwen35: QWEN35_MARLIN_G={other:?} unrecognized (want 32/64/128), defaulting to 32");
+            32
+        }
+    })
+}
 
 /// F-85 round-8: the marlin routing triple (`sorted_token_ids`/`expert_ids`/
 /// `num_tokens_past_padded`) for the trivial single-"expert" M=1 dense
@@ -325,19 +341,20 @@ fn marlin_shared_scratch(dev: &dyn Device) -> Result<(&'static Tensor, &'static 
 /// plan's original "dequant our Q4 -> requant" framing was written before
 /// noticing the loader already holds the pre-Q4 f32 at this call site).
 fn build_marlin(dev: &dyn Device, flat: &[f32], m: usize, k: usize) -> Result<MarlinWeight> {
-    let (bqw, scales_f32) = ops::quantize_u4b8_gptq_g32(flat, m, k);
+    let gs = marlin_group_size();
+    let (bqw, scales_f32) = ops::quantize_u4b8_gptq(flat, m, k, gs);
     let scales_bytes = f32s_to_f16_bytes(&scales_f32);
     let bqw_t = Tensor::new(dev.upload(&u32s_to_bytes(&bqw))?, vec![bqw.len()], DType::U32);
     let scales_raw = Tensor::new(dev.upload(&scales_bytes)?, vec![scales_bytes.len() / 2], DType::F16);
     let b_repacked = ops::marlin_repack(dev, &bqw_t, k, m, GB10_SMS, MARLIN_MAX_SHARED_MEM)?;
-    let num_groups = k / MARLIN_GROUP_SIZE;
+    let num_groups = k / gs;
     let b_scales = ops::marlin_permute_scales(dev, &scales_raw, num_groups, m)?;
     // F-85 round-10 (lever 1): resolve the auto-config ONCE per weight
     // shape at load time instead of paying marlin_mm's per-call
     // cudaFuncGetAttributes probe loop on every one of the ~320 decode
     // calls/step that share this (m,k).
     let (thread_k, thread_n, blocks_per_sm) =
-        ops::marlin_pick_config(dev, 1, m, k, MARLIN_GROUP_SIZE, GB10_SMS)?;
+        ops::marlin_pick_config(dev, 1, m, k, gs, GB10_SMS)?;
     Ok(MarlinWeight { b_repacked, b_scales, thread_k, thread_n, blocks_per_sm })
 }
 
