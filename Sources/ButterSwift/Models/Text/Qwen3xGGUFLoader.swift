@@ -128,6 +128,37 @@
 // ~2) would silently corrupt every norm in the model — this was caught
 // by dumping real tensor values before writing the loader, not assumed.
 //
+// ─── GDN V-head "grouped ↔ tiled" reorder ──────────────────────────────
+//
+// The GGUF export for a GQA-style GDN mixer (`linear_num_key_heads !=
+// linear_num_value_heads` — Qwen3.6-27B is 16 K-heads / 48 V-heads, a
+// 3-V-per-K grouping) reorders every V-associated tensor from HF's
+// native "grouped by K head" row/column order
+// (`[K0_v0..v2, K1_v0..v2, ..., K15_v0..v2]`) into a "tiled" order
+// (`[K0_v0, K1_v0, ..., K15_v0, K0_v1, K1_v1, ..., K15_v2]`) that the
+// GGUF-side kernel wants for a cheap broadcast-repeat. This touches the
+// V rows of the fused `attn_qkv` projection, the whole of `attn_gate`
+// (z) / `ssm_alpha` (a) / `ssm_beta` (b), `ssm_a` (A_log) and
+// `ssm_dt.bias`, the V channels of `ssm_conv1d`, and the INPUT
+// (column) dimension of `ssm_out` (out_proj) — i.e. every GDN tensor
+// this loader touches except the QK-only rows/channels and the norm
+// weight (which is per-value-head-dim, not per-head, so head order
+// doesn't apply). Butter's `Qwen35GDNMixer` was built and validated
+// against HF safetensors and indexes V heads in the native grouped
+// order (`gatedDeltaQKNormPrepass`'s `vHeadIdx / (hv/hk)` K-group
+// derivation assumes it), so every one of these tensors must be
+// un-reordered back to grouped order before requant. Root-caused via
+// this file's own layer-diff method against the MLX-safetensors
+// oracle: layer-0 full-attention output matched the oracle almost
+// exactly while layer-0 GDN output diverged (cosine < 0.5), isolating
+// the corruption to the GDN mixer's weights specifically — not RoPE,
+// not the full-attention q/k/v/gate packing (both already ruled out).
+// The transform is a plain 2-axis transpose and therefore its own
+// inverse under the swapped block sizes; `vHeadUnReorderPermutation`
+// below computes it once and every site applies the same permutation.
+// A checkpoint where `linear_num_key_heads == linear_num_value_heads`
+// (no grouping) makes this a no-op, matching the exporter's own guard.
+//
 // ─── MTP (multi-token prediction) — NOT wired ─────────────────────────
 //
 // GGUF's `blk.<block_count-1>.nextn.*` tensors (the MTP draft head) are
@@ -227,6 +258,14 @@ enum Qwen3xGGUFLoader {
         let linearNumValueHeads = valueDim / linearValueHeadDim
         let keyDim = linearKeyHeadDim * linearNumKeyHeads
         let convDim = keyDim * 2 + valueDim
+
+        // See file header — GDN V-head grouped↔tiled reorder. `nil`
+        // (no-op) when there's no K/V head grouping to reorder.
+        let numVPerK = linearNumKeyHeads > 0 ? linearNumValueHeads / linearNumKeyHeads : 1
+        let vHeadUnPerm: [Int]? =
+            (linearNumKeyHeads > 0 && numVPerK > 1)
+            ? vHeadUnReorderPermutation(numKHeads: linearNumKeyHeads, numVPerK: numVPerK)
+            : nil
 
         // vocab_size — derived from token_embd.weight's element count
         // (hidden is already known), not hardcoded, so this loader
@@ -335,11 +374,20 @@ enum Qwen3xGGUFLoader {
             }
         }
 
-        func addDense2D(key: String, ggufName: String, outDim: Int, inDim: Int) throws {
+        // `rowPermute`/`columnPermute` un-reorder the GDN V-head
+        // grouped↔tiled export convention (see file header) — applied
+        // to the dequanted f32 floats before bf16 cast + requant so
+        // the permutation is exact (no rounding interaction).
+        func addDense2D(
+            key: String, ggufName: String, outDim: Int, inDim: Int,
+            rowPermute: (offset: Int, perm: [Int], blockSize: Int)? = nil,
+            columnPermute: (perm: [Int], blockSize: Int)? = nil
+        ) throws {
             let bits = try requantBits(for: ggufName)
             let dense = try autoreleasepool {
                 try materializeDense2D(
-                    reader: reader, name: ggufName, outDim: outDim, inDim: inDim, device: device)
+                    reader: reader, name: ggufName, outDim: outDim, inDim: inDim, device: device,
+                    rowPermute: rowPermute, columnPermute: columnPermute)
             }
             autoreleasepool {
                 addQuantizedLinear(
@@ -361,8 +409,16 @@ enum Qwen3xGGUFLoader {
         // (`A_log`/`dt_bias` — converted to `[Float]` via
         // `readFloats35` and never touch a dtype-checked GPU kernel)
         // pass `.f32` explicitly to keep full source precision.
-        func addVector(key: String, ggufName: String, n: Int, dtype: DType = .bf16) throws {
-            let floats = try materializeFlatF32Array(reader: reader, name: ggufName, nValues: n)
+        // `perm` un-reorders a GDN V-head vector (see file header) —
+        // a length-`n` array of per-head scalars, so blockSize is
+        // always 1 here.
+        func addVector(
+            key: String, ggufName: String, n: Int, dtype: DType = .bf16, perm: [Int]? = nil
+        ) throws {
+            var floats = try materializeFlatF32Array(reader: reader, name: ggufName, nValues: n)
+            if let perm {
+                applyRowBlockPermutation(&floats, rowOffset: 0, perm: perm, blockSize: 1, numCols: 1)
+            }
             let t = Tensor.empty(shape: [n], dtype: dtype, device: device)
             switch dtype {
             case .f32: t.copyIn(from: floats)
@@ -405,37 +461,59 @@ enum Qwen3xGGUFLoader {
 
             if layerTypes[i] == "linear_attention" {
                 let lp = "\(p).linear_attn"
+                // See file header — GDN V-head grouped↔tiled reorder.
+                // `in_proj_qkv`'s V rows start after the Q and K blocks
+                // (rowOffset: 2*keyDim); every other V-associated
+                // tensor here is V-only across its full extent.
                 try addDense2D(
                     key: "\(lp).in_proj_qkv", ggufName: "\(g).attn_qkv.weight",
-                    outDim: convDim, inDim: hidden)
+                    outDim: convDim, inDim: hidden,
+                    rowPermute: vHeadUnPerm.map {
+                        (offset: 2 * keyDim, perm: $0, blockSize: linearValueHeadDim)
+                    })
                 try addDense2D(
                     key: "\(lp).in_proj_z", ggufName: "\(g).attn_gate.weight",
-                    outDim: valueDim, inDim: hidden)
+                    outDim: valueDim, inDim: hidden,
+                    rowPermute: vHeadUnPerm.map { (offset: 0, perm: $0, blockSize: linearValueHeadDim) })
                 try addDense2D(
                     key: "\(lp).in_proj_a", ggufName: "\(g).ssm_alpha.weight",
-                    outDim: linearNumValueHeads, inDim: hidden)
+                    outDim: linearNumValueHeads, inDim: hidden,
+                    rowPermute: vHeadUnPerm.map { (offset: 0, perm: $0, blockSize: 1) })
                 try addDense2D(
                     key: "\(lp).in_proj_b", ggufName: "\(g).ssm_beta.weight",
-                    outDim: linearNumValueHeads, inDim: hidden)
+                    outDim: linearNumValueHeads, inDim: hidden,
+                    rowPermute: vHeadUnPerm.map { (offset: 0, perm: $0, blockSize: 1) })
                 try addDense2D(
                     key: "\(lp).out_proj", ggufName: "\(g).ssm_out.weight",
-                    outDim: hidden, inDim: valueDim)
+                    outDim: hidden, inDim: valueDim,
+                    columnPermute: vHeadUnPerm.map { (perm: $0, blockSize: linearValueHeadDim) })
 
                 // conv1d.weight: raw on-disk layout is c-major / k-fastest
                 // (row r = channel r's `convKernel` taps), matching what
                 // `transposeConv1dWeight35` expects as its flat input —
                 // see the file header for why the shape is `[C, K, 1]`
                 // (trailing-1 "already sanitized" marker) rather than the
-                // physically-accurate `[C, K]`.
-                let convFloats = try materializeFlatF32Array(
+                // physically-accurate `[C, K]`. The V channels (rows
+                // `2*keyDim..<convDim`, same offset as `in_proj_qkv`
+                // above) carry the same grouped↔tiled reorder as every
+                // other V-associated GDN tensor — see file header.
+                var convFloats = try materializeFlatF32Array(
                     reader: reader, name: "\(g).ssm_conv1d.weight",
                     nValues: convDim * convKernel)
+                if let vHeadUnPerm {
+                    applyRowBlockPermutation(
+                        &convFloats, rowOffset: 2 * keyDim, perm: vHeadUnPerm,
+                        blockSize: linearValueHeadDim, numCols: convKernel)
+                }
                 let convT = Tensor.empty(shape: [convDim, convKernel, 1], dtype: .f32, device: device)
                 convT.copyIn(from: convFloats)
                 entries["\(lp).conv1d.weight"] = SafeTensorsFile.Entry(
                     name: "\(lp).conv1d.weight", dtype: .f32,
                     shape: [convDim, convKernel, 1], buffer: convT.buffer)
 
+                // `ssm_norm` is a single `[linearValueHeadDim]` vector
+                // shared across every V head (not per-head), so no
+                // V-head reorder applies here.
                 try addVector(key: "\(lp).norm.weight", ggufName: "\(g).ssm_norm.weight", n: linearValueHeadDim)
 
                 // GGUF's `ssm_a` is llama.cpp's PRE-COMPUTED `-exp(A_log)`,
@@ -468,7 +546,14 @@ enum Qwen3xGGUFLoader {
                 // characteristic NaN/garbage of a shape or dtype bug.
                 let ssmARaw = try materializeFlatF32Array(
                     reader: reader, name: "\(g).ssm_a", nValues: linearNumValueHeads)
-                let aLogFed = ssmARaw.map { Foundation.log(-$0) }
+                var aLogFed = ssmARaw.map { Foundation.log(-$0) }
+                // Same GDN V-head grouped↔tiled reorder as every other
+                // V-indexed tensor above — see file header. A_log is
+                // one scalar per V head, so blockSize is 1.
+                if let vHeadUnPerm {
+                    applyRowBlockPermutation(
+                        &aLogFed, rowOffset: 0, perm: vHeadUnPerm, blockSize: 1, numCols: 1)
+                }
                 let aLogT = Tensor.empty(shape: [linearNumValueHeads], dtype: .f32, device: device)
                 aLogT.copyIn(from: aLogFed)
                 entries["\(lp).A_log"] = SafeTensorsFile.Entry(
@@ -481,9 +566,10 @@ enum Qwen3xGGUFLoader {
                 // default. No value transform needed (GGUF's `ssm_dt.bias`
                 // is the same additive bias in both conventions — it
                 // enters the softplus argument identically either way).
+                // Same GDN V-head reorder as A_log (one scalar per V head).
                 try addVector(
                     key: "\(lp).dt_bias", ggufName: "\(g).ssm_dt.bias", n: linearNumValueHeads,
-                    dtype: .f32)
+                    dtype: .f32, perm: vHeadUnPerm)
             } else {
                 let ap = "\(p).self_attn"
                 let qOutDim = 2 * nHeads * headDim  // [query | gate] per head
@@ -537,10 +623,25 @@ enum Qwen3xGGUFLoader {
     /// activations. This was caught empirically: an f32 first pass
     /// loaded cleanly but crashed on the first forward step with
     /// `Ops.siluCastF32PlusCastF32Two: unsupported dtype f32`.
+    ///
+    /// `rowPermute`/`columnPermute` un-reorder the GDN V-head
+    /// grouped↔tiled export convention (see file header) — applied to
+    /// the dequanted f32 floats before the bf16 cast below.
     private static func materializeDense2D(
-        reader: GGUFReader, name: String, outDim: Int, inDim: Int, device: Device
+        reader: GGUFReader, name: String, outDim: Int, inDim: Int, device: Device,
+        rowPermute: (offset: Int, perm: [Int], blockSize: Int)? = nil,
+        columnPermute: (perm: [Int], blockSize: Int)? = nil
     ) throws -> Tensor {
-        let floats = try materializeFlatF32Array(reader: reader, name: name, nValues: outDim * inDim)
+        var floats = try materializeFlatF32Array(reader: reader, name: name, nValues: outDim * inDim)
+        if let rowPermute {
+            applyRowBlockPermutation(
+                &floats, rowOffset: rowPermute.offset, perm: rowPermute.perm,
+                blockSize: rowPermute.blockSize, numCols: inDim)
+        }
+        if let columnPermute {
+            applyColumnBlockPermutation(
+                &floats, perm: columnPermute.perm, blockSize: columnPermute.blockSize, numRows: outDim)
+        }
         let t = Tensor.empty(shape: [outDim, inDim], dtype: .bf16, device: device)
         t.copyIn(from: floatsToBF16(floats))
         return t
@@ -557,6 +658,76 @@ enum Qwen3xGGUFLoader {
             let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
             return UInt16(rounded >> 16)
         }
+    }
+
+    // ─── GDN V-head un-reorder ──────────────────────────────────────────
+    // See the file header for the full explanation of what this undoes
+    // and why.
+
+    /// `perm[dstBlock] = srcBlock` — un-reorders llama.cpp's GDN V-head
+    /// "tiled" GGUF export order back to HF's native "grouped by K
+    /// head" order. A 2-axis transpose is its own inverse under the
+    /// swapped block-size labelling: the exporter reshapes
+    /// `[numKHeads, numVPerK, headDim]` and swaps the first two axes to
+    /// get tiled order; reading tiled data back as
+    /// `[numVPerK, numKHeads, headDim]` and swapping those same two
+    /// axes recovers the original. `perm` encodes exactly that second
+    /// swap as a block-index lookup so callers never need to reshape.
+    private static func vHeadUnReorderPermutation(numKHeads: Int, numVPerK: Int) -> [Int] {
+        var perm = [Int](repeating: 0, count: numKHeads * numVPerK)
+        for v in 0..<numVPerK {
+            for k in 0..<numKHeads {
+                let srcBlock = v * numKHeads + k  // position in the GGUF (tiled) data
+                let dstBlock = k * numVPerK + v  // position HF (grouped) order wants
+                perm[dstBlock] = srcBlock
+            }
+        }
+        return perm
+    }
+
+    /// Apply a block permutation along the ROW axis of a row-major
+    /// `[perm.count * blockSize, numCols]` flat array, optionally
+    /// starting at `rowOffset` rows in — lets callers reorder just the
+    /// V-slice of a larger fused matrix (`in_proj_qkv`, `ssm_conv1d`)
+    /// without touching the Q/K rows ahead of it.
+    private static func applyRowBlockPermutation(
+        _ flat: inout [Float], rowOffset: Int, perm: [Int], blockSize: Int, numCols: Int
+    ) {
+        let sliceLen = perm.count * blockSize * numCols
+        var out = [Float](repeating: 0, count: sliceLen)
+        let base = rowOffset * numCols
+        for (dstBlock, srcBlock) in perm.enumerated() {
+            let srcBase = srcBlock * blockSize * numCols
+            let dstBase = dstBlock * blockSize * numCols
+            for i in 0..<(blockSize * numCols) {
+                out[dstBase + i] = flat[base + srcBase + i]
+            }
+        }
+        for i in 0..<sliceLen {
+            flat[base + i] = out[i]
+        }
+    }
+
+    /// Apply a block permutation along the COLUMN axis of a row-major
+    /// `[numRows, perm.count * blockSize]` flat array — `out_proj`
+    /// carries its V-head structure in its INPUT (column) dimension,
+    /// not its rows, since it's `valueDim → hidden`.
+    private static func applyColumnBlockPermutation(
+        _ flat: inout [Float], perm: [Int], blockSize: Int, numRows: Int
+    ) {
+        let numCols = perm.count * blockSize
+        var out = [Float](repeating: 0, count: flat.count)
+        for r in 0..<numRows {
+            let rowBase = r * numCols
+            for (dstBlock, srcBlock) in perm.enumerated() {
+                let srcOff = rowBase + srcBlock * blockSize
+                let dstOff = rowBase + dstBlock * blockSize
+                for i in 0..<blockSize {
+                    out[dstOff + i] = flat[srcOff + i]
+                }
+            }
+        }
+        flat = out
     }
 
     /// Read + dequant (if needed) a named GGUF tensor to a flat `[Float]`
