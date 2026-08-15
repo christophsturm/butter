@@ -1322,6 +1322,30 @@ public final class Model: @unchecked Sendable {
         device: Device = .shared
     ) async throws -> Model {
         Debug.log(.load, "Model.load id-or-path=\(idOrPath)")
+
+        // A bare `.gguf` file path bypasses the HF-directory pipeline
+        // entirely (no `config.json`, no `SafeTensorsBundle` — the GGUF
+        // carries its own metadata + tokenizer). Checked before the
+        // `ModelLocator` resolution below, which expects a directory or
+        // a downloadable HF repo id, neither of which a single `.gguf`
+        // file is.
+        if idOrPath.hasSuffix(".gguf"), FileManager.default.fileExists(atPath: idOrPath) {
+            let model = try await Profile.timeAsync("model_load") {
+                try await Profile.signpostAsync("model_load") {
+                    try Model.loadGGUF(path: idOrPath, options: options, device: device)
+                }
+            }
+            if options.prewarm {
+                await Profile.timeAsync("prewarm") {
+                    await Profile.signpostAsync("prewarm") {
+                        await model.prewarm()
+                    }
+                }
+            }
+            model.emit(ModelLifecycleEvent(state: .ready))
+            return model
+        }
+
         let model = try await Profile.timeAsync("model_load") {
             try await Profile.signpostAsync("model_load") {
                 let locator = ModelLocator(
@@ -1382,6 +1406,50 @@ public final class Model: @unchecked Sendable {
 
         model.emit(ModelLifecycleEvent(state: .ready))
         return model
+    }
+
+    /// GGUF entry point for `load(_:)` — parses the file, dispatches by
+    /// `general.architecture`, and builds the tokenizer straight from
+    /// the embedded `tokenizer.ggml.*` metadata (no external
+    /// `tokenizer.json` — a bare `.gguf` file has no sibling directory
+    /// to look for one in). Wraps the result exactly like the
+    /// safetensors path. Only the Qwen3.5/3.6 ("qwen35") architecture
+    /// has a `loadModelFromGGUF` override today — see
+    /// `Qwen3xGGUFLoader.swift`; every other family's default
+    /// `loadModelFromGGUF` throws `unsupportedConfig`, surfaced here as
+    /// `ModelError.unsupportedArchitecture`.
+    private static func loadGGUF(
+        path: String, options: LoadOptions, device: Device
+    ) throws -> Model {
+        let url = URL(fileURLWithPath: path)
+        let gguf = try GGUFTensorBundle(url: url)
+        guard let arch = gguf.architecture else {
+            throw ModelError.unsupportedArchitecture("(missing general.architecture)")
+        }
+        Debug.log(.load, "GGUF config: arch=\(arch) name=\(gguf.modelName ?? "?")")
+
+        let loaded: ModelRegistry.Loaded
+        let config = ModelConfig(architecture: arch, modelType: arch, raw: [:])
+        switch arch {
+        case "qwen35":
+            let engine = try Qwen35Hybrid.loadModelFromGGUF(
+                config: config, gguf: gguf, options: options, device: device)
+            loaded = ModelRegistry.Loaded(
+                engine: engine,
+                defaultGenerationParameters: Qwen35Hybrid.defaultGenerationParameters)
+        default:
+            throw ModelError.unsupportedArchitecture(arch)
+        }
+
+        let tokenizer = try gguf.tokenizer()
+        return Model(
+            engine: loaded.engine, tokenizer: tokenizer, config: config,
+            modelDirectory: url.deletingLastPathComponent(),
+            availableCapabilities: loaded.availableCapabilities,
+            enabledCapabilities: options.capabilities,
+            defaultGenerationParameters: loaded.defaultGenerationParameters,
+            vlModel: loaded.vlModel
+        )
     }
 
     /// Compile PSOs for the kernels we'll need during decode by running

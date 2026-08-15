@@ -181,6 +181,25 @@ public struct Qwen35Hybrid: Qwen35Variant {
         repetitionPenalty: 1.0
     )
 
+    /// GGUF entry point — translates the checkpoint into an in-memory
+    /// `SafeTensorsBundle` (dequant + requant to Butter's native int4)
+    /// and delegates to `loadModel` below. See `Qwen3xGGUFLoader.swift`
+    /// for the full tensor-mapping + config-derivation rationale.
+    public static func loadModelFromGGUF(
+        config: ModelConfig,
+        gguf: GGUFTensorBundle,
+        options: LoadOptions,
+        device: Device
+    ) throws -> Qwen35Model {
+        if let arch = gguf.architecture, arch != "qwen35" {
+            Debug.log(
+                .load,
+                "Qwen3xGGUF: general.architecture='\(arch)' (expected 'qwen35') — "
+                    + "attempting load anyway since the qwen35.* metadata namespace matched")
+        }
+        return try Qwen3xGGUFLoader.loadModel(gguf: gguf, options: options, device: device)
+    }
+
     public static func loadModel(
         config: ModelConfig,
         weights: SafeTensorsBundle,
@@ -411,6 +430,10 @@ public struct Qwen35Hybrid: Qwen35Variant {
         precondition(
             activationDtype == .f32 || activationDtype == .bf16 || activationDtype == .f16,
             "Qwen3.5: unexpected activation dtype \(activationDtype)")
+        Debug.log(
+            .load,
+            "Qwen3.5: activationDtype=\(activationDtype) isQuantizedEmbed="
+                + "\(weights.isQuantized("\(modelPrefix).embed_tokens")) embedW.dtype=\(embedW.dtype)")
         // `loadEmbedding` picks Embedding vs QuantizedEmbedding based on
         // the bundle's quant triplet — Qwen3.6's quantized embed is
         // routed through `dequantGather` automatically.
@@ -4493,7 +4516,13 @@ private func zeroVector35(_ n: Int, dtype: DType, device: Device) -> Tensor {
 /// Transpose HF conv1d.weight `[C, K, 1]` → `[K, C]` for the iron
 /// conv kernel. The trailing `1` is the depthwise group dim; row-major
 /// the source is `[c][k]`-ordered.
-private func transposeConv1dWeight35(
+///
+/// `internal` (not `private`) so `Qwen3xGGUFLoader.swift` can reuse it:
+/// GGUF's `ssm_conv1d.weight` ships in the same raw `[c][k]`-ordered
+/// row-major layout as unsanitized HF safetensors (K contiguous, C
+/// outer — see `Qwen3xGGUFLoader`'s tensor-mapping notes), so the exact
+/// same transpose applies unchanged.
+func transposeConv1dWeight35(
     src: Tensor, kernel K: Int, channels C: Int,
     dtype: DType, device: Device
 ) -> Tensor {
