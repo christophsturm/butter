@@ -173,3 +173,56 @@ struct SafeTensorsTests {
         #expect(bundle.allKeys.sorted() == ["a", "b"])
     }
 }
+
+// ─── In-memory adapter (used by Qwen3xGGUFLoader) ─────────────────────
+
+@Suite("SafeTensors in-memory adapter")
+struct SafeTensorsInMemoryTests {
+    /// `SafeTensorsFile.init(url:entries:)` / `SafeTensorsBundle
+    /// .init(inMemory:directory:)` — no disk file — is how
+    /// `Qwen3xGGUFLoader` reuses `loadLinear`/`isQuantized`/
+    /// `quantizedTriplet` for a GGUF checkpoint. Verify the roundtrip
+    /// (tensor lookup, quantized-triplet detection) works identically
+    /// to the disk-backed path these tests exercise above.
+    @Test("plain f32 tensor roundtrips through tensor(named:)")
+    func plainTensorRoundtrip() throws {
+        let device = Device.shared
+        let t = Tensor.empty(shape: [4], dtype: .f32, device: device)
+        t.copyIn(from: [Float](arrayLiteral: 1, 2, 3, 4))
+        let entry = SafeTensorsFile.Entry(name: "x.weight", dtype: .f32, shape: [4], buffer: t.buffer)
+        let file = SafeTensorsFile(url: URL(fileURLWithPath: "/synthetic.gguf"), entries: ["x.weight": entry])
+        let bundle = SafeTensorsBundle(inMemory: file, directory: URL(fileURLWithPath: "/"))
+
+        #expect(bundle.has("x.weight"))
+        #expect(bundle.allKeys == ["x.weight"])
+        let readBack = try bundle.tensor(named: "x.weight")
+        #expect(readBack.toArray(as: Float.self) == [1, 2, 3, 4])
+    }
+
+    @Test("quantized triplet is detected via isQuantized/quantizedTriplet")
+    func quantizedTripletRoundtrip() throws {
+        let device = Device.shared
+        func entry(_ name: String, dtype: DType, shape: [Int]) -> SafeTensorsFile.Entry {
+            let t = Tensor.empty(shape: shape, dtype: dtype, device: device)
+            t.zero()
+            return SafeTensorsFile.Entry(name: name, dtype: dtype, shape: shape, buffer: t.buffer)
+        }
+        let entries: [String: SafeTensorsFile.Entry] = [
+            "w.weight": entry("w.weight", dtype: .u32, shape: [8, 2]),
+            "w.scales": entry("w.scales", dtype: .bf16, shape: [8, 1]),
+            "w.biases": entry("w.biases", dtype: .bf16, shape: [8, 1]),
+            // A plain (non-quantized) tensor alongside it — isQuantized
+            // must stay scoped to the exact base name.
+            "n.weight": entry("n.weight", dtype: .f32, shape: [8]),
+        ]
+        let file = SafeTensorsFile(url: URL(fileURLWithPath: "/synthetic.gguf"), entries: entries)
+        let bundle = SafeTensorsBundle(inMemory: file, directory: URL(fileURLWithPath: "/"))
+
+        #expect(bundle.isQuantized("w"))
+        #expect(!bundle.isQuantized("n"))
+        let triplet = try bundle.quantizedTriplet("w")
+        #expect(triplet.weight.dtype == .u32)
+        #expect(triplet.scales.dtype == .bf16)
+        #expect(triplet.biases.dtype == .bf16)
+    }
+}

@@ -181,6 +181,25 @@ public struct Qwen35Hybrid: Qwen35Variant {
         repetitionPenalty: 1.0
     )
 
+    /// GGUF entry point — translates the checkpoint into an in-memory
+    /// `SafeTensorsBundle` (dequant + requant to Butter's native int4)
+    /// and delegates to `loadModel` below. See `Qwen3xGGUFLoader.swift`
+    /// for the full tensor-mapping + config-derivation rationale.
+    public static func loadModelFromGGUF(
+        config: ModelConfig,
+        gguf: GGUFTensorBundle,
+        options: LoadOptions,
+        device: Device
+    ) throws -> Qwen35Model {
+        if let arch = gguf.architecture, arch != "qwen35" {
+            Debug.log(
+                .load,
+                "Qwen3xGGUF: general.architecture='\(arch)' (expected 'qwen35') — "
+                    + "attempting load anyway since the qwen35.* metadata namespace matched")
+        }
+        return try Qwen3xGGUFLoader.loadModel(gguf: gguf, options: options, device: device)
+    }
+
     public static func loadModel(
         config: ModelConfig,
         weights: SafeTensorsBundle,
@@ -411,6 +430,10 @@ public struct Qwen35Hybrid: Qwen35Variant {
         precondition(
             activationDtype == .f32 || activationDtype == .bf16 || activationDtype == .f16,
             "Qwen3.5: unexpected activation dtype \(activationDtype)")
+        Debug.log(
+            .load,
+            "Qwen3.5: activationDtype=\(activationDtype) isQuantizedEmbed="
+                + "\(weights.isQuantized("\(modelPrefix).embed_tokens")) embedW.dtype=\(embedW.dtype)")
         // `loadEmbedding` picks Embedding vs QuantizedEmbedding based on
         // the bundle's quant triplet — Qwen3.6's quantized embed is
         // routed through `dequantGather` automatically.
@@ -3863,6 +3886,11 @@ public final class Qwen35Model: LanguageModel {
             embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
         }
 
+        // See `Sources/ButterSwift/Telemetry/InspectTap.swift` — no-op
+        // when BUTTER_INSPECT isn't set. `butter inspect --layer-trace`.
+        let tap = InspectTap.fromEnvironment
+        workCmd = tap.dumpLayerBoundary(h, label: "embed_out", layer: -1, cmd: workCmd, device: device)
+
         Profile.signpost("model.layer_loop") {
             for (i, layer) in layers.enumerated() {
                 h = layer.decode(
@@ -3876,6 +3904,8 @@ public final class Qwen35Model: LanguageModel {
                 default: committed = false
                 }
                 if committed { workCmd = device.makeCommandBuffer() }
+                let kind = layer is Qwen35AttentionLayer ? "attn" : (layer is Qwen35GDNLayer ? "gdn" : "other")
+                workCmd = tap.dumpLayerBoundary(h, label: "\(kind)_out", layer: i, cmd: workCmd, device: device)
             }
         }
 
@@ -4201,6 +4231,11 @@ public final class Qwen35Model: LanguageModel {
         let dt = h.dtype
         let dtBytes = dt.byteSize
 
+        // See `Sources/ButterSwift/Telemetry/InspectTap.swift` — no-op
+        // when BUTTER_INSPECT isn't set. `butter inspect --layer-trace`.
+        let tap = InspectTap.fromEnvironment
+        workCmd = tap.dumpLayerBoundary(h, label: "embed_out", layer: -1, cmd: workCmd, device: device)
+
         if profileLayers {
             workCmd.commit()
             workCmd.waitUntilCompleted()
@@ -4308,6 +4343,8 @@ public final class Qwen35Model: LanguageModel {
                     nOther += 1
                 }
             }
+            let kind = layer is Qwen35AttentionLayer ? "attn" : (layer is Qwen35GDNLayer ? "gdn" : "other")
+            workCmd = tap.dumpLayerBoundary(h, label: "\(kind)_out", layer: i, cmd: workCmd, device: device)
             }  // autoreleasepool
         }
 
@@ -4493,7 +4530,13 @@ private func zeroVector35(_ n: Int, dtype: DType, device: Device) -> Tensor {
 /// Transpose HF conv1d.weight `[C, K, 1]` → `[K, C]` for the iron
 /// conv kernel. The trailing `1` is the depthwise group dim; row-major
 /// the source is `[c][k]`-ordered.
-private func transposeConv1dWeight35(
+///
+/// `internal` (not `private`) so `Qwen3xGGUFLoader.swift` can reuse it:
+/// GGUF's `ssm_conv1d.weight` ships in the same raw `[c][k]`-ordered
+/// row-major layout as unsanitized HF safetensors (K contiguous, C
+/// outer — see `Qwen3xGGUFLoader`'s tensor-mapping notes), so the exact
+/// same transpose applies unchanged.
+func transposeConv1dWeight35(
     src: Tensor, kernel K: Int, channels C: Int,
     dtype: DType, device: Device
 ) -> Tensor {
