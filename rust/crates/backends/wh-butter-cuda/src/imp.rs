@@ -433,18 +433,69 @@ impl Device for CudaDevice {
         self.dev.moe_grouped_cutlass(ab.ptr, wb.ptr, ob.ptr, group_rows, expert_ids, n, k).map_err(dispatch_err)
     }
 
-    // NOTE(rebrand-merge): PR #70 also implemented moe_marlin_gemm /
-    // marlin_repack / marlin_build_routing here, calling through to
-    // `self.dev.{moe_marlin_gemm,marlin_repack,marlin_build_routing}` on the
-    // raw `wh_iron_runtime::CudaDevice`. Those methods don't exist on
-    // `thewafflehaus/iron@dev`'s CudaDevice — the marlin/NVFP4 CUDA runtime
-    // support was apparently only ever on the pre-rebrand kernel-toolchain
-    // fork this branch was originally pinned to. Left unimplemented here
-    // (falls through to the wh-butter-core default "unsupported on this
-    // backend" stub) until the iron runtime crate grows real marlin
-    // support; re-add the three pass-through impls verbatim from this
-    // crate's pre-rebrand-merge git history (PR #70 / a27773ec, `src/imp.rs`)
-    // once it does.
+    // NOTE(rebrand-merge, resolved F-85 round-8): PR #70's moe_marlin_gemm /
+    // marlin_repack / marlin_build_routing pass-throughs assumed the
+    // pre-rebrand kernel-toolchain fork's NVFP4-flavored CudaDevice methods,
+    // which don't exist on this branch's wh-iron-runtime. Rather than
+    // resurrect that NVFP4 (kFE2M1F, global_scale/topk_weights-bearing)
+    // surface, round-8 gives wh-iron-runtime its own from-scratch marlin
+    // support scoped to the symmetric U4B8 decode GEMM (marlin_repack,
+    // marlin_permute_scales, marlin_build_routing, marlin_gemm_u4b8_f16 in
+    // `crates/wh-iron-runtime/src/device/cuda/marlin.rs`). marlin_repack and
+    // marlin_build_routing happen to share this trait's pre-existing generic
+    // signatures verbatim, so those two are wired below unchanged from the
+    // PR #70 shape; marlin_permute_scales and marlin_gemm_u4b8_f16 are new
+    // (moe_marlin_gemm, the generic multi-expert NVFP4 entry point, is left
+    // unimplemented -- no CudaDevice-side backer for it yet).
+    #[allow(clippy::too_many_arguments)]
+    fn marlin_repack(
+        &self, b_q: &dyn DeviceBuffer, out: &dyn DeviceBuffer,
+        size_k: usize, size_n: usize, sms: i32, max_shared_mem: i32,
+    ) -> Result<()> {
+        let g = |x: &dyn DeviceBuffer, nm: &str| x.as_any().downcast_ref::<CudaBuffer>().map(|b| b.ptr)
+            .ok_or_else(|| Error::Msg(format!("marlin_repack: {nm} not CudaBuffer")));
+        self.dev.marlin_repack(g(b_q, "b_q")?, g(out, "out")?, size_k, size_n, sms, max_shared_mem)
+            .map_err(dispatch_err)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn marlin_build_routing(&self, off: &dyn DeviceBuffer, n_exp: usize, blk: usize, mt: usize, stid: &dyn DeviceBuffer, eid: &dyn DeviceBuffer, ntpp: &dyn DeviceBuffer) -> Result<()> {
+        let g = |x: &dyn DeviceBuffer, nm: &str| x.as_any().downcast_ref::<CudaBuffer>().map(|b| b.ptr)
+            .ok_or_else(|| Error::Msg(format!("marlin_build_routing: {nm} not CudaBuffer")));
+        self.dev.marlin_build_routing(g(off, "off")?, n_exp, blk, mt, g(stid, "stid")?, g(eid, "eid")?, g(ntpp, "ntpp")?)
+            .map_err(dispatch_err)
+    }
+
+    fn marlin_permute_scales(
+        &self, in_: &dyn DeviceBuffer, out: &dyn DeviceBuffer,
+        num_groups: usize, size_n: usize,
+    ) -> Result<()> {
+        let g = |x: &dyn DeviceBuffer, nm: &str| x.as_any().downcast_ref::<CudaBuffer>().map(|b| b.ptr)
+            .ok_or_else(|| Error::Msg(format!("marlin_permute_scales: {nm} not CudaBuffer")));
+        self.dev.marlin_permute_scales(g(in_, "in_")?, g(out, "out")?, num_groups, size_n)
+            .map_err(dispatch_err)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn marlin_gemm_u4b8_f16(
+        &self,
+        a: &dyn DeviceBuffer, b_repacked: &dyn DeviceBuffer, c: &dyn DeviceBuffer, c_tmp: &dyn DeviceBuffer,
+        b_scales: &dyn DeviceBuffer,
+        sorted_token_ids: &dyn DeviceBuffer, expert_ids: &dyn DeviceBuffer, num_tokens_past_padded: &dyn DeviceBuffer,
+        workspace: &dyn DeviceBuffer,
+        prob_m: usize, prob_n: usize, prob_k: usize, num_groups: usize, group_size: usize,
+        sms: i32, use_fp32_reduce: bool,
+    ) -> Result<()> {
+        let g = |x: &dyn DeviceBuffer, nm: &str| x.as_any().downcast_ref::<CudaBuffer>().map(|b| b.ptr)
+            .ok_or_else(|| Error::Msg(format!("marlin_gemm_u4b8_f16: {nm} not CudaBuffer")));
+        self.dev.marlin_gemm_u4b8_f16(
+            g(a, "a")?, g(b_repacked, "b_repacked")?, g(c, "c")?, g(c_tmp, "c_tmp")?,
+            g(b_scales, "b_scales")?,
+            g(sorted_token_ids, "sorted_token_ids")?, g(expert_ids, "expert_ids")?, g(num_tokens_past_padded, "num_tokens_past_padded")?,
+            g(workspace, "workspace")?,
+            prob_m, prob_n, prob_k, num_groups, group_size, sms, use_fp32_reduce,
+        ).map_err(dispatch_err)
+    }
 
     fn moe_grouped_cutlass_fp4(
         &self,

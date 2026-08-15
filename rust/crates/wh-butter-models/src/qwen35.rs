@@ -194,11 +194,23 @@ impl Qwen35Config {
 // Weight loading primitives
 // ─────────────────────────────────────────────────────────────────────────
 
+/// F-85 round-8: the marlin U4B8 repacked-weight + permuted-scale device
+/// buffers for one [`Q4Dense`], built once at load time (see
+/// `build_marlin`/`load_q4dense_routed`) for the 5 dense-projection weight
+/// classes (ffn_gate/up/down, attn_q, gdn attn_qkv) that round-7 measured a
+/// decode-M=1 win on. Kept ALONGSIDE the plain `qs`/`scales` (not instead
+/// of) so `QWEN35_MARLIN=0` is a same-process A/B toggle, not a reload.
+struct MarlinWeight {
+    b_repacked: Tensor, // u32 [k/16, m*2] -- ops::marlin_repack output
+    b_scales: Tensor,   // f16 [k/32, m], permuted -- ops::marlin_permute_scales output
+}
+
 struct Q4Dense {
     qs: Tensor,
     scales: Tensor,
     m: usize,
     k: usize,
+    marlin: Option<MarlinWeight>,
 }
 impl Q4Dense {
     // NOTE (round-2 perf campaign, 2026-08): `ops::gemv_q4_auto` (2-row-per-
@@ -212,9 +224,106 @@ impl Q4Dense {
     // Root cause NOT isolated within this campaign's time budget. DO NOT
     // wire `gemv_q4_auto` here (or anywhere in the real decode path) until
     // that's root-caused — stays on the safe, fully-plain `gemv_q4` path.
+    //
+    // F-85 round-8: the marlin U4B8 path (below, `if let Some(mw)`) is the
+    // decode-M=1 GEMM for the 5 routed weight classes -- verified correct
+    // (round-7, max_rel <=5.3e-4) and verified faster than gemv_q4 at M=1
+    // (0.69x-0.79x). Unlike gemv_q4_auto this is a *different kernel family*
+    // (tensor-core marlin, not a gemv retile), built + oracle-checked fresh
+    // this round -- see the round-8 report for the A/B + oracle numbers.
     fn gemv(&self, dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
+        if let Some(mw) = &self.marlin {
+            // This decode path's hidden state is F32-resident end to end
+            // (`tok_embd` is f32; `gemv_q4` is dtype-polymorphic and just
+            // follows whatever `x.dtype` is, per `gemv_q4_dispatch`'s
+            // `Tensor::empty(dev, ..., x.dtype)`). marlin's C ABI hardwires
+            // f16 activations (`ffai_marlin_gemm_u4b8_f16`'s `A`), so cast
+            // at the boundary and cast the (small, m-wide) output back to
+            // keep the rest of the pipeline's dtype contract unchanged.
+            let routing = marlin_m1_routing(dev)?;
+            let (workspace, c_tmp) = marlin_shared_scratch(dev)?;
+            let need_cast = x.dtype != DType::F16;
+            let x16 = if need_cast { ops::cast_f32_f16(dev, x)? } else { x.clone() };
+            let out16 = ops::marlin_gemm_u4b8_f16(
+                dev, &x16, &mw.b_repacked, &mw.b_scales,
+                &routing.0, &routing.1, &routing.2,
+                workspace, c_tmp,
+                1, self.m, self.k, MARLIN_GROUP_SIZE, GB10_SMS,
+            )?;
+            // marlin's GEMM returns [prob_m,prob_n] = [1,m]; gemv_q4's
+            // convention (and every downstream call site) is flat [m].
+            let out16 = out16.reshaped(vec![self.m]);
+            return if need_cast { ops::cast_f16_f32(dev, &out16) } else { Ok(out16) };
+        }
         ops::gemv_q4(dev, &self.qs, &self.scales, x, self.m, self.k, self.m)
     }
+}
+
+/// GB10 (sm_121a) SM count -- matches the round-7/8 marlin probe harness
+/// and the existing NEMOTRON marlin precedent (`wh-butter-modeltests`).
+const GB10_SMS: i32 = 48;
+/// Matches the round-7 probe harness's `ffai_marlin_repack` call exactly
+/// (a repack-kernel occupancy hint, not correctness-critical, but kept
+/// bit-identical to the verified-working recipe).
+const MARLIN_MAX_SHARED_MEM: i32 = 101376;
+/// K-dimension group size for the u4b8 requant -- matches round-7's GS=32.
+const MARLIN_GROUP_SIZE: usize = 32;
+
+/// F-85 round-8: the marlin routing triple (`sorted_token_ids`/`expert_ids`/
+/// `num_tokens_past_padded`) for the trivial single-"expert" M=1 dense
+/// decode-GEMM case is IDENTICAL for every routed weight (it depends only
+/// on M and the block/expert-count constants, not the weight shape) --
+/// built once per process and cached, not rebuilt on every decode step.
+static MARLIN_M1_ROUTING: std::sync::OnceLock<(Tensor, Tensor, Tensor)> = std::sync::OnceLock::new();
+
+fn marlin_m1_routing(dev: &dyn Device) -> Result<&'static (Tensor, Tensor, Tensor)> {
+    if let Some(r) = MARLIN_M1_ROUTING.get() {
+        return Ok(r);
+    }
+    let off_bytes: Vec<u8> = [0i32, 1i32].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let off = Tensor::new(dev.upload(&off_bytes)?, vec![2], DType::I32);
+    let routing = ops::marlin_build_routing(dev, &off, 1, 8, 1)?;
+    Ok(MARLIN_M1_ROUTING.get_or_init(|| routing))
+}
+
+/// F-85 round-8 (memory-gate fix): `ops::marlin_gemm_u4b8_workspace`'s
+/// sizing formula clamps BOTH `workspace` (`min(N/64*64, sms*4)`) and
+/// `c_tmp` (`min(N*512, sms*4*8*256)*2`) to an SM-count-bound ceiling that
+/// every one of the 4 routed shapes (N in {17408,12288,10240,5120}) hits
+/// -- i.e. the two buffers are the SAME size (192 i32 words / 786432 f32
+/// words = ~3.1MB) for every routed weight on this GPU. Allocating one pair
+/// PER WEIGHT (320 of them: 5 classes x 64 layers) would waste ~1GB on
+/// `c_tmp` alone for zero benefit (decode calls are sequential, never
+/// concurrent) -- one shared, cached pair is correct and ~320x smaller.
+static MARLIN_SCRATCH: std::sync::OnceLock<(Tensor, Tensor)> = std::sync::OnceLock::new();
+
+fn marlin_shared_scratch(dev: &dyn Device) -> Result<(&'static Tensor, &'static Tensor)> {
+    if let Some((w, c)) = MARLIN_SCRATCH.get() {
+        return Ok((w, c));
+    }
+    // Sized off the largest routed N (ffn_gate/up, 17408) -- safe for the
+    // smaller routed N's too since the clamp formula only ever shrinks
+    // toward the same sms-bound ceiling as N grows, never the reverse.
+    let pair = ops::marlin_gemm_u4b8_workspace(dev, 17408, GB10_SMS)?;
+    let (w, c) = MARLIN_SCRATCH.get_or_init(|| pair);
+    Ok((w, c))
+}
+
+/// F-85 round-8: builds the marlin U4B8 repacked-weight + permuted-scale
+/// buffers for one weight DIRECTLY from its GGUF f32 dequant (`flat`,
+/// `[m,k]` row-major) -- not from our own already-lossy `Q4Dense`, so this
+/// doesn't stack a second quantization error on top of the first (the
+/// plan's original "dequant our Q4 -> requant" framing was written before
+/// noticing the loader already holds the pre-Q4 f32 at this call site).
+fn build_marlin(dev: &dyn Device, flat: &[f32], m: usize, k: usize) -> Result<MarlinWeight> {
+    let (bqw, scales_f32) = ops::quantize_u4b8_gptq_g32(flat, m, k);
+    let scales_bytes = f32s_to_f16_bytes(&scales_f32);
+    let bqw_t = Tensor::new(dev.upload(&u32s_to_bytes(&bqw))?, vec![bqw.len()], DType::U32);
+    let scales_raw = Tensor::new(dev.upload(&scales_bytes)?, vec![scales_bytes.len() / 2], DType::F16);
+    let b_repacked = ops::marlin_repack(dev, &bqw_t, k, m, GB10_SMS, MARLIN_MAX_SHARED_MEM)?;
+    let num_groups = k / MARLIN_GROUP_SIZE;
+    let b_scales = ops::marlin_permute_scales(dev, &scales_raw, num_groups, m)?;
+    Ok(MarlinWeight { b_repacked, b_scales })
 }
 
 /// GGUF dims are fastest-first: a 2-D `[out, in]` weight is stored with
@@ -239,7 +348,40 @@ fn load_q4dense(dev: &dyn Device, g: &Gguf, name: &str) -> Result<Q4Dense> {
         scales: Tensor::new(dev.upload(&scales_bytes)?, vec![scales_bytes.len() / 2], DType::F16),
         m,
         k,
+        marlin: None,
     })
+}
+
+/// F-85 round-8: like [`load_q4dense`], but additionally builds the marlin
+/// U4B8 path ([`build_marlin`]) for the 5 dense-projection weight classes
+/// round-7 measured a decode-M=1 win on (ffn_gate/up/down, attn_q, gdn
+/// attn_qkv -- callers pick this vs. plain `load_q4dense` per weight name,
+/// see the trunk-layer loop). `QWEN35_MARLIN=0` opts out (plain Q4Dense
+/// only, same as `load_q4dense`) for A/B benchmarking without a reload-free
+/// toggle. A marlin build failure is NON-fatal -- logged once, falls back
+/// to the plain gemv_q4 path for that weight -- so a partial/older
+/// wh-iron-runtime (built without IRON_MARLIN_BUILD=1) degrades cleanly
+/// instead of failing the whole model load.
+fn load_q4dense_routed(dev: &dyn Device, g: &Gguf, name: &str) -> Result<Q4Dense> {
+    let t = g.tensor(name).ok_or_else(|| Error::Msg(format!("qwen35: missing tensor '{name}'")))?;
+    let (m, k) = dims_out_in(t, name)?;
+    let flat = g.dequant_f32(name)?;
+    let (qs, scales_f32) = ops::quantize_q4(&flat, m, k);
+    let scales_bytes = f32s_to_f16_bytes(&scales_f32);
+    let mut qd = Q4Dense {
+        qs: Tensor::new(dev.upload(&u32s_to_bytes(&qs))?, vec![qs.len()], DType::U32),
+        scales: Tensor::new(dev.upload(&scales_bytes)?, vec![scales_bytes.len() / 2], DType::F16),
+        m,
+        k,
+        marlin: None,
+    };
+    if std::env::var("QWEN35_MARLIN").as_deref() != Ok("0") {
+        match build_marlin(dev, &flat, m, k) {
+            Ok(mw) => qd.marlin = Some(mw),
+            Err(e) => eprintln!("qwen35: marlin repack skipped for {name} ({m}x{k}): {e}"),
+        }
+    }
+    Ok(qd)
 }
 
 /// Plain F32 dense `[m, k]` weight for `ops::gemv` — used for GDN's tiny
@@ -440,6 +582,7 @@ fn load_q4dense_eh_proj_split(dev: &dyn Device, g: &Gguf, name: &str, hidden: us
             scales: Tensor::new(dev.upload(&scales_bytes)?, vec![scales_bytes.len() / 2], DType::F16),
             m: hidden,
             k: hidden,
+            marlin: None,
         })
     };
     Ok((mk(we)?, mk(wh)?))
@@ -581,7 +724,7 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
         let mixer = if cfg.is_full_layer(i) {
             Mixer::Full(FullAttnWeights {
                 attn_norm: load_f32_vec(dev, g, &format!("{p}.attn_norm.weight"))?,
-                wq: load_q4dense(dev, g, &format!("{p}.attn_q.weight"))?,
+                wq: load_q4dense_routed(dev, g, &format!("{p}.attn_q.weight"))?,
                 wk: load_q4dense(dev, g, &format!("{p}.attn_k.weight"))?,
                 wv: load_q4dense(dev, g, &format!("{p}.attn_v.weight"))?,
                 wo: load_q4dense(dev, g, &format!("{p}.attn_output.weight"))?,
@@ -605,7 +748,7 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
             let conv_repacked = repack_conv1d_weight(&conv_flat, cfg.gdn_conv_dim(), cfg.gdn_conv_kernel);
             Mixer::Gdn(GdnWeights {
                 attn_norm: load_f32_vec(dev, g, &format!("{p}.attn_norm.weight"))?,
-                wqkv: load_q4dense(dev, g, &format!("{p}.attn_qkv.weight"))?,
+                wqkv: load_q4dense_routed(dev, g, &format!("{p}.attn_qkv.weight"))?,
                 wz: load_q4dense(dev, g, &format!("{p}.attn_gate.weight"))?,
                 w_alpha: load_f32_dense(dev, g, &format!("{p}.ssm_alpha.weight"))?,
                 w_beta: load_f32_dense(dev, g, &format!("{p}.ssm_beta.weight"))?,
@@ -626,9 +769,9 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
         };
         let ffn = DenseFfn {
             ffn_norm: load_f32_vec(dev, g, &format!("{p}.post_attention_norm.weight"))?,
-            gate: load_q4dense(dev, g, &format!("{p}.ffn_gate.weight"))?,
-            up: load_q4dense(dev, g, &format!("{p}.ffn_up.weight"))?,
-            down: load_q4dense(dev, g, &format!("{p}.ffn_down.weight"))?,
+            gate: load_q4dense_routed(dev, g, &format!("{p}.ffn_gate.weight"))?,
+            up: load_q4dense_routed(dev, g, &format!("{p}.ffn_up.weight"))?,
+            down: load_q4dense_routed(dev, g, &format!("{p}.ffn_down.weight"))?,
         };
         layers.push(Qwen35Layer { mixer, ffn });
     }

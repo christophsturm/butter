@@ -555,6 +555,7 @@ name = "wh-butter-ops"
 version = "0.1.0"
 dependencies = [
  "parking_lot",
+ "rayon",
  "rustc-hash",
  "wh-butter-core",
  "wh-iron-codegen",
