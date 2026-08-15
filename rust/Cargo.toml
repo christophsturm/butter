@@ -61,3 +61,20 @@ inherits = "release"
 lto = "fat"
 codegen-units = 1
 debug = true
+
+# ── local-dev override (qwen35-port / MTP spec-decode): pin iron to the
+# sibling ~/iron checkout (131b199, same commit Cargo.lock already resolved
+# to) with the validated Hv=48 GDN chunk-kernel fix (divergent-barrier fix +
+# d128_128_48_16 fast variant) cherry-picked in from ~/iron-gdnwork's
+# gdn-prefill-validation branch @ bdf0d49. Surgical: only
+# kernels/ssm/{gated_delta_prep_chunk,gated_delta_wy_plan,gated_delta_wy_scan}.rs
+# differ from the git-locked 131b199 baseline -- everything else (MoE,
+# caching pool, etc.) is untouched, so this does not risk regressing other
+# model ports that share the iron dependency. Local-only (qwen35-port branch
+# never pushed) -- NOT meant to be committed upstream if this branch is ever
+# merged; a real fix should land in thewafflehaus/iron dev instead.
+[patch."https://github.com/thewafflehaus/iron"]
+wh-iron-core = { path = "/home/pidtom/iron/crates/wh-iron-core" }
+wh-iron-codegen = { path = "/home/pidtom/iron/crates/wh-iron-codegen" }
+wh-iron-runtime = { path = "/home/pidtom/iron/crates/wh-iron-runtime" }
+wh-iron-std = { path = "/home/pidtom/iron/crates/wh-iron-std" }

@@ -581,7 +581,6 @@ dependencies = [
 [[package]]
 name = "wh-iron"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/iron?branch=dev#131b1993ce4dce72c176af9368efe1d7263c7e97"
 dependencies = [
  "bytemuck",
  "inventory",
@@ -600,7 +599,6 @@ dependencies = [
 [[package]]
 name = "wh-iron-codegen"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/iron?branch=dev#131b1993ce4dce72c176af9368efe1d7263c7e97"
 dependencies = [
  "inventory",
  "rustc-hash",
@@ -615,7 +613,6 @@ dependencies = [
 [[package]]
 name = "wh-iron-core"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/iron?branch=dev#131b1993ce4dce72c176af9368efe1d7263c7e97"
 dependencies = [
  "inventory",
  "rustc-hash",
@@ -629,7 +626,6 @@ dependencies = [
 [[package]]
 name = "wh-iron-macros"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/iron?branch=dev#131b1993ce4dce72c176af9368efe1d7263c7e97"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -639,7 +635,6 @@ dependencies = [
 [[package]]
 name = "wh-iron-runtime"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/iron?branch=dev#131b1993ce4dce72c176af9368efe1d7263c7e97"
 dependencies = [
  "objc2",
  "objc2-foundation",
@@ -656,7 +651,6 @@ dependencies = [
 [[package]]
 name = "wh-iron-std"
 version = "0.1.0"
-source = "git+https://github.com/thewafflehaus/iron?branch=dev#131b1993ce4dce72c176af9368efe1d7263c7e97"
 dependencies = [
  "half",
  "rustc-hash",

@@ -342,12 +342,146 @@ impl LmHead {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// MTP (multi-token-prediction) sidecar -- self-speculative decode drafter
+// ─────────────────────────────────────────────────────────────────────────
+//
+// F-85-style speculative decode: `qwen35.nextn_predict_layers` (GGUF meta)
+// = 1, i.e. exactly ONE extra decoder-layer-shaped block appended after the
+// 64 trunk layers (`blk.64.*` + `blk.64.nextn.*`), consuming ~1.6% of the
+// model's own weight bytes per draft step (verified against the GGUF tensor
+// census in `load_mtp`'s doc). Architecture confirmed against the llama.cpp
+// fork's `models/qwen35.cpp` `graph_mtp()` (the only available from-source
+// reference for this arch's MTP -- mlx-swift-lm's `Qwen35.swift` explicitly
+// STRIPS `mtp.*` weights rather than running them, see its
+// `hasMTPWeights`/`weights.filter` comment, so it was not usable as the
+// executable reference here): DeepSeek-style NextN -- concat the seed
+// token's embedding with a "final normed hidden" from the previous stage,
+// project down through `eh_proj`, run one full-attention decoder layer
+// (own KV cache, own position axis matching the backbone's), then share
+// the trunk's own final-norm-shaped head. See `MtpWeights`'s doc for the
+// exact per-tensor contract and `mtp_draft_step`'s doc for the forward.
+struct MtpWeights {
+    // `eh_proj`'s GGUF shape is `[hidden, 2*hidden]` computing
+    // `eh_proj · [e_norm; h_norm]` (concat on the input axis). This engine
+    // has no device `concat` op, so the weight is split at LOAD time into
+    // two `[hidden,hidden]` halves and the concat-then-project is computed
+    // as `eh_proj_e·e_norm + eh_proj_h·h_norm` instead -- algebraically
+    // identical (block matrix times block vector), reuses existing
+    // `gemv`+`add` rather than adding a new device op.
+    eh_proj_e: Q4Dense, // [hidden, hidden] (embedding half)
+    eh_proj_h: Q4Dense, // [hidden, hidden] (hidden half)
+    enorm: Tensor,      // f32 [hidden]  ("blk.N.nextn.enorm")
+    hnorm: Tensor,      // f32 [hidden]  ("blk.N.nextn.hnorm")
+    attn_norm: Tensor,  // f32 [hidden]  ("blk.N.attn_norm")
+    wq: Q4Dense,        // [n_head*2*head_dim, hidden]  ([q;gate] fused, same as FullAttnWeights)
+    wk: Q4Dense,        // [n_kv_heads*head_dim, hidden]
+    wv: Q4Dense,        // [n_kv_heads*head_dim, hidden]
+    wo: Q4Dense,        // [hidden, n_head*head_dim]
+    q_norm: Tensor,     // f32 [head_dim]
+    k_norm: Tensor,     // f32 [head_dim]
+    ffn_norm: Tensor,   // f32 [hidden]  ("blk.N.post_attention_norm")
+    ffn_gate: Q4Dense,
+    ffn_up: Q4Dense,
+    ffn_down: Q4Dense,
+    // Shared head: the GGUF carries `blk.N.nextn.shared_head_norm` (a
+    // DEDICATED final-norm weight for the MTP head, distinct from the
+    // backbone's own `output_norm`) but NO `nextn.shared_head_head` and NO
+    // `nextn.embed_tokens` -- confirmed absent via `gguf-dump` (only
+    // eh_proj/enorm/hnorm/shared_head_norm present under `blk.64.nextn.*`),
+    // consistent with the checkpoint's "shared embeddings" convention: the
+    // draft head reuses `model.tok_embd` (already true for any lookup) and
+    // `model.lm_head` (the trunk's own LM head) directly, just with its OWN
+    // pre-head norm.
+    shared_head_norm: Tensor, // f32 [hidden]
+}
+
+/// Splits `eh_proj`'s `[hidden, 2*hidden]` GGUF weight (GGUF dims
+/// `[2*hidden, hidden]`, i.e. `dims_out_in` gives `m=hidden` (out),
+/// `k=2*hidden` (in)) into two independently-quantized `[hidden,hidden]`
+/// `Q4Dense` halves -- see `MtpWeights::eh_proj_e`/`eh_proj_h`'s doc for why.
+/// Row-major flat layout from `dequant_f32`: `flat[o*k + i]`, `i < hidden`
+/// is the embedding-half column range (matches `ggml_concat(e_norm, h_norm,
+/// dim=0)`'s e_norm-first order in the reference), `i >= hidden` is the
+/// hidden-half range.
+fn load_q4dense_eh_proj_split(dev: &dyn Device, g: &Gguf, name: &str, hidden: usize) -> Result<(Q4Dense, Q4Dense)> {
+    let t = g.tensor(name).ok_or_else(|| Error::Msg(format!("qwen35: missing tensor '{name}'")))?;
+    let (m, k) = dims_out_in(t, name)?;
+    if m != hidden || k != 2 * hidden {
+        return Err(Error::Msg(format!(
+            "{name}: expected eh_proj shape out={hidden} in={} (2*hidden), got out={m} in={k}",
+            2 * hidden
+        )));
+    }
+    let flat = g.dequant_f32(name)?;
+    let mut we = vec![0f32; m * hidden];
+    let mut wh = vec![0f32; m * hidden];
+    for o in 0..m {
+        we[o * hidden..(o + 1) * hidden].copy_from_slice(&flat[o * k..o * k + hidden]);
+        wh[o * hidden..(o + 1) * hidden].copy_from_slice(&flat[o * k + hidden..o * k + 2 * hidden]);
+    }
+    let mk = |flat: Vec<f32>| -> Result<Q4Dense> {
+        let (qs, scales_f32) = ops::quantize_q4(&flat, hidden, hidden);
+        let scales_bytes = f32s_to_f16_bytes(&scales_f32);
+        Ok(Q4Dense {
+            qs: Tensor::new(dev.upload(&u32s_to_bytes(&qs))?, vec![qs.len()], DType::U32),
+            scales: Tensor::new(dev.upload(&scales_bytes)?, vec![scales_bytes.len() / 2], DType::F16),
+            m: hidden,
+            k: hidden,
+        })
+    };
+    Ok((mk(we)?, mk(wh)?))
+}
+
+/// Loads the MTP sidecar if present. `qwen35.block_count` (`cfg.n_layers`,
+/// 64) is the trunk-layer count; `qwen35.nextn_predict_layers` (GGUF meta,
+/// verified = 1 on the MTP-preserved checkpoint) says the MTP block is
+/// stored as ONE extra "layer" immediately after the trunk, i.e.
+/// `blk.<n_layers>.*` (verified via `gguf-dump`: `blk.64.attn_norm.weight`,
+/// `blk.64.attn_q.weight` [5120,12288] Q4_K, `blk.64.attn_k.weight`
+/// [5120,1024] Q4_K, `blk.64.attn_v.weight` [5120,1024] Q6_K,
+/// `blk.64.attn_output.weight` [6144,5120] Q4_K, `blk.64.attn_q_norm`/
+/// `attn_k_norm.weight` [256], `blk.64.post_attention_norm.weight` [5120],
+/// `blk.64.ffn_{gate,up}.weight` [5120,17408] Q4_K, `blk.64.ffn_down.weight`
+/// [17408,5120] Q6_K, `blk.64.nextn.eh_proj.weight` [5120,10240] Q8_0,
+/// `blk.64.nextn.{enorm,hnorm,shared_head_norm}.weight` [5120] F32 --
+/// `nextn.embed_tokens`/`nextn.shared_head_head` confirmed ABSENT). Returns
+/// `Ok(None)` (not an error) for a non-MTP checkpoint so the rest of the
+/// loader/decode path is unaffected.
+fn load_mtp(dev: &dyn Device, g: &Gguf, cfg: &Qwen35Config) -> Result<Option<MtpWeights>> {
+    let p = format!("blk.{}", cfg.n_layers);
+    if g.tensor(&format!("{p}.nextn.eh_proj.weight")).is_none() {
+        return Ok(None);
+    }
+    let (eh_proj_e, eh_proj_h) =
+        load_q4dense_eh_proj_split(dev, g, &format!("{p}.nextn.eh_proj.weight"), cfg.hidden)?;
+    Ok(Some(MtpWeights {
+        eh_proj_e,
+        eh_proj_h,
+        enorm: load_f32_vec(dev, g, &format!("{p}.nextn.enorm.weight"))?,
+        hnorm: load_f32_vec(dev, g, &format!("{p}.nextn.hnorm.weight"))?,
+        attn_norm: load_f32_vec(dev, g, &format!("{p}.attn_norm.weight"))?,
+        wq: load_q4dense(dev, g, &format!("{p}.attn_q.weight"))?,
+        wk: load_q4dense(dev, g, &format!("{p}.attn_k.weight"))?,
+        wv: load_q4dense(dev, g, &format!("{p}.attn_v.weight"))?,
+        wo: load_q4dense(dev, g, &format!("{p}.attn_output.weight"))?,
+        q_norm: load_f32_vec(dev, g, &format!("{p}.attn_q_norm.weight"))?,
+        k_norm: load_f32_vec(dev, g, &format!("{p}.attn_k_norm.weight"))?,
+        ffn_norm: load_f32_vec(dev, g, &format!("{p}.post_attention_norm.weight"))?,
+        ffn_gate: load_q4dense(dev, g, &format!("{p}.ffn_gate.weight"))?,
+        ffn_up: load_q4dense(dev, g, &format!("{p}.ffn_up.weight"))?,
+        ffn_down: load_q4dense(dev, g, &format!("{p}.ffn_down.weight"))?,
+        shared_head_norm: load_f32_vec(dev, g, &format!("{p}.nextn.shared_head_norm.weight"))?,
+    }))
+}
+
 pub struct Qwen35Model {
     pub cfg: Qwen35Config,
     tok_embd: Tensor, // f32 [vocab, hidden]
     layers: Vec<Qwen35Layer>,
     out_norm: Tensor, // f32 [hidden]
     lm_head: LmHead,
+    mtp: Option<MtpWeights>,
     /// Constant (not loaded) per-head Q/K rescale buffers for GDN, shared
     /// across all GDN layers: Qwen3.5's GDN normalizes q/k with a WEIGHTLESS
     /// RMSNorm scaled by `invScale^2` (q) / `invScale` (k), `invScale =
@@ -479,9 +613,26 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
         layers.push(Qwen35Layer { mixer, ffn });
     }
 
-    eprintln!("Qwen35: load done in {:.2}s ({} layers)", load_t0.elapsed().as_secs_f64(), cfg.n_layers);
+    let mtp = load_mtp(dev, g, &cfg)?;
+    eprintln!(
+        "Qwen35: load done in {:.2}s ({} layers, mtp={})",
+        load_t0.elapsed().as_secs_f64(),
+        cfg.n_layers,
+        mtp.is_some()
+    );
 
-    Ok(Qwen35Model { cfg, tok_embd, layers, out_norm, lm_head, gdn_q_scale, gdn_k_scale, gdn_conv_zero_bias, gdn_gqa_cyclic_idx })
+    Ok(Qwen35Model {
+        cfg,
+        tok_embd,
+        layers,
+        out_norm,
+        lm_head,
+        mtp,
+        gdn_q_scale,
+        gdn_k_scale,
+        gdn_conv_zero_bias,
+        gdn_gqa_cyclic_idx,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -617,6 +768,21 @@ fn full_attn_layer(
 /// reusing `cache` so KV/recurrent state persists across calls (prompt
 /// tokens included — see the module doc's "decode-only" note).
 pub fn decode_step(dev: &dyn Device, model: &Qwen35Model, cache: &mut Qwen35Cache, token_id: u32, pos: u32) -> Result<Tensor> {
+    Ok(decode_step_ex(dev, model, cache, token_id, pos)?.0)
+}
+
+/// Same as [`decode_step`] but also returns `xn` — the post-`output_norm`
+/// hidden state that fed the lm_head (i.e. `xn` such that
+/// `lm_head.gemv(xn) == logits`). Added for MTP self-speculative decode
+/// (see `mtp_draft_step`/`speculative_round`): the MTP drafter's seed input
+/// is exactly this tensor, and re-deriving it by re-running the trunk would
+/// double the backbone cost. `decode_step` is unchanged (still the plain,
+/// single-return entry point every existing caller uses) — it now just
+/// forwards to this and drops `xn`, so this refactor is behavior-preserving
+/// for all pre-existing call sites.
+pub fn decode_step_ex(
+    dev: &dyn Device, model: &Qwen35Model, cache: &mut Qwen35Cache, token_id: u32, pos: u32,
+) -> Result<(Tensor, Tensor)> {
     let cfg = &model.cfg;
     let debug = std::env::var("QWEN35_DEBUG").map(|v| v == "1").unwrap_or(false);
     let tok_buf = Tensor::new(dev.upload(&token_id.to_le_bytes())?, vec![1], DType::U32);
@@ -640,7 +806,8 @@ pub fn decode_step(dev: &dyn Device, model: &Qwen35Model, cache: &mut Qwen35Cach
     }
 
     let xn = ops::rms_norm(dev, &x, &model.out_norm, cfg.eps)?;
-    model.lm_head.gemv(dev, &xn)
+    let logits = model.lm_head.gemv(dev, &xn)?;
+    Ok((logits, xn))
 }
 
 /// One GDN (linear-attention) layer's forward. Takes `model` (rather than
@@ -731,4 +898,251 @@ fn gdn_layer_full(
     let o = w.wo.gemv(dev, &gated)?;
     if dbg { dbg_sum(dev, "linear_attn_out-0", pos, &o); }
     ops::add(dev, x, &o)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// MTP self-speculative decode
+// ─────────────────────────────────────────────────────────────────────────
+
+/// MTP's own attention KV cache. Architecturally identical to a backbone
+/// full-attention layer's cache (see `FullAttnSlot`) — the MTP block tracks
+/// the SAME absolute position axis as the backbone (see `mtp_draft_step`'s
+/// doc), just with its own weights/K/V. Reusing `FullAttnSlot` directly
+/// (rather than a parallel type) so `mtp_draft_step` can reuse
+/// `full_attn_layer`'s exact kv_append/sdpa_decode call pattern.
+pub struct MtpCache {
+    slot: FullAttnSlot,
+}
+
+impl MtpCache {
+    pub fn new(dev: &dyn Device, cfg: &Qwen35Config, max_seq: usize) -> Result<Self> {
+        let n = cfg.n_kv_heads * max_seq * cfg.head_dim;
+        let k = Tensor::new(dev.alloc_zeroed(n * 4)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim], DType::F32);
+        let v = Tensor::new(dev.alloc_zeroed(n * 4)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim], DType::F32);
+        Ok(MtpCache { slot: FullAttnSlot { k, v, cap: max_seq } })
+    }
+}
+
+/// One MTP draft step — see `MtpWeights`'s module doc for the full
+/// architectural contract. `h` = seed hidden (a "final normed hidden": the
+/// backbone's own `xn` from [`decode_step_ex`] for the FIRST step of a
+/// speculative round, or this function's own returned `h_nextn` when
+/// chaining γ>1 draft steps). `tok` = seed token (its embedding is mixed
+/// in via `eh_proj`) — the just-accepted/confirmed token for the first
+/// step, or the previous step's own draft token when chaining. `pos` = the
+/// absolute sequence position `tok` occupies; MTP's RoPE + KV-cache write
+/// use this position directly (MTP shares the backbone's position axis —
+/// confirmed against `llama.cpp`'s `graph_mtp`, which threads the SAME
+/// `inp_pos` the backbone's own decode call used). Returns
+/// `(draft_token, h_nextn)`: `draft_token` predicts the token at `pos+1`;
+/// `h_nextn` is this step's own "final normed hidden", ready to chain
+/// directly into the next call's `h`.
+fn mtp_draft_step(
+    dev: &dyn Device,
+    cfg: &Qwen35Config,
+    model: &Qwen35Model,
+    w: &MtpWeights,
+    slot: &mut FullAttnSlot,
+    h: &Tensor,
+    tok: u32,
+    pos: u32,
+) -> Result<(u32, Tensor)> {
+    let tok_buf = Tensor::new(dev.upload(&tok.to_le_bytes())?, vec![1], DType::U32);
+    let e = ops::gather(dev, &model.tok_embd, &tok_buf)?.reshaped(vec![cfg.hidden]);
+    let e_norm = ops::rms_norm(dev, &e, &w.enorm, cfg.eps)?;
+    let h_norm = ops::rms_norm(dev, h, &w.hnorm, cfg.eps)?;
+    // eh_proj(concat(e_norm, h_norm)) == eh_proj_e·e_norm + eh_proj_h·h_norm
+    // — see `MtpWeights::eh_proj_e`'s doc for why this split form is used.
+    let xe = w.eh_proj_e.gemv(dev, &e_norm)?;
+    let xh = w.eh_proj_h.gemv(dev, &h_norm)?;
+    let x = ops::add(dev, &xe, &xh)?;
+    let inp_sa = x.clone();
+
+    // One full-attention decoder layer on `x` (own weights/KV), same shape
+    // as `full_attn_layer`'s trunk full-attn layers.
+    let hn = ops::rms_norm(dev, &x, &w.attn_norm, cfg.eps)?;
+    let qg = w.wq.gemv(dev, &hn)?;
+    let k = w.wk.gemv(dev, &hn)?;
+    let v = w.wv.gemv(dev, &hn)?;
+    let q = ops::strided_head_half(dev, &qg, cfg.n_head, cfg.head_dim, 0)?;
+    let gate = ops::strided_head_half(dev, &qg, cfg.n_head, cfg.head_dim, 1)?;
+    let q = q.reshaped(vec![cfg.n_head, cfg.head_dim]);
+    let k = k.reshaped(vec![cfg.n_kv_heads, cfg.head_dim]);
+    let v = v.reshaped(vec![cfg.n_kv_heads, cfg.head_dim]);
+    let q = ops::rms_norm(dev, &q, &w.q_norm, cfg.eps)?;
+    let k = ops::rms_norm(dev, &k, &w.k_norm, cfg.eps)?;
+    let q = ops::rope_yarn_partial(dev, &q, pos, cfg.rope_n_rot, cfg.rope_theta, 1.0, 0.0, 1.0, 32.0, 1.0, 262144)?;
+    let k = ops::rope_yarn_partial(dev, &k, pos, cfg.rope_n_rot, cfg.rope_theta, 1.0, 0.0, 1.0, 32.0, 1.0, 262144)?;
+
+    let posbuf = Tensor::new(dev.upload(&pos.to_le_bytes())?, vec![1], DType::U32);
+    ops::kv_append(dev, &k, &slot.k, &posbuf, cfg.head_dim, slot.cap, cfg.n_kv_heads * cfg.head_dim)?;
+    ops::kv_append(dev, &v, &slot.v, &posbuf, cfg.head_dim, slot.cap, cfg.n_kv_heads * cfg.head_dim)?;
+
+    let heads_per_group = (cfg.n_head / cfg.n_kv_heads) as u32;
+    let n_kv_used = pos + 1;
+    let attn = ops::sdpa_decode(
+        dev, &q, &slot.k, &slot.v, cfg.head_dim, n_kv_used, slot.cap as u32, heads_per_group, cfg.attn_scale(),
+    )?;
+    let attn_flat = attn.reshaped(vec![cfg.n_head * cfg.head_dim]);
+    let gated = ops::sigmoid_mul(dev, &attn_flat, &gate)?;
+    let o = w.wo.gemv(dev, &gated)?;
+    let cur = ops::add(dev, &o, &inp_sa)?;
+
+    let ffn_residual = cur.clone();
+    let post = ops::rms_norm(dev, &cur, &w.ffn_norm, cfg.eps)?;
+    let g2 = w.ffn_gate.gemv(dev, &post)?;
+    let u2 = w.ffn_up.gemv(dev, &post)?;
+    let act = ops::swiglu(dev, &g2, &u2)?;
+    let ffn_out = w.ffn_down.gemv(dev, &act)?;
+    let cur = ops::add(dev, &ffn_out, &ffn_residual)?;
+
+    let h_nextn = ops::rms_norm(dev, &cur, &w.shared_head_norm, cfg.eps)?;
+    // Shared head: MTP has no `nextn.shared_head_head` (see `MtpWeights`'s
+    // doc), so this reuses `model.lm_head` directly.
+    let logits = model.lm_head.gemv(dev, &h_nextn)?;
+    let am = ops::argmax_f32_device(dev, &logits)?;
+    let mut ib = [0u8; 4];
+    dev.synchronize()?;
+    dev.download(am.buffer.as_ref(), &mut ib)?;
+    let draft_token = u32::from_le_bytes(ib);
+    Ok((draft_token, h_nextn))
+}
+
+/// Combined backbone + MTP cache for speculative decode.
+pub struct Qwen35SpecCache {
+    pub backbone: Qwen35Cache,
+    mtp: MtpCache,
+}
+
+impl Qwen35SpecCache {
+    pub fn new(dev: &dyn Device, cfg: &Qwen35Config, max_seq: usize) -> Result<Self> {
+        Ok(Qwen35SpecCache { backbone: Qwen35Cache::new(dev, cfg, max_seq)?, mtp: MtpCache::new(dev, cfg, max_seq)? })
+    }
+}
+
+/// Per-round speculative-decode bookkeeping (for the γ ladder / acceptance-
+/// rate measurement — see the perf-campaign report, not correctness).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpecDecodeStats {
+    pub n_drafted: usize,
+    pub n_accepted: usize,
+}
+
+/// One speculative-decode round: draft up to `gamma` tokens from
+/// `(last_token, last_pos, last_hidden)` via the MTP sidecar, then verify
+/// against the backbone and return the run of tokens that are CONFIRMED
+/// correct (i.e. bit-identical to what plain greedy `decode_step` would
+/// have produced one token at a time).
+///
+/// ## Verify strategy: sequential ("lazy"), not batched
+///
+/// This calls [`decode_step_ex`] (the ordinary, unmodified backbone path)
+/// **at most once per drafted candidate, and never for a candidate past the
+/// first mismatch**: the loop compares the backbone's own greedy argmax
+/// (computed from the PREVIOUS confirmed step's logits, cheap — just a
+/// `lm_head.gemv` off already-computed hidden, no new trunk pass) against
+/// the next draft token BEFORE running the trunk on it. Only once a draft
+/// matches does its trunk pass actually execute (to advance KV/GDN state
+/// and get the FOLLOWING step's logits for the next comparison).
+///
+/// Consequence: **no rollback machinery is needed.** Full-attention KV
+/// (both the backbone's and MTP's own) is safe under the trunk's existing
+/// position-indexed overwrite + explicit `n_kv_used` bound — a position
+/// speculatively written during the draft phase but not reached by the
+/// (lazy) verify phase is simply overwritten next round before anything
+/// ever reads it. GDN's recurrent state is only ever advanced (via
+/// `decode_step_ex`, which mutates it in place) for a token that has
+/// ALREADY been confirmed correct at the point of the call — the sequence
+/// of `decode_step_ex` calls this function makes is therefore exactly the
+/// sequence plain (non-speculative) decode would have made, just
+/// interleaved with cheap drafter calls. This is why the correctness bar
+/// (bit-identical vs spec-decode OFF) holds by construction here.
+///
+/// ## What this does NOT do: save backbone bandwidth
+///
+/// Every ACCEPTED token still costs one full backbone forward pass (same
+/// as plain decode) — this form saves nothing on the dominant GEMV cost,
+/// and actively COSTS MORE than plain decode (drafter overhead + the
+/// sequential argmax/download round-trips), so it will not beat the 14
+/// tok/s bar. Its purpose is to validate the drafter (weight loading,
+/// `eh_proj` split-GEMV algebra, KV-cache/position bookkeeping) and to
+/// measure acceptance rate — the number that determines whether the
+/// bandwidth-saving batched-verify path (chunked GDN + small-M
+/// `gemm_q4_mpp` projections, needing real GDN-state snapshot/restore
+/// rollback since it commits state for γ+1 positions before knowing the
+/// accept count) is worth building out.
+pub fn speculative_round(
+    dev: &dyn Device,
+    model: &Qwen35Model,
+    cache: &mut Qwen35SpecCache,
+    last_token: u32,
+    last_pos: u32,
+    last_hidden: &Tensor,
+    gamma: usize,
+) -> Result<(Vec<u32>, u32, u32, Tensor, SpecDecodeStats)> {
+    let Some(mtp) = &model.mtp else {
+        return Err(Error::Msg("speculative_round: model has no MTP weights (non-MTP checkpoint)".into()));
+    };
+    let cfg = &model.cfg;
+
+    // ---- Draft phase: chain `gamma` MTP steps off the confirmed seed. ----
+    let mut drafts: Vec<u32> = Vec::with_capacity(gamma);
+    let mut dh = last_hidden.clone();
+    let mut dtok = last_token;
+    let mut dpos = last_pos;
+    for _ in 0..gamma {
+        let (t, h_next) = mtp_draft_step(dev, cfg, model, mtp, &mut cache.mtp.slot, &dh, dtok, dpos)?;
+        drafts.push(t);
+        dh = h_next;
+        dtok = t;
+        dpos += 1;
+    }
+
+    // ---- Verify phase: lazy sequential accept/reject (see doc above). ----
+    // `logits` here is the ALREADY-COMPUTED backbone prediction for
+    // `last_pos+1` (== `lm_head(last_hidden)`), reusing the hidden the
+    // caller already paid for — no redundant trunk pass.
+    let mut logits = model.lm_head.gemv(dev, last_hidden)?;
+    let mut cur_hidden = last_hidden.clone();
+    let mut cur_tok = last_token;
+    let mut cur_pos = last_pos;
+    let mut n_accept = 0usize;
+    let mut accepted: Vec<u32> = Vec::with_capacity(gamma);
+
+    for &d in &drafts {
+        let am = ops::argmax_f32_device(dev, &logits)?;
+        let mut ib = [0u8; 4];
+        dev.synchronize()?;
+        dev.download(am.buffer.as_ref(), &mut ib)?;
+        let true_next = u32::from_le_bytes(ib);
+
+        if true_next != d {
+            // Misprediction: `true_next` (not `d`) is the real next token.
+            // It was never drafted, so nothing needs to be rolled back —
+            // just run the trunk on it once to seed the NEXT round, then
+            // stop (the rest of `drafts` is discarded).
+            let (logits2, xn2) = decode_step_ex(dev, model, &mut cache.backbone, true_next, cur_pos + 1)?;
+            accepted.push(true_next);
+            cur_pos += 1;
+            cur_tok = true_next;
+            cur_hidden = xn2;
+            let _ = logits2; // not needed past this point; next round recomputes via lm_head(cur_hidden)
+            return Ok((accepted, cur_tok, cur_pos, cur_hidden, SpecDecodeStats { n_drafted: drafts.len(), n_accepted: n_accept }));
+        }
+
+        // Accepted: `d` matches the backbone's own greedy choice. Advance
+        // the trunk through it to get the next comparison's logits/hidden.
+        accepted.push(d);
+        cur_pos += 1;
+        cur_tok = d;
+        n_accept += 1;
+        let (logits2, xn2) = decode_step_ex(dev, model, &mut cache.backbone, cur_tok, cur_pos)?;
+        logits = logits2;
+        cur_hidden = xn2;
+    }
+
+    // All `gamma` drafts accepted — `cur_hidden`/`logits` already hold the
+    // confirmed state at `cur_pos`, ready to seed the next round directly.
+    let _ = logits;
+    Ok((accepted, cur_tok, cur_pos, cur_hidden, SpecDecodeStats { n_drafted: drafts.len(), n_accepted: n_accept }))
 }
