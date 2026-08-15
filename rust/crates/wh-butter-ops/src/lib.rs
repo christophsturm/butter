@@ -6616,7 +6616,7 @@ extern "C" __global__ void butter_rope_yarn_partial_many(
 {
     int t = blockIdx.x;
     int h = blockIdx.y;
-    int tid = threadIdx.z;
+    int tid = threadIdx.x;
     int half_rot = n_rot / 2;
     int position = (int)positions[t];
     long row_off = ((long)t * n_heads + h) * head_dim;
@@ -6661,9 +6661,16 @@ extern "C" __global__ void butter_rope_yarn_partial_many(
 /// prefill attention path. Same math/params as `rope_yarn_partial` (pass
 /// `n_rot == head_dim`, `freq_scale = 1.0`, `ext_factor = 0.0`,
 /// `attn_factor = 1.0` for plain, non-YaRN RoPE: Laguna's sliding-window
-/// layers use exactly this). Grid `[T, n_heads, 1]`, block `[1, 1, head_dim/2]`
+/// layers use exactly this). Grid `[T, n_heads, 1]`, block `[head_dim/2, 1, 1]`
 /// (covers both the rotated-pair range and the passthrough-tail range, same
-/// as the scalar-position kernel). f32 only.
+/// as the scalar-position kernel; the thread index lives in `blockDim.x`,
+/// NOT `.z` -- CUDA's hardware cap on `blockDim.z` is only 64, unlike `.x`/
+/// `.y`'s 1024, and this genuinely needs up to `head_dim/2` threads: at
+/// `head_dim=256` [F-85 prefill wave, Qwen3.6-27B's full-attn shape] that's
+/// 128, which a `.z`-indexed launch -- this function's ORIGINAL form, valid
+/// only by accident for every prior caller's `head_dim <= 128` -- silently
+/// violates, surfacing as `cuLaunchKernel: invalid argument`; `.x` has no
+/// such ceiling short of 1024, i.e. `head_dim <= 2048`). f32 only.
 #[allow(clippy::too_many_arguments)]
 pub fn rope_yarn_partial_many(
     dev: &dyn Device,
@@ -6716,7 +6723,7 @@ pub fn rope_yarn_partial_many(
             f(theta_base), f(freq_scale), f(ext_factor), f(attn_factor),
             f(corr_low), f(corr_high),
         ],
-        [t as u32, n_heads as u32, 1], [1, 1, half], 0, false,
+        [t as u32, n_heads as u32, 1], [half, 1, 1], 0, false,
     )?;
     Ok(out)
 }
@@ -7379,6 +7386,225 @@ pub fn gdn_tail_gate(dev: &dyn Device, y: &Tensor, z: &Tensor, w: &Tensor, eps: 
         Grid { grid: [hv as u32, 1, 1], block: [(dv / 4) as u32, 1, 1] },
     )?;
     Ok(out)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Qwen3.5/3.6 batched (chunked) prefill support
+// ─────────────────────────────────────────────────────────────────────────
+
+const STRIDED_HEAD_HALF_MANY_SRC: &str = r#"
+extern "C" __global__ void butter_strided_head_half_many(
+    const float* __restrict__ x, float* __restrict__ out,
+    int t_total, int n_head, int head_dim, int half)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)t_total * n_head * head_dim;
+    if (i >= total) return;
+    long per_row = (long)n_head * head_dim;
+    long t = i / per_row;
+    long r = i - t * per_row;
+    int h = (int)(r / head_dim);
+    int d = (int)(r % head_dim);
+    long src = t * per_row * 2 + (long)h * 2 * head_dim + (long)half * head_dim + d;
+    out[i] = x[src];
+}
+"#;
+
+/// Batched (`T`-row) sibling of [`strided_head_half`] — de-interleaves a
+/// `[T, n_head, 2*head_dim]` fused Q/gate prefill projection output into
+/// one contiguous `[T, n_head, head_dim]` half. Replaces the T-loop of
+/// per-token `strided_head_half` calls in the Qwen3.5/3.6 full-attention
+/// prefill path (see `qwen35::prefill_layer_full`). `half=0` extracts Q,
+/// `half=1` extracts the gate. f32 only, same convention as the decode-step
+/// kernel it batches.
+pub fn strided_head_half_many(
+    dev: &dyn Device, x: &Tensor, t_total: usize, n_head: usize, head_dim: usize, half: u32,
+) -> Result<Tensor> {
+    let out = Tensor::empty(dev, vec![t_total * n_head * head_dim], DType::F32)?;
+    let i = |v: i32| v.to_le_bytes().to_vec();
+    let total = (t_total * n_head * head_dim) as u32;
+    dev.dispatch_raw_cuda(
+        STRIDED_HEAD_HALF_MANY_SRC,
+        "strided_head_half_many.cu",
+        "butter_strided_head_half_many",
+        &[(x.buffer.as_ref(), x.offset), (out.buffer.as_ref(), 0)],
+        &[i(t_total as i32), i(n_head as i32), i(head_dim as i32), i(half as i32)],
+        [total.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+        false,
+    )?;
+    Ok(out)
+}
+
+const CONCAT_ROWS_F32_SRC: &str = r#"
+extern "C" __global__ void butter_concat_rows_f32(
+    const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out,
+    long a_rows, long row_width)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long a_elems = a_rows * row_width;
+    // total is implied by the launch grid; no separate bound needed beyond a_elems+b_elems,
+    // which the caller sizes the grid to exactly.
+    if (i < a_elems) {
+        out[i] = a[i];
+    } else {
+        out[i] = b[i - a_elems];
+    }
+}
+"#;
+
+/// Concatenate two row-major f32 buffers of the same `row_width` along the
+/// row axis, entirely on-device (no host round-trip): `out = [a; b]`,
+/// `[a_rows + b_rows, row_width]` flat. Used by Qwen3.5/3.6 GDN chunked
+/// prefill (`qwen35::prefill_layer_gdn`) to prepend the carried
+/// `conv_kernel-1` rows of causal-conv history onto a chunk's `T` new raw
+/// qkv rows before calling `conv1d_causal_prefill` (which itself always
+/// starts from zero state) — see that call site's doc for why this makes
+/// the zero-state prefill kernel produce state-continuing output.
+pub fn concat_rows_f32(dev: &dyn Device, a: &Tensor, a_rows: usize, b: &Tensor, b_rows: usize, row_width: usize) -> Result<Tensor> {
+    let out = Tensor::empty(dev, vec![(a_rows + b_rows) * row_width], DType::F32)?;
+    let total = ((a_rows + b_rows) * row_width) as u32;
+    let i64b = |v: i64| v.to_le_bytes().to_vec();
+    dev.dispatch_raw_cuda(
+        CONCAT_ROWS_F32_SRC,
+        "concat_rows_f32.cu",
+        "butter_concat_rows_f32",
+        &[(a.buffer.as_ref(), a.offset), (b.buffer.as_ref(), b.offset), (out.buffer.as_ref(), 0)],
+        &[i64b(a_rows as i64), i64b(row_width as i64)],
+        [total.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+        false,
+    )?;
+    Ok(out)
+}
+
+/// Batched q/k RMSNorm pre-pass for the GDN chunked-prefill pipeline —
+/// wraps `iron_gated_delta_qknorm_prepass` (see `GDN_PREFILL_CONTRACT.md`
+/// §3/§5 on the iron side). Computes the per-`(b,t,hk_idx)` q/k RMSNorm
+/// ONCE (hoisted out of `gdn_prep_chunk_fast_27b`'s `Dv·(Hv/Hk)`-redundant
+/// grid) and writes dense `q_normed`/`k_normed`.
+///
+/// `conv_out`: `[T, 2·Hk·Dk + Hv·Dv]` f32 (B=1) — the GDN conv1d+SiLU
+/// output for this chunk. `q_norm_weight`/`k_norm_weight`: `[Hk·Dk]` f32 —
+/// Qwen3.5/3.6's GDN q/k RMSNorm is WEIGHTLESS-scaled (see `qwen35.rs`'s
+/// `gdn_q_scale`/`gdn_k_scale` doc), so callers pass those same constant
+/// per-element scale buffers here, mirroring `gdn_decode_fused`'s
+/// `q_scale`/`k_scale` convention exactly (NOT a real learned weight,
+/// despite the iron kernel's generic parameter name). Returns
+/// `(q_normed, k_normed)`, both `[T, Hk, Dk]` f32.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_qknorm_prepass_chunk(
+    dev: &dyn Device,
+    conv_out: &Tensor,
+    q_scale: &Tensor,
+    k_scale: &Tensor,
+    t_len: &Tensor,
+    t: usize,
+    dk: usize,
+    dv: usize,
+    hv: usize,
+    hk: usize,
+) -> Result<(Tensor, Tensor)> {
+    let kernel = lookup("iron_gated_delta_qknorm_prepass", DType::F32)?;
+    let q_normed = Tensor::empty(dev, vec![t * hk * dk], DType::F32)?;
+    let k_normed = Tensor::empty(dev, vec![t * hk * dk], DType::F32)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(conv_out.buffer.clone()),
+            Binding::Buffer(q_scale.buffer.clone()),
+            Binding::Buffer(k_scale.buffer.clone()),
+            Binding::Buffer(q_normed.buffer.clone()),
+            Binding::Buffer(k_normed.buffer.clone()),
+            Binding::Buffer(t_len.buffer.clone()),
+            u(dk as u32),
+            u(dv as u32),
+            u(hv as u32),
+            u(hk as u32),
+        ],
+        Grid { grid: [t as u32, hk as u32, 1], block: [32, 1, 1] },
+    )?;
+    Ok((q_normed, k_normed))
+}
+
+/// Qwen3.6-27B-shape (`Dk=Dv=128, Hv=48, Hk=16`) fused-prep chunked-prefill
+/// GDN kernel — wraps `iron_gated_delta_prep_chunk_fast_cyclic_d128_128_48_16`
+/// (see `GDN_PREFILL_CONTRACT.md` §1/§5, "THE PRODUCTION PREFILL KERNEL",
+/// shape-specialized/register-promoted variant). State stays register-
+/// resident across the entire `T`-loop: one `state_in` load at entry, one
+/// `state_out` store at exit, regardless of `T` — this is what collapses
+/// the per-token decode-step T-loop to a single dispatch per chunk per
+/// layer.
+///
+/// F-85 prefill wave, CORRECTNESS FIX: this calls the `_cyclic` sibling of
+/// the family's `_d128_128_48_16` kernel, NOT the block-GQA original the
+/// contract doc's §5 recommends by default. This checkpoint's GDN mixer
+/// needs the CYCLIC GQA head mapping (`hk_idx = hv_idx % Hk`), the same
+/// one `qwen35.rs`'s decode-step kernel (`iron_gdn_decode_fused`) already
+/// bakes in — the family-default BLOCK mapping (`hk_idx = hv_idx /
+/// (Hv/Hk)`) silently produced degenerate/repetitive greedy continuations
+/// (caught by this port's prefill-vs-decode-loop identity test) because it
+/// reads the wrong native `Hk` slot for most `hv_idx` at this shape. See
+/// `iron_gated_delta_prep_chunk_fast_cyclic`'s doc (wh-iron-std,
+/// `kernels/ssm/gated_delta_prep_chunk.rs`) for the full root-cause
+/// writeup and why this is a separate kernel rather than a changed
+/// family default.
+///
+/// `a_log_raw` is the RAW (pre `-exp()`) per-Hv-head decay parameter —
+/// **NOT** the checkpoint's `neg_exp_a_log` tensor `qwen35.rs`'s decode
+/// path (`gdn_decode_fused`) uses directly: this generic kernel family
+/// computes `g = exp(-exp(a_log)·dt)` in-kernel (see the module doc's §2
+/// gate/beta derivation), so it needs `a_log_raw = ln(-neg_exp_a_log)`,
+/// precomputed once at load time (`qwen35.rs`'s `GdnWeights::a_log_raw`)
+/// to reproduce the SAME `g` the decode-step kernel computes from the
+/// checkpoint's pre-transformed tensor. Passing `neg_exp_a_log` directly
+/// here would silently double-apply the transform.
+///
+/// Layouts: `conv_out` `[T, 2·Hk·Dk+Hv·Dv]`, `a_raw`/`b_raw` `[T, Hv]`,
+/// `q_normed`/`k_normed` `[T, Hk, Dk]` (from
+/// [`gdn_qknorm_prepass_chunk`]), `state_in`/`state_out` `[Hv, Dv, Dk]`
+/// (B=1; pass the SAME tensor for both — safe, see the iron kernel's own
+/// doc on why in-place aliasing is correct for a register-resident
+/// once-in/once-out state). Returns `y`, `[T, Hv, Dv]`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prep_chunk_fast_27b(
+    dev: &dyn Device,
+    conv_out: &Tensor,
+    a_log_raw: &Tensor,
+    dt_bias: &Tensor,
+    a_raw: &Tensor,
+    b_raw: &Tensor,
+    q_normed: &Tensor,
+    k_normed: &Tensor,
+    state: &Tensor,
+    t_len: &Tensor,
+    t: usize,
+) -> Result<Tensor> {
+    const DV: usize = 128;
+    const HV: usize = 48;
+    let kernel = lookup("iron_gated_delta_prep_chunk_fast_cyclic_d128_128_48_16", DType::F32)?;
+    let y = Tensor::empty(dev, vec![t * HV * DV], DType::F32)?;
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(conv_out.buffer.clone()),
+            Binding::Buffer(a_log_raw.buffer.clone()),
+            Binding::Buffer(dt_bias.buffer.clone()),
+            Binding::Buffer(a_raw.buffer.clone()),
+            Binding::Buffer(b_raw.buffer.clone()),
+            Binding::Buffer(q_normed.buffer.clone()),
+            Binding::Buffer(k_normed.buffer.clone()),
+            Binding::Buffer(state.buffer.clone()), // state_in
+            Binding::Buffer(state.buffer.clone()), // state_out (aliased)
+            Binding::Buffer(y.buffer.clone()),
+            Binding::Buffer(t_len.buffer.clone()),
+        ],
+        Grid { grid: [(DV as u32).div_ceil(4), HV as u32, 1], block: [128, 1, 1] },
+    )?;
+    Ok(y)
 }
 
 #[cfg(test)]
