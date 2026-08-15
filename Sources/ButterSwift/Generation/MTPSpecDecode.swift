@@ -32,14 +32,24 @@
 //      returns the per-position hidden states the next draft burst and
 //      the head's KV lockstep need.
 //   3. Accept via `SpeculativeAccept.verify` (longest matching prefix).
-//   4. EXACTNESS DISCIPLINE (inherited verbatim from SpecDecode): the
-//      batched verify logits are used ONLY for accept-length decisions.
-//      On a partial/zero accept the emitted next token comes from
-//      REPLAYING the accepted prefix through the single-token forward
-//      path after a full cache restore — batched kernels can drift vs
-//      decode kernels (SpecDecode.swift ~168-176). On a full accept the
-//      bonus token comes from the trailing batched logits row, matching
-//      `SpecDecode.generateGreedy`'s existing bonus handling.
+//   4. EXACTNESS DISCIPLINE, greedy mode (mirrors DFlashSpecDecode.swift
+//      — see that file's header, point 5): the batched verify logits are
+//      used ONLY for accept-length decisions, NEVER emission or cache
+//      content. On EVERY cycle — partial, zero, AND full accept alike —
+//      the emitted next token comes from REPLAYING the accepted prefix
+//      through the single-token forward path after a full cache restore
+//      (`mtpDecodeLoop`'s `mustReplayForExactness`) — batched kernels
+//      can drift vs decode kernels by ULPs even when every drafted
+//      token's identity already matched (SpecDecode.swift ~168-176;
+//      confirmed here too via `mtpSpecMatchesBaselineExactly`, which
+//      caught a full-accept-only divergence before this fix closed it).
+//      Sampled mode keeps the original full-accept fast path — the
+//      bonus token comes straight from the trailing batched logits row,
+//      matching `SpecDecode.generateGreedy`'s bonus handling — since
+//      sampled decode's losslessness contract doesn't depend on
+//      kernel-level bit-exactness the way greedy's baseline-matching
+//      gate does (see `mtpDecodeLoop`'s `mustReplayForExactness` doc
+//      comment).
 //   5. MTP KV LOCKSTEP: the draft head runs as a normal decoder layer
 //      with a persistent KV cache mirroring the backbone's committed
 //      history (see Qwen3xMTPHead's header). After each iteration the
@@ -1032,7 +1042,53 @@ extension SpecDecode {
 
             var nextTok = plan.nextToken
             var replayed = false
-            if plan.needsReplay {
+            // ── EXACTNESS DISCIPLINE (greedy only) ─────────────────────
+            // Mirrors the fix `DFlashSpecDecode.swift` already made (see
+            // that file's header, EXACTNESS DISCIPLINE section, point 5):
+            // a full accept's batched verify-pass argmax can drift by
+            // ULPs from what the single-token forward path would compute
+            // at the SAME position, even though every drafted token's
+            // IDENTITY already matched row-by-row. Trusting that drift
+            // straight into the emitted bonus token and the cache
+            // content on every full accept (the old `if plan.needsReplay`
+            // gate below skipped this whole block whenever
+            // `plan.needsReplay == false`) is exactly what
+            // `mtpSpecMatchesBaselineExactly` caught: a reproducible
+            // divergence at token index 16 under the shipped fixed-γ
+            // config (γ ∈ {1, 2, 4}), present since before the PR #129
+            // adversarial audit — see that test's git history for the
+            // bisect. Forcing greedy-mode full accepts through the same
+            // replay path partial accepts already use closes the gap:
+            // `nextTok` and the cache both end up backed by the exact
+            // single-token kernel, matching baseline greedy by
+            // construction, same as DFlash.
+            //
+            // Sampled mode's full-accept fast path is UNCHANGED: its
+            // bonus token already comes from a valid draw over the
+            // batched pass's own probabilities (see
+            // `planMTPAcceptSampled`/`planMTPAcceptMatch`'s doc
+            // comments) — a losslessness contract that does not depend
+            // on kernel-level bit-exactness the way greedy's
+            // baseline-matching gate does, so sampled decode keeps full
+            // accept's speed win.
+            let mustReplayForExactness = mode.isGreedy && !plan.needsReplay
+            if plan.needsReplay || mustReplayForExactness {
+              // `autoreleasepool` wrap — this block now runs on nearly
+              // EVERY greedy cycle instead of only partial/zero accepts
+              // (the whole point of `mustReplayForExactness`), and each
+              // pass through it allocates several MTLCommandBuffers /
+              // Tensors (the snapshot restore, the per-token or batched
+              // replay forward). Confirmed by direct repro during this
+              // fix: at γ=1 (where nearly every cycle takes this path)
+              // running unwrapped drove the process to a silent kill
+              // partway through a 120-token run — undrained Metal
+              // objects piling up across ~120 iterations in one
+              // process, the same class of issue as the repo's
+              // Metal-autoreleasepool-leak note (wrap any
+              // `makeBuffer`-heavy loop). Scoped to this block rather
+              // than the whole `loop: while` above because that outer
+              // loop has `break loop` statements a closure can't target.
+              autoreleasepool {
                 // ── Partial/zero accept: restore + replay ─────────────
                 // The batched pass's cache writes and logits are
                 // discarded; the accepted prefix replays through the
@@ -1177,17 +1233,33 @@ extension SpecDecode {
                 }
                 msReplay += Date().timeIntervalSince(rT)
                 }
+              }
             }
-            // Full accept: backbone caches already hold the verified
-            // block (all rows backed by accepted tokens); `nextTok` is
-            // the batched bonus, per SpecDecode's existing handling.
+            // Full accept, greedy: handled by the `mustReplayForExactness`
+            // branch above — caches and `nextTok` both come from the
+            // single-token replay, not the batched pass.
+            // Full accept, sampled: backbone caches already hold the
+            // verified block (all rows backed by accepted tokens);
+            // `nextTok` is the batched bonus, per SpecDecode's existing
+            // handling (see the `mustReplayForExactness` doc comment
+            // above for why sampled mode keeps this fast path).
 
             // ── Parity probe (diagnostic only) ────────────────────────
             // BUTTER_QWEN_MTP_PARITY=1 recomputes the bonus through the
             // single-token path on FULL accepts and reports how far the
-            // batched logits drift from it. The emitted stream still
-            // uses the fast path, so timings stay representative and
-            // only the diagnostic cost is added.
+            // batched logits drift from it. Since the greedy full-accept
+            // fix above (`mustReplayForExactness`) now already replays
+            // through the single-token path for real, this block runs
+            // AFTER the cache has been corrected — so on greedy runs it
+            // measures single-token-vs-single-token (always zero drift)
+            // rather than the pre-fix batched-vs-single-token gap. Left
+            // in place (harmless — restores back to the already-correct
+            // post-replay content either way) as a live check that the
+            // fix actually closed the gap; the historical
+            // batched-vs-single-token numbers this block used to report
+            // are in the PR history for this fix. The emitted stream
+            // still uses the fast path, so timings stay representative
+            // and only the diagnostic cost is added.
             //
             // The margin is |top1 - top2| of the batched bonus row. A
             // mismatch at a tiny margin is an argmax tie-break between

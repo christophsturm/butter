@@ -214,9 +214,17 @@ struct MTPSpecDecodeIntegrationTests {
     // batched pass's cache writes directly, token-identity agreement on
     // full accept did NOT guarantee bit-identical cache, and accumulated
     // drift eventually flipped an argmax on a high-entropy creative
-    // prompt. `MTPSpecDecode.swift`'s full-accept path (see this file's
-    // `mtpDecodeLoop`, the `// Full accept: backbone caches already hold
-    // the verified block` comment) inherits the identical shortcut.
+    // prompt. `MTPSpecDecode.swift`'s full-accept path used to inherit
+    // the identical shortcut — and DID diverge from it, just not on
+    // these 3 adversarial prompts: `mtpSpecMatchesBaselineExactly`
+    // above caught it first, on its own low-entropy fibonacci prompt
+    // (diverges at token 16 under the shipped γ ∈ {1, 2, 4} config —
+    // the margin-based intuition in this comment's second paragraph is
+    // about AVERAGE margin across a prompt, not a guarantee at every
+    // position, and index 16 was evidently a tight one). Fixed by
+    // routing greedy-mode full accepts through the same single-token
+    // replay partial accepts already use — see `mtpDecodeLoop`'s
+    // `mustReplayForExactness` — matching DFlash's discipline exactly.
     //
     // These 3 prompts mirror the adversarial half of
     // `GlimmerDFlashSpecDecodeIntegrationTests`'s 5-prompt matrix
@@ -443,13 +451,22 @@ struct MTPSpecDecodeIntegrationTests {
     // full-accept counts up to 56/89 cycles and per-run parity mismatch
     // rates up to 20% (margins 0.25-7.6, not all tie-breaks). The hazard
     // proven real by `BUTTER_QWEN_MTP_PARITY` (batched-vs-single-token
-    // drift on full-accept bonus positions) stays THEORETICAL on this
-    // checkpoint even under the boosted regime: the same
-    // partial/zero-accept replay frequency that protected the shipped
-    // config continues to reset the cache often enough to interrupt
-    // drift before it compounds into a flipped argmax, across every
-    // config tested. No production fix applied — see the commit message
-    // for the full per-config/per-case numbers.
+    // drift on full-accept bonus positions) stayed only THEORETICAL on
+    // this specific matrix (the 3 adversarial prompts, all 3 promotion
+    // configs): the same partial/zero-accept replay frequency that
+    // protected the shipped config continued to reset the cache often
+    // enough to interrupt drift before it compounded into a flipped
+    // argmax, across every config tested here. It was NOT theoretical
+    // in general — `mtpSpecMatchesBaselineExactly`'s own fixed-γ
+    // fibonacci-prompt gate hit it directly (diverges at token 16,
+    // reproducible, see that test's comment for the bisect). Fixed by
+    // `mtpDecodeLoop`'s `mustReplayForExactness`: greedy-mode full
+    // accepts now always replay through the single-token path, exactly
+    // like partial accepts already did, so this hazard is closed
+    // structurally rather than surviving on this suite by the
+    // replay-frequency coincidence described above — see the commit
+    // message for the full per-config/per-case numbers this audit
+    // found before the fix.
     private static let boostedRegimeConfigs:
         [(name: String, env: [String: String])] = [
             ("pmin-moderate", ["BUTTER_QWEN_MTP_PMIN": "0.8"]),
