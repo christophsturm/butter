@@ -10275,6 +10275,12 @@ pub fn marlin_gemm_u4b8_workspace(dev: &dyn Device, prob_n: usize, sms: i32) -> 
 /// [`marlin_gemm_u4b8_workspace`] pair -- **allocate that ONCE per weight
 /// and pass the same buffers every decode step; a fresh alloc per call
 /// measured a full perf-gate wash, see that function's doc.**
+/// F-85 round-10 (lever 1): `thread_k`/`thread_n`/`blocks_per_sm` -- pass
+/// `(-1,-1,-1)` for marlin_mm's own auto-config search (the round-8
+/// behavior), or a triple from [`marlin_pick_config`] to skip it. Every
+/// routed weight class shares one shape across all layers, so callers on
+/// the decode hot path should resolve + cache the triple once at load time
+/// (see `qwen35.rs`'s `MarlinWeight`) rather than pass `-1,-1,-1` here.
 #[allow(clippy::too_many_arguments)]
 pub fn marlin_gemm_u4b8_f16(
     dev: &dyn Device,
@@ -10282,6 +10288,7 @@ pub fn marlin_gemm_u4b8_f16(
     sorted_token_ids: &Tensor, expert_ids: &Tensor, num_tokens_past_padded: &Tensor,
     workspace: &Tensor, c_tmp: &Tensor,
     prob_m: usize, prob_n: usize, prob_k: usize, group_size: usize, sms: i32,
+    thread_k: i32, thread_n: i32, blocks_per_sm: i32,
 ) -> Result<Tensor> {
     let out = Tensor::empty(dev, vec![prob_m, prob_n], DType::F16)?;
     let num_groups = prob_k / group_size;
@@ -10291,8 +10298,18 @@ pub fn marlin_gemm_u4b8_f16(
         sorted_token_ids.buffer.as_ref(), expert_ids.buffer.as_ref(), num_tokens_past_padded.buffer.as_ref(),
         workspace.buffer.as_ref(),
         prob_m, prob_n, prob_k, num_groups, group_size, sms, true,
+        thread_k, thread_n, blocks_per_sm,
     )?;
     Ok(out)
+}
+
+/// F-85 round-10 (lever 1): resolves `marlin_mm`'s auto-config once for a
+/// fixed decode shape -- see [`marlin_gemm_u4b8_f16`]'s doc comment and
+/// `wh-iron-runtime`'s `marlin_pick_config`.
+pub fn marlin_pick_config(
+    dev: &dyn Device, prob_m: usize, prob_n: usize, prob_k: usize, group_size: usize, sms: i32,
+) -> Result<(i32, i32, i32)> {
+    dev.marlin_pick_config(prob_m, prob_n, prob_k, group_size, sms)
 }
 
 /// F-85 round-8: host-side symmetric u4 (bias-8, "u4b8") GPTQ-style

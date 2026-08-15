@@ -203,6 +203,14 @@ impl Qwen35Config {
 struct MarlinWeight {
     b_repacked: Tensor, // u32 [k/16, m*2] -- ops::marlin_repack output
     b_scales: Tensor,   // f16 [k/32, m], permuted -- ops::marlin_permute_scales output
+    // F-85 round-10 (lever 1): `marlin_mm`'s auto-config search
+    // (`thread_k=thread_n=blocks_per_sm=-1`) recomputes the same result on
+    // EVERY call via a `cudaFuncGetAttributes` probe loop -- deterministic
+    // for a fixed (m,k) shape, so resolved ONCE here (`build_marlin`, via
+    // `ops::marlin_pick_config`) and reused for every decode step's call.
+    thread_k: i32,
+    thread_n: i32,
+    blocks_per_sm: i32,
 }
 
 struct Q4Dense {
@@ -249,6 +257,7 @@ impl Q4Dense {
                 &routing.0, &routing.1, &routing.2,
                 workspace, c_tmp,
                 1, self.m, self.k, MARLIN_GROUP_SIZE, GB10_SMS,
+                mw.thread_k, mw.thread_n, mw.blocks_per_sm,
             )?;
             // marlin's GEMM returns [prob_m,prob_n] = [1,m]; gemv_q4's
             // convention (and every downstream call site) is flat [m].
@@ -323,7 +332,13 @@ fn build_marlin(dev: &dyn Device, flat: &[f32], m: usize, k: usize) -> Result<Ma
     let b_repacked = ops::marlin_repack(dev, &bqw_t, k, m, GB10_SMS, MARLIN_MAX_SHARED_MEM)?;
     let num_groups = k / MARLIN_GROUP_SIZE;
     let b_scales = ops::marlin_permute_scales(dev, &scales_raw, num_groups, m)?;
-    Ok(MarlinWeight { b_repacked, b_scales })
+    // F-85 round-10 (lever 1): resolve the auto-config ONCE per weight
+    // shape at load time instead of paying marlin_mm's per-call
+    // cudaFuncGetAttributes probe loop on every one of the ~320 decode
+    // calls/step that share this (m,k).
+    let (thread_k, thread_n, blocks_per_sm) =
+        ops::marlin_pick_config(dev, 1, m, k, MARLIN_GROUP_SIZE, GB10_SMS)?;
+    Ok(MarlinWeight { b_repacked, b_scales, thread_k, thread_n, blocks_per_sm })
 }
 
 /// GGUF dims are fastest-first: a 2-D `[out, in]` weight is stored with
@@ -724,10 +739,16 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
         let mixer = if cfg.is_full_layer(i) {
             Mixer::Full(FullAttnWeights {
                 attn_norm: load_f32_vec(dev, g, &format!("{p}.attn_norm.weight"))?,
+                // F-85 round-10 (lever 2): wk/wv/wo isolated-microbench
+                // marlin-vs-gemv_q4 at these exact shapes (m=1024,k=5120
+                // and m=5120,k=6144) showed marlin 2.7x-4.4x faster
+                // (10.3-16.4us vs 16.4-71.8us, see
+                // qwen35_marlin_smallproj_microbench.rs) -- routed like the
+                // round-7/8 big shapes instead of plain gemv_q4.
                 wq: load_q4dense_routed(dev, g, &format!("{p}.attn_q.weight"))?,
-                wk: load_q4dense(dev, g, &format!("{p}.attn_k.weight"))?,
-                wv: load_q4dense(dev, g, &format!("{p}.attn_v.weight"))?,
-                wo: load_q4dense(dev, g, &format!("{p}.attn_output.weight"))?,
+                wk: load_q4dense_routed(dev, g, &format!("{p}.attn_k.weight"))?,
+                wv: load_q4dense_routed(dev, g, &format!("{p}.attn_v.weight"))?,
+                wo: load_q4dense_routed(dev, g, &format!("{p}.attn_output.weight"))?,
                 q_norm: load_f32_vec(dev, g, &format!("{p}.attn_q_norm.weight"))?,
                 k_norm: load_f32_vec(dev, g, &format!("{p}.attn_k_norm.weight"))?,
             })
@@ -749,7 +770,10 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
             Mixer::Gdn(GdnWeights {
                 attn_norm: load_f32_vec(dev, g, &format!("{p}.attn_norm.weight"))?,
                 wqkv: load_q4dense_routed(dev, g, &format!("{p}.attn_qkv.weight"))?,
-                wz: load_q4dense(dev, g, &format!("{p}.attn_gate.weight"))?,
+                // F-85 round-10 (lever 2): see the wk/wv/wo comment above --
+                // gdn_wz is the same (m=6144,k=5120) shape microbenched
+                // there (marlin 16.4us vs gemv 71.7us).
+                wz: load_q4dense_routed(dev, g, &format!("{p}.attn_gate.weight"))?,
                 w_alpha: load_f32_dense(dev, g, &format!("{p}.ssm_alpha.weight"))?,
                 w_beta: load_f32_dense(dev, g, &format!("{p}.ssm_beta.weight"))?,
                 dt_bias: load_f32_vec(dev, g, &format!("{p}.ssm_dt.bias"))?,
@@ -764,7 +788,9 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
                     DType::F32,
                 ),
                 ssm_norm_w: load_f32_vec(dev, g, &format!("{p}.ssm_norm.weight"))?,
-                wo: load_q4dense(dev, g, &format!("{p}.ssm_out.weight"))?,
+                // F-85 round-10 (lever 2): gdn_wo is the wo(5120,6144)
+                // shape microbenched above (marlin 16.4us vs gemv 71.8us).
+                wo: load_q4dense_routed(dev, g, &format!("{p}.ssm_out.weight"))?,
             })
         };
         let ffn = DenseFfn {

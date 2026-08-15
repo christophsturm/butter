@@ -485,6 +485,7 @@ impl Device for CudaDevice {
         workspace: &dyn DeviceBuffer,
         prob_m: usize, prob_n: usize, prob_k: usize, num_groups: usize, group_size: usize,
         sms: i32, use_fp32_reduce: bool,
+        thread_k: i32, thread_n: i32, blocks_per_sm: i32,
     ) -> Result<()> {
         let g = |x: &dyn DeviceBuffer, nm: &str| x.as_any().downcast_ref::<CudaBuffer>().map(|b| b.ptr)
             .ok_or_else(|| Error::Msg(format!("marlin_gemm_u4b8_f16: {nm} not CudaBuffer")));
@@ -494,7 +495,18 @@ impl Device for CudaDevice {
             g(sorted_token_ids, "sorted_token_ids")?, g(expert_ids, "expert_ids")?, g(num_tokens_past_padded, "num_tokens_past_padded")?,
             g(workspace, "workspace")?,
             prob_m, prob_n, prob_k, num_groups, group_size, sms, use_fp32_reduce,
+            thread_k, thread_n, blocks_per_sm,
         ).map_err(dispatch_err)
+    }
+
+    /// F-85 round-10 (lever 1): resolves `marlin_mm`'s auto-config once for
+    /// a fixed decode-M=1 shape, so the hot GEMM call can skip the
+    /// per-call `cudaFuncGetAttributes` probe loop -- see
+    /// `wh-iron-runtime`'s `marlin_pick_config` doc comment.
+    fn marlin_pick_config(
+        &self, prob_m: usize, prob_n: usize, prob_k: usize, group_size: usize, sms: i32,
+    ) -> Result<(i32, i32, i32)> {
+        self.dev.marlin_pick_config(prob_m, prob_n, prob_k, group_size, sms).map_err(dispatch_err)
     }
 
     fn moe_grouped_cutlass_fp4(
