@@ -2370,6 +2370,153 @@ pub fn gemm_q4_mpp(
     Ok(out)
 }
 
+/// Dense Q4 GEMM, BM=8, tensor-core MMA (`iron_gemm_q4_bm8`) -- the F-85
+/// batched-verify final lever. Tensor-core twin of `gemv_q4_multi` (which
+/// failed the batched-verify perf gate, instruction-issue-bound scalar
+/// dequant+FMA): puts the per-candidate FMAs on the MMA pipe instead.
+/// `x` is `[n_rows, k_in]` (n_rows small, real candidates <= n_rows, caller
+/// pads/zeros unused rows -- typically n_rows=8 for the gamma in {2,3,4}
+/// verify shapes); `out` is `[n_rows, out_dim]`. Same dense (non-indexed)
+/// call contract as `gemm_q4_mpp`, just BM=8 direct-input `matmul2d`
+/// instead of the 64x64 cooperative-tensor tile (which failed small-M by
+/// 15-70x on fixed tile overhead -- see that kernel's doc).
+pub fn gemm_q4_bm8(
+    dev: &dyn Device,
+    x: &Tensor,
+    qs: &Tensor,
+    scales: &Tensor,
+    n_rows: usize,
+    out_dim: usize,
+    k_in: usize,
+) -> Result<Tensor> {
+    use wh_iron_core::ir::KernelMode;
+    if k_in % 32 != 0 {
+        return Err(Error::Msg(format!("gemm_q4_bm8: k_in {k_in} must be a multiple of 32")));
+    }
+    let out = Tensor::empty(dev, vec![n_rows, out_dim], x.dtype)?;
+    let kern = cached_ir("iron_gemm_q4_bm8", x.dtype, || {
+        let mut kk = wh_iron_std::kernels::gemm::gemm_q4_bm8::iron_gemm_q4_bm8::kernel_ir_for(x.dtype);
+        kk.mode = KernelMode::Reduction;
+        kk
+    });
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let grid = Grid {
+        grid: [(out_dim as u32).div_ceil(32), (n_rows as u32).div_ceil(8), 1],
+        block: [32, 1, 1],
+    };
+    dev.dispatch(
+        &kern,
+        &[
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(qs.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(n_rows as u32),
+            u(out_dim as u32),
+            u(k_in as u32),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// Round-5 ARM B: BN=16 retile of `gemm_q4_bm8` (`iron_gemm_q4_bm8n16`) --
+/// same dense BM=8 call contract, narrower N-tile (16 output features/TG
+/// instead of 32) to characterize the threadgroup-count-vs-per-TG-overhead
+/// curve `gemm_q4_bm8`'s 4.5-8.6x gate miss was root-caused to (see that
+/// kernel's doc + `gemm_q4_bm8_narrow.rs`'s doc for the coop_tile-is-
+/// software-emulated-on-CUDA correction). Not expected to clear the gate
+/// outright -- informative dead-end characterization, not a hardened lever.
+pub fn gemm_q4_bm8n16(
+    dev: &dyn Device,
+    x: &Tensor,
+    qs: &Tensor,
+    scales: &Tensor,
+    n_rows: usize,
+    out_dim: usize,
+    k_in: usize,
+) -> Result<Tensor> {
+    use wh_iron_core::ir::KernelMode;
+    if k_in % 32 != 0 {
+        return Err(Error::Msg(format!("gemm_q4_bm8n16: k_in {k_in} must be a multiple of 32")));
+    }
+    let out = Tensor::empty(dev, vec![n_rows, out_dim], x.dtype)?;
+    let kern = cached_ir("iron_gemm_q4_bm8n16", x.dtype, || {
+        let mut kk =
+            wh_iron_std::kernels::gemm::gemm_q4_bm8_narrow::iron_gemm_q4_bm8n16::kernel_ir_for(
+                x.dtype,
+            );
+        kk.mode = KernelMode::Reduction;
+        kk
+    });
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let grid = Grid {
+        grid: [(out_dim as u32).div_ceil(16), (n_rows as u32).div_ceil(8), 1],
+        block: [32, 1, 1],
+    };
+    dev.dispatch(
+        &kern,
+        &[
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(qs.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(n_rows as u32),
+            u(out_dim as u32),
+            u(k_in as u32),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// Round-5 ARM B: BN=8 retile of `gemm_q4_bm8` (`iron_gemm_q4_bm8n8`) -- see
+/// `gemm_q4_bm8n16`'s doc; this is the narrower-still sibling (8 output
+/// features/TG, matching plain gemv's per-feature TG granularity as
+/// closely as this tile shape allows).
+pub fn gemm_q4_bm8n8(
+    dev: &dyn Device,
+    x: &Tensor,
+    qs: &Tensor,
+    scales: &Tensor,
+    n_rows: usize,
+    out_dim: usize,
+    k_in: usize,
+) -> Result<Tensor> {
+    use wh_iron_core::ir::KernelMode;
+    if k_in % 32 != 0 {
+        return Err(Error::Msg(format!("gemm_q4_bm8n8: k_in {k_in} must be a multiple of 32")));
+    }
+    let out = Tensor::empty(dev, vec![n_rows, out_dim], x.dtype)?;
+    let kern = cached_ir("iron_gemm_q4_bm8n8", x.dtype, || {
+        let mut kk =
+            wh_iron_std::kernels::gemm::gemm_q4_bm8_narrow::iron_gemm_q4_bm8n8::kernel_ir_for(
+                x.dtype,
+            );
+        kk.mode = KernelMode::Reduction;
+        kk
+    });
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let grid = Grid {
+        grid: [(out_dim as u32).div_ceil(8), (n_rows as u32).div_ceil(8), 1],
+        block: [32, 1, 1],
+    };
+    dev.dispatch(
+        &kern,
+        &[
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(qs.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(n_rows as u32),
+            u(out_dim as u32),
+            u(k_in as u32),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
 /// Routed-expert MoE Q4 grouped BGEMM via MMA (`iron_moe_bgemm_q4_bm64`). The
 /// token rows of `x` `[m_total, k_in]` MUST be pre-sorted by expert, with
 /// `indices` `[m_total]` giving each row's expert id. Expert weights are the
