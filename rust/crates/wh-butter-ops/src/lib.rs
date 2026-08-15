@@ -791,6 +791,45 @@ pub fn gemv_q8_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor,
     Ok(out)
 }
 
+/// NVFP4 block-scaled GEMV (test/validation wrapper -- NOT wired into any
+/// model forward path): `out[row] = Σ_k dequant_nvfp4(weight[row,k]) · x[k]`.
+/// Dispatches iron's `iron_nvfp4_qgemv` (`kernels/gemm/block_scaled_matmul.rs`),
+/// one of the block-scaled kernels the F-85-adjacent NVFP4 pre-build campaign
+/// scoped as "compiling clean, zero real-model callers". This wrapper exists
+/// so `wh-butter-cuda`'s `nvfp4_qgemv_layout_test.rs` can validate the
+/// checkpoint -> kernel layout mapping documented in `NVFP4_LAYOUT.md` with an
+/// actual GPU dispatch, not just a host-side transcription of the decode math.
+///
+/// `weight` is `[out_dim, in_dim/8]` u32 (8 E2M1 nibbles/word -- a checkpoint's
+/// packed `[out_dim, in_dim/2]` u8 buffer reinterpreted in place, 4 bytes/word,
+/// per `NVFP4_LAYOUT.md` §3); `scales` is `[out_dim, in_dim/block_size]` u8
+/// raw E4M3 byte codes; `global` is the per-tensor `weight_scale_2`.
+pub fn gemv_nvfp4(dev: &dyn Device, weight: &Tensor, scales: &Tensor, x: &Tensor, out_dim: usize, in_dim: usize, block_size: usize, global: f32) -> Result<Tensor> {
+    let k = cached_ir("iron_nvfp4_qgemv", x.dtype, || {
+        let mut k = wh_iron_std::kernels::gemm::block_scaled_matmul::iron_nvfp4_qgemv::kernel_ir_for(x.dtype);
+        k.mode = wh_iron_core::ir::KernelMode::Reduction;
+        k
+    });
+    let out = Tensor::empty(dev, vec![out_dim], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let f = |v: f32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let grid = Grid { grid: [out_dim as u32, 1, 1], block: [64, 1, 1] };
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(weight.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(in_dim as u32),
+            u(block_size as u32),
+            f(global),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
 /// Q8 gemv that scales + accumulates in place: `acc[r] += scale · (Wq · x)[r]`.
 /// Fuses an MoE expert's `down` projection with its router-weighted sum into the
 /// layer accumulator — no per-expert scalar-broadcast upload or separate add.

@@ -116,3 +116,7 @@ required-features = ["cuda"]
 [[test]]
 name = "proj_fp8_bench"
 required-features = ["cuda"]
+
+[[test]]
+name = "nvfp4_qgemv_layout_test"
+required-features = ["cuda"]

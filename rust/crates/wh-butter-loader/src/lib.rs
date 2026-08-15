@@ -62,6 +62,17 @@ fn parse_dtype(s: &str) -> Result<DType> {
         "U32" => DType::U32,
         "I8" => DType::I8,
         "U8" => DType::U8,
+        // FP8 byte codes (E4M3/E5M2) — modelopt NVFP4 checkpoints store
+        // `<base>.weight_scale` as one of these. No IEEE-754-style decode
+        // happens at the dtype layer for any tag here (BF16/F16 are the only
+        // ones this loader actually interprets numerically, in
+        // `bytes_to_f32`); F8_E4M3/F8_E5M2 are carried as opaque raw bytes
+        // (`DType::U8`) — callers that need the E4M3 value decode the byte
+        // themselves (see `nvfp4.rs`, mirroring `iron`'s `iron_decode_e4m3`).
+        // Without this arm, `weight_scale` tensors were silently dropped from
+        // the shard index by the `Err(_) => continue` below, making them
+        // invisible to `tensor()`/`load_nvfp4_tensor()` lookups.
+        "F8_E4M3" | "F8_E5M2" => DType::U8,
         other => return Err(Error::Msg(format!("safetensors: unsupported dtype {other}"))),
     })
 }
@@ -412,6 +423,7 @@ impl SafeTensors {
 }
 mod iq2xxs_tables;
 pub mod gguf;
+pub mod nvfp4;
 
 // ── Capability probe ────────────────────────────────────────────────────
 //
