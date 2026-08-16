@@ -15,12 +15,16 @@
 //! - **Rust Butter** (this) — the cross-platform path: CUDA / Vulkan / ROCm
 //!   (+ Metal for cross-validation). Same kernels, same model parity.
 //!
-//! Use [`devices`] to enumerate every backend compiled into this build.
+//! Use [`devices`] to enumerate every backend compiled into this build, and
+//! [`generate::run`] for the real "load a GGUF, generate text" entrypoint
+//! (`wh-butter-cli`'s `generate` subcommand is a thin wrapper over it).
 
 pub use wh_butter_core::{
     Backend, Binding, Device, DeviceBuffer, DType, Error, Grid, Kernel, Result, Tensor,
 };
 pub use wh_butter_ops as ops;
+
+pub mod generate;
 
 use std::sync::Arc;
 
