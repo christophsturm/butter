@@ -43,6 +43,8 @@ fn print_usage() {
     println!("    --seed <n>           sampling seed (default: 0)");
     println!("    --greedy             greedy decoding (default: on — this port is greedy-only for now)");
     println!("    --no-stream          don't print tokens as they're generated");
+    println!("    --warmup             run a tiny throwaway generate first to pay JIT/kernel-compile");
+    println!("                         cost before the timed run (use for steady-state bench numbers)");
 }
 
 fn report_backends() {
@@ -70,6 +72,7 @@ fn generate_cmd(args: &[String]) {
     let mut chunk = 0usize;
     let mut seed = 0u64;
     let mut stream = true;
+    let mut warmup = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -82,6 +85,14 @@ fn generate_cmd(args: &[String]) {
             "--seed" => { i += 1; seed = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(seed); }
             "--greedy" => {}
             "--no-stream" => { stream = false; }
+            // Run a tiny throwaway prefill+decode before the timed
+            // generate, so the reported tok/s reflect steady state instead
+            // of also paying this process's one-time NVRTC/JIT kernel
+            // compile cost (see wh-iron-runtime's own bench convention:
+            // "Warmup — first launch pays JIT/cache/clock-ramp costs",
+            // device/cuda/mod.rs). Doesn't affect --model's KV cache/state
+            // (warmup uses its own cache) or the timed run's correctness.
+            "--warmup" => { warmup = true; }
             other => {
                 eprintln!("butter generate: unrecognized flag {other:?}");
                 std::process::exit(2);
@@ -102,7 +113,11 @@ fn generate_cmd(args: &[String]) {
         }
         (Some(p), None) => p,
         (None, Some(path)) => match std::fs::read_to_string(&path) {
-            Ok(s) => s,
+            // Strip exactly one trailing newline (matches the oracle
+            // harnesses' `prompt.strip_suffix('\n')` convention, e.g.
+            // qwen35_prefill_correctness.rs) so a prompt file saved with a
+            // trailing newline tokenizes identically either way.
+            Ok(s) => s.strip_suffix('\n').map(str::to_string).unwrap_or(s),
             Err(e) => {
                 eprintln!("butter generate: reading --prompt-file {path:?}: {e}");
                 std::process::exit(1);
@@ -122,6 +137,43 @@ fn generate_cmd(args: &[String]) {
     };
     eprintln!("butter generate: device [{}] {}", dev.backend().as_str(), dev.name());
 
+    // load() once — dominates wall time (real-checkpoint load is ~2min for
+    // the 27B Q4_K_M GGUF this port targets) and is prompt-independent, so
+    // both the optional warmup generate and the real timed generate reuse
+    // these SAME weights instead of paying the load cost twice.
+    let t_load = std::time::Instant::now();
+    let loaded = match wh_butter::generate::load(dev.as_ref(), &model) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("butter generate: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "butter generate: loaded {} in {:.3}s",
+        loaded.architecture(),
+        t_load.elapsed().as_secs_f64()
+    );
+
+    if warmup {
+        eprintln!("butter generate: warmup pass (JIT-compiling kernels)...");
+        let warmup_opts = GenerateOpts {
+            max_new: 4,
+            chunk: 0,
+            sampling: wh_butter::generate::Sampling::Greedy,
+            seed: 0,
+            stream: false,
+        };
+        let t_warm = std::time::Instant::now();
+        match wh_butter::generate::generate(dev.as_ref(), &loaded, DEFAULT_PROMPT, &warmup_opts) {
+            Ok(_) => eprintln!("butter generate: warmup done in {:.3}s", t_warm.elapsed().as_secs_f64()),
+            Err(e) => {
+                eprintln!("butter generate: warmup failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let opts = GenerateOpts {
         max_new,
         chunk,
@@ -131,7 +183,7 @@ fn generate_cmd(args: &[String]) {
     };
 
     let t0 = std::time::Instant::now();
-    let report = match wh_butter::generate::run(dev.as_ref(), &model, &prompt, &opts) {
+    let report = match wh_butter::generate::generate(dev.as_ref(), &loaded, &prompt, &opts) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("butter generate: {e}");

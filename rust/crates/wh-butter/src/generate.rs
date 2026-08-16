@@ -8,13 +8,25 @@
 //! already depends on `wh-butter-models`/`wh-butter-runtime`/
 //! `wh-butter-loader` unconditionally (see this crate's `Cargo.toml`), so
 //! the CLI, the FFI surface, and any future host can all call the same
-//! `run` without each re-deriving the load->prefill->decode wiring.
+//! `load`/`generate` without each re-deriving the load->prefill->decode
+//! wiring.
 //!
-//! Architecture registry: add an arm to `run`'s `match` + a `run_<arch>`
-//! function per newly-ported model (the `qwen35` arm below is the
-//! reference shape: tokenizer from GGUF metadata, `<arch>::load_gguf`,
-//! `<arch>::Cache::new`, `<arch>::prefill` for the prompt, `<arch>::
-//! decode_step` per generated token).
+//! `load` and `generate` are deliberately SEPARATE calls (not one
+//! `run(path, prompt)`): loading a real checkpoint dominates wall time
+//! (~2min for the 27B Q4_K_M GGUF used in this port) and is completely
+//! independent of the prompt, so a caller that wants to warm up CUDA's
+//! NVRTC/JIT kernel cache with a throwaway generate before a timed one (see
+//! `wh-butter-cli`'s `--warmup`) must be able to reuse the SAME loaded
+//! weights for both calls rather than paying the load cost twice.
+//! [`run`] is a thin load+generate convenience wrapper for callers that
+//! only need one shot.
+//!
+//! Architecture registry: [`LoadedModel`] gets a new variant, `load`'s
+//! `match` gets a new arm, and `generate`'s `match` gets the matching arm
+//! per newly-ported model (the `qwen35` arm below is the reference shape:
+//! tokenizer from GGUF metadata, `<arch>::load_gguf` at load time,
+//! `<arch>::Cache::new` + `<arch>::prefill` for the prompt + `<arch>::
+//! decode_step` per generated token at generate time).
 
 use std::io::Write;
 use std::time::Instant;
@@ -25,8 +37,8 @@ use wh_butter_models::{gguf_tokenizer::GgufTokenizer, qwen35};
 use wh_butter_runtime::{sample, Rng};
 pub use wh_butter_runtime::Sampling;
 
-/// Options for one `run` call. `chunk == 0` is the "auto" sentinel each
-/// model's own `prefill` already understands (see e.g.
+/// Options for one [`generate`] call. `chunk == 0` is the "auto" sentinel
+/// each model's own `prefill` already understands (see e.g.
 /// `qwen35::default_prefill_chunk` / `laguna::default_prefill_chunk`) —
 /// passed straight through rather than re-picking a default here, so this
 /// module can't drift from the bench-validated per-model operating point.
@@ -47,10 +59,10 @@ impl Default for GenerateOpts {
 }
 
 /// Prompt-processing (prefill) and decode throughput + generated text for
-/// one `run` call. Prefill/decode are timed and reported SEPARATELY (the
-/// CLI's UX-numbers requirement) since they run through entirely different
-/// paths (batched chunked forward vs. per-token `decode_step`) with very
-/// different tok/s.
+/// one [`generate`] call. Prefill/decode are timed and reported
+/// SEPARATELY (the CLI's UX-numbers requirement) since they run through
+/// entirely different paths (batched chunked forward vs. per-token
+/// `decode_step`) with very different tok/s.
 #[derive(Debug, Clone)]
 pub struct GenerateReport {
     pub architecture: String,
@@ -64,6 +76,23 @@ pub struct GenerateReport {
     pub text: String,
 }
 
+/// A GGUF checkpoint loaded onto a [`Device`], dispatched by
+/// `general.architecture`. Holds everything [`generate`] needs
+/// (tokenizer, eos id, model weights) but no per-call state (no KV
+/// cache/positions) — a single `LoadedModel` can drive any number of
+/// independent [`generate`] calls (each builds its own fresh cache).
+pub enum LoadedModel {
+    Qwen35 { tok: GgufTokenizer, eos: Option<u32>, model: qwen35::Qwen35Model },
+}
+
+impl LoadedModel {
+    pub fn architecture(&self) -> &'static str {
+        match self {
+            LoadedModel::Qwen35 { .. } => "qwen35",
+        }
+    }
+}
+
 /// GGUF architecture string that selects the generation path — read
 /// straight from `general.architecture` metadata, same key `llama.rs`'s
 /// `load_hf` already keys its own dispatch off of.
@@ -71,27 +100,56 @@ pub fn detect_architecture(g: &Gguf) -> String {
     g.meta_str("general.architecture").unwrap_or("unknown").to_string()
 }
 
-/// Load `gguf_path`, detect its architecture, and run prefill+decode over
-/// `prompt` per `opts`. This is the one real generation entrypoint the CLI
-/// (and anything else that wants "load a GGUF, generate text") should call.
-pub fn run(dev: &dyn Device, gguf_path: &str, prompt: &str, opts: &GenerateOpts) -> Result<GenerateReport> {
+/// Open `gguf_path`, detect its architecture, and load weights onto `dev`.
+/// The dominant-cost, prompt-independent half of "load a GGUF, generate
+/// text" — call once, then drive as many [`generate`] calls as you like.
+pub fn load(dev: &dyn Device, gguf_path: &str) -> Result<LoadedModel> {
     let g = Gguf::open(gguf_path)?;
     let arch = detect_architecture(&g);
     match arch.as_str() {
-        "qwen35" => run_qwen35(dev, &g, arch, prompt, opts),
+        "qwen35" => {
+            let tok = GgufTokenizer::from_gguf(&g)?;
+            let eos = g.meta_u32("tokenizer.ggml.eos_token_id");
+            let model = qwen35::load_gguf(dev, &g)?;
+            Ok(LoadedModel::Qwen35 { tok, eos, model })
+        }
         other => Err(Error::Msg(format!(
             "butter generate: no registered generation path for GGUF architecture {other:?} \
-             (registered: \"qwen35\"). To add one: teach `wh_butter::generate::run` a new \
-             match arm + a `run_<arch>` function following the `run_qwen35` shape."
+             (registered: \"qwen35\"). To add one: teach `wh_butter::generate::{{load,generate}}` \
+             a new match arm following the `qwen35` arm's shape."
         ))),
     }
 }
 
-fn run_qwen35(dev: &dyn Device, g: &Gguf, arch: String, prompt: &str, opts: &GenerateOpts) -> Result<GenerateReport> {
-    let tok = GgufTokenizer::from_gguf(g)?;
-    let eos = g.meta_u32("tokenizer.ggml.eos_token_id");
-    let model = qwen35::load_gguf(dev, g)?;
+/// Batched chunked prefill (F-85) over `prompt`, then per-token
+/// `decode_step` for up to `opts.max_new` tokens. This is the "real
+/// generation entrypoint" — prompt processing routes through the same
+/// `<arch>::prefill` the bench/correctness harnesses validated
+/// (token-identical to the old decode-loop-as-prefill baseline, see
+/// `qwen35_prefill_correctness.rs`), not a decode-loop re-implementation.
+pub fn generate(dev: &dyn Device, loaded: &LoadedModel, prompt: &str, opts: &GenerateOpts) -> Result<GenerateReport> {
+    match loaded {
+        LoadedModel::Qwen35 { tok, eos, model } => generate_qwen35(dev, tok, *eos, model, prompt, opts),
+    }
+}
 
+/// Convenience one-shot wrapper: [`load`] + [`generate`]. Fine for a
+/// single request; a caller issuing more than one (e.g. a warmup pass
+/// before a timed bench run) should call `load` once and reuse the
+/// `LoadedModel` instead, to avoid paying the load cost per call.
+pub fn run(dev: &dyn Device, gguf_path: &str, prompt: &str, opts: &GenerateOpts) -> Result<GenerateReport> {
+    let loaded = load(dev, gguf_path)?;
+    generate(dev, &loaded, prompt, opts)
+}
+
+fn generate_qwen35(
+    dev: &dyn Device,
+    tok: &GgufTokenizer,
+    eos: Option<u32>,
+    model: &qwen35::Qwen35Model,
+    prompt: &str,
+    opts: &GenerateOpts,
+) -> Result<GenerateReport> {
     let ids = tok.encode(prompt);
     if ids.is_empty() {
         return Err(Error::Msg("generate: empty prompt after tokenization".into()));
@@ -101,7 +159,7 @@ fn run_qwen35(dev: &dyn Device, g: &Gguf, arch: String, prompt: &str, opts: &Gen
 
     // ---- Prompt processing: batched chunked prefill (F-85) ----
     let t_prefill = Instant::now();
-    let logits = qwen35::prefill(dev, &model, &mut cache, &ids, opts.chunk)?;
+    let logits = qwen35::prefill(dev, model, &mut cache, &ids, opts.chunk)?;
     dev.synchronize()?;
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
 
@@ -122,7 +180,7 @@ fn run_qwen35(dev: &dyn Device, g: &Gguf, arch: String, prompt: &str, opts: &Gen
             print!("{}", tok.decode(&[next]));
             let _ = std::io::stdout().flush();
         }
-        let logits = qwen35::decode_step(dev, &model, &mut cache, next, pos)?;
+        let logits = qwen35::decode_step(dev, model, &mut cache, next, pos)?;
         last_logits = download_logits(dev, &logits, model.cfg.vocab)?;
         pos += 1;
     }
@@ -134,7 +192,7 @@ fn run_qwen35(dev: &dyn Device, g: &Gguf, arch: String, prompt: &str, opts: &Gen
     let generated_tokens = out_ids.len();
     let text = tok.decode(&out_ids);
     Ok(GenerateReport {
-        architecture: arch,
+        architecture: "qwen35".to_string(),
         prompt_tokens: ids.len(),
         generated_tokens,
         prefill_secs,
