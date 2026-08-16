@@ -41,7 +41,11 @@ fn print_usage() {
     println!("    --max-new <n>        max tokens to generate (default: 128)");
     println!("    --chunk <n>          prefill chunk size, 0 = model's bench-validated default (default: 0)");
     println!("    --seed <n>           sampling seed (default: 0)");
-    println!("    --greedy             greedy decoding (default: on — this port is greedy-only for now)");
+    println!("    --greedy             greedy decoding (default when no --temp/--top-k/--top-p given)");
+    println!("    --temp <f32>         softmax temperature; presence switches off greedy sampling");
+    println!("    --top-k <n>          keep only the top-n logits (needs --temp, or defaults temp to 1.0)");
+    println!("    --top-p <f32>        nucleus sampling threshold (needs --temp, or defaults temp to 1.0;");
+    println!("                         mutually exclusive with --top-k)");
     println!("    --no-stream          don't print tokens as they're generated");
     println!("    --warmup             run a tiny throwaway generate first to pay JIT/kernel-compile");
     println!("                         cost before the timed run (use for steady-state bench numbers)");
@@ -73,6 +77,9 @@ fn generate_cmd(args: &[String]) {
     let mut seed = 0u64;
     let mut stream = true;
     let mut warmup = false;
+    let mut temp: Option<f32> = None;
+    let mut top_k: Option<usize> = None;
+    let mut top_p: Option<f32> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -84,6 +91,9 @@ fn generate_cmd(args: &[String]) {
             "--chunk" => { i += 1; chunk = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(chunk); }
             "--seed" => { i += 1; seed = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(seed); }
             "--greedy" => {}
+            "--temp" => { i += 1; temp = args.get(i).and_then(|s| s.parse().ok()); }
+            "--top-k" => { i += 1; top_k = args.get(i).and_then(|s| s.parse().ok()); }
+            "--top-p" => { i += 1; top_p = args.get(i).and_then(|s| s.parse().ok()); }
             "--no-stream" => { stream = false; }
             // Run a tiny throwaway prefill+decode before the timed
             // generate, so the reported tok/s reflect steady state instead
@@ -124,6 +134,20 @@ fn generate_cmd(args: &[String]) {
             }
         },
         (None, None) => DEFAULT_PROMPT.to_string(),
+    };
+
+    let sampling = match (temp, top_k, top_p) {
+        (_, Some(_), Some(_)) => {
+            eprintln!("butter generate: pass only one of --top-k / --top-p");
+            std::process::exit(2);
+        }
+        (None, None, None) => wh_butter::generate::Sampling::Greedy,
+        (Some(t), None, None) => wh_butter::generate::Sampling::Temperature(t),
+        (Some(t), Some(k), None) => wh_butter::generate::Sampling::TopK(t, k),
+        (Some(t), None, Some(p)) => wh_butter::generate::Sampling::TopP(t, p),
+        // --top-k/--top-p given without --temp: default temp to 1.0.
+        (None, Some(k), None) => wh_butter::generate::Sampling::TopK(1.0, k),
+        (None, None, Some(p)) => wh_butter::generate::Sampling::TopP(1.0, p),
     };
 
     let devices = wh_butter::devices();
@@ -177,7 +201,7 @@ fn generate_cmd(args: &[String]) {
     let opts = GenerateOpts {
         max_new,
         chunk,
-        sampling: wh_butter::generate::Sampling::Greedy,
+        sampling,
         seed,
         stream,
     };
