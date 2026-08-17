@@ -1034,6 +1034,8 @@ extension SpecDecode {
                 }
             }
 
+            let inputIds = [prev] + drafts
+
             // ── Snapshot ALL caches before the speculative forward ────
             // Backbone layer caches via the composite snapshot; the MTP
             // head's own KV cache alongside (`mtpLen` above — same
@@ -1041,14 +1043,20 @@ extension SpecDecode {
             // case). Taking the backbone snapshot AFTER the draft burst
             // is safe: the burst only touches the head's own cache.
             let snapT = Date()
-            // The verifier is submitted next on Device's primary queue,
-            // so queue order completes these blits before it mutates state.
-            let snap = caches.snapshotAll(
-                device: device, waitUntilCompleted: false)
+            // Eligible state planes replace the recurrent snapshot entirely.
+            // Keep it for priming, diagnostic replay, and every fallback shape.
+            let planesReplaceSnapshot =
+                statePlanes && !parityProbe
+                && model.canCaptureStatePlanes(
+                    tokenCount: inputIds.count, caches: caches)
+            let snap =
+                planesReplaceSnapshot
+                ? nil
+                : caches.snapshotAll(
+                    device: device, waitUntilCompleted: false)
             msSnap += Date().timeIntervalSince(snapT)
 
             // ── Verify: ONE batched backbone pass ─────────────────────
-            let inputIds = [prev] + drafts
             let vT = Date()
             let vCmd = device.makeCommandBuffer()
             var (hiddenAll, logitsAll) = model.forwardManyHiddenAndLogits(
@@ -1228,6 +1236,10 @@ extension SpecDecode {
                     // (wrong, full-T) state exactly as they expect.
                 }
                 if !replayed, stateRewind {
+                    guard let snap else {
+                        preconditionFailure(
+                            "MTP state-plane capture failed after eligibility check")
+                    }
                     // ── Partial accept WITHOUT replay ─────────────────
                     // The batched pass is causal, so everything it
                     // produced for accepted rows is already correct: the
@@ -1262,6 +1274,10 @@ extension SpecDecode {
                     }
                 }
                 if !replayed {
+                guard let snap else {
+                    preconditionFailure(
+                        "MTP state-plane capture failed after eligibility check")
+                }
                 caches.restoreAll(from: snap, device: device)
                 if batchedReplay {
                     // The rejected rows polluted every cache, so the
@@ -1393,6 +1409,9 @@ extension SpecDecode {
             // `restoreRangeEncode` after the probe, so the probe's own
             // replay never leaks into what the fast path reads next.
             if parityProbe, mode.isGreedy, !plan.needsReplay {
+                guard let snap else {
+                    preconditionFailure("MTP parity probe requires a cache snapshot")
+                }
                 // Recomputed locally (not read from the `.greedy` accept-plan
                 // branch's own local) — this diagnostic block only runs in
                 // greedy mode, where it equals the batched trailing row's

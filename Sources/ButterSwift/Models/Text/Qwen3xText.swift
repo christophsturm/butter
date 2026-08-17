@@ -4160,6 +4160,28 @@ public final class Qwen35Model: LanguageModel {
         return ok
     }
 
+    /// True when the next batched pass is guaranteed to capture a state
+    /// plane for every recurrent layer. Callers can then recover any
+    /// accepted prefix directly without a pre-pass recurrent snapshot.
+    public func canCaptureStatePlanes(
+        tokenCount: Int, caches: [any LayerCacheProtocol]
+    ) -> Bool {
+        guard (2 ... 16).contains(tokenCount),
+            ButterEnv["BUTTER_GDN_STATE_PLANES"] != "0",
+            ButterEnv["BUTTER_NO_CONV1D_MANY"] == nil,
+            caches.count >= layers.count
+        else { return false }
+
+        for (i, layer) in layers.enumerated() {
+            if let gdnLayer = layer as? Qwen35GDNLayer {
+                guard caches[i] is Qwen35GDNLayerCache,
+                    gdnLayer.mixer.convKernel == 4
+                else { return false }
+            }
+        }
+        return true
+    }
+
     /// Roll every cache forward to `keep` tokens of the last batched pass
     /// by SELECTING each GDN layer's `(keep-1)`th captured state plane —
     /// the scan-emitted-planes alternative to `rewindCaches` (restore +
