@@ -201,6 +201,37 @@ struct QmvQmmParityTests {
         }
     }
 
+    @Test("split M5/M7 QMM matches padded path on every row")
+    func splitM57MatchesPaddedAllRows() {
+        let f = Self.fixture()
+        let device = Device.shared
+        for t in [5, 7] {
+            var rows: [Float] = []
+            for row in 0 ..< t {
+                let scale = 1.0 + Float(row) * 0.03125
+                rows.append(contentsOf: f.x.map { $0 * scale + Float(row) * 0.001 })
+            }
+            let input = Self.bf16Tensor(rows, shape: [t * Self.kIn])
+            func run(split: Bool) -> [Float] {
+                setenv("BUTTER_QMM_SPLIT_M57", split ? "1" : "0", 1)
+                let out = Tensor.empty(shape: [t * Self.nOut], dtype: .bf16)
+                Self.runAndWait { cb in
+                    Ops.dequantGemmDynamicM(
+                        input: input,
+                        weight: f.weight, scales: f.scales, biases: f.biases,
+                        t: t, nOut: Self.nOut, kIn: Self.kIn,
+                        groupSize: Self.groupSize,
+                        on: cb, device: device, into: out)
+                }
+                return Self.bf16Values(out)
+            }
+            let padded = run(split: false)
+            let split = run(split: true)
+            unsetenv("BUTTER_QMM_SPLIT_M57")
+            #expect(split == padded, "T=\(t): exact row split differs from padded path")
+        }
+    }
+
     /// `BUTTER_QMM_MMA_BM8` routes T<=16 straight through `iron_qmm_mma_bm8`
     /// (see `Ops.dequantGemmDynamicM`'s BM8 fast-path arm). Row 0 of that
     /// path must agree with the single-token QMV baseline exactly like the
