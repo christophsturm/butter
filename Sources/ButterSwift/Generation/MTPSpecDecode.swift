@@ -1547,7 +1547,8 @@ extension SpecDecode {
                         prevTokens: tokens, startPosition: pos + startIdx,
                         on: lCmd, device: device)
                     lCmd.commit()
-                    lCmd.waitUntilCompleted()
+                    // The next head pass is submitted to the same primary
+                    // queue, which preserves the KV update dependency.
                     msLockstep += Date().timeIntervalSince(lT)
                     lockstepSteps += 1
                 }
