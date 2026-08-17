@@ -9610,9 +9610,22 @@ public enum Ops {
         let useCoop4 =
             coopRequested4 && n % 64 == 0 && gsPerRow > 0 && k % gsPerRow == 0
             && k / gsPerRow == 64
+        let useCoop128 =
+            useCoop4 && m >= 256 && n % 128 == 0
+            && ButterEnv["BUTTER_QMM_COOP_BN128"] != "0"
         switch (bits, input.dtype) {
         case (4, .f32):
-            if useCoop4 {
+            if useCoop128 {
+                IronKernels.iron_qmm_coop_bn128_f32_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: MTLSize(width: n / 128, height: m / 32, depth: 1),
+                    threadgroupSize: tg, on: cmd)
+            } else if useCoop4 {
                 IronKernels.iron_qmm_coop_f32_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -9641,7 +9654,17 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             }
         case (4, .f16):
-            if useCoop4 {
+            if useCoop128 {
+                IronKernels.iron_qmm_coop_bn128_f16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: MTLSize(width: n / 128, height: m / 32, depth: 1),
+                    threadgroupSize: tg, on: cmd)
+            } else if useCoop4 {
                 IronKernels.iron_qmm_coop_f16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
@@ -9670,7 +9693,17 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             }
         case (4, .bf16):
-            if useCoop4 {
+            if useCoop128 {
+                IronKernels.iron_qmm_coop_bn128_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: MTLSize(width: n / 128, height: m / 32, depth: 1),
+                    threadgroupSize: tg, on: cmd)
+            } else if useCoop4 {
                 IronKernels.iron_qmm_coop_bf16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
