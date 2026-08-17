@@ -3148,10 +3148,16 @@ public final class Qwen35AttentionMixer: Module {
         // path at prefill M (measured M=1024: fused ~11.5ms vs 3 MMA qmms
         // ~1.6ms per layer; routing it to prefill cost ~16% e2e). Use the
         // fused kernel only for tiny T; batched prefill takes the three
-        // MMA `callMany` qmms. BUTTER_FUSED_QKV_PREFILL=1 forces the old
-        // routing for A/B.
+        // MMA `callMany` qmms. The direct BM3/BM4 path is faster at the
+        // Qwen3.8 MTP cost model's verify widths 4...8. The existing
+        // prefill override and BUTTER_QWEN_FUSED_QKV_VERIFY=1 retain the
+        // fused route for diagnosis.
+        let directQkvVerify =
+            (4 ... 8).contains(t)
+            && ButterEnv["BUTTER_QWEN_FUSED_QKV_VERIFY"] != "1"
         let fusedQkvAtPrefill =
-            ButterEnv["BUTTER_FUSED_QKV_PREFILL"] != nil || t <= 8
+            ButterEnv["BUTTER_FUSED_QKV_PREFILL"] != nil
+            || (t <= 8 && !directQkvVerify)
         let qOut: Tensor
         let kOut: Tensor
         let vOut: Tensor
