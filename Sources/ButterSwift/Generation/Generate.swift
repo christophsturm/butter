@@ -498,6 +498,17 @@ extension Model {
         // Empty prompts hit the early-return below.
         let prefillStart = Date()
         var nextToken = 0
+        // Qwen3.8 MTP attends over the committed prompt, not just tokens
+        // generated after prefill. Capture post-final-norm trunk hiddens while
+        // the prompt is already flowing through the backbone and use them to
+        // prime the sidecar's one-layer KV cache. This is gated by the same
+        // explicit speculative-decode switch as the decode loop.
+        let qwenMTPPrefillModel: Qwen35Model? =
+            ButterEnv["BUTTER_QWEN_MTP_SPEC"] == "1"
+            ? engine as? Qwen35Model : nil
+        let qwenMTPPrefillHead = qwenMTPPrefillModel?.mtpHead
+        var qwenMTPLastPromptHidden: Tensor?
+        qwenMTPPrefillHead?.resetCache()
         try profile.signpost("prefill") {
             let n = promptTokens.count
             // Honour the caller's explicit `prefillStepSize` if set;
@@ -523,12 +534,59 @@ extension Model {
                 let end = min(pos + chunkSize, n)
                 let chunk = Array(promptTokens[pos ..< end])
                 let cmd = Device.shared.makeCommandBuffer()
-                lastLogits = engine.forwardMulti(
-                    tokenIds: chunk, startingAt: pos,
-                    caches: caches, on: cmd,
-                    device: Device.shared)
+                var qwenPromptHidden: Tensor?
+                if let qwen = qwenMTPPrefillModel,
+                    qwenMTPPrefillHead != nil
+                {
+                    let out = qwen.forwardManyHiddenAndLastLogits(
+                        tokenIds: chunk, startPosition: pos,
+                        caches: caches, on: cmd, device: Device.shared)
+                    lastLogits = out.logits
+                    qwenPromptHidden = out.hidden
+                } else {
+                    lastLogits = engine.forwardMulti(
+                        tokenIds: chunk, startingAt: pos,
+                        caches: caches, on: cmd,
+                        device: Device.shared)
+                }
                 cmd.commit()
                 cmd.waitUntilCompleted()
+                if let head = qwenMTPPrefillHead,
+                    let hiddenRows = qwenPromptHidden,
+                    let qwen = qwenMTPPrefillModel
+                {
+                    // Across a chunk boundary, the previous chunk's last
+                    // hidden pairs with this chunk's first token.
+                    if let previous = qwenMTPLastPromptHidden {
+                        let primeCmd = Device.shared.makeCommandBuffer()
+                        head.draftStepMany(
+                            prevHiddensFlat: previous,
+                            prevTokens: [chunk[0]], startPosition: pos,
+                            on: primeCmd, device: Device.shared)
+                        primeCmd.commit()
+                        primeCmd.waitUntilCompleted()
+                    }
+                    // Within a chunk, hidden row i pairs with token i+1.
+                    if chunk.count > 1 {
+                        let rows = chunk.count - 1
+                        let primeHidden = Tensor(
+                            buffer: hiddenRows.buffer, offset: hiddenRows.offset,
+                            shape: [rows * qwen.hidden], dtype: hiddenRows.dtype)
+                        let primeCmd = Device.shared.makeCommandBuffer()
+                        head.draftStepMany(
+                            prevHiddensFlat: primeHidden,
+                            prevTokens: Array(chunk.dropFirst()),
+                            startPosition: pos + 1,
+                            on: primeCmd, device: Device.shared)
+                        primeCmd.commit()
+                        primeCmd.waitUntilCompleted()
+                    }
+                    let rowBytes = qwen.hidden * hiddenRows.dtype.byteSize
+                    qwenMTPLastPromptHidden = Tensor(
+                        buffer: hiddenRows.buffer,
+                        offset: hiddenRows.offset + (chunk.count - 1) * rowBytes,
+                        shape: [qwen.hidden], dtype: hiddenRows.dtype)
+                }
                 memTracker.sample()
                 pos = end
             }
@@ -622,7 +680,9 @@ extension Model {
         // Spec 030 phase 2: MTP self-speculative decode. Opt-in via
         // BUTTER_QWEN_MTP_SPEC=1 (default OFF), Qwen3x-only, and only
         // when the checkpoint shipped an `mtp-sidecar/` (`mtpHead !=
-        // nil`). γ (draft chain length) defaults to 2; override with
+        // nil`). γ (draft-chain ceiling) defaults to 8; the promoted cost
+        // model normally selects a smaller effective depth and expands only
+        // after observed accepts. Override with
         // BUTTER_QWEN_MTP_GAMMA=<n>.
         //
         // Two arms: `temperature == 0` dispatches the original
@@ -672,12 +732,10 @@ extension Model {
                     1,
                     Int(
                         ButterEnv[
-                            "BUTTER_QWEN_MTP_GAMMA"] ?? "") ?? 2)
-                // Fresh generation → fresh draft-head KV history. The
-                // loop primes its own first hidden state (the chunked
-                // prefill above only returns logits), then keeps the
-                // head's cache in lockstep with every committed token.
-                mtpHead.resetCache()
+                            "BUTTER_QWEN_MTP_GAMMA"] ?? "") ?? 8)
+                // Prefill above already reset and primed the head cache with
+                // the committed prompt history, and captured the final seed
+                // hidden for the first drafting round.
                 var mtpRNG = params.makeRNG()
                 // The seed (`nextToken`) sits at `pos` — same contract as
                 // the GPU-loop's seedPosition (#108): capture it by name
@@ -704,6 +762,7 @@ extension Model {
                         return SpecDecode.generateSampledMTP(
                             model: qwen, head: mtpHead, gamma: gamma,
                             lastToken: nextToken, position: mtpEntryPosition,
+                            lastHidden: qwenMTPLastPromptHidden,
                             caches: caches, history: &tokenHistory,
                             maxNewTokens: params.maxTokens,
                             stopTokens: stopSet, device: Device.shared,
@@ -713,6 +772,7 @@ extension Model {
                     return SpecDecode.generateGreedyMTP(
                         model: qwen, head: mtpHead, gamma: gamma,
                         lastToken: nextToken, position: mtpEntryPosition,
+                        lastHidden: qwenMTPLastPromptHidden,
                         caches: caches, history: &tokenHistory,
                         maxNewTokens: params.maxTokens,
                         stopTokens: stopSet, device: Device.shared,

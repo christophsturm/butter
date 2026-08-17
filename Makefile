@@ -54,6 +54,14 @@ regenerate-kernels: ## run `iron build --emit` to regenerate metallib + Swift wr
 	  echo "Clone the sibling repo at ../iron."; \
 	  exit 1; \
 	fi
+	@# The emitter is additive. Clear generated output first so wrappers and
+	@# kernels from pre-Iron builds cannot survive a package/kernel rename.
+	@# Preserve tracked Butter overlay sources that share this directory.
+	@git clean -fdX -- $(KERNEL_OUT)/Resources/kernels
+	@rm -f $(KERNEL_OUT)/Resources/kernels.metallib \
+	  $(KERNEL_OUT)/Resources/kernels_extra.metallib \
+	  $(KERNEL_OUT)/Resources/manifest.json
+	@rm -f $(KERNEL_OUT)/Generated/*.swift
 	@# Run from iron so its rust-toolchain.toml is honored.
 	@# `iron build` writes:
 	@#   $(KERNEL_OUT)/Resources/kernels/<name>.metal

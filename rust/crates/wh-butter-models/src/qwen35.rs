@@ -245,7 +245,7 @@ impl Q4Dense {
             // (`tok_embd` is f32; `gemv_q4` is dtype-polymorphic and just
             // follows whatever `x.dtype` is, per `gemv_q4_dispatch`'s
             // `Tensor::empty(dev, ..., x.dtype)`). marlin's C ABI hardwires
-            // f16 activations (`ffai_marlin_gemm_u4b8_f16`'s `A`), so cast
+            // f16 activations (`iron_marlin_gemm_u4b8_f16`'s `A`), so cast
             // at the boundary and cast the (small, m-wide) output back to
             // keep the rest of the pipeline's dtype contract unchanged.
             let routing = marlin_m1_routing(dev)?;
@@ -310,7 +310,7 @@ impl Q4Dense {
 /// GB10 (sm_121a) SM count -- matches the round-7/8 marlin probe harness
 /// and the existing NEMOTRON marlin precedent (`wh-butter-modeltests`).
 const GB10_SMS: i32 = 48;
-/// Matches the round-7 probe harness's `ffai_marlin_repack` call exactly
+/// Matches the round-7 probe harness's `iron_marlin_repack` call exactly
 /// (a repack-kernel occupancy hint, not correctness-critical, but kept
 /// bit-identical to the verified-working recipe).
 const MARLIN_MAX_SHARED_MEM: i32 = 101376;

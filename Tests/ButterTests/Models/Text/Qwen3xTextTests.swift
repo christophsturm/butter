@@ -49,13 +49,53 @@ struct Qwen35HybridTests {
         #expect(p.topK == 0)
         // `nil` on purpose: this family used to hardcode 1024, silently
         // overriding `Qwen35Model.defaultPrefillStepSize` (4096, this
-        // architecture is always MoE) on every real generation call. A
+        // hybrid family, including its dense 27B variant) on every real
+        // generation call. A
         // chunk-size sweep found no numerical difference between chunk
         // sizes at this range (bit-identical dumped prefill logits) and
         // a throughput win from deferring to the tuned engine default,
         // so the family-level override was removed rather than bumped
         // to a second hardcoded number.
         #expect(p.prefillStepSize == nil)
+    }
+}
+
+@Suite("Qwen35Hybrid MTP sidecar discovery")
+struct Qwen35HybridMTPSidecarTests {
+    @Test("GGUF companions precede the shared legacy directory")
+    func ggufCandidateOrder() {
+        let root = URL(fileURLWithPath: "/models", isDirectory: true)
+        let gguf = root.appendingPathComponent("Qwen3.8-27B-Q4_K_M.gguf")
+        let candidates = Qwen35Hybrid.mtpSidecarCandidates(
+            weightsDirectory: root, weightURLs: [gguf], overridePath: nil)
+        #expect(
+            candidates.map(\.path) == [
+                "/models/Qwen3.8-27B-Q4_K_M.gguf.mtp-sidecar",
+                "/models/Qwen3.8-27B-Q4_K_M.mtp-sidecar",
+                "/models/mtp-sidecar",
+            ])
+    }
+
+    @Test("explicit sidecar override wins and duplicates are removed")
+    func explicitOverride() {
+        let root = URL(fileURLWithPath: "/models", isDirectory: true)
+        let candidates = Qwen35Hybrid.mtpSidecarCandidates(
+            weightsDirectory: root,
+            weightURLs: [root.appendingPathComponent("model.safetensors")],
+            overridePath: "/models/mtp-sidecar")
+        #expect(candidates.map(\.path) == ["/models/mtp-sidecar"])
+    }
+
+    @Test("MTP loader accepts old namespaced and Qwen3.8 standalone head keys")
+    func tensorPrefixes() throws {
+        #expect(try Qwen3xMTPHead.tensorPrefix(for: ["mtp.fc.weight"]) == "mtp.")
+        #expect(try Qwen3xMTPHead.tensorPrefix(for: ["fc.weight"]) == "")
+        #expect(
+            try Qwen3xMTPHead.tensorPrefix(
+                for: ["fc.weight", "mtp.fc.weight"]) == "mtp.")
+        #expect(throws: Qwen35Error.self) {
+            _ = try Qwen3xMTPHead.tensorPrefix(for: ["norm.weight"])
+        }
     }
 }
 

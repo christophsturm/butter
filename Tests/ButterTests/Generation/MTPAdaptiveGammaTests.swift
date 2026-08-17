@@ -235,3 +235,42 @@ struct MTPAdaptiveGammaTests {
         }
     }
 }
+
+@Suite("Qwen MTP promoted cost-model gamma")
+struct MTPCostModelGammaTests {
+    @Test("promoted priors choose depth four at an eight-token ceiling")
+    func initialDepth() {
+        var model = SpecDecode.MTPCostModelGamma(cap: 8)
+        #expect(model.nextCycleGamma() == 4)
+    }
+
+    @Test("repeated first-position rejection shortens the next round")
+    func rejectionShortens() {
+        var model = SpecDecode.MTPCostModelGamma(cap: 8)
+        let before = model.nextCycleGamma()
+        for _ in 0 ..< 4 {
+            model.record(accepted: 0, proposed: before)
+        }
+        #expect(model.nextCycleGamma() < before)
+    }
+
+    @Test("repeated full accepts transfer optimism and widen")
+    func fullAcceptsWiden() {
+        var model = SpecDecode.MTPCostModelGamma(cap: 8)
+        var widest = 0
+        for _ in 0 ..< 20 {
+            let depth = model.nextCycleGamma()
+            widest = max(widest, depth)
+            model.record(accepted: depth, proposed: depth)
+        }
+        #expect(widest > 4)
+        #expect(widest <= 8)
+    }
+
+    @Test("higher measured head cost selects no deeper a round")
+    func headCostMonotonicity() {
+        var cheap = SpecDecode.MTPCostModelGamma(cap: 8, headStepCostRatio: 0.10)
+        var expensive = SpecDecode.MTPCostModelGamma(cap: 8, headStepCostRatio: 0.40)
+        #expect(expensive.nextCycleGamma() <= cheap.nextCycleGamma())
+    }
+}

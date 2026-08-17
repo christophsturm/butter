@@ -48,15 +48,12 @@
 //
 // The weights load from a `mtp-sidecar/` directory placed beside the
 // backbone checkpoint (single `model.safetensors` + a `config.json`
-// carrying the quantization block written by `butter convert`; keys
-// are `mtp.*`). The sidecar tensors are extracted from the RAW
-// published checkpoint: the standard sanitize pass DROPS every `mtp.*`
-// tensor, so a sidecar by construction carries *centered* outer
-// RMSNorm weights (the kernel-side `1.0 +` is implicit - the same
-// fingerprint rule `Qwen35Hybrid.loadModel` keys its
-// `needsCenteredNormFold` detection on). Every sidecar norm therefore
-// gets the +1 fold at load time, mirroring the backbone loader's
-// convention for raw checkpoints.
+// carrying the quantization block written by `butter convert`). Both
+// historical `mtp.*` keys and the unprefixed standalone-head layout
+// published for Qwen3.8 are accepted. Historical sidecars extracted
+// `mtp.*` tensors from a raw checkpoint and therefore carry centered
+// RMSNorm weights (the kernel-side `1.0 +` is implicit). The standalone
+// Qwen3.8 head is already sanitized and must not receive that fold again.
 //
 // Command-buffer contract: `draftStep` queues ALL work (embedding
 // gather, fuse, attention layer, final norm, lm_head) onto the
@@ -332,7 +329,10 @@ public final class Qwen3xMTPHead: Module {
         }
         let normed = mtpNorm(hOut, on: cmd)
         let logits = (useDraftHead ? draftLmHead! : lmHead)(normed, on: cmd)
-        return (hidden: hOut, logits: logits)
+        // Qwen3.8 chains the head's own post-`mtp.norm` hidden into the
+        // next draft step. Returning `hOut` here silently degrades every
+        // candidate after draft position zero.
+        return (hidden: normed, logits: logits)
     }
 
     /// T-batched fuse: same computation as `fuseInputs`, over `t` rows
@@ -463,6 +463,8 @@ public final class Qwen3xMTPHead: Module {
         eps: Float, dtype: DType, device: Device
     ) throws -> Qwen3xMTPHead {
         let weights = try SafeTensorsBundle(directory: sidecarDirectory, device: device)
+        let tensorPrefix = try tensorPrefix(for: weights.allKeys)
+        func key(_ relative: String) -> String { tensorPrefix + relative }
         // Pin the sidecar weights in the residency set, matching the
         // main-bundle load path.
         var buffers: [MTLBuffer] = []
@@ -475,28 +477,28 @@ public final class Qwen3xMTPHead: Module {
         // by `butter convert` to match the backbone's quant settings).
         let config = try ModelConfig.load(from: sidecarDirectory)
         let quant = config.quantization
-        if quant == nil, weights.isQuantized("mtp.fc") {
+        if quant == nil, weights.isQuantized(key("fc")) {
             throw Qwen35Error.missingConfig(
                 "mtp-sidecar carries quantized tensors but its config.json "
                     + "has no quantization block")
         }
 
-        // Sidecar norms are centered (raw-checkpoint convention, see the
-        // file header) - fold the +1 at load, like the backbone loader
-        // does for raw checkpoints.
+        // Historical namespaced sidecar norms are centered. The standalone
+        // Qwen3.8 head's root-level norms are already conventional weights.
         func loadFoldedNorm(_ name: String) throws -> RMSNorm {
             let raw = try weights.tensor(named: name)
-            return RMSNorm(weight: foldGemmaRMSNormWeight(raw), eps: eps)
+            let weight = tensorPrefix == "mtp." ? foldGemmaRMSNormWeight(raw) : raw
+            return RMSNorm(weight: weight, eps: eps)
         }
 
-        let fc = try loadLinear(base: "mtp.fc", in: weights, quantization: quant)
-        let preFcNormHidden = try loadFoldedNorm("mtp.pre_fc_norm_hidden.weight")
-        let preFcNormEmbedding = try loadFoldedNorm("mtp.pre_fc_norm_embedding.weight")
-        let mtpNorm = try loadFoldedNorm("mtp.norm.weight")
+        let fc = try loadLinear(base: key("fc"), in: weights, quantization: quant)
+        let preFcNormHidden = try loadFoldedNorm(key("pre_fc_norm_hidden.weight"))
+        let preFcNormEmbedding = try loadFoldedNorm(key("pre_fc_norm_embedding.weight"))
+        let mtpNorm = try loadFoldedNorm(key("norm.weight"))
 
         // The single MTP decoder layer - same construction as the
         // backbone's `.attention` case in `Qwen35Hybrid.loadModel`.
-        let p = "mtp.layers.0"
+        let p = key("layers.0")
         let inputNorm = try loadFoldedNorm("\(p).input_layernorm.weight")
         let postNorm = try loadFoldedNorm("\(p).post_attention_layernorm.weight")
         let qProj = try loadLinear(
@@ -646,6 +648,19 @@ public final class Qwen3xMTPHead: Module {
             draftLmHeadMode: draftLmHeadMode,
             kvCache: kvCache,
             hidden: hidden, vocab: vocab, dtype: dtype)
+    }
+
+    /// Standalone Qwen3.8 MTP repositories store `fc.weight`,
+    /// `layers.0.*`, and friends at the root. Older Butter sidecars retain
+    /// the original checkpoint's `mtp.*` namespace. Prefer the namespaced
+    /// layout when both are present so existing converted artifacts remain
+    /// compatible.
+    static func tensorPrefix(for keys: [String]) throws -> String {
+        let names = Set(keys)
+        if names.contains("mtp.fc.weight") { return "mtp." }
+        if names.contains("fc.weight") { return "" }
+        throw Qwen35Error.missingConfig(
+            "MTP sidecar has neither mtp.fc.weight nor fc.weight")
     }
 }
 

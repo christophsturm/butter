@@ -255,6 +255,78 @@ extension SpecDecode {
         }
     }
 
+    /// Per-draft-position cost model adapted from the promoted Qwen3.8
+    /// MLX.fast schedule. Position `i` tracks
+    /// P(draft i accepted | every earlier draft accepted), then chooses
+    /// the depth maximizing expected committed tokens per unit round cost.
+    /// A full round transfers capped optimism to the first untried
+    /// position so easy prompts can widen without making cold prompts pay.
+    struct MTPCostModelGamma {
+        let cap: Int
+        let headStepCostRatio: Double
+        let alpha: Double
+        private(set) var positionAcceptEMA: [Double]
+
+        private(set) var gammaCycleSum = 0
+        private(set) var gammaCycles = 0
+        private(set) var gammaMin = Int.max
+        private(set) var gammaMax = 0
+
+        init(cap: Int, headStepCostRatio: Double = 0.18, alpha: Double = 0.15) {
+            precondition(cap >= 1, "MTPCostModelGamma: cap must be >= 1")
+            precondition(
+                headStepCostRatio > 0,
+                "MTPCostModelGamma: headStepCostRatio must be positive")
+            precondition(
+                alpha > 0 && alpha <= 1,
+                "MTPCostModelGamma: alpha must be in (0, 1]")
+            self.cap = cap
+            self.headStepCostRatio = headStepCostRatio
+            self.alpha = alpha
+            self.positionAcceptEMA = (0 ..< cap).map { 0.85 * pow(0.98, Double($0)) }
+        }
+
+        mutating func nextCycleGamma() -> Int {
+            let h = headStepCostRatio
+            var reach = 1.0
+            var expected = 0.0
+            var depth = 0
+            while depth < cap {
+                reach *= positionAcceptEMA[depth]
+                let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
+                guard reach > threshold else { break }
+                expected += reach
+                depth += 1
+            }
+            gammaCycleSum += depth
+            gammaCycles += 1
+            gammaMin = min(gammaMin, depth)
+            gammaMax = max(gammaMax, depth)
+            return depth
+        }
+
+        mutating func record(accepted: Int, proposed: Int) {
+            guard proposed > 0 else { return }
+            precondition(
+                accepted >= 0 && accepted <= proposed,
+                "MTPCostModelGamma.record: accepted out of range")
+            for index in 0 ..< min(accepted, positionAcceptEMA.count) {
+                positionAcceptEMA[index] += alpha * (1.0 - positionAcceptEMA[index])
+            }
+            if accepted < proposed, accepted < positionAcceptEMA.count {
+                positionAcceptEMA[accepted] += alpha * (0.0 - positionAcceptEMA[accepted])
+            } else if accepted == proposed, accepted < positionAcceptEMA.count,
+                positionAcceptEMA[accepted] < 0.95
+            {
+                positionAcceptEMA[accepted] += alpha * (0.95 - positionAcceptEMA[accepted])
+            }
+        }
+
+        var avgGamma: Double {
+            gammaCycles > 0 ? Double(gammaCycleSum) / Double(gammaCycles) : 0
+        }
+    }
+
     /// Compute the commit plan from the draft block and the verifier's
     /// own (argmax) tokens. `verifierTokens[j]` verifies `drafts[j]`;
     /// `batchedBonus` is the verifier's token one past the draft block.
@@ -661,7 +733,7 @@ extension SpecDecode {
         var msDraft = 0.0, msVerify = 0.0, msReplay = 0.0
         var msLockstep = 0.0, msSnap = 0.0
         let stateRewind =
-            ButterEnv["BUTTER_QWEN_MTP_STATE_REWIND"] == "1"
+            ButterEnv["BUTTER_QWEN_MTP_STATE_REWIND"] != "0"
         var rewindSteps = 0
         // BUTTER_GDN_STATE_PLANES=1 — same flag that opts the fused
         // conv+scan kernels into writing per-token state planes (see
@@ -677,14 +749,16 @@ extension SpecDecode {
             ButterEnv["BUTTER_GDN_STATE_PLANES"] == "1"
         var planeSteps = 0
         let batchedReplay =
-            ButterEnv["BUTTER_QWEN_MTP_BATCHED_REPLAY"] == "1"
-        // BUTTER_QWEN_MTP_BATCHED_LOCKSTEP=1: run the post-accept MTP
+            ButterEnv["BUTTER_QWEN_MTP_BATCHED_REPLAY"] != "0"
+        // Batched lockstep is the Qwen3.8 default; set
+        // BUTTER_QWEN_MTP_BATCHED_LOCKSTEP=0 to restore the sequential
+        // diagnostic path. It runs the post-accept MTP
         // KV re-advance (below) as ONE T-batched `draftStepMany` pass
-        // instead of k+1 sequential `draftStep` calls. Off by default;
+        // instead of k+1 sequential `draftStep` calls. The flag is
         // read fresh on every call (no hoisted/cached global) so a
         // per-process env change always takes effect.
         let batchedLockstep =
-            ButterEnv["BUTTER_QWEN_MTP_BATCHED_LOCKSTEP"] == "1"
+            ButterEnv["BUTTER_QWEN_MTP_BATCHED_LOCKSTEP"] != "0"
         let parityProbe =
             ButterEnv["BUTTER_QWEN_MTP_PARITY"] == "1"
         var parityChecked = 0
@@ -703,17 +777,15 @@ extension SpecDecode {
         // env-gated knobs above.
         let pMinEnv = ButterEnv["BUTTER_QWEN_MTP_PMIN"]
         let pMin: Float? = (pMinEnv?.isEmpty == false) ? Float(pMinEnv!) : nil
-        // BUTTER_QWEN_MTP_ADAPTIVE=1: adaptive per-cycle draft depth,
+        // BUTTER_QWEN_MTP_ADAPTIVE=1: trailing-window adaptive draft depth,
         // gated on REALIZED trailing acceptance rather than drafter
         // self-confidence (BUTTER_QWEN_MTP_PMIN above was measured
         // uninformative on this head — confident everywhere; see the
         // BUTTER_QWEN_MTP_ACCEPT_CURVE=1 diagnosis: acceptance decays
         // via CONTENT DRIFT, oscillating 73->47% over 512 tokens, not
-        // via a confidence signal). Unset/empty ⇒ feature OFF, behavior
-        // byte-identical to the fixed-γ loop — every burst drafts
-        // exactly `gamma` tokens, matching every other env-gated knob's
-        // contract in this file. Read fresh every call, no static
-        // caching.
+        // via a confidence signal). `cost` is now the Qwen3.8 default;
+        // set the variable to `0` for the fixed-γ diagnostic path. Read
+        // fresh every call, with no static caching.
         //
         // When set, `gamma` becomes the CEILING (`MTPAdaptiveGamma.cap`):
         // each cycle's effective draft length starts there and is
@@ -728,7 +800,12 @@ extension SpecDecode {
         // (warmup), gamma stays at the cap. See `MTPAdaptiveGamma`'s
         // doc for the controller itself.
         //
-        // Works identically in BOTH `.greedy` and `.sampled` mode: the
+        // BUTTER_QWEN_MTP_ADAPTIVE=cost selects the promoted Qwen3.8
+        // per-position acceptance-EMA cost model instead. Its head/verify
+        // cost ratio defaults to the campaign's 0.18 and can be re-fit for
+        // this engine with BUTTER_QWEN_MTP_HEAD_COST_RATIO=<float>.
+        //
+        // Both controllers work identically in `.greedy` and `.sampled` mode: the
         // controller only consumes `drafts.count` /
         // `plan.committed.count - 1`, the same per-cycle accept
         // arithmetic `candidatesProposed`/`candidatesAccepted` already
@@ -737,8 +814,8 @@ extension SpecDecode {
         // tokens are DRAFTED per cycle, never what gets accepted or
         // emitted; a greedy exact-match run is gamma-INVARIANT in its
         // output stream by construction).
-        let adaptiveEnabled =
-            ButterEnv["BUTTER_QWEN_MTP_ADAPTIVE"] == "1"
+        let adaptiveMode = ButterEnv["BUTTER_QWEN_MTP_ADAPTIVE"] ?? "cost"
+        let adaptiveEnabled = adaptiveMode == "1"
         let adaptWindowEnv =
             ButterEnv["BUTTER_QWEN_MTP_ADAPT_WINDOW"]
         let adaptWindow =
@@ -750,6 +827,13 @@ extension SpecDecode {
         var adaptiveGamma: MTPAdaptiveGamma? =
             adaptiveEnabled
             ? MTPAdaptiveGamma(cap: gamma, window: adaptWindow, lo: adaptLo, hi: adaptHi)
+            : nil
+        let headCostEnv = ButterEnv["BUTTER_QWEN_MTP_HEAD_COST_RATIO"]
+        let headCost =
+            (headCostEnv?.isEmpty == false) ? (Double(headCostEnv!) ?? 0.18) : 0.18
+        var costModelGamma: MTPCostModelGamma? =
+            adaptiveMode == "cost"
+            ? MTPCostModelGamma(cap: gamma, headStepCostRatio: headCost)
             : nil
         // BUTTER_QWEN_MTP_ACCEPT=ratio: correctness-oracle override for
         // `.sampled` mode, reproducing the original sampled-draft +
@@ -827,7 +911,10 @@ extension SpecDecode {
                 // which this `if let seedHidden` branch already is (the
                 // priming iteration never reaches here, so it never
                 // pollutes the stats or the trailing window).
-                let effectiveGamma = adaptiveGamma?.nextCycleGamma() ?? gamma
+                let effectiveGamma =
+                    costModelGamma?.nextCycleGamma()
+                    ?? adaptiveGamma?.nextCycleGamma()
+                    ?? gamma
                 for j in 0 ..< effectiveGamma {
                     let dT = Date()
                     let dCmd = device.makeCommandBuffer()
@@ -1030,6 +1117,8 @@ extension SpecDecode {
             // the NEXT cycle's gamma decision. No-ops on the priming
             // cycle (`drafts.count == 0`) — see `record`'s doc.
             adaptiveGamma?.record(
+                accepted: plan.committed.count - 1, proposed: drafts.count)
+            costModelGamma?.record(
                 accepted: plan.committed.count - 1, proposed: drafts.count)
             if acceptCurve {
                 while bucketProposed.count <= curveBucketIdx {
@@ -1543,7 +1632,12 @@ extension SpecDecode {
             // stable field either way; avg/min/max only populated `on`
             // (mirrors `adaptiveGamma`'s own optionality).
             let adaptiveSuffix: String
-            if let ag = adaptiveGamma {
+            if let ag = costModelGamma {
+                let mn = ag.gammaMin == Int.max ? 0 : ag.gammaMin
+                adaptiveSuffix =
+                    " adaptive=cost avggamma=\(String(format: "%.2f", ag.avgGamma)) "
+                    + "mingamma=\(mn) maxgamma=\(ag.gammaMax)"
+            } else if let ag = adaptiveGamma {
                 let mn = ag.gammaMin == Int.max ? 0 : ag.gammaMin
                 adaptiveSuffix =
                     " adaptive=on avggamma=\(String(format: "%.2f", ag.avgGamma)) "

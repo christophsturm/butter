@@ -152,7 +152,8 @@ public struct Qwen35Hybrid: Qwen35Variant {
     ///
     /// `prefillStepSize` is left `nil` here on purpose so the real
     /// `butter generate` path defers to `Qwen35Model.defaultPrefillStepSize`
-    /// (4096, since every layer here carries an MoE FFN). This field used
+    /// (4096 for this hybrid mixer family, whether its FFN is dense or
+    /// MoE). This field used
     /// to hardcode 1024, silently overriding that tuned engine default
     /// down to a quarter of its value on every real generation call. A
     /// chunk-size sweep on an M5 Max (Qwen3.6-35B-A3B 4-bit, T =
@@ -198,6 +199,35 @@ public struct Qwen35Hybrid: Qwen35Variant {
                     + "attempting load anyway since the qwen35.* metadata namespace matched")
         }
         return try Qwen3xGGUFLoader.loadModel(gguf: gguf, options: options, device: device)
+    }
+
+    /// Ordered MTP sidecar locations. GGUF is a single file, so a shared
+    /// parent-level `mtp-sidecar/` is ambiguous as soon as that directory
+    /// contains more than one model. Prefer a model-specific companion
+    /// (`model.gguf.mtp-sidecar/`, then `model.mtp-sidecar/`) and retain the
+    /// legacy checkpoint-directory layout as the final fallback.
+    static func mtpSidecarCandidates(
+        weightsDirectory: URL,
+        weightURLs: [URL],
+        overridePath: String?
+    ) -> [URL] {
+        var candidates: [URL] = []
+        if let overridePath, !overridePath.isEmpty {
+            candidates.append(
+                URL(
+                    fileURLWithPath: (overridePath as NSString).expandingTildeInPath,
+                    isDirectory: true))
+        }
+        if weightURLs.count == 1, weightURLs[0].pathExtension.lowercased() == "gguf" {
+            let gguf = weightURLs[0]
+            candidates.append(gguf.appendingPathExtension("mtp-sidecar"))
+            candidates.append(
+                gguf.deletingPathExtension().appendingPathExtension("mtp-sidecar"))
+        }
+        candidates.append(weightsDirectory.appendingPathComponent("mtp-sidecar"))
+
+        var seen: Set<String> = []
+        return candidates.filter { seen.insert($0.standardizedFileURL.path).inserted }
     }
 
     public static func loadModel(
@@ -561,14 +591,18 @@ public struct Qwen35Hybrid: Qwen35Variant {
             vocab: vocab, maxSeq: maxSeq, dtype: activationDtype)
 
         // ── Optional MTP draft head (spec 030 phase 1) ────────────────
-        // A `mtp-sidecar/` directory beside the checkpoint weights
+        // An MTP sidecar beside the checkpoint weights
         // carries the `mtp.*` draft-head tensors (see Qwen3xMTPHead.swift
         // for the layout). Attach it when present; a malformed sidecar
         // logs and degrades to no-MTP rather than failing the whole
         // backbone load. `BUTTER_QWEN_MTP=0` disables the load entirely.
         if ButterEnv["BUTTER_QWEN_MTP"] != "0" {
-            let sidecarDir = weights.directory.appendingPathComponent("mtp-sidecar")
-            if FileManager.default.fileExists(atPath: sidecarDir.path) {
+            let sidecarDir = mtpSidecarCandidates(
+                weightsDirectory: weights.directory,
+                weightURLs: weights.files.map(\.url),
+                overridePath: ButterEnv["BUTTER_QWEN_MTP_SIDECAR"]
+            ).first { FileManager.default.fileExists(atPath: $0.path) }
+            if let sidecarDir {
                 do {
                     model.mtpHead = try Qwen3xMTPHead.load(
                         sidecarDirectory: sidecarDir,
@@ -4154,6 +4188,28 @@ public final class Qwen35Model: LanguageModel {
         return (hidden: hidden, logits: out.logits)
     }
 
+    /// Prefill sibling of `forwardManyHiddenAndLogits`: returns every
+    /// position's MTP seed hidden but projects logits for the final row only.
+    /// This keeps prompt-history priming cheap even with a 248k vocabulary.
+    public func forwardManyHiddenAndLastLogits(
+        tokenIds: [Int], startPosition: Int,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> (hidden: Tensor, logits: Tensor) {
+        precondition(
+            !tokenIds.isEmpty,
+            "Qwen35Model.forwardManyHiddenAndLastLogits: tokenIds must not be empty")
+        let out = _forwardManyBatched(
+            tokenIds: tokenIds, startPosition: startPosition,
+            caches: caches, returnAllLogits: false, returnHidden: true,
+            on: cmd, device: device)
+        guard let hidden = out.hidden else {
+            fatalError(
+                "Qwen35Model.forwardManyHiddenAndLastLogits: missing hidden snapshot")
+        }
+        return (hidden: hidden, logits: out.logits)
+    }
+
     /// Legacy per-token-loop path retained behind `BUTTER_LEGACY_FORWARDMANY=1`
     /// for A/B benching of the batched mixer wiring.
     private func _forwardManyPerTokenLegacy(
@@ -4398,7 +4454,7 @@ public final class Qwen35Model: LanguageModel {
         // per-channel weight, not by magnitude. Flagged so both arms are
         // measurable from one build.
         let mtpPostNormHidden =
-            ButterEnv["BUTTER_QWEN_MTP_POSTNORM"] == "1"
+            ButterEnv["BUTTER_QWEN_MTP_POSTNORM"] != "0"
         var hiddenSnapshot: Tensor?
         if returnHidden && !(mtpPostNormHidden && returnAllLogits) {
             let snap = Tensor.empty(
@@ -4415,6 +4471,20 @@ public final class Qwen35Model: LanguageModel {
         //     batched lm_head — the spec-decode verify path needs
         //     per-position logits.
         if !returnAllLogits {
+            if returnHidden && mtpPostNormHidden {
+                let normedAll = Ops.rmsNormRows(
+                    h, weight: finalNorm.weight, eps: finalNorm.eps,
+                    nRows: t, rowSize: hidden, on: cmd)
+                let snap = Tensor.empty(
+                    shape: [t, hidden], dtype: dt, device: device)
+                Ops.copy(normedAll.reshaped(to: [t, hidden]), into: snap, on: cmd)
+                hiddenSnapshot = snap
+                let lastNormed = Tensor(
+                    buffer: normedAll.buffer,
+                    offset: normedAll.offset + (t - 1) * hidden * dtBytes,
+                    shape: [hidden], dtype: dt)
+                return (logits: lmHead(lastNormed, on: cmd), hidden: hiddenSnapshot)
+            }
             let lastRow = Tensor(
                 buffer: h.buffer,
                 offset: h.offset + (t - 1) * hidden * dtBytes,
