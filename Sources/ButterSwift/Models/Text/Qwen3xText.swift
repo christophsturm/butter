@@ -1241,7 +1241,7 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
     public var specT: Int = 0
 
     /// Per-token state planes captured by the last verify pass, when
-    /// `BUTTER_GDN_STATE_PLANES=1` and `specCapture` were both active for
+    /// state planes were enabled and `specCapture` was active for
     /// that call (see `Qwen35GDNLayer.forwardManyChunked`). `specGdnPlanes`
     /// is `[specPlanesT, Hv, Dv, Dk]` f32; `specConvPlanes` is
     /// `[specPlanesT, convKernel-1, convDim]` in the layer's running
@@ -2340,8 +2340,8 @@ public final class Qwen35GDNMixer: Module {
 
         // ── Per-token state planes (spec-decode rollback) ────────────────
         //
-        // `BUTTER_GDN_STATE_PLANES=1` opts the fused conv+scan kernels into
-        // writing their register-resident state out to a per-token plane at
+        // State planes are enabled by default. The fused conv+scan kernels
+        // write their register-resident state out to a per-token plane at
         // every token boundary — see `iron_gated_delta_prep_chunk`'s
         // "Per-token state planes" doc and
         // `iron_conv1d_causal_step_silu_cast_many`'s "Per-token conv-state
@@ -2370,7 +2370,7 @@ public final class Qwen35GDNMixer: Module {
         // there is no rollback use case at prefill-chunk `T` (1024-4096),
         // and honoring the flag there would transiently allocate `T ·
         // Hv·Dv·Dk · 4B` per layer (e.g. ~8.6 GB at T=4096) for zero
-        // benefit. `maxPlaneT` keeps a naive/global `BUTTER_GDN_STATE_PLANES=1`
+        // benefit. `maxPlaneT` keeps globally enabled state planes
         // safe even outside a scoped spec-decode run. Conv planes require
         // the batched `conv1dCausalStepSiluCastMany` path specifically
         // (the per-token fallback loop below never writes them), so the
@@ -2382,7 +2382,7 @@ public final class Qwen35GDNMixer: Module {
         let gdnPlanesEnabled =
             useConv1dMany
             && t <= maxPlaneT
-            && ButterEnv["BUTTER_GDN_STATE_PLANES"] == "1"
+            && ButterEnv["BUTTER_GDN_STATE_PLANES"] != "0"
         let convStatePlanesBuf: Tensor
         let convPlanesEnabledBuf: Tensor
         let gdnStatePlanesBuf: Tensor
@@ -2685,7 +2685,7 @@ public final class Qwen35GDNMixer: Module {
     /// SELECTING the `(k-1)`th captured plane instead of restoring a
     /// pre-verify snapshot and re-running conv+scan (`rewindState` above).
     /// Requires the last verify pass to have captured planes for at least
-    /// `k` tokens (`BUTTER_GDN_STATE_PLANES=1` was active and `t` was
+    /// `k` tokens (state planes were enabled and `t` was
     /// plane-eligible — see `Qwen35GDNLayerCache.specGdnPlanes` doc);
     /// returns false otherwise so the caller falls back to `rewindState`.
     ///

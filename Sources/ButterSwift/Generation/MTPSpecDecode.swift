@@ -735,8 +735,9 @@ extension SpecDecode {
         let stateRewind =
             ButterEnv["BUTTER_QWEN_MTP_STATE_REWIND"] != "0"
         var rewindSteps = 0
-        // BUTTER_GDN_STATE_PLANES=1 — same flag that opts the fused
-        // conv+scan kernels into writing per-token state planes (see
+        // State planes are enabled by default; BUTTER_GDN_STATE_PLANES=0
+        // opts the fused conv+scan kernels out of writing per-token state
+        // planes (see
         // `Qwen35GDNLayer.forwardManyChunked`) — tried FIRST on partial
         // accept, ahead of `stateRewind`: `model.adoptPlanes` selects the
         // `(keep-1)`th captured plane directly into the live cache
@@ -746,7 +747,7 @@ extension SpecDecode {
         // captured for this cycle (e.g. `t` exceeded the plane-eligible
         // cap — see `forwardManyChunked`'s `maxPlaneT`).
         let statePlanes =
-            ButterEnv["BUTTER_GDN_STATE_PLANES"] == "1"
+            ButterEnv["BUTTER_GDN_STATE_PLANES"] != "0"
         var planeSteps = 0
         let batchedReplay =
             ButterEnv["BUTTER_QWEN_MTP_BATCHED_REPLAY"] != "0"
@@ -869,7 +870,7 @@ extension SpecDecode {
         // `statePlanes` also needs `specCapture` on: it gates
         // `forwardManyChunked`'s plane STASH onto the cache (the WRITE
         // itself is separately gated on the `BUTTER_GDN_STATE_PLANES` env
-        // check alone — see that method's doc), same as `stateRewind`
+        // opt-out alone — see that method's doc), same as `stateRewind`
         // needing it for the qkv/a_raw/b_raw stash.
         if stateRewind || statePlanes { model.setSpecCapture(true, caches: caches) }
         defer { if stateRewind || statePlanes { model.setSpecCapture(false, caches: caches) } }
