@@ -9067,6 +9067,68 @@ public enum Ops {
             }
         }
 
+        // Widths 5 and 7 otherwise pad to two BM4 tiles, including an
+        // input copy, tail fill, and output copy for every projection.
+        // Exact 3+2 and 4+3 splits keep the same two weight reads while
+        // dispatching directly from and into row-offset views.
+        if bits == 4, groupSize == 64, kIn % 256 == 0,
+            (t == 5 || t == 7), nOut % 8 == 0,
+            (input.dtype == .f16 || input.dtype == .bf16),
+            ButterEnv["BUTTER_QMM_SPLIT_M57"] != "0"
+        {
+            let firstRows = t == 5 ? 3 : 4
+            let secondRows = t - firstRows
+            let dtBytes = input.dtype.byteSize
+            let xFirst = Tensor(
+                buffer: input.buffer, offset: input.offset,
+                shape: [firstRows, kIn], dtype: input.dtype)
+            let outFirst = Tensor(
+                buffer: out.buffer, offset: out.offset,
+                shape: [firstRows, nOut], dtype: out.dtype)
+            let xSecond = Tensor(
+                buffer: input.buffer,
+                offset: input.offset + firstRows * kIn * dtBytes,
+                shape: [secondRows, kIn], dtype: input.dtype)
+            let outSecond = Tensor(
+                buffer: out.buffer,
+                offset: out.offset + firstRows * nOut * dtBytes,
+                shape: [secondRows, nOut], dtype: out.dtype)
+            let tg = MTLSize(width: 64, height: 1, depth: 1)
+            let firstGrid = MTLSize(width: nOut / 8, height: 1, depth: 1)
+            let firstHandled: Bool
+            if firstRows == 3 {
+                firstHandled = dispatchQmmBm3(
+                    weight: weight, scales: scales, biases: biases,
+                    input: xFirst, output: outFirst,
+                    n: nOut, k: kIn, gsPerRow: gsPerRow,
+                    grid: firstGrid, tg: tg, on: cmd)
+            } else {
+                firstHandled = dispatchQmmSmallM(
+                    weight: weight, scales: scales, biases: biases,
+                    input: xFirst, output: outFirst,
+                    n: nOut, k: kIn, gsPerRow: gsPerRow, useBm4: true,
+                    grid: firstGrid, tg: tg, on: cmd)
+            }
+            if firstHandled {
+                let secondGrid = MTLSize(width: nOut / 8, height: 1, depth: 1)
+                let secondHandled: Bool
+                if secondRows == 3 {
+                    secondHandled = dispatchQmmBm3(
+                        weight: weight, scales: scales, biases: biases,
+                        input: xSecond, output: outSecond,
+                        n: nOut, k: kIn, gsPerRow: gsPerRow,
+                        grid: secondGrid, tg: tg, on: cmd)
+                } else {
+                    secondHandled = dispatchQmmSmallM(
+                        weight: weight, scales: scales, biases: biases,
+                        input: xSecond, output: outSecond,
+                        n: nOut, k: kIn, gsPerRow: gsPerRow, useBm4: false,
+                        grid: secondGrid, tg: tg, on: cmd)
+                }
+                if secondHandled { return }
+            }
+        }
+
         // BM3 shares each int4 weight tile across exactly three activation
         // rows. Widths 3 and 6 avoid the padding and extra register pressure
         // of the four-row route used below. Keep an opt-out for paired model
