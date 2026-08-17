@@ -1205,7 +1205,9 @@ extension SpecDecode {
                         keep: plan.committed.count, absolutePosition: pos,
                         caches: caches, on: wCmd)
                     wCmd.commit()
-                    wCmd.waitUntilCompleted()
+                    // Every later target buffer uses Device's primary command
+                    // queue too. Queue order preserves the GPU dependency, and
+                    // no host code reads the adopted state here.
                     if ok {
                         msReplay += Date().timeIntervalSince(rT)
                         // nextTok stays plan.nextToken; hiddenAll stays
