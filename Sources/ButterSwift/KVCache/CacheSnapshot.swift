@@ -68,7 +68,10 @@ extension Array where Element == any LayerCacheProtocol {
     /// which at 48 GDN layers (conv + state apiece) meant ~96 blocking
     /// round-trips per spec-decode cycle - measured at ~25 ms, i.e. most
     /// of the snapshot cost, versus ~1 ms batched.
-    public func snapshotAll(device: Device = .shared) -> [LayerCacheSnapshot] {
+    public func snapshotAll(
+        device: Device = .shared,
+        waitUntilCompleted: Bool = true
+    ) -> [LayerCacheSnapshot] {
         let cmd = device.makeCommandBuffer()
         let out = self.map { cache -> LayerCacheSnapshot in
             if let composite = cache as? Qwen35GDNLayerCache {
@@ -99,7 +102,7 @@ extension Array where Element == any LayerCacheProtocol {
             )
         }
         cmd.commit()
-        cmd.waitUntilCompleted()
+        if waitUntilCompleted { cmd.waitUntilCompleted() }
         return out
     }
 
