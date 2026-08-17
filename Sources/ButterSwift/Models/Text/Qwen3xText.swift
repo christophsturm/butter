@@ -1757,7 +1757,9 @@ public final class Qwen35GDNMixer: Module {
             ButterEnv["BUTTER_GDN_WY"] != nil
             && valueHeadDim % 32 == 0 && keyHeadDim % 16 == 0 && valueHeadDim % 16 == 0
         self.fastPrepChunkEligible =
-            keyHeadDim == 128 && valueHeadDim == 128 && numValueHeads == 32 && numKeyHeads == 16
+            keyHeadDim == 128 && valueHeadDim == 128
+            && (numValueHeads == 32 || numValueHeads == 48)
+            && numKeyHeads == 16
             && ButterEnv["BUTTER_GDN_NO_PREP_CHUNK_FAST"] == nil
 
         // Per-decode-token scratch — pre-allocated once at init so the
@@ -2514,6 +2516,7 @@ public final class Qwen35GDNMixer: Module {
                 tLen: tLenScalar,
                 statePlanes: gdnStatePlanesBuf, planesEnabled: gdnPlanesEnabledBuf,
                 batchSize: 1,
+                numValueHeads: numValueHeads,
                 on: cmd)
         } else {
             Ops.gatedDeltaPrepChunk(
@@ -2640,6 +2643,7 @@ public final class Qwen35GDNMixer: Module {
                 tLen: kLenScalar,
                 statePlanes: rewindPlanes, planesEnabled: rewindPlanesEnabled,
                 batchSize: 1,
+                numValueHeads: numValueHeads,
                 on: cmd)
         } else {
             Ops.gatedDeltaPrepChunk(
