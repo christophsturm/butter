@@ -9130,13 +9130,15 @@ public enum Ops {
         }
 
         // BM3 shares each int4 weight tile across exactly three activation
-        // rows. Widths 3 and 6 avoid the padding and extra register pressure
+        // rows. Widths 3, 6, and 9 avoid the padding and extra register pressure
         // of the four-row route used below. Keep an opt-out for paired model
         // measurements and restrict this to the kernel's affine group-64
         // contract. Its K loop has no ragged-block bounds checks, so only
         // route widths composed of complete 256-element blocks.
         if bits == 4, groupSize == 64, kIn % 256 == 0,
-            (t == 3 || t == 6), nOut % 8 == 0,
+            (t == 3 || t == 6
+                || (t == 9 && ButterEnv["BUTTER_QMM_BM3_M9"] != "0")),
+            nOut % 8 == 0,
             ButterEnv["BUTTER_QMM_BM3"] != "0"
         {
             let grid = MTLSize(width: nOut / 8, height: t / 3, depth: 1)
