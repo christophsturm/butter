@@ -2875,6 +2875,67 @@ public enum Ops {
         }
     }
 
+    /// Exact-row sibling of `batched4QmmFast` that dispatches four BM3 or
+    /// BM4 projections through one compute encoder. Each projection reuses
+    /// its weight tile across the tile's activation rows, while the shared
+    /// encoder keeps the four-dispatch host cost close to the fused entry.
+    public static func batched4QmmReuseRowsFast(
+        input x: Tensor, m: Int,
+        wA: Tensor, scalesA: Tensor, biasesA: Tensor, outA: Tensor,
+        wB: Tensor, scalesB: Tensor, biasesB: Tensor, outB: Tensor,
+        wC: Tensor, scalesC: Tensor, biasesC: Tensor, outC: Tensor,
+        wD: Tensor, scalesD: Tensor, biasesD: Tensor, outD: Tensor,
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition((m == 6 || m == 8) && groupSize == 64)
+        precondition(
+            wA.dtype == .u32 && wB.dtype == .u32 && wC.dtype == .u32 && wD.dtype == .u32)
+        let k = wA.shape[1] * 8
+        precondition(k % 256 == 0)
+        precondition(
+            wB.shape[1] * 8 == k && wC.shape[1] * 8 == k && wD.shape[1] * 8 == k)
+        let tileRows = m == 6 ? 3 : 4
+        let kernelStem = m == 6 ? "iron_qmm_bm3" : "iron_qmm_bm4"
+        let psoName: String
+        switch x.dtype {
+        case .f32: psoName = "\(kernelStem)_f32"
+        case .f16: psoName = "\(kernelStem)_f16"
+        case .bf16: psoName = "\(kernelStem)_bf16"
+        default: fatalError("Ops.batched4QmmReuseRowsFast: unsupported dtype \(x.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        var kU = UInt32(k)
+        var gsU = UInt32(k / groupSize)
+        @inline(__always)
+        func dispatch(
+            weight: Tensor, scales: Tensor, biases: Tensor,
+            output: Tensor
+        ) {
+            let n = weight.shape[0]
+            precondition(n % 8 == 0 && output.elementCount == m * n)
+            var nU = UInt32(n)
+            enc.setBuffer(weight.buffer, offset: weight.offset, index: 0)
+            enc.setBuffer(scales.buffer, offset: scales.offset, index: 1)
+            enc.setBuffer(biases.buffer, offset: biases.offset, index: 2)
+            enc.setBuffer(x.buffer, offset: x.offset, index: 3)
+            enc.setBuffer(output.buffer, offset: output.offset, index: 4)
+            enc.setBytes(&kU, length: 4, index: 5)
+            enc.setBytes(&nU, length: 4, index: 6)
+            enc.setBytes(&gsU, length: 4, index: 7)
+            enc.dispatchThreadgroups(
+                MTLSize(width: n / 8, height: m / tileRows, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        }
+        dispatch(weight: wA, scales: scalesA, biases: biasesA, output: outA)
+        dispatch(weight: wB, scales: scalesB, biases: biasesB, output: outB)
+        dispatch(weight: wC, scales: scalesC, biases: biasesC, output: outC)
+        dispatch(weight: wD, scales: scalesD, biases: biasesD, output: outD)
+        enc.endEncoding()
+    }
+
     /// Per-expert indexed int4 dequant-GEMV. The caller stacks every
     /// expert's weight slab into one `[nExperts, outDim, inDim/8]`
     /// u32-packed tensor (and matching scales / biases stacks); the

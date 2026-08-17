@@ -2284,13 +2284,26 @@ public final class Qwen35GDNMixer: Module {
             let zBuf = Tensor.empty(shape: [t, valueDim], dtype: dt, device: device)
             let bBuf = Tensor.empty(shape: [t, numValueHeads], dtype: dt, device: device)
             let aBuf = Tensor.empty(shape: [t, numValueHeads], dtype: dt, device: device)
-            Ops.batched4QmmFast(
-                input: xNormFlat, m: t,
-                wA: bp.qW, scalesA: bp.qS, biasesA: bp.qB, outA: qkvBuf,
-                wB: bp.zW, scalesB: bp.zS, biasesB: bp.zB, outB: zBuf,
-                wC: bp.bW, scalesC: bp.bS, biasesC: bp.bB, outC: bBuf,
-                wD: bp.aW, scalesD: bp.aS, biasesD: bp.aB, outD: aBuf,
-                groupSize: bp.groupSize, on: cmd)
+            let reuseRows =
+                (t == 6 && ButterEnv["BUTTER_GDN_NO_BATCHED4_BM3"] != "1")
+                || (t == 8 && ButterEnv["BUTTER_GDN_NO_BATCHED4_BM4"] != "1")
+            if reuseRows {
+                Ops.batched4QmmReuseRowsFast(
+                    input: xNormFlat, m: t,
+                    wA: bp.qW, scalesA: bp.qS, biasesA: bp.qB, outA: qkvBuf,
+                    wB: bp.zW, scalesB: bp.zS, biasesB: bp.zB, outB: zBuf,
+                    wC: bp.bW, scalesC: bp.bS, biasesC: bp.bB, outC: bBuf,
+                    wD: bp.aW, scalesD: bp.aS, biasesD: bp.aB, outD: aBuf,
+                    groupSize: bp.groupSize, on: cmd)
+            } else {
+                Ops.batched4QmmFast(
+                    input: xNormFlat, m: t,
+                    wA: bp.qW, scalesA: bp.qS, biasesA: bp.qB, outA: qkvBuf,
+                    wB: bp.zW, scalesB: bp.zS, biasesB: bp.zB, outB: zBuf,
+                    wC: bp.bW, scalesC: bp.bS, biasesC: bp.bB, outC: bBuf,
+                    wD: bp.aW, scalesD: bp.aS, biasesD: bp.aB, outD: aBuf,
+                    groupSize: bp.groupSize, on: cmd)
+            }
             qkvAll = qkvBuf.reshaped(to: [t * convDim])
             zAll = zBuf.reshaped(to: [t * valueDim])
             bRawAll = bBuf.reshaped(to: [t * numValueHeads])
