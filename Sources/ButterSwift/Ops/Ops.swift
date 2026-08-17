@@ -2888,15 +2888,15 @@ public enum Ops {
         groupSize: Int = 64,
         on cmd: MTLCommandBuffer
     ) {
-        precondition((m == 6 || m == 8) && groupSize == 64)
+        precondition((m == 6 || m == 8 || m == 9) && groupSize == 64)
         precondition(
             wA.dtype == .u32 && wB.dtype == .u32 && wC.dtype == .u32 && wD.dtype == .u32)
         let k = wA.shape[1] * 8
         precondition(k % 256 == 0)
         precondition(
             wB.shape[1] * 8 == k && wC.shape[1] * 8 == k && wD.shape[1] * 8 == k)
-        let tileRows = m == 6 ? 3 : 4
-        let kernelStem = m == 6 ? "iron_qmm_bm3" : "iron_qmm_bm4"
+        let tileRows = m == 8 ? 4 : 3
+        let kernelStem = m == 8 ? "iron_qmm_bm4" : "iron_qmm_bm3"
         let psoName: String
         switch x.dtype {
         case .f32: psoName = "\(kernelStem)_f32"

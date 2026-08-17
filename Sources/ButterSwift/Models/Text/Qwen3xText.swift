@@ -2287,6 +2287,7 @@ public final class Qwen35GDNMixer: Module {
             let reuseRows =
                 (t == 6 && ButterEnv["BUTTER_GDN_NO_BATCHED4_BM3"] != "1")
                 || (t == 8 && ButterEnv["BUTTER_GDN_NO_BATCHED4_BM4"] != "1")
+                || (t == 9 && ButterEnv["BUTTER_GDN_NO_BATCHED4_BM3_M9"] != "1")
             if reuseRows {
                 Ops.batched4QmmReuseRowsFast(
                     input: xNormFlat, m: t,

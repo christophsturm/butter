@@ -419,4 +419,61 @@ struct QmvQmmParityTests {
             }
         }
     }
+
+    @Test("BM3 M9 fused-4 row reuse matches fused path on every row")
+    func batched4Bm3M9MatchesFusedAllRows() {
+        let banks = [
+            Self.fixture(seed: 0x5DEE_CE66_D3A7_1B41),
+            Self.fixture(seed: 0xA24B_AED4_963E_E407),
+            Self.fixture(seed: 0x9E37_79B9_7F4A_7C15),
+            Self.fixture(seed: 0xD1B5_4A32_D192_ED03),
+        ]
+        let t = 9
+        var rows: [Float] = []
+        for row in 0 ..< t {
+            rows.append(contentsOf: banks[0].x.map { $0 + Float(row) * 0.002 })
+        }
+        let input = Self.bf16Tensor(rows, shape: [t * Self.kIn])
+        let reused = (0 ..< 4).map { _ in
+            Tensor.empty(shape: [t * Self.nOut], dtype: .bf16)
+        }
+        let fused = (0 ..< 4).map { _ in
+            Tensor.empty(shape: [t * Self.nOut], dtype: .bf16)
+        }
+        Self.runAndWait { cb in
+            Ops.batched4QmmReuseRowsFast(
+                input: input, m: t,
+                wA: banks[0].weight, scalesA: banks[0].scales,
+                biasesA: banks[0].biases, outA: reused[0],
+                wB: banks[1].weight, scalesB: banks[1].scales,
+                biasesB: banks[1].biases, outB: reused[1],
+                wC: banks[2].weight, scalesC: banks[2].scales,
+                biasesC: banks[2].biases, outC: reused[2],
+                wD: banks[3].weight, scalesD: banks[3].scales,
+                biasesD: banks[3].biases, outD: reused[3],
+                groupSize: Self.groupSize, on: cb)
+        }
+        Self.runAndWait { cb in
+            Ops.batched4QmmFast(
+                input: input, m: t,
+                wA: banks[0].weight, scalesA: banks[0].scales,
+                biasesA: banks[0].biases, outA: fused[0],
+                wB: banks[1].weight, scalesB: banks[1].scales,
+                biasesB: banks[1].biases, outB: fused[1],
+                wC: banks[2].weight, scalesC: banks[2].scales,
+                biasesC: banks[2].biases, outC: fused[2],
+                wD: banks[3].weight, scalesD: banks[3].scales,
+                biasesD: banks[3].biases, outD: fused[3],
+                groupSize: Self.groupSize, on: cb)
+        }
+        for bank in 0 ..< 4 {
+            let a = Self.bf16Values(reused[bank])
+            let b = Self.bf16Values(fused[bank])
+            let (maxAbs, maxRel, worst) = Self.report(a, b)
+            #expect(
+                maxAbs < 0.032,
+                "bank=\(bank): BM3 M9 fused-4 deviation beyond ULP scale: max_abs=\(maxAbs) max_rel=\(maxRel) at out[\(worst)]"
+            )
+        }
+    }
 }
