@@ -9006,6 +9006,28 @@ public enum Ops {
             }
         }
 
+        // BM3 shares each int4 weight tile across exactly three activation
+        // rows. Widths 3 and 6 avoid the padding and extra register pressure
+        // of the four-row route used below. Keep an opt-out for paired model
+        // measurements and restrict this to the kernel's affine group-64
+        // contract. Its K loop has no ragged-block bounds checks, so only
+        // route widths composed of complete 256-element blocks.
+        if bits == 4, groupSize == 64, kIn % 256 == 0,
+            (t == 3 || t == 6), nOut % 8 == 0,
+            ButterEnv["BUTTER_QMM_BM3"] != "0"
+        {
+            let grid = MTLSize(width: nOut / 8, height: t / 3, depth: 1)
+            let tg = MTLSize(width: 64, height: 1, depth: 1)
+            if dispatchQmmBm3(
+                weight: weight, scales: scales, biases: biases,
+                input: input, output: out,
+                n: nOut, k: kIn, gsPerRow: gsPerRow,
+                grid: grid, tg: tg, on: cmd)
+            {
+                return
+            }
+        }
+
         // ── Small-M fast path (BUTTER_QMM_SMALL_M, default ON) ────────
         // The BM=32 tile below pads M up to 32, so a 2-row spec-decode
         // verify does 16x the needed compute and flips the pass from
@@ -9273,6 +9295,50 @@ public enum Ops {
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (.f16, true):
             IronKernels.iron_qmm_bm4_f16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            return false
+        }
+        return true
+    }
+
+    /// Dispatch the exact-three-row scalar int4 kernel. Its grid is
+    /// `[N/8, M/3, 1]`, with two SIMD groups producing eight output columns
+    /// while reusing one weight tile across three activation rows.
+    private static func dispatchQmmBm3(
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        input: Tensor, output: Tensor,
+        n: Int, k: Int, gsPerRow: Int,
+        grid: MTLSize, tg: MTLSize, on cmd: MTLCommandBuffer
+    ) -> Bool {
+        let kU = UInt32(k), nU = UInt32(n), gsU = UInt32(gsPerRow)
+        switch input.dtype {
+        case .f32:
+            IronKernels.iron_qmm_bm3_f32_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_qmm_bm3_f16_threadgroups(
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                x: input.buffer, xOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                k: kU, n: nU, gs_per_row: gsU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_qmm_bm3_bf16_threadgroups(
                 w: weight.buffer, wOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,
