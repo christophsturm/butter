@@ -2264,16 +2264,21 @@ public final class Qwen35GDNMixer: Module {
         // every out_*%8==0, groupSize==64): the kernel is the same
         // family, just M-generalized, so anything already routed
         // through the single-token fused-4 path is safe to route here
-        // too. Opt-in via `BUTTER_GDN_BATCHED4_MANY=1` pending A/B
-        // measurement (digest + verify-cost bench) — read fresh every
-        // call, no cached global, matching the other GDN env knobs
-        // above.
+        // too. It wins for the small speculative-verify widths but loses
+        // badly on long prefill, so widths up to 9 default to the fused
+        // route and larger calls retain the separate projections. The
+        // old env knob can still force the fused route at larger widths;
+        // `BUTTER_GDN_NO_BATCHED4_MANY=1` disables it for small-width A/B.
+        // Read fresh every call, matching the other GDN env knobs above.
+        let useBatched4Many =
+            t <= 9
+            ? ButterEnv["BUTTER_GDN_NO_BATCHED4_MANY"] != "1"
+            : ButterEnv["BUTTER_GDN_BATCHED4_MANY"] == "1"
         let qkvAll: Tensor
         let zAll: Tensor
         let bRawAll: Tensor
         let aRawAll: Tensor
-        if fused4Eligible, let bp = batchedInputProj,
-            ButterEnv["BUTTER_GDN_BATCHED4_MANY"] == "1"
+        if fused4Eligible, let bp = batchedInputProj, useBatched4Many
         {
             let qkvBuf = Tensor.empty(shape: [t, convDim], dtype: dt, device: device)
             let zBuf = Tensor.empty(shape: [t, valueDim], dtype: dt, device: device)
