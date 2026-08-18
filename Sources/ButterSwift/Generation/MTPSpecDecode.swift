@@ -1041,7 +1041,10 @@ extension SpecDecode {
             // case). Taking the backbone snapshot AFTER the draft burst
             // is safe: the burst only touches the head's own cache.
             let snapT = Date()
-            let snap = caches.snapshotAll(device: device)
+            // The verifier is submitted next on Device's primary queue,
+            // so queue order completes these blits before it mutates state.
+            let snap = caches.snapshotAll(
+                device: device, waitUntilCompleted: false)
             msSnap += Date().timeIntervalSince(snapT)
 
             // ── Verify: ONE batched backbone pass ─────────────────────
