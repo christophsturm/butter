@@ -2115,6 +2115,50 @@ public enum Ops {
             on: cmd, into: out)
     }
 
+    /// Int4 dequant GEMV over a compact list of source matrix rows.
+    /// `rowIndices` is u32 and the candidate count must be a multiple of 8.
+    public static func dequantGemvInt4Gathered(
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        rowIndices: Tensor, input: Tensor, groupSize: Int = 64,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(weight.shape.count == 2, "gathered dequant GEMV weight must be 2D")
+        precondition(weight.dtype == .u32, "gathered dequant GEMV weight must be packed u32")
+        precondition(input.dtype == .bf16, "gathered dequant GEMV requires bf16 input")
+        precondition(
+            scales.dtype == .bf16 && biases.dtype == .bf16,
+            "gathered dequant GEMV scales and biases must be bf16")
+        precondition(rowIndices.dtype == .u32, "gathered dequant GEMV row indices must be u32")
+        let candidateCount = rowIndices.elementCount
+        precondition(
+            candidateCount > 0 && candidateCount.isMultiple(of: 8),
+            "gathered dequant GEMV candidate count must be a positive multiple of 8")
+        let inDim = weight.shape[1] * 8
+        precondition(input.elementCount == inDim, "gathered dequant GEMV input size mismatch")
+        precondition(
+            groupSize == 64 && inDim.isMultiple(of: 512),
+            "gathered dequant GEMV requires group size 64 and input multiple of 512")
+        precondition(
+            scales.shape == [weight.shape[0], inDim / groupSize]
+                && biases.shape == scales.shape,
+            "gathered dequant GEMV scale shape mismatch")
+        let result = out ?? Tensor.empty(shape: [candidateCount], dtype: input.dtype)
+        precondition(result.elementCount == candidateCount, "gathered dequant GEMV output size mismatch")
+        let grid = MTLSize(width: candidateCount * 8, height: 1, depth: 1)
+        let tg = MTLSize(width: 64, height: 1, depth: 1)
+        IronKernels.iron_dequant_gemv_int4_gathered_bf16(
+            weight: weight.buffer, weightOffset: weight.offset,
+            scales: scales.buffer, scalesOffset: scales.offset,
+            biases: biases.buffer, biasesOffset: biases.offset,
+            row_indices: rowIndices.buffer, row_indicesOffset: rowIndices.offset,
+            input: input.buffer, inputOffset: input.offset,
+            output: result.buffer, outputOffset: result.offset,
+            in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+            gridSize: grid, threadgroupSize: tg, on: cmd)
+        return result
+    }
+
     /// Batched int4 dequantGemv on TWO projections sharing one input
     /// in ONE compute encoder. Used by `Qwen35MoEFFN.forward` for the
     /// per-expert gate + up pair: both projections read the same
