@@ -2317,17 +2317,31 @@ public final class Qwen35GDNMixer: Module {
             aRawAll = inProjA.callMany(xNormFlat, t: t, on: cmd, device: device)
         }
 
-        // a_raw / b_raw → f32 once on ONE shared encoder via
-        // `castToF32Two`. Saves one encoder begin/end pair per GDN
-        // layer × 30 = 30 pairs/prefill.
+        let useConv1dMany =
+            convKernel == 4
+            && ButterEnv["BUTTER_NO_CONV1D_MANY"] == nil
+        let usePackedPrework =
+            useConv1dMany
+            && ButterEnv["BUTTER_NO_PACKED_GDN_PREWORK"] == nil
+            && t >= 2 && t <= 9
+            && dt == .bf16
+            && keyHeadDim == 128 && valueHeadDim == 128
+            && numKeyHeads == 16 && numValueHeads == 48
+            && convDim == 10_240
+
+        // The packed verifier path writes these casts as part of its
+        // convolution dispatch. Other shapes retain the shared-encoder
+        // paired cast.
         let aRawF32All = Tensor.empty(
             shape: [t * numValueHeads], dtype: .f32, device: device)
         let bRawF32All = Tensor.empty(
             shape: [t * numValueHeads], dtype: .f32, device: device)
-        Ops.castToF32Two(
-            aRawAll, into: aRawF32All,
-            bRawAll, into: bRawF32All,
-            on: cmd)
+        if !usePackedPrework {
+            Ops.castToF32Two(
+                aRawAll, into: aRawF32All,
+                bRawAll, into: bRawF32All,
+                on: cmd)
+        }
 
         // Stash the weight-derived scan inputs so a later partial accept
         // can rewind the recurrent state without re-running any
@@ -2377,9 +2391,6 @@ public final class Qwen35GDNMixer: Module {
         // (the per-token fallback loop below never writes them), so the
         // gate also requires that path's own eligibility check.
         let maxPlaneT = 16
-        let useConv1dMany =
-            convKernel == 4
-            && ButterEnv["BUTTER_NO_CONV1D_MANY"] == nil
         let gdnPlanesEnabled =
             useConv1dMany
             && t <= maxPlaneT
@@ -2433,7 +2444,25 @@ public final class Qwen35GDNMixer: Module {
         // via BUTTER_NO_CONV1D_MANY=1.
         let convOutAllF32 = Tensor.empty(
             shape: [t * convDim], dtype: .f32, device: device)
-        if useConv1dMany {
+        let qNormedAll = Tensor.empty(
+            shape: [t * numKeyHeads * keyHeadDim], dtype: .f32, device: device)
+        let kNormedAll = Tensor.empty(
+            shape: [t * numKeyHeads * keyHeadDim], dtype: .f32, device: device)
+        if usePackedPrework {
+            Ops.gatedDeltaPackedPrework(
+                src: qkvAll.reshaped(to: [t, convDim]),
+                w: convW, b: convB,
+                aRaw: aRawAll, bRaw: bRawAll,
+                stateIn: cache.conv.state, stateOut: cache.conv.state,
+                statePlanes: convStatePlanesBuf, planesEnabled: convPlanesEnabledBuf,
+                qNormWeight: qNormWeightF32, kNormWeight: kNormWeightF32,
+                convOut: convOutAllF32,
+                qNormed: qNormedAll, kNormed: kNormedAll,
+                aOut: aRawF32All, bOut: bRawF32All,
+                t: t, dk: keyHeadDim, dv: valueHeadDim,
+                hv: numValueHeads, hk: numKeyHeads,
+                on: cmd)
+        } else if useConv1dMany {
             Ops.conv1dCausalStepSiluCastMany(
                 src: qkvAll.reshaped(to: [t, convDim]),
                 w: convW, b: convB,
@@ -2481,18 +2510,16 @@ public final class Qwen35GDNMixer: Module {
         // Per-head RMSNorm of q/k, computed once per (b, t, hk_idx) —
         // gatedDeltaPrepChunk's own grid would otherwise redundantly
         // recompute it `valueHeadDim · (numValueHeads/numKeyHeads)` times.
-        let qNormedAll = Tensor.empty(
-            shape: [t * numKeyHeads * keyHeadDim], dtype: .f32, device: device)
-        let kNormedAll = Tensor.empty(
-            shape: [t * numKeyHeads * keyHeadDim], dtype: .f32, device: device)
-        Ops.gatedDeltaQKNormPrepass(
-            convOut: convOutAllF32,
-            qNormWeight: qNormWeightF32, kNormWeight: kNormWeightF32,
-            qNormed: qNormedAll, kNormed: kNormedAll,
-            tLen: tLenScalar, tCount: t,
-            batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
-            hv: numValueHeads, hk: numKeyHeads,
-            on: cmd)
+        if !usePackedPrework {
+            Ops.gatedDeltaQKNormPrepass(
+                convOut: convOutAllF32,
+                qNormWeight: qNormWeightF32, kNormWeight: kNormWeightF32,
+                qNormed: qNormedAll, kNormed: kNormedAll,
+                tLen: tLenScalar, tCount: t,
+                batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
+                hv: numValueHeads, hk: numKeyHeads,
+                on: cmd)
+        }
 
         // `BUTTER_GDN_WY=1` opts into the chunked-WY prefill pipeline
         // (`iron_gdn_wy_plan` + `iron_gdn_wy_scan`, see `Ops.swift`) —

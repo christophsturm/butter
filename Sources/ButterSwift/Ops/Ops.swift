@@ -3752,6 +3752,114 @@ public enum Ops {
         }
     }
 
+    /// Packed verifier prework for a Gated DeltaNet chunk. Combines the
+    /// paired a/b casts, causal convolution with SiLU, and Q/K RMSNorm in
+    /// one dispatch. The Q, K, and V head dimensions must match so logical
+    /// heads map to one contiguous run of channels.
+    public static func gatedDeltaPackedPrework(
+        src: Tensor, w: Tensor, b: Tensor,
+        aRaw: Tensor, bRaw: Tensor,
+        stateIn: Tensor, stateOut: Tensor,
+        statePlanes: Tensor, planesEnabled: Tensor,
+        qNormWeight: Tensor, kNormWeight: Tensor,
+        convOut: Tensor, qNormed: Tensor, kNormed: Tensor,
+        aOut: Tensor, bOut: Tensor,
+        t: Int, dk: Int, dv: Int, hv: Int, hk: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(t > 0, "Ops.gatedDeltaPackedPrework: t must be positive")
+        precondition(
+            dk == dv && dk.isMultiple(of: 32),
+            "Ops.gatedDeltaPackedPrework: dk and dv must match and be multiples of 32")
+        precondition(
+            src.dtype == w.dtype && w.dtype == b.dtype
+                && b.dtype == aRaw.dtype && aRaw.dtype == bRaw.dtype
+                && bRaw.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
+                && stateOut.dtype == statePlanes.dtype,
+            "Ops.gatedDeltaPackedPrework: model tensors must share dtype")
+        precondition(
+            qNormWeight.dtype == .f32 && kNormWeight.dtype == .f32
+                && convOut.dtype == .f32 && qNormed.dtype == .f32
+                && kNormed.dtype == .f32 && aOut.dtype == .f32 && bOut.dtype == .f32,
+            "Ops.gatedDeltaPackedPrework: normalized and cast tensors must be f32")
+        precondition(
+            planesEnabled.dtype == .u32 && planesEnabled.elementCount == 1,
+            "Ops.gatedDeltaPackedPrework: planesEnabled must be a [1] u32 scalar buffer")
+        let tgWidth = 32
+        let grid = MTLSize(width: t * tgWidth, height: 2 * hk + hv, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let tU = UInt32(t)
+        let dkU = UInt32(dk)
+        let dvU = UInt32(dv)
+        let hvU = UInt32(hv)
+        let hkU = UInt32(hk)
+
+        switch src.dtype {
+        case .f32:
+            IronKernels.iron_gated_delta_packed_prework_f32(
+                src: src.buffer, srcOffset: src.offset,
+                weight: w.buffer, weightOffset: w.offset,
+                bias: b.buffer, biasOffset: b.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                a_out: aOut.buffer, a_outOffset: aOut.offset,
+                b_out: bOut.buffer, b_outOffset: bOut.offset,
+                t_len: tU, dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_gated_delta_packed_prework_f16(
+                src: src.buffer, srcOffset: src.offset,
+                weight: w.buffer, weightOffset: w.offset,
+                bias: b.buffer, biasOffset: b.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                a_out: aOut.buffer, a_outOffset: aOut.offset,
+                b_out: bOut.buffer, b_outOffset: bOut.offset,
+                t_len: tU, dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_gated_delta_packed_prework_bf16(
+                src: src.buffer, srcOffset: src.offset,
+                weight: w.buffer, weightOffset: w.offset,
+                bias: b.buffer, biasOffset: b.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                state_planes: statePlanes.buffer, state_planesOffset: statePlanes.offset,
+                planes_enabled: planesEnabled.buffer, planes_enabledOffset: planesEnabled.offset,
+                q_normed: qNormed.buffer, q_normedOffset: qNormed.offset,
+                k_normed: kNormed.buffer, k_normedOffset: kNormed.offset,
+                a_out: aOut.buffer, a_outOffset: aOut.offset,
+                b_out: bOut.buffer, b_outOffset: bOut.offset,
+                t_len: tU, dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.gatedDeltaPackedPrework: unsupported dtype \(src.dtype)")
+        }
+    }
+
     /// Mamba 2 selective-scan single-token decode step. Updates the
     /// per-layer recurrent state `h` in place and writes the output
     /// channel vector `y`. `h` lives in fp32 (state accumulates over

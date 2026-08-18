@@ -115,6 +115,107 @@ struct OpsSpecialPathTests {
         }
     }
 
+    @Test("packed GDN prework bf16 matches the existing dispatch chain")
+    func packedGdnPreworkMatchesExistingChain() {
+        autoreleasepool {
+            let t = 6
+            let dk = 32
+            let dv = 32
+            let hk = 2
+            let hv = 4
+            let convDim = (2 * hk + hv) * dk
+            func bf16(_ count: Int, period: Int, scale: Float) -> [UInt16] {
+                (0 ..< count).map { i in
+                    let value = (Float(i % period) / Float(period) - 0.5) * scale
+                    return UInt16(truncatingIfNeeded: value.bitPattern >> 16)
+                }
+            }
+            func modelTensor(_ values: [UInt16]) -> Tensor {
+                let tensor = Tensor.empty(shape: [values.count], dtype: .bf16)
+                tensor.copyIn(from: values)
+                return tensor
+            }
+            func scalar(_ value: UInt32) -> Tensor {
+                let tensor = Tensor.empty(shape: [1], dtype: .u32)
+                tensor.copyIn(from: [value])
+                return tensor
+            }
+
+            let src = modelTensor(bf16(t * convDim, period: 17, scale: 1.0))
+            let weight = modelTensor(bf16(4 * convDim, period: 11, scale: 0.2))
+            let bias = modelTensor(bf16(convDim, period: 7, scale: 0.1))
+            let aRaw = modelTensor(bf16(t * hv, period: 9, scale: 0.8))
+            let bRaw = modelTensor(bf16(t * hv, period: 13, scale: 0.8))
+            let stateBits = bf16(3 * convDim, period: 19, scale: 1.0)
+            let packedState = modelTensor(stateBits)
+            let referenceState = modelTensor(stateBits)
+            let qWeight = Tensor.filled(0.75, shape: [hk * dk], dtype: .f32)
+            let kWeight = Tensor.filled(0.625, shape: [hk * dk], dtype: .f32)
+            let planeMode = scalar(3)
+            let tLen = scalar(UInt32(t))
+
+            let packedConv = Tensor.empty(shape: [t * convDim], dtype: .f32)
+            let packedQ = Tensor.empty(shape: [t * hk * dk], dtype: .f32)
+            let packedK = Tensor.empty(shape: [t * hk * dk], dtype: .f32)
+            let packedA = Tensor.empty(shape: [t * hv], dtype: .f32)
+            let packedB = Tensor.empty(shape: [t * hv], dtype: .f32)
+            let packedPlanes = Tensor.empty(shape: [t * 3 * convDim], dtype: .bf16)
+            packedPlanes.zero()
+
+            let referenceConv = Tensor.empty(shape: [t * convDim], dtype: .f32)
+            let referenceQ = Tensor.empty(shape: [t * hk * dk], dtype: .f32)
+            let referenceK = Tensor.empty(shape: [t * hk * dk], dtype: .f32)
+            let referenceA = Tensor.empty(shape: [t * hv], dtype: .f32)
+            let referenceB = Tensor.empty(shape: [t * hv], dtype: .f32)
+            let referencePlanes = Tensor.empty(shape: [t * 3 * convDim], dtype: .bf16)
+            referencePlanes.zero()
+
+            runAndWait { cb in
+                Ops.gatedDeltaPackedPrework(
+                    src: src, w: weight, b: bias,
+                    aRaw: aRaw, bRaw: bRaw,
+                    stateIn: packedState, stateOut: packedState,
+                    statePlanes: packedPlanes, planesEnabled: planeMode,
+                    qNormWeight: qWeight, kNormWeight: kWeight,
+                    convOut: packedConv, qNormed: packedQ, kNormed: packedK,
+                    aOut: packedA, bOut: packedB,
+                    t: t, dk: dk, dv: dv, hv: hv, hk: hk,
+                    on: cb)
+
+                Ops.castToF32Two(
+                    aRaw, into: referenceA, bRaw, into: referenceB, on: cb)
+                Ops.conv1dCausalStepSiluCastMany(
+                    src: src, w: weight, b: bias,
+                    stateIn: referenceState, outF32: referenceConv,
+                    stateOut: referenceState,
+                    statePlanes: referencePlanes, planesEnabled: planeMode,
+                    t: t, convDim: convDim, convKernel: 4,
+                    on: cb)
+                Ops.gatedDeltaQKNormPrepass(
+                    convOut: referenceConv,
+                    qNormWeight: qWeight, kNormWeight: kWeight,
+                    qNormed: referenceQ, kNormed: referenceK,
+                    tLen: tLen, tCount: t,
+                    batchSize: 1, dk: dk, dv: dv, hv: hv, hk: hk,
+                    on: cb)
+            }
+
+            #expect(packedConv.toArray(as: Float.self) == referenceConv.toArray(as: Float.self))
+            let packedQValues = packedQ.toArray(as: Float.self)
+            let referenceQValues = referenceQ.toArray(as: Float.self)
+            let packedKValues = packedK.toArray(as: Float.self)
+            let referenceKValues = referenceK.toArray(as: Float.self)
+            for i in packedQValues.indices {
+                #expect(abs(packedQValues[i] - referenceQValues[i]) < 1e-5, "q[\(i)]")
+                #expect(abs(packedKValues[i] - referenceKValues[i]) < 1e-5, "k[\(i)]")
+            }
+            #expect(packedA.toArray(as: Float.self) == referenceA.toArray(as: Float.self))
+            #expect(packedB.toArray(as: Float.self) == referenceB.toArray(as: Float.self))
+            #expect(packedState.toArray(as: UInt16.self) == referenceState.toArray(as: UInt16.self))
+            #expect(packedPlanes.toArray(as: UInt16.self) == referencePlanes.toArray(as: UInt16.self))
+        }
+    }
+
     @Test("castToF32Three bf16 — same as three sequential castToF32 calls")
     func castToF32ThreeMatchesSequential() {
         autoreleasepool {
