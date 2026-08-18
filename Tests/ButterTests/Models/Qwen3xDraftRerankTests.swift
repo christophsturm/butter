@@ -26,7 +26,7 @@ struct Qwen3xDraftRerankTests {
         values[17] = Float.nan
         values[23] = values[24]
         let limit = 90
-        let count = 32
+        let count = Qwen3xMTPHead.draftRerankCandidateCount
         let actual = qwen3xTopDraftCandidateIDs(values, count: count, limit: limit)
         let expected = Array(
             (0 ..< limit).sorted { lhs, rhs in
@@ -41,8 +41,9 @@ struct Qwen3xDraftRerankTests {
     @Test("equal values prefer the lower compact ID")
     func tieBreak() {
         let values = [Float](repeating: 4, count: 64)
-        let actual = qwen3xTopDraftCandidateIDs(values, count: 32, limit: values.count)
-        #expect(Set(actual) == Set(0 ..< 32))
+        let count = Qwen3xMTPHead.draftRerankCandidateCount
+        let actual = qwen3xTopDraftCandidateIDs(values, count: count, limit: values.count)
+        #expect(Set(actual) == Set(0 ..< count))
     }
 
     @Test("compact control rows map to published token IDs")

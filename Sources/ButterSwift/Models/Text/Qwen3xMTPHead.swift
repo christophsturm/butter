@@ -243,7 +243,7 @@ public final class Qwen3xMTPHead: Module {
     static let compactDraftControlStart = 248_044
     static let compactDraftRealCount = 98_330
     static let compactDraftPaddedCount = 98_336
-    static let draftRerankCandidateCount = 32
+    static let draftRerankCandidateCount = 16
 
     static func mapCompactDraftID(_ id: Int) -> Int {
         precondition(id >= 0 && id < compactDraftRealCount)
