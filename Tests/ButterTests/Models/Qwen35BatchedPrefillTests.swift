@@ -278,4 +278,51 @@ struct Qwen35BatchedPrefillTests {
             "per-row batched vs per-token divergence: max_abs_diff=\(worstDiff) on row \(worstRow)")
     }
 
+    @Test("dense boundary verifier matches materialized layer boundaries")
+    func denseBoundaryVerifierMatchesMaterializedBoundaries() {
+        let tokens = [3, 17, 42, 5, 60]
+        let device = Device.shared
+
+        let referenceModel = Self.makeTinyDenseModel()
+        let referenceCaches = referenceModel.makeLayerCaches(maxSeq: nil, device: device)
+        let referenceCmd = device.makeCommandBuffer()
+        let referenceLogits = referenceModel.forwardManyAllLogits(
+            tokenIds: tokens, startPosition: 0, caches: referenceCaches,
+            on: referenceCmd, device: device)
+        referenceCmd.commit()
+        referenceCmd.waitUntilCompleted()
+        let reference = referenceLogits.toFloatArray()
+
+        let boundaryModel = Self.makeTinyDenseModel()
+        let boundaryCaches = boundaryModel.makeLayerCaches(maxSeq: nil, device: device)
+        let boundaryCmd = device.makeCommandBuffer()
+        let boundary = boundaryModel.forwardManyHiddenAndLogits(
+            tokenIds: tokens, startPosition: 0, caches: boundaryCaches,
+            on: boundaryCmd, device: device)
+        boundaryCmd.commit()
+        boundaryCmd.waitUntilCompleted()
+        let actual = boundary.logits.toFloatArray()
+        let hidden = boundary.hidden.toFloatArray()
+
+        #expect(actual.count == reference.count)
+        #expect(hidden.count == tokens.count * 512)
+        #expect(hidden.allSatisfy { $0.isFinite })
+
+        var worstDiff: Float = 0
+        for index in reference.indices {
+            worstDiff = max(worstDiff, abs(reference[index] - actual[index]))
+        }
+        #expect(
+            worstDiff < 0.05,
+            "boundary and materialized logits diverge: max_abs_diff=\(worstDiff)")
+
+        let vocab = actual.count / tokens.count
+        for row in 0 ..< tokens.count {
+            let range = row * vocab ..< (row + 1) * vocab
+            let referenceArgmax = range.max(by: { reference[$0] < reference[$1] })!
+            let actualArgmax = range.max(by: { actual[$0] < actual[$1] })!
+            #expect(referenceArgmax == actualArgmax)
+        }
+    }
+
 }

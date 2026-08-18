@@ -3603,6 +3603,44 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
         if case .dense = ffn { cmd.commit() }
         return out
     }
+
+    /// Dense verifier path that leaves the final FFN residual unmerged.
+    /// The next layer fuses that add with its input RMS normalization.
+    func decodeManyDenseBoundary(
+        base: Tensor, delta: Tensor?, t: Int,
+        cache: any LayerCacheProtocol,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> (base: Tensor, delta: Tensor) {
+        guard let gc = cache as? Qwen35GDNLayerCache else {
+            fatalError(
+                "Qwen35GDNLayer.decodeManyDenseBoundary: expected Qwen35GDNLayerCache")
+        }
+        precondition(mixer.fused && t > 0)
+        guard case .dense(let mlp) = ffn else {
+            fatalError("Qwen35GDNLayer.decodeManyDenseBoundary: dense FFN required")
+        }
+
+        let input = qwen35MergeAndInputNorm(
+            base: base, delta: delta, norm: inputNorm,
+            nRows: t, rowSize: hidden, device: device, on: cmd)
+        let mixerOut = mixer.forwardMany(
+            input.normed, t: t, cache: gc, cmd: cmd, device: device
+        ).reshaped(to: [t * hidden])
+        let post = qwen35AddAndRmsNorm(
+            input.residual, mixerOut, norm: postNorm,
+            nRows: t, rowSize: hidden, device: device, on: cmd)
+        let postMix =
+            post?.residual ?? Ops.add(input.residual, mixerOut, on: cmd)
+        let ffnNorm =
+            post?.normed
+            ?? Ops.rmsNormRows(
+                postMix, weight: postNorm.weight, eps: postNorm.eps,
+                nRows: t, rowSize: hidden, on: cmd)
+        let ffnOut = mlp.forwardMany(ffnNorm, t: t, cmd: cmd, device: device)
+            .reshaped(to: [t * hidden])
+        cmd.commit()
+        return (base: postMix, delta: ffnOut)
+    }
 }
 
 // ─── Qwen35AttentionLayer — a "full_attention" layer ─────────────────
@@ -3770,6 +3808,43 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
             cmd: cmd, device: device,
             preNormed: ffnNorm)
     }
+
+    /// Dense verifier path that leaves the final FFN residual unmerged.
+    /// The next layer fuses that add with its input RMS normalization.
+    func decodeManyDenseBoundary(
+        base: Tensor, delta: Tensor?, t: Int, startPosition: Int,
+        cache: any LayerCacheProtocol,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> (base: Tensor, delta: Tensor) {
+        guard let kv = cache as? KVCache else {
+            fatalError(
+                "Qwen35AttentionLayer.decodeManyDenseBoundary: expected KVCache")
+        }
+        guard case .dense(let mlp) = ffn else {
+            fatalError("Qwen35AttentionLayer.decodeManyDenseBoundary: dense FFN required")
+        }
+
+        let input = qwen35MergeAndInputNorm(
+            base: base, delta: delta, norm: inputNorm,
+            nRows: t, rowSize: hidden, device: device, on: cmd)
+        let mixerOut = mixer.forwardMany(
+            input.normed, t: t, startPosition: startPosition,
+            cache: kv, cmd: cmd, device: device
+        ).reshaped(to: [t * hidden])
+        let post = qwen35AddAndRmsNorm(
+            input.residual, mixerOut, norm: postNorm,
+            nRows: t, rowSize: hidden, device: device, on: cmd)
+        let postMix =
+            post?.residual ?? Ops.add(input.residual, mixerOut, on: cmd)
+        let ffnNorm =
+            post?.normed
+            ?? Ops.rmsNormRows(
+                postMix, weight: postNorm.weight, eps: postNorm.eps,
+                nRows: t, rowSize: hidden, on: cmd)
+        let ffnOut = mlp.forwardMany(ffnNorm, t: t, cmd: cmd, device: device)
+            .reshaped(to: [t * hidden])
+        return (base: postMix, delta: ffnOut)
+    }
 }
 
 private let qwen35WideAddNormEnabled =
@@ -3794,6 +3869,25 @@ private func qwen35AddAndRmsNorm(
     return MuseGlimmerAddRmsNormWideFuse.addAndRmsNormWide(
         a, b, weight: norm.weight, eps: norm.eps,
         nRows: nRows, rowSize: rowSize, device: device, on: cmd)
+}
+
+private func qwen35MergeAndInputNorm(
+    base: Tensor, delta: Tensor?, norm: RMSNorm,
+    nRows: Int, rowSize: Int, device: Device,
+    on cmd: MTLCommandBuffer
+) -> (residual: Tensor, normed: Tensor) {
+    if let delta,
+        let fused = qwen35AddAndRmsNorm(
+            base, delta, norm: norm,
+            nRows: nRows, rowSize: rowSize, device: device, on: cmd)
+    {
+        return fused
+    }
+    let residual = delta.map { Ops.add(base, $0, on: cmd) } ?? base
+    let normed = Ops.rmsNormRows(
+        residual, weight: norm.weight, eps: norm.eps,
+        nRows: nRows, rowSize: rowSize, on: cmd)
+    return (residual: residual, normed: normed)
 }
 
 // ─── finalNorm + lmHead fused dispatch helper ───────────────────────
@@ -4421,6 +4515,38 @@ public final class Qwen35Model: LanguageModel {
             caches: caches, on: cmd, device: device)
     }
 
+    /// Carry dense FFN output as an unmerged residual pair between layers.
+    /// Every interior boundary becomes one add-and-normalize dispatch.
+    private func forwardManyDenseBoundaryLayers(
+        _ input: Tensor, t: Int, startPosition: Int,
+        caches: [any LayerCacheProtocol],
+        workCmd: inout MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        var base = input
+        var delta: Tensor?
+        for (index, layer) in layers.enumerated() {
+            let pair: (base: Tensor, delta: Tensor)
+            if let gdn = layer as? Qwen35GDNLayer {
+                pair = gdn.decodeManyDenseBoundary(
+                    base: base, delta: delta, t: t,
+                    cache: caches[index], cmd: workCmd, device: device)
+                workCmd = device.makeCommandBuffer()
+            } else if let attention = layer as? Qwen35AttentionLayer {
+                pair = attention.decodeManyDenseBoundary(
+                    base: base, delta: delta, t: t,
+                    startPosition: startPosition,
+                    cache: caches[index], cmd: workCmd, device: device)
+            } else {
+                fatalError(
+                    "Qwen35Model.forwardManyDenseBoundaryLayers: unsupported layer")
+            }
+            base = pair.base
+            delta = pair.delta
+        }
+        guard let delta else { return base }
+        return Ops.add(base, delta, on: workCmd)
+    }
+
     /// Mixed-dispatch batched forwardMany. Attention layers fan to
     /// `decodeMany`; GDN (and any other) layer types stay per-token with
     /// a per-row `Ops.copy` blit-back into the running `[T, hidden]`
@@ -4472,6 +4598,36 @@ public final class Qwen35Model: LanguageModel {
         // QuantizedEmbedding variants.
         let dt = h.dtype
         let dtBytes = dt.byteSize
+
+        // The dense verifier can carry each layer's final residual as a
+        // pair. Fuse its merge with the next layer's input norm, then merge
+        // only once after the final layer. Profiling and inspection retain
+        // the conventional materialized boundary for attribution.
+        let useDenseBoundaryVerify =
+            returnAllLogits && returnHidden && !hasMoE
+            && dt == .bf16
+            && !profileLayers
+            && ButterEnv["BUTTER_INSPECT"] != "1"
+            && ButterEnv["BUTTER_QWEN_MTP_POSTNORM"] != "0"
+            && ButterEnv["BUTTER_QWEN_NO_DENSE_BOUNDARY_FUSE"] != "1"
+        if useDenseBoundaryVerify {
+            h = forwardManyDenseBoundaryLayers(
+                h, t: t, startPosition: startPosition,
+                caches: caches, workCmd: &workCmd, device: device)
+            workCmd.commit()
+            workCmd.waitUntilCompleted()
+
+            let normedAll = Ops.rmsNormRows(
+                h, weight: finalNorm.weight, eps: finalNorm.eps,
+                nRows: t, rowSize: hidden, on: cmd)
+            let snap = Tensor.empty(
+                shape: [t, hidden], dtype: dt, device: device)
+            Ops.copy(normedAll.reshaped(to: [t, hidden]), into: snap, on: cmd)
+            let logits = lmHead.callMany(
+                normedAll.reshaped(to: [t, hidden]),
+                t: t, on: cmd, device: device)
+            return (logits: logits, hidden: snap)
+        }
 
         // See `Sources/ButterSwift/Telemetry/InspectTap.swift` — no-op
         // when BUTTER_INSPECT isn't set. `butter inspect --layer-trace`.
