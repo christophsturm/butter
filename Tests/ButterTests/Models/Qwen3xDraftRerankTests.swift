@@ -91,6 +91,35 @@ struct Qwen3xDraftRerankTests {
         #expect(Qwen3xMTPHead.mapCompactDraftID(98_329) == 248_069)
     }
 
+    @Test("wide row argmax matches the exact verifier geometry")
+    func wideRowArgmax() {
+        let rows = 4
+        let columns = 248_320
+        var values = (0 ..< rows * columns).map {
+            Float(($0 * 73 + 29) % 1_009) / 1_024
+        }
+        var expected: [UInt32] = []
+        for row in 0 ..< rows {
+            let lower = 97 + row * 1_003
+            let higher = lower + 65_536
+            values[row * columns + lower] = 10
+            values[row * columns + higher] = 10
+            values[row * columns + lower + 1] = .nan
+            expected.append(UInt32(lower))
+        }
+
+        let logits = Tensor.empty(shape: [rows, columns], dtype: .bf16)
+        logits.copyIn(from: values.map(bf16Bits))
+        let indices = Tensor.empty(shape: [rows], dtype: .u32)
+        runAndWait { commandBuffer in
+            Ops.argmaxRows(
+                logits, rows: rows, columns: columns,
+                into: indices, on: commandBuffer)
+        }
+
+        #expect(indices.toArray(as: UInt32.self) == expected)
+    }
+
     @Test("gathered 4-bit rerank matches selected matrix rows")
     func gatheredRerankRows() {
         let outDim = 16
