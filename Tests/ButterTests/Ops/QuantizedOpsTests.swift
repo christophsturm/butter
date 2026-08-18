@@ -267,19 +267,19 @@ struct QuantizedOpsTests {
     func runDequantGemvCheck(
         bits: Int, mask: UInt32,
         packPerChunk: Int, uint32sPerChunk: Int,
+        outDim: Int = 2, inDim: Int = 64,
         pack: ([UInt32]) -> [UInt32]
     ) {
-        let outDim = 2
-        let inDim = 64  // 1 group, group_size=64
         let gs = 64
+        let nGroups = inDim / gs
         let chunkValues = packPerChunk  // values per chunk
 
         var q = [[UInt32]](repeating: [], count: outDim)
         for r in 0 ..< outDim {
             q[r] = (0 ..< inDim).map { UInt32(($0 + r * 7) & Int(mask)) }
         }
-        let scales: [Float] = (0 ..< outDim).map { Float($0 + 1) * 0.04 }
-        let biases: [Float] = (0 ..< outDim).map { Float($0) * -0.07 }
+        let scales: [Float] = (0 ..< outDim * nGroups).map { Float($0 + 1) * 0.04 }
+        let biases: [Float] = (0 ..< outDim * nGroups).map { Float($0) * -0.07 }
         let input: [Float] = (0 ..< inDim).map { Float($0) * 0.1 - 3.2 }
 
         var packed: [UInt32] = []
@@ -298,7 +298,8 @@ struct QuantizedOpsTests {
             var acc: Float = 0
             for j in 0 ..< inDim {
                 let qv = Float(q[r][j])
-                acc += (qv * bf(scales[r]) + bf(biases[r])) * bf(input[j])
+                let g = r * nGroups + j / gs
+                acc += (qv * bf(scales[g]) + bf(biases[g])) * bf(input[j])
             }
             expected.append(acc)
         }
@@ -309,9 +310,9 @@ struct QuantizedOpsTests {
         let u32PerRow = inDim * bits / 32
         let weight = Tensor.empty(shape: [outDim, u32PerRow], dtype: .u32)
         weight.copyIn(from: packed)
-        let scalesT = Tensor.empty(shape: [outDim, 1], dtype: .bf16)
+        let scalesT = Tensor.empty(shape: [outDim, nGroups], dtype: .bf16)
         scalesT.copyIn(from: scalesBits)
-        let biasesT = Tensor.empty(shape: [outDim, 1], dtype: .bf16)
+        let biasesT = Tensor.empty(shape: [outDim, nGroups], dtype: .bf16)
         biasesT.copyIn(from: biasesBits)
         let inputT = Tensor.empty(shape: [inDim], dtype: .bf16)
         inputT.copyIn(from: inputBits)
@@ -350,6 +351,15 @@ struct QuantizedOpsTests {
             runDequantGemvCheck(
                 bits: 2, mask: 0x03, packPerChunk: 16, uint32sPerChunk: 1,
                 pack: Self.pack16Twobit)
+        }
+    }
+
+    @Test("aligned int2 dequant gemv fast path matches CPU")
+    func roundTripInt2FastBf16() {
+        autoreleasepool {
+            runDequantGemvCheck(
+                bits: 2, mask: 0x03, packPerChunk: 16, uint32sPerChunk: 1,
+                outDim: 8, inDim: 512, pack: Self.pack16Twobit)
         }
     }
 

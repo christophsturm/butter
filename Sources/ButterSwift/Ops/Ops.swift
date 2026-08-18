@@ -1926,6 +1926,44 @@ public enum Ops {
             preconditionFailure("Ops.dequantGemv: \(reason)")
         }
         let result = out ?? Tensor.empty(shape: [outDim], dtype: input.dtype)
+        if bits == 2 && groupSize == 64 && outDim.isMultiple(of: 8)
+            && inDim.isMultiple(of: 512)
+        {
+            let grid = MTLSize(width: outDim * 8, height: 1, depth: 1)
+            let tg = MTLSize(width: 64, height: 1, depth: 1)
+            switch input.dtype {
+            case .f32:
+                IronKernels.iron_dequant_gemv_int2_fast_f32(
+                    weight: weight.buffer, weightOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    input: input.buffer, inputOffset: input.offset,
+                    output: result.buffer, outputOffset: result.offset,
+                    in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            case .f16:
+                IronKernels.iron_dequant_gemv_int2_fast_f16(
+                    weight: weight.buffer, weightOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    input: input.buffer, inputOffset: input.offset,
+                    output: result.buffer, outputOffset: result.offset,
+                    in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            case .bf16:
+                IronKernels.iron_dequant_gemv_int2_fast_bf16(
+                    weight: weight.buffer, weightOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    input: input.buffer, inputOffset: input.offset,
+                    output: result.buffer, outputOffset: result.offset,
+                    in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            default:
+                preconditionFailure("Ops.dequantGemv: unsupported dtype \(input.dtype)")
+            }
+            return result
+        }
         // Reduction kernel: one threadgroup per output row.
         let tgWidth = 256
         let grid = MTLSize(width: outDim * tgWidth, height: 1, depth: 1)
