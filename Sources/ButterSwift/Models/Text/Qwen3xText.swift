@@ -611,6 +611,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
                         nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
                         rotaryDim: rotaryDim, ropeTheta: ropeTheta,
                         attnOutputGate: attnOutputGate,
+                        cacheCapacity: maxSeq,
                         eps: eps, dtype: activationDtype, device: device)
                 } catch {
                     fputs(

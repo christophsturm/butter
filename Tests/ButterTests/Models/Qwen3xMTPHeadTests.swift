@@ -50,6 +50,30 @@ private let mtpRotaryDim = 64  // headDim * partial_rotary_factor 0.25
 private let mtpRopeTheta: Float = 10_000_000
 private let mtpEps: Float = 1e-6
 
+@Suite("Qwen3x MTP cache capacity")
+struct Qwen3xMTPCacheCapacityTests {
+    @Test("uses configured model context without an override")
+    func usesConfiguredModelContext() {
+        #expect(
+            Qwen3xMTPHead.resolvedCacheCapacity(
+                configuredMaxSeq: 262_144, override: nil) == 262_144)
+    }
+
+    @Test("valid override takes precedence")
+    func validOverrideTakesPrecedence() {
+        #expect(
+            Qwen3xMTPHead.resolvedCacheCapacity(
+                configuredMaxSeq: 262_144, override: "65536") == 65_536)
+    }
+
+    @Test("invalid override falls back to configured model context")
+    func invalidOverrideFallsBack() {
+        #expect(
+            Qwen3xMTPHead.resolvedCacheCapacity(
+                configuredMaxSeq: 262_144, override: "invalid") == 262_144)
+    }
+}
+
 // ─── Host-side bf16 helpers ──────────────────────────────────────────
 
 /// Round-to-nearest-even Float -> bf16 bit pattern (matches the Metal

@@ -231,8 +231,8 @@ public final class Qwen3xMTPHead: Module {
 
     /// The head's OWN KV cache (the draft layer attends over its own
     /// key/value history, independent of every backbone layer cache).
-    /// Unbounded eviction; capacity is `defaultCacheCapacity` slots
-    /// (override with `BUTTER_QWEN_MTP_CACHE=<n>`).
+    /// Unbounded eviction; normal model loads use the backbone's configured
+    /// context capacity (override with `BUTTER_QWEN_MTP_CACHE=<n>`).
     public let kvCache: KVCache
 
     public let hidden: Int
@@ -251,13 +251,14 @@ public final class Qwen3xMTPHead: Module {
         return id + compactDraftControlStart - compactDraftPrefixCount
     }
 
-    /// Draft-cache slot capacity. The phase-1 driver only needs the
-    /// drafting horizon plus the accepted-token history; 8192 slots
-    /// costs ~34 MB at bf16 (4 KV heads x 256 dims, K+V). The spec
-    /// decode engine (phase 2) can size this via the env override.
-    /// TODO(spec 030 phase 2): plumb the generation cap through
-    /// instead of a fixed default.
+    /// Standalone draft-cache slot capacity. Normal model loads pass the
+    /// backbone's configured context capacity. 8192 slots cost ~34 MB at
+    /// bf16 (4 KV heads x 256 dims, K+V).
     static let defaultCacheCapacity = 8192
+
+    static func resolvedCacheCapacity(configuredMaxSeq: Int, override: String?) -> Int {
+        override.flatMap(Int.init) ?? configuredMaxSeq
+    }
 
     init(
         fc: AnyLinear,
@@ -607,6 +608,7 @@ public final class Qwen3xMTPHead: Module {
         hidden: Int, vocab: Int,
         nHeads: Int, nKVHeads: Int, headDim: Int,
         rotaryDim: Int, ropeTheta: Float, attnOutputGate: Bool,
+        cacheCapacity: Int = defaultCacheCapacity,
         eps: Float, dtype: DType, device: Device
     ) throws -> Qwen3xMTPHead {
         let weights = try SafeTensorsBundle(directory: sidecarDirectory, device: device)
@@ -728,9 +730,9 @@ public final class Qwen3xMTPHead: Module {
                     gateProj: gateProj, upProj: upProj, downProj: downProj)),
             hidden: hidden)
 
-        let cacheCapacity =
-            ButterEnv["BUTTER_QWEN_MTP_CACHE"]
-            .flatMap(Int.init) ?? defaultCacheCapacity
+        let resolvedCacheCapacity = Self.resolvedCacheCapacity(
+            configuredMaxSeq: cacheCapacity,
+            override: ButterEnv["BUTTER_QWEN_MTP_CACHE"])
         // `.weight` residency: this cache is built ONCE here (at head
         // load) and lives for the head's entire lifetime — every
         // `generate()` call on the owning model calls `resetCache()`
@@ -741,7 +743,7 @@ public final class Qwen3xMTPHead: Module {
         // fast path the first time any generation on this model ends.
         // See `Device.CacheResidencyKind`'s doc comment.
         let kvCache = KVCache(
-            nKVHeads: nKVHeads, headDim: headDim, maxSeq: cacheCapacity,
+            nKVHeads: nKVHeads, headDim: headDim, maxSeq: resolvedCacheCapacity,
             dtype: dtype, device: device, residency: .weight)
 
         // Optional cheaper draft-only lm_head (see `draftLmHead`'s doc
