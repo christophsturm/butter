@@ -46,6 +46,43 @@ struct Qwen3xDraftRerankTests {
         #expect(Set(actual) == Set(0 ..< count))
     }
 
+    @Test("tiled GPU selection matches the exact wide candidate set")
+    func tiledCandidateSet() {
+        let realCount = 98_330
+        let paddedCount = 98_336
+        let tileCount = 64
+        let candidateCount = Qwen3xMTPHead.draftRerankCandidateCount
+        var values = (0 ..< paddedCount).map {
+            (Float(($0 * 73 + 29) % 65_521) - 32_760) / 1_024
+        }
+        values[137] = .nan
+        values[41_223] = values[41_224]
+        let bits = values.map(bf16Bits)
+        let rounded = bits.map { Float(bitPattern: UInt32($0) << 16) }
+        let expected = Array(
+            (0 ..< realCount).sorted { lhs, rhs in
+                qwen3xDraftCandidateBetter(
+                    lhsValue: rounded[lhs], lhsID: lhs,
+                    rhsValue: rounded[rhs], rhsID: rhs)
+            }.prefix(candidateCount)
+        ).map(UInt32.init)
+
+        let logits = Tensor.empty(shape: [paddedCount], dtype: .bf16)
+        logits.copyIn(from: bits)
+        let scratch = Tensor.empty(
+            shape: [tileCount * candidateCount], dtype: .u32)
+        let indices = Tensor.empty(shape: [candidateCount], dtype: .u32)
+        runAndWait { commandBuffer in
+            Ops.topKIndicesTiled(
+                logits: logits, candidateScratch: scratch,
+                indicesOut: indices, count: realCount,
+                tileCount: tileCount, topK: candidateCount,
+                on: commandBuffer)
+        }
+
+        #expect(indices.toArray(as: UInt32.self) == expected)
+    }
+
     @Test("compact control rows map to published token IDs")
     func compactMapping() {
         #expect(Qwen3xMTPHead.mapCompactDraftID(0) == 0)
