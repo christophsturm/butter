@@ -444,71 +444,42 @@ public final class Qwen3xMTPHead: Module {
 
     var hasDeclaredDraftRerank: Bool { declaredDraftExactHead != nil }
 
-    /// Encodes the coarse head's strongest real rows without reading the
-    /// complete logits vector back to the CPU.
-    func prepareDeclaredDraftCandidateIDs(
-        coarseLogits: Tensor, on cmd: MTLCommandBuffer, device: Device
-    ) -> Tensor? {
-        guard declaredDraftExactHead != nil,
-            coarseLogits.elementCount == Self.compactDraftPaddedCount,
-            coarseLogits.dtype == .bf16
-        else { return nil }
-        let tileCount = 64
-        let candidates = Tensor.empty(
-            shape: [tileCount * Self.draftRerankCandidateCount],
-            dtype: .u32, device: device)
-        let indices = Tensor.empty(
-            shape: [Self.draftRerankCandidateCount], dtype: .u32, device: device)
-        Ops.topKIndicesTiled(
-            logits: coarseLogits, candidateScratch: candidates,
-            indicesOut: indices, count: Self.compactDraftRealCount,
-            tileCount: tileCount, topK: Self.draftRerankCandidateCount,
-            on: cmd)
-        return indices
-    }
-
-    /// Encodes exact 4-bit logits for the coarse head's strongest rows.
-    /// The caller commits and waits on `cmd`, then resolves the winner with
-    /// `selectDeclaredDraftRerank`.
-    func prepareDeclaredDraftRerank(
-        compactIDs: [Int], normalizedHidden: Tensor,
+    /// Selects one exact draft token entirely on the GPU. The coarse top-k,
+    /// compact-ID mapping, gathered exact head, and final indexed argmax are
+    /// ordered on the caller's command buffer.
+    func prepareDeclaredDraftSelection(
+        coarseLogits: Tensor, normalizedHidden: Tensor,
         on cmd: MTLCommandBuffer, device: Device
-    ) -> (logits: Tensor, compactIDs: [Int])? {
+    ) -> Tensor? {
         guard let exact = declaredDraftExactHead,
-            compactIDs.count == Self.draftRerankCandidateCount,
-            compactIDs.allSatisfy({ $0 >= 0 && $0 < Self.compactDraftRealCount }),
+            coarseLogits.elementCount == Self.compactDraftPaddedCount,
+            coarseLogits.dtype == .bf16,
             normalizedHidden.elementCount == hidden
         else { return nil }
-        let fullIDs = compactIDs.map { id -> UInt32 in
-            UInt32(Self.mapCompactDraftID(id))
-        }
-        let idBuffer = device.makeBuffer(length: fullIDs.count * MemoryLayout<UInt32>.stride)
-        _ = fullIDs.withUnsafeBytes { bytes in
-            memcpy(idBuffer.contents(), bytes.baseAddress!, bytes.count)
-        }
-        let idTensor = Tensor(
-            buffer: idBuffer, offset: 0, shape: [fullIDs.count], dtype: .u32)
+        let tileCount = 64
+        let candidateScratch = Tensor.empty(
+            shape: [tileCount * Self.draftRerankCandidateCount],
+            dtype: .u32, device: device)
+        let compactIDs = Tensor.empty(
+            shape: [Self.draftRerankCandidateCount], dtype: .u32, device: device)
+        Ops.topKIndicesTiled(
+            logits: coarseLogits, candidateScratch: candidateScratch,
+            indicesOut: compactIDs, count: Self.compactDraftRealCount,
+            tileCount: tileCount, topK: Self.draftRerankCandidateCount,
+            on: cmd)
+        let fullIDs = Tensor.empty(
+            shape: [Self.draftRerankCandidateCount], dtype: .u32, device: device)
+        Ops.piecewiseOffsetIndices(
+            compactIDs, threshold: Self.compactDraftPrefixCount,
+            offset: Self.compactDraftControlStart - Self.compactDraftPrefixCount,
+            into: fullIDs, on: cmd)
         let logits = Ops.dequantGemvInt4Gathered(
             weight: exact.weight, scales: exact.scales, biases: exact.biases,
-            rowIndices: idTensor, input: normalizedHidden,
+            rowIndices: fullIDs, input: normalizedHidden,
             groupSize: exact.groupSize, on: cmd)
-        return (logits, compactIDs)
-    }
-
-    func selectDeclaredDraftRerank(
-        logits: [Float], compactIDs: [Int]
-    ) -> Int? {
-        guard logits.count == compactIDs.count, !logits.isEmpty else { return nil }
-        var best = 0
-        for i in 1 ..< logits.count {
-            if qwen3xDraftCandidateBetter(
-                lhsValue: logits[i], lhsID: compactIDs[i],
-                rhsValue: logits[best], rhsID: compactIDs[best])
-            {
-                best = i
-            }
-        }
-        return Self.mapCompactDraftID(compactIDs[best])
+        let selected = Tensor.empty(shape: [1], dtype: .u32, device: device)
+        Ops.indexedArgmax(logits, indices: fullIDs, into: selected, on: cmd)
+        return selected
     }
 
     /// T-batched fuse: same computation as `fuseInputs`, over `t` rows

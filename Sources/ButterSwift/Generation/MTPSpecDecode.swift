@@ -932,24 +932,25 @@ extension SpecDecode {
                     case .greedy: draftsGreedily = true
                     case .sampled: draftsGreedily = !useRatioAccept
                     }
-                    var candidateSelection: Tensor?
+                    var declaredDraftSelection: Tensor?
                     if draftsGreedily && pMin == nil && isGreedyRun
                         && head.hasDeclaredDraftRerank
                     {
-                        candidateSelection = head.prepareDeclaredDraftCandidateIDs(
-                            coarseLogits: dLogits, on: dCmd, device: device)
+                        declaredDraftSelection = head.prepareDeclaredDraftSelection(
+                            coarseLogits: dLogits, normalizedHidden: h,
+                            on: dCmd, device: device)
                         precondition(
-                            candidateSelection != nil,
-                            "declared draft candidate inputs are inconsistent")
+                            declaredDraftSelection != nil,
+                            "declared draft selection inputs are inconsistent")
                     }
                     dCmd.commit()
                     dCmd.waitUntilCompleted()
-                    let compactCandidateIDs = candidateSelection?
-                        .toArray(as: UInt32.self).map { Int($0) }
-                    // The declared greedy path reads back only the compact
-                    // candidate IDs. Sampling, confidence gating, and the
-                    // generic argmax retain the complete logits readback.
-                    let flatD = compactCandidateIDs == nil ? dLogits.toFloatArray() : []
+                    let declaredDraftTokenID = declaredDraftSelection?
+                        .toArray(as: UInt32.self).first.map(Int.init)
+                    // The declared greedy path reads back one selected token.
+                    // Sampling, confidence gating, and the generic argmax
+                    // retain the complete logits readback.
+                    let flatD = declaredDraftTokenID == nil ? dLogits.toFloatArray() : []
                     let c: Int
                     var pTop: Float = 1
                     // ── mode: divergence 1 — draft token choice.
@@ -972,23 +973,8 @@ extension SpecDecode {
                             pTop = top
                         } else {
                             if isGreedyRun && head.hasDeclaredDraftRerank {
-                                let rerankCmd = device.makeCommandBuffer()
-                                guard
-                                    let rerank = head.prepareDeclaredDraftRerank(
-                                        compactIDs: compactCandidateIDs ?? [],
-                                        normalizedHidden: h,
-                                        on: rerankCmd, device: device)
-                                else {
-                                    preconditionFailure("declared draft rerank inputs are inconsistent")
-                                }
-                                rerankCmd.commit()
-                                rerankCmd.waitUntilCompleted()
-                                guard
-                                    let selected = head.selectDeclaredDraftRerank(
-                                        logits: rerank.logits.toFloatArray(),
-                                        compactIDs: rerank.compactIDs)
-                                else {
-                                    preconditionFailure("declared draft rerank output is inconsistent")
+                                guard let selected = declaredDraftTokenID else {
+                                    preconditionFailure("declared draft selection output is inconsistent")
                                 }
                                 c = selected
                             } else {

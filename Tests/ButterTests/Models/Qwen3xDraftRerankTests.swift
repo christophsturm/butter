@@ -120,6 +120,27 @@ struct Qwen3xDraftRerankTests {
         #expect(indices.toArray(as: UInt32.self) == expected)
     }
 
+    @Test("compact mapping and indexed selection stay on GPU")
+    func deviceResidentSelection() {
+        let compact = Tensor.empty(shape: [4], dtype: .u32)
+        compact.copyIn(from: [UInt32(0), 98_303, 98_304, 98_329])
+        let full = Tensor.empty(shape: [4], dtype: .u32)
+        let values = Tensor.empty(shape: [4], dtype: .bf16)
+        values.copyIn(from: [Float(1), 7, .nan, 7].map(bf16Bits))
+        let selected = Tensor.empty(shape: [1], dtype: .u32)
+
+        runAndWait { commandBuffer in
+            Ops.piecewiseOffsetIndices(
+                compact, threshold: 98_304, offset: 149_740,
+                into: full, on: commandBuffer)
+            Ops.indexedArgmax(
+                values, indices: full, into: selected, on: commandBuffer)
+        }
+
+        #expect(full.toArray(as: UInt32.self) == [0, 98_303, 248_044, 248_069])
+        #expect(selected.toArray(as: UInt32.self) == [98_303])
+    }
+
     @Test("gathered 4-bit rerank matches selected matrix rows")
     func gatheredRerankRows() {
         let outDim = 16
