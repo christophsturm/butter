@@ -3412,11 +3412,15 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
         let mixerOut = mixer.forward(xNorm, cache: gc, cmd: cmd, device: device)
 
         let ffnCmd = mixer.fused ? cmd : device.makeCommandBuffer()
-        let postMix = Ops.add(h, mixerOut, on: ffnCmd)
+        let fusedPostMix = qwen35AddAndRmsNorm(
+            h, mixerOut, norm: postNorm,
+            nRows: 1, rowSize: hidden, device: device, on: ffnCmd)
+        let postMix = fusedPostMix?.residual ?? Ops.add(h, mixerOut, on: ffnCmd)
         return qwen35ApplyFFN(
             ffn, postMix: postMix, postNorm: postNorm,
             position: position, cmd: ffnCmd,
-            commitCmd: true, device: device)
+            commitCmd: true, device: device,
+            preNormed: fusedPostMix?.normed)
     }
 
     /// T-batched layer forward for batched prefill. Mirrors the attention
@@ -3482,11 +3486,10 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
         // Residual + post-norm (same fuse as attention when hidden fits).
         let postMix: Tensor
         let ffnNorm: Tensor?
-        if OpsValidation.validateAddRmsNorm(n: hidden) == nil {
-            let fused = Ops.addAndRmsNorm(
-                hFlat, mixerOutFlat,
-                weight: postNorm.weight, eps: postNorm.eps,
-                nRows: t, rowSize: hidden, on: cmd)
+        if let fused = qwen35AddAndRmsNorm(
+            hFlat, mixerOutFlat, norm: postNorm,
+            nRows: t, rowSize: hidden, device: device, on: cmd)
+        {
             postMix = fused.residual
             ffnNorm = fused.normed
         } else {
@@ -3584,10 +3587,10 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
         // hybrids that may exceed the kernel's row-width cap.
         let postMix: Tensor
         let ffnNorm: Tensor?
-        if OpsValidation.validateAddRmsNorm(n: hidden) == nil {
-            let fused = Ops.addAndRmsNorm(
-                h, mixerOut, weight: postNorm.weight, eps: postNorm.eps,
-                nRows: 1, rowSize: hidden, on: cmd)
+        if let fused = qwen35AddAndRmsNorm(
+            h, mixerOut, norm: postNorm,
+            nRows: 1, rowSize: hidden, device: device, on: cmd)
+        {
             postMix = fused.residual
             ffnNorm = fused.normed
         } else {
@@ -3662,11 +3665,10 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
         // for wider hidden sizes via the validator gate.
         let postMix: Tensor
         let ffnNorm: Tensor?
-        if OpsValidation.validateAddRmsNorm(n: hidden) == nil {
-            let fused = Ops.addAndRmsNorm(
-                hFlat, mixerOutFlat,
-                weight: postNorm.weight, eps: postNorm.eps,
-                nRows: t, rowSize: hidden, on: cmd)
+        if let fused = qwen35AddAndRmsNorm(
+            hFlat, mixerOutFlat, norm: postNorm,
+            nRows: t, rowSize: hidden, device: device, on: cmd)
+        {
             postMix = fused.residual
             ffnNorm = fused.normed
         } else {
@@ -3684,6 +3686,30 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
             cmd: cmd, device: device,
             preNormed: ffnNorm)
     }
+}
+
+private let qwen35WideAddNormEnabled =
+    ButterEnv["BUTTER_QWEN_NO_WIDE_ADDNORM"] != "1"
+
+private func qwen35AddAndRmsNorm(
+    _ a: Tensor, _ b: Tensor, norm: RMSNorm,
+    nRows: Int, rowSize: Int, device: Device,
+    on cmd: MTLCommandBuffer
+) -> (residual: Tensor, normed: Tensor)? {
+    if OpsValidation.validateAddRmsNorm(n: rowSize) == nil {
+        return Ops.addAndRmsNorm(
+            a, b, weight: norm.weight, eps: norm.eps,
+            nRows: nRows, rowSize: rowSize, on: cmd)
+    }
+    guard qwen35WideAddNormEnabled,
+        rowSize == 5120,
+        a.dtype == .bf16,
+        b.dtype == .bf16,
+        norm.weight.dtype == .bf16
+    else { return nil }
+    return MuseGlimmerAddRmsNormWideFuse.addAndRmsNormWide(
+        a, b, weight: norm.weight, eps: norm.eps,
+        nRows: nRows, rowSize: rowSize, device: device, on: cmd)
 }
 
 // ─── finalNorm + lmHead fused dispatch helper ───────────────────────
