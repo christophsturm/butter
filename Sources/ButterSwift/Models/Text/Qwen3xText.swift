@@ -2395,14 +2395,17 @@ public final class Qwen35GDNMixer: Module {
                 shape: [t * numValueHeads * valueHeadDim * keyHeadDim],
                 dtype: .f32, device: device)
             let flagBuf = device.makeBuffer(length: 4)
-            // Prefix-only capture. A partial accept always selects a state
-            // before the verifier's final row, while a full accept keeps the
-            // live final state. The kernels therefore skip the final plane's
-            // stores without removing any rollback target.
-            // Keep a diagnostic opt-out so prefix-only capture can be
-            // measured against full capture with the same binary.
-            var flagU32: UInt32 =
-                ButterEnv["BUTTER_GDN_PREFIX_STATE_PLANES"] == "0" ? 1 : 2
+            // Tail capture keeps the four rollback targets nearest the live
+            // final state. The MTP loop retains one pre-verify snapshot for
+            // earlier targets. Keep the previous modes behind diagnostic
+            // opt-outs for same-binary measurements.
+            var flagU32: UInt32
+            if ButterEnv["BUTTER_GDN_TAIL_STATE_PLANES"] != "0" {
+                flagU32 = 3
+            } else {
+                flagU32 =
+                    ButterEnv["BUTTER_GDN_PREFIX_STATE_PLANES"] == "0" ? 1 : 2
+            }
             memcpy(flagBuf.contents(), &flagU32, 4)
             let flag = Tensor(buffer: flagBuf, offset: 0, shape: [1], dtype: .u32)
             convPlanesEnabledBuf = flag
@@ -4207,6 +4210,16 @@ public final class Qwen35Model: LanguageModel {
         caches: [any LayerCacheProtocol],
         on cmd: MTLCommandBuffer
     ) -> Bool {
+        if ButterEnv["BUTTER_GDN_TAIL_STATE_PLANES"] != "0" {
+            for cache in caches {
+                if let gc = cache as? Qwen35GDNLayerCache,
+                    !Self.tailStatePlaneCaptured(
+                        keep: keep, tokenCount: gc.specPlanesT)
+                {
+                    return false
+                }
+            }
+        }
         var ok = true
         for (i, layer) in layers.enumerated() {
             guard i < caches.count else { break }
@@ -4221,6 +4234,11 @@ public final class Qwen35Model: LanguageModel {
             }
         }
         return ok
+    }
+
+    static func tailStatePlaneCaptured(keep: Int, tokenCount: Int) -> Bool {
+        guard keep > 0, tokenCount > 1, keep < tokenCount else { return false }
+        return keep >= max(1, tokenCount - 4)
     }
 
     public func forwardManyHiddenAndLogits(

@@ -748,6 +748,8 @@ extension SpecDecode {
         // cap — see `forwardManyChunked`'s `maxPlaneT`).
         let statePlanes =
             ButterEnv["BUTTER_GDN_STATE_PLANES"] != "0"
+        let tailStatePlanes =
+            statePlanes && ButterEnv["BUTTER_GDN_TAIL_STATE_PLANES"] != "0"
         var planeSteps = 0
         var fullPlaneAdoptionsSkipped = 0
         let batchedReplay =
@@ -1046,10 +1048,12 @@ extension SpecDecode {
             let snapT = Date()
             // Eligible state planes replace the recurrent snapshot entirely.
             // Keep it for priming, diagnostic replay, and every fallback shape.
-            let planesReplaceSnapshot =
+            let planesCapturedThisCycle =
                 statePlanes && !parityProbe
                 && model.canCaptureStatePlanes(
                     tokenCount: inputIds.count, caches: caches)
+            let planesReplaceSnapshot =
+                planesCapturedThisCycle && !tailStatePlanes
             let snap =
                 planesReplaceSnapshot
                 ? nil
@@ -1184,7 +1188,8 @@ extension SpecDecode {
             // earlier plane through the recovery block below.
             let fullAcceptStateAlreadyCurrent =
                 mustReplayForExactness
-                && statePlanes && planesReplaceSnapshot
+                && (planesReplaceSnapshot
+                    || (tailStatePlanes && planesCapturedThisCycle))
                 && ButterEnv["BUTTER_QWEN_MTP_SKIP_FULL_PLANE_ADOPTION"] != "0"
             if fullAcceptStateAlreadyCurrent {
                 fullPlaneAdoptionsSkipped += 1
