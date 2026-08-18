@@ -272,7 +272,7 @@ extension SpecDecode {
         private(set) var gammaMin = Int.max
         private(set) var gammaMax = 0
 
-        init(cap: Int, headStepCostRatio: Double = 0.22, alpha: Double = 0.15) {
+        init(cap: Int, headStepCostRatio: Double = 0.16, alpha: Double = 0.15) {
             precondition(cap >= 1, "MTPCostModelGamma: cap must be >= 1")
             precondition(
                 headStepCostRatio > 0,
@@ -806,7 +806,7 @@ extension SpecDecode {
         //
         // BUTTER_QWEN_MTP_ADAPTIVE=cost selects the promoted Qwen3.8
         // per-position acceptance-EMA cost model instead. Its head/verify
-        // cost ratio defaults to the measured 0.22 and can be re-fit with
+        // cost ratio defaults to the measured 0.16 and can be re-fit with
         // BUTTER_QWEN_MTP_HEAD_COST_RATIO=<float>.
         //
         // Both controllers work identically in `.greedy` and `.sampled` mode: the
@@ -834,7 +834,7 @@ extension SpecDecode {
             : nil
         let headCostEnv = ButterEnv["BUTTER_QWEN_MTP_HEAD_COST_RATIO"]
         let headCost =
-            (headCostEnv?.isEmpty == false) ? (Double(headCostEnv!) ?? 0.22) : 0.22
+            (headCostEnv?.isEmpty == false) ? (Double(headCostEnv!) ?? 0.16) : 0.16
         var costModelGamma: MTPCostModelGamma? =
             adaptiveMode == "cost"
             ? MTPCostModelGamma(cap: gamma, headStepCostRatio: headCost)

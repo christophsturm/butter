@@ -238,10 +238,10 @@ struct MTPAdaptiveGammaTests {
 
 @Suite("Qwen MTP promoted cost-model gamma")
 struct MTPCostModelGammaTests {
-    @Test("promoted priors choose depth four at an eight-token ceiling")
+    @Test("repriced priors choose depth five at an eight-token ceiling")
     func initialDepth() {
         var model = SpecDecode.MTPCostModelGamma(cap: 8)
-        #expect(model.nextCycleGamma() == 4)
+        #expect(model.nextCycleGamma() == 5)
     }
 
     @Test("repeated first-position rejection shortens the next round")
