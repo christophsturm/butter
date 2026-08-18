@@ -721,6 +721,7 @@ public final class Qwen3xMTPHead: Module {
             rotaryDim: rotaryDim, ropeTheta: ropeTheta,
             attnOutputGate: attnOutputGate,
             projectionPrecisionIslands: projectionPrecisionIslands,
+            useTwoPassDecode: false,
             device: device)
         let layer = Qwen35AttentionLayer(
             inputNorm: inputNorm, postNorm: postNorm,

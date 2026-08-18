@@ -2841,6 +2841,7 @@ public final class Qwen35AttentionMixer: Module {
     private var partialMScratch: Tensor?
     private var partialLScratch: Tensor?
     private let sdpa2PassBlocks: Int = 32
+    let useTwoPassDecode: Bool
     private let sdpa2PassThreshold: Int = {
         if let raw = ButterEnv["BUTTER_SDPA_2PASS_THRESHOLD"],
             let n = Int(raw)
@@ -2868,6 +2869,7 @@ public final class Qwen35AttentionMixer: Module {
         nHeads: Int, nKVHeads: Int, headDim: Int, rotaryDim: Int,
         ropeTheta: Float, attnOutputGate: Bool,
         projectionPrecisionIslands: Qwen35ProjectionPrecisionIslands? = nil,
+        useTwoPassDecode: Bool = true,
         device: Device = .shared
     ) {
         self.qProj = qProj
@@ -2883,6 +2885,7 @@ public final class Qwen35AttentionMixer: Module {
         self.ropeTheta = ropeTheta
         self.attnOutputGate = attnOutputGate
         self.projectionPrecisionIslands = projectionPrecisionIslands
+        self.useTwoPassDecode = useTwoPassDecode
         self.scale = 1.0 / Float(Double(headDim).squareRoot())
         // See `useMmaD256Cached`/`useQtiledD256Cached` doc above - cached
         // once here instead of read from `forwardMany` on every call.
@@ -3158,7 +3161,7 @@ public final class Qwen35AttentionMixer: Module {
         // when nKV ≥ ~1024 (default threshold); env var
         // `BUTTER_SDPA_2PASS_THRESHOLD` overrides.
         let attnOut: Tensor
-        if kv.length >= sdpa2PassThreshold {
+        if useTwoPassDecode && kv.length >= sdpa2PassThreshold {
             if partialOScratch == nil
                 || partialOScratch!.elementCount
                     != nHeads * sdpa2PassBlocks * headDim

@@ -173,6 +173,7 @@ struct Qwen3xMTPHeadSidecarTests {
         #expect(mixer.headDim == mtpHeadDim)
         #expect(mixer.rotaryDim == mtpRotaryDim)
         #expect(mixer.attnOutputGate)
+        #expect(!mixer.useTwoPassDecode)
         let qProj = try #require(mixer.qProj.inner as? QuantizedLinear)
         #expect(qProj.weight.shape[0] == 2 * mtpNHeads * mtpHeadDim)  // 12288
         let kProj = try #require(mixer.kProj.inner as? QuantizedLinear)
