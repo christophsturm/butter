@@ -2395,7 +2395,14 @@ public final class Qwen35GDNMixer: Module {
                 shape: [t * numValueHeads * valueHeadDim * keyHeadDim],
                 dtype: .f32, device: device)
             let flagBuf = device.makeBuffer(length: 4)
-            var flagU32: UInt32 = 1
+            // Prefix-only capture. A partial accept always selects a state
+            // before the verifier's final row, while a full accept keeps the
+            // live final state. The kernels therefore skip the final plane's
+            // stores without removing any rollback target.
+            // Keep a diagnostic opt-out so prefix-only capture can be
+            // measured against full capture with the same binary.
+            var flagU32: UInt32 =
+                ButterEnv["BUTTER_GDN_PREFIX_STATE_PLANES"] == "0" ? 1 : 2
             memcpy(flagBuf.contents(), &flagU32, 4)
             let flag = Tensor(buffer: flagBuf, offset: 0, shape: [1], dtype: .u32)
             convPlanesEnabledBuf = flag
