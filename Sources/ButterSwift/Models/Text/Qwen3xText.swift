@@ -2753,6 +2753,13 @@ public final class Qwen35GDNMixer: Module {
 // fresh per-call tensors and does not touch the single-token
 // scratches. Callers must serialise inference on a given instance.
 
+struct Qwen35ProjectionPrecisionIslands {
+    let projection: AnyLinear
+    let qIndices: Tensor
+    let qOutputWidth: Int
+    let kvOutputWidth: Int
+}
+
 public final class Qwen35AttentionMixer: Module {
     let qProj, kProj, vProj, oProj: AnyLinear
     let qNorm, kNorm: RMSNorm
@@ -2780,6 +2787,9 @@ public final class Qwen35AttentionMixer: Module {
     private var qOutScratch: Tensor?
     private var kOutScratch: Tensor?
     private var vOutScratch: Tensor?
+    private let projectionPrecisionIslands: Qwen35ProjectionPrecisionIslands?
+    private var islandKOutScratch: Tensor?
+    private var islandVOutScratch: Tensor?
     /// Fused-QKV single-dispatch fast path. When set, `forward` uses
     /// `Ops.batchedQkvQgemvInt4Fast` (1 dispatch) instead of
     /// `dequantGemvInt4Three` (3 dispatches on shared encoder).
@@ -2829,6 +2839,7 @@ public final class Qwen35AttentionMixer: Module {
         qNorm: RMSNorm, kNorm: RMSNorm,
         nHeads: Int, nKVHeads: Int, headDim: Int, rotaryDim: Int,
         ropeTheta: Float, attnOutputGate: Bool,
+        projectionPrecisionIslands: Qwen35ProjectionPrecisionIslands? = nil,
         device: Device = .shared
     ) {
         self.qProj = qProj
@@ -2843,6 +2854,7 @@ public final class Qwen35AttentionMixer: Module {
         self.rotaryDim = rotaryDim
         self.ropeTheta = ropeTheta
         self.attnOutputGate = attnOutputGate
+        self.projectionPrecisionIslands = projectionPrecisionIslands
         self.scale = 1.0 / Float(Double(headDim).squareRoot())
         // See `useMmaD256Cached`/`useQtiledD256Cached` doc above - cached
         // once here instead of read from `forwardMany` on every call.
@@ -2939,7 +2951,47 @@ public final class Qwen35AttentionMixer: Module {
         let qOut: Tensor
         let kPre: Tensor
         let vPre: Tensor
-        if let bq = batchedQKV {
+        if let islands = projectionPrecisionIslands {
+            if fusedQKVEligible, let bq = batchedQKV {
+                let qDim = bq.qW.shape[0]
+                if qOutScratch == nil
+                    || qOutScratch!.elementCount != qDim
+                    || qOutScratch!.dtype != xNorm.dtype
+                {
+                    qOutScratch = Tensor.empty(
+                        shape: [qDim], dtype: xNorm.dtype, device: device)
+                }
+                qOut = qOutScratch!
+                Ops.batchedQkvQgemvInt4Fast(
+                    x: xNorm,
+                    wQ: bq.qW, scalesQ: bq.qS, biasesQ: bq.qB,
+                    wK: bq.kW, scalesK: bq.kS, biasesK: bq.kB,
+                    wV: bq.vW, scalesV: bq.vS, biasesV: bq.vB,
+                    outQ: qDim, outK: bq.kW.shape[0], outV: bq.vW.shape[0],
+                    projectionCount: 1, on: cmd, into: qOut)
+            } else {
+                qOut = qProj(xNorm, on: cmd)
+            }
+            let exact = islands.projection(xNorm, on: cmd)
+            let kvDim = islands.kvOutputWidth
+            if islandKOutScratch == nil
+                || islandKOutScratch!.elementCount != kvDim
+                || islandKOutScratch!.dtype != xNorm.dtype
+            {
+                islandKOutScratch = Tensor.empty(
+                    shape: [kvDim], dtype: xNorm.dtype, device: device)
+                islandVOutScratch = Tensor.empty(
+                    shape: [kvDim], dtype: xNorm.dtype, device: device)
+            }
+            kPre = islandKOutScratch!
+            vPre = islandVOutScratch!
+            Ops.splitScatterColumns(
+                input: exact, indices: islands.qIndices,
+                primary: qOut, secondary: kPre, tertiary: vPre,
+                scatterWidth: islands.qIndices.elementCount,
+                primaryWidth: islands.qOutputWidth,
+                copyWidth: kvDim, on: cmd)
+        } else if let bq = batchedQKV {
             let qDim = bq.qW.shape[0]
             let kDim = bq.kW.shape[0]
             let vDim = bq.vW.shape[0]
@@ -3172,7 +3224,39 @@ public final class Qwen35AttentionMixer: Module {
         let qOut: Tensor
         let kOut: Tensor
         let vOut: Tensor
-        if fusedQKVEligible, fusedQkvAtPrefill, let bq = batchedQKV {
+        if let islands = projectionPrecisionIslands {
+            let qBuf: Tensor
+            if fusedQKVEligible, fusedQkvAtPrefill, let bq = batchedQKV
+            {
+                let qDimW = bq.qW.shape[0]
+                let inDim = bq.qW.shape[1] * 8
+                qBuf = Tensor.empty(shape: [t, qDimW], dtype: dt, device: device)
+                Ops.batchedQkvQmmFast(
+                    x: xNormFlat.reshaped(to: [t, inDim]),
+                    wQ: bq.qW, scalesQ: bq.qS, biasesQ: bq.qB,
+                    wK: bq.kW, scalesK: bq.kS, biasesK: bq.kB,
+                    wV: bq.vW, scalesV: bq.vS, biasesV: bq.vB,
+                    m: t, outQ: qDimW,
+                    outK: bq.kW.shape[0], outV: bq.vW.shape[0],
+                    projectionCount: 1, on: cmd,
+                    qBuf: qBuf, kBuf: qBuf, vBuf: qBuf)
+            } else {
+                qBuf = qProj.callMany(xNormFlat, t: t, on: cmd, device: device)
+            }
+            let kBuf = Tensor.empty(shape: [t, kvDim], dtype: dt, device: device)
+            let vBuf = Tensor.empty(shape: [t, kvDim], dtype: dt, device: device)
+            let exact = islands.projection.callMany(
+                xNormFlat, t: t, on: cmd, device: device)
+            Ops.splitScatterColumns(
+                input: exact, indices: islands.qIndices,
+                primary: qBuf, secondary: kBuf, tertiary: vBuf,
+                scatterWidth: islands.qIndices.elementCount,
+                primaryWidth: islands.qOutputWidth,
+                copyWidth: kvDim, on: cmd)
+            qOut = qBuf
+            kOut = kBuf
+            vOut = vBuf
+        } else if fusedQKVEligible, fusedQkvAtPrefill, let bq = batchedQKV {
             let qDimW = bq.qW.shape[0]
             let kDimW = bq.kW.shape[0]
             let vDimW = bq.vW.shape[0]

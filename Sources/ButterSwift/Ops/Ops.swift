@@ -598,6 +598,69 @@ public enum Ops {
         return result
     }
 
+    /// Split `[rows, scatterWidth + 2*copyWidth]` into one indexed
+    /// overwrite and two contiguous outputs. `primary` is preinitialized;
+    /// the other two outputs are completely written by this operation.
+    public static func splitScatterColumns(
+        input: Tensor, indices: Tensor,
+        primary: Tensor, secondary: Tensor, tertiary: Tensor,
+        scatterWidth: Int, primaryWidth: Int, copyWidth: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        let inputWidth = scatterWidth + 2 * copyWidth
+        precondition(inputWidth > 0 && input.elementCount % inputWidth == 0)
+        let rows = input.elementCount / inputWidth
+        precondition(indices.dtype == .u32 && indices.elementCount == scatterWidth)
+        precondition(primary.elementCount == rows * primaryWidth)
+        precondition(secondary.elementCount == rows * copyWidth)
+        precondition(tertiary.elementCount == rows * copyWidth)
+        precondition(
+            input.dtype == primary.dtype
+                && input.dtype == secondary.dtype
+                && input.dtype == tertiary.dtype)
+        let (grid, tg) = elementwiseGrid(input.elementCount)
+        switch input.dtype {
+        case .f32:
+            IronKernels.iron_split_scatter_columns_f32(
+                input: input.buffer, inputOffset: input.offset,
+                indices: indices.buffer, indicesOffset: indices.offset,
+                primary: primary.buffer, primaryOffset: primary.offset,
+                secondary: secondary.buffer, secondaryOffset: secondary.offset,
+                tertiary: tertiary.buffer, tertiaryOffset: tertiary.offset,
+                scatter_width: UInt32(scatterWidth),
+                primary_width: UInt32(primaryWidth),
+                copy_width: UInt32(copyWidth),
+                n_elems: UInt32(input.elementCount),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_split_scatter_columns_f16(
+                input: input.buffer, inputOffset: input.offset,
+                indices: indices.buffer, indicesOffset: indices.offset,
+                primary: primary.buffer, primaryOffset: primary.offset,
+                secondary: secondary.buffer, secondaryOffset: secondary.offset,
+                tertiary: tertiary.buffer, tertiaryOffset: tertiary.offset,
+                scatter_width: UInt32(scatterWidth),
+                primary_width: UInt32(primaryWidth),
+                copy_width: UInt32(copyWidth),
+                n_elems: UInt32(input.elementCount),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_split_scatter_columns_bf16(
+                input: input.buffer, inputOffset: input.offset,
+                indices: indices.buffer, indicesOffset: indices.offset,
+                primary: primary.buffer, primaryOffset: primary.offset,
+                secondary: secondary.buffer, secondaryOffset: secondary.offset,
+                tertiary: tertiary.buffer, tertiaryOffset: tertiary.offset,
+                scatter_width: UInt32(scatterWidth),
+                primary_width: UInt32(primaryWidth),
+                copy_width: UInt32(copyWidth),
+                n_elems: UInt32(input.elementCount),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.splitScatterColumns: unsupported dtype \(input.dtype)")
+        }
+    }
+
     /// Two embedding lookups against the SAME `table` on one compute
     /// encoder. Used when two parallel id streams need to read the
     /// same embedding (or, in Qwen3 attention, when a single linear
@@ -2452,8 +2515,9 @@ public enum Ops {
     /// from DRAM. Saves 2 encoder begin/end pairs per attention layer
     /// at decode T=1.
     ///
-    /// Output layout: q, k, v concatenated in that order in `out`;
-    /// caller slices into the three regions.
+    /// Output layout: q, k, v concatenated in that order in `out`.
+    /// `projectionCount` can restrict the grid to the leading projection
+    /// planes while preserving their arithmetic and output offsets.
     ///
     /// Kernel constraints (mirror `iron_rms_norm_qgemv_fast`):
     /// - `in_dim` MUST be a multiple of 512.
@@ -2466,6 +2530,7 @@ public enum Ops {
         wK: Tensor, scalesK: Tensor, biasesK: Tensor,
         wV: Tensor, scalesV: Tensor, biasesV: Tensor,
         outQ: Int, outK: Int, outV: Int,
+        projectionCount: Int = 3,
         on cmd: MTLCommandBuffer,
         into out: Tensor
     ) {
@@ -2484,9 +2549,16 @@ public enum Ops {
         precondition(
             x.elementCount == inDim,
             "Ops.batchedQkvQgemvInt4Fast: x.elementCount \(x.elementCount) ≠ inDim \(inDim)")
+        precondition((1 ... 3).contains(projectionCount))
+        let requiredOutputCount: Int
+        switch projectionCount {
+        case 1: requiredOutputCount = outQ
+        case 2: requiredOutputCount = outQ + outK
+        default: requiredOutputCount = outQ + outK + outV
+        }
         precondition(
-            out.elementCount == outQ + outK + outV,
-            "Ops.batchedQkvQgemvInt4Fast: out.elementCount must be q+k+v")
+            out.elementCount == requiredOutputCount,
+            "Ops.batchedQkvQgemvInt4Fast: output size does not match projection count")
         precondition(
             inDim % 512 == 0,
             "Ops.batchedQkvQgemvInt4Fast: in_dim must be a multiple of 512")
@@ -2494,12 +2566,17 @@ public enum Ops {
             outQ % 8 == 0 && outK % 8 == 0 && outV % 8 == 0,
             "Ops.batchedQkvQgemvInt4Fast: out_q/k/v must each be a multiple of 8")
         let groupSize = 64
-        let maxOut = max(outQ, max(outK, outV))
-        // Grid: [ceil(maxOut/8) * TPG, 1, 3] — TG count per matrix axis
-        // times TPG=64 lanes; 3 matrices.
+        let maxOut: Int
+        switch projectionCount {
+        case 1: maxOut = outQ
+        case 2: maxOut = max(outQ, outK)
+        default: maxOut = max(outQ, max(outK, outV))
+        }
+        // Grid depth selects the leading projection planes. The full path
+        // dispatches Q, K, and V; a reduced path keeps identical plane math.
         let tpg = 64
         let nTiles = maxOut / 8
-        let grid = MTLSize(width: nTiles * tpg, height: 1, depth: 3)
+        let grid = MTLSize(width: nTiles * tpg, height: 1, depth: projectionCount)
         let tg = MTLSize(width: tpg, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
@@ -2571,13 +2648,15 @@ public enum Ops {
     /// - `group_size` MUST be 64. TPG = 64.
     /// - All three outputs MUST be pre-zeroed (kernel only writes
     ///   valid `row0 < out_*` tiles per matrix branch). The wrapper
-    ///   handles this — callers do not need to zero ahead of time.
+    ///   handles this. `projectionCount` can restrict the grid to the
+    ///   leading planes while preserving their arithmetic.
     public static func batchedQkvQmmFast(
         x: Tensor,  // [M, in_dim]
         wQ: Tensor, scalesQ: Tensor, biasesQ: Tensor,
         wK: Tensor, scalesK: Tensor, biasesK: Tensor,
         wV: Tensor, scalesV: Tensor, biasesV: Tensor,
         m: Int, outQ: Int, outK: Int, outV: Int,
+        projectionCount: Int = 3,
         on cmd: MTLCommandBuffer,
         qBuf: Tensor,  // [M, out_q]
         kBuf: Tensor,  // [M, out_k]
@@ -2601,12 +2680,17 @@ public enum Ops {
         precondition(
             qBuf.elementCount == m * outQ,
             "Ops.batchedQkvQmmFast: qBuf.elementCount must be M·out_q")
-        precondition(
-            kBuf.elementCount == m * outK,
-            "Ops.batchedQkvQmmFast: kBuf.elementCount must be M·out_k")
-        precondition(
-            vBuf.elementCount == m * outV,
-            "Ops.batchedQkvQmmFast: vBuf.elementCount must be M·out_v")
+        precondition((1 ... 3).contains(projectionCount))
+        if projectionCount >= 2 {
+            precondition(
+                kBuf.elementCount == m * outK,
+                "Ops.batchedQkvQmmFast: kBuf.elementCount must be M·out_k")
+        }
+        if projectionCount == 3 {
+            precondition(
+                vBuf.elementCount == m * outV,
+                "Ops.batchedQkvQmmFast: vBuf.elementCount must be M·out_v")
+        }
         precondition(
             inDim % 512 == 0,
             "Ops.batchedQkvQmmFast: in_dim must be a multiple of 512")
@@ -2616,14 +2700,19 @@ public enum Ops {
         // Pre-zero outputs: the kernel tile mechanic depends on the
         // buffer starting at zero where the smaller two matrices' tiles
         // past their `out_*` count no-op the store.
-        qBuf.zero()
-        kBuf.zero()
-        vBuf.zero()
+        if projectionCount > 1 { qBuf.zero() }
+        if projectionCount >= 2 { kBuf.zero() }
+        if projectionCount == 3 { vBuf.zero() }
         let groupSize = 64
         let tpg = 64
-        let maxOut = max(outQ, max(outK, outV))
+        let maxOut: Int
+        switch projectionCount {
+        case 1: maxOut = outQ
+        case 2: maxOut = max(outQ, outK)
+        default: maxOut = max(outQ, max(outK, outV))
+        }
         let nTiles = maxOut / 8
-        let grid = MTLSize(width: nTiles * tpg, height: m, depth: 3)
+        let grid = MTLSize(width: nTiles * tpg, height: m, depth: projectionCount)
         let tg = MTLSize(width: tpg, height: 1, depth: 1)
         switch x.dtype {
         case .f32:
