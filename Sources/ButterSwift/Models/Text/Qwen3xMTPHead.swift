@@ -122,6 +122,69 @@ enum DraftLmHead3BitMode: Equatable {
     }
 }
 
+@inline(__always)
+func qwen3xDraftCandidateBetter(
+    lhsValue: Float, lhsID: Int,
+    rhsValue: Float, rhsID: Int
+) -> Bool {
+    let lhsNaN = lhsValue.isNaN
+    let rhsNaN = rhsValue.isNaN
+    if lhsNaN != rhsNaN { return !lhsNaN }
+    if lhsValue != rhsValue { return lhsValue > rhsValue }
+    return lhsID < rhsID
+}
+
+/// Returns the strongest `count` IDs from `values[0..<limit]` in heap order.
+/// Ordering is by descending value, then ascending ID, with NaNs last.
+func qwen3xTopDraftCandidateIDs(
+    _ values: [Float], count: Int, limit: Int
+) -> [Int] {
+    precondition(count > 0 && count <= limit && limit <= values.count)
+    var heap: [Int] = []
+    heap.reserveCapacity(count)
+
+    @inline(__always)
+    func worse(_ lhs: Int, than rhs: Int) -> Bool {
+        qwen3xDraftCandidateBetter(
+            lhsValue: values[rhs], lhsID: rhs,
+            rhsValue: values[lhs], rhsID: lhs)
+    }
+
+    for id in 0 ..< limit {
+        if heap.count < count {
+            heap.append(id)
+            var child = heap.count - 1
+            while child > 0 {
+                let parent = (child - 1) / 2
+                guard worse(heap[child], than: heap[parent]) else { break }
+                heap.swapAt(child, parent)
+                child = parent
+            }
+            continue
+        }
+        guard
+            qwen3xDraftCandidateBetter(
+                lhsValue: values[id], lhsID: id,
+                rhsValue: values[heap[0]], rhsID: heap[0])
+        else { continue }
+        heap[0] = id
+        var parent = 0
+        while true {
+            let left = parent * 2 + 1
+            guard left < heap.count else { break }
+            let right = left + 1
+            var worstChild = left
+            if right < heap.count && worse(heap[right], than: heap[left]) {
+                worstChild = right
+            }
+            guard worse(heap[worstChild], than: heap[parent]) else { break }
+            heap.swapAt(parent, worstChild)
+            parent = worstChild
+        }
+    }
+    return heap
+}
+
 public final class Qwen3xMTPHead: Module {
     // ── Sidecar-owned modules ────────────────────────────────────────
     /// Fuse projection `[hidden, 2*hidden]`, no bias.
@@ -156,6 +219,10 @@ public final class Qwen3xMTPHead: Module {
     /// sidecar is absent (falls back to the shared `lmHead`).
     let draftLmHead: AnyLinear?
 
+    /// Optional compact 2-bit proposal readout declared by the sidecar.
+    /// Its 32 best rows are reranked with the shared 4-bit head before use.
+    let declaredDraftLmHead: QuantizedLinear?
+
     /// Resolved policy for which draft steps use `draftLmHead` (see
     /// `DraftLmHead3BitMode`'s doc comment). `.off` whenever
     /// `draftLmHead` is `nil` regardless of this value — `draftStep`
@@ -172,6 +239,18 @@ public final class Qwen3xMTPHead: Module {
     public let vocab: Int
     public let dtype: DType
 
+    static let compactDraftPrefixCount = 98_304
+    static let compactDraftControlStart = 248_044
+    static let compactDraftRealCount = 98_330
+    static let compactDraftPaddedCount = 98_336
+    static let draftRerankCandidateCount = 32
+
+    static func mapCompactDraftID(_ id: Int) -> Int {
+        precondition(id >= 0 && id < compactDraftRealCount)
+        if id < compactDraftPrefixCount { return id }
+        return id + compactDraftControlStart - compactDraftPrefixCount
+    }
+
     /// Draft-cache slot capacity. The phase-1 driver only needs the
     /// drafting horizon plus the accepted-token history; 8192 slots
     /// costs ~34 MB at bf16 (4 KV heads x 256 dims, K+V). The spec
@@ -186,6 +265,7 @@ public final class Qwen3xMTPHead: Module {
         layer: Qwen35AttentionLayer, mtpNorm: RMSNorm,
         embedTokens: AnyEmbedding, lmHead: AnyLinear,
         draftLmHead: AnyLinear? = nil,
+        declaredDraftLmHead: QuantizedLinear? = nil,
         draftLmHeadMode: DraftLmHead3BitMode = .off,
         kvCache: KVCache,
         hidden: Int, vocab: Int, dtype: DType
@@ -198,6 +278,7 @@ public final class Qwen3xMTPHead: Module {
         self.embedTokens = embedTokens
         self.lmHead = lmHead
         self.draftLmHead = draftLmHead
+        self.declaredDraftLmHead = declaredDraftLmHead
         self.draftLmHeadMode = draftLmHeadMode
         self.kvCache = kvCache
         self.hidden = hidden
@@ -316,8 +397,9 @@ public final class Qwen3xMTPHead: Module {
         // cheaper 3-bit draft-only head when loaded AND this step's
         // policy (see `DraftLmHead3BitMode`) says to use it, else the
         // shared 4-bit head the backbone/verifier also use.
+        let useDeclaredDraftHead = isGreedy && hasDeclaredDraftRerank
         let useDraftHead: Bool
-        if draftLmHead != nil {
+        if draftLmHead != nil && !useDeclaredDraftHead {
             switch draftLmHeadMode {
             case .off: useDraftHead = false
             case .always: useDraftHead = true
@@ -328,11 +410,85 @@ public final class Qwen3xMTPHead: Module {
             useDraftHead = false
         }
         let normed = mtpNorm(hOut, on: cmd)
-        let logits = (useDraftHead ? draftLmHead! : lmHead)(normed, on: cmd)
+        let logits: Tensor
+        if useDeclaredDraftHead {
+            logits = declaredDraftLmHead!(normed, on: cmd)
+        } else {
+            logits = (useDraftHead ? draftLmHead! : lmHead)(normed, on: cmd)
+        }
         // Qwen3.8 chains the head's own post-`mtp.norm` hidden into the
         // next draft step. Returning `hOut` here silently degrades every
         // candidate after draft position zero.
         return (hidden: normed, logits: logits)
+    }
+
+    private var declaredDraftExactHead: QuantizedLinear? {
+        guard let coarse = declaredDraftLmHead,
+            coarse.bits == 2,
+            coarse.groupSize == 64,
+            coarse.weight.shape == [Self.compactDraftPaddedCount, hidden / 16],
+            coarse.scales.shape == [Self.compactDraftPaddedCount, hidden / 64],
+            coarse.biases.shape == coarse.scales.shape,
+            let exact = lmHead.inner as? QuantizedLinear,
+            exact.bits == 4,
+            exact.groupSize == 64,
+            exact.additiveBias == nil,
+            exact.weight.shape.count == 2,
+            exact.weight.shape[0] > Self.compactDraftControlStart + 25,
+            exact.weight.shape[1] == hidden / 8,
+            exact.scales.shape[1] == hidden / 64,
+            exact.biases.shape == exact.scales.shape
+        else { return nil }
+        return exact
+    }
+
+    var hasDeclaredDraftRerank: Bool { declaredDraftExactHead != nil }
+
+    /// Encodes exact 4-bit logits for the coarse head's 32 best rows.
+    /// The caller commits and waits on `cmd`, then resolves the winner with
+    /// `selectDeclaredDraftRerank`.
+    func prepareDeclaredDraftRerank(
+        coarseLogits: [Float], normalizedHidden: Tensor,
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> (logits: Tensor, compactIDs: [Int])? {
+        guard let exact = declaredDraftExactHead,
+            coarseLogits.count == Self.compactDraftPaddedCount,
+            normalizedHidden.elementCount == hidden
+        else { return nil }
+        let compactIDs = qwen3xTopDraftCandidateIDs(
+            coarseLogits,
+            count: Self.draftRerankCandidateCount,
+            limit: Self.compactDraftRealCount)
+        let fullIDs = compactIDs.map { id -> UInt32 in
+            UInt32(Self.mapCompactDraftID(id))
+        }
+        let idBuffer = device.makeBuffer(length: fullIDs.count * MemoryLayout<UInt32>.stride)
+        _ = fullIDs.withUnsafeBytes { bytes in
+            memcpy(idBuffer.contents(), bytes.baseAddress!, bytes.count)
+        }
+        let idTensor = Tensor(
+            buffer: idBuffer, offset: 0, shape: [fullIDs.count], dtype: .u32)
+        let logits = Ops.dequantGemvInt4Gathered(
+            weight: exact.weight, scales: exact.scales, biases: exact.biases,
+            rowIndices: idTensor, input: normalizedHidden,
+            groupSize: exact.groupSize, on: cmd)
+        return (logits, compactIDs)
+    }
+
+    func selectDeclaredDraftRerank(
+        logits: [Float], compactIDs: [Int]
+    ) -> Int? {
+        guard logits.count == compactIDs.count, !logits.isEmpty else { return nil }
+        var best = 0
+        for i in 1 ..< logits.count {
+            if qwen3xDraftCandidateBetter(
+                lhsValue: logits[i], lhsID: compactIDs[i],
+                rhsValue: logits[best], rhsID: compactIDs[best])
+            {
+                best = i
+            }
+        }
+        return Self.mapCompactDraftID(compactIDs[best])
     }
 
     /// T-batched fuse: same computation as `fuseInputs`, over `t` rows
@@ -638,6 +794,41 @@ public final class Qwen3xMTPHead: Module {
             }
         }
 
+        var declaredDraftLmHead: QuantizedLinear?
+        let declaredDraftKeys = [
+            "draft_lm_head.weight",
+            "draft_lm_head.scales",
+            "draft_lm_head.biases",
+        ]
+        let declaredDraftKeyCount = declaredDraftKeys.filter(weights.allKeys.contains).count
+        if declaredDraftKeyCount != 0 && declaredDraftKeyCount != declaredDraftKeys.count {
+            throw Qwen35Error.missingConfig(
+                "draft_lm_head must provide weight, scales, and biases")
+        }
+        if declaredDraftKeyCount == declaredDraftKeys.count
+            && ButterEnv["BUTTER_QWEN_MTP_Q2_RERANK"] != "0"
+        {
+            let weight = try weights.tensor(named: declaredDraftKeys[0])
+            let scales = try weights.tensor(named: declaredDraftKeys[1])
+            let biases = try weights.tensor(named: declaredDraftKeys[2])
+            let groupSize = 64
+            let bits = deriveAffineQuantBits(
+                weightPackedCols: weight.shape[1],
+                scaleCols: scales.shape[1],
+                groupSize: groupSize)
+            guard bits == 2,
+                weight.shape == [compactDraftPaddedCount, hidden / 16],
+                scales.shape == [compactDraftPaddedCount, hidden / groupSize],
+                biases.shape == scales.shape
+            else {
+                throw Qwen35Error.unsupportedConfig(
+                    "draft_lm_head does not match the compact 2-bit Qwen3.8 contract")
+            }
+            declaredDraftLmHead = QuantizedLinear(
+                weight: weight, scales: scales, biases: biases,
+                bits: bits, groupSize: groupSize)
+        }
+
         return Qwen3xMTPHead(
             fc: fc,
             preFcNormHidden: preFcNormHidden,
@@ -645,6 +836,7 @@ public final class Qwen3xMTPHead: Module {
             layer: layer, mtpNorm: mtpNorm,
             embedTokens: embedTokens, lmHead: lmHead,
             draftLmHead: draftLmHead,
+            declaredDraftLmHead: declaredDraftLmHead,
             draftLmHeadMode: draftLmHeadMode,
             kvCache: kvCache,
             hidden: hidden, vocab: vocab, dtype: dtype)

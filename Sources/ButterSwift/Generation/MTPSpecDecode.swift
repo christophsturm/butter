@@ -925,7 +925,7 @@ extension SpecDecode {
                     let (h, dLogits) = head.draftStep(
                         prevHidden: chainHidden, prevToken: chainTok,
                         position: pos + j,
-                        draftStepIndex: j, isGreedy: isGreedyRun,
+                        draftStepIndex: j, isGreedy: isGreedyRun && pMin == nil,
                         on: dCmd, device: device)
                     dCmd.commit()
                     dCmd.waitUntilCompleted()
@@ -960,7 +960,29 @@ extension SpecDecode {
                             c = idx
                             pTop = top
                         } else {
-                            c = argmax(flatD, offset: 0, count: flatD.count)
+                            var rerankedToken: Int?
+                            if isGreedyRun && head.hasDeclaredDraftRerank {
+                                let rerankCmd = device.makeCommandBuffer()
+                                guard
+                                    let rerank = head.prepareDeclaredDraftRerank(
+                                        coarseLogits: flatD, normalizedHidden: h,
+                                        on: rerankCmd, device: device)
+                                else {
+                                    preconditionFailure("declared draft rerank inputs are inconsistent")
+                                }
+                                rerankCmd.commit()
+                                rerankCmd.waitUntilCompleted()
+                                guard
+                                    let selected = head.selectDeclaredDraftRerank(
+                                        logits: rerank.logits.toFloatArray(),
+                                        compactIDs: rerank.compactIDs)
+                                else {
+                                    preconditionFailure("declared draft rerank output is inconsistent")
+                                }
+                                rerankedToken = selected
+                            }
+                            c = rerankedToken ?? argmax(
+                                flatD, offset: 0, count: flatD.count)
                         }
                     } else if case .sampled(let params) = mode {
                         // Ratio-oracle branch (BUTTER_QWEN_MTP_ACCEPT=ratio):
