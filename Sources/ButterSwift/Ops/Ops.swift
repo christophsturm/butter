@@ -3924,6 +3924,45 @@ public enum Ops {
         }
     }
 
+    /// Select the caller-provided ID paired with the strongest compact value.
+    public static func indexedArgmax(
+        _ values: Tensor, indices: Tensor, into out: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(values.elementCount > 0 && values.elementCount <= 32)
+        precondition(values.dtype == .bf16)
+        precondition(indices.dtype == .u32 && indices.elementCount == values.elementCount)
+        precondition(out.dtype == .u32 && out.elementCount == 1)
+        let width = 32
+        IronKernels.iron_indexed_argmax_bf16(
+            values: values.buffer, valuesOffset: values.offset,
+            indices: indices.buffer, indicesOffset: indices.offset,
+            out: out.buffer, outOffset: out.offset,
+            n: UInt32(values.elementCount),
+            gridSize: MTLSize(width: width, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: width, height: 1, depth: 1),
+            on: cmd)
+    }
+
+    /// Add an offset to every u32 index at or above a threshold.
+    public static func piecewiseOffsetIndices(
+        _ indices: Tensor, threshold: Int, offset: Int,
+        into out: Tensor, on cmd: MTLCommandBuffer
+    ) {
+        precondition(indices.dtype == .u32 && out.dtype == .u32)
+        precondition(indices.elementCount == out.elementCount)
+        precondition(threshold >= 0 && offset >= 0)
+        let width = 32
+        IronKernels.iron_piecewise_offset_u32_f32(
+            indices: indices.buffer, indicesOffset: indices.offset,
+            out: out.buffer, outOffset: out.offset,
+            n: UInt32(indices.elementCount), threshold: UInt32(threshold),
+            offset: UInt32(offset),
+            gridSize: MTLSize(width: width, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: width, height: 1, depth: 1),
+            on: cmd)
+    }
+
     /// GPU argmax for each contiguous row of a BF16 matrix.
     public static func argmaxRows(
         _ logits: Tensor, rows: Int, columns: Int,
