@@ -749,6 +749,7 @@ extension SpecDecode {
         let statePlanes =
             ButterEnv["BUTTER_GDN_STATE_PLANES"] != "0"
         var planeSteps = 0
+        var fullPlaneAdoptionsSkipped = 0
         let batchedReplay =
             ButterEnv["BUTTER_QWEN_MTP_BATCHED_REPLAY"] != "0"
         // Batched lockstep is the Qwen3.8 default; set
@@ -1173,7 +1174,24 @@ extension SpecDecode {
             // baseline-matching gate does, so sampled decode keeps full
             // accept's speed win.
             let mustReplayForExactness = mode.isGreedy && !plan.needsReplay
-            if plan.needsReplay || mustReplayForExactness {
+            // With state planes active, the existing greedy full-accept
+            // path keeps the batched verifier's hidden row and bonus token.
+            // The live recurrent and convolution states already equal the
+            // final captured planes because every proposed row was accepted,
+            // so adopting that same final plane only copies each state onto
+            // itself. Skip those redundant blits while retaining an opt-out
+            // for paired measurements. Partial accepts still select their
+            // earlier plane through the recovery block below.
+            let fullAcceptStateAlreadyCurrent =
+                mustReplayForExactness
+                && statePlanes && planesReplaceSnapshot
+                && ButterEnv["BUTTER_QWEN_MTP_SKIP_FULL_PLANE_ADOPTION"] != "0"
+            if fullAcceptStateAlreadyCurrent {
+                fullPlaneAdoptionsSkipped += 1
+            }
+            if (plan.needsReplay || mustReplayForExactness)
+                && !fullAcceptStateAlreadyCurrent
+            {
               // `autoreleasepool` wrap — this block now runs on nearly
               // EVERY greedy cycle instead of only partial/zero accepts
               // (the whole point of `mustReplayForExactness`), and each
@@ -1676,6 +1694,7 @@ extension SpecDecode {
                     "[mtp-prof] total=%.2fs draft=%.2f verify=%.2f replay=%.2f "
                     + "lockstep=%.2f snap=%.2f other=%.2f rewinds=\(rewindSteps) "
                     + "planes=\(planeSteps) "
+                    + "fullplaneskip=\(fullPlaneAdoptionsSkipped) "
                     + "avgdraft=\(String(format: "%.2f", avgDraft)) "
                     + "mindraft=\(minD) maxdraft=\(maxDraftLen) draftcycles=\(draftCycles) "
                     + "accepted=\(candidatesAccepted)/\(candidatesProposed) "
