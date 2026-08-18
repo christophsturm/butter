@@ -703,12 +703,32 @@ public final class Qwen3xMTPHead: Module {
                     + "headDim=\(headDim)")
         }
 
+        let projectionPrecisionIslands: Qwen35ProjectionPrecisionIslands?
+        let hasProjectionPrecisionIslands = weights.allKeys.contains {
+            $0.hasPrefix("precision_islands.")
+        }
+        if hasProjectionPrecisionIslands
+            && ButterEnv["BUTTER_QWEN_MTP_PRECISION_ISLANDS"] != "0"
+        {
+            projectionPrecisionIslands = try qwen3xLoadProjectionPrecisionIslands(
+                from: weights,
+                hidden: hidden,
+                qOutputWidth: expectedQRows,
+                kvOutputWidth: nKVHeads * headDim,
+                dtype: dtype,
+                device: device)
+        } else {
+            projectionPrecisionIslands = nil
+        }
+
         let mixer = Qwen35AttentionMixer(
             qProj: qProj, kProj: kProj, vProj: vProj, oProj: oProj,
             qNorm: qNorm, kNorm: kNorm,
             nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
             rotaryDim: rotaryDim, ropeTheta: ropeTheta,
-            attnOutputGate: attnOutputGate, device: device)
+            attnOutputGate: attnOutputGate,
+            projectionPrecisionIslands: projectionPrecisionIslands,
+            device: device)
         let layer = Qwen35AttentionLayer(
             inputNorm: inputNorm, postNorm: postNorm,
             mixer: mixer,
@@ -864,4 +884,112 @@ private func qwen3xMTPOutRows(_ linear: AnyLinear) -> Int {
     case let l as Linear: return l.weight.shape[0]
     default: return -1
     }
+}
+
+private func qwen3xLoadProjectionPrecisionIslands(
+    from weights: SafeTensorsBundle,
+    hidden: Int,
+    qOutputWidth: Int,
+    kvOutputWidth: Int,
+    dtype: DType,
+    device: Device
+) throws -> Qwen35ProjectionPrecisionIslands {
+    let qIndexKey = "precision_islands.q.indices"
+    let qWeightKey = "precision_islands.q.weight"
+    let kIndexKey = "precision_islands.k.indices"
+    let kWeightKey = "precision_islands.k.weight"
+    let vIndexKey = "precision_islands.v.indices"
+    let vWeightKey = "precision_islands.v.weight"
+    let requiredKeys = [
+        qIndexKey, qWeightKey,
+        kIndexKey, kWeightKey,
+        vIndexKey, vWeightKey,
+    ]
+    guard requiredKeys.allSatisfy(weights.allKeys.contains) else {
+        throw Qwen35Error.missingConfig(
+            "declared projection precision islands require q, k, and v weights and indices")
+    }
+
+    let qIndicesRaw = try weights.tensor(named: qIndexKey)
+    let kIndicesRaw = try weights.tensor(named: kIndexKey)
+    let vIndicesRaw = try weights.tensor(named: vIndexKey)
+    let qWeight = try weights.tensor(named: qWeightKey)
+    let kWeight = try weights.tensor(named: kWeightKey)
+    let vWeight = try weights.tensor(named: vWeightKey)
+
+    func validatedIndices(
+        _ tensor: Tensor, count: Int, upperBound: Int,
+        requirePermutation: Bool, label: String
+    ) throws -> [Int] {
+        guard tensor.shape == [count], tensor.dtype == .i32 || tensor.dtype == .u32 else {
+            throw Qwen35Error.unsupportedConfig(
+                "precision_islands.\(label).indices must be [\(count)] i32 or u32")
+        }
+        let values: [Int]
+        if tensor.dtype == .i32 {
+            values = tensor.toArray(as: Int32.self).map(Int.init)
+        } else {
+            values = tensor.toArray(as: UInt32.self).map(Int.init)
+        }
+        guard values.allSatisfy({ $0 >= 0 && $0 < upperBound }),
+            Set(values).count == count,
+            !requirePermutation || count == upperBound
+        else {
+            throw Qwen35Error.unsupportedConfig(
+                "precision_islands.\(label).indices are not a valid unique mapping")
+        }
+        return values
+    }
+
+    let qCount = qIndicesRaw.elementCount
+    let qIndices = try validatedIndices(
+        qIndicesRaw, count: qCount, upperBound: qOutputWidth,
+        requirePermutation: false, label: "q")
+    let kIndices = try validatedIndices(
+        kIndicesRaw, count: kvOutputWidth, upperBound: kvOutputWidth,
+        requirePermutation: true, label: "k")
+    let vIndices = try validatedIndices(
+        vIndicesRaw, count: kvOutputWidth, upperBound: kvOutputWidth,
+        requirePermutation: true, label: "v")
+
+    guard qWeight.shape == [qCount, hidden],
+        kWeight.shape == [kvOutputWidth, hidden],
+        vWeight.shape == [kvOutputWidth, hidden],
+        qWeight.dtype == dtype,
+        kWeight.dtype == dtype,
+        vWeight.dtype == dtype
+    else {
+        throw Qwen35Error.unsupportedConfig(
+            "precision island projection shapes or dtypes do not match the draft layer")
+    }
+
+    let combinedRows = qCount + 2 * kvOutputWidth
+    let combinedWeight = Tensor.empty(
+        shape: [combinedRows, hidden], dtype: dtype, device: device)
+    let rowBytes = hidden * dtype.byteSize
+    let destination = combinedWeight.buffer.contents().advanced(by: combinedWeight.offset)
+    _ = memcpy(
+        destination,
+        qWeight.buffer.contents().advanced(by: qWeight.offset),
+        qWeight.byteCount)
+    for sourceRow in 0 ..< kvOutputWidth {
+        _ = memcpy(
+            destination.advanced(by: (qCount + kIndices[sourceRow]) * rowBytes),
+            kWeight.buffer.contents().advanced(by: kWeight.offset + sourceRow * rowBytes),
+            rowBytes)
+        _ = memcpy(
+            destination.advanced(
+                by: (qCount + kvOutputWidth + vIndices[sourceRow]) * rowBytes),
+            vWeight.buffer.contents().advanced(by: vWeight.offset + sourceRow * rowBytes),
+            rowBytes)
+    }
+
+    let qIndexTensor = Tensor.empty(shape: [qCount], dtype: .u32, device: device)
+    qIndexTensor.copyIn(from: qIndices.map(UInt32.init))
+    device.markWeightsResident([combinedWeight.buffer, qIndexTensor.buffer])
+    return Qwen35ProjectionPrecisionIslands(
+        projection: AnyLinear(Linear(weight: combinedWeight)),
+        qIndices: qIndexTensor,
+        qOutputWidth: qOutputWidth,
+        kvOutputWidth: kvOutputWidth)
 }
