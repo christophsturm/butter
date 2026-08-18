@@ -927,13 +927,29 @@ extension SpecDecode {
                         position: pos + j,
                         draftStepIndex: j, isGreedy: isGreedyRun && pMin == nil,
                         on: dCmd, device: device)
+                    let draftsGreedily: Bool
+                    switch mode {
+                    case .greedy: draftsGreedily = true
+                    case .sampled: draftsGreedily = !useRatioAccept
+                    }
+                    var candidateSelection: Tensor?
+                    if draftsGreedily && pMin == nil && isGreedyRun
+                        && head.hasDeclaredDraftRerank
+                    {
+                        candidateSelection = head.prepareDeclaredDraftCandidateIDs(
+                            coarseLogits: dLogits, on: dCmd, device: device)
+                        precondition(
+                            candidateSelection != nil,
+                            "declared draft candidate inputs are inconsistent")
+                    }
                     dCmd.commit()
                     dCmd.waitUntilCompleted()
-                    // Single CPU readback of this step's logits row,
-                    // shared by both the argmax (always) and the
-                    // confidence check (only when BUTTER_QWEN_MTP_PMIN
-                    // is set) — no extra GPU work either way.
-                    let flatD = dLogits.toFloatArray()
+                    let compactCandidateIDs = candidateSelection?
+                        .toArray(as: UInt32.self).map { Int($0) }
+                    // The declared greedy path reads back only the compact
+                    // candidate IDs. Sampling, confidence gating, and the
+                    // generic argmax retain the complete logits readback.
+                    let flatD = compactCandidateIDs == nil ? dLogits.toFloatArray() : []
                     let c: Int
                     var pTop: Float = 1
                     // ── mode: divergence 1 — draft token choice.
@@ -948,11 +964,6 @@ extension SpecDecode {
                     // `Sampling.sample` uses on the non-spec path) and
                     // stash the raw row for the accept step, reproducing
                     // the pre-match scheme verbatim.
-                    let draftsGreedily: Bool
-                    switch mode {
-                    case .greedy: draftsGreedily = true
-                    case .sampled: draftsGreedily = !useRatioAccept
-                    }
                     if draftsGreedily {
                         if pMin != nil {
                             let (idx, top) = argmaxAndTopProb(
@@ -960,12 +971,12 @@ extension SpecDecode {
                             c = idx
                             pTop = top
                         } else {
-                            var rerankedToken: Int?
                             if isGreedyRun && head.hasDeclaredDraftRerank {
                                 let rerankCmd = device.makeCommandBuffer()
                                 guard
                                     let rerank = head.prepareDeclaredDraftRerank(
-                                        coarseLogits: flatD, normalizedHidden: h,
+                                        compactIDs: compactCandidateIDs ?? [],
+                                        normalizedHidden: h,
                                         on: rerankCmd, device: device)
                                 else {
                                     preconditionFailure("declared draft rerank inputs are inconsistent")
@@ -979,10 +990,10 @@ extension SpecDecode {
                                 else {
                                     preconditionFailure("declared draft rerank output is inconsistent")
                                 }
-                                rerankedToken = selected
+                                c = selected
+                            } else {
+                                c = argmax(flatD, offset: 0, count: flatD.count)
                             }
-                            c = rerankedToken ?? argmax(
-                                flatD, offset: 0, count: flatD.count)
                         }
                     } else if case .sampled(let params) = mode {
                         // Ratio-oracle branch (BUTTER_QWEN_MTP_ACCEPT=ratio):

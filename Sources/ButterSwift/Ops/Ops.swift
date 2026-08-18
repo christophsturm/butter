@@ -661,6 +661,45 @@ public enum Ops {
         }
     }
 
+    /// Select the strongest indices from one wide BF16 logits row with a
+    /// tiled partial pass followed by a single-SIMDgroup final reduction.
+    public static func topKIndicesTiled(
+        logits: Tensor, candidateScratch: Tensor, indicesOut: Tensor,
+        count: Int, tileCount: Int, topK: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(logits.dtype == .bf16 && count <= logits.elementCount)
+        precondition(tileCount == 64 && topK > 0 && topK <= 16)
+        precondition(candidateScratch.dtype == .u32)
+        precondition(candidateScratch.elementCount == tileCount * topK)
+        precondition(indicesOut.dtype == .u32 && indicesOut.elementCount == topK)
+        let partialWidth = 256
+        let valuesPerThread = (count + tileCount * partialWidth - 1)
+            / (tileCount * partialWidth)
+        IronKernels.iron_logits_topk_tiled_partial_bf16(
+            logits: logits.buffer, logitsOffset: logits.offset,
+            candidate_indices: candidateScratch.buffer,
+            candidate_indicesOffset: candidateScratch.offset,
+            n: UInt32(count), n_tiles: UInt32(tileCount),
+            values_per_thread: UInt32(valuesPerThread), k: UInt32(topK),
+            gridSize: MTLSize(width: tileCount * partialWidth, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: partialWidth, height: 1, depth: 1),
+            on: cmd)
+        let candidateCount = tileCount * topK
+        let finalizeWidth = 32
+        let candidatesPerThread = (candidateCount + finalizeWidth - 1) / finalizeWidth
+        IronKernels.iron_logits_topk_tiled_finalize_bf16(
+            logits: logits.buffer, logitsOffset: logits.offset,
+            candidate_indices: candidateScratch.buffer,
+            candidate_indicesOffset: candidateScratch.offset,
+            indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+            n_candidates: UInt32(candidateCount),
+            values_per_thread: UInt32(candidatesPerThread), k: UInt32(topK),
+            gridSize: MTLSize(width: finalizeWidth, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: finalizeWidth, height: 1, depth: 1),
+            on: cmd)
+    }
+
     /// Two embedding lookups against the SAME `table` on one compute
     /// encoder. Used when two parallel id streams need to read the
     /// same embedding (or, in Qwen3 attention, when a single linear

@@ -444,21 +444,41 @@ public final class Qwen3xMTPHead: Module {
 
     var hasDeclaredDraftRerank: Bool { declaredDraftExactHead != nil }
 
-    /// Encodes exact 4-bit logits for the coarse head's 32 best rows.
+    /// Encodes the coarse head's strongest real rows without reading the
+    /// complete logits vector back to the CPU.
+    func prepareDeclaredDraftCandidateIDs(
+        coarseLogits: Tensor, on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor? {
+        guard declaredDraftExactHead != nil,
+            coarseLogits.elementCount == Self.compactDraftPaddedCount,
+            coarseLogits.dtype == .bf16
+        else { return nil }
+        let tileCount = 64
+        let candidates = Tensor.empty(
+            shape: [tileCount * Self.draftRerankCandidateCount],
+            dtype: .u32, device: device)
+        let indices = Tensor.empty(
+            shape: [Self.draftRerankCandidateCount], dtype: .u32, device: device)
+        Ops.topKIndicesTiled(
+            logits: coarseLogits, candidateScratch: candidates,
+            indicesOut: indices, count: Self.compactDraftRealCount,
+            tileCount: tileCount, topK: Self.draftRerankCandidateCount,
+            on: cmd)
+        return indices
+    }
+
+    /// Encodes exact 4-bit logits for the coarse head's strongest rows.
     /// The caller commits and waits on `cmd`, then resolves the winner with
     /// `selectDeclaredDraftRerank`.
     func prepareDeclaredDraftRerank(
-        coarseLogits: [Float], normalizedHidden: Tensor,
+        compactIDs: [Int], normalizedHidden: Tensor,
         on cmd: MTLCommandBuffer, device: Device
     ) -> (logits: Tensor, compactIDs: [Int])? {
         guard let exact = declaredDraftExactHead,
-            coarseLogits.count == Self.compactDraftPaddedCount,
+            compactIDs.count == Self.draftRerankCandidateCount,
+            compactIDs.allSatisfy({ $0 >= 0 && $0 < Self.compactDraftRealCount }),
             normalizedHidden.elementCount == hidden
         else { return nil }
-        let compactIDs = qwen3xTopDraftCandidateIDs(
-            coarseLogits,
-            count: Self.draftRerankCandidateCount,
-            limit: Self.compactDraftRealCount)
         let fullIDs = compactIDs.map { id -> UInt32 in
             UInt32(Self.mapCompactDraftID(id))
         }
