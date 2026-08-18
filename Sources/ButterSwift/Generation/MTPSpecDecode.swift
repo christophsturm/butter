@@ -1097,21 +1097,34 @@ extension SpecDecode {
             // ── Verify: ONE batched backbone pass ─────────────────────
             let vT = Date()
             let vCmd = device.makeCommandBuffer()
+            let rows = inputIds.count
             var (hiddenAll, logitsAll) = model.forwardManyHiddenAndLogits(
                 tokenIds: inputIds, startPosition: pos,
                 caches: caches, on: vCmd, device: device)
+            let vocab = logitsAll.elementCount / rows
+            precondition(
+                logitsAll.elementCount == rows * vocab,
+                "generateGreedyMTP: logits have \(logitsAll.elementCount) elements; "
+                    + "expected rows*vocab = \(rows * vocab)")
+            let verifierArgmax: Tensor?
+            if mode.isGreedy && !parityProbe {
+                let indices = Tensor.empty(
+                    shape: [rows], dtype: .u32, device: device)
+                Ops.argmaxRows(
+                    logitsAll, rows: rows, columns: vocab,
+                    into: indices, on: vCmd)
+                verifierArgmax = indices
+            } else {
+                verifierArgmax = nil
+            }
             vCmd.commit()
             vCmd.waitUntilCompleted()
             msVerify += Date().timeIntervalSince(vT)
             verifySteps += 1
 
-            let flat = logitsAll.toFloatArray()
-            let rows = inputIds.count
-            let vocab = flat.count / rows
-            precondition(
-                flat.count == rows * vocab,
-                "generateGreedyMTP: logits have \(flat.count) elements; "
-                    + "expected rows*vocab = \(rows * vocab)")
+            let verifierArgmaxIDs = verifierArgmax?
+                .toArray(as: UInt32.self).map(Int.init)
+            let flat = verifierArgmaxIDs == nil ? logitsAll.toFloatArray() : []
 
             // ── Accept plan ── mode: divergence 2 ──────────────────────
             // Greedy: argmax per draft-aligned row (verifierTokens) +
@@ -1132,13 +1145,19 @@ extension SpecDecode {
                 // Verifier tokens: argmax per draft-aligned row. Row j
                 // verifies drafts[j] (the token at position pos + 1 + j);
                 // the trailing row is the full-accept bonus.
-                var verifierTokens: [Int] = []
-                verifierTokens.reserveCapacity(drafts.count)
-                for j in 0 ..< drafts.count {
-                    verifierTokens.append(argmax(flat, offset: j * vocab, count: vocab))
+                let verifierTokens: [Int]
+                let batchedBonus: Int
+                if let verifierArgmaxIDs {
+                    precondition(verifierArgmaxIDs.count == rows)
+                    verifierTokens = Array(verifierArgmaxIDs.dropLast())
+                    batchedBonus = verifierArgmaxIDs[rows - 1]
+                } else {
+                    verifierTokens = (0 ..< drafts.count).map {
+                        argmax(flat, offset: $0 * vocab, count: vocab)
+                    }
+                    batchedBonus = argmax(
+                        flat, offset: (rows - 1) * vocab, count: vocab)
                 }
-                let batchedBonus = argmax(
-                    flat, offset: (rows - 1) * vocab, count: vocab)
                 if ButterEnv["BUTTER_QWEN_MTP_TRACE"] == "1",
                     verifySteps <= 6
                 {

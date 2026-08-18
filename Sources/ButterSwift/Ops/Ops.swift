@@ -3924,6 +3924,25 @@ public enum Ops {
         }
     }
 
+    /// GPU argmax for each contiguous row of a BF16 matrix.
+    public static func argmaxRows(
+        _ logits: Tensor, rows: Int, columns: Int,
+        into out: Tensor, on cmd: MTLCommandBuffer
+    ) {
+        precondition(rows > 0 && columns > 0)
+        precondition(logits.dtype == .bf16)
+        precondition(logits.elementCount == rows * columns)
+        precondition(out.dtype == .u32 && out.elementCount == rows)
+        let width = 256
+        IronKernels.iron_argmax_rows_bf16(
+            inp: logits.buffer, inpOffset: logits.offset,
+            out: out.buffer, outOffset: out.offset,
+            n_cols: UInt32(columns),
+            gridSize: MTLSize(width: rows * width, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: width, height: 1, depth: 1),
+            on: cmd)
+    }
+
     /// GPU softmax + categorical sample over a 1D logits tensor.
     /// Caller supplies:
     ///   - 1-element u32 output buffer for the sampled token id
