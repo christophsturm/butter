@@ -62,6 +62,16 @@ import Metal
 import IronSwift
 
 enum LagunaMppGemm {
+    /// Test/benchmark-only dispatch control. Production callers use the
+    /// default `.automatic` path, which retains the environment escape and
+    /// shape gate. Explicit modes avoid mutating process-global environment
+    /// state while GPU tests run concurrently.
+    enum Nax2DispatchMode {
+        case automatic
+        case forceNax2
+        case forceStaged
+    }
+
     static let kernelName = "butter_dense_gemm_mpp_bf16"
 
     /// W34: register-direct NAX-structure dense GEMM (see
@@ -70,6 +80,34 @@ enum LagunaMppGemm {
     /// threadgroup staging, deep BK=256 barrier-free K-loop, paired
     /// (16,32,16) matmul2d fragment calls, native bfloat operands).
     static let nax2KernelName = "butter_dense_gemm_nax2_mpp_bf16"
+
+    /// Apple-family-9 (M3/M4) variant of NAX2. The original kernel was
+    /// tuned and validated on M5 (Apple family 10) and hard-codes that
+    /// generation's implementation-defined cooperative-tensor layout.
+    /// This variant uses the family-9 layout measured by a one-shot accessor
+    /// probe, then hard-codes that mapping so no coordinate, validity, or
+    /// capacity accessors remain in the hot K-loop. Family-9 GPUs therefore
+    /// receive the same register-direct algorithm without inheriting the M5
+    /// lane mapping.
+    static let nax2Apple9KernelName = "butter_dense_gemm_nax2_mpp_bf16_apple9"
+
+    /// Preserve the measured M5 path byte-for-byte. Apple maps M3/M4 to
+    /// family 9 and M5 to family 10, so only family-9 hardware selects the
+    /// family-9 kernel.
+    static func nax2DispatchKernelName(supportsApple10: Bool) -> String {
+        supportsApple10 ? nax2KernelName : nax2Apple9KernelName
+    }
+
+    static func nax2DispatchKernelName(for device: MTLDevice) -> String {
+        nax2DispatchKernelName(supportsApple10: device.supportsFamily(.apple10))
+    }
+
+    /// Resolve the system GPU generation once. `callMany` is a hot encoding
+    /// path, so neither family pays an Objective-C `supportsFamily` query per
+    /// projection dispatch; after lazy initialization this is the same static
+    /// kernel-name lookup the original family-10 path used.
+    private static let systemNax2KernelName =
+        nax2DispatchKernelName(for: Device.shared.mtlDevice)
 
     /// Default ON (`!= "0"`): candidate for the F-85 campaign pivot.
     /// Escape: BUTTER_LAGUNA_MPP_GEMM=0.
@@ -102,8 +140,12 @@ enum LagunaMppGemm {
     /// Every Laguna XS prefill projection this file routes (Q/K/V/O,
     /// L00 gate/up/down, router) satisfies the N/K conditions; anything
     /// that does not declines to the staged kernel, not to steel.
+    static func nax2ShapeEligible(m: Int, n: Int, k: Int) -> Bool {
+        capable && m % 64 == 0 && n % 128 == 0 && k % 256 == 0
+    }
+
     static func nax2Eligible(m: Int, n: Int, k: Int) -> Bool {
-        nax2Enabled && capable && m % 64 == 0 && n % 128 == 0 && k % 256 == 0
+        nax2Enabled && nax2ShapeEligible(m: m, n: n, k: k)
     }
 
     /// Apple GPU Family 9+ / macOS 26+ -- the same gate every other MPP
@@ -189,25 +231,45 @@ enum LagunaMppGemm {
     /// N/K preconditions.
     static func callMany(
         a: Tensor, w: Tensor, m: Int, n: Int, k: Int,
-        on cmd: MTLCommandBuffer, device: Device
+        on cmd: MTLCommandBuffer, device: Device,
+        nax2Mode: Nax2DispatchMode = .automatic,
+        nax2SwizzleLogOverride: UInt32? = nil
     ) -> Tensor {
         precondition(n % 64 == 0, "LagunaMppGemm.callMany: n=\(n) must be a multiple of 64")
         precondition(k % 32 == 0, "LagunaMppGemm.callMany: k=\(k) must be a multiple of 32")
         let out = Tensor.empty(shape: [m, n], dtype: .bf16, device: device)
-        dispatch(a: a, w: w, out: out, m: m, n: n, k: k, on: cmd)
+        dispatch(
+            a: a, w: w, out: out, m: m, n: n, k: k, on: cmd,
+            nax2Mode: nax2Mode, nax2SwizzleLogOverride: nax2SwizzleLogOverride)
         return out
     }
 
     private static func dispatch(
         a: Tensor, w: Tensor, out: Tensor, m: Int, n: Int, k: Int,
-        on cmd: MTLCommandBuffer
+        on cmd: MTLCommandBuffer,
+        nax2Mode: Nax2DispatchMode,
+        nax2SwizzleLogOverride: UInt32?
     ) {
         // W34 try-first: route fully aligned shapes through the
         // register-direct NAX2 structure when opted in; everything else
         // (and everything when the flag is off) takes the staged kernel
         // unchanged.
-        if nax2Eligible(m: m, n: n, k: k) {
-            dispatchNax2(a: a, w: w, out: out, m: m, n: n, k: k, on: cmd)
+        let useNax2: Bool
+        switch nax2Mode {
+        case .automatic:
+            useNax2 = nax2Eligible(m: m, n: n, k: k)
+        case .forceNax2:
+            precondition(
+                nax2ShapeEligible(m: m, n: n, k: k),
+                "LagunaMppGemm.callMany: forced NAX2 dispatch is not shape/device eligible")
+            useNax2 = true
+        case .forceStaged:
+            useNax2 = false
+        }
+        if useNax2 {
+            dispatchNax2(
+                a: a, w: w, out: out, m: m, n: n, k: k, on: cmd,
+                swizzleLogOverride: nax2SwizzleLogOverride)
             return
         }
         let pso = PSOCache.shared.pipelineState(for: kernelName)
@@ -238,9 +300,9 @@ enum LagunaMppGemm {
     /// kernel's own tiles_m/tiles_n guard drops the overshoot).
     private static func dispatchNax2(
         a: Tensor, w: Tensor, out: Tensor, m: Int, n: Int, k: Int,
-        on cmd: MTLCommandBuffer
+        on cmd: MTLCommandBuffer, swizzleLogOverride: UInt32?
     ) {
-        let pso = PSOCache.shared.pipelineState(for: nax2KernelName)
+        let pso = PSOCache.shared.pipelineState(for: systemNax2KernelName)
         guard let enc = cmd.makeComputeCommandEncoder() else {
             fatalError("LagunaMppGemm.dispatchNax2: could not make compute encoder")
         }
@@ -251,7 +313,7 @@ enum LagunaMppGemm {
         var mU = UInt32(m)
         var nU = UInt32(n)
         var kU = UInt32(k)
-        var swizzle = nax2SwizzleLog
+        var swizzle = swizzleLogOverride ?? nax2SwizzleLog
         enc.setBytes(&mU, length: 4, index: 3)
         enc.setBytes(&nU, length: 4, index: 4)
         enc.setBytes(&kU, length: 4, index: 5)

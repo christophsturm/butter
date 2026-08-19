@@ -14,7 +14,7 @@ KERNEL_OUT := $(PROJECT_ROOT)/Sources/IronSwift
 # ─── Help ─────────────────────────────────────────────────────────────
 .PHONY: help
 help: ## show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
 	  awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
 
 # ─── Setup ────────────────────────────────────────────────────────────
@@ -153,6 +153,10 @@ test: regenerate-kernels test-unit test-integration ## run unit then integration
 .PHONY: test-unit
 test-unit: regenerate-kernels ## unit + Metal tests at production cap (BUTTER_MAX_COMMAND_BUFFERS=16)
 	BUTTER_MAX_COMMAND_BUFFERS=16 swift test --filter "ButterTests|IronSwiftTests"
+
+.PHONY: test-laguna-nax2-fast
+test-laguna-nax2-fast: ## live-compile + run the minimum family-specific NAX2 tile (no full kernel regen)
+	BUTTER_MAX_COMMAND_BUFFERS=16 swift test -c release --filter LagunaNax2GemmTests.minimumShapeSmoke
 
 .PHONY: test-integration
 test-integration: regenerate-kernels ## end-to-end model tests; production cap + ModelLoadLock; matches release.yml

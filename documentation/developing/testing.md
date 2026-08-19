@@ -28,6 +28,23 @@ swift test --filter OpsTests          # unit suite — fast, no cap needed
 
 `--filter` matches a regex against suite + test names.
 
+### Fast NAX2 Metal loop
+
+The Laguna NAX2 kernels contain `_mpp_` in their names, so `PSOCache` always
+live-compiles their packaged `.metal` source against the running OS. While
+iterating on a generation-specific fragment layout, use the minimum legal
+`M=64, N=128, K=256` tile:
+
+```bash
+make test-laguna-nax2-fast
+```
+
+This intentionally skips the 1,349-kernel Iron regeneration and exercises the
+real family dispatch, runtime Metal compilation, and a CPU numerical oracle.
+It is an inner-loop shortcut, not a final gate: once the kernel settles, run
+`make build`, the full test targets above, and the release benchmarks named in
+`LagunaNax2GemmBenchTests` and `LagunaNax2GpuOnlyBenchTests`.
+
 ## Test layout
 
 ```
