@@ -256,6 +256,17 @@ public final class QuantizedLinear: Module {
                 input: x, weight: weight, scales: scales, biases: biases,
                 t: t, nOut: outDim, kIn: inDim, groupSize: groupSize,
                 on: cmd, device: device, into: out, bits: bits)
+        } else if bits == 4, outDim % 8 == 0, outDim % 32 != 0,
+            t >= 8, groupSize == 64, inDim % 256 == 0,
+            (x.dtype == .bf16 || x.dtype == .f16),
+            ButterEnv["BUTTER_QMM_NARROW_N"] != "0"
+        {
+            // GDN a/b is N=48: skip full-weight dequant + dense gemm.
+            out = Tensor.empty(shape: [t, outDim], dtype: x.dtype, device: device)
+            Ops.dequantGemmNarrowN(
+                input: x, weight: weight, scales: scales, biases: biases,
+                t: t, nOut: outDim, kIn: inDim, groupSize: groupSize,
+                on: cmd, device: device, into: out)
         } else if bits == 4 || bits == 8 {
             // Narrow outDim (e.g. 8-bit shared_expert_gate hidden->1) that
             // misses the outDim%32 fast tile: dequantize the weight to dense
