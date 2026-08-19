@@ -113,21 +113,22 @@ struct LagunaMppGemmTests {
     // w3/mpp-bench (m=192) and isn't specific to these real shapes. Full
     // m=512 IS exercised below, GPU-only (no CPU triple loop needed), by
     // `steelEquivalenceAtBenchShapes`.
-    private static let benchShapes:
-        [(label: String, n: Int, k: Int)] = [
-            ("qproj48h", 6144, 2048),
-            ("qproj64h", 8192, 2048),
-            ("kvproj", 1024, 2048),
-            ("oproj48h", 2048, 6144),
-            ("oproj64h", 2048, 8192),
-            ("l00gateup", 8192, 2048),
-            ("l00down", 2048, 8192),
-        ]
+    private static let benchShapes: [(label: String, n: Int, k: Int)] = [
+        ("qproj48h", 6144, 2048),
+        ("qproj64h", 8192, 2048),
+        ("kvproj", 1024, 2048),
+        ("oproj48h", 2048, 6144),
+        ("oproj64h", 2048, 8192),
+        ("l00gateup", 8192, 2048),
+        ("l00down", 2048, 8192),
+    ]
 
-    @Test("MPP dense GEMM matches CPU reference at all 7 real Laguna XS bench shapes (m=64)",
+    @Test(
+        "MPP dense GEMM matches CPU reference at all 7 real Laguna XS bench shapes (m=64)",
         .enabled(if: true))
     func correctnessAtBenchShapes() throws {
-        guard mppAvailable else { return }  // MPP incapable (e.g. CI paravirt GPU) or BUTTER_FORCE_NO_MPP=1: skip, not fail
+        // MPP incapable (e.g. CI paravirt GPU): skip, not fail.
+        guard mppAvailable else { return }
         let device = Device.shared
         let m = 64
 
@@ -140,7 +141,9 @@ struct LagunaMppGemmTests {
 
             var out: Tensor!
             runAndWait { cmd in
-                out = LagunaMppGemm.callMany(a: a, w: w, m: m, n: n, k: k, on: cmd, device: device)
+                out = LagunaMppGemm.callMany(
+                    a: a, w: w, m: m, n: n, k: k, on: cmd, device: device,
+                    nax2Mode: .forceStaged)
             }
 
             let gpuBits = out.toArray(as: UInt16.self)
@@ -182,10 +185,12 @@ struct LagunaMppGemmTests {
     // K-iterations of the BK=32 loop) but modest N/M keeps the CPU
     // reference cheap while still exercising the fold across many
     // accumulation steps.
-    @Test("MPP dense GEMM stays finite and accurate through activation magnitude 800 (T23 fold)",
+    @Test(
+        "MPP dense GEMM stays finite and accurate through activation magnitude 800 (T23 fold)",
         .enabled(if: true))
     func magnitudeFoldRamp() throws {
-        guard mppAvailable else { return }  // MPP incapable (e.g. CI paravirt GPU) or BUTTER_FORCE_NO_MPP=1: skip, not fail
+        // MPP incapable (e.g. CI paravirt GPU): skip, not fail.
+        guard mppAvailable else { return }
         let device = Device.shared
         let m = 64, n = 64, k = 2048
 
@@ -204,7 +209,9 @@ struct LagunaMppGemmTests {
 
             var out: Tensor!
             runAndWait { cmd in
-                out = LagunaMppGemm.callMany(a: a, w: w, m: m, n: n, k: k, on: cmd, device: device)
+                out = LagunaMppGemm.callMany(
+                    a: a, w: w, m: m, n: n, k: k, on: cmd, device: device,
+                    nax2Mode: .forceStaged)
             }
             let gpu = out.toArray(as: UInt16.self).map(bf16Decode)
             let nan = gpu.filter(\.isNaN).count
@@ -215,11 +222,18 @@ struct LagunaMppGemmTests {
             let refInf = ref.filter(\.isInfinite).count
             let cos = cosineSimilarity(gpu, ref)
 
-            print("[laguna-mpp-gemm-magnitude] mag=\(magnitude) nan=\(nan) inf=\(inf) refNan=\(refNan) refInf=\(refInf) cos=\(cos)")
+            print(
+                "[laguna-mpp-gemm-magnitude] mag=\(magnitude) nan=\(nan) inf=\(inf) refNan=\(refNan) refInf=\(refInf) cos=\(cos)"
+            )
             #expect(nan == 0, "LagunaMppGemm produced \(nan) NaNs at activation magnitude \(magnitude)")
             #expect(inf == 0, "LagunaMppGemm produced \(inf) Infs at activation magnitude \(magnitude)")
-            #expect(refNan == 0 && refInf == 0, "CPU f32 reference itself non-finite at magnitude \(magnitude) -- ramp exceeds the reference's own safe range")
-            #expect(cos > 0.9999, "LagunaMppGemm vs CPU reference cos=\(cos) <= 0.9999 at activation magnitude \(magnitude)")
+            #expect(
+                refNan == 0 && refInf == 0,
+                "CPU f32 reference itself non-finite at magnitude \(magnitude) -- ramp exceeds the reference's own safe range"
+            )
+            #expect(
+                cos > 0.9999, "LagunaMppGemm vs CPU reference cos=\(cos) <= 0.9999 at activation magnitude \(magnitude)"
+            )
         }
     }
 
@@ -231,10 +245,12 @@ struct LagunaMppGemmTests {
     // Verifies both the eligibility predicate and the `tryMppGemm` hook
     // every call site uses decline cleanly (return `false`/`nil`) rather
     // than silently dispatching an under-populated tile.
-    @Test("MPP dense GEMM declines non-64-multiple M (decode / odd prefill chunk)",
+    @Test(
+        "MPP dense GEMM declines non-64-multiple M (decode / odd prefill chunk)",
         .enabled(if: true))
     func declinesNonAlignedM() throws {
-        guard mppAvailable else { return }  // MPP incapable (e.g. CI paravirt GPU) or BUTTER_FORCE_NO_MPP=1: skip, not fail
+        // MPP incapable (e.g. CI paravirt GPU): skip, not fail.
+        guard mppAvailable else { return }
         let device = Device.shared
         let outDim = 2048, inDim = 2048  // both %64==0 / %32==0: shape alone is otherwise eligible
 
@@ -289,10 +305,12 @@ struct LagunaMppGemmTests {
     // simdgroup_matrix<bfloat,8,8> MMA vs this kernel's half-staged +
     // T23-folded MPP matmul2d), so the two are expected to be
     // FP-reorder-class close, not bit-identical.
-    @Test("MPP dense GEMM matches the steel path at all 7 real Laguna XS bench shapes (m=512)",
+    @Test(
+        "MPP dense GEMM matches the steel path at all 7 real Laguna XS bench shapes (m=512)",
         .enabled(if: true))
     func steelEquivalenceAtBenchShapes() throws {
-        guard mppAvailable else { return }  // MPP incapable (e.g. CI paravirt GPU) or BUTTER_FORCE_NO_MPP=1: skip, not fail
+        // MPP incapable (e.g. CI paravirt GPU): skip, not fail.
+        guard mppAvailable else { return }
         let device = Device.shared
         let m = 512
 
@@ -310,7 +328,9 @@ struct LagunaMppGemmTests {
 
             var mppOut: Tensor!
             runAndWait { cmd in
-                mppOut = LagunaMppGemm.callMany(a: a, w: wLinear, m: m, n: n, k: k, on: cmd, device: device)
+                mppOut = LagunaMppGemm.callMany(
+                    a: a, w: wLinear, m: m, n: n, k: k, on: cmd, device: device,
+                    nax2Mode: .forceStaged)
             }
 
             // Steel needs the weight pre-transposed to [K,N] once, off

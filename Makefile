@@ -154,6 +154,10 @@ test: regenerate-kernels test-unit test-integration ## run unit then integration
 test-unit: regenerate-kernels ## unit + Metal tests at production cap (BUTTER_MAX_COMMAND_BUFFERS=16)
 	BUTTER_MAX_COMMAND_BUFFERS=16 swift test --filter "ButterTests|IronSwiftTests"
 
+.PHONY: test-laguna-nax2-fast
+test-laguna-nax2-fast: ## live-compile + run the minimum family-specific NAX2 tile (no full kernel regen)
+	BUTTER_MAX_COMMAND_BUFFERS=16 swift test -c release --filter LagunaNax2GemmTests.minimumShapeSmoke
+
 .PHONY: test-integration
 test-integration: regenerate-kernels ## end-to-end model tests; production cap + ModelLoadLock; matches release.yml
 	@# ModelLoadLock (Tests/ModelIntegrationTests/ModelLoadLock.swift) serializes

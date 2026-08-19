@@ -19,16 +19,6 @@ import IronSwift
 struct LagunaNax2GemmTests {
     private var mppAvailable: Bool { LagunaMppGemm.capable }
 
-    /// Every test that wants the NAX2 path must opt in explicitly (the
-    /// production default is OFF); scoped via defer so a failing test
-    /// cannot leak the flag into later suites (`.serialized` keeps
-    /// ordering deterministic).
-    private func withNax2<T>(_ body: () throws -> T) rethrows -> T {
-        setenv("BUTTER_LAGUNA_NAX2_GEMM", "1", 1)
-        defer { unsetenv("BUTTER_LAGUNA_NAX2_GEMM") }
-        return try body()
-    }
-
     // MARK: - Host helpers (same bf16-truncated generation scheme as
     // LagunaMppGemmTests so CPU and GPU see identical input bits).
 
@@ -96,40 +86,73 @@ struct LagunaNax2GemmTests {
     /// -- every one satisfies NAX2's stricter N%128==0 / K%256==0 gate,
     /// so with the flag on, all production prefill GEMM traffic routes
     /// through the new kernel.
-    private static let benchShapes:
-        [(label: String, n: Int, k: Int)] = [
-            ("qproj48h", 6144, 2048),
-            ("qproj64h", 8192, 2048),
-            ("kvproj", 1024, 2048),
-            ("oproj48h", 2048, 6144),
-            ("oproj64h", 2048, 8192),
-            ("l00gateup", 8192, 2048),
-            ("l00down", 2048, 8192),
-            ("router", 256, 2048),
-        ]
+    private static let benchShapes: [(label: String, n: Int, k: Int)] = [
+        ("qproj48h", 6144, 2048),
+        ("qproj64h", 8192, 2048),
+        ("kvproj", 1024, 2048),
+        ("oproj48h", 2048, 6144),
+        ("oproj64h", 2048, 8192),
+        ("l00gateup", 8192, 2048),
+        ("l00down", 2048, 8192),
+        ("router", 256, 2048),
+    ]
 
     // MARK: - Eligibility gate
 
-    @Test("NAX2 gate: default OFF, and stricter N/K alignment declines to the staged kernel")
-    func eligibilityGate() throws {
-        // Opt-out contract: =0 must decline, even for perfect shapes.
-        setenv("BUTTER_LAGUNA_NAX2_GEMM", "0", 1)
-        #expect(!LagunaMppGemm.nax2Eligible(m: 512, n: 8192, k: 2048), "BUTTER_LAGUNA_NAX2_GEMM=0 must disable")
-        unsetenv("BUTTER_LAGUNA_NAX2_GEMM")
-
-        try withNax2 {
-            guard mppAvailable else { return }  // capability is part of the gate below
-            #expect(LagunaMppGemm.nax2Eligible(m: 512, n: 8192, k: 2048))
-            #expect(LagunaMppGemm.nax2Eligible(m: 64, n: 128, k: 256), "minimum aligned shape")
-            #expect(!LagunaMppGemm.nax2Eligible(m: 100, n: 8192, k: 2048), "M%64 != 0 declines")
-            #expect(!LagunaMppGemm.nax2Eligible(m: 512, n: 8256, k: 2048), "N%128 != 0 declines")
-            #expect(!LagunaMppGemm.nax2Eligible(m: 512, n: 8192, k: 2080), "K%256 != 0 declines")
-        }
+    @Test("NAX2 shape gate declines unaligned M/N/K")
+    func eligibilityGate() {
+        #expect(
+            LagunaMppGemm.nax2DispatchKernelName(supportsApple10: false)
+                == LagunaMppGemm.nax2Apple9KernelName)
+        #expect(
+            LagunaMppGemm.nax2DispatchKernelName(supportsApple10: true)
+                == LagunaMppGemm.nax2KernelName,
+            "Apple family 10 must retain the original M5 kernel")
+        guard mppAvailable else { return }  // capability is part of the gate below
+        #expect(LagunaMppGemm.nax2ShapeEligible(m: 512, n: 8192, k: 2048))
+        #expect(LagunaMppGemm.nax2ShapeEligible(m: 64, n: 128, k: 256), "minimum aligned shape")
+        #expect(!LagunaMppGemm.nax2ShapeEligible(m: 100, n: 8192, k: 2048), "M%64 != 0 declines")
+        #expect(!LagunaMppGemm.nax2ShapeEligible(m: 512, n: 8256, k: 2048), "N%128 != 0 declines")
+        #expect(!LagunaMppGemm.nax2ShapeEligible(m: 512, n: 8192, k: 2080), "K%256 != 0 declines")
     }
 
     // MARK: - Correctness vs CPU reference (m=64, one M-tile; same
     // rationale as LagunaMppGemmTests.correctnessAtBenchShapes for why
     // the CPU triple loop stays at m=64).
+
+    /// Fast edit/compile/run loop for generation-specific fragment-layout
+    /// work. This is the minimum legal NAX2 tile and therefore keeps both
+    /// the CPU oracle and the GPU dispatch small while still exercising
+    /// every A/B/C cooperative-tensor coordinate in the real kernel.
+    ///
+    ///   swift test -c release --filter LagunaNax2GemmTests.minimumShapeSmoke
+    @Test("NAX2 minimum aligned shape matches CPU reference")
+    func minimumShapeSmoke() throws {
+        guard mppAvailable else { return }
+        let device = Device.shared
+        let m = 64, n = 128, k = 256
+        var seed: UInt32 = 0xA9
+        let (aBits, aF32) = randomBf16(count: m * k, seed: &seed, scale: 2.0)
+        let (bBits, bF32) = randomBf16(count: n * k, seed: &seed, scale: 2.0)
+        let a = makeBf16Tensor(aBits, shape: [m, k], device: device)
+        let w = makeBf16Tensor(bBits, shape: [n, k], device: device)
+
+        try #require(LagunaMppGemm.nax2ShapeEligible(m: m, n: n, k: k))
+        var out: Tensor!
+        runAndWait { cmd in
+            out = LagunaMppGemm.callMany(
+                a: a, w: w, m: m, n: n, k: k, on: cmd, device: device,
+                nax2Mode: .forceNax2)
+        }
+
+        let gpu = out.toArray(as: UInt16.self).map(bf16Decode)
+        let ref = cpuReference(a: aF32, b: bF32, m: m, n: n, k: k)
+        let nan = gpu.filter(\.isNaN).count
+        let cos = cosineSimilarity(gpu, ref)
+        print("[laguna-nax2-minimum-smoke] m=\(m) n=\(n) k=\(k) nan=\(nan) cos=\(cos)")
+        #expect(nan == 0)
+        #expect(cos > 0.999, "NAX2 cos \(cos) vs CPU reference")
+    }
 
     @Test("NAX2 dense GEMM matches CPU reference at all real Laguna XS shapes (m=64)")
     func correctnessAtBenchShapes() throws {
@@ -137,33 +160,33 @@ struct LagunaNax2GemmTests {
         let device = Device.shared
         let m = 64
 
-        try withNax2 {
-            for (label, n, k) in Self.benchShapes {
-                try #require(
-                    LagunaMppGemm.nax2Eligible(m: m, n: n, k: k),
-                    "\(label): bench shape unexpectedly ineligible for NAX2")
-                var seed: UInt32 = UInt32(label.utf8.reduce(0) { $0 &+ UInt32($1) }) &+ 7
-                let (aBits, aF32) = randomBf16(count: m * k, seed: &seed, scale: 2.0)
-                let (bBits, bF32) = randomBf16(count: n * k, seed: &seed, scale: 2.0)
-                let a = makeBf16Tensor(aBits, shape: [m, k], device: device)
-                let w = makeBf16Tensor(bBits, shape: [n, k], device: device)
+        for (label, n, k) in Self.benchShapes {
+            try #require(
+                LagunaMppGemm.nax2ShapeEligible(m: m, n: n, k: k),
+                "\(label): bench shape unexpectedly ineligible for NAX2")
+            var seed: UInt32 = UInt32(label.utf8.reduce(0) { $0 &+ UInt32($1) }) &+ 7
+            let (aBits, aF32) = randomBf16(count: m * k, seed: &seed, scale: 2.0)
+            let (bBits, bF32) = randomBf16(count: n * k, seed: &seed, scale: 2.0)
+            let a = makeBf16Tensor(aBits, shape: [m, k], device: device)
+            let w = makeBf16Tensor(bBits, shape: [n, k], device: device)
 
-                var out: Tensor!
-                runAndWait { cmd in
-                    out = LagunaMppGemm.callMany(a: a, w: w, m: m, n: n, k: k, on: cmd, device: device)
-                }
-
-                let gpu = out.toArray(as: UInt16.self).map(bf16Decode)
-                let ref = cpuReference(a: aF32, b: bF32, m: m, n: n, k: k)
-                let nan = gpu.filter(\.isNaN).count
-                let cos = cosineSimilarity(gpu, ref)
-                print("[laguna-nax2-gemm-correctness] \(label) m=\(m) n=\(n) k=\(k) nan=\(nan) cos=\(cos)")
-                #expect(nan == 0, "\(label): NAX2 produced \(nan) NaNs")
-                // Same bar the staged kernel's CPU-reference gate uses
-                // (its header documents 0.99985+ measured, 0.999 asserted:
-                // reduced-precision K-accumulation noise, with margin).
-                #expect(cos > 0.999, "\(label): NAX2 cos \(cos) vs CPU reference")
+            var out: Tensor!
+            runAndWait { cmd in
+                out = LagunaMppGemm.callMany(
+                    a: a, w: w, m: m, n: n, k: k, on: cmd, device: device,
+                    nax2Mode: .forceNax2)
             }
+
+            let gpu = out.toArray(as: UInt16.self).map(bf16Decode)
+            let ref = cpuReference(a: aF32, b: bF32, m: m, n: n, k: k)
+            let nan = gpu.filter(\.isNaN).count
+            let cos = cosineSimilarity(gpu, ref)
+            print("[laguna-nax2-gemm-correctness] \(label) m=\(m) n=\(n) k=\(k) nan=\(nan) cos=\(cos)")
+            #expect(nan == 0, "\(label): NAX2 produced \(nan) NaNs")
+            // Same bar the staged kernel's CPU-reference gate uses
+            // (its header documents 0.99985+ measured, 0.999 asserted:
+            // reduced-precision K-accumulation noise, with margin).
+            #expect(cos > 0.999, "\(label): NAX2 cos \(cos) vs CPU reference")
         }
     }
 
@@ -185,15 +208,17 @@ struct LagunaNax2GemmTests {
             let w = makeBf16Tensor(bBits, shape: [n, k], device: device)
 
             var nax2Out: Tensor!
-            withNax2 {
-                runAndWait { cmd in
-                    nax2Out = LagunaMppGemm.callMany(a: a, w: w, m: m, n: n, k: k, on: cmd, device: device)
-                }
+            runAndWait { cmd in
+                nax2Out = LagunaMppGemm.callMany(
+                    a: a, w: w, m: m, n: n, k: k, on: cmd, device: device,
+                    nax2Mode: .forceNax2)
             }
 
             var stagedOut: Tensor!
             runAndWait { cmd in
-                stagedOut = LagunaMppGemm.callMany(a: a, w: w, m: m, n: n, k: k, on: cmd, device: device)
+                stagedOut = LagunaMppGemm.callMany(
+                    a: a, w: w, m: m, n: n, k: k, on: cmd, device: device,
+                    nax2Mode: .forceStaged)
             }
 
             let nax2Vals = nax2Out.toArray(as: UInt16.self).map(bf16Decode)
@@ -221,29 +246,29 @@ struct LagunaNax2GemmTests {
         let device = Device.shared
         let m = 64, n = 128, k = 2048
 
-        try withNax2 {
-            try #require(LagunaMppGemm.nax2Eligible(m: m, n: n, k: k))
-            for magnitude: Float in [1, 10, 50, 100, 200, 400, 800] {
-                var seed: UInt32 = UInt32(magnitude) &+ 5
-                let (aBits, aF32) = randomBf16(count: m * k, seed: &seed, scale: magnitude)
-                let (bBits, bF32) = randomBf16(count: n * k, seed: &seed, scale: 2.0)
-                let a = makeBf16Tensor(aBits, shape: [m, k], device: device)
-                let w = makeBf16Tensor(bBits, shape: [n, k], device: device)
+        try #require(LagunaMppGemm.nax2ShapeEligible(m: m, n: n, k: k))
+        for magnitude: Float in [1, 10, 50, 100, 200, 400, 800] {
+            var seed: UInt32 = UInt32(magnitude) &+ 5
+            let (aBits, aF32) = randomBf16(count: m * k, seed: &seed, scale: magnitude)
+            let (bBits, bF32) = randomBf16(count: n * k, seed: &seed, scale: 2.0)
+            let a = makeBf16Tensor(aBits, shape: [m, k], device: device)
+            let w = makeBf16Tensor(bBits, shape: [n, k], device: device)
 
-                var out: Tensor!
-                runAndWait { cmd in
-                    out = LagunaMppGemm.callMany(a: a, w: w, m: m, n: n, k: k, on: cmd, device: device)
-                }
-                let gpu = out.toArray(as: UInt16.self).map(bf16Decode)
-                let nan = gpu.filter(\.isNaN).count
-                let inf = gpu.filter(\.isInfinite).count
-                let ref = cpuReference(a: aF32, b: bF32, m: m, n: n, k: k)
-                let cos = cosineSimilarity(gpu, ref)
-                print("[laguna-nax2-gemm-magnitude] mag=\(magnitude) nan=\(nan) inf=\(inf) cos=\(cos)")
-                #expect(nan == 0, "NAX2 produced \(nan) NaNs at activation magnitude \(magnitude)")
-                #expect(inf == 0, "NAX2 produced \(inf) Infs at activation magnitude \(magnitude)")
-                #expect(cos > 0.9999, "NAX2 vs CPU reference cos=\(cos) at activation magnitude \(magnitude)")
+            var out: Tensor!
+            runAndWait { cmd in
+                out = LagunaMppGemm.callMany(
+                    a: a, w: w, m: m, n: n, k: k, on: cmd, device: device,
+                    nax2Mode: .forceNax2)
             }
+            let gpu = out.toArray(as: UInt16.self).map(bf16Decode)
+            let nan = gpu.filter(\.isNaN).count
+            let inf = gpu.filter(\.isInfinite).count
+            let ref = cpuReference(a: aF32, b: bF32, m: m, n: n, k: k)
+            let cos = cosineSimilarity(gpu, ref)
+            print("[laguna-nax2-gemm-magnitude] mag=\(magnitude) nan=\(nan) inf=\(inf) cos=\(cos)")
+            #expect(nan == 0, "NAX2 produced \(nan) NaNs at activation magnitude \(magnitude)")
+            #expect(inf == 0, "NAX2 produced \(inf) Infs at activation magnitude \(magnitude)")
+            #expect(cos > 0.9999, "NAX2 vs CPU reference cos=\(cos) at activation magnitude \(magnitude)")
         }
     }
 
@@ -260,29 +285,29 @@ struct LagunaNax2GemmTests {
         let device = Device.shared
         let m = 192, n = 1024, k = 2048
 
-        try withNax2 {
-            try #require(LagunaMppGemm.nax2Eligible(m: m, n: n, k: k))
-            var seed: UInt32 = 2026
-            let (aBits, _) = randomBf16(count: m * k, seed: &seed, scale: 1.5)
-            let (bBits, _) = randomBf16(count: n * k, seed: &seed, scale: 1.5)
-            let a = makeBf16Tensor(aBits, shape: [m, k], device: device)
-            let w = makeBf16Tensor(bBits, shape: [n, k], device: device)
+        try #require(LagunaMppGemm.nax2ShapeEligible(m: m, n: n, k: k))
+        var seed: UInt32 = 2026
+        let (aBits, _) = randomBf16(count: m * k, seed: &seed, scale: 1.5)
+        let (bBits, _) = randomBf16(count: n * k, seed: &seed, scale: 1.5)
+        let a = makeBf16Tensor(aBits, shape: [m, k], device: device)
+        let w = makeBf16Tensor(bBits, shape: [n, k], device: device)
 
-            var out0: Tensor!
-            runAndWait { cmd in
-                out0 = LagunaMppGemm.callMany(a: a, w: w, m: m, n: n, k: k, on: cmd, device: device)
-            }
-
-            setenv("BUTTER_LAGUNA_NAX2_SWIZZLE", "2", 1)
-            defer { unsetenv("BUTTER_LAGUNA_NAX2_SWIZZLE") }
-            var out2: Tensor!
-            runAndWait { cmd in
-                out2 = LagunaMppGemm.callMany(a: a, w: w, m: m, n: n, k: k, on: cmd, device: device)
-            }
-
-            let bits0 = out0.toArray(as: UInt16.self)
-            let bits2 = out2.toArray(as: UInt16.self)
-            #expect(bits0 == bits2, "swizzle remap changed output bits (tile mapping bug)")
+        var out0: Tensor!
+        runAndWait { cmd in
+            out0 = LagunaMppGemm.callMany(
+                a: a, w: w, m: m, n: n, k: k, on: cmd, device: device,
+                nax2Mode: .forceNax2, nax2SwizzleLogOverride: 0)
         }
+
+        var out2: Tensor!
+        runAndWait { cmd in
+            out2 = LagunaMppGemm.callMany(
+                a: a, w: w, m: m, n: n, k: k, on: cmd, device: device,
+                nax2Mode: .forceNax2, nax2SwizzleLogOverride: 2)
+        }
+
+        let bits0 = out0.toArray(as: UInt16.self)
+        let bits2 = out2.toArray(as: UInt16.self)
+        #expect(bits0 == bits2, "swizzle remap changed output bits (tile mapping bug)")
     }
 }

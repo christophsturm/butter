@@ -71,7 +71,8 @@ struct LagunaNax2GpuOnlyBenchTests {
         return t
     }
 
-    @Test("NAX2 & staged GPU-only GB/s at Laguna dense-proj shapes (m=512)",
+    @Test(
+        "NAX2 & staged GPU-only GB/s at Laguna dense-proj shapes (m=512)",
         .enabled(if: mppAvailable))
     func nax2GpuOnly() throws {
         let device = Device.shared
@@ -87,34 +88,43 @@ struct LagunaNax2GpuOnlyBenchTests {
         // penalized by GPU clock ramp — same guard the wall-clock file uses.
         do {
             var seed: UInt32 = 91
-            let a = Self.makeBf16Tensor(Self.randomBf16(count: 1408 * 2048, seed: &seed, scale: 1.0),
-                                   shape: [1408, 2048], device: device)
-            let w = Self.makeBf16Tensor(Self.randomBf16(count: 8192 * 2048, seed: &seed, scale: 1.0),
-                                   shape: [8192, 2048], device: device)
+            let a = Self.makeBf16Tensor(
+                Self.randomBf16(count: 1408 * 2048, seed: &seed, scale: 1.0),
+                shape: [1408, 2048], device: device)
+            let w = Self.makeBf16Tensor(
+                Self.randomBf16(count: 8192 * 2048, seed: &seed, scale: 1.0),
+                shape: [8192, 2048], device: device)
             let t0 = CFAbsoluteTimeGetCurrent()
             while CFAbsoluteTimeGetCurrent() - t0 < 1.0 {
                 let cmd = device.makeCommandBuffer()
-                _ = LagunaMppGemm.callMany(a: a, w: w, m: 1408, n: 8192, k: 2048, on: cmd, device: device)
+                _ = LagunaMppGemm.callMany(
+                    a: a, w: w, m: 1408, n: 8192, k: 2048, on: cmd, device: device,
+                    nax2Mode: .forceNax2)
                 cmd.commit(); cmd.waitUntilCompleted()
             }
         }
 
         for (label, n, k) in shapes {
             var seed = UInt32(label.utf8.reduce(0) { $0 &+ UInt32($1) }) &+ 5
-            let a = Self.makeBf16Tensor(Self.randomBf16(count: m * k, seed: &seed, scale: 1.5), shape: [m, k], device: device)
-            let w = Self.makeBf16Tensor(Self.randomBf16(count: n * k, seed: &seed, scale: 1.5), shape: [n, k], device: device)
+            let a = Self.makeBf16Tensor(
+                Self.randomBf16(count: m * k, seed: &seed, scale: 1.5), shape: [m, k], device: device)
+            let w = Self.makeBf16Tensor(
+                Self.randomBf16(count: n * k, seed: &seed, scale: 1.5), shape: [n, k], device: device)
 
-            setenv("BUTTER_LAGUNA_NAX2_GEMM", "1", 1)
             let nax2Ms = Self.gpuOnlyMedianMs(warmup: 15, iters: 15) { cmd in
-                _ = LagunaMppGemm.callMany(a: a, w: w, m: m, n: n, k: k, on: cmd, device: device)
+                _ = LagunaMppGemm.callMany(
+                    a: a, w: w, m: m, n: n, k: k, on: cmd, device: device,
+                    nax2Mode: .forceNax2)
             }
-            unsetenv("BUTTER_LAGUNA_NAX2_GEMM")
             let stagedMs = Self.gpuOnlyMedianMs(warmup: 15, iters: 15) { cmd in
-                _ = LagunaMppGemm.callMany(a: a, w: w, m: m, n: n, k: k, on: cmd, device: device)
+                _ = LagunaMppGemm.callMany(
+                    a: a, w: w, m: m, n: n, k: k, on: cmd, device: device,
+                    nax2Mode: .forceStaged)
             }
 
             let line = String(
-                format: "[w13-gpuonly] %@ m=%d n=%d k=%d  NAX2 %.3fms %.1f GB/s (%.0f GF/s)  |  staged %.3fms %.1f GB/s (%.0f GF/s)",
+                format:
+                    "[w13-gpuonly] %@ m=%d n=%d k=%d  NAX2 %.3fms %.1f GB/s (%.0f GF/s)  |  staged %.3fms %.1f GB/s (%.0f GF/s)",
                 label, m, n, k,
                 nax2Ms, Self.gbps(m: m, n: n, k: k, ms: nax2Ms), Self.gflops(m: m, n: n, k: k, ms: nax2Ms),
                 stagedMs, Self.gbps(m: m, n: n, k: k, ms: stagedMs), Self.gflops(m: m, n: n, k: k, ms: stagedMs))

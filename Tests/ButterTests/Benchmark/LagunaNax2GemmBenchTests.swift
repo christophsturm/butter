@@ -64,7 +64,8 @@ struct LagunaNax2GemmBenchTests {
         return t
     }
 
-    @Test("NAX2 vs staged MPP at real Laguna XS shapes (m=512 and m=1408)",
+    @Test(
+        "NAX2 vs staged MPP at real Laguna XS shapes (m=512 and m=1408)",
         .enabled(if: mppAvailable))
     func nax2VsStaged() throws {
         let device = Device.shared
@@ -94,7 +95,9 @@ struct LagunaNax2GemmBenchTests {
             let t0 = CFAbsoluteTimeGetCurrent()
             while CFAbsoluteTimeGetCurrent() - t0 < 1.0 {
                 let cmd = Device.shared.makeCommandBuffer()
-                _ = LagunaMppGemm.callMany(a: a, w: w, m: 1408, n: 8192, k: 2048, on: cmd, device: device)
+                _ = LagunaMppGemm.callMany(
+                    a: a, w: w, m: 1408, n: 8192, k: 2048, on: cmd, device: device,
+                    nax2Mode: .forceNax2)
                 cmd.commit()
                 cmd.waitUntilCompleted()
             }
@@ -110,19 +113,22 @@ struct LagunaNax2GemmBenchTests {
                 let a = Self.makeBf16Tensor(aBits, shape: [m, k], device: device)
                 let w = Self.makeBf16Tensor(bBits, shape: [n, k], device: device)
 
-                setenv("BUTTER_LAGUNA_NAX2_GEMM", "1", 1)
                 let nax2Ms = Self.medianOf3 { cmd in
-                    _ = LagunaMppGemm.callMany(a: a, w: w, m: m, n: n, k: k, on: cmd, device: device)
+                    _ = LagunaMppGemm.callMany(
+                        a: a, w: w, m: m, n: n, k: k, on: cmd, device: device,
+                        nax2Mode: .forceNax2)
                 }
-                unsetenv("BUTTER_LAGUNA_NAX2_GEMM")
                 let stagedMs = Self.medianOf3 { cmd in
-                    _ = LagunaMppGemm.callMany(a: a, w: w, m: m, n: n, k: k, on: cmd, device: device)
+                    _ = LagunaMppGemm.callMany(
+                        a: a, w: w, m: m, n: n, k: k, on: cmd, device: device,
+                        nax2Mode: .forceStaged)
                 }
 
                 let nax2Gf = Self.gflops(m: m, n: n, k: k, ms: nax2Ms)
                 let stagedGf = Self.gflops(m: m, n: n, k: k, ms: stagedMs)
                 let line = String(
-                    format: "[w34-nax2-vs-staged] %@ m=%d n=%d k=%d nax2=%.3fms (%.0f GF/s) staged=%.3fms (%.0f GF/s) ratio=%.3f",
+                    format:
+                        "[w34-nax2-vs-staged] %@ m=%d n=%d k=%d nax2=%.3fms (%.0f GF/s) staged=%.3fms (%.0f GF/s) ratio=%.3f",
                     label, m, n, k, nax2Ms, nax2Gf, stagedMs, stagedGf, nax2Ms / stagedMs)
                 print(line)
             }
