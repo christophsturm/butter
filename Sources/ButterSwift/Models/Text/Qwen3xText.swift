@@ -1366,6 +1366,12 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //   BUTTER_SDPA_2PASS_THRESHOLD=<n>
 //     Decode-only. KV length above which 2-pass flash-decoding kicks
 //     in for the attention mixer. Default 1024 when unset.
+//   BUTTER_MTP_DRAFT_KV_ONLY=0
+//     Force the lockstep draft re-advance through the full layer.
+//     Default ON: write KV only.
+//   BUTTER_MTP_DRAFT_APPEND_ONLY=0
+//     Force Q, SDPA, and o_proj on the KV-only path. Default ON: append
+//     K/V only.
 //
 // ── Dense int4 GEMM (batched-prefill quantized projections, T > 1) ──
 //   Routes through `Ops.dequantGemmDynamicM` / `Ops.dispatchQmmMma`, the
@@ -3480,6 +3486,69 @@ public final class Qwen35AttentionMixer: Module {
         }
         let attnRows = attnFlat.reshaped(to: [t, qDim])
         return oProj.callMany(attnRows, t: t, on: cmd, device: device)
+    }
+
+    /// KV-append-only T-batched mixer. Same K/V write as `forwardMany`,
+    /// then return. Skips q_proj, Q RMSNorm, Q RoPE, SDPA, and o_proj.
+    /// Used by `Qwen3xMTPHead.draftStepMany` when the caller only needs
+    /// the cache side effect.
+    func forwardManyAppendKV(
+        _ xNormFlat: Tensor, t: Int, startPosition: Int,
+        cache kv: KVCache,
+        cmd: MTLCommandBuffer, device: Device
+    ) {
+        precondition(
+            t > 0, "Qwen35AttentionMixer.forwardManyAppendKV: T must be positive")
+        let dt = xNormFlat.dtype
+        let kvDim = nKVHeads * headDim
+
+        let kOut: Tensor
+        let vOut: Tensor
+        if let islands = projectionPrecisionIslands {
+            let qBuf = Tensor.empty(
+                shape: [t, islands.qOutputWidth], dtype: dt, device: device)
+            let kBuf = Tensor.empty(shape: [t, kvDim], dtype: dt, device: device)
+            let vBuf = Tensor.empty(shape: [t, kvDim], dtype: dt, device: device)
+            let exact = islands.projection.callMany(
+                xNormFlat, t: t, on: cmd, device: device)
+            Ops.splitScatterColumns(
+                input: exact, indices: islands.qIndices,
+                primary: qBuf, secondary: kBuf, tertiary: vBuf,
+                scatterWidth: islands.qIndices.elementCount,
+                primaryWidth: islands.qOutputWidth,
+                copyWidth: kvDim, on: cmd)
+            kOut = kBuf
+            vOut = vBuf
+        } else {
+            kOut = kProj.callMany(xNormFlat, t: t, on: cmd, device: device)
+            vOut = vProj.callMany(xNormFlat, t: t, on: cmd, device: device)
+        }
+
+        let kNormed = Tensor.empty(
+            shape: kOut.shape, dtype: kOut.dtype, device: device)
+        _ = Ops.rmsNormRows(
+            kOut, weight: kNorm.weight, eps: kNorm.eps,
+            nRows: t * nKVHeads, rowSize: headDim, on: cmd, into: kNormed)
+
+        let positions = device.makeBuffer(length: t * 4)
+        let positionsPtr = positions.contents().bindMemory(
+            to: UInt32.self, capacity: t)
+        for r in 0 ..< t { positionsPtr[r] = UInt32(startPosition + r) }
+        let positionsT = Tensor(
+            buffer: positions, offset: 0, shape: [t], dtype: .u32)
+        Ops.ropePartialMany(
+            kNormed, positions: positionsT,
+            t: t, nHeads: nKVHeads,
+            headDim: headDim, rotaryDim: rotaryDim,
+            rowStride: kvDim,
+            thetaBase: ropeTheta, on: cmd)
+
+        let appendPositions = Tensor.empty(
+            shape: [t], dtype: .u32, device: device)
+        kv.reserveSlotsManyOnHost(t: t, into: appendPositions)
+        kv.appendRangeOnGPUMany(
+            kFlat: kNormed, vFlat: vOut, t: t,
+            positions: appendPositions, on: cmd)
     }
 }
 
