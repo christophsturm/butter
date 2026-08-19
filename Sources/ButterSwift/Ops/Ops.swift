@@ -10082,6 +10082,17 @@ public enum Ops {
             useCoop4 && m >= 64 && m % 64 == 0 && n % 128 == 0
             && input.dtype == .bf16
             && ButterEnv["BUTTER_QMM_COOP_BM64"] != "0"
+        // Baked K/N/GSPR BM64 siblings for dense FFN/QKV/down.
+        // Default ON. Force off: BUTTER_QMM_COOP_BM64_SHAPE=0.
+        let useCoopBm64Shape =
+            useCoopBm64 && ButterEnv["BUTTER_QMM_COOP_BM64_SHAPE"] != "0"
+        // Extra baked shapes (GDN z/o + attn Q/K/V). Default ON when
+        // m<768. Force on at all M: =1. Force off: =0.
+        let extraEnv = ButterEnv["BUTTER_QMM_COOP_BM64_SHAPE_EXTRA"]
+        let useCoopBm64ShapeExtra =
+            useCoopBm64Shape
+            && extraEnv != "0"
+            && (extraEnv == "1" || (extraEnv == nil && m < 768))
         switch (bits, input.dtype) {
         case (4, .f32):
             if useCoop128 {
@@ -10162,7 +10173,67 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             }
         case (4, .bf16):
-            if useCoopBm64 {
+            if useCoopBm64ShapeExtra && n == 6144 && k == 5120 {
+                IronKernels.iron_qmm_coop_bm64_shape_n6144_k5120_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    gridSize: MTLSize(width: n / 128, height: m / 64, depth: 1),
+                    threadgroupSize: MTLSize(width: 256, height: 1, depth: 1),
+                    on: cmd)
+            } else if useCoopBm64ShapeExtra && n == 5120 && k == 6144 {
+                IronKernels.iron_qmm_coop_bm64_shape_n5120_k6144_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    gridSize: MTLSize(width: n / 128, height: m / 64, depth: 1),
+                    threadgroupSize: MTLSize(width: 256, height: 1, depth: 1),
+                    on: cmd)
+            } else if useCoopBm64ShapeExtra && n == 1024 && k == 5120 {
+                IronKernels.iron_qmm_coop_bm64_shape_n1024_k5120_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    gridSize: MTLSize(width: n / 128, height: m / 64, depth: 1),
+                    threadgroupSize: MTLSize(width: 256, height: 1, depth: 1),
+                    on: cmd)
+            } else if useCoopBm64Shape && n == 17408 && k == 5120 {
+                IronKernels.iron_qmm_coop_bm64_shape_n17408_k5120_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    gridSize: MTLSize(width: n / 128, height: m / 64, depth: 1),
+                    threadgroupSize: MTLSize(width: 256, height: 1, depth: 1),
+                    on: cmd)
+            } else if useCoopBm64Shape && n == 10240 && k == 5120 {
+                IronKernels.iron_qmm_coop_bm64_shape_n10240_k5120_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    gridSize: MTLSize(width: n / 128, height: m / 64, depth: 1),
+                    threadgroupSize: MTLSize(width: 256, height: 1, depth: 1),
+                    on: cmd)
+            } else if useCoopBm64Shape && n == 5120 && k == 17408 {
+                IronKernels.iron_qmm_coop_bm64_shape_n5120_k17408_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    gridSize: MTLSize(width: n / 128, height: m / 64, depth: 1),
+                    threadgroupSize: MTLSize(width: 256, height: 1, depth: 1),
+                    on: cmd)
+            } else if useCoopBm64 {
                 IronKernels.iron_qmm_coop_bm64_bf16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,

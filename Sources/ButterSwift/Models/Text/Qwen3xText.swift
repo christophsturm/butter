@@ -1404,6 +1404,12 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //   BUTTER_QMM_SPLIT64=0
 //     Force off. Default ON only when t<768: aligned prefix on BM64,
 //     remainder padded. Force on at all T with =1.
+//   BUTTER_QMM_COOP_BM64_SHAPE=0
+//     Force off baked-K/N BM64 tiles for dense FFN up / QKV / FFN down.
+//     Default ON.
+//   BUTTER_QMM_COOP_BM64_SHAPE_EXTRA=0
+//     Force off extra baked BM64 tiles (GDN z/o + attn Q/K/V). Default ON
+//     only when M<768. Force on at all M with =1.
 //
 // ── GDN (Gated DeltaNet recurrent mixer) ────────────────────────────
 //   BUTTER_GDN_NO_FUSED_PREP=1
