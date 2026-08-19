@@ -10686,6 +10686,29 @@ public enum Ops {
     private static let qmmCoopEnvRaw: String? =
         ButterEnv["BUTTER_QMM_COOP"]
 
+    /// The BN=64/128 cooperative QMM kernels are validated on Apple GPU
+    /// Family 10. On Family 9 their cooperative-tensor load/store layout
+    /// produces incorrect values, while the BN=32 MPP tier below is both
+    /// supported and parity-clean. Keep this as a pure selector so the
+    /// family split can be tested without requiring particular hardware.
+    static func qmmCoopRequested(
+        envRaw: String?, supportsApple10: Bool, mppAutoCapable: Bool
+    ) -> Bool {
+        switch envRaw {
+        case "0": return false
+        case "1": return supportsApple10
+        default: return supportsApple10 && mppAutoCapable
+        }
+    }
+
+    /// Cached once: this dispatcher is in every dense int4 projection's
+    /// hot path, so neither environment lookup nor GPU-family detection
+    /// belongs in each invocation.
+    private static let qmmCoopRequested4 = qmmCoopRequested(
+        envRaw: qmmCoopEnvRaw,
+        supportsApple10: Device.shared.mtlDevice.supportsFamily(.apple10),
+        mppAutoCapable: mppAutoCapable)
+
     /// Inner dispatcher for `dequantGemmDynamicM`. Grid is `[N/32, M/32, 1]`
     /// × tg `[128, 1, 1]` (4 SGs WM=WN=2 per the canonical `iron_qmm_mma`).
     /// `dispatchThreads` counts total threads per axis, so grid.x = N/32·128.
@@ -10704,9 +10727,11 @@ public enum Ops {
     ///     gate below; a caller with a narrower N (not a multiple of 64,
     ///     e.g. some vision-tower FFN dims) falls through to tier 2/3
     ///     regardless of the gate. Gate: `BUTTER_QMM_COOP=0` (force off) /
-    ///     `=1` (force on); unset auto-detects on `Ops.mppAutoCapable`
-    ///     hardware (default ON there; this is the fastest of the three
-    ///     tiers on every dense int4 shape measured so far).
+    ///     `=1` (force on where validated); unset auto-detects Apple GPU
+    ///     Family 10 + `Ops.mppAutoCapable` hardware. Family 9 falls
+    ///     through to tier 2 because its cooperative-tensor load/store
+    ///     layout fails QMM parity there. The family check also applies to
+    ///     `=1`; an A/B override cannot enable a known-invalid kernel.
     ///  2. `iron_qmm_mma_mpp` (MPP/NAX cooperative-tensor kernel,
     ///     live-compiled via `MetalPerformancePrimitives`) over the manual
     ///     simdgroup ladder, same idea as the existing bits=8 MPP arm
@@ -10951,14 +10976,8 @@ public enum Ops {
         default: mppRequested4 = Self.mppAutoCapable
         }
         let useMpp4 = mppRequested4 && gsPerRow > 0 && k % gsPerRow == 0 && k / gsPerRow == 64
-        let coopRequested4: Bool
-        switch Self.qmmCoopEnvRaw {
-        case "0": coopRequested4 = false
-        case "1": coopRequested4 = true
-        default: coopRequested4 = Self.mppAutoCapable
-        }
         let useCoop4 =
-            coopRequested4 && n % 64 == 0 && gsPerRow > 0 && k % gsPerRow == 0
+            Self.qmmCoopRequested4 && n % 64 == 0 && gsPerRow > 0 && k % gsPerRow == 0
             && k / gsPerRow == 64
         let useCoop128 =
             useCoop4 && m >= 256 && n % 128 == 0
