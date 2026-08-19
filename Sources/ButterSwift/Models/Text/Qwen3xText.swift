@@ -1366,6 +1366,9 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //   BUTTER_SDPA_2PASS_THRESHOLD=<n>
 //     Decode-only. KV length above which 2-pass flash-decoding kicks
 //     in for the attention mixer. Default 256 when unset.
+//   BUTTER_SDPA_VERIFY_MULTI=0
+//     Force MTP-verify (T<=16, long KV) back to the BQ=32 MMA tile.
+//     Default ON: sdpaMulti, one threadgroup per query row.
 //   BUTTER_MTP_DRAFT_KV_ONLY=0
 //     Force the lockstep draft re-advance through the full layer.
 //     Default ON: write KV only.
@@ -3182,7 +3185,7 @@ public final class Qwen35AttentionMixer: Module {
         }
         // Flash-Decoding 2-pass at long KV. Splits KV across `blocks`
         // threadgroups in pass1, merges in pass2. Wins over single-pass
-        // when nKV ≥ ~1024 (default threshold); env var
+        // when nKV is at the decode-page threshold; env var
         // `BUTTER_SDPA_2PASS_THRESHOLD` overrides.
         let attnOut: Tensor
         if useTwoPassDecode && kv.length >= sdpa2PassThreshold {
@@ -3430,8 +3433,25 @@ public final class Qwen35AttentionMixer: Module {
         let useMmaD256 = useMmaD256Cached
         let useQtiled = useQtiledD256Cached
         let (cacheK, cacheV) = kv.prepareForAttention(on: cmd)
+        // Skinny long-KV (MTP verify): a BQ=32 MMA tile is mostly
+        // padding at T<=16. sdpaMulti walks one query row per
+        // threadgroup. Default ON after 4K/8K/16K golden pairs.
+        // Force off: BUTTER_SDPA_VERIFY_MULTI=0.
+        let useVerifyMulti =
+            headDim == 256
+            && t <= 16
+            && (startPosition + t) >= sdpa2PassThreshold
+            && ButterEnv["BUTTER_SDPA_VERIFY_MULTI"] != "0"
         let attnAll: Tensor
-        if useMmaD256 {
+        if useVerifyMulti {
+            let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
+            attnAll = Ops.sdpaMulti(
+                q: qBlock, k: cacheK, v: cacheV,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
+                causal: true, scale: scale, on: cmd
+            ).reshaped(to: [t * qDim])
+        } else if useMmaD256 {
             let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
             attnAll = Ops.sdpaPrefillMmaD256(
                 q: qBlock, k: cacheK, v: cacheV,
