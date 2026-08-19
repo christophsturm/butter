@@ -587,12 +587,27 @@ public final class Qwen3xMTPHead: Module {
         let fused = fuseInputsMany(
             prevHiddenFlat: prevHiddensFlat, embeddingFlat: embeddingFlat,
             t: t, on: cmd, device: device)
-        // Full layer forward (attention + dense FFN) for its KV side
-        // effect only — mirrors single-token `draftStep`, whose
-        // lockstep caller already discards both `hidden` and `logits`.
-        _ = layer.decodeMany(
-            fused, t: t, startPosition: startPosition,
-            cache: kvCache, cmd: cmd, device: device)
+        // Callers discard the hidden. Default ON: write KV only.
+        // APPEND_ONLY also skips Q, SDPA, and o_proj. Force either
+        // off with =0.
+        if ButterEnv["BUTTER_MTP_DRAFT_KV_ONLY"] != "0" {
+            let xNormFlat = Ops.rmsNormRows(
+                fused, weight: layer.inputNorm.weight, eps: layer.inputNorm.eps,
+                nRows: t, rowSize: hidden, on: cmd)
+            if ButterEnv["BUTTER_MTP_DRAFT_APPEND_ONLY"] != "0" {
+                layer.mixer.forwardManyAppendKV(
+                    xNormFlat, t: t, startPosition: startPosition,
+                    cache: kvCache, cmd: cmd, device: device)
+            } else {
+                _ = layer.mixer.forwardMany(
+                    xNormFlat, t: t, startPosition: startPosition,
+                    cache: kvCache, cmd: cmd, device: device)
+            }
+        } else {
+            _ = layer.decodeMany(
+                fused, t: t, startPosition: startPosition,
+                cache: kvCache, cmd: cmd, device: device)
+        }
     }
 
     // ── Loading ──────────────────────────────────────────────────────
