@@ -64,6 +64,23 @@ struct LagunaNax2GemmTests {
         return out
     }
 
+    private func cpuReferenceSamples(
+        a: [Float], b: [Float], n: Int, k: Int, rows: [Int], columns: [Int]
+    ) -> [Float] {
+        var out: [Float] = []
+        out.reserveCapacity(rows.count * columns.count)
+        for i in rows {
+            let aRow = i * k
+            for j in columns {
+                let bRow = j * k
+                var acc: Float = 0
+                for kk in 0 ..< k { acc += a[aRow + kk] * b[bRow + kk] }
+                out.append(acc)
+            }
+        }
+        return out
+    }
+
     private func cosineSimilarity(_ x: [Float], _ y: [Float]) -> Float {
         precondition(x.count == y.count)
         var dot: Float = 0, nx: Float = 0, ny: Float = 0
@@ -116,9 +133,11 @@ struct LagunaNax2GemmTests {
         #expect(!LagunaMppGemm.nax2ShapeEligible(m: 512, n: 8192, k: 2080), "K%256 != 0 declines")
     }
 
-    // MARK: - Correctness vs CPU reference (m=64, one M-tile; same
-    // rationale as LagunaMppGemmTests.correctnessAtBenchShapes for why
-    // the CPU triple loop stays at m=64).
+    // MARK: - Correctness vs CPU reference (m=64, one M-tile). Sample
+    // fragment/tile boundaries at every production N/K shape: a full
+    // m*n*k scalar oracle takes billions of operations in a debug unit
+    // run, while the full-output staged-kernel parity test below covers
+    // every output coordinate at those same production shapes.
 
     /// Fast edit/compile/run loop for generation-specific fragment-layout
     /// work. This is the minimum legal NAX2 tile and therefore keeps both
@@ -154,7 +173,7 @@ struct LagunaNax2GemmTests {
         #expect(cos > 0.999, "NAX2 cos \(cos) vs CPU reference")
     }
 
-    @Test("NAX2 dense GEMM matches CPU reference at all real Laguna XS shapes (m=64)")
+    @Test("NAX2 dense GEMM matches sampled CPU reference at all real Laguna XS shapes (m=64)")
     func correctnessAtBenchShapes() throws {
         guard mppAvailable else { return }  // MPP incapable (e.g. CI paravirt GPU): skip, not fail
         let device = Device.shared
@@ -178,10 +197,18 @@ struct LagunaNax2GemmTests {
             }
 
             let gpu = out.toArray(as: UInt16.self).map(bf16Decode)
-            let ref = cpuReference(a: aF32, b: bF32, m: m, n: n, k: k)
             let nan = gpu.filter(\.isNaN).count
-            let cos = cosineSimilarity(gpu, ref)
-            print("[laguna-nax2-gemm-correctness] \(label) m=\(m) n=\(n) k=\(k) nan=\(nan) cos=\(cos)")
+            let rows = [0, 1, 15, 16, 31, 32, 62, 63]
+            let columns = Array(
+                Set([0, 1, 63, 64, 127, min(128, n - 1), n / 2 - 1, n / 2, n - 2, n - 1])
+            ).sorted()
+            let gpuSamples = rows.flatMap { i in columns.map { j in gpu[i * n + j] } }
+            let refSamples = cpuReferenceSamples(
+                a: aF32, b: bF32, n: n, k: k, rows: rows, columns: columns)
+            let cos = cosineSimilarity(gpuSamples, refSamples)
+            print(
+                "[laguna-nax2-gemm-correctness] \(label) m=\(m) n=\(n) k=\(k) "
+                    + "samples=\(gpuSamples.count) nan=\(nan) cos=\(cos)")
             #expect(nan == 0, "\(label): NAX2 produced \(nan) NaNs")
             // Same bar the staged kernel's CPU-reference gate uses
             // (its header documents 0.99985+ measured, 0.999 asserted:
@@ -238,7 +265,8 @@ struct LagunaNax2GemmTests {
     // native bfloat operands (e8 exponent, f32 accumulate) make the
     // whole half-overflow cliff class structurally impossible -- this
     // ramp (same shape/texture as the staged kernel's fold test, out to
-    // 16x past the T23-observed cliff) is the evidence.
+    // 16x past the T23-observed cliff) scans the full GPU output for
+    // non-finite values and compares boundary samples to the CPU oracle.
 
     @Test("NAX2 stays finite and accurate through activation magnitude 800 with no fold")
     func magnitudeRamp() throws {
@@ -263,8 +291,12 @@ struct LagunaNax2GemmTests {
             let gpu = out.toArray(as: UInt16.self).map(bf16Decode)
             let nan = gpu.filter(\.isNaN).count
             let inf = gpu.filter(\.isInfinite).count
-            let ref = cpuReference(a: aF32, b: bF32, m: m, n: n, k: k)
-            let cos = cosineSimilarity(gpu, ref)
+            let rows = [0, 1, 15, 16, 31, 32, 62, 63]
+            let columns = [0, 1, 15, 16, 31, 32, 63, 64, 95, 96, 126, 127]
+            let gpuSamples = rows.flatMap { i in columns.map { j in gpu[i * n + j] } }
+            let refSamples = cpuReferenceSamples(
+                a: aF32, b: bF32, n: n, k: k, rows: rows, columns: columns)
+            let cos = cosineSimilarity(gpuSamples, refSamples)
             print("[laguna-nax2-gemm-magnitude] mag=\(magnitude) nan=\(nan) inf=\(inf) cos=\(cos)")
             #expect(nan == 0, "NAX2 produced \(nan) NaNs at activation magnitude \(magnitude)")
             #expect(inf == 0, "NAX2 produced \(inf) Infs at activation magnitude \(magnitude)")
