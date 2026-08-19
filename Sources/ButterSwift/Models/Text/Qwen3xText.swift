@@ -1377,24 +1377,20 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //   BUTTER_QMM_COOP=0
 //     Force off the BN=64 wide-N cooperative-tensor kernel
 //     (`iron_qmm_coop`); falls through to the MPP tier below. Default: ON
-//     on `Ops.mppAutoCapable` hardware (Apple GPU Family 9+ / macOS 26+)
-//     when the shape is eligible (`n % 64 == 0`, group_size 64). The
-//     fastest of the three dense int4 tiers on every shape measured.
+//     on Apple GPU Family 10 + `Ops.mppAutoCapable` hardware when the
+//     shape is eligible (`n % 64 == 0`, group_size 64). Family 9 uses the
+//     MPP tier because the coop kernel fails QMM parity there. The coop
+//     kernel remains the fastest dense int4 tier where it is enabled.
 //   BUTTER_QMM_COOP=1
-//     Force the coop kernel on even off the auto-capability check (A/B
-//     only; the kernel needs the same MPP/NAX hardware support as
-//     `iron_qmm_mma_mpp`, this does not bypass that requirement).
-//     CAUTION: unlike the shape/group-size checks (still enforced),
-//     forcing this on hardware below the MPP/NAX capability floor is
-//     untested territory - the auto-capability gate exists specifically
-//     to keep this kernel off such hardware, and no test in this repo
-//     exercises the forced-on + incapable-hardware combination.
+//     Force the coop kernel on for eligible shapes on Family 10 (A/B
+//     only). The family gate remains enforced, so this cannot select the
+//     known-invalid Family-9 route or hardware below the MPP/NAX floor.
 //   BUTTER_QMM_MPP=0 | =1
 //     Force off / on the BN=32 MPP/NAX cooperative-tensor kernel
 //     (`iron_qmm_mma_mpp`), the tier below coop. Default: auto-detected
-//     the same way as `BUTTER_QMM_COOP`. Only reached when coop is off or
-//     the shape fails coop's `n % 64 == 0` guard (e.g. some vision-tower
-//     FFN dims).
+//     on Apple GPU Family 9+ / macOS 26+. It is the default dense int4
+//     tier on Family 9, and is also reached when coop is off or the shape
+//     fails coop's `n % 64 == 0` guard (e.g. some vision-tower FFN dims).
 //
 // ── GDN (Gated DeltaNet recurrent mixer) ────────────────────────────
 //   BUTTER_GDN_NO_FUSED_PREP=1

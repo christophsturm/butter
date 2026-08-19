@@ -50,6 +50,20 @@ struct QmvQmmParityTests {
     static let nOut = 64
     static let groupSize = 64
 
+    @Test("cooperative QMM is restricted to Apple GPU Family 10")
+    func coopFamilyGate() {
+        #expect(!Ops.qmmCoopRequested(
+            envRaw: nil, supportsApple10: false, mppAutoCapable: true))
+        #expect(!Ops.qmmCoopRequested(
+            envRaw: "1", supportsApple10: false, mppAutoCapable: true))
+        #expect(!Ops.qmmCoopRequested(
+            envRaw: "0", supportsApple10: true, mppAutoCapable: true))
+        #expect(Ops.qmmCoopRequested(
+            envRaw: nil, supportsApple10: true, mppAutoCapable: true))
+        #expect(Ops.qmmCoopRequested(
+            envRaw: "1", supportsApple10: true, mppAutoCapable: false))
+    }
+
     /// Deterministic LCG so failures reproduce exactly.
     struct RNG {
         var state: UInt64
@@ -273,12 +287,13 @@ struct QmvQmmParityTests {
     /// dispatch (rather than caching a `static let`) is sufficient — no
     /// process restart needed.
     /// Class-numerics control for the bm8 tolerance question: at T=32 the
-    /// DEFAULT route dispatches the existing BM=32 `iron_qmm_mma` kernel,
-    /// which stages dequantized weights through threadgroup memory in the
-    /// activation dtype (bf16 here) exactly like bm8 does. If this control
-    /// shows the same ~0.02+ deviation from QMV, the deviation is the MMA
-    /// class's staging numerics, not a bm8 defect.
-    @Test("CONTROL: QMV vs default MMA32 route row 0 at T=32")
+    /// default route dispatches the best eligible BM=32 QMM tier (MPP on
+    /// Family 9, coop on Family 10, manual MMA below that capability
+    /// floor). Each stages dequantized weights through threadgroup memory
+    /// in the activation dtype (bf16 here) exactly like bm8 does. If this
+    /// control shows the same ~0.02+ deviation from QMV, the deviation is
+    /// the QMM class's staging numerics, not a bm8 defect.
+    @Test("CONTROL: QMV vs default QMM route row 0 at T=32")
     func gemvMatchesMma32GemmRow0() {
         let f = Self.fixture()
         let v = Self.gemv(f)
