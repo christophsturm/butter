@@ -1365,7 +1365,7 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //     small-T / decode routing above, not the general prefill default).
 //   BUTTER_SDPA_2PASS_THRESHOLD=<n>
 //     Decode-only. KV length above which 2-pass flash-decoding kicks
-//     in for the attention mixer. Default 1024 when unset.
+//     in for the attention mixer. Default 256 when unset.
 //   BUTTER_MTP_DRAFT_KV_ONLY=0
 //     Force the lockstep draft re-advance through the full layer.
 //     Default ON: write KV only.
@@ -2872,7 +2872,7 @@ public final class Qwen35AttentionMixer: Module {
         {
             return n
         }
-        return 1024  // default: only kick in at long KV
+        return 256  // default: start 2-pass after one decode page
     }()
 
     /// D=256 attention kernel tier, cached at init (same reasoning as
