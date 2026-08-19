@@ -64,7 +64,8 @@ for n in laguna_moe_routed_swiglu_qmv_nvfp4_bf16 \
          laguna_moe_routed_down_reduce_nvfp4_bf16 \
          nemotron_moe_routed_relu2_qmv_nvfp4_bf16 \
          nemotron_moe_routed_down_reduce_nvfp4_bf16 \
-         iron_nvfp4_dequant_gemv_expert_indexed_bf16; do
+         iron_nvfp4_dequant_gemv_expert_indexed_bf16 \
+         iron_qmm_coop_bm64_bf16; do
   if xcrun metal-nm "$EXTRA_METALLIB" 2>/dev/null | grep -q " $n\$"; then
     echo "  ok: $n in kernels_extra.metallib"
   else

@@ -9597,10 +9597,97 @@ public enum Ops {
             }
         }
 
-        let mPadded = ((t + 31) / 32) * 32
+        // Split a BM64-eligible ragged T into an aligned prefix plus a
+        // remainder so the prefix hits BM64 with no pad blit. Default ON
+        // only when t<768. Force on: BUTTER_QMM_SPLIT64=1. Force off: =0.
+        let split64Env = ButterEnv["BUTTER_QMM_SPLIT64"]
+        let useSplit64 =
+            split64Env == "1"
+            || (split64Env == nil && t < 768)
+        if bits == 4, t >= 64, t % 64 != 0,
+            input.dtype == .bf16, nOut % 128 == 0,
+            useSplit64 && split64Env != "0"
+        {
+            let m0 = (t / 64) * 64
+            let rem = t - m0
+            let dtBytes = input.dtype.byteSize
+            let x0 = Tensor(
+                buffer: input.buffer, offset: input.offset,
+                shape: [m0, kIn], dtype: input.dtype)
+            let out0 = Tensor(
+                buffer: out.buffer, offset: out.offset,
+                shape: [m0, nOut], dtype: out.dtype)
+            let x1 = Tensor(
+                buffer: input.buffer,
+                offset: input.offset + m0 * kIn * dtBytes,
+                shape: [rem, kIn], dtype: input.dtype)
+            let out1 = Tensor(
+                buffer: out.buffer,
+                offset: out.offset + m0 * nOut * dtBytes,
+                shape: [rem, nOut], dtype: out.dtype)
+            dispatchQmmMma(
+                weight: weight, scales: scales, biases: biases,
+                input: x0, output: out0,
+                m: m0, n: nOut, k: kIn, gsPerRow: gsPerRow, bits: bits,
+                on: cmd)
+            // rem 32..63: pad to 64 and stay on BM64. rem 1..31 keeps
+            // the small/pad32 recurse.
+            if rem >= 32 {
+                let remPad = 64
+                autoreleasepool {
+                    let xPadded = Tensor.empty(
+                        shape: [remPad, kIn], dtype: input.dtype, device: device)
+                    let outPadded = Tensor.empty(
+                        shape: [remPad, nOut], dtype: input.dtype, device: device)
+                    let validInBytes = rem * kIn * dtBytes
+                    let tailZeroBytes = (remPad - rem) * kIn * dtBytes
+                    let blit = cmd.makeBlitCommandEncoder()!
+                    blit.copy(
+                        from: x1.buffer, sourceOffset: x1.offset,
+                        to: xPadded.buffer, destinationOffset: xPadded.offset,
+                        size: validInBytes)
+                    if tailZeroBytes > 0 {
+                        blit.fill(
+                            buffer: xPadded.buffer,
+                            range: (xPadded.offset + validInBytes)
+                                ..< (xPadded.offset + validInBytes + tailZeroBytes),
+                            value: 0)
+                    }
+                    blit.endEncoding()
+                    dispatchQmmMma(
+                        weight: weight, scales: scales, biases: biases,
+                        input: xPadded, output: outPadded,
+                        m: remPad, n: nOut, k: kIn, gsPerRow: gsPerRow, bits: bits,
+                        on: cmd)
+                    let validOutBytes = rem * nOut * dtBytes
+                    let outBlit = cmd.makeBlitCommandEncoder()!
+                    outBlit.copy(
+                        from: outPadded.buffer, sourceOffset: outPadded.offset,
+                        to: out1.buffer, destinationOffset: out1.offset,
+                        size: validOutBytes)
+                    outBlit.endEncoding()
+                }
+            } else {
+                dequantGemmDynamicM(
+                    input: x1, weight: weight, scales: scales, biases: biases,
+                    t: rem, nOut: nOut, kIn: kIn, groupSize: groupSize,
+                    on: cmd, device: device, into: out1, bits: bits)
+            }
+            return
+        }
 
-        // Fast path: T already multiple of 32 — dispatch directly without
-        // padding. The hot-loop case for Qwen3.6 prefill (T = 32, 256, 1024,
+        let mPadded32 = ((t + 31) / 32) * 32
+        // Pad to 64 so ragged T can hit BM64 (`m % 64 == 0`). Default ON.
+        // Force off: BUTTER_QMM_PAD64=0.
+        let usePad64 =
+            t >= 64
+            && input.dtype == .bf16
+            && nOut % 128 == 0
+            && ButterEnv["BUTTER_QMM_PAD64"] != "0"
+        let mPadded = usePad64 ? ((t + 63) / 64) * 64 : mPadded32
+
+        // Fast path: T already a tile multiple. Dispatch without padding.
+        // The hot-loop case for Qwen3.6 prefill (T = 32, 256, 1024,
         // 4096, 32768 are all naturally aligned).
         if t == mPadded {
             dispatchQmmMma(
@@ -9989,6 +10076,12 @@ public enum Ops {
         let useCoop128 =
             useCoop4 && m >= 256 && n % 128 == 0
             && ButterEnv["BUTTER_QMM_COOP_BN128"] != "0"
+        // Tall-M sibling of BN128. Requires m%64==0, n%128==0, bf16.
+        // Default ON. Force off: BUTTER_QMM_COOP_BM64=0.
+        let useCoopBm64 =
+            useCoop4 && m >= 64 && m % 64 == 0 && n % 128 == 0
+            && input.dtype == .bf16
+            && ButterEnv["BUTTER_QMM_COOP_BM64"] != "0"
         switch (bits, input.dtype) {
         case (4, .f32):
             if useCoop128 {
@@ -10069,7 +10162,18 @@ public enum Ops {
                     gridSize: grid, threadgroupSize: tg, on: cmd)
             }
         case (4, .bf16):
-            if useCoop128 {
+            if useCoopBm64 {
+                IronKernels.iron_qmm_coop_bm64_bf16_threadgroups(
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    x: input.buffer, xOffset: input.offset,
+                    out: output.buffer, outOffset: output.offset,
+                    k: kU, n: nU, gs_per_row: gsU,
+                    gridSize: MTLSize(width: n / 128, height: m / 64, depth: 1),
+                    threadgroupSize: MTLSize(width: 256, height: 1, depth: 1),
+                    on: cmd)
+            } else if useCoop128 {
                 IronKernels.iron_qmm_coop_bn128_bf16_threadgroups(
                     w: weight.buffer, wOffset: weight.offset,
                     scales: scales.buffer, scalesOffset: scales.offset,
