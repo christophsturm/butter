@@ -1410,6 +1410,9 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //   BUTTER_QMM_COOP_BM64_SHAPE_EXTRA=0
 //     Force off extra baked BM64 tiles (GDN z/o + attn Q/K/V). Default ON
 //     only when M<768. Force on at all M with =1.
+//   BUTTER_QMM_NARROW_N=0
+//     Force off. Default ON: int4 N%8==0 N%32!=0 (GDN a/b N=48) uses
+//     iron_qmm_bm8 instead of dequant-to-dense plus gemm.
 //
 // ── GDN (Gated DeltaNet recurrent mixer) ────────────────────────────
 //   BUTTER_GDN_NO_FUSED_PREP=1

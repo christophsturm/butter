@@ -9748,6 +9748,71 @@ public enum Ops {
         }
     }
 
+    /// Narrow-N int4 QMM (nOut % 8 == 0, nOut % 32 != 0). GDN a/b is
+    /// N=48, so QuantizedLinear.callMany would otherwise dequantize the
+    /// weight to dense and run gemm. Reuses iron_qmm_bm8 (BN=8).
+    /// Default ON. Force off: BUTTER_QMM_NARROW_N=0.
+    public static func dequantGemmNarrowN(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        t: Int, nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        device: Device,
+        into out: Tensor
+    ) {
+        precondition(weight.dtype == .u32)
+        precondition(nOut % 8 == 0 && nOut % 32 != 0)
+        precondition(kIn % 256 == 0 && groupSize == 64)
+        precondition(input.dtype == .bf16 || input.dtype == .f16)
+        let gsPerRow = kIn / groupSize
+        let mPad = ((t + 7) / 8) * 8
+        let grid = MTLSize(width: nOut / 8, height: mPad / 8, depth: 1)
+        let tg = MTLSize(width: 64, height: 1, depth: 1)
+        if mPad == t {
+            _ = dispatchQmmBm8Scalar(
+                weight: weight, scales: scales, biases: biases,
+                input: input, output: out,
+                n: nOut, k: kIn, gsPerRow: gsPerRow,
+                grid: grid, tg: tg, on: cmd)
+            return
+        }
+        autoreleasepool {
+            let dtBytes = input.dtype.byteSize
+            let xPad = Tensor.empty(
+                shape: [mPad, kIn], dtype: input.dtype, device: device)
+            let oPad = Tensor.empty(
+                shape: [mPad, nOut], dtype: input.dtype, device: device)
+            let validIn = t * kIn * dtBytes
+            let tailIn = (mPad - t) * kIn * dtBytes
+            let blit = cmd.makeBlitCommandEncoder()!
+            blit.copy(
+                from: input.buffer, sourceOffset: input.offset,
+                to: xPad.buffer, destinationOffset: xPad.offset,
+                size: validIn)
+            if tailIn > 0 {
+                blit.fill(
+                    buffer: xPad.buffer,
+                    range: (xPad.offset + validIn)
+                        ..< (xPad.offset + validIn + tailIn),
+                    value: 0)
+            }
+            blit.endEncoding()
+            _ = dispatchQmmBm8Scalar(
+                weight: weight, scales: scales, biases: biases,
+                input: xPad, output: oPad,
+                n: nOut, k: kIn, gsPerRow: gsPerRow,
+                grid: grid, tg: tg, on: cmd)
+            let validOut = t * nOut * dtBytes
+            let outBlit = cmd.makeBlitCommandEncoder()!
+            outBlit.copy(
+                from: oPad.buffer, sourceOffset: oPad.offset,
+                to: out.buffer, destinationOffset: out.offset,
+                size: validOut)
+            outBlit.endEncoding()
+        }
+    }
+
     /// Encode an int8 affine MPP QMM onto an existing (possibly concurrent)
     /// encoder. Same geometry as `dispatchQmmMma` bits=8 MPP path.
     /// Caller owns encoder lifetime. `m`/`n`/`k` must already satisfy
