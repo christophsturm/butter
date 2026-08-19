@@ -1395,6 +1395,15 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //     the same way as `BUTTER_QMM_COOP`. Only reached when coop is off or
 //     the shape fails coop's `n % 64 == 0` guard (e.g. some vision-tower
 //     FFN dims).
+//   BUTTER_QMM_COOP_BM64=0
+//     Force off the tall-M coop QMM (`iron_qmm_coop_bm64`, BM=64 BN=128
+//     TPG=256) used for fat bf16 prefill (M%64==0, N%128==0, M>=64).
+//     Default ON.
+//   BUTTER_QMM_PAD64=0
+//     Force 32-row QMM M-pad. Default ON: pad to 64 so ragged T hits BM64.
+//   BUTTER_QMM_SPLIT64=0
+//     Force off. Default ON only when t<768: aligned prefix on BM64,
+//     remainder padded. Force on at all T with =1.
 //
 // ── GDN (Gated DeltaNet recurrent mixer) ────────────────────────────
 //   BUTTER_GDN_NO_FUSED_PREP=1
