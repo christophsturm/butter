@@ -199,6 +199,55 @@ public enum OpsValidation {
         return nil
     }
 
+    // ─── sdpaMultiD256Gqa ──────────────────────────────────────────
+    //
+    // Kernel invariants (from
+    // `crates/wh-iron-std/src/kernels/sdpa/sdpa_multi_d256_gqa.rs`
+    // §"DISPATCH INVARIANTS"):
+    //   1. `head_dim == 256`. Lane owns 8 consecutive elements.
+    //   2. Same GQA / baseKV / nQuery / kvStride rules as sdpaMulti.
+    //   3. `1 <= heads_chunk <= heads_per_group <= 8`. Stack arrays
+    //      are sized for 8 heads; larger groups need a specialized
+    //      sibling.
+    //   4. `heads_per_group % heads_chunk == 0`. Each chunk owns the
+    //      same number of Q heads. `heads_chunk == heads_per_group`
+    //      recovers one TG per KV head.
+    //   5. TPG = 512 (hard). Wrapper grid is one threadgroup per
+    //      (query, kv_head, chunk):
+    //      (n_kv_heads * n_query * n_chunks * 512, 1, 1).
+
+    /// Validate dispatch shape for `Ops.sdpaMultiD256Gqa`.
+    public static func validateSdpaMultiD256Gqa(
+        headDim: Int, nQHeads: Int, nKVHeads: Int,
+        baseKV: Int, nQuery: Int, kvStride: Int,
+        headsChunk: Int
+    ) -> String? {
+        if headDim != 256 {
+            return "head_dim must be 256 (got \(headDim)); "
+                + "iron_sdpa_multi_d256_gqa is the d256 GQA variant only"
+        }
+        if let reason = validateSdpaMulti(
+            headDim: headDim, nQHeads: nQHeads, nKVHeads: nKVHeads,
+            baseKV: baseKV, nQuery: nQuery, kvStride: kvStride
+        ) {
+            return reason
+        }
+        let headsPerGroup = nQHeads / nKVHeads
+        if headsPerGroup < 1 || headsPerGroup > 8 {
+            return "heads_per_group must be in 1...8 (got \(headsPerGroup) "
+                + "from nQHeads=\(nQHeads) / nKVHeads=\(nKVHeads))"
+        }
+        if headsChunk < 1 || headsChunk > headsPerGroup {
+            return "heads_chunk must be in 1...heads_per_group "
+                + "(got \(headsChunk), heads_per_group=\(headsPerGroup))"
+        }
+        if !headsPerGroup.isMultiple(of: headsChunk) {
+            return "heads_per_group (\(headsPerGroup)) must be a multiple "
+                + "of heads_chunk (\(headsChunk))"
+        }
+        return nil
+    }
+
     // ─── add_rms_norm (fused residual + RMSNorm) ───────────────────
     //
     // `iron_add_rms_norm` fuses the transformer block's residual stream

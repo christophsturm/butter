@@ -5074,6 +5074,85 @@ public enum Ops {
         return result
     }
 
+    /// GQA-grouped multi-query SDPA for `headDim == 256`. Sibling of
+    /// `sdpaMulti`'s d256 path that shares one K/V walk across every Q
+    /// head in a GQA group instead of one threadgroup per Q head.
+    /// Wraps `iron_sdpa_multi_d256_gqa` (see
+    /// `crates/wh-iron-std/src/kernels/sdpa/sdpa_multi_d256_gqa.rs`).
+    ///
+    /// Same Q/K/V layouts and causal rule as `sdpaMulti`. Dispatch is
+    /// one threadgroup per (query_row, kv_head, chunk) at TPG = 512:
+    /// `nChunks = heads_per_group / headsChunk`,
+    /// `grid = (nKVHeads * nQuery * nChunks * 512, 1, 1)`,
+    /// `tg = (512, 1, 1)`.
+    /// `heads_per_group` must be in `1...8` and a multiple of `headsChunk`.
+    /// Isolated kernel benches picked `headsChunk = 3` on 24Q/4KV.
+    public static func sdpaMultiD256Gqa(
+        q: Tensor, k: Tensor, v: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        baseKV: Int, nQuery: Int, kvStride: Int,
+        causal: Bool, scale: Float,
+        headsChunk: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        // ## DISPATCH INVARIANTS - butter/sdpa_multi_d256_gqa.rs.
+        if let reason = OpsValidation.validateSdpaMultiD256Gqa(
+            headDim: headDim, nQHeads: nQHeads, nKVHeads: nKVHeads,
+            baseKV: baseKV, nQuery: nQuery, kvStride: kvStride,
+            headsChunk: headsChunk
+        ) {
+            preconditionFailure("Ops.sdpaMultiD256Gqa: \(reason)")
+        }
+        let headsPerGroup = nQHeads / nKVHeads
+        let nChunks = headsPerGroup / headsChunk
+        let result = out ?? Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: q.dtype)
+        // TPG = 512 (16 simdgroups x 32 lanes). One threadgroup per
+        // (query, kv_head, chunk).
+        let threadsPerGroup = 512
+        let grid = MTLSize(
+            width: nKVHeads * nQuery * nChunks * threadsPerGroup, height: 1, depth: 1)
+        let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+        let causalFlag = UInt32(causal ? 1 : 0)
+        switch q.dtype {
+        case .f32:
+            IronKernels.iron_sdpa_multi_d256_gqa_f32(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                heads_chunk: UInt32(headsChunk),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_sdpa_multi_d256_gqa_f16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                heads_chunk: UInt32(headsChunk),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_sdpa_multi_d256_gqa_bf16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                heads_chunk: UInt32(headsChunk),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError(
+                "Ops.sdpaMultiD256Gqa: unsupported dtype \(q.dtype) "
+                    + "(only f32/f16/bf16 are emitted)")
+        }
+        return result
+    }
+
     /// Q-tiled prefill-append SDPA for `headDim == 256`, the default d=256
     /// prefill path (see `Qwen35AttentionMixer.forwardMany`;
     /// `BUTTER_SDPA_LEGACY_D256=1` reverts to `sdpaMulti`). One threadgroup

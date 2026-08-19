@@ -1369,6 +1369,16 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //   BUTTER_SDPA_VERIFY_MULTI=0
 //     Force MTP-verify (T<=16, long KV) back to the BQ=32 MMA tile.
 //     Default ON: sdpaMulti, one threadgroup per query row.
+//   BUTTER_SDPA_VERIFY_GQA=0
+//     Force MTP-verify off the GQA-grouped d256 kernel and back to
+//     plain sdpaMulti (one threadgroup per Q head). Default ON when
+//     heads_per_group is in 1...8: share the KV walk across a chunk
+//     of the GQA group via Ops.sdpaMultiD256Gqa.
+//   BUTTER_SDPA_VERIFY_GQA_CHUNK=<n>
+//     Heads per threadgroup inside a GQA group. Must divide
+//     heads_per_group. Default 3 (the occupancy-split winner on
+//     isolated 24Q/4KV benches). Unset or invalid falls back to
+//     heads_per_group (one TG per KV head).
 //   BUTTER_MTP_DRAFT_KV_ONLY=0
 //     Force the lockstep draft re-advance through the full layer.
 //     Default ON: write KV only.
@@ -3437,6 +3447,9 @@ public final class Qwen35AttentionMixer: Module {
         // padding at T<=16. sdpaMulti walks one query row per
         // threadgroup. Default ON after 4K/8K/16K golden pairs.
         // Force off: BUTTER_SDPA_VERIFY_MULTI=0.
+        // When heads_per_group is in 1...8, prefer the GQA-grouped
+        // d256 kernel (one KV walk per kv_head). Force off GQA with
+        // BUTTER_SDPA_VERIFY_GQA=0 (falls back to plain sdpaMulti).
         let useVerifyMulti =
             headDim == 256
             && t <= 16
@@ -3445,12 +3458,40 @@ public final class Qwen35AttentionMixer: Module {
         let attnAll: Tensor
         if useVerifyMulti {
             let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
-            attnAll = Ops.sdpaMulti(
-                q: qBlock, k: cacheK, v: cacheV,
-                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-                baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
-                causal: true, scale: scale, on: cmd
-            ).reshaped(to: [t * qDim])
+            let headsPerGroup =
+                nHeads.isMultiple(of: nKVHeads) ? (nHeads / nKVHeads) : 0
+            let useVerifyGqa =
+                headsPerGroup >= 1
+                && headsPerGroup <= 8
+                && ButterEnv["BUTTER_SDPA_VERIFY_GQA"] != "0"
+            if useVerifyGqa {
+                // Isolated benches: headsChunk=3 (2 TGs per KV head)
+                // beat both unsplit GQA and per-Q-head multi. Official
+                // MTP e2e is a separate oracle (see RST session).
+                let chunkEnv = Int(ButterEnv["BUTTER_SDPA_VERIFY_GQA_CHUNK"] ?? "3") ?? 0
+                let headsChunk: Int
+                if chunkEnv >= 1
+                    && chunkEnv <= headsPerGroup
+                    && headsPerGroup.isMultiple(of: chunkEnv)
+                {
+                    headsChunk = chunkEnv
+                } else {
+                    headsChunk = headsPerGroup
+                }
+                attnAll = Ops.sdpaMultiD256Gqa(
+                    q: qBlock, k: cacheK, v: cacheV,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
+                    causal: true, scale: scale, headsChunk: headsChunk, on: cmd
+                ).reshaped(to: [t * qDim])
+            } else {
+                attnAll = Ops.sdpaMulti(
+                    q: qBlock, k: cacheK, v: cacheV,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
+                    causal: true, scale: scale, on: cmd
+                ).reshaped(to: [t * qDim])
+            }
         } else if useMmaD256 {
             let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
             attnAll = Ops.sdpaPrefillMmaD256(
