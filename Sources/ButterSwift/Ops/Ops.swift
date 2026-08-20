@@ -5153,7 +5153,7 @@ public enum Ops {
         return result
     }
 
-    /// MLX-derived `blocks` for chained 2-pass SDPA on Apple M5 Max.
+    /// Block count for chained 2-pass SDPA on Apple M5 Max.
     /// Mirrors `recommended_blocks_m5_max` in
     /// `crates/wh-iron-std/src/kernels/sdpa/sdpa_decode_2pass.rs`.
     /// `nSimds` = `gqaFactor * nQuery`. Output is always a multiple of 32.
