@@ -117,10 +117,13 @@ struct AURABatchedEncodeParityTests {
         expectedCommand.commit()
         expectedCommand.waitUntilCompleted()
 
+        let rangeInput = Tensor.empty(
+            shape: [appendedPositions, rows, dim], dtype: .bf16, device: device)
+        rangeInput.copyIn(from: inputs.flatMap { $0.toArray(as: UInt16.self) })
         let cacheCommand = device.makeCommandBuffer()
-        for input in inputs {
-            cache.appendOnGPU(kFlat: input, vFlat: input, on: cacheCommand)
-        }
+        cache.appendManyOnGPU(
+            kFlat: rangeInput, vFlat: rangeInput,
+            t: appendedPositions, on: cacheCommand)
         cacheCommand.commit()
         cacheCommand.waitUntilCompleted()
 
