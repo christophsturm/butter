@@ -3029,6 +3029,10 @@ public final class Qwen35AttentionMixer: Module {
         kFlat: Tensor, vFlat: Tensor, t: Int,
         on cmd: MTLCommandBuffer, device: Device
     ) {
+        if let aura = kv as? AURAQuantizedKVCache {
+            aura.appendManyOnGPU(kFlat: kFlat, vFlat: vFlat, t: t, on: cmd)
+            return
+        }
         if let raw = kv as? KVCache {
             let appendPositions = Tensor.empty(
                 shape: [t], dtype: .u32, device: device)
