@@ -233,7 +233,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
     public static func loadModel(
         config: ModelConfig,
         weights: SafeTensorsBundle,
-        options _: LoadOptions,
+        options: LoadOptions,
         device: Device
     ) throws -> Qwen35Model {
         // ── text_config — every text field lives under `text_config`
@@ -270,7 +270,8 @@ public struct Qwen35Hybrid: Qwen35Variant {
             (tcBool("tie_word_embeddings")
                 ?? config.bool("tie_word_embeddings")) ?? false
         let intermediate = tcInt("intermediate_size") ?? (4 * hidden)
-        let maxSeq = tcInt("max_position_embeddings") ?? 262_144
+        let advertised = tcInt("max_position_embeddings") ?? 262_144
+        let maxSeq = options.maxContextLength ?? advertised
         let fullAttnInterval = tcInt("full_attention_interval") ?? 4
         // `attn_output_gate` — q_proj projects 2× heads (queries + gate).
         let attnOutputGate = tcBool("attn_output_gate") ?? true
@@ -588,7 +589,10 @@ public struct Qwen35Hybrid: Qwen35Variant {
             numKeyHeads: linearNumKeyHeads, numValueHeads: linearNumValueHeads,
             keyHeadDim: linearKeyHeadDim, valueHeadDim: linearValueHeadDim,
             convDim: convDim, convKernel: convKernel,
-            vocab: vocab, maxSeq: maxSeq, dtype: activationDtype)
+            vocab: vocab, maxSeq: maxSeq, dtype: activationDtype,
+            kvCacheKind: options.kvCache,
+            kvEviction: options.kvEviction,
+            auraDecodePath: options.auraDecodePath)
 
         // ── Optional MTP draft head (spec 030 phase 1) ────────────────
         // An MTP sidecar beside the checkpoint weights
@@ -3002,11 +3006,100 @@ public final class Qwen35AttentionMixer: Module {
         return out
     }
 
+    /// Batched KV append. Raw caches take the fused `appendRangeOnGPUMany`
+    /// path; AURA / affine caches loop `appendOnGPU` (they have no range
+    /// kernel). TODO: range-append on AURA once a packed-update kernel
+    /// exists — the T-loop is the serve-prefill cost of `--kv-cache aura`.
+    private func appendKVMany(
+        cache kv: any KVCacheProtocol,
+        kFlat: Tensor, vFlat: Tensor, t: Int,
+        on cmd: MTLCommandBuffer, device: Device
+    ) {
+        if let raw = kv as? KVCache {
+            let appendPositions = Tensor.empty(
+                shape: [t], dtype: .u32, device: device)
+            raw.reserveSlotsManyOnHost(t: t, into: appendPositions)
+            raw.appendRangeOnGPUMany(
+                kFlat: kFlat, vFlat: vFlat, t: t,
+                positions: appendPositions, on: cmd)
+            return
+        }
+        let dt = kFlat.dtype
+        let dtBytes = dt.byteSize
+        let kvDim = nKVHeads * headDim
+        for r in 0 ..< t {
+            let kRow = Tensor(
+                buffer: kFlat.buffer,
+                offset: kFlat.offset + r * kvDim * dtBytes,
+                shape: [nKVHeads, headDim], dtype: dt)
+            let vRow = Tensor(
+                buffer: vFlat.buffer,
+                offset: vFlat.offset + r * kvDim * dtBytes,
+                shape: [nKVHeads, headDim], dtype: dt)
+            kv.appendOnGPU(kFlat: kRow, vFlat: vRow, on: cmd)
+        }
+    }
+
+    /// Π-rotate Q so SDPA against an AURA cache recovers Q·Kᵀ. Identity
+    /// for raw / affine caches.
+    private func rotateQueriesIfAura(
+        _ qFlat: Tensor, t: Int, cache: any KVCacheProtocol,
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        guard let aura = cache as? AURAQuantizedKVCache else { return qFlat }
+        return rotatePerHeadRows(
+            qFlat, t: t, rotation: aura.rotationDtype,
+            on: cmd, device: device)
+    }
+
+    /// Πᵀ-unrotate SDPA output so o_proj sees the original activation
+    /// space. Identity for raw / affine caches.
+    private func unrotateAttnIfAura(
+        _ attnFlat: Tensor, t: Int, cache: any KVCacheProtocol,
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        guard let aura = cache as? AURAQuantizedKVCache else { return attnFlat }
+        return rotatePerHeadRows(
+            attnFlat, t: t, rotation: aura.rotationDtypeT,
+            on: cmd, device: device)
+    }
+
+    private func rotatePerHeadRows(
+        _ flat: Tensor, t: Int, rotation: Tensor,
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let qDim = nHeads * headDim
+        if t == 1 {
+            let row = flat.elementCount == qDim ? flat : flat.reshaped(to: [qDim])
+            return Ops.auraRotatePerHead(
+                row, rotation: rotation,
+                nHeads: nHeads, headDim: headDim, on: cmd)
+        }
+        let dt = flat.dtype
+        let dtBytes = dt.byteSize
+        let out = Tensor.empty(shape: [t * qDim], dtype: dt, device: device)
+        for r in 0 ..< t {
+            let row = Tensor(
+                buffer: flat.buffer,
+                offset: flat.offset + r * qDim * dtBytes,
+                shape: [qDim], dtype: dt)
+            let rotated = Ops.auraRotatePerHead(
+                row, rotation: rotation,
+                nHeads: nHeads, headDim: headDim, on: cmd)
+            let dst = Tensor(
+                buffer: out.buffer,
+                offset: out.offset + r * qDim * dtBytes,
+                shape: [qDim], dtype: dt)
+            Ops.copy(rotated, into: dst, on: cmd)
+        }
+        return out
+    }
+
     /// Single-token attention forward. Returns the post-o_proj
     /// contribution (residual add done by the enclosing layer). All work
     /// queued on `cmd`; no commit inside.
     func forward(
-        _ xNorm: Tensor, position: Int, cache kv: KVCache,
+        _ xNorm: Tensor, position: Int, cache kv: any KVCacheProtocol,
         cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
         return Profile.signpost("attn.forward") { () -> Tensor in
@@ -3182,7 +3275,13 @@ public final class Qwen35AttentionMixer: Module {
             kFlat: kNormed.reshaped(to: [nKVHeads, headDim]),
             vFlat: v.reshaped(to: [nKVHeads, headDim]), on: cmd)
 
-        let (cacheK, cacheV) = kv.prepareForAttention(on: cmd)
+        // AURA stores K/V in Π-rotated space — rotate Q after RoPE so
+        // scores cancel, then Πᵀ the SDPA output before o_proj.
+        let qForSdpa = rotateQueriesIfAura(
+            qNormed.reshaped(to: [nHeads * headDim]), t: 1, cache: kv,
+            on: cmd, device: device
+        ).reshaped(to: [nHeads, headDim])
+
         // Cached sdpaDecode output + sigmoidMul output scratches.
         if attnOutScratch == nil
             || attnOutScratch!.elementCount != nHeads * headDim
@@ -3193,47 +3292,114 @@ public final class Qwen35AttentionMixer: Module {
             attnFlatGatedScratch = Tensor.empty(
                 shape: [nHeads * headDim], dtype: qNormed.dtype, device: device)
         }
-        // Flash-Decoding 2-pass at long KV. Splits KV across `blocks`
-        // threadgroups in pass1, merges in pass2. Wins over single-pass
-        // when nKV is at the decode-page threshold; env var
-        // `BUTTER_SDPA_2PASS_THRESHOLD` overrides.
         let attnOut: Tensor
-        if useTwoPassDecode && kv.length >= sdpa2PassThreshold {
-            if partialOScratch == nil
-                || partialOScratch!.elementCount
-                    != nHeads * sdpa2PassBlocks * headDim
-                || partialOScratch!.dtype != qNormed.dtype
-            {
-                partialOScratch = Tensor.empty(
-                    shape: [nHeads, sdpa2PassBlocks, headDim],
-                    dtype: qNormed.dtype, device: device)
-                partialMScratch = Tensor.empty(
-                    shape: [nHeads, sdpa2PassBlocks], dtype: .f32, device: device)
-                partialLScratch = Tensor.empty(
-                    shape: [nHeads, sdpa2PassBlocks], dtype: .f32, device: device)
-            }
-            Ops.sdpaDecode2Pass(
-                q: qNormed.reshaped(to: [nHeads, headDim]), k: cacheK, v: cacheV,
+        if let auraCache = kv as? AURAQuantizedKVCache,
+            auraCache.decodePath == .compressed,
+            Ops.supportsAuraFlashSdpa2Pass(
+                keyBits: auraCache.scheme.keyBits,
+                valueBits: auraCache.scheme.valueBits,
+                headDim: headDim, dtype: qNormed.dtype)
+        {
+            let blockSize = AuraFlashScratchCache.blockSizeOverride ?? 32
+            let maxBlocks = (auraCache.maxSeq + blockSize - 1) / blockSize
+            let partials = AuraFlashScratchCache.partials(
+                nQHeads: nHeads, maxBlocks: maxBlocks,
+                headDim: headDim, dtype: qNormed.dtype)
+            let outTensor = Tensor.empty(
+                shape: [nHeads, headDim], dtype: qNormed.dtype, device: device)
+            Ops.auraFlashSdpa2Pass(
+                q: qForSdpa,
+                kPacked: auraCache.kPacked, kNorms: auraCache.kNorms,
+                kCodebook: auraCache.kCodebook,
+                vPacked: auraCache.vPacked, vNorms: auraCache.vNorms,
+                vCodebook: auraCache.vCodebook,
+                into: outTensor,
                 nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-                nKV: kv.length, kvStride: kv.maxSeq, blocks: sdpa2PassBlocks,
+                kPackedWidth: auraCache.kPackedWidth,
+                vPackedWidth: auraCache.vPackedWidth,
+                liveLength: auraCache.length, kvStride: auraCache.maxSeq,
+                keyBits: auraCache.scheme.keyBits,
+                valueBits: auraCache.scheme.valueBits,
                 scale: scale,
-                partialO: partialOScratch!,
-                partialM: partialMScratch!,
-                partialL: partialLScratch!,
-                into: attnOutScratch!, on: cmd)
-            attnOut = attnOutScratch!
-        } else {
-            attnOut = Ops.sdpaDecode(
-                q: qNormed.reshaped(to: [nHeads, headDim]), k: cacheK, v: cacheV,
+                blockSize: blockSize,
+                partialO: partials.partialO,
+                partialM: partials.partialM,
+                partialL: partials.partialL,
+                on: cmd)
+            attnOut = outTensor
+        } else if let auraCache = kv as? AURAQuantizedKVCache,
+            auraCache.decodePath == .compressed,
+            Ops.supportsAuraFlashSdpa(
+                keyBits: auraCache.scheme.keyBits,
+                valueBits: auraCache.scheme.valueBits,
+                headDim: headDim, dtype: qNormed.dtype)
+        {
+            let outTensor = Tensor.empty(
+                shape: [nHeads, headDim], dtype: qNormed.dtype, device: device)
+            let sinksScratch = Tensor.empty(
+                shape: [nHeads], dtype: qNormed.dtype, device: device)
+            Ops.auraFlashSdpa(
+                q: qForSdpa, sinks: sinksScratch,
+                kPacked: auraCache.kPacked, kNorms: auraCache.kNorms,
+                kCodebook: auraCache.kCodebook,
+                vPacked: auraCache.vPacked, vNorms: auraCache.vNorms,
+                vCodebook: auraCache.vCodebook,
+                into: outTensor,
                 nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-                nKV: kv.length, kvStride: kv.maxSeq,
-                scale: scale, on: cmd, into: attnOutScratch)
+                kPackedWidth: auraCache.kPackedWidth,
+                vPackedWidth: auraCache.vPackedWidth,
+                liveLength: auraCache.length, kvStride: auraCache.maxSeq,
+                keyBits: auraCache.scheme.keyBits,
+                valueBits: auraCache.scheme.valueBits,
+                scale: scale,
+                hasSinks: false, windowSize: 0,
+                on: cmd)
+            attnOut = outTensor
+        } else {
+            let (cacheK, cacheV) = kv.prepareForAttention(on: cmd)
+            // Flash-Decoding 2-pass at long KV. Splits KV across `blocks`
+            // threadgroups in pass1, merges in pass2. Wins over single-pass
+            // when nKV is at the decode-page threshold; env var
+            // `BUTTER_SDPA_2PASS_THRESHOLD` overrides.
+            if useTwoPassDecode && kv.length >= sdpa2PassThreshold {
+                if partialOScratch == nil
+                    || partialOScratch!.elementCount
+                        != nHeads * sdpa2PassBlocks * headDim
+                    || partialOScratch!.dtype != qNormed.dtype
+                {
+                    partialOScratch = Tensor.empty(
+                        shape: [nHeads, sdpa2PassBlocks, headDim],
+                        dtype: qNormed.dtype, device: device)
+                    partialMScratch = Tensor.empty(
+                        shape: [nHeads, sdpa2PassBlocks], dtype: .f32, device: device)
+                    partialLScratch = Tensor.empty(
+                        shape: [nHeads, sdpa2PassBlocks], dtype: .f32, device: device)
+                }
+                Ops.sdpaDecode2Pass(
+                    q: qForSdpa, k: cacheK, v: cacheV,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    nKV: kv.length, kvStride: kv.maxSeq, blocks: sdpa2PassBlocks,
+                    scale: scale,
+                    partialO: partialOScratch!,
+                    partialM: partialMScratch!,
+                    partialL: partialLScratch!,
+                    into: attnOutScratch!, on: cmd)
+                attnOut = attnOutScratch!
+            } else {
+                attnOut = Ops.sdpaDecode(
+                    q: qForSdpa, k: cacheK, v: cacheV,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    nKV: kv.length, kvStride: kv.maxSeq,
+                    scale: scale, on: cmd, into: attnOutScratch)
+            }
         }
 
         // Gated output: attnOut * sigmoid(gate), then o_proj.
         // Fused sigmoidMul via mt_sigmoid_mul into cached scratch —
         // saves 1 encoder per attn layer × 10 ≈ 170 µs/token.
-        var attnFlat = attnOut.reshaped(to: [nHeads * headDim])
+        var attnFlat = unrotateAttnIfAura(
+            attnOut.reshaped(to: [nHeads * headDim]), t: 1, cache: kv,
+            on: cmd, device: device)
         if let gate {
             attnFlat = Ops.sigmoidMul(
                 attnFlat, gate, on: cmd, into: attnFlatGatedScratch)
@@ -3264,7 +3430,7 @@ public final class Qwen35AttentionMixer: Module {
     /// All work queued on `cmd`; no commit inside.
     func forwardMany(
         _ xNormFlat: Tensor, t: Int, startPosition: Int,
-        cache kv: KVCache,
+        cache kv: any KVCacheProtocol,
         cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
         precondition(t > 0, "Qwen35AttentionMixer.forwardMany: T must be positive")
@@ -3399,16 +3565,14 @@ public final class Qwen35AttentionMixer: Module {
             headDim: headDim, rotaryDim: rotaryDim,
             thetaBase: ropeTheta, on: cmd)
 
-        // ── KV append — batched K+V cache append. Reserves T
-        // sequential physical slots on host under lengthLock, then writes
-        // K/V for all T tokens via ONE shared encoder + 2 dispatches (vs
-        // the T-loop of `kvCacheUpdateKV` paired-encoder calls).
-        let appendPositions = Tensor.empty(
-            shape: [t], dtype: .u32, device: device)
-        kv.reserveSlotsManyOnHost(t: t, into: appendPositions)
-        kv.appendRangeOnGPUMany(
-            kFlat: kNormed, vFlat: vOut, t: t,
-            positions: appendPositions, on: cmd)
+        // ── KV append — batched K+V cache append on raw caches;
+        // AURA / affine fall back to a T-loop of `appendOnGPU`.
+        appendKVMany(
+            cache: kv, kFlat: kNormed, vFlat: vOut, t: t,
+            on: cmd, device: device)
+
+        let qForSdpa = rotateQueriesIfAura(
+            qNormed, t: t, cache: kv, on: cmd, device: device)
 
         // ── SDPA (fuse the T-token causal attention into ONE dispatch).
         // d=128 wraps `iron_sdpa_multi` (`Ops.sdpaMulti`, unchanged). d=256
@@ -3457,7 +3621,7 @@ public final class Qwen35AttentionMixer: Module {
             && ButterEnv["BUTTER_SDPA_VERIFY_MULTI"] != "0"
         let attnAll: Tensor
         if useVerifyMulti {
-            let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
+            let qBlock = qForSdpa.reshaped(to: [t, nHeads, headDim])
             let headsPerGroup =
                 nHeads.isMultiple(of: nKVHeads) ? (nHeads / nKVHeads) : 0
             let useVerifyGqa =
@@ -3466,8 +3630,7 @@ public final class Qwen35AttentionMixer: Module {
                 && ButterEnv["BUTTER_SDPA_VERIFY_GQA"] != "0"
             if useVerifyGqa {
                 // Isolated benches: headsChunk=3 (2 TGs per KV head)
-                // beat both unsplit GQA and per-Q-head multi. Official
-                // MTP e2e is a separate oracle (see RST session).
+                // beat both unsplit GQA and per-Q-head multi.
                 let chunkEnv = Int(ButterEnv["BUTTER_SDPA_VERIFY_GQA_CHUNK"] ?? "3") ?? 0
                 let headsChunk: Int
                 if chunkEnv >= 1
@@ -3493,7 +3656,7 @@ public final class Qwen35AttentionMixer: Module {
                 ).reshaped(to: [t * qDim])
             }
         } else if useMmaD256 {
-            let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
+            let qBlock = qForSdpa.reshaped(to: [t, nHeads, headDim])
             attnAll = Ops.sdpaPrefillMmaD256(
                 q: qBlock, k: cacheK, v: cacheV,
                 nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
@@ -3501,7 +3664,7 @@ public final class Qwen35AttentionMixer: Module {
                 causal: true, scale: scale, on: cmd
             ).reshaped(to: [t * qDim])
         } else if useQtiled {
-            let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
+            let qBlock = qForSdpa.reshaped(to: [t, nHeads, headDim])
             attnAll = Ops.sdpaPrefillQtiledD256(
                 q: qBlock, k: cacheK, v: cacheV,
                 nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
@@ -3509,9 +3672,9 @@ public final class Qwen35AttentionMixer: Module {
                 causal: true, scale: scale, on: cmd
             ).reshaped(to: [t * qDim])
         } else if headDim == 128 || headDim == 256 {
-            // qNormed is `[T, nHeads, headDim]` flat. Reshape into the
+            // qForSdpa is `[T, nHeads, headDim]` flat. Reshape into the
             // shape sdpaMulti expects (same buffer, no copy).
-            let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
+            let qBlock = qForSdpa.reshaped(to: [t, nHeads, headDim])
             attnAll = Ops.sdpaMulti(
                 q: qBlock, k: cacheK, v: cacheV,
                 nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
@@ -3523,8 +3686,8 @@ public final class Qwen35AttentionMixer: Module {
                 shape: [t * qDim], dtype: dt, device: device)
             for r in 0 ..< t {
                 let qRow = Tensor(
-                    buffer: qNormed.buffer,
-                    offset: qNormed.offset + r * qDim * dtBytes,
+                    buffer: qForSdpa.buffer,
+                    offset: qForSdpa.offset + r * qDim * dtBytes,
                     shape: [nHeads, headDim], dtype: dt)
                 let outRow = Tensor(
                     buffer: attnAllScratch.buffer,
@@ -3541,7 +3704,8 @@ public final class Qwen35AttentionMixer: Module {
 
         // ── Gated output * o_proj — fused sigmoidMul on the prefill
         // path (same kernel as the single-token forward path).
-        var attnFlat = attnAll
+        var attnFlat = unrotateAttnIfAura(
+            attnAll, t: t, cache: kv, on: cmd, device: device)
         if let gateFlat {
             attnFlat = Ops.sigmoidMul(attnFlat, gateFlat, on: cmd)
         }
@@ -3555,7 +3719,7 @@ public final class Qwen35AttentionMixer: Module {
     /// the cache side effect.
     func forwardManyAppendKV(
         _ xNormFlat: Tensor, t: Int, startPosition: Int,
-        cache kv: KVCache,
+        cache kv: any KVCacheProtocol,
         cmd: MTLCommandBuffer, device: Device
     ) {
         precondition(
@@ -3604,12 +3768,9 @@ public final class Qwen35AttentionMixer: Module {
             rowStride: kvDim,
             thetaBase: ropeTheta, on: cmd)
 
-        let appendPositions = Tensor.empty(
-            shape: [t], dtype: .u32, device: device)
-        kv.reserveSlotsManyOnHost(t: t, into: appendPositions)
-        kv.appendRangeOnGPUMany(
-            kFlat: kNormed, vFlat: vOut, t: t,
-            positions: appendPositions, on: cmd)
+        appendKVMany(
+            cache: kv, kFlat: kNormed, vFlat: vOut, t: t,
+            on: cmd, device: device)
     }
 }
 
@@ -3865,16 +4026,16 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
         return out
     }
 
-    /// `DecoderLayer` conformance. Cache slot is a `KVCache`. Commits
-    /// `cmd` only when the FFN is an MoE block.
+    /// `DecoderLayer` conformance. Cache slot is any `KVCacheProtocol`
+    /// (raw / affine / AURA). Commits `cmd` only when the FFN is MoE.
     public func decode(
         _ h: Tensor, position: Int,
         cache: any LayerCacheProtocol,
         cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
-        guard let kv = cache as? KVCache else {
+        guard let kv = cache as? any KVCacheProtocol else {
             fatalError(
-                "Qwen35AttentionLayer: expected KVCache, "
+                "Qwen35AttentionLayer: expected KVCacheProtocol, "
                     + "got \(type(of: cache))")
         }
         // ── Mixer half — pre-norm + attention + residual add ──────────
@@ -3937,9 +4098,9 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
         cache: any LayerCacheProtocol,
         cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
-        guard let kv = cache as? KVCache else {
+        guard let kv = cache as? any KVCacheProtocol else {
             fatalError(
-                "Qwen35AttentionLayer.decodeMany: expected KVCache, "
+                "Qwen35AttentionLayer.decodeMany: expected KVCacheProtocol, "
                     + "got \(type(of: cache))")
         }
         precondition(t > 0, "Qwen35AttentionLayer.decodeMany: T must be positive")
@@ -3995,9 +4156,9 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
         cache: any LayerCacheProtocol,
         cmd: MTLCommandBuffer, device: Device
     ) -> (base: Tensor, delta: Tensor) {
-        guard let kv = cache as? KVCache else {
+        guard let kv = cache as? any KVCacheProtocol else {
             fatalError(
-                "Qwen35AttentionLayer.decodeManyDenseBoundary: expected KVCache")
+                "Qwen35AttentionLayer.decodeManyDenseBoundary: expected KVCacheProtocol")
         }
         guard case .dense(let mlp) = ffn else {
             fatalError("Qwen35AttentionLayer.decodeManyDenseBoundary: dense FFN required")
@@ -4214,6 +4375,9 @@ public final class Qwen35Model: LanguageModel {
     public let numKeyHeads, numValueHeads, keyHeadDim, valueHeadDim: Int
     public let convDim, convKernel: Int
     public let dtype: DType
+    public let kvCacheKind: KVCacheKind
+    public let kvEviction: KVEviction
+    public let auraDecodePath: AURADecodePath
 
     /// Layer kinds, index-aligned with `layers` — drives `makeLayerCaches`.
     let layerKinds: [Qwen35LayerKind]
@@ -4237,7 +4401,10 @@ public final class Qwen35Model: LanguageModel {
         numKeyHeads: Int, numValueHeads: Int,
         keyHeadDim: Int, valueHeadDim: Int,
         convDim: Int, convKernel: Int,
-        vocab: Int, maxSeq: Int, dtype: DType
+        vocab: Int, maxSeq: Int, dtype: DType,
+        kvCacheKind: KVCacheKind = .raw,
+        kvEviction: KVEviction = .unbounded,
+        auraDecodePath: AURADecodePath = .compressed
     ) {
         self.embedTokens = embedTokens
         self.layers = layers
@@ -4257,6 +4424,9 @@ public final class Qwen35Model: LanguageModel {
         self.vocab = vocab
         self.maxSeq = maxSeq
         self.dtype = dtype
+        self.kvCacheKind = kvCacheKind
+        self.kvEviction = kvEviction
+        self.auraDecodePath = auraDecodePath
         self.layerKinds = layers.map { layer in
             switch layer {
             case is Qwen35GDNLayer: return .gdn
@@ -4291,9 +4461,11 @@ public final class Qwen35Model: LanguageModel {
     }
 
     /// One cache per layer index, matching the layer kind:
-    ///   GDN → GDNStateCache, attention → KVCache.
+    ///   GDN → GDNStateCache, attention → KV (raw / affine / AURA).
     public func makeLayerCaches(maxSeq: Int?, device: Device) -> [any LayerCacheProtocol] {
         let cap = maxSeq ?? self.maxSeq
+        let attnCount = layerKinds.filter { $0 == .attention }.count
+        var attn = makeAttentionCaches(count: attnCount, cap: cap, device: device).makeIterator()
         return layerKinds.map { kind in
             switch kind {
             case .gdn:
@@ -4305,9 +4477,67 @@ public final class Qwen35Model: LanguageModel {
                     convDim: convDim, convKernelSize: convKernel,
                     dtype: dtype, device: device)
             case .attention:
-                return KVCache(
+                return attn.next()!
+            }
+        }
+    }
+
+    private func makeAttentionCaches(
+        count: Int, cap: Int, device: Device
+    ) -> [any LayerCacheProtocol] {
+        let eviction = kvEviction
+        switch kvCacheKind {
+        case .raw:
+            return (0 ..< count).map { _ in
+                KVCache(
                     nKVHeads: nKVHeads, headDim: headDim, maxSeq: cap,
-                    dtype: dtype, device: device)
+                    dtype: dtype, eviction: eviction, device: device)
+            }
+        case .affineQuantized(let bits, let groupSize):
+            let sharedK = Tensor.empty(
+                shape: [nKVHeads, cap, headDim], dtype: dtype, device: device)
+            let sharedV = Tensor.empty(
+                shape: [nKVHeads, cap, headDim], dtype: dtype, device: device)
+            return (0 ..< count).map { _ in
+                AffineQuantizedKVCache(
+                    nKVHeads: nKVHeads, headDim: headDim, maxSeq: cap,
+                    dtype: dtype, bits: bits, groupSize: groupSize,
+                    sharedWorkingK: sharedK, sharedWorkingV: sharedV,
+                    eviction: eviction, device: device)
+            }
+        case .auraQuantized(let requestedScheme):
+            let gqaFactor = nHeads / max(nKVHeads, 1)
+            let scheme: AURAScheme = AURAScheme.autoAsymmetricOptedIn
+                ? AURAScheme.autoAsymmetric(
+                    requested: requestedScheme, gqaFactor: gqaFactor)
+                : requestedScheme
+            let kCodebook = AURACodebook.centroidsTensor(
+                dim: headDim, bits: scheme.keyBits, dtype: dtype, device: device)
+            let kBoundaries = AURACodebook.boundariesTensor(
+                dim: headDim, bits: scheme.keyBits, dtype: dtype, device: device)
+            let vCodebook = AURACodebook.centroidsTensor(
+                dim: headDim, bits: scheme.valueBits, dtype: dtype, device: device)
+            let vBoundaries = AURACodebook.boundariesTensor(
+                dim: headDim, bits: scheme.valueBits, dtype: dtype, device: device)
+            let sharedK = Tensor.empty(
+                shape: [nKVHeads, cap, headDim], dtype: dtype, device: device)
+            let sharedV = Tensor.empty(
+                shape: [nKVHeads, cap, headDim], dtype: dtype, device: device)
+            return (0 ..< count).map { i in
+                let rot = AURAQuantizedKVCacheRotations.build(
+                    headDim: headDim, layerIndex: i,
+                    activationDtype: dtype, device: device)
+                return AURAQuantizedKVCache(
+                    nKVHeads: nKVHeads, headDim: headDim, maxSeq: cap,
+                    dtype: dtype, scheme: scheme,
+                    rotation: rot.rotation, rotationT: rot.rotationT,
+                    rotationDtype: rot.rotationDtype, rotationDtypeT: rot.rotationDtypeT,
+                    kCodebook: kCodebook, kBoundaries: kBoundaries,
+                    vCodebook: vCodebook, vBoundaries: vBoundaries,
+                    sharedWorkingK: sharedK, sharedWorkingV: sharedV,
+                    eviction: eviction,
+                    decodePath: auraDecodePath,
+                    device: device)
             }
         }
     }
@@ -4546,7 +4776,7 @@ public final class Qwen35Model: LanguageModel {
                 {
                     ok = false
                 }
-            } else if let kv = caches[i] as? KVCache {
+            } else if let kv = caches[i] as? any KVCacheProtocol {
                 kv.truncate(toLength: absolutePosition + keep)
             }
         }
@@ -4612,7 +4842,7 @@ public final class Qwen35Model: LanguageModel {
                 if !gdnLayer.adoptPlaneState(to: keep, cache: gc, cmd: cmd) {
                     ok = false
                 }
-            } else if let kv = caches[i] as? KVCache {
+            } else if let kv = caches[i] as? any KVCacheProtocol {
                 kv.truncate(toLength: absolutePosition + keep)
             }
         }

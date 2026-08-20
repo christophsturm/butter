@@ -64,7 +64,8 @@ public struct Qwen3Dense: Qwen3Variant {
         }
         let nKVHeads = config.numKeyValueHeads ?? nHeads
         let theta = Float(config.ropeTheta ?? 1_000_000)
-        let maxSeq = config.int("max_position_embeddings") ?? 32_768
+        let advertised = config.int("max_position_embeddings") ?? 32_768
+        let maxSeq = options.maxContextLength ?? advertised
         let tieEmbed = config.tieWordEmbeddings
 
         // Optional linear RoPE scaling (Qwen3 dense uses rope_scaling
