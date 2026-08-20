@@ -65,6 +65,7 @@ struct ChatTemplateTests {
         #expect(o.maxLength == nil)
         #expect(o.truncation == false)
         #expect(o.extraContext.isEmpty)
+        #expect(o.tools == nil)
     }
 
     @Test("ChatTemplateOptions custom init + Equatable on typed fields")
@@ -92,6 +93,21 @@ struct ChatTemplateTests {
             enableThinking: true,
             reasoningEffort: .low)
         #expect(o != different)
+    }
+
+    @Test("Serve ChatToolDefinition template shape is OpenAI function")
+    func toolDefinitionTemplateShape() {
+        let tool = ChatToolDefinition(
+            name: "read",
+            description: "Read a file",
+            parametersJSON: #"{"type":"object","properties":{"path":{"type":"string"}}}"#)
+        let dict = tool.asTemplateTool
+        #expect(dict["type"] as? String == "function")
+        let fn = dict["function"] as? [String: any Sendable]
+        #expect(fn?["name"] as? String == "read")
+        #expect(fn?["description"] as? String == "Read a file")
+        let params = fn?["parameters"] as? [String: any Sendable]
+        #expect(params?["type"] as? String == "object")
     }
 
     @Test("ReasoningEffort rawValues align with Harmony convention")
