@@ -228,7 +228,8 @@ enum Qwen3xGGUFLoader {
         let headDim = try metaU32("qwen35.attention.key_length")
         let rmsEps = try metaFloat("qwen35.attention.layer_norm_rms_epsilon")
         let intermediate = try metaU32("qwen35.feed_forward_length")
-        let maxSeq = try metaU32("qwen35.context_length")
+        let advertised = try metaU32("qwen35.context_length")
+        let maxSeq = options.maxContextLength ?? advertised
         let fullAttnInterval = try metaU32("qwen35.full_attention_interval")
         let ropeTheta = try metaFloat("qwen35.rope.freq_base")
         let ropeDimCount = try metaU32("qwen35.rope.dimension_count")
