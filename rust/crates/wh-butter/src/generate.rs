@@ -50,11 +50,21 @@ pub struct GenerateOpts {
     pub seed: u64,
     /// Print each decoded token to stdout as it's produced.
     pub stream: bool,
+    /// Cap KV allocation (`--max-context`). `None` sizes to
+    /// `prompt + max_new + 8` as before.
+    pub max_context: Option<usize>,
 }
 
 impl Default for GenerateOpts {
     fn default() -> Self {
-        GenerateOpts { max_new: 128, chunk: 0, sampling: Sampling::Greedy, seed: 0, stream: true }
+        GenerateOpts {
+            max_new: 128,
+            chunk: 0,
+            sampling: Sampling::Greedy,
+            seed: 0,
+            stream: true,
+            max_context: None,
+        }
     }
 }
 
@@ -128,8 +138,108 @@ pub fn load(dev: &dyn Device, gguf_path: &str) -> Result<LoadedModel> {
 /// (token-identical to the old decode-loop-as-prefill baseline, see
 /// `qwen35_prefill_correctness.rs`), not a decode-loop re-implementation.
 pub fn generate(dev: &dyn Device, loaded: &LoadedModel, prompt: &str, opts: &GenerateOpts) -> Result<GenerateReport> {
+    let report = generate_with_sink(dev, loaded, prompt, opts, |text, _id| {
+        if opts.stream {
+            print!("{text}");
+            let _ = std::io::stdout().flush();
+        }
+        true
+    })?;
+    if opts.stream {
+        println!();
+    }
+    Ok(report)
+}
+
+/// Like [`generate`], but each decoded token is handed to `on_token`.
+/// Return `false` from the callback to abort decode (client gone).
+pub fn generate_with_sink<F>(
+    dev: &dyn Device,
+    loaded: &LoadedModel,
+    prompt: &str,
+    opts: &GenerateOpts,
+    on_token: F,
+) -> Result<GenerateReport>
+where
+    F: FnMut(&str, u32) -> bool,
+{
     match loaded {
-        LoadedModel::Qwen35 { tok, eos, model } => generate_qwen35(dev, tok, *eos, model, prompt, opts),
+        LoadedModel::Qwen35 { tok, eos, model } => {
+            let mut live = None;
+            generate_qwen35(dev, tok, *eos, model, prompt, opts, &mut live, on_token)
+        }
+    }
+}
+
+/// Live KV / GDN cache carried across serve requests. `tokens` is
+/// prompt + generated (not generated-only) so the next request can
+/// decide append-only suffix prefill vs rebuild.
+pub struct LiveGenerateCache {
+    pub cache: qwen35::Qwen35Cache,
+    pub tokens: Vec<u32>,
+}
+
+/// Longest common prefix length of two token sequences.
+pub fn common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// Prefix length safe to keep for hybrid Qwen3.5. If the new prompt is
+/// fully covered by the cache (`n == new.len()`), decrement by 1. That
+/// case is a rewind (need at least one new token to prefill) and
+/// recurrent GDN/conv state cannot rewind.
+pub fn n_past(cached: &[u32], new: &[u32]) -> usize {
+    if new.is_empty() {
+        return 0;
+    }
+    let mut n = common_prefix(cached, new);
+    if n == new.len() {
+        n -= 1;
+    }
+    n
+}
+
+/// Pure append-vs-rebuild decision for a live Qwen3.5 cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReusePlan {
+    Append { n_past: usize },
+    Rebuild,
+}
+
+/// Suffix-only prefill is valid only when `new` strictly appends to
+/// `cached` (`n_past == cached.len()` after [`n_past`]), capacity fits
+/// `need`, and neither side is empty. Any rewind / fork / undersize →
+/// [`ReusePlan::Rebuild`].
+pub fn reuse_plan(cached: &[u32], new: &[u32], cap: usize, need: usize) -> ReusePlan {
+    if cached.is_empty() || new.is_empty() || cap < need {
+        return ReusePlan::Rebuild;
+    }
+    let n = n_past(cached, new);
+    if n == cached.len() && n < new.len() {
+        ReusePlan::Append { n_past: n }
+    } else {
+        ReusePlan::Rebuild
+    }
+}
+
+/// Like [`generate_with_sink`], but reuses `live` across calls when the
+/// new prompt strictly appends to the previous prompt+generated tokens.
+/// Rewinds rebuild because hybrid recurrent state cannot rewind.
+pub fn generate_with_sink_cached<F>(
+    dev: &dyn Device,
+    loaded: &LoadedModel,
+    prompt: &str,
+    opts: &GenerateOpts,
+    live: &mut Option<LiveGenerateCache>,
+    on_token: F,
+) -> Result<GenerateReport>
+where
+    F: FnMut(&str, u32) -> bool,
+{
+    match loaded {
+        LoadedModel::Qwen35 { tok, eos, model } => {
+            generate_qwen35(dev, tok, *eos, model, prompt, opts, live, on_token)
+        }
     }
 }
 
@@ -142,24 +252,54 @@ pub fn run(dev: &dyn Device, gguf_path: &str, prompt: &str, opts: &GenerateOpts)
     generate(dev, &loaded, prompt, opts)
 }
 
-fn generate_qwen35(
+fn generate_qwen35<F>(
     dev: &dyn Device,
     tok: &GgufTokenizer,
     eos: Option<u32>,
     model: &qwen35::Qwen35Model,
     prompt: &str,
     opts: &GenerateOpts,
-) -> Result<GenerateReport> {
+    live: &mut Option<LiveGenerateCache>,
+    mut on_token: F,
+) -> Result<GenerateReport>
+where
+    F: FnMut(&str, u32) -> bool,
+{
     let ids = tok.encode(prompt);
     if ids.is_empty() {
         return Err(Error::Msg("generate: empty prompt after tokenization".into()));
     }
-    let max_seq = ids.len() + opts.max_new + 8;
-    let mut cache = qwen35::Qwen35Cache::new(dev, &model.cfg, max_seq)?;
+    let need = ids.len() + opts.max_new + 8;
+    let cap = match opts.max_context {
+        Some(m) if m > 0 => m,
+        _ => need,
+    };
+    if cap < need {
+        return Err(Error::Msg(format!(
+            "generate: prompt+max_new ({need}) exceeds --max-context ({cap})"
+        )));
+    }
+    let plan = match live.as_ref() {
+        Some(l) => reuse_plan(&l.tokens, &ids, l.cache.cap(), need),
+        None => ReusePlan::Rebuild,
+    };
+
+    let mut cache = match plan {
+        ReusePlan::Append { .. } => live.take().expect("Append implies live cache").cache,
+        ReusePlan::Rebuild => {
+            let _ = live.take();
+            qwen35::Qwen35Cache::new(dev, &model.cfg, cap)?
+        }
+    };
 
     // ---- Prompt processing: batched chunked prefill (F-85) ----
     let t_prefill = Instant::now();
-    let logits = qwen35::prefill(dev, model, &mut cache, &ids, opts.chunk)?;
+    let logits = match plan {
+        ReusePlan::Append { n_past } => {
+            qwen35::prefill_at(dev, model, &mut cache, &ids[n_past..], n_past, opts.chunk)?
+        }
+        ReusePlan::Rebuild => qwen35::prefill(dev, model, &mut cache, &ids, opts.chunk)?,
+    };
     dev.synchronize()?;
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
 
@@ -176,21 +316,22 @@ fn generate_qwen35(
             break;
         }
         out_ids.push(next);
-        if opts.stream {
-            print!("{}", tok.decode(&[next]));
-            let _ = std::io::stdout().flush();
+        let piece = tok.decode(&[next]);
+        if !on_token(&piece, next) {
+            break;
         }
         let logits = qwen35::decode_step(dev, model, &mut cache, next, pos)?;
         last_logits = download_logits(dev, &logits, model.cfg.vocab)?;
         pos += 1;
     }
     let decode_secs = t_decode.elapsed().as_secs_f64();
-    if opts.stream {
-        println!();
-    }
 
     let generated_tokens = out_ids.len();
     let text = tok.decode(&out_ids);
+    let mut all_tokens = ids.clone();
+    all_tokens.extend_from_slice(&out_ids);
+    *live = Some(LiveGenerateCache { cache, tokens: all_tokens });
+
     Ok(GenerateReport {
         architecture: "qwen35".to_string(),
         prompt_tokens: ids.len(),
@@ -209,4 +350,29 @@ fn download_logits(dev: &dyn Device, t: &Tensor, vocab: usize) -> Result<Vec<f32
     dev.synchronize()?;
     dev.download(t.buffer.as_ref(), &mut b)?;
     Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Product: append only on a strict extension that fits. Mutation: treat
+    /// equal/shorter/fork as Append, or ignore `cap < need`.
+    #[test]
+    fn reuse_plan_table() {
+        assert_eq!(
+            reuse_plan(&[1, 2, 3, 4], &[1, 2, 3, 4, 5, 6], 64, 16),
+            ReusePlan::Append { n_past: 4 }
+        );
+        assert_eq!(reuse_plan(&[1, 2, 3, 4], &[1, 2, 3, 4], 64, 16), ReusePlan::Rebuild);
+        assert_eq!(reuse_plan(&[1, 2, 3, 4], &[1, 2], 64, 16), ReusePlan::Rebuild);
+        assert_eq!(reuse_plan(&[1, 2, 3, 4], &[9, 9], 64, 16), ReusePlan::Rebuild);
+        assert_eq!(
+            reuse_plan(&[1, 2, 3, 4], &[1, 2, 3, 4, 5, 6], 8, 16),
+            ReusePlan::Rebuild
+        );
+        assert_eq!(reuse_plan(&[], &[1, 2], 64, 16), ReusePlan::Rebuild);
+        assert_eq!(n_past(&[1, 2, 3], &[1, 2, 3]), 2);
+        assert_eq!(n_past(&[1, 2, 3, 4], &[1, 2, 3, 4, 5]), 4);
+    }
 }

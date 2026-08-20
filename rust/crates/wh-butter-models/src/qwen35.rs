@@ -1060,6 +1060,17 @@ impl Qwen35Cache {
         }
         Ok(Qwen35Cache { slots })
     }
+
+    /// KV capacity of the first full-attn slot, or 0 if this model has none.
+    pub fn cap(&self) -> usize {
+        self.slots
+            .iter()
+            .find_map(|s| match s {
+                LayerSlot::Full(f) => Some(f.cap),
+                LayerSlot::Gdn(_) => None,
+            })
+            .unwrap_or(0)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1474,7 +1485,24 @@ fn default_prefill_chunk(total: usize) -> usize {
 /// architecture), so `cache` alone (the same `Qwen35Cache` decode uses) is
 /// threaded through both the chunk loop and the final compaction step
 /// laguna needs and this architecture doesn't.
+///
+/// Equivalent to [`prefill_at`] with `start_pos = 0`.
 pub fn prefill(dev: &dyn Device, model: &Qwen35Model, cache: &mut Qwen35Cache, tokens: &[u32], chunk: usize) -> Result<Tensor> {
+    prefill_at(dev, model, cache, tokens, 0, chunk)
+}
+
+/// Like [`prefill`], but RoPE / KV / SDPA absolute positions start at
+/// `start_pos` instead of 0. Used for append-only suffix prefill when the
+/// prompt strictly extends a live cache (`start_pos == n_past`). Passing
+/// the suffix alone with `start_pos = 0` would overwrite KV slot 0.
+pub fn prefill_at(
+    dev: &dyn Device,
+    model: &Qwen35Model,
+    cache: &mut Qwen35Cache,
+    tokens: &[u32],
+    start_pos: usize,
+    chunk: usize,
+) -> Result<Tensor> {
     let cfg = &model.cfg;
     let total = tokens.len();
     if total == 0 {
@@ -1488,11 +1516,12 @@ pub fn prefill(dev: &dyn Device, model: &Qwen35Model, cache: &mut Qwen35Cache, t
     while start < total {
         let t = chunk.min(total - start);
         let chunk_tokens = &tokens[start..start + t];
+        let abs_start = start_pos + start;
 
         let ids = Tensor::new(dev.upload(&u32s_to_bytes(chunk_tokens))?, vec![t], DType::U32);
         let mut x = ops::gather(dev, &model.tok_embd, &ids)?.reshaped(vec![t, cfg.hidden]);
 
-        let pos_vec: Vec<u32> = (0..t).map(|i| (start + i) as u32).collect();
+        let pos_vec: Vec<u32> = (0..t).map(|i| (abs_start + i) as u32).collect();
         let positions = Tensor::new(dev.upload(&u32s_to_bytes(&pos_vec))?, vec![t], DType::U32);
         let t_len = Tensor::new(dev.upload(&(t as u32).to_le_bytes())?, vec![1], DType::U32);
 
@@ -1501,7 +1530,7 @@ pub fn prefill(dev: &dyn Device, model: &Qwen35Model, cache: &mut Qwen35Cache, t
             dbg_sum_rows(dev, "x_embed", &pos_vec, &x, cfg.hidden);
         }
         for (i, layer) in model.layers.iter().enumerate() {
-            x = prefill_layer(dev, cfg, model, i, layer, &mut cache.slots[i], &x, t, start, &positions, &t_len)?;
+            x = prefill_layer(dev, cfg, model, i, layer, &mut cache.slots[i], &x, t, abs_start, &positions, &t_len)?;
             if std::env::var("QWEN35_PREFILL_SYNC").is_ok() {
                 dev.synchronize().map_err(|e| Error::Msg(format!("prefill fault after layer {i}: {e:?}")))?;
             }

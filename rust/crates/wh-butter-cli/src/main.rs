@@ -9,12 +9,15 @@
 //! token-by-token, streaming output and reporting prefill/decode tok/s
 //! separately.
 
+mod serve;
+
 use wh_butter::generate::GenerateOpts;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("generate") => generate_cmd(&args[1..]),
+        Some("serve") => serve::run(&args[1..]),
         Some("help" | "--help" | "-h") => {
             print_usage();
         }
@@ -33,6 +36,7 @@ fn print_usage() {
     println!("USAGE:");
     println!("    butter                       report compiled backends + live devices");
     println!("    butter generate [OPTIONS]    load a GGUF and generate text");
+    println!("    butter serve [OPTIONS]       OpenAI-compatible HTTP server");
     println!();
     println!("generate OPTIONS:");
     println!("    --model <path>       GGUF path (required)");
@@ -49,6 +53,20 @@ fn print_usage() {
     println!("    --no-stream          don't print tokens as they're generated");
     println!("    --warmup             run a tiny throwaway generate first to pay JIT/kernel-compile");
     println!("                         cost before the timed run (use for steady-state bench numbers)");
+    println!();
+    println!("    --max-context <n>    size the KV cache for this many positions");
+    println!();
+    println!("serve OPTIONS:");
+    println!("    --model <path>       GGUF path (required)");
+    println!("    --host <addr>        bind address (default: 127.0.0.1)");
+    println!("    --port <n>           bind port (default: 8000)");
+    println!("    --kv-cache <kind>    raw (default). affine/aura: Apple-only, ignored here.");
+    println!("    --aura-decode-path <p>  compressed | dequant-mirror (ignored unless Apple AURA)");
+    println!("    --max-context <n>    size the KV cache for this many positions");
+    println!("    --kv-window-size <n> FIFO KV window (not yet on this backend)");
+    println!("    --kv-window-keep <n> attention-sink slots (needs --kv-window-size)");
+    println!("    --enable-thinking    default chat_template_kwargs.enable_thinking");
+    println!("    --reasoning-effort <low|medium|high>");
 }
 
 fn report_backends() {
@@ -80,6 +98,7 @@ fn generate_cmd(args: &[String]) {
     let mut temp: Option<f32> = None;
     let mut top_k: Option<usize> = None;
     let mut top_p: Option<f32> = None;
+    let mut max_context: Option<usize> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -88,12 +107,18 @@ fn generate_cmd(args: &[String]) {
             "--prompt" => { i += 1; prompt = args.get(i).cloned(); }
             "--prompt-file" => { i += 1; prompt_file = args.get(i).cloned(); }
             "--max-new" => { i += 1; max_new = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(max_new); }
+            "--max-context" => { i += 1; max_context = args.get(i).and_then(|s| s.parse().ok()); }
             "--chunk" => { i += 1; chunk = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(chunk); }
             "--seed" => { i += 1; seed = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(seed); }
             "--greedy" => {}
             "--temp" => { i += 1; temp = args.get(i).and_then(|s| s.parse().ok()); }
             "--top-k" => { i += 1; top_k = args.get(i).and_then(|s| s.parse().ok()); }
             "--top-p" => { i += 1; top_p = args.get(i).and_then(|s| s.parse().ok()); }
+            "--kv-cache" | "--aura-decode-path" | "--kv-window-size" | "--kv-window-keep"
+            | "--reasoning-effort" => {
+                i += 1;
+            }
+            "--enable-thinking" => {}
             "--no-stream" => { stream = false; }
             // Run a tiny throwaway prefill+decode before the timed
             // generate, so the reported tok/s reflect steady state instead
@@ -187,6 +212,7 @@ fn generate_cmd(args: &[String]) {
             sampling: wh_butter::generate::Sampling::Greedy,
             seed: 0,
             stream: false,
+            max_context,
         };
         let t_warm = std::time::Instant::now();
         match wh_butter::generate::generate(dev.as_ref(), &loaded, DEFAULT_PROMPT, &warmup_opts) {
@@ -204,6 +230,7 @@ fn generate_cmd(args: &[String]) {
         sampling,
         seed,
         stream,
+        max_context,
     };
 
     let t0 = std::time::Instant::now();
