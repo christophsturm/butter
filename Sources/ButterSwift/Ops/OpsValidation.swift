@@ -248,6 +248,60 @@ public enum OpsValidation {
         return nil
     }
 
+    // ─── sdpaMultiD2562Pass ──────────────────────────────────────────
+    //
+    // Kernel invariants (from
+    // `crates/wh-iron-std/src/kernels/sdpa/sdpa_2pass_nq_d256.rs`):
+    //   1. `head_dim == 256`. Lane owns 8 consecutive elements.
+    //   2. Same GQA / baseKV / nQuery / kvStride rules as sdpaMulti.
+    //   3. `blocks >= 32` and `blocks % 32 == 0` (pass2 reducer loops
+    //      `b < blocks / 32` and silently drops partials otherwise).
+    //   4. Partials sized `[n_query, n_q_heads, blocks, 256]` /
+    //      `[n_query, n_q_heads, blocks]` (f32 for m/l).
+    //   5. Pass1 TG width = gqa_factor * 32; pass2 TPG = 1024.
+
+    /// Validate dispatch shape for `Ops.sdpaMultiD2562Pass`.
+    public static func validateSdpaMultiD2562Pass(
+        headDim: Int, nQHeads: Int, nKVHeads: Int,
+        baseKV: Int, nQuery: Int, kvStride: Int,
+        blocks: Int,
+        partialOCount: Int, partialMCount: Int, partialLCount: Int,
+        partialOMatchesQ: Bool, partialMIsF32: Bool, partialLIsF32: Bool
+    ) -> String? {
+        if headDim != 256 {
+            return "head_dim must be 256 (got \(headDim)); "
+                + "iron_sdpa_2pass_nq_pass{1,2}_d256 is the d256 nq 2-pass only"
+        }
+        if let reason = validateSdpaMulti(
+            headDim: headDim, nQHeads: nQHeads, nKVHeads: nKVHeads,
+            baseKV: baseKV, nQuery: nQuery, kvStride: kvStride
+        ) {
+            return reason
+        }
+        if blocks < 32 || !blocks.isMultiple(of: 32) {
+            return "blocks (\(blocks)) must be a multiple of 32 and >= 32 "
+                + "(pass2 hardcodes a 32-lane block-merge reduction)"
+        }
+        let expectedO = nQuery * nQHeads * blocks * headDim
+        if partialOCount != expectedO {
+            return "partialO must be [nQuery, nQHeads, blocks, headDim] "
+                + "(got \(partialOCount) elems, expected \(expectedO))"
+        }
+        let expectedML = nQuery * nQHeads * blocks
+        if partialMCount != expectedML || !partialMIsF32 {
+            return "partialM must be [nQuery, nQHeads, blocks] f32 "
+                + "(got count=\(partialMCount) f32=\(partialMIsF32))"
+        }
+        if partialLCount != expectedML || !partialLIsF32 {
+            return "partialL must be [nQuery, nQHeads, blocks] f32 "
+                + "(got count=\(partialLCount) f32=\(partialLIsF32))"
+        }
+        if !partialOMatchesQ {
+            return "partialO dtype must match q"
+        }
+        return nil
+    }
+
     // ─── add_rms_norm (fused residual + RMSNorm) ───────────────────
     //
     // `iron_add_rms_norm` fuses the transformer block's residual stream
