@@ -171,11 +171,15 @@ extension Model {
     internal func generateStreamInternal(
         promptTokens: [Int],
         parameters params: GenerationParameters,
-        profile: Profile = .shared
+        profile: Profile = .shared,
+        caches: [any LayerCacheProtocol]? = nil,
+        prefillStart: Int = 0
     )
         -> AsyncThrowingStream<GenerationChunk, Error>
     {
-        runStream(promptTokens: promptTokens, parameters: params, profile: profile)
+        runStream(
+            promptTokens: promptTokens, parameters: params, profile: profile,
+            caches: caches, prefillStart: prefillStart)
     }
 
     /// Drain a generation stream into a buffered `GenerationResult`.
@@ -206,7 +210,9 @@ extension Model {
     private func runStream(
         promptTokens: [Int],
         parameters params: GenerationParameters,
-        profile: Profile
+        profile: Profile,
+        caches: [any LayerCacheProtocol]?,
+        prefillStart: Int
     )
         -> AsyncThrowingStream<GenerationChunk, Error>
     {
@@ -225,13 +231,15 @@ extension Model {
             // restores the old bare `Task {}` for A/B.
             let qosFixEnabled =
                 ButterEnv["BUTTER_DECODE_QOS"] != "0"
-            Task(priority: qosFixEnabled ? .high : nil) {
+            let producer = Task(priority: qosFixEnabled ? .high : nil) {
                 do {
                     try await model.driveGeneration(
                         promptTokens: promptTokens,
                         parameters: params,
                         profile: profile,
-                        continuation: continuation
+                        continuation: continuation,
+                        sessionCaches: caches,
+                        prefillStart: prefillStart
                     )
                     continuation.finish()
                 } catch is CancellationError {
@@ -240,6 +248,9 @@ extension Model {
                     continuation.finish(throwing: error)
                 }
             }
+            continuation.onTermination = { @Sendable _ in
+                producer.cancel()
+            }
         }
     }
 
@@ -247,7 +258,9 @@ extension Model {
         promptTokens: [Int],
         parameters params: GenerationParameters,
         profile: Profile,
-        continuation: AsyncThrowingStream<GenerationChunk, Error>.Continuation
+        continuation: AsyncThrowingStream<GenerationChunk, Error>.Continuation,
+        sessionCaches: [any LayerCacheProtocol]?,
+        prefillStart: Int
     ) async throws {
         // T38: pin the executing thread's OS-visible QoS class to
         // user-interactive for the duration of this generate call (covers
@@ -279,17 +292,16 @@ extension Model {
         // sessions, another process squeezing this one). See
         // `Device.refreshWeightResidency` for the full rationale.
         Device.shared.refreshWeightResidency()
-        // Cross-arm/cross-generation retention fix: drop residency for
-        // the PREVIOUS generation's KV/conv/GDN-state cache buffers
-        // before building this generation's fresh set below. Safe here
-        // — nothing in Butter carries a cache object across separate
-        // `generate()` calls, every call rebuilds via `makeLayerCaches`
-        // — and required: without it, `markCacheResident` (called from
-        // each cache's initializer) accumulates a strong GPU-residency
-        // reference per generation for the life of the process. See
-        // `Device.releaseGenerationCaches` for the full writeup.
-        Device.shared.releaseGenerationCaches()
-        let caches = engine.makeLayerCaches()
+        // Session path reuses live KV — do not release/rebuild. One-shot
+        // `generate()` still drops the previous generation's caches.
+        let caches: [any LayerCacheProtocol]
+        if let sessionCaches {
+            caches = sessionCaches
+        } else {
+            Device.shared.releaseGenerationCaches()
+            caches = engine.makeLayerCaches()
+        }
+        let nPast = min(max(prefillStart, 0), promptTokens.count)
         // Gemma 3+, several Qwen variants, and a few llama-tuned models
         // publish `eos_token_id` as a *list* (model EOS plus end-of-turn
         // tokens like `<|im_end|>`). Stop on any of them.
@@ -527,7 +539,7 @@ extension Model {
             // returns logits at the final prompt position so we can sample
             // the first generate token without a second full layer stack
             // (previously multi was n-1 then sampleNext re-forwarded last).
-            var pos = 0
+            var pos = nPast
             var lastLogits: Tensor?
             while pos < n {
                 try Task.checkCancellation()
@@ -706,7 +718,10 @@ extension Model {
             && params.temperature > 0
             && params.repetitionPenalty == 1.0
             && (mtpModel?.mtpHead) != nil
-        let useMTPSpec = useMTPSpecGreedy || useMTPSpecSampled
+        // MTP sidecar is primed during a full-prompt prefill. A session
+        // suffix prefill would leave the draft cache missing the prefix.
+        let useMTPSpec =
+            (useMTPSpecGreedy || useMTPSpecSampled) && nPast == 0
 
         // F-131: NemotronH MTP self-speculative decode. Opt-in via
         // BUTTER_NEMOTRON_MTP_SPEC=1 (default OFF — measured a
@@ -724,6 +739,7 @@ extension Model {
             nemotronMTPSpecEnabled && path == .greedyGPU && !capturePPL
             && params.temperature == 0
             && (nemotronModel?.mtpHead) != nil
+            && nPast == 0
 
         if useMTPSpec, let qwen = mtpModel, let mtpHead = qwen.mtpHead {
             try Task.checkCancellation()

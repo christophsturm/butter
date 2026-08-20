@@ -139,6 +139,12 @@ struct GenerateCommand: AsyncParsableCommand {
     )
     var auraDecodePath: String?
 
+    @Option(
+        name: .long,
+        help: "Size the KV cache for this many positions. Default: model family pick."
+    )
+    var maxContext: Int?
+
     // ─── Nemotron-Labs-Diffusion tri-mode decoding ───────────────────
 
     @Option(
@@ -170,62 +176,16 @@ struct GenerateCommand: AsyncParsableCommand {
 
         print("butter \(Butter.version) — loading \(model)…")
         let loadStart = Date()
-        // Build LoadOptions with the requested KV cache scheme.
-        var loadOpts = LoadOptions()
-        let rawKVKind = (kvCache ?? "raw").lowercased()
-        switch rawKVKind {
-        case "raw":
-            loadOpts.kvCache = .raw
-        case "affine8":
-            loadOpts.kvCache = .affineQuantized(bits: 8, groupSize: 64)
-        case "affine4":
-            // group_size=16 at 4-bit — much finer groups than affine8's
-            // 64. Affine min-max int4 has only 16 quant levels, so a
-            // single per-head outlier channel inflates a wide group's
-            // range and collapses the other dims onto 1-2 levels. At
-            // gs64 decode is fully degenerate ("a time, a time"); gs32
-            // is grammatical but loops; gs16 is the first group size
-            // that decodes coherently (measured on Qwen3-1.7B — see
-            // Tests/ModelTests/KVCacheSchemeIntegrationTests.swift).
-            // TurboQuant-style rotation would let group_size=64 work at
-            // 4-bit; that's Phase 5d (AURA).
-            loadOpts.kvCache = .affineQuantized(bits: 4, groupSize: 16)
-        case _ where rawKVKind.hasPrefix("aura"):
-            guard let scheme = AURAScheme.parse(rawKVKind) else {
-                throw ValidationError(
-                    "Unknown AURA recipe \"\(rawKVKind)\". Try \"aura\", \"aura4\", \"aura4v2\", \"aura3\", \"aura8\"."
-                )
-            }
-            loadOpts.kvCache = .auraQuantized(scheme: scheme)
-        default:
-            throw ValidationError(
-                "Unknown --kv-cache \"\(kvCache ?? "")\". Use \"raw\", \"affine8\", \"affine4\", or any \"auraNvM\" recipe."
-            )
-        }
-
-        // Sliding-window / FIFO eviction. Translates the CLI pair
-        // (--kv-window-size, --kv-window-keep) into LoadOptions.kvEviction.
-        // Validation deferred to KVEvictionState's preconditions so the
-        // error site is colocated with the policy logic.
-        if let size = kvWindowSize, size > 0 {
-            let keep = kvWindowKeep ?? 0
-            loadOpts.kvEviction = .window(maxSize: size, keep: keep)
-        } else if (kvWindowKeep ?? 0) != 0 {
-            throw ValidationError("--kv-window-keep requires --kv-window-size to be set.")
-        }
-
-        // AURA decode-path A/B selection.
-        if let raw = auraDecodePath?.lowercased() {
-            switch raw {
-            case "compressed":
-                loadOpts.auraDecodePath = .compressed
-            case "dequant-mirror", "dequant_mirror", "mirror":
-                loadOpts.auraDecodePath = .dequantMirror
-            default:
-                throw ValidationError(
-                    "Unknown --aura-decode-path \"\(auraDecodePath ?? "")\". Use \"compressed\" or \"dequant-mirror\"."
-                )
-            }
+        let loadOpts: LoadOptions
+        do {
+            loadOpts = try LoadOptions.fromCLI(
+                kvCache: kvCache,
+                kvWindowSize: kvWindowSize,
+                kvWindowKeep: kvWindowKeep,
+                auraDecodePath: auraDecodePath,
+                maxContextLength: maxContext)
+        } catch {
+            throw ValidationError("\(error)")
         }
         let m = try await Model.load(model, options: loadOpts)
         print("loaded in \(String(format: "%.2f", Date().timeIntervalSince(loadStart)))s")

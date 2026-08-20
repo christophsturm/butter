@@ -25,6 +25,7 @@
 // rather than us implementing per-family rendering. That way new
 // models that adopt the same conventions just work.
 
+import CoreFoundation
 import Foundation
 import Tokenizers
 
@@ -93,13 +94,18 @@ public struct ChatTemplateOptions: Sendable, Equatable {
     /// above. Merged into `additionalContext` after the typed fields.
     public var extraContext: [String: any Sendable]
 
+    /// OpenAI-style tool defs passed into the Jinja `tools` variable.
+    /// `nil` (default) matches the previous hardcoded `tools: nil`.
+    public var tools: [ChatToolDefinition]?
+
     public init(
         addGenerationPrompt: Bool = true,
         enableThinking: Bool = false,
         reasoningEffort: ReasoningEffort? = nil,
         maxLength: Int? = nil,
         truncation: Bool = false,
-        extraContext: [String: any Sendable] = [:]
+        extraContext: [String: any Sendable] = [:],
+        tools: [ChatToolDefinition]? = nil
     ) {
         self.addGenerationPrompt = addGenerationPrompt
         self.enableThinking = enableThinking
@@ -107,6 +113,7 @@ public struct ChatTemplateOptions: Sendable, Equatable {
         self.maxLength = maxLength
         self.truncation = truncation
         self.extraContext = extraContext
+        self.tools = tools
     }
 
     public static func == (lhs: ChatTemplateOptions, rhs: ChatTemplateOptions) -> Bool {
@@ -114,10 +121,72 @@ public struct ChatTemplateOptions: Sendable, Equatable {
             && lhs.enableThinking == rhs.enableThinking
             && lhs.reasoningEffort == rhs.reasoningEffort && lhs.maxLength == rhs.maxLength
             && lhs.truncation == rhs.truncation
+            && lhs.tools == rhs.tools
         // extraContext intentionally not compared — `any Sendable` isn't
         // Equatable. Two options with different `extraContext` will read
         // as equal here; callers that care should compare the dicts
         // themselves.
+    }
+}
+
+/// One OpenAI-style function tool (`type: function`) for the chat template.
+public struct ChatToolDefinition: Sendable, Equatable {
+    public var name: String
+    public var description: String
+    /// JSON Schema object, serialized. Empty / invalid falls back to `{}`.
+    public var parametersJSON: String
+
+    public init(name: String, description: String = "", parametersJSON: String = "{}") {
+        self.name = name
+        self.description = description
+        self.parametersJSON = parametersJSON
+    }
+
+    /// Shape Jinja templates expect: `{type, function:{name,description,parameters}}`.
+    public var asTemplateTool: [String: any Sendable] {
+        let params: any Sendable
+        if let data = parametersJSON.data(using: .utf8),
+            let obj = try? JSONSerialization.jsonObject(with: data)
+        {
+            params = jsonToSendable(obj)
+        } else {
+            params = [String: any Sendable]()
+        }
+        let function: [String: any Sendable] = [
+            "name": name,
+            "description": description,
+            "parameters": params,
+        ]
+        return ["type": "function", "function": function]
+    }
+}
+
+/// Convert `JSONSerialization` output into Sendable JSON values.
+internal func jsonToSendable(_ value: Any) -> any Sendable {
+    switch value {
+    case let b as Bool:
+        return b
+    case let i as Int:
+        return i
+    case let d as Double:
+        return d
+    case let s as String:
+        return s
+    case let a as [Any]:
+        return a.map { jsonToSendable($0) }
+    case let o as [String: Any]:
+        var out: [String: any Sendable] = [:]
+        for (k, v) in o { out[k] = jsonToSendable(v) }
+        return out
+    case let n as NSNumber:
+        if CFGetTypeID(n) == CFBooleanGetTypeID() { return n.boolValue }
+        let d = n.doubleValue
+        if d == Double(n.intValue) { return n.intValue }
+        return d
+    case is NSNull:
+        return Optional<String>.none as String?
+    default:
+        return String(describing: value)
     }
 }
 
@@ -154,13 +223,14 @@ extension Model {
         }
         let templateMessages = messages.map { $0.asTemplateMessage }
         do {
+            let tools = options.tools?.map(\.asTemplateTool)
             return try tokenizer.applyChatTemplate(
                 messages: templateMessages,
                 chatTemplate: nil,
                 addGenerationPrompt: options.addGenerationPrompt,
                 truncation: options.truncation,
                 maxLength: options.maxLength,
-                tools: nil,
+                tools: tools,
                 additionalContext: additional
             )
         } catch {

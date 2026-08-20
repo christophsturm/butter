@@ -36,7 +36,7 @@ struct ButterRoot: AsyncParsableCommand {
         subcommands: [
             GenerateCommand.self, BenchCommand.self,
             InspectCommand.self, ModelsCommand.self,
-            ConvertCommand.self,
+            ConvertCommand.self, ServeCommand.self,
         ],
         defaultSubcommand: GenerateCommand.self
     )
