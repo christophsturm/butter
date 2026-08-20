@@ -57,20 +57,11 @@
 //
 // ─── Dispatch granularity ───────────────────────────────────────────
 //
-// `appendOnGPU` runs `nKVHeads` encode dispatches per K (and the same
-// per V): the encode kernel writes `[rows, packed_width]` contiguous
-// output, but our storage layout interleaves heads as the outer
-// dimension so per-position writes for different heads are not
-// contiguous. We work around this by issuing one encode per head with
-// a per-head buffer view. For Qwen3 1.7B (nKVHeads=8, 28 layers) that's
-// 16 encode dispatches per token per layer = 448 per token total — a
-// real perf cost vs raw bf16 KV. Production speedup paths:
-//
-//   1. Strided-output encode kernel (one dispatch writes all heads).
-//   2. Layout change to `[maxSeq, nKVHeads, packedWidth]` + matching
-//      dequant kernel rewrite.
-//
-// Both queued for the perf pass.
+// `appendOnGPU` encodes every K head in one dispatch and every V head in
+// one dispatch. Small contiguous scratch rows receive the atomic output,
+// then one ordered blit scatters those rows into the permanent head-major
+// cache. This preserves the attention layout while avoiding one encode
+// dispatch per head.
 
 import Foundation
 import Metal
@@ -122,6 +113,14 @@ public final class AURAQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {
     public let vPacked: Tensor  // [nKVHeads, maxSeq, vPackedWidth] u32
     public let kNorms: Tensor  // [nKVHeads, maxSeq] dtype — encode writes T, decode reads T
     public let vNorms: Tensor  // [nKVHeads, maxSeq] dtype
+
+    // One-position contiguous output for the all-head append. The encode
+    // kernel uses atomic OR for packed codes, so these packed scratches are
+    // cleared before each append. Norm scratches are overwritten directly.
+    private let kAppendPackedScratch: Tensor
+    private let vAppendPackedScratch: Tensor
+    private let kAppendNormsScratch: Tensor
+    private let vAppendNormsScratch: Tensor
 
     // Shared working buffers — bulk-dequant target; reused across layers.
     public let sharedWorkingK: Tensor  // [nKVHeads, maxSeq, headDim] dtype
@@ -247,6 +246,14 @@ public final class AURAQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {
             shape: [nKVHeads, maxSeq], dtype: dtype, device: device)
         self.vNorms = Tensor.empty(
             shape: [nKVHeads, maxSeq], dtype: dtype, device: device)
+        self.kAppendPackedScratch = Tensor.empty(
+            shape: [nKVHeads, kPackedWidth], dtype: .u32, device: device)
+        self.vAppendPackedScratch = Tensor.empty(
+            shape: [nKVHeads, vPackedWidth], dtype: .u32, device: device)
+        self.kAppendNormsScratch = Tensor.empty(
+            shape: [nKVHeads], dtype: dtype, device: device)
+        self.vAppendNormsScratch = Tensor.empty(
+            shape: [nKVHeads], dtype: dtype, device: device)
 
         // Codec is purely additive in atomic_or terms, so packed slots
         // MUST start zeroed. Norms slots get overwritten per encode but
@@ -285,46 +292,39 @@ public final class AURAQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {
 
         lengthLock.withLock {
             let pos = _evictionState.reserveNextSlot()
-            // AURA encode atomic_or-accumulates into `packed[pos]`,
-            // so on a rotated slot we MUST zero the prior contents
-            // before the encode runs, or stale bits will OR through.
-            // Cheap (one packed_width × u32 row per head per cache).
-            if case .window = _evictionState.policy,
-                _evictionState.absolutePosition > _evictionState.length
-            {
-                zeroPackedSlot(packed: kPacked, packedWidth: kPackedWidth, pos: pos, on: cmd)
-                zeroPackedSlot(packed: vPacked, packedWidth: vPackedWidth, pos: pos, on: cmd)
-            }
-            encodePerHead(
-                inputFlat: kFlat, packed: kPacked, norms: kNorms,
-                codebook: kCodebook, boundaries: kBoundaries,
-                packedWidth: kPackedWidth, bits: scheme.keyBits,
-                pos: pos, on: cmd)
-            encodePerHead(
-                inputFlat: vFlat, packed: vPacked, norms: vNorms,
-                codebook: vCodebook, boundaries: vBoundaries,
-                packedWidth: vPackedWidth, bits: scheme.valueBits,
-                pos: pos, on: cmd)
+            clearAppendPackedScratch(on: cmd)
+            Ops.auraEncode(
+                input: kFlat.reshaped(to: [nKVHeads, headDim]),
+                rotation: rotationDtype,
+                boundaries: kBoundaries, codebook: kCodebook,
+                packedOut: kAppendPackedScratch, normsOut: kAppendNormsScratch,
+                rows: nKVHeads, dim: headDim, packedWidth: kPackedWidth,
+                bits: scheme.keyBits, on: cmd)
+            Ops.auraEncode(
+                input: vFlat.reshaped(to: [nKVHeads, headDim]),
+                rotation: rotationDtype,
+                boundaries: vBoundaries, codebook: vCodebook,
+                packedOut: vAppendPackedScratch, normsOut: vAppendNormsScratch,
+                rows: nKVHeads, dim: headDim, packedWidth: vPackedWidth,
+                bits: scheme.valueBits, on: cmd)
+            scatterAppendScratch(pos: pos, on: cmd)
         }
     }
 
-    /// Clear the packed-u32 row at `pos` across all heads, in
-    /// preparation for the atomic_or-accumulating encode kernel.
-    /// Called only when rotating into a previously-occupied slot.
-    private func zeroPackedSlot(
-        packed: Tensor, packedWidth: Int, pos: Int,
-        on cmd: MTLCommandBuffer
-    ) {
-        let packedBytesPerSlot = packedWidth * 4
-        let packedBytesPerHead = maxSeq * packedBytesPerSlot
-        guard let blit = cmd.makeBlitCommandEncoder() else { return }
-        for h in 0 ..< nKVHeads {
-            let off = packed.offset + h * packedBytesPerHead + pos * packedBytesPerSlot
-            blit.fill(
-                buffer: packed.buffer,
-                range: off ..< (off + packedBytesPerSlot),
-                value: 0)
+    private func clearAppendPackedScratch(on cmd: MTLCommandBuffer) {
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure("AURAQuantizedKVCache: append scratch clear failed")
         }
+        blit.fill(
+            buffer: kAppendPackedScratch.buffer,
+            range: kAppendPackedScratch.offset
+                ..< (kAppendPackedScratch.offset + nKVHeads * kPackedWidth * 4),
+            value: 0)
+        blit.fill(
+            buffer: vAppendPackedScratch.buffer,
+            range: vAppendPackedScratch.offset
+                ..< (vAppendPackedScratch.offset + nKVHeads * vPackedWidth * 4),
+            value: 0)
         blit.endEncoding()
     }
 
@@ -375,51 +375,42 @@ public final class AURAQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {
 
     // MARK: - Internals
 
-    /// Issue one `Ops.auraEncode` dispatch per head, with per-head
-    /// buffer views, so each head's encoded output lands at its
-    /// non-contiguous slot in the [nKVHeads, maxSeq, packedWidth]
-    /// storage layout. See class header for the perf-followup note.
-    private func encodePerHead(
-        inputFlat: Tensor, packed: Tensor, norms: Tensor,
-        codebook: Tensor, boundaries: Tensor,
-        packedWidth: Int, bits: Int,
-        pos: Int,
-        on cmd: MTLCommandBuffer
-    ) {
-        let inputBytesPerHead = headDim * dtype.byteSize
-        let packedBytesPerSlot = packedWidth * 4  // u32
-        let packedBytesPerHead = maxSeq * packedBytesPerSlot
-        // Norms are stored in the cache dtype post-unification — stride
-        // tracks the activation dtype's byte size, not the legacy 4 (f32).
+    private func scatterAppendScratch(pos: Int, on cmd: MTLCommandBuffer) {
         let normByteSize = dtype.byteSize
         let normBytesPerHead = maxSeq * normByteSize
-
-        for h in 0 ..< nKVHeads {
-            let inputView = Tensor(
-                buffer: inputFlat.buffer,
-                offset: inputFlat.offset + h * inputBytesPerHead,
-                shape: [1, headDim], dtype: dtype)
-            let packedView = Tensor(
-                buffer: packed.buffer,
-                offset: packed.offset + h * packedBytesPerHead + pos * packedBytesPerSlot,
-                shape: [1, packedWidth], dtype: .u32)
-            let normsView = Tensor(
-                buffer: norms.buffer,
-                offset: norms.offset + h * normBytesPerHead + pos * normByteSize,
-                shape: [1], dtype: dtype)
-            // iron #226: aura_encode now takes rotation+boundaries
-            // as Tensor<T>. Use the activation-dtype copy of Π
-            // (`rotationDtype`) instead of the legacy f32 `rotation`
-            // field — the f32 field is kept around for any future
-            // kernel that wants f32 rotations, but the encoder no
-            // longer does.
-            Ops.auraEncode(
-                input: inputView, rotation: rotationDtype,
-                boundaries: boundaries, codebook: codebook,
-                packedOut: packedView, normsOut: normsView,
-                rows: 1, dim: headDim, packedWidth: packedWidth, bits: bits,
-                on: cmd)
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure("AURAQuantizedKVCache: append scratch scatter failed")
         }
+        func scatter(
+            packedScratch: Tensor, normsScratch: Tensor,
+            packed: Tensor, norms: Tensor, packedWidth: Int
+        ) {
+            let packedBytesPerSlot = packedWidth * 4
+            let packedBytesPerHead = maxSeq * packedBytesPerSlot
+            for h in 0 ..< nKVHeads {
+                blit.copy(
+                    from: packedScratch.buffer,
+                    sourceOffset: packedScratch.offset + h * packedBytesPerSlot,
+                    to: packed.buffer,
+                    destinationOffset: packed.offset
+                        + h * packedBytesPerHead + pos * packedBytesPerSlot,
+                    size: packedBytesPerSlot)
+                blit.copy(
+                    from: normsScratch.buffer,
+                    sourceOffset: normsScratch.offset + h * normByteSize,
+                    to: norms.buffer,
+                    destinationOffset: norms.offset
+                        + h * normBytesPerHead + pos * normByteSize,
+                    size: normByteSize)
+            }
+        }
+        scatter(
+            packedScratch: kAppendPackedScratch, normsScratch: kAppendNormsScratch,
+            packed: kPacked, norms: kNorms, packedWidth: kPackedWidth)
+        scatter(
+            packedScratch: vAppendPackedScratch, normsScratch: vAppendNormsScratch,
+            packed: vPacked, norms: vNorms, packedWidth: vPackedWidth)
+        blit.endEncoding()
     }
 }
 
