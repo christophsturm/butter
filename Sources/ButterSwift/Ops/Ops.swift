@@ -6149,6 +6149,8 @@ public enum Ops {
         let kvStrideU = UInt32(kvStride)
         let repeatCount = UInt32(nQHeads / nKVHeads)
         let numQ = UInt32(nQHeads)
+        let headsChunk: UInt32 = 1
+        let qStartPosition = UInt32(liveLength - 1)
         let sinksFlag: UInt32 = hasSinks ? 1 : 0
         let win = UInt32(windowSize)
 
@@ -6172,6 +6174,7 @@ public enum Ops {
                 dim: dim, key_packed_width: kpw, value_packed_width: vpw,
                 tokens: tokens, kv_stride: kvStrideU,
                 repeat_count: repeatCount, num_q_heads: numQ,
+                heads_chunk: headsChunk, q_start_position: qStartPosition,
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 2, 128, .f16):
@@ -6188,6 +6191,7 @@ public enum Ops {
                 dim: dim, key_packed_width: kpw, value_packed_width: vpw,
                 tokens: tokens, kv_stride: kvStrideU,
                 repeat_count: repeatCount, num_q_heads: numQ,
+                heads_chunk: headsChunk, q_start_position: qStartPosition,
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 2, 128, .bf16):
@@ -6204,6 +6208,7 @@ public enum Ops {
                 dim: dim, key_packed_width: kpw, value_packed_width: vpw,
                 tokens: tokens, kv_stride: kvStrideU,
                 repeat_count: repeatCount, num_q_heads: numQ,
+                heads_chunk: headsChunk, q_start_position: qStartPosition,
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 4, 128, .f32):
@@ -6220,6 +6225,7 @@ public enum Ops {
                 dim: dim, key_packed_width: kpw, value_packed_width: vpw,
                 tokens: tokens, kv_stride: kvStrideU,
                 repeat_count: repeatCount, num_q_heads: numQ,
+                heads_chunk: headsChunk, q_start_position: qStartPosition,
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 4, 128, .f16):
@@ -6236,6 +6242,7 @@ public enum Ops {
                 dim: dim, key_packed_width: kpw, value_packed_width: vpw,
                 tokens: tokens, kv_stride: kvStrideU,
                 repeat_count: repeatCount, num_q_heads: numQ,
+                heads_chunk: headsChunk, q_start_position: qStartPosition,
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (4, 4, 128, .bf16):
@@ -6252,6 +6259,7 @@ public enum Ops {
                 dim: dim, key_packed_width: kpw, value_packed_width: vpw,
                 tokens: tokens, kv_stride: kvStrideU,
                 repeat_count: repeatCount, num_q_heads: numQ,
+                heads_chunk: headsChunk, q_start_position: qStartPosition,
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
@@ -6452,6 +6460,81 @@ public enum Ops {
                 output: out.buffer, outputOffset: out.offset,
                 dim: dim, num_blocks: numBlocksU,
                 gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
+        case (4, 2, 256, .f32):
+            IronKernels.iron_aura_flash_p1_kb4_vb2_d256_f32(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount,
+                num_blocks: numBlocksU, block_size: blockSizeU,
+                q_position: qPosition,
+                gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
+            IronKernels.iron_aura_flash_pass2_d256_f32(
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                output: out.buffer, outputOffset: out.offset,
+                dim: dim, num_blocks: numBlocksU,
+                gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
+        case (4, 2, 256, .f16):
+            IronKernels.iron_aura_flash_p1_kb4_vb2_d256_f16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount,
+                num_blocks: numBlocksU, block_size: blockSizeU,
+                q_position: qPosition,
+                gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
+            IronKernels.iron_aura_flash_pass2_d256_f16(
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                output: out.buffer, outputOffset: out.offset,
+                dim: dim, num_blocks: numBlocksU,
+                gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
+        case (4, 2, 256, .bf16):
+            IronKernels.iron_aura_flash_p1_kb4_vb2_d256_bf16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount,
+                num_blocks: numBlocksU, block_size: blockSizeU,
+                q_position: qPosition,
+                gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
+            IronKernels.iron_aura_flash_pass2_d256_bf16(
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                output: out.buffer, outputOffset: out.offset,
+                dim: dim, num_blocks: numBlocksU,
+                gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
         case (4, 4, 128, .f32):
             IronKernels.iron_aura_flash_p1_kb4_vb4_d128_f32(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
@@ -6537,14 +6620,15 @@ public enum Ops {
     }
 
     /// Predicate for the `auraFlashSdpa2Pass` supported-scheme set.
-    /// Matches `supportsAuraFlashSdpa` today — both wrappers cover the
-    /// same iron-emitted (kb=4, vb∈{2,4}) × d=128 cells.
+    /// Covers 4v2 at d128 and d256, plus 4v4 at d128.
     public static func supportsAuraFlashSdpa2Pass(
         keyBits: Int, valueBits: Int, headDim: Int, dtype: DType
     ) -> Bool {
         guard [DType.f32, .f16, .bf16].contains(dtype) else { return false }
-        guard headDim == 128 else { return false }
-        if keyBits == 4 && (valueBits == 2 || valueBits == 4) { return true }
+        if keyBits == 4 && valueBits == 2 && (headDim == 128 || headDim == 256) {
+            return true
+        }
+        if keyBits == 4 && valueBits == 4 && headDim == 128 { return true }
         return false
     }
 
