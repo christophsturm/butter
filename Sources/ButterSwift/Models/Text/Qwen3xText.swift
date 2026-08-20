@@ -3067,7 +3067,7 @@ public final class Qwen35AttentionMixer: Module {
         guard let aura = cache as? AURAQuantizedKVCache else { return qFlat }
         return rotatePerHeadRows(
             qFlat, t: t, rotation: aura.rotationDtype,
-            on: cmd, device: device)
+            inverse: false, on: cmd, device: device)
     }
 
     /// Πᵀ-unrotate SDPA output so o_proj sees the original activation
@@ -3078,15 +3078,24 @@ public final class Qwen35AttentionMixer: Module {
     ) -> Tensor {
         guard let aura = cache as? AURAQuantizedKVCache else { return attnFlat }
         return rotatePerHeadRows(
-            attnFlat, t: t, rotation: aura.rotationDtypeT,
-            on: cmd, device: device)
+            attnFlat, t: t, rotation: aura.rotationDtype,
+            inverse: true, on: cmd, device: device)
     }
 
     private func rotatePerHeadRows(
         _ flat: Tensor, t: Int, rotation: Tensor,
+        inverse: Bool,
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
         let qDim = nHeads * headDim
+        if headDim == 256 {
+            let rows = t * nHeads
+            let input = flat.elementCount == rows * headDim
+                ? flat : flat.reshaped(to: [rows * headDim])
+            return Ops.auraSRHTRowsD256(
+                input, signedScale: rotation,
+                rows: rows, inverse: inverse, on: cmd)
+        }
         if t == 1 {
             let row = flat.elementCount == qDim ? flat : flat.reshaped(to: [qDim])
             return Ops.auraRotatePerHead(

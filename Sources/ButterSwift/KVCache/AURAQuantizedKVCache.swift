@@ -303,14 +303,14 @@ public final class AURAQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {
                 boundaries: kBoundaries, codebook: kCodebook,
                 packedOut: kAppendPackedScratch, normsOut: kAppendNormsScratch,
                 rows: nKVHeads, dim: headDim, packedWidth: kPackedWidth,
-                bits: scheme.keyBits, on: cmd)
+                bits: scheme.keyBits, useFastSRHT: true, on: cmd)
             Ops.auraEncode(
                 input: vFlat.reshaped(to: [nKVHeads, headDim]),
                 rotation: rotationDtype,
                 boundaries: vBoundaries, codebook: vCodebook,
                 packedOut: vAppendPackedScratch, normsOut: vAppendNormsScratch,
                 rows: nKVHeads, dim: headDim, packedWidth: vPackedWidth,
-                bits: scheme.valueBits, on: cmd)
+                bits: scheme.valueBits, useFastSRHT: true, on: cmd)
             scatterAppendScratch(positions: [pos], on: cmd)
         }
     }
@@ -345,14 +345,14 @@ public final class AURAQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {
                 boundaries: kBoundaries, codebook: kCodebook,
                 packedOut: kAppendPackedScratch, normsOut: kAppendNormsScratch,
                 rows: rows, dim: headDim, packedWidth: kPackedWidth,
-                bits: scheme.keyBits, on: cmd)
+                bits: scheme.keyBits, useFastSRHT: true, on: cmd)
             Ops.auraEncode(
                 input: vFlat.reshaped(to: [rows, headDim]),
                 rotation: rotationDtype,
                 boundaries: vBoundaries, codebook: vCodebook,
                 packedOut: vAppendPackedScratch, normsOut: vAppendNormsScratch,
                 rows: rows, dim: headDim, packedWidth: vPackedWidth,
-                bits: scheme.valueBits, on: cmd)
+                bits: scheme.valueBits, useFastSRHT: true, on: cmd)
             scatterAppendScratch(positions: positions, on: cmd)
         }
     }

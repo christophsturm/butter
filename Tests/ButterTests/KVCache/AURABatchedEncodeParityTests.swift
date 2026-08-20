@@ -93,7 +93,7 @@ struct AURABatchedEncodeParityTests {
                         offset: expectedNorms.offset + (position * rows + row) * 2,
                         shape: [1], dtype: .bf16),
                     rows: 1, dim: dim, packedWidth: cache.kPackedWidth,
-                    bits: scheme.keyBits, on: expectedCommand)
+                    bits: scheme.keyBits, useFastSRHT: true, on: expectedCommand)
                 Ops.auraEncode(
                     input: Tensor(
                         buffer: inputs[position].buffer,
@@ -111,7 +111,7 @@ struct AURABatchedEncodeParityTests {
                         offset: expectedVNorms.offset + (position * rows + row) * 2,
                         shape: [1], dtype: .bf16),
                     rows: 1, dim: dim, packedWidth: cache.vPackedWidth,
-                    bits: scheme.valueBits, on: expectedCommand)
+                    bits: scheme.valueBits, useFastSRHT: true, on: expectedCommand)
             }
         }
         expectedCommand.commit()

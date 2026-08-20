@@ -5727,6 +5727,7 @@ public enum Ops {
         input: Tensor, rotation: Tensor, boundaries: Tensor, codebook: Tensor,
         packedOut: Tensor, normsOut: Tensor,
         rows: Int, dim: Int, packedWidth: Int, bits: Int,
+        useFastSRHT: Bool = false,
         on cmd: MTLCommandBuffer
     ) {
         precondition(
@@ -5765,6 +5766,7 @@ public enum Ops {
         let tg = MTLSize(width: dim, height: 1, depth: 1)
         let dimU = UInt32(dim)
         let pwU = UInt32(packedWidth)
+        let srhtU: UInt32 = useFastSRHT ? 1 : 0
 
         // Per-(bits, dtype) routing. The kernel layout, argument order,
         // and grid shape are identical across all 12 variants — only the
@@ -5775,7 +5777,7 @@ public enum Ops {
             _ kernel: (
                 MTLBuffer, Int, MTLBuffer, Int, MTLBuffer, Int,
                 MTLBuffer, Int, MTLBuffer, Int, MTLBuffer, Int,
-                UInt32, UInt32, MTLSize, MTLSize, MTLCommandBuffer
+                UInt32, UInt32, UInt32, MTLSize, MTLSize, MTLCommandBuffer
             ) -> Void
         ) {
             kernel(
@@ -5785,106 +5787,106 @@ public enum Ops {
                 codebook.buffer, codebook.offset,
                 packedOut.buffer, packedOut.offset,
                 normsOut.buffer, normsOut.offset,
-                dimU, pwU, grid, tg, cmd
+                dimU, pwU, srhtU, grid, tg, cmd
             )
         }
 
         switch (bits, input.dtype) {
         case (2, .f32):
-            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, srht, g, t, cmd in
                 IronKernels.iron_aura_encode_int2_f32(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
-                    packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd)
+                    packed_width: pw, use_srht: srht, gridSize: g, threadgroupSize: t, on: cmd)
             }
         case (2, .f16):
-            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, srht, g, t, cmd in
                 IronKernels.iron_aura_encode_int2_f16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
-                    packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd)
+                    packed_width: pw, use_srht: srht, gridSize: g, threadgroupSize: t, on: cmd)
             }
         case (2, .bf16):
-            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, srht, g, t, cmd in
                 IronKernels.iron_aura_encode_int2_bf16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
-                    packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd)
+                    packed_width: pw, use_srht: srht, gridSize: g, threadgroupSize: t, on: cmd)
             }
         case (3, .f32):
-            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, srht, g, t, cmd in
                 IronKernels.iron_aura_encode_int3_f32(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
-                    packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd)
+                    packed_width: pw, use_srht: srht, gridSize: g, threadgroupSize: t, on: cmd)
             }
         case (3, .f16):
-            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, srht, g, t, cmd in
                 IronKernels.iron_aura_encode_int3_f16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
-                    packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd)
+                    packed_width: pw, use_srht: srht, gridSize: g, threadgroupSize: t, on: cmd)
             }
         case (3, .bf16):
-            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, srht, g, t, cmd in
                 IronKernels.iron_aura_encode_int3_bf16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
-                    packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd)
+                    packed_width: pw, use_srht: srht, gridSize: g, threadgroupSize: t, on: cmd)
             }
         case (4, .f32):
-            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, srht, g, t, cmd in
                 IronKernels.iron_aura_encode_int4_f32(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
-                    packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd)
+                    packed_width: pw, use_srht: srht, gridSize: g, threadgroupSize: t, on: cmd)
             }
         case (4, .f16):
-            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, srht, g, t, cmd in
                 IronKernels.iron_aura_encode_int4_f16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
-                    packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd)
+                    packed_width: pw, use_srht: srht, gridSize: g, threadgroupSize: t, on: cmd)
             }
         case (4, .bf16):
-            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, srht, g, t, cmd in
                 IronKernels.iron_aura_encode_int4_bf16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
-                    packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd)
+                    packed_width: pw, use_srht: srht, gridSize: g, threadgroupSize: t, on: cmd)
             }
         case (8, .f32):
-            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, srht, g, t, cmd in
                 IronKernels.iron_aura_encode_int8_f32(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
-                    packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd)
+                    packed_width: pw, use_srht: srht, gridSize: g, threadgroupSize: t, on: cmd)
             }
         case (8, .f16):
-            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, srht, g, t, cmd in
                 IronKernels.iron_aura_encode_int8_f16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
-                    packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd)
+                    packed_width: pw, use_srht: srht, gridSize: g, threadgroupSize: t, on: cmd)
             }
         case (8, .bf16):
-            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, srht, g, t, cmd in
                 IronKernels.iron_aura_encode_int8_bf16(
                     input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b,
                     boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p,
                     packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d,
-                    packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd)
+                    packed_width: pw, use_srht: srht, gridSize: g, threadgroupSize: t, on: cmd)
             }
         default:
             fatalError("Ops.auraEncode: unsupported (bits=\(bits), input.dtype=\(input.dtype))")
@@ -6544,6 +6546,56 @@ public enum Ops {
         guard headDim == 128 else { return false }
         if keyBits == 4 && (valueBits == 2 || valueBits == 4) { return true }
         return false
+    }
+
+    /// Apply the d256 SRHT to every contiguous row in one dispatch.
+    /// `signedScale` is the first row of `H * diag(signs) / sqrt(256)`;
+    /// the full rotation tensor is accepted because that row starts at
+    /// the same buffer offset. Forward mode signs before the transform.
+    /// Inverse mode signs after it.
+    public static func auraSRHTRowsD256(
+        _ x: Tensor, signedScale: Tensor,
+        rows: Int, inverse: Bool,
+        on cmd: MTLCommandBuffer
+    ) -> Tensor {
+        let headDim = 256
+        precondition(rows > 0, "auraSRHTRowsD256: rows must be positive")
+        precondition(
+            x.elementCount == rows * headDim,
+            "auraSRHTRowsD256: input shape mismatch")
+        precondition(
+            signedScale.elementCount >= headDim && signedScale.dtype == x.dtype,
+            "auraSRHTRowsD256: signed scale mismatch")
+        let result = Tensor.empty(shape: [rows * headDim], dtype: x.dtype)
+        let grid = MTLSize(width: rows * headDim, height: 1, depth: 1)
+        let tg = MTLSize(width: headDim, height: 1, depth: 1)
+        let signMode: UInt32 = inverse ? 2 : 1
+        switch x.dtype {
+        case .f32:
+            IronKernels.iron_hadamard_n256_f32(
+                inp: x.buffer, inpOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                signs: signedScale.buffer, signsOffset: signedScale.offset,
+                scale: 1, sign_mode: signMode,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            IronKernels.iron_hadamard_n256_f16(
+                inp: x.buffer, inpOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                signs: signedScale.buffer, signsOffset: signedScale.offset,
+                scale: 1, sign_mode: signMode,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            IronKernels.iron_hadamard_n256_bf16(
+                inp: x.buffer, inpOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                signs: signedScale.buffer, signsOffset: signedScale.offset,
+                scale: 1, sign_mode: signMode,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            preconditionFailure("auraSRHTRowsD256: unsupported dtype \(x.dtype)")
+        }
+        return result
     }
 
     public static func auraRotatePerHead(

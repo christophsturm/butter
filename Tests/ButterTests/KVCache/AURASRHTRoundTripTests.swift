@@ -92,6 +92,45 @@ struct AURASRHTRoundTripTests {
         }
     }
 
+    @Test("signed d256 Hadamard forward and inverse round-trip")
+    func signedHadamardD256RoundTrip() {
+        autoreleasepool {
+            let dim = 256
+            let rows = 8
+            let pi = AURARotation.srhtMatrix(dim: dim, seed: 17)
+            let piBits = pi.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+            let rotation = Tensor.empty(shape: [dim, dim], dtype: .bf16)
+            rotation.copyIn(from: piBits)
+
+            let values = (0 ..< rows * dim).map { i -> Float in
+                sin(Float(i) * 0.019) * 0.6 + cos(Float(i) * 0.043) * 0.2
+            }
+            let inputBits = values.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+            let input = Tensor.empty(shape: [rows * dim], dtype: .bf16)
+            input.copyIn(from: inputBits)
+
+            var roundTrip: Tensor!
+            runAndWait { cb in
+                let rotated = Ops.auraSRHTRowsD256(
+                    input, signedScale: rotation,
+                    rows: rows, inverse: false, on: cb)
+                roundTrip = Ops.auraSRHTRowsD256(
+                    rotated, signedScale: rotation,
+                    rows: rows, inverse: true, on: cb)
+            }
+
+            let output = roundTrip.toArray(as: UInt16.self).map {
+                Float(bitPattern: UInt32($0) << 16)
+            }
+            let expected = inputBits.map { Float(bitPattern: UInt32($0) << 16) }
+            var maxError: Float = 0
+            for i in output.indices {
+                maxError = max(maxError, abs(output[i] - expected[i]))
+            }
+            #expect(maxError < 0.02, "signed d256 round-trip max error=\(maxError)")
+        }
+    }
+
     @Test("aura_encode + aura_dequant_rotated with SRHT Π reproduces Π·input")
     func auraCodecSrht() {
         autoreleasepool {
@@ -135,7 +174,7 @@ struct AURASRHTRoundTripTests {
                     boundaries: boundaries, codebook: codebook,
                     packedOut: packedOut, normsOut: normsOut,
                     rows: 1, dim: dim, packedWidth: packedWidth, bits: bits,
-                    on: cb)
+                    useFastSRHT: true, on: cb)
             }
 
             let dequant = Tensor.empty(shape: [1, 1, dim], dtype: .f32)
