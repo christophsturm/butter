@@ -5153,6 +5153,114 @@ public enum Ops {
         return result
     }
 
+    /// MLX-derived `blocks` for chained 2-pass SDPA on Apple M5 Max.
+    /// Mirrors `recommended_blocks_m5_max` in
+    /// `crates/wh-iron-std/src/kernels/sdpa/sdpa_decode_2pass.rs`.
+    /// `nSimds` = `gqaFactor * nQuery`. Output is always a multiple of 32.
+    public static func recommendedBlocksM5Max(nKV: Int, nSimds: Int) -> Int {
+        if nKV <= 1024 || nSimds <= 4 {
+            return 64
+        }
+        if nKV <= 8192 { return 128 }
+        if nKV <= 32768 { return 256 }
+        if nKV <= 65536 { return 512 }
+        return 1024
+    }
+
+    /// Two-pass skinny multi-query SDPA for `headDim == 256`. Sibling of
+    /// `sdpaDecode2Pass` (T=1) extended to `nQuery > 1` (MTP verify tile).
+    /// Splits the long KV walk across `blocks` threadgroups so one TG
+    /// never serializes the full cache. Wraps
+    /// `iron_sdpa_2pass_nq_pass{1,2}_d256` (see
+    /// `crates/wh-iron-std/src/kernels/sdpa/sdpa_2pass_nq_d256.rs`).
+    ///
+    /// Layouts: Q/out `[nQuery, nQHeads, 256]`; K/V
+    /// `[nKVHeads, kvStride, 256]`; partialO
+    /// `[nQuery, nQHeads, blocks, 256]` matching `q.dtype`; partialM/L
+    /// `[nQuery, nQHeads, blocks]` f32. Caller owns partials.
+    ///
+    /// Dispatch (Metal TOTAL THREADS, matching `sdpaDecode2Pass`):
+    ///   pass1TgWidth = gqaFactor * 32
+    ///   pass1Grid = (nQuery * nKVHeads * pass1TgWidth, blocks, 1)
+    ///   pass1Tg   = (pass1TgWidth, 1, 1)
+    ///   pass2Grid = (nQuery * nQHeads * 1024, 1, 1)
+    ///   pass2Tg   = (1024, 1, 1)
+    ///
+    /// Iron currently emits bf16 only (bench dtypes); other dtypes
+    /// fatalError until iron expands the emit set.
+    public static func sdpaMultiD2562Pass(
+        q: Tensor, k: Tensor, v: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        baseKV: Int, nQuery: Int, kvStride: Int,
+        blocks: Int,
+        causal: Bool, scale: Float,
+        partialO: Tensor, partialM: Tensor, partialL: Tensor,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        if let reason = OpsValidation.validateSdpaMultiD2562Pass(
+            headDim: headDim, nQHeads: nQHeads, nKVHeads: nKVHeads,
+            baseKV: baseKV, nQuery: nQuery, kvStride: kvStride,
+            blocks: blocks,
+            partialOCount: partialO.elementCount,
+            partialMCount: partialM.elementCount,
+            partialLCount: partialL.elementCount,
+            partialOMatchesQ: partialO.dtype == q.dtype,
+            partialMIsF32: partialM.dtype == .f32,
+            partialLIsF32: partialL.dtype == .f32
+        ) {
+            preconditionFailure("Ops.sdpaMultiD2562Pass: \(reason)")
+        }
+        precondition(
+            out == nil || out!.dtype == q.dtype,
+            "Ops.sdpaMultiD2562Pass: out dtype must match q")
+        let gqaFactor = nQHeads / nKVHeads
+        let result = out ?? Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: q.dtype)
+        let pass1TgWidth = gqaFactor * 32
+        let pass1Grid = MTLSize(
+            width: nQuery * nKVHeads * pass1TgWidth, height: blocks, depth: 1)
+        let pass1Tg = MTLSize(width: pass1TgWidth, height: 1, depth: 1)
+        let pass2TgWidth = 1024
+        let pass2Grid = MTLSize(
+            width: nQuery * nQHeads * pass2TgWidth, height: 1, depth: 1)
+        let pass2Tg = MTLSize(width: pass2TgWidth, height: 1, depth: 1)
+        let causalFlag = UInt32(causal ? 1 : 0)
+        switch q.dtype {
+        case .bf16:
+            IronKernels.iron_sdpa_2pass_nq_pass1_d256_bf16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim),
+                n_q_heads: UInt32(nQHeads),
+                n_kv_heads: UInt32(nKVHeads),
+                base_kv: UInt32(baseKV),
+                n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor),
+                blocks: UInt32(blocks),
+                causal: causalFlag,
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            IronKernels.iron_sdpa_2pass_nq_pass2_d256_bf16(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        default:
+            fatalError(
+                "Ops.sdpaMultiD2562Pass: unsupported dtype \(q.dtype) "
+                    + "(iron currently emits bf16 only for "
+                    + "iron_sdpa_2pass_nq_pass{1,2}_d256)")
+        }
+        return result
+    }
+
     /// Q-tiled prefill-append SDPA for `headDim == 256`, the default d=256
     /// prefill path (see `Qwen35AttentionMixer.forwardMany`;
     /// `BUTTER_SDPA_LEGACY_D256=1` reverts to `sdpaMulti`). One threadgroup

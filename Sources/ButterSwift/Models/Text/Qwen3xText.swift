@@ -1377,12 +1377,18 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 //     Force MTP-verify off the GQA-grouped d256 kernel and back to
 //     plain sdpaMulti (one threadgroup per Q head). Default ON when
 //     heads_per_group is in 1...8: share the KV walk across a chunk
-//     of the GQA group via Ops.sdpaMultiD256Gqa.
+//     of the GQA group via Ops.sdpaMultiD256Gqa. Ignored when the
+//     2-pass nq path below is active.
 //   BUTTER_SDPA_VERIFY_GQA_CHUNK=<n>
 //     Heads per threadgroup inside a GQA group. Must divide
 //     heads_per_group. Default 3 (the occupancy-split winner on
 //     isolated 24Q/4KV benches). Unset or invalid falls back to
 //     heads_per_group (one TG per KV head).
+//   BUTTER_SDPA_VERIFY_2PASS_NQ=0
+//     Force MTP-verify (T<=16, long KV, d=256) off the two-pass
+//     skinny nq kernels and back to GQA-hc3 / sdpaMulti. Default ON:
+//     Ops.sdpaMultiD2562Pass splits the KV walk across
+//     recommendedBlocksM5Max(nKV, gqa*nQuery) threadgroups.
 //   BUTTER_MTP_DRAFT_KV_ONLY=0
 //     Force the lockstep draft re-advance through the full layer.
 //     Default ON: write KV only.
@@ -2877,11 +2883,19 @@ public final class Qwen35AttentionMixer: Module {
     /// Cached Flash-Decoding 2-pass partial buffers. Allocated lazily
     /// on first 2-pass dispatch (when kv.length ≥ threshold). Sized for
     /// (nHeads, blocks=32, headDim) — ~192KB per attn layer on
-    /// Qwen3.6 bf16.
+    /// Qwen3.6 bf16. T=1 decode path only; verify uses nqPartial*Scratch.
     private var partialOScratch: Tensor?
     private var partialMScratch: Tensor?
     private var partialLScratch: Tensor?
     private let sdpa2PassBlocks: Int = 32
+    /// Multi-query (MTP verify) 2-pass partials. Separate from T=1
+    /// partial*Scratch: shape is [nQuery, nHeads, blocks, headDim] /
+    /// [nQuery, nHeads, blocks] and blocks follow recommendedBlocksM5Max.
+    private var nqPartialOScratch: Tensor?
+    private var nqPartialMScratch: Tensor?
+    private var nqPartialLScratch: Tensor?
+    private var nqPartialBlocks: Int = 0
+    private var nqPartialNQuery: Int = 0
     let useTwoPassDecode: Bool
     private let sdpa2PassThreshold: Int = {
         if let raw = ButterEnv["BUTTER_SDPA_2PASS_THRESHOLD"],
@@ -3608,12 +3622,14 @@ public final class Qwen35AttentionMixer: Module {
         let useQtiled = useQtiledD256Cached
         let (cacheK, cacheV) = kv.prepareForAttention(on: cmd)
         // Skinny long-KV (MTP verify): a BQ=32 MMA tile is mostly
-        // padding at T<=16. sdpaMulti walks one query row per
-        // threadgroup. Default ON after 4K/8K/16K golden pairs.
-        // Force off: BUTTER_SDPA_VERIFY_MULTI=0.
-        // When heads_per_group is in 1...8, prefer the GQA-grouped
-        // d256 kernel (one KV walk per kv_head). Force off GQA with
-        // BUTTER_SDPA_VERIFY_GQA=0 (falls back to plain sdpaMulti).
+        // padding at T<=16. Preference order:
+        //   1. two-pass nq (Ops.sdpaMultiD2562Pass) - default ON;
+        //      force off with BUTTER_SDPA_VERIFY_2PASS_NQ=0
+        //   2. GQA-grouped d256 (Ops.sdpaMultiD256Gqa) when
+        //      heads_per_group in 1...8; force off with
+        //      BUTTER_SDPA_VERIFY_GQA=0
+        //   3. plain sdpaMulti
+        // Force the whole skinny path off: BUTTER_SDPA_VERIFY_MULTI=0.
         let useVerifyMulti =
             headDim == 256
             && t <= 16
@@ -3624,36 +3640,70 @@ public final class Qwen35AttentionMixer: Module {
             let qBlock = qForSdpa.reshaped(to: [t, nHeads, headDim])
             let headsPerGroup =
                 nHeads.isMultiple(of: nKVHeads) ? (nHeads / nKVHeads) : 0
-            let useVerifyGqa =
+            let useVerify2PassNq =
                 headsPerGroup >= 1
-                && headsPerGroup <= 8
-                && ButterEnv["BUTTER_SDPA_VERIFY_GQA"] != "0"
-            if useVerifyGqa {
-                // Isolated benches: headsChunk=3 (2 TGs per KV head)
-                // beat both unsplit GQA and per-Q-head multi.
-                let chunkEnv = Int(ButterEnv["BUTTER_SDPA_VERIFY_GQA_CHUNK"] ?? "3") ?? 0
-                let headsChunk: Int
-                if chunkEnv >= 1
-                    && chunkEnv <= headsPerGroup
-                    && headsPerGroup.isMultiple(of: chunkEnv)
+                && ButterEnv["BUTTER_SDPA_VERIFY_2PASS_NQ"] != "0"
+            if useVerify2PassNq {
+                let nKV = startPosition + t
+                let blocks = Ops.recommendedBlocksM5Max(
+                    nKV: nKV, nSimds: headsPerGroup * t)
+                if nqPartialOScratch == nil
+                    || nqPartialNQuery != t
+                    || nqPartialBlocks != blocks
+                    || nqPartialOScratch!.dtype != qBlock.dtype
                 {
-                    headsChunk = chunkEnv
-                } else {
-                    headsChunk = headsPerGroup
+                    nqPartialOScratch = Tensor.empty(
+                        shape: [t, nHeads, blocks, headDim],
+                        dtype: qBlock.dtype, device: device)
+                    nqPartialMScratch = Tensor.empty(
+                        shape: [t, nHeads, blocks], dtype: .f32, device: device)
+                    nqPartialLScratch = Tensor.empty(
+                        shape: [t, nHeads, blocks], dtype: .f32, device: device)
+                    nqPartialNQuery = t
+                    nqPartialBlocks = blocks
                 }
-                attnAll = Ops.sdpaMultiD256Gqa(
+                attnAll = Ops.sdpaMultiD2562Pass(
                     q: qBlock, k: cacheK, v: cacheV,
                     nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
                     baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
-                    causal: true, scale: scale, headsChunk: headsChunk, on: cmd
+                    blocks: blocks, causal: true, scale: scale,
+                    partialO: nqPartialOScratch!,
+                    partialM: nqPartialMScratch!,
+                    partialL: nqPartialLScratch!,
+                    on: cmd
                 ).reshaped(to: [t * qDim])
             } else {
-                attnAll = Ops.sdpaMulti(
-                    q: qBlock, k: cacheK, v: cacheV,
-                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-                    baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
-                    causal: true, scale: scale, on: cmd
-                ).reshaped(to: [t * qDim])
+                let useVerifyGqa =
+                    headsPerGroup >= 1
+                    && headsPerGroup <= 8
+                    && ButterEnv["BUTTER_SDPA_VERIFY_GQA"] != "0"
+                if useVerifyGqa {
+                    // Isolated benches: headsChunk=3 (2 TGs per KV head)
+                    // beat both unsplit GQA and per-Q-head multi.
+                    let chunkEnv = Int(ButterEnv["BUTTER_SDPA_VERIFY_GQA_CHUNK"] ?? "3") ?? 0
+                    let headsChunk: Int
+                    if chunkEnv >= 1
+                        && chunkEnv <= headsPerGroup
+                        && headsPerGroup.isMultiple(of: chunkEnv)
+                    {
+                        headsChunk = chunkEnv
+                    } else {
+                        headsChunk = headsPerGroup
+                    }
+                    attnAll = Ops.sdpaMultiD256Gqa(
+                        q: qBlock, k: cacheK, v: cacheV,
+                        nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                        baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
+                        causal: true, scale: scale, headsChunk: headsChunk, on: cmd
+                    ).reshaped(to: [t * qDim])
+                } else {
+                    attnAll = Ops.sdpaMulti(
+                        q: qBlock, k: cacheK, v: cacheV,
+                        nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                        baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
+                        causal: true, scale: scale, on: cmd
+                    ).reshaped(to: [t * qDim])
+                }
             }
         } else if useMmaD256 {
             let qBlock = qForSdpa.reshaped(to: [t, nHeads, headDim])
