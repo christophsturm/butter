@@ -213,6 +213,7 @@ fn generate_cmd(args: &[String]) {
             seed: 0,
             stream: false,
             max_context,
+            abort: None,
         };
         let t_warm = std::time::Instant::now();
         match wh_butter::generate::generate(dev.as_ref(), &loaded, DEFAULT_PROMPT, &warmup_opts) {
@@ -231,6 +232,7 @@ fn generate_cmd(args: &[String]) {
         seed,
         stream,
         max_context,
+        abort: None,
     };
 
     let t0 = std::time::Instant::now();

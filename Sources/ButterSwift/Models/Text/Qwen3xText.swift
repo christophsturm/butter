@@ -3379,7 +3379,7 @@ public final class Qwen35AttentionMixer: Module {
                 keyBits: auraCache.scheme.keyBits,
                 valueBits: auraCache.scheme.valueBits,
                 scale: scale,
-                hasSinks: false, windowSize: 0,
+                hasSinks: false, windowSize: auraCache.auraWindowSize,
                 on: cmd)
             attnOut = outTensor
         } else {

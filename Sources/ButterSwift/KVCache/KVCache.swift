@@ -133,6 +133,13 @@ extension KVCacheProtocol {
     public func sdpaSinkWindow(nKV: Int) -> (sinkEnd: Int, windowStart: Int) {
         (sinkEnd: 0, windowStart: 0)
     }
+
+    /// Sliding-window size for AURA flash SDPA. 0 = attend the live
+    /// cache (unbounded, or a ring that already compacted to `length`).
+    public var auraWindowSize: Int {
+        if case .window(let maxSize, _) = eviction { return maxSize }
+        return 0
+    }
 }
 
 // MARK: - KVCache (raw fp16 / bf16)

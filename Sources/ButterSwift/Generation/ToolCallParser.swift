@@ -11,8 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// ToolCallParser : recover structured tool_calls from leaked markup
-// (JSON fences and family XML).
+// ToolCallParser: recover structured tool_calls from leaked markup
+// (JSON fences and family XML). Lives next to chat templating.
 
 import Foundation
 
@@ -34,11 +34,27 @@ public enum ToolCallParser {
     public static let recoveryMinRatio: Double = 0.5
 
     public static func recover(from content: String) -> (calls: [ParsedToolCall], residual: String)? {
-        if let r = recoverJSONFence(content) { return r }
-        if let r = recoverQwen3Coder(content) { return r }
-        if let r = recoverPhi4Pipe(content) { return r }
-        if let r = recoverMistralBracket(content) { return r }
+        let visible = stripThinkBlocks(content)
+        if let r = recoverJSONFence(visible) { return r }
+        if let r = recoverQwen3Coder(visible) { return r }
+        if let r = recoverPhi4Pipe(visible) { return r }
+        if let r = recoverMistralBracket(visible) { return r }
         return nil
+    }
+
+    /// Drop `<think>...</think>` (and an unclosed `<think>` tail) so
+    /// reasoning text cannot look like a tool leak.
+    public static func stripThinkBlocks(_ content: String) -> String {
+        var s = content
+        while let start = s.range(of: "<think>") {
+            if let end = s.range(of: "</think>", range: start.lowerBound..<s.endIndex) {
+                s.removeSubrange(start.lowerBound..<end.upperBound)
+            } else {
+                s.removeSubrange(start.lowerBound..<s.endIndex)
+                break
+            }
+        }
+        return s
     }
 
     public static func looksLikeToolMarkup(_ text: String) -> Bool {

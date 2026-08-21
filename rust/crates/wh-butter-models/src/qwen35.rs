@@ -1488,7 +1488,7 @@ fn default_prefill_chunk(total: usize) -> usize {
 ///
 /// Equivalent to [`prefill_at`] with `start_pos = 0`.
 pub fn prefill(dev: &dyn Device, model: &Qwen35Model, cache: &mut Qwen35Cache, tokens: &[u32], chunk: usize) -> Result<Tensor> {
-    prefill_at(dev, model, cache, tokens, 0, chunk)
+    prefill_at(dev, model, cache, tokens, 0, chunk, None)
 }
 
 /// Like [`prefill`], but RoPE / KV / SDPA absolute positions start at
@@ -1502,6 +1502,7 @@ pub fn prefill_at(
     tokens: &[u32],
     start_pos: usize,
     chunk: usize,
+    abort: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Tensor> {
     let cfg = &model.cfg;
     let total = tokens.len();
@@ -1514,6 +1515,9 @@ pub fn prefill_at(
     let mut t_last = 0usize;
     let mut start = 0usize;
     while start < total {
+        if abort.map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false) {
+            return Err(Error::Msg("prefill: aborted".into()));
+        }
         let t = chunk.min(total - start);
         let chunk_tokens = &tokens[start..start + t];
         let abs_start = start_pos + start;

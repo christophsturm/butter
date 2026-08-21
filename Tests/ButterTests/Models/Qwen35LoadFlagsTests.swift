@@ -64,6 +64,59 @@ struct Qwen35LoadFlagsTests {
             if case .window(let s, let k) = $0.eviction { s == 32 && k == 4 } else { false }
         })
     }
+
+    @Test("AURA flash window size follows eviction")
+    func qwen35AuraWindowSize() {
+        let model = makeTinyQwen35(
+            kv: .auraQuantized(scheme: .default), maxSeq: 64,
+            eviction: .window(maxSize: 32, keep: 0))
+        let caches = model.makeLayerCaches(maxSeq: nil, device: .shared)
+        let aura = caches.compactMap { $0 as? AURAQuantizedKVCache }
+        #expect(!aura.isEmpty)
+        #expect(aura.allSatisfy { $0.auraWindowSize == 32 })
+    }
+
+    @Test("AURA dequant-mirror logits stay close to raw")
+    func qwen35AuraLogitsNearRaw() {
+        let rawModel = makeTinyQwen35(kv: .raw, maxSeq: 64)
+        let auraModel = Qwen35Model(
+            embedTokens: rawModel.embedTokens, layers: rawModel.layers,
+            finalNorm: rawModel.finalNorm, lmHead: rawModel.lmHead,
+            hidden: rawModel.hidden, nLayers: rawModel.nLayers,
+            nHeads: rawModel.nHeads, nKVHeads: rawModel.nKVHeads,
+            headDim: rawModel.headDim,
+            numKeyHeads: rawModel.numKeyHeads, numValueHeads: rawModel.numValueHeads,
+            keyHeadDim: rawModel.keyHeadDim, valueHeadDim: rawModel.valueHeadDim,
+            convDim: rawModel.convDim, convKernel: rawModel.convKernel,
+            vocab: rawModel.vocab, maxSeq: rawModel.maxSeq, dtype: rawModel.dtype,
+            kvCacheKind: .auraQuantized(scheme: .default),
+            kvEviction: .unbounded,
+            auraDecodePath: .dequantMirror)
+        let device = Device.shared
+        func logits(_ model: Qwen35Model) -> [Float] {
+            let caches = model.makeLayerCaches(maxSeq: nil, device: device)
+            let cmd = device.makeCommandBuffer()
+            let t = model.forward(
+                tokenId: 3, position: 0, caches: caches,
+                on: cmd, device: device)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            return t.toFloatArray()
+        }
+        let a = logits(rawModel)
+        let b = logits(auraModel)
+        #expect(a.count == b.count)
+        #expect(a.contains { $0 != 0 && $0.isFinite })
+        #expect(b.allSatisfy { $0.isFinite })
+        var dot: Float = 0, na: Float = 0, nb: Float = 0
+        for i in 0 ..< a.count {
+            dot += a[i] * b[i]
+            na += a[i] * a[i]
+            nb += b[i] * b[i]
+        }
+        let cos = dot / (sqrt(na) * sqrt(nb) + 1e-6)
+        #expect(cos > 0.7, "AURA vs raw cosine \(cos)")
+    }
 }
 
 /// 1 GDN + 1 full-attention dense hybrid so `makeLayerCaches` actually

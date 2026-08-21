@@ -86,40 +86,79 @@ struct ServeFlagsTests {
         #expect(session.lastCachedTokens == 4)
     }
 
-    @Test("usage includes cached_tokens : mutation: omit the field")
-    func usageCachedTokens() async throws {
-        let backend = StubServeBackend(
-            modelId: "stub-model",
-            lastCachedTokens: 17,
-            chunks: [
-                GenerationChunk(text: "ok", tokens: [1], position: 1),
-                GenerationChunk(
-                    text: "", tokens: [], position: 1,
-                    stats: GenerationStats(
-                        promptTokens: 20, generatedTokens: 1, contextSize: 0,
-                        prefillTimeS: 0, decodeTimeS: 0, timeToFirstTokenMs: 0,
-                        steadyTokensPerSecond: nil,
-                        baselineGPUBytes: 0, postPrefillGPUBytes: 0, postDecodeGPUBytes: 0,
-                        prefillPeakGPUBytes: 0, decodePeakGPUBytes: 0,
-                        wiredTicketBytes: 0, weightsBytes: 0,
-                        kvCacheAllocatedBytes: 0, kvCacheUsedBytes: 0,
-                        thinkPerplexity: nil, genPerplexity: nil,
-                        thinkKLDivergence: nil, genKLDivergence: nil,
-                        thinkTokenCount: nil, genTokenCount: nil)),
-            ])
+    @Test("usage cached_tokens is nPast of overlapping prompts")
+    func usageCachedTokensFromSession() async throws {
+        let backend = SessionStubBackend(modelId: "stub-model")
         let server = ServeServer(host: "127.0.0.1", port: 0, backend: backend)
         try await server.start()
         defer { server.stop() }
-        var req = URLRequest(
-            url: URL(string: "http://127.0.0.1:\(server.boundPort)/v1/chat/completions")!)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = Data(#"{"stream":false,"messages":[{"role":"user","content":"hi"}]}"#.utf8)
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        #expect((resp as! HTTPURLResponse).statusCode == 200)
-        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        let usage = obj?["usage"] as? [String: Any]
-        #expect(usage?["cached_tokens"] as? Int == 17)
+        func post(_ content: String) async throws -> Int? {
+            var req = URLRequest(
+                url: URL(string: "http://127.0.0.1:\(server.boundPort)/v1/chat/completions")!)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = Data(
+                #"{"stream":false,"messages":[{"role":"user","content":"\#(content)"}]}"#.utf8)
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            #expect((resp as! HTTPURLResponse).statusCode == 200)
+            let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let usage = obj?["usage"] as? [String: Any]
+            return usage?["cached_tokens"] as? Int
+        }
+        let first = try await post("hello")
+        #expect(first == 0)
+        let second = try await post("hello!")
+        let expected = GenerationSession.nPast(
+            cached: Array("hello".utf8.map { Int($0) }),
+            new: Array("hello!".utf8.map { Int($0) }))
+        #expect(second == expected)
+        #expect(expected > 0)
+    }
+}
+
+/// Fake session: message bytes are token ids, so overlapping prompts
+/// produce a real nPast instead of a planted usage field.
+final class SessionStubBackend: ServeGenerationBackend, @unchecked Sendable {
+    let modelId: String
+    var maxModelLen: Int? = 2048
+    var defaultGenerationParameters = GenerationParameters()
+    private let session = GenerationSession(makeCaches: {
+        [FakeKVCache(length: 0, maxSeq: 256)]
+    })
+
+    init(modelId: String) { self.modelId = modelId }
+
+    var lastCachedTokens: Int { session.lastCachedTokens }
+
+    func completeChat(
+        messages: [ChatMessage],
+        tools: [ChatToolDefinition]?,
+        parameters: GenerationParameters,
+        templateOptions: ChatTemplateOptions
+    ) throws -> AsyncThrowingStream<GenerationChunk, Error> {
+        let ids = Array(messages.map(\.content).joined().utf8.map { Int($0) })
+        _ = session.prepare(for: ids)
+        let kv = FakeKVCache(length: ids.count, maxSeq: 256)
+        session.testingReplaceCaches([kv], tokens: ids)
+        let cached = session.lastCachedTokens
+        let stats = GenerationStats(
+            promptTokens: ids.count, generatedTokens: 1, contextSize: 0,
+            prefillTimeS: 0, decodeTimeS: 0, timeToFirstTokenMs: 0,
+            steadyTokensPerSecond: nil,
+            baselineGPUBytes: 0, postPrefillGPUBytes: 0, postDecodeGPUBytes: 0,
+            prefillPeakGPUBytes: 0, decodePeakGPUBytes: 0,
+            wiredTicketBytes: 0, weightsBytes: 0,
+            kvCacheAllocatedBytes: 0, kvCacheUsedBytes: 0,
+            thinkPerplexity: nil, genPerplexity: nil,
+            thinkKLDivergence: nil, genKLDivergence: nil,
+            thinkTokenCount: nil, genTokenCount: nil)
+        return AsyncThrowingStream { continuation in
+            continuation.yield(GenerationChunk(text: "ok", tokens: [1], position: ids.count))
+            continuation.yield(
+                GenerationChunk(text: "", tokens: [], position: ids.count, stats: stats))
+            continuation.finish()
+            _ = cached
+        }
     }
 }
 

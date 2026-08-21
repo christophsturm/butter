@@ -8,7 +8,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -261,6 +262,7 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
     let model_id = v.get("model").and_then(|m| m.as_str()).unwrap_or(&state.model_id);
     let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let id = format!("chatcmpl-{}", created);
+    let abort = watch_disconnect(stream);
 
     let opts = GenerateOpts {
         max_new,
@@ -269,6 +271,7 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
         seed: v.get("seed").and_then(|s| s.as_u64()).unwrap_or(0),
         stream: false,
         max_context: state.max_context,
+        abort: Some(abort.clone()),
     };
 
     if stream_flag {
@@ -306,6 +309,28 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
             }
         };
         drop(live);
+        abort.store(true, Ordering::Relaxed);
+        let tools = recover_tools(&report.text);
+        let finish_reason = if tools.is_some() { "tool_calls" } else { "stop" };
+        if let Some((name, args, _)) = &tools {
+            let tc = json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_id,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "chatcmpl-tool-recovered-000000000000",
+                        "type": "function",
+                        "function": {"name": name, "arguments": args}
+                    }]},
+                    "finish_reason": Value::Null
+                }]
+            });
+            write_sse(stream, &tc.to_string())?;
+        }
         let finish = json!({
             "id": id,
             "object": "chat.completion.chunk",
@@ -314,7 +339,7 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
             "choices": [{
                 "index": 0,
                 "delta": {},
-                "finish_reason": "stop"
+                "finish_reason": finish_reason
             }]
         });
         write_sse(stream, &finish.to_string())?;
@@ -328,7 +353,8 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
                 "usage": {
                     "prompt_tokens": report.prompt_tokens,
                     "completion_tokens": report.generated_tokens,
-                    "total_tokens": report.prompt_tokens + report.generated_tokens
+                    "total_tokens": report.prompt_tokens + report.generated_tokens,
+                    "cached_tokens": report.cached_tokens
                 }
             });
             write_sse(stream, &usage.to_string())?;
@@ -352,6 +378,24 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
             }
         };
         drop(live);
+        abort.store(true, Ordering::Relaxed);
+        let tools = recover_tools(&report.text);
+        let (content, tool_calls, finish_reason) = match &tools {
+            Some((name, args, residual)) => (
+                if residual.is_empty() { Value::Null } else { json!(residual) },
+                json!([{
+                    "id": "chatcmpl-tool-recovered-000000000000",
+                    "type": "function",
+                    "function": {"name": name, "arguments": args}
+                }]),
+                "tool_calls",
+            ),
+            None => (json!(report.text), Value::Null, "stop"),
+        };
+        let mut message = json!({"role": "assistant", "content": content});
+        if !tool_calls.is_null() {
+            message["tool_calls"] = tool_calls;
+        }
         let payload = json!({
             "id": id,
             "object": "chat.completion",
@@ -359,13 +403,14 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
             "model": model_id,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": report.text},
-                "finish_reason": "stop"
+                "message": message,
+                "finish_reason": finish_reason
             }],
             "usage": {
                 "prompt_tokens": report.prompt_tokens,
                 "completion_tokens": report.generated_tokens,
-                "total_tokens": report.prompt_tokens + report.generated_tokens
+                "total_tokens": report.prompt_tokens + report.generated_tokens,
+                "cached_tokens": report.cached_tokens
             }
         });
         write_response(stream, 200, "application/json", payload.to_string().as_bytes())
@@ -415,7 +460,7 @@ fn event_frame(event: &str, json: &str) -> String {
 }
 
 fn messages_stop_reason(assembled: &str, generated: usize, max_new: usize) -> &'static str {
-    if recover_json_markup(assembled).is_some() {
+    if recover_tools(assembled).is_some() {
         "tool_use"
     } else if max_new > 0 && generated >= max_new {
         "max_tokens"
@@ -429,7 +474,7 @@ fn messages_finish_events(assembled: &str, text_started: bool, generated: usize,
     let mut out = String::new();
     let mut started = text_started;
     let stop = messages_stop_reason(assembled, generated, max_new);
-    if let Some((name, args, residual)) = recover_json_markup(assembled) {
+    if let Some((name, args, residual)) = recover_tools(assembled) {
         if !residual.is_empty() {
             if !started {
                 out.push_str(&event_frame(
@@ -504,6 +549,7 @@ fn messages(state: &ServerState, stream: &mut TcpStream, body: &[u8]) -> std::io
         "msg_{}",
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
     );
+    let abort = watch_disconnect(stream);
     let opts = GenerateOpts {
         max_new,
         chunk: 0,
@@ -511,6 +557,7 @@ fn messages(state: &ServerState, stream: &mut TcpStream, body: &[u8]) -> std::io
         seed: parsed.seed,
         stream: false,
         max_context: state.max_context,
+        abort: Some(abort.clone()),
     };
 
     if stream_flag {
@@ -575,6 +622,7 @@ fn messages(state: &ServerState, stream: &mut TcpStream, body: &[u8]) -> std::io
             }
         };
         drop(live);
+        abort.store(true, Ordering::Relaxed);
         stream.write_all(
             messages_finish_events(&assembled, text_started, report.generated_tokens, max_new)
                 .as_bytes(),
@@ -598,13 +646,14 @@ fn messages(state: &ServerState, stream: &mut TcpStream, body: &[u8]) -> std::io
             }
         };
         drop(live);
+        abort.store(true, Ordering::Relaxed);
         let mut finish = if max_new > 0 && report.generated_tokens >= max_new {
             "max_tokens"
         } else {
             "end_turn"
         };
         let mut content: Vec<Value> = Vec::new();
-        if let Some((name, args, residual)) = recover_json_markup(&report.text) {
+        if let Some((name, args, residual)) = recover_tools(&report.text) {
             if !residual.is_empty() {
                 content.push(json!({"type":"text","text":residual}));
             }
@@ -701,6 +750,25 @@ fn flatten_anthropic(v: &Value) -> Result<Vec<Value>, ()> {
     if out.is_empty() { Err(()) } else { Ok(out) }
 }
 
+fn strip_think_blocks(text: &str) -> String {
+    let mut s = text.to_string();
+    while let Some(start) = s.find("<think>") {
+        if let Some(rel_end) = s[start..].find("</think>") {
+            let end = start + rel_end + "</think>".len();
+            s.replace_range(start..end, "");
+        } else {
+            s.truncate(start);
+            break;
+        }
+    }
+    s
+}
+
+fn recover_tools(text: &str) -> Option<(String, String, String)> {
+    let visible = strip_think_blocks(text);
+    recover_json_markup(&visible).or_else(|| recover_xml_markup(&visible))
+}
+
 /// JSON tool-call markup leak -> (name, arguments JSON string, residual).
 fn recover_json_markup(text: &str) -> Option<(String, String, String)> {
     let start = text.find("<tool_call>")?;
@@ -709,6 +777,9 @@ fn recover_json_markup(text: &str) -> Option<(String, String, String)> {
         return None;
     }
     let inner = text[start + "<tool_call>".len()..end].trim();
+    if inner.contains("<function=") {
+        return None;
+    }
     let obj: Value = serde_json::from_str(inner).ok()?;
     let name = obj.get("name")?.as_str()?.to_string();
     let args = match obj.get("arguments") {
@@ -720,6 +791,68 @@ fn recover_json_markup(text: &str) -> Option<(String, String, String)> {
         .trim()
         .to_string();
     Some((name, args, residual))
+}
+
+fn recover_xml_markup(text: &str) -> Option<(String, String, String)> {
+    let start = text.find("<tool_call>")?;
+    let end = text.find("</tool_call>")?;
+    if end <= start {
+        return None;
+    }
+    let inner = text[start + "<tool_call>".len()..end].trim();
+    let fname = inner.find("<function=")?;
+    let name_start = fname + "<function=".len();
+    let name_end = inner[name_start..].find('>')?;
+    let name = inner[name_start..name_start + name_end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut args = serde_json::Map::new();
+    let mut rest = &inner[name_start + name_end + 1..];
+    while let Some(p) = rest.find("<parameter=") {
+        rest = &rest[p + "<parameter=".len()..];
+        let gt = rest.find('>')?;
+        let key = rest[..gt].trim().to_string();
+        rest = &rest[gt + 1..];
+        let close = rest.find("</parameter>")?;
+        let val = rest[..close].trim().to_string();
+        args.insert(key, json!(val));
+        rest = &rest[close + "</parameter>".len()..];
+    }
+    let residual = format!("{}{}", &text[..start], &text[end + "</tool_call>".len()..])
+        .trim()
+        .to_string();
+    Some((name, Value::Object(args).to_string(), residual))
+}
+
+fn watch_disconnect(stream: &TcpStream) -> Arc<AtomicBool> {
+    let abort = Arc::new(AtomicBool::new(false));
+    if let Ok(peek) = stream.try_clone() {
+        let abort2 = abort.clone();
+        std::thread::spawn(move || {
+            let _ = peek.set_nonblocking(true);
+            let mut buf = [0u8; 1];
+            while !abort2.load(Ordering::Relaxed) {
+                match peek.peek(&mut buf) {
+                    Ok(0) => {
+                        abort2.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::Interrupted
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => {
+                        abort2.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+    }
+    abort
 }
 
 fn write_event(stream: &mut TcpStream, event: &str, json: &str) -> std::io::Result<()> {
@@ -982,5 +1115,19 @@ mod tests {
     #[test]
     fn recover_json_markup_rejects_truncated() {
         assert!(recover_json_markup("<tool_call>{\"name\":\"x\"}").is_none());
+    }
+
+    #[test]
+    fn think_block_hides_json_leak() {
+        let s = "<think><tool_call>{\"name\":\"bash\",\"arguments\":{}}</tool_call></think>ok";
+        assert!(recover_tools(s).is_none());
+    }
+
+    #[test]
+    fn recover_xml_function_leak() {
+        let s = "<tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>";
+        let (name, args, _) = recover_tools(s).expect("xml");
+        assert_eq!(name, "bash");
+        assert!(args.contains("ls"));
     }
 }

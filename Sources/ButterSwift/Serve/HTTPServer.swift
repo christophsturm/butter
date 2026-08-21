@@ -171,7 +171,13 @@ private final class ConnectionHandler: @unchecked Sendable {
     private func shouldStopReading() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return closed || closeWhenIdle || readingPaused
+        return closed || closeWhenIdle
+    }
+
+    private func isReadingPaused() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return readingPaused
     }
 
     private func receive() {
@@ -191,17 +197,17 @@ private final class ConnectionHandler: @unchecked Sendable {
                 }
             }
             var handled = self.tryHandleRequest(connectionComplete: isComplete)
-            while handled && !self.shouldStopReading()
+            while handled && !self.shouldStopReading() && !self.isReadingPaused()
                 && self.tryHandleRequest(connectionComplete: false)
             {
                 handled = true
             }
             if self.shouldStopReading() { return }
             if handled {
-                if isComplete && self.buffer.isEmpty {
-                    self.cancel()
-                    return
-                }
+                // A finished request (no Content-Length uses this FIN as
+                // the body delimiter) must keep generating. A later
+                // receive that cannot parse a request and is complete
+                // is a mid-prefill drop and cancel()s below.
                 if !isComplete { self.receive() }
                 return
             }

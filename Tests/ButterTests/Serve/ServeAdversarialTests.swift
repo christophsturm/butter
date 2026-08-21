@@ -16,6 +16,7 @@
 
 import Foundation
 import Network
+import os
 import Testing
 
 @testable import ButterSwift
@@ -238,7 +239,39 @@ struct ServeAdversarialTests {
         #expect(ToolCallParser.recover(from: markup + " ok")?.calls.first?.name == "bash")
     }
 
+    @Test("XML inside think does not recover")
+    func xmlInsideThinkDoesNotRecover() {
+        let xml = """
+            <think>
+            <tool_call>
+            <function=bash>
+            <parameter=command>rm</parameter>
+            </function>
+            </tool_call>
+            </think>
+            done
+            """
+        #expect(ToolCallParser.recover(from: xml) == nil)
+    }
+
     // MARK: - Charter 4 : two POSTs cannot share one KV (Time)
+
+    @Test("client close during prefill cancels generation")
+    func abortDuringPrefill() async throws {
+        let backend = SlowStubBackend()
+        let server = ServeServer(host: "127.0.0.1", port: 0, backend: backend)
+        try await server.start()
+        defer { server.stop() }
+        let body = #"{"stream":true,"messages":[{"role":"user","content":"hi"}]}"#
+        let req =
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            + "Content-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\n"
+            + "Connection: close\r\n\r\n\(body)"
+        try await abortTCP(port: server.boundPort, send: req)
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(backend.didStart)
+        #expect(backend.cancelled)
+    }
 
     @Test("AsyncLock peak is 1 : Time; mutation: no-op acquire")
     func admitSerial() async {
@@ -259,20 +292,86 @@ struct ServeAdversarialTests {
     }
 }
 
+final class SlowStubBackend: ServeGenerationBackend, @unchecked Sendable {
+    let modelId = "stub-model"
+    var maxModelLen: Int? = 128
+    var lastCachedTokens: Int = 0
+    var defaultGenerationParameters = GenerationParameters()
+    private let state = OSAllocatedUnfairLock(initialState: (cancelled: false, didStart: false))
+    var cancelled: Bool { state.withLock { $0.cancelled } }
+    var didStart: Bool { state.withLock { $0.didStart } }
+
+    func completeChat(
+        messages: [ChatMessage],
+        tools: [ChatToolDefinition]?,
+        parameters: GenerationParameters,
+        templateOptions: ChatTemplateOptions
+    ) throws -> AsyncThrowingStream<GenerationChunk, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                self.state.withLock { $0.didStart = true }
+                do {
+                    for _ in 0 ..< 40 {
+                        try Task.checkCancellation()
+                        try await Task.sleep(for: .milliseconds(25))
+                    }
+                    continuation.yield(
+                        GenerationChunk(text: "late", tokens: [1], position: 1))
+                    continuation.finish()
+                } catch {
+                    self.state.withLock { $0.cancelled = true }
+                    continuation.finish()
+                }
+            }
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
+            }
+        }
+    }
+}
+
+private func abortTCP(port: UInt16, send: String) async throws {
+    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+        let conn = NWConnection(
+            host: NWEndpoint.Host("127.0.0.1"),
+            port: NWEndpoint.Port(rawValue: port)!,
+            using: .tcp)
+        conn.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                conn.send(
+                    content: Data(send.utf8),
+                    completion: .contentProcessed { _ in
+                        conn.send(
+                            content: nil,
+                            contentContext: .finalMessage,
+                            isComplete: true,
+                            completion: .contentProcessed { _ in
+                                conn.cancel()
+                                cont.resume()
+                            })
+                    })
+            case .failed(let e):
+                cont.resume(throwing: e)
+            default:
+                break
+            }
+        }
+        conn.start(queue: DispatchQueue(label: "butter.abortTCP"))
+    }
+}
+
 private final class PeakBox: @unchecked Sendable {
-    private let sem = DispatchSemaphore(value: 1)
-    private var live = 0
-    private(set) var peak = 0
+    private let lock = OSAllocatedUnfairLock(initialState: (live: 0, peak: 0))
+    var peak: Int { lock.withLock { $0.peak } }
     func enter() {
-        sem.wait()
-        live += 1
-        peak = max(peak, live)
-        sem.signal()
+        lock.withLock { s in
+            s.live += 1
+            s.peak = max(s.peak, s.live)
+        }
     }
     func leave() {
-        sem.wait()
-        live -= 1
-        sem.signal()
+        lock.withLock { s in s.live -= 1 }
     }
 }
 
@@ -312,9 +411,7 @@ private func rawTCP(
     until predicate: @escaping @Sendable (String) -> Bool
 ) async throws -> String {
     final class Session: @unchecked Sendable {
-        private let sem = DispatchSemaphore(value: 1)
-        private var _conn: NWConnection?
-        private var acc = Data()
+        private let lock = OSAllocatedUnfairLock(initialState: SessionState())
         let once = OnceResume()
         let predicate: @Sendable (String) -> Bool
 
@@ -323,26 +420,16 @@ private func rawTCP(
         }
 
         var conn: NWConnection? {
-            get {
-                sem.wait(); defer { sem.signal() }
-                return _conn
-            }
-            set {
-                sem.wait(); defer { sem.signal() }
-                _conn = newValue
-            }
+            get { lock.withLock { $0.conn } }
+            set { lock.withLock { $0.conn = newValue } }
         }
 
         func append(_ data: Data) {
-            sem.wait()
-            acc.append(data)
-            sem.signal()
+            lock.withLock { $0.acc.append(data) }
         }
 
         func snapshot() -> String {
-            sem.wait()
-            defer { sem.signal() }
-            return String(data: acc, encoding: .utf8) ?? ""
+            lock.withLock { String(data: $0.acc, encoding: .utf8) ?? "" }
         }
 
         func receiveLoop(
@@ -427,17 +514,23 @@ private func rawTCP(
 
 private struct RSTTimeout: Error {}
 
+private struct SessionState {
+    var conn: NWConnection?
+    var acc = Data()
+}
+
 private final class OnceResume: @unchecked Sendable {
-    private let lock = NSLock()
-    private var done = false
+    private let lock = OSAllocatedUnfairLock(initialState: false)
     func finish(
         _ cont: CheckedContinuation<String, Error>,
         _ result: Result<String, Error>
     ) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !done else { return }
-        done = true
+        let first = lock.withLock { done -> Bool in
+            if done { return false }
+            done = true
+            return true
+        }
+        guard first else { return }
         cont.resume(with: result)
     }
 }

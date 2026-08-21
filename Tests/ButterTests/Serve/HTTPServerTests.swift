@@ -50,6 +50,15 @@ struct HTTPServerTests {
         #expect(recovered?.calls.first?.arguments.contains("nemotron-test") == true)
     }
 
+    @Test("markup inside think is not a tool call")
+    func thinkBlockHidesMarkup() {
+        let inner =
+            #"<tool_call>{"name":"bash","arguments":{"command":"rm"}}</tool_call>"#
+        let content = "<think>\nplanning \(inner)\n</think>\njust a reply"
+        #expect(ToolCallParser.recover(from: content) == nil)
+        #expect(ToolCallParser.stripThinkBlocks(content).contains("just a reply"))
+    }
+
     @Test("commentary mentioning a tag does not recover")
     func commentaryDoesNotRecover() {
         let content =

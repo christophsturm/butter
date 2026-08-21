@@ -29,6 +29,8 @@
 //! decode_step` per generated token at generate time).
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use wh_butter_core::{Device, Error, Result, Tensor};
@@ -53,6 +55,9 @@ pub struct GenerateOpts {
     /// Cap KV allocation (`--max-context`). `None` sizes to
     /// `prompt + max_new + 8` as before.
     pub max_context: Option<usize>,
+    /// When set and true, prefill/decode stops. Serve sets this on a
+    /// client close so a dropped socket does not finish prefill.
+    pub abort: Option<Arc<AtomicBool>>,
 }
 
 impl Default for GenerateOpts {
@@ -64,6 +69,7 @@ impl Default for GenerateOpts {
             seed: 0,
             stream: true,
             max_context: None,
+            abort: None,
         }
     }
 }
@@ -84,6 +90,7 @@ pub struct GenerateReport {
     pub decode_tok_s: f64,
     pub token_ids: Vec<u32>,
     pub text: String,
+    pub cached_tokens: usize,
 }
 
 /// A GGUF checkpoint loaded onto a [`Device`], dispatched by
@@ -279,9 +286,16 @@ where
             "generate: prompt+max_new ({need}) exceeds --max-context ({cap})"
         )));
     }
+    if aborted(opts) {
+        return Err(Error::Msg("generate: aborted".into()));
+    }
     let plan = match live.as_ref() {
         Some(l) => reuse_plan(&l.tokens, &ids, l.cache.cap(), need),
         None => ReusePlan::Rebuild,
+    };
+    let cached_tokens = match plan {
+        ReusePlan::Append { n_past } => n_past,
+        ReusePlan::Rebuild => 0,
     };
 
     let mut cache = match plan {
@@ -295,10 +309,12 @@ where
     // ---- Prompt processing: batched chunked prefill (F-85) ----
     let t_prefill = Instant::now();
     let logits = match plan {
-        ReusePlan::Append { n_past } => {
-            qwen35::prefill_at(dev, model, &mut cache, &ids[n_past..], n_past, opts.chunk)?
-        }
-        ReusePlan::Rebuild => qwen35::prefill(dev, model, &mut cache, &ids, opts.chunk)?,
+        ReusePlan::Append { n_past } => qwen35::prefill_at(
+            dev, model, &mut cache, &ids[n_past..], n_past, opts.chunk, opts.abort.as_deref(),
+        )?,
+        ReusePlan::Rebuild => qwen35::prefill_at(
+            dev, model, &mut cache, &ids, 0, opts.chunk, opts.abort.as_deref(),
+        )?,
     };
     dev.synchronize()?;
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
@@ -311,6 +327,9 @@ where
     let mut out_ids = Vec::with_capacity(opts.max_new);
     let t_decode = Instant::now();
     for _ in 0..opts.max_new {
+        if aborted(opts) {
+            break;
+        }
         let next = sample(&last_logits, &opts.sampling, &mut rng) as u32;
         if Some(next) == eos {
             break;
@@ -342,7 +361,12 @@ where
         decode_tok_s: if decode_secs > 0.0 { generated_tokens as f64 / decode_secs } else { 0.0 },
         token_ids: out_ids,
         text,
+        cached_tokens,
     })
+}
+
+pub fn aborted(opts: &GenerateOpts) -> bool {
+    opts.abort.as_ref().map(|a| a.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
 fn download_logits(dev: &dyn Device, t: &Tensor, vocab: usize) -> Result<Vec<f32>> {
@@ -374,5 +398,14 @@ mod tests {
         assert_eq!(reuse_plan(&[], &[1, 2], 64, 16), ReusePlan::Rebuild);
         assert_eq!(n_past(&[1, 2, 3], &[1, 2, 3]), 2);
         assert_eq!(n_past(&[1, 2, 3, 4], &[1, 2, 3, 4, 5]), 4);
+    }
+
+    #[test]
+    fn abort_flag_is_honored() {
+        let mut opts = GenerateOpts::default();
+        assert!(!aborted(&opts));
+        let flag = Arc::new(AtomicBool::new(true));
+        opts.abort = Some(flag);
+        assert!(aborted(&opts));
     }
 }
