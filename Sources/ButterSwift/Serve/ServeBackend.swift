@@ -27,6 +27,12 @@ public protocol ServeGenerationBackend: Sendable {
         parameters: GenerationParameters,
         templateOptions: ChatTemplateOptions
     ) throws -> AsyncThrowingStream<GenerationChunk, Error>
+    /// Stop in-flight prefill/decode. Default is a no-op.
+    func abort()
+}
+
+extension ServeGenerationBackend {
+    public func abort() {}
 }
 
 /// Production backend: one `GenerationSession` over a loaded `Model`.
@@ -65,4 +71,6 @@ public final class ButterServeBackend: ServeGenerationBackend, @unchecked Sendab
         return session.complete(
             promptTokens: promptTokens, parameters: parameters)
     }
+
+    public func abort() { session.abort() }
 }

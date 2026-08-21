@@ -29,6 +29,7 @@
 //! decode_step` per generated token at generate time).
 
 use std::io::Write;
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -369,6 +370,38 @@ pub fn aborted(opts: &GenerateOpts) -> bool {
     opts.abort.as_ref().map(|a| a.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
+/// Set abort when the peer closes `stream`. Serve polls this during
+/// `prefill_at` so a TCP drop stops leftover chunks.
+pub fn watch_disconnect(stream: &TcpStream) -> Arc<AtomicBool> {
+    let abort = Arc::new(AtomicBool::new(false));
+    if let Ok(peek) = stream.try_clone() {
+        let abort2 = abort.clone();
+        std::thread::spawn(move || {
+            let _ = peek.set_nonblocking(true);
+            let mut buf = [0u8; 1];
+            while !abort2.load(Ordering::Relaxed) {
+                match peek.peek(&mut buf) {
+                    Ok(0) => {
+                        abort2.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::Interrupted
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => {
+                        abort2.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+    }
+    abort
+}
+
 fn download_logits(dev: &dyn Device, t: &Tensor, vocab: usize) -> Result<Vec<f32>> {
     let mut b = vec![0u8; vocab * 4];
     dev.synchronize()?;
@@ -407,5 +440,51 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(true));
         opts.abort = Some(flag);
         assert!(aborted(&opts));
+    }
+
+    #[test]
+    fn tcp_drop_stops_prefill_at_remaining_chunks() {
+        let path = match std::env::var("BUTTER_QWEN35_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("skip tcp_drop_stops_prefill_at_remaining_chunks: no BUTTER_QWEN35_GGUF");
+                return;
+            }
+        };
+        let devices = crate::devices();
+        let Some(dev) = devices.first() else {
+            eprintln!("skip tcp_drop_stops_prefill_at_remaining_chunks: no device");
+            return;
+        };
+        let LoadedModel::Qwen35 { model, .. } = load(dev.as_ref(), &path).expect("load");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let abort = watch_disconnect(&server);
+        let tokens: Vec<u32> = (0..64).map(|i| (i % 16) as u32).collect();
+        let mut cache = qwen35::Qwen35Cache::new(dev.as_ref(), &model.cfg, 128).unwrap();
+        let abort_c = abort.clone();
+        let dropper = std::thread::spawn(move || {
+            while qwen35::PREFILL_CHUNKS_DONE.load(Ordering::Relaxed) < 1 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            drop(client);
+        });
+        let r = qwen35::prefill_at(
+            dev.as_ref(),
+            &model,
+            &mut cache,
+            &tokens,
+            0,
+            1,
+            Some(abort_c.as_ref()),
+        );
+        dropper.join().unwrap();
+        abort.store(true, Ordering::Relaxed);
+        let done = qwen35::PREFILL_CHUNKS_DONE.load(Ordering::Relaxed);
+        assert!(r.is_err(), "prefill_at finished after TCP drop, chunks={done}");
+        assert!(done >= 1, "no GPU chunk ran");
+        assert!(done < 64, "leftover prefill completed: chunks={done}");
     }
 }

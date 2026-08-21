@@ -122,7 +122,7 @@ struct Qwen35LoadFlagsTests {
 /// 1 GDN + 1 full-attention dense hybrid so `makeLayerCaches` actually
 /// builds an attention KV (the all-GDN tiny used by prefill tests never
 /// hits `--kv-cache aura`).
-private func makeTinyQwen35(
+func makeTinyQwen35(
     kv: KVCacheKind,
     maxSeq: Int,
     eviction: KVEviction = .unbounded

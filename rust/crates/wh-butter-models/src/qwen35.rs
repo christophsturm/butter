@@ -50,9 +50,14 @@
 //! oracle-length prompts, not the throughput path). MTP, vision, and
 //! CUDA-graph capture are explicitly out of scope.
 
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use wh_butter_core::{DType, Device, Error, Result, Tensor};
 use wh_butter_loader::gguf::{Gguf, GgufTensor};
 use wh_butter_ops as ops;
+
+/// Prefill chunks that finished their GPU work. Tests use this to
+/// observe leftover chunks after a TCP drop.
+pub static PREFILL_CHUNKS_DONE: AtomicUsize = AtomicUsize::new(0);
 
 fn f32s_to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -1510,6 +1515,7 @@ pub fn prefill_at(
         return Err(Error::Msg("prefill: empty prompt".into()));
     }
     let chunk = if chunk == 0 { default_prefill_chunk(total) } else { chunk.max(1) };
+    PREFILL_CHUNKS_DONE.store(0, AtomicOrdering::Relaxed);
 
     let mut x_last: Option<Tensor> = None;
     let mut t_last = 0usize;
@@ -1546,6 +1552,7 @@ pub fn prefill_at(
         x_last = Some(x);
         t_last = t;
         start += t;
+        PREFILL_CHUNKS_DONE.fetch_add(1, AtomicOrdering::Relaxed);
     }
     let x = x_last.expect("prefill: total > 0 was checked above, so at least one chunk always runs");
 

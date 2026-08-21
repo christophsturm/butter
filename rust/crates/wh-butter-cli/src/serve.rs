@@ -8,12 +8,12 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use wh_butter::generate::{GenerateOpts, LiveGenerateCache, LoadedModel};
+use wh_butter::generate::{watch_disconnect, GenerateOpts, LiveGenerateCache, LoadedModel};
 
 pub use wh_butter::generate::{common_prefix, n_past};
 
@@ -825,36 +825,6 @@ fn recover_xml_markup(text: &str) -> Option<(String, String, String)> {
     Some((name, Value::Object(args).to_string(), residual))
 }
 
-fn watch_disconnect(stream: &TcpStream) -> Arc<AtomicBool> {
-    let abort = Arc::new(AtomicBool::new(false));
-    if let Ok(peek) = stream.try_clone() {
-        let abort2 = abort.clone();
-        std::thread::spawn(move || {
-            let _ = peek.set_nonblocking(true);
-            let mut buf = [0u8; 1];
-            while !abort2.load(Ordering::Relaxed) {
-                match peek.peek(&mut buf) {
-                    Ok(0) => {
-                        abort2.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::Interrupted
-                            || e.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(_) => {
-                        abort2.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        });
-    }
-    abort
-}
-
 fn write_event(stream: &mut TcpStream, event: &str, json: &str) -> std::io::Result<()> {
     stream.write_all(event_frame(event, json).as_bytes())?;
     stream.flush()
@@ -1129,5 +1099,28 @@ mod tests {
         let (name, args, _) = recover_tools(s).expect("xml");
         assert_eq!(name, "bash");
         assert!(args.contains("ls"));
+    }
+
+    #[test]
+    fn watch_disconnect_tcp_drop_sets_abort() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            let (srv, _) = listener.accept().unwrap();
+            let abort = watch_disconnect(&srv);
+            let start = std::time::Instant::now();
+            while !abort.load(Ordering::Relaxed)
+                && start.elapsed() < std::time::Duration::from_secs(2)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let hit = abort.load(Ordering::Relaxed);
+            abort.store(true, Ordering::Relaxed);
+            hit
+        });
+        let client = TcpStream::connect(addr).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        drop(client);
+        assert!(t.join().unwrap(), "TCP drop did not set watch_disconnect abort");
     }
 }

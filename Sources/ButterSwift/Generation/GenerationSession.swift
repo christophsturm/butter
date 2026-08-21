@@ -29,6 +29,7 @@ public final class GenerationSession: @unchecked Sendable {
     private var caches: [any LayerCacheProtocol]
     private var cachedTokens: [Int]
     private var lastNPast: Int = 0
+    private var producerTask: Task<Void, Never>?
 
     public init(model: Model) {
         self.model = model
@@ -52,6 +53,12 @@ public final class GenerationSession: @unchecked Sendable {
     /// Prefix tokens reused on the last `prepare` / `complete` (usage.cached_tokens).
     public var lastCachedTokens: Int {
         lock.withLock { lastNPast }
+    }
+
+    /// Cancel the in-flight producer so prefill checks cancellation
+    /// between GPU chunks without waiting for the first yield.
+    public func abort() {
+        lock.withLock { producerTask }?.cancel()
     }
 
     /// Longest common prefix length of two token sequences.
@@ -87,19 +94,14 @@ public final class GenerationSession: @unchecked Sendable {
                     try Task.checkCancellation()
                     let (model, caches, nPast) = try self.begin(promptTokens: promptTokens)
                     let params = parameters ?? model.defaultGenerationParameters
-                    let inner = model.generateStreamInternal(
+                    let generated = try await model.driveGeneration(
                         promptTokens: promptTokens,
                         parameters: params,
                         profile: profile,
-                        caches: caches,
+                        continuation: continuation,
+                        sessionCaches: caches,
                         prefillStart: nPast
                     )
-                    var generated: [Int] = []
-                    for try await chunk in inner {
-                        try Task.checkCancellation()
-                        generated.append(contentsOf: chunk.tokens)
-                        continuation.yield(chunk)
-                    }
                     self.commit(promptTokens: promptTokens, generated: generated)
                     continuation.finish()
                 } catch is CancellationError {
@@ -109,7 +111,9 @@ public final class GenerationSession: @unchecked Sendable {
                     self.invalidate()
                     continuation.finish(throwing: error)
                 }
+                self.lock.withLock { self.producerTask = nil }
             }
+            self.lock.withLock { self.producerTask = producer }
             continuation.onTermination = { @Sendable _ in
                 producer.cancel()
             }

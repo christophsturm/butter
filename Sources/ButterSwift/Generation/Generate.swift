@@ -254,14 +254,18 @@ extension Model {
         }
     }
 
-    private func driveGeneration(
+    /// Session HTTP abort runs this on the session producer Task so
+    /// `Task.checkCancellation` in prefill sees the client close. One-shot
+    /// `generate()` still goes through `runStream`.
+    @discardableResult
+    func driveGeneration(
         promptTokens: [Int],
         parameters params: GenerationParameters,
         profile: Profile,
         continuation: AsyncThrowingStream<GenerationChunk, Error>.Continuation,
         sessionCaches: [any LayerCacheProtocol]?,
         prefillStart: Int
-    ) async throws {
+    ) async throws -> [Int] {
         // T38: pin the executing thread's OS-visible QoS class to
         // user-interactive for the duration of this generate call (covers
         // both prefill and decode; prefill was already unaffected by
@@ -542,6 +546,7 @@ extension Model {
             var pos = nPast
             var lastLogits: Tensor?
             while pos < n {
+                PrefillAbortProbe.markBegun()
                 try Task.checkCancellation()
                 let end = min(pos + chunkSize, n)
                 let chunk = Array(promptTokens[pos ..< end])
@@ -563,6 +568,7 @@ extension Model {
                 }
                 cmd.commit()
                 cmd.waitUntilCompleted()
+                PrefillAbortProbe.markCommitted()
                 if let head = qwenMTPPrefillHead,
                     let hiddenRows = qwenPromptHidden,
                     let qwen = qwenMTPPrefillModel
@@ -654,7 +660,7 @@ extension Model {
                 GenerationChunk(
                     text: "", tokens: [],
                     position: 0, stats: stats))
-            return
+            return []
         }
 
         // TTFT for the slow per-token prefill is identical to prefill time.
@@ -991,6 +997,7 @@ extension Model {
             GenerationChunk(
                 text: "", tokens: [],
                 position: pos, stats: stats))
+        return generated
     }
 
     // MARK: - Stats assembly

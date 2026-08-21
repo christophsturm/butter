@@ -163,6 +163,7 @@ private final class ConnectionHandler: @unchecked Sendable {
         generationTask = nil
         lock.unlock()
         guard !already else { return }
+        server?.backend.abort()
         task?.cancel()
         connection.cancel()
         onClose?()
