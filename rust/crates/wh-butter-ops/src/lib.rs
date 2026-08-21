@@ -791,6 +791,57 @@ pub fn gemv_q8_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor,
     Ok(out)
 }
 
+/// Decode one row-major NVFP4 matrix while multiplying an F32 activation.
+pub fn gemv_nvfp4(
+    dev: &dyn Device,
+    weight: &Tensor,
+    scales: &Tensor,
+    x: &Tensor,
+    out_dim: usize,
+    in_dim: usize,
+    block_size: usize,
+    weight_multiplier: f32,
+) -> Result<Tensor> {
+    if x.dtype != DType::F32 {
+        return Err(Error::Msg(format!("gemv_nvfp4: input must be F32, got {:?}", x.dtype)));
+    }
+    if out_dim == 0 || in_dim == 0 || block_size != 16 || in_dim % block_size != 0 {
+        return Err(Error::Msg(format!(
+            "gemv_nvfp4: invalid shape out={out_dim} in={in_dim} block={block_size}"
+        )));
+    }
+    let weight_bytes = out_dim * in_dim / 2;
+    let scale_bytes = out_dim * in_dim / block_size;
+    if weight.buffer.len() < weight_bytes || scales.buffer.len() < scale_bytes {
+        return Err(Error::Msg(format!(
+            "gemv_nvfp4: short buffers weight={}/{} scales={}/{}",
+            weight.buffer.len(), weight_bytes, scales.buffer.len(), scale_bytes
+        )));
+    }
+    let kernel = cached_ir("iron_nvfp4_qgemv", x.dtype, || {
+        let mut kernel = wh_iron_std::kernels::gemm::block_scaled_matmul::iron_nvfp4_qgemv::kernel_ir_for(x.dtype);
+        kernel.mode = wh_iron_core::ir::KernelMode::Reduction;
+        kernel
+    });
+    let out = Tensor::empty(dev, vec![out_dim], x.dtype)?;
+    let u = |value: u32| Binding::Scalar(value.to_le_bytes().to_vec());
+    let f = |value: f32| Binding::Scalar(value.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(weight.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(in_dim as u32),
+            u(block_size as u32),
+            f(weight_multiplier),
+        ],
+        Grid { grid: [out_dim as u32, 1, 1], block: [64, 1, 1] },
+    )?;
+    Ok(out)
+}
+
 /// Q8 gemv that scales + accumulates in place: `acc[r] += scale · (Wq · x)[r]`.
 /// Fuses an MoE expert's `down` projection with its router-weighted sum into the
 /// layer accumulator — no per-expert scalar-broadcast upload or separate add.

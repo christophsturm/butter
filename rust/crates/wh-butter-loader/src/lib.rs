@@ -62,6 +62,9 @@ fn parse_dtype(s: &str) -> Result<DType> {
         "U32" => DType::U32,
         "I8" => DType::I8,
         "U8" => DType::U8,
+        // SafeTensors stores FP8 values as one byte per element. Keep the raw
+        // byte code so quantized-weight loaders can choose the right decoder.
+        "F8_E4M3" | "F8_E5M2" => DType::U8,
         other => return Err(Error::Msg(format!("safetensors: unsupported dtype {other}"))),
     })
 }
@@ -412,6 +415,7 @@ impl SafeTensors {
 }
 mod iq2xxs_tables;
 pub mod gguf;
+pub mod nvfp4;
 
 // ── Capability probe ────────────────────────────────────────────────────
 //
