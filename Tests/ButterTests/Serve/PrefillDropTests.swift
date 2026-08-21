@@ -56,7 +56,7 @@ struct PrefillDropTests {
         let req =
             "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
             + "Content-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\n"
-            + "Connection: close\r\n\r\n\(body)"
+            + "Connection: keep-alive\r\n\r\n\(body)"
 
         let conn = try await prefillDropOpen(port: server.boundPort, send: req)
         try await waitUntil(timeout: 8) { PrefillAbortProbe.committed >= 1 }

@@ -301,8 +301,13 @@ private final class ConnectionHandler: @unchecked Sendable {
                 }
             }
         } catch let e as ServeError {
+            let status: Int
+            switch e {
+            case .notFound: status = 404
+            default: status = 400
+            }
             let msg = jsonObject(["error": ["message": e.description, "type": "invalid_request_error"]])
-            reply(status: 400, body: msg, contentType: "application/json", headers: cors)
+            reply(status: status, body: msg, contentType: "application/json", headers: cors)
         } catch {
             let msg = jsonObject(["error": ["message": "\(error)", "type": "server_error"]])
             reply(status: 500, body: msg, contentType: "application/json", headers: cors)
@@ -312,6 +317,7 @@ private final class ConnectionHandler: @unchecked Sendable {
     private func handleChatCompletions(body: Data, extraHeaders: [(String, String)]) throws {
         guard let server else { throw ServeError.badRequest("server gone") }
         let req = try ChatCompletionHTTPRequest.parse(body)
+        try server.backend.prepare(requestedModel: req.model)
         // Generation is one-shot; URLSession clients expect the connection to end.
         responseKeepAlive = false
         readingPaused = true

@@ -8,8 +8,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::Ordering;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -126,14 +126,16 @@ pub fn run(args: &[String]) {
         }
     };
     let model_id = model_path.clone();
-    let state = ServerState {
+    let state = Arc::new(ServerState {
         dev: dev.clone(),
-        loaded,
-        model_id,
+        loaded: Mutex::new(loaded),
+        model_id: Mutex::new(model_id),
         live: Mutex::new(None),
+        current_abort: Mutex::new(Arc::new(AtomicBool::new(false))),
+        load_count: AtomicUsize::new(1),
         max_context,
         enable_thinking,
-    };
+    });
 
     let bind = format!("{host}:{port}");
     let listener = match TcpListener::bind(&bind) {
@@ -151,9 +153,12 @@ pub fn run(args: &[String]) {
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
-                if let Err(e) = handle(&state, stream) {
-                    eprintln!("butter serve: {e}");
-                }
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = handle(&state, stream) {
+                        eprintln!("butter serve: {e}");
+                    }
+                });
             }
             Err(e) => eprintln!("butter serve: accept: {e}"),
         }
@@ -162,11 +167,29 @@ pub fn run(args: &[String]) {
 
 struct ServerState {
     dev: std::sync::Arc<dyn wh_butter::Device>,
-    loaded: LoadedModel,
-    model_id: String,
+    loaded: Mutex<LoadedModel>,
+    model_id: Mutex<String>,
     live: Mutex<Option<LiveGenerateCache>>,
+    current_abort: Mutex<Arc<AtomicBool>>,
+    load_count: AtomicUsize,
     max_context: Option<usize>,
     enable_thinking: bool,
+}
+
+fn ensure_resident(state: &ServerState, want: &str) -> Result<(), String> {
+    if want.is_empty() {
+        return Ok(());
+    }
+    if *state.model_id.lock().unwrap() == want {
+        return Ok(());
+    }
+    let loaded = wh_butter::generate::load(state.dev.as_ref(), want).map_err(|e| e.to_string())?;
+    state.current_abort.lock().unwrap().store(true, Ordering::Relaxed);
+    *state.loaded.lock().unwrap() = loaded;
+    *state.model_id.lock().unwrap() = want.to_string();
+    *state.live.lock().unwrap() = None;
+    state.load_count.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 fn handle(state: &ServerState, mut stream: TcpStream) -> std::io::Result<()> {
@@ -211,13 +234,19 @@ fn dispatch(
     match (method, path) {
         ("GET", "/health") => write_response(stream, 200, "text/plain", b"ok\n"),
         ("GET", "/v1/models") => {
+            let id = state.model_id.lock().unwrap().clone();
+            let mut entry = json!({
+                "id": id,
+                "object": "model",
+                "owned_by": "butter"
+            });
+            if let Some(n) = state.max_context {
+                entry["max_model_len"] = json!(n);
+                entry["context_length"] = json!(n);
+            }
             let payload = json!({
                 "object": "list",
-                "data": [{
-                    "id": state.model_id,
-                    "object": "model",
-                    "owned_by": "butter"
-                }]
+                "data": [entry]
             });
             write_response(stream, 200, "application/json", payload.to_string().as_bytes())
         }
@@ -259,10 +288,20 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
         .or_else(|| v.get("max_completion_tokens"))
         .and_then(|n| n.as_u64())
         .unwrap_or(256) as usize;
-    let model_id = v.get("model").and_then(|m| m.as_str()).unwrap_or(&state.model_id);
+    let requested = v.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    let model_id = if requested.is_empty() {
+        state.model_id.lock().unwrap().clone()
+    } else {
+        requested
+    };
+    if let Err(e) = ensure_resident(state, &model_id) {
+        let err = json!({"error": {"message": e, "type": "invalid_request_error"}});
+        return write_response(stream, 404, "application/json", err.to_string().as_bytes());
+    }
     let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let id = format!("chatcmpl-{}", created);
     let abort = watch_disconnect(stream);
+    *state.current_abort.lock().unwrap() = abort.clone();
 
     let opts = GenerateOpts {
         max_new,
@@ -278,10 +317,11 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
         write_sse_headers(stream)?;
         let id_c = id.clone();
         let model_c = model_id.to_string();
+        let loaded = state.loaded.lock().unwrap();
         let mut live = state.live.lock().unwrap();
         let report = match wh_butter::generate::generate_with_sink_cached(
             state.dev.as_ref(),
-            &state.loaded,
+            &loaded,
             &prompt,
             &opts,
             &mut live,
@@ -362,10 +402,11 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
         write_sse_done(stream)?;
         Ok(())
     } else {
+        let loaded = state.loaded.lock().unwrap();
         let mut live = state.live.lock().unwrap();
         let report = match wh_butter::generate::generate_with_sink_cached(
             state.dev.as_ref(),
-            &state.loaded,
+            &loaded,
             &prompt,
             &opts,
             &mut live,
@@ -544,12 +585,20 @@ fn messages(state: &ServerState, stream: &mut TcpStream, body: &[u8]) -> std::io
     let stream_flag = parsed.stream;
     let thinking = parsed.thinking.unwrap_or(state.enable_thinking);
     let rendered = render_messages(&parsed.flat, thinking);
-    let model_id = parsed.model.as_deref().unwrap_or(&state.model_id);
+    let model_id = parsed
+        .model
+        .clone()
+        .unwrap_or_else(|| state.model_id.lock().unwrap().clone());
+    if let Err(e) = ensure_resident(state, &model_id) {
+        let err = json!({"error": {"message": e, "type": "invalid_request_error"}});
+        return write_response(stream, 404, "application/json", err.to_string().as_bytes());
+    }
     let id = format!(
         "msg_{}",
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
     );
     let abort = watch_disconnect(stream);
+    *state.current_abort.lock().unwrap() = abort.clone();
     let opts = GenerateOpts {
         max_new,
         chunk: 0,
@@ -582,10 +631,11 @@ fn messages(state: &ServerState, stream: &mut TcpStream, body: &[u8]) -> std::io
         )?;
         let mut assembled = String::new();
         let mut text_started = false;
+        let loaded = state.loaded.lock().unwrap();
         let mut live = state.live.lock().unwrap();
         let report = match wh_butter::generate::generate_with_sink_cached(
             state.dev.as_ref(),
-            &state.loaded,
+            &loaded,
             &rendered,
             &opts,
             &mut live,
@@ -630,10 +680,11 @@ fn messages(state: &ServerState, stream: &mut TcpStream, body: &[u8]) -> std::io
         stream.flush()?;
         Ok(())
     } else {
+        let loaded = state.loaded.lock().unwrap();
         let mut live = state.live.lock().unwrap();
         let report = match wh_butter::generate::generate_with_sink_cached(
             state.dev.as_ref(),
-            &state.loaded,
+            &loaded,
             &rendered,
             &opts,
             &mut live,
@@ -997,6 +1048,45 @@ mod tests {
         assert_eq!(f.max_context, Some(8192));
         assert!(f.enable_thinking);
         assert_eq!(f.kv_cache.as_deref(), Some("aura"));
+    }
+
+    #[test]
+    fn same_id_does_not_bump_loads() {
+        let mut id = "model-a".to_string();
+        let mut loads = 1usize;
+        assert!(swap_ids(&mut id, &mut loads, "model-a", true).is_ok());
+        assert_eq!(loads, 1);
+        assert_eq!(id, "model-a");
+    }
+
+    #[test]
+    fn swap_success_drops_previous_id() {
+        let mut id = "model-a".to_string();
+        let mut loads = 1usize;
+        assert!(swap_ids(&mut id, &mut loads, "model-b", true).is_ok());
+        assert_eq!(id, "model-b");
+        assert_eq!(loads, 2);
+    }
+
+    #[test]
+    fn failed_load_keeps_previous_id() {
+        let mut id = "model-a".to_string();
+        let mut loads = 1usize;
+        assert!(swap_ids(&mut id, &mut loads, "missing", false).is_err());
+        assert_eq!(id, "model-a");
+        assert_eq!(loads, 1);
+    }
+
+    fn swap_ids(id: &mut String, loads: &mut usize, want: &str, load_ok: bool) -> Result<(), ()> {
+        if want == id.as_str() {
+            return Ok(());
+        }
+        if !load_ok {
+            return Err(());
+        }
+        *id = want.to_string();
+        *loads += 1;
+        Ok(())
     }
 
     #[test]

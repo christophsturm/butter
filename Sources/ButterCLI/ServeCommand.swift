@@ -16,6 +16,7 @@
 import ArgumentParser
 import ButterSwift
 import Foundation
+import os
 
 struct ServeCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -99,7 +100,28 @@ struct ServeCommand: AsyncParsableCommand {
             template.reasoningEffort = effort
         }
 
-        let backend = ButterServeBackend(model: m, modelId: model)
+        let initial = ButterServeBackend(model: m, modelId: model)
+        let opts = loadOpts
+        let backend = ResidentServeBackend(initial: initial) { id in
+            let box = OSAllocatedUnfairLock<Result<ButterServeBackend, Error>?>(initialState: nil)
+            let sem = DispatchSemaphore(value: 0)
+            Task {
+                do {
+                    let loaded = try await Model.load(id, options: opts)
+                    box.withLock {
+                        $0 = .success(ButterServeBackend(model: loaded, modelId: id))
+                    }
+                } catch {
+                    box.withLock { $0 = .failure(error) }
+                }
+                sem.signal()
+            }
+            sem.wait()
+            switch box.withLock({ $0 }) {
+            case .success(let b): return b
+            default: throw ServeError.notFound
+            }
+        }
         let server = ServeServer(
             host: host,
             port: UInt16(port),

@@ -29,10 +29,14 @@ public protocol ServeGenerationBackend: Sendable {
     ) throws -> AsyncThrowingStream<GenerationChunk, Error>
     /// Stop in-flight prefill/decode. Default is a no-op.
     func abort()
+    /// Make `id` the resident checkpoint. Same id is a no-op. Default
+    /// ignores the request and keeps the boot model.
+    func prepare(requestedModel: String?) throws
 }
 
 extension ServeGenerationBackend {
     public func abort() {}
+    public func prepare(requestedModel: String?) throws {}
 }
 
 /// Production backend: one `GenerationSession` over a loaded `Model`.

@@ -298,8 +298,13 @@ final class SlowStubBackend: ServeGenerationBackend, @unchecked Sendable {
     var lastCachedTokens: Int = 0
     var defaultGenerationParameters = GenerationParameters()
     private let state = OSAllocatedUnfairLock(initialState: (cancelled: false, didStart: false))
+    private let running = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
     var cancelled: Bool { state.withLock { $0.cancelled } }
     var didStart: Bool { state.withLock { $0.didStart } }
+
+    func abort() {
+        running.withLock { $0 }?.cancel()
+    }
 
     func completeChat(
         messages: [ChatMessage],
@@ -323,6 +328,7 @@ final class SlowStubBackend: ServeGenerationBackend, @unchecked Sendable {
                     continuation.finish()
                 }
             }
+            self.running.withLock { $0 = task }
             continuation.onTermination = { @Sendable _ in
                 task.cancel()
             }
