@@ -30,15 +30,15 @@
 
 use std::io::Write;
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use wh_butter_core::{Device, Error, Result, Tensor};
 use wh_butter_loader::gguf::Gguf;
 use wh_butter_models::{gguf_tokenizer::GgufTokenizer, qwen35};
-use wh_butter_runtime::{sample, Rng};
 pub use wh_butter_runtime::Sampling;
+use wh_butter_runtime::{Rng, sample};
 
 /// Options for one [`generate`] call. `chunk == 0` is the "auto" sentinel
 /// each model's own `prefill` already understands (see e.g.
@@ -100,7 +100,11 @@ pub struct GenerateReport {
 /// cache/positions) — a single `LoadedModel` can drive any number of
 /// independent [`generate`] calls (each builds its own fresh cache).
 pub enum LoadedModel {
-    Qwen35 { tok: GgufTokenizer, eos: Option<u32>, model: qwen35::Qwen35Model },
+    Qwen35 {
+        tok: GgufTokenizer,
+        eos: Option<u32>,
+        model: qwen35::Qwen35Model,
+    },
 }
 
 impl LoadedModel {
@@ -109,19 +113,33 @@ impl LoadedModel {
             LoadedModel::Qwen35 { .. } => "qwen35",
         }
     }
+
+    pub fn max_model_len(&self) -> usize {
+        match self {
+            LoadedModel::Qwen35 { model, .. } => model.cfg.max_seq,
+        }
+    }
 }
 
 /// GGUF architecture string that selects the generation path — read
 /// straight from `general.architecture` metadata, same key `llama.rs`'s
 /// `load_hf` already keys its own dispatch off of.
 pub fn detect_architecture(g: &Gguf) -> String {
-    g.meta_str("general.architecture").unwrap_or("unknown").to_string()
+    g.meta_str("general.architecture")
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 /// Open `gguf_path`, detect its architecture, and load weights onto `dev`.
 /// The dominant-cost, prompt-independent half of "load a GGUF, generate
 /// text" — call once, then drive as many [`generate`] calls as you like.
 pub fn load(dev: &dyn Device, gguf_path: &str) -> Result<LoadedModel> {
+    if std::path::Path::new(gguf_path).is_dir() {
+        let tok = GgufTokenizer::from_hf_dir(gguf_path)?;
+        let eos = read_hf_eos(gguf_path)?;
+        let model = qwen35::load_nvfp4_dir(dev, gguf_path)?;
+        return Ok(LoadedModel::Qwen35 { tok, eos, model });
+    }
     let g = Gguf::open(gguf_path)?;
     let arch = detect_architecture(&g);
     match arch.as_str() {
@@ -139,13 +157,43 @@ pub fn load(dev: &dyn Device, gguf_path: &str) -> Result<LoadedModel> {
     }
 }
 
+fn read_hf_eos(dir: &str) -> Result<Option<u32>> {
+    for file in ["generation_config.json", "tokenizer_config.json"] {
+        let path = std::path::Path::new(dir).join(file);
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let json: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Msg(format!("parse {}: {e}", path.display())))?;
+        let value = json.get("eos_token_id");
+        let eos = value
+            .and_then(|value| value.as_u64())
+            .or_else(|| {
+                value
+                    .and_then(|value| value.as_array())
+                    .and_then(|values| values.first())
+                    .and_then(|value| value.as_u64())
+            })
+            .map(|value| value as u32);
+        if eos.is_some() {
+            return Ok(eos);
+        }
+    }
+    Ok(None)
+}
+
 /// Batched chunked prefill (F-85) over `prompt`, then per-token
 /// `decode_step` for up to `opts.max_new` tokens. This is the "real
 /// generation entrypoint" — prompt processing routes through the same
 /// `<arch>::prefill` the bench/correctness harnesses validated
 /// (token-identical to the old decode-loop-as-prefill baseline, see
 /// `qwen35_prefill_correctness.rs`), not a decode-loop re-implementation.
-pub fn generate(dev: &dyn Device, loaded: &LoadedModel, prompt: &str, opts: &GenerateOpts) -> Result<GenerateReport> {
+pub fn generate(
+    dev: &dyn Device,
+    loaded: &LoadedModel,
+    prompt: &str,
+    opts: &GenerateOpts,
+) -> Result<GenerateReport> {
     let report = generate_with_sink(dev, loaded, prompt, opts, |text, _id| {
         if opts.stream {
             print!("{text}");
@@ -259,7 +307,12 @@ where
 /// single request; a caller issuing more than one (e.g. a warmup pass
 /// before a timed bench run) should call `load` once and reuse the
 /// `LoadedModel` instead, to avoid paying the load cost per call.
-pub fn run(dev: &dyn Device, gguf_path: &str, prompt: &str, opts: &GenerateOpts) -> Result<GenerateReport> {
+pub fn run(
+    dev: &dyn Device,
+    gguf_path: &str,
+    prompt: &str,
+    opts: &GenerateOpts,
+) -> Result<GenerateReport> {
     let loaded = load(dev, gguf_path)?;
     generate(dev, &loaded, prompt, opts)
 }
@@ -279,13 +332,21 @@ where
 {
     let ids = tok.encode(prompt);
     if ids.is_empty() {
-        return Err(Error::Msg("generate: empty prompt after tokenization".into()));
+        return Err(Error::Msg(
+            "generate: empty prompt after tokenization".into(),
+        ));
     }
     let need = ids.len() + opts.max_new + 8;
     let cap = match opts.max_context {
         Some(m) if m > 0 => m,
         _ => need,
     };
+    if cap > model.cfg.max_seq {
+        return Err(Error::Msg(format!(
+            "generate: requested context {cap} exceeds the wired model limit {}",
+            model.cfg.max_seq
+        )));
+    }
     if cap < need {
         return Err(Error::Msg(format!(
             "generate: prompt+max_new ({need}) exceeds --max-context ({cap})"
@@ -320,16 +381,30 @@ where
     let mut last_logits = match plan {
         ReusePlan::Exact => cached_prompt_logits.unwrap_or_default(),
         ReusePlan::Append { n_past } => qwen35::prefill_at(
-            dev, model, &mut cache, &ids[n_past..], n_past, opts.chunk, opts.abort.as_deref(),
+            dev,
+            model,
+            &mut cache,
+            &ids[n_past..],
+            n_past,
+            opts.chunk,
+            opts.abort.as_deref(),
         )
         .and_then(|logits| download_logits(dev, &logits, model.cfg.vocab))?,
         ReusePlan::Rebuild => qwen35::prefill_at(
-            dev, model, &mut cache, &ids, 0, opts.chunk, opts.abort.as_deref(),
+            dev,
+            model,
+            &mut cache,
+            &ids,
+            0,
+            opts.chunk,
+            opts.abort.as_deref(),
         )
         .and_then(|logits| download_logits(dev, &logits, model.cfg.vocab))?,
     };
     if matches!(plan, ReusePlan::Exact) && last_logits.is_empty() {
-        return Err(Error::Msg("generate: exact cache hit missing prompt logits".into()));
+        return Err(Error::Msg(
+            "generate: exact cache hit missing prompt logits".into(),
+        ));
     }
     dev.synchronize()?;
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
@@ -363,7 +438,11 @@ where
     let generated_tokens = out_ids.len();
     let text = tok.decode(&out_ids);
     cache.restore_prompt(prompt_snapshot)?;
-    *live = Some(LiveGenerateCache { cache, tokens: ids.clone(), prompt_logits });
+    *live = Some(LiveGenerateCache {
+        cache,
+        tokens: ids.clone(),
+        prompt_logits,
+    });
 
     Ok(GenerateReport {
         architecture: "qwen35".to_string(),
@@ -372,7 +451,11 @@ where
         prefill_secs,
         decode_secs,
         prefill_tok_s: ids.len() as f64 / prefill_secs,
-        decode_tok_s: if decode_secs > 0.0 { generated_tokens as f64 / decode_secs } else { 0.0 },
+        decode_tok_s: if decode_secs > 0.0 {
+            generated_tokens as f64 / decode_secs
+        } else {
+            0.0
+        },
         token_ids: out_ids,
         text,
         cached_tokens,
@@ -380,7 +463,10 @@ where
 }
 
 pub fn aborted(opts: &GenerateOpts) -> bool {
-    opts.abort.as_ref().map(|a| a.load(Ordering::Relaxed)).unwrap_or(false)
+    opts.abort
+        .as_ref()
+        .map(|a| a.load(Ordering::Relaxed))
+        .unwrap_or(false)
 }
 
 /// Set abort when the peer closes `stream`. Serve polls this during
@@ -419,7 +505,9 @@ fn download_logits(dev: &dyn Device, t: &Tensor, vocab: usize) -> Result<Vec<f32
     let mut b = vec![0u8; vocab * 4];
     dev.synchronize()?;
     dev.download(t.buffer.as_ref(), &mut b)?;
-    Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    Ok(b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect())
 }
 
 #[cfg(test)]
@@ -434,9 +522,18 @@ mod tests {
             reuse_plan(&[1, 2, 3, 4], &[1, 2, 3, 4, 5, 6], 64, 16),
             ReusePlan::Append { n_past: 4 }
         );
-        assert_eq!(reuse_plan(&[1, 2, 3, 4], &[1, 2, 3, 4], 64, 16), ReusePlan::Exact);
-        assert_eq!(reuse_plan(&[1, 2, 3, 4], &[1, 2], 64, 16), ReusePlan::Rebuild);
-        assert_eq!(reuse_plan(&[1, 2, 3, 4], &[9, 9], 64, 16), ReusePlan::Rebuild);
+        assert_eq!(
+            reuse_plan(&[1, 2, 3, 4], &[1, 2, 3, 4], 64, 16),
+            ReusePlan::Exact
+        );
+        assert_eq!(
+            reuse_plan(&[1, 2, 3, 4], &[1, 2], 64, 16),
+            ReusePlan::Rebuild
+        );
+        assert_eq!(
+            reuse_plan(&[1, 2, 3, 4], &[9, 9], 64, 16),
+            ReusePlan::Rebuild
+        );
         assert_eq!(
             reuse_plan(&[1, 2, 3, 4], &[1, 2, 3, 4, 5, 6], 8, 16),
             ReusePlan::Rebuild
@@ -496,7 +593,10 @@ mod tests {
         dropper.join().unwrap();
         abort.store(true, Ordering::Relaxed);
         let done = qwen35::PREFILL_CHUNKS_DONE.load(Ordering::Relaxed);
-        assert!(r.is_err(), "prefill_at finished after TCP drop, chunks={done}");
+        assert!(
+            r.is_err(),
+            "prefill_at finished after TCP drop, chunks={done}"
+        );
         assert!(done >= 1, "no GPU chunk ran");
         assert!(done < 64, "leftover prefill completed: chunks={done}");
     }

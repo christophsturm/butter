@@ -52,7 +52,10 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use wh_butter_core::{DType, Device, Error, Result, Tensor};
-use wh_butter_loader::gguf::{Gguf, GgufTensor};
+use wh_butter_loader::{
+    SafeTensors,
+    gguf::{Gguf, GgufTensor},
+};
 use wh_butter_ops as ops;
 
 /// Prefill chunks that finished their GPU work. Tests use this to
@@ -92,6 +95,7 @@ fn f32s_to_f16_bytes(v: &[f32]) -> Vec<u8> {
 
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
+    pub max_seq: usize,
     pub hidden: usize,
     pub n_layers: usize,
     pub head_dim: usize,               // full-attn head_dim (256)
@@ -138,6 +142,7 @@ impl Qwen35Config {
         let f = |k: &str, def: f32| g.meta_f32(k).unwrap_or(def);
 
         let hidden = u("qwen35.embedding_length", 5120);
+        let max_seq = u("qwen35.context_length", 262_144);
         // `qwen35.block_count` on an MTP-preserved checkpoint counts the
         // MTP sidecar block TOO (verified via `gguf-dump`: block_count=65,
         // nextn_predict_layers=1, but only 64 trunk layers carry
@@ -175,6 +180,7 @@ impl Qwen35Config {
         let gdn_conv_kernel = u("qwen35.ssm.conv_kernel", 4);
 
         Qwen35Config {
+            max_seq,
             hidden,
             n_layers,
             head_dim,
@@ -192,6 +198,71 @@ impl Qwen35Config {
             gdn_value_head_dim,
             gdn_conv_kernel,
         }
+    }
+
+    /// Read the text-model geometry from a Hugging Face checkpoint directory.
+    /// Multimodal wrapper configs keep these fields under `text_config`; a
+    /// text-only config may place them at the root.
+    pub fn from_hf_dir(dir: &str) -> Result<Self> {
+        let path = std::path::Path::new(dir).join("config.json");
+        let bytes = std::fs::read(&path)
+            .map_err(|e| Error::Msg(format!("read {}: {e}", path.display())))?;
+        let root: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Msg(format!("parse {}: {e}", path.display())))?;
+        let cfg = root.get("text_config").unwrap_or(&root);
+        let u = |key: &str| -> Result<usize> {
+            cfg.get(key)
+                .and_then(|value| value.as_u64())
+                .map(|value| value as usize)
+                .ok_or_else(|| Error::Msg(format!("config.json: {key} missing")))
+        };
+        let f = |key: &str| -> Result<f32> {
+            cfg.get(key)
+                .and_then(|value| value.as_f64())
+                .map(|value| value as f32)
+                .ok_or_else(|| Error::Msg(format!("config.json: {key} missing")))
+        };
+        let head_dim = u("head_dim")?;
+        let rope = cfg.get("rope_parameters").unwrap_or(cfg);
+        let rope_theta = rope
+            .get("rope_theta")
+            .and_then(|value| value.as_f64())
+            .map(|value| value as f32)
+            .unwrap_or(10_000_000.0);
+        let partial_rotary = cfg
+            .get("partial_rotary_factor")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.25);
+        let gdn_num_v_heads = u("linear_num_value_heads")?;
+        let gdn_value_dim_total = gdn_num_v_heads * u("linear_value_head_dim")?;
+        let advertised_max_seq = u("max_position_embeddings")?;
+        // The current Rust RoPE path is native-context only. A checkpoint may
+        // advertise a longer YaRN window, but reporting or allocating that
+        // window before the YaRN math is wired would be a false capability.
+        let max_seq = rope
+            .get("original_max_position_embeddings")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(advertised_max_seq);
+        Ok(Self {
+            max_seq,
+            hidden: u("hidden_size")?,
+            n_layers: u("num_hidden_layers")?,
+            head_dim,
+            n_head: u("num_attention_heads")?,
+            n_kv_heads: u("num_key_value_heads")?,
+            rope_n_rot: (head_dim as f64 * partial_rotary).round() as u32,
+            rope_theta,
+            full_attention_interval: u("full_attention_interval")?,
+            eps: f("rms_norm_eps")?,
+            vocab: u("vocab_size")?,
+            ffn_inter: u("intermediate_size")?,
+            gdn_num_k_heads: u("linear_num_key_heads")?,
+            gdn_num_v_heads,
+            gdn_key_head_dim: u("linear_key_head_dim")?,
+            gdn_value_head_dim: gdn_value_dim_total / gdn_num_v_heads.max(1),
+            gdn_conv_kernel: u("linear_conv_kernel_dim")?,
+        })
     }
 }
 
@@ -224,6 +295,178 @@ struct Q4Dense {
     m: usize,
     k: usize,
     marlin: Option<MarlinWeight>,
+}
+
+struct Dense16 {
+    weight: Tensor,
+    m: usize,
+    k: usize,
+}
+
+struct Nvfp4Dense {
+    weight: Tensor,
+    scales: Tensor,
+    scales_interleaved: Tensor,
+    m: usize,
+    k: usize,
+    block_size: usize,
+    input_multiplier: f32,
+    weight_multiplier: f32,
+}
+
+enum DenseWeight {
+    Q4(Q4Dense),
+    Dense16(Dense16),
+    Nvfp4(Nvfp4Dense),
+}
+
+impl DenseWeight {
+    fn gemv(&self, dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Q4(weight) => weight.gemv(dev, x),
+            Self::Dense16(weight) => {
+                let input = match weight.weight.dtype {
+                    DType::F32 => x.clone(),
+                    DType::F16 => ops::cast_f32_f16(dev, x)?,
+                    DType::BF16 => ops::cast_f32_bf16(dev, x)?,
+                    dtype => {
+                        return Err(Error::Msg(format!(
+                            "qwen35: unsupported dense dtype {dtype}"
+                        )));
+                    }
+                };
+                let out = ops::gemv(dev, &weight.weight, &input)?;
+                match out.dtype {
+                    DType::F32 => Ok(out),
+                    DType::F16 => ops::cast_f16_f32(dev, &out),
+                    DType::BF16 => ops::cast_bf16_f32(dev, &out),
+                    dtype => Err(Error::Msg(format!(
+                        "qwen35: unsupported dense output {dtype}"
+                    ))),
+                }
+            }
+            Self::Nvfp4(weight) => {
+                let use_w4a4 = std::env::var("BUTTER_QWEN35_NVFP4_W4A4")
+                    .map(|value| value != "0" && value != "false")
+                    .unwrap_or(true);
+                if !use_w4a4 {
+                    return ops::gemv_nvfp4(
+                        dev,
+                        &weight.weight,
+                        &weight.scales,
+                        x,
+                        weight.m,
+                        weight.k,
+                        weight.block_size,
+                        weight.weight_multiplier,
+                    );
+                }
+                let (x_pack, x_scales, _) = ops::lt_fp4_quant_with_global(
+                    dev,
+                    x,
+                    1,
+                    weight.k,
+                    weight.input_multiplier,
+                )?;
+                let alpha = weight.input_multiplier * weight.weight_multiplier;
+                let alpha_tensor = Tensor::new(
+                    dev.upload(&alpha.to_le_bytes())?,
+                    vec![1],
+                    DType::F32,
+                );
+                Ok(ops::gemm_fp4(
+                    dev,
+                    &x_pack,
+                    &x_scales,
+                    &weight.weight,
+                    &weight.scales_interleaved,
+                    1,
+                    weight.m,
+                    weight.k,
+                    true,
+                    Some(&alpha_tensor),
+                )?
+                .reshaped(vec![weight.m]))
+            }
+        }
+    }
+
+    fn gemm(&self, dev: &dyn Device, x: &Tensor, rows: usize) -> Result<Tensor> {
+        match self {
+            Self::Q4(weight) => weight.gemm(dev, x, rows),
+            Self::Dense16(weight) => {
+                let input = match weight.weight.dtype {
+                    DType::F16 => ops::cast_f32_f16(dev, x)?,
+                    DType::BF16 => ops::cast_f32_bf16(dev, x)?,
+                    DType::F32 => return ops::matmul(dev, &weight.weight, x),
+                    dtype => {
+                        return Err(Error::Msg(format!(
+                            "qwen35: unsupported dense dtype {dtype}"
+                        )));
+                    }
+                };
+                ops::gemm_cublas_f32out(dev, &input, &weight.weight, rows, weight.m, weight.k)
+            }
+            Self::Nvfp4(weight) => {
+                let use_w4a4 = std::env::var("BUTTER_QWEN35_NVFP4_W4A4")
+                    .map(|value| value != "0" && value != "false")
+                    .unwrap_or(true);
+                if use_w4a4 {
+                    let (x_pack, x_scales, _) = ops::lt_fp4_quant_with_global(
+                        dev,
+                        x,
+                        rows,
+                        weight.k,
+                        weight.input_multiplier,
+                    )?;
+                    let alpha = weight.input_multiplier * weight.weight_multiplier;
+                    let alpha_tensor = Tensor::new(
+                        dev.upload(&alpha.to_le_bytes())?,
+                        vec![1],
+                        DType::F32,
+                    );
+                    return Ok(ops::gemm_fp4(
+                        dev,
+                        &x_pack,
+                        &x_scales,
+                        &weight.weight,
+                        &weight.scales_interleaved,
+                        rows,
+                        weight.m,
+                        weight.k,
+                        true,
+                        Some(&alpha_tensor),
+                    )?
+                    .reshaped(vec![rows, weight.m]));
+                }
+
+                // Explicit W4A16 diagnostic fallback.
+                let mut joined: Option<Tensor> = None;
+                for row in 0..rows {
+                    let input = ops::slice(dev, x, row * weight.k, weight.k)?;
+                    let output = ops::gemv_nvfp4(
+                        dev,
+                        &weight.weight,
+                        &weight.scales,
+                        &input,
+                        weight.m,
+                        weight.k,
+                        weight.block_size,
+                        weight.weight_multiplier,
+                    )?;
+                    joined = Some(match joined {
+                        None => output,
+                        Some(previous) => {
+                            ops::concat_rows_f32(dev, &previous, row, &output, 1, weight.m)?
+                        }
+                    });
+                }
+                joined
+                    .map(|output| output.reshaped(vec![rows, weight.m]))
+                    .ok_or_else(|| Error::Msg("qwen35: NVFP4 GEMM needs at least one row".into()))
+            }
+        }
+    }
 }
 impl Q4Dense {
     // NOTE (round-2 perf campaign, 2026-08): `ops::gemv_q4_auto` (2-row-per-
@@ -504,6 +747,10 @@ fn load_q4dense_routed(dev: &dyn Device, g: &Gguf, name: &str) -> Result<Q4Dense
     Ok(qd)
 }
 
+fn load_q4weight_routed(dev: &dyn Device, g: &Gguf, name: &str) -> Result<DenseWeight> {
+    load_q4dense_routed(dev, g, name).map(DenseWeight::Q4)
+}
+
 /// Plain F32 dense `[m, k]` weight for `ops::gemv` — used for GDN's tiny
 /// (`Hv`-wide) alpha/beta decay-gate projections, kept unquantized (see the
 /// module doc's numerical-safety rationale).
@@ -545,10 +792,10 @@ fn repack_conv1d_weight(flat: &[f32], conv_dim: usize, conv_kernel: usize) -> Ve
 /// split at decode time with `ops::strided_head_half`.
 struct FullAttnWeights {
     attn_norm: Tensor, // f32 [hidden]
-    wq: Q4Dense,       // [n_head*2*head_dim, hidden]
-    wk: Q4Dense,       // [n_kv_heads*head_dim, hidden]
-    wv: Q4Dense,       // [n_kv_heads*head_dim, hidden]
-    wo: Q4Dense,       // [hidden, n_head*head_dim]
+    wq: DenseWeight,   // [n_head*2*head_dim, hidden]
+    wk: DenseWeight,   // [n_kv_heads*head_dim, hidden]
+    wv: DenseWeight,   // [n_kv_heads*head_dim, hidden]
+    wo: DenseWeight,   // [hidden, n_head*head_dim]
     q_norm: Tensor,    // f32 [head_dim] (weighted RMSNorm, full head_dim)
     k_norm: Tensor,    // f32 [head_dim]
 }
@@ -556,8 +803,8 @@ struct FullAttnWeights {
 /// GDN (linear attention) layer weights.
 struct GdnWeights {
     attn_norm: Tensor,     // f32 [hidden]
-    wqkv: Q4Dense,         // [key_dim*2+value_dim, hidden]  ("attn_qkv")
-    wz: Q4Dense,           // [value_dim, hidden]             ("attn_gate" = in_proj_z)
+    wqkv: DenseWeight,     // [key_dim*2+value_dim, hidden]  ("attn_qkv")
+    wz: DenseWeight,       // [value_dim, hidden]             ("attn_gate" = in_proj_z)
     w_alpha: Tensor,       // f32 [Hv, hidden]                ("ssm_alpha" = in_proj_a)
     w_beta: Tensor,        // f32 [Hv, hidden]                ("ssm_beta"  = in_proj_b)
     dt_bias: Tensor,       // f32 [Hv]
@@ -577,7 +824,7 @@ struct GdnWeights {
     a_log_raw: Tensor,     // f32 [Hv]
     conv_w: Tensor,        // f32 [conv_kernel*conv_dim], kernel-major (repacked)
     ssm_norm_w: Tensor,    // f32 [Dv]  gated-RMSNorm weight
-    wo: Q4Dense,           // [hidden, value_dim]             ("ssm_out")
+    wo: DenseWeight,       // [hidden, value_dim]             ("ssm_out")
 }
 
 enum Mixer {
@@ -586,10 +833,10 @@ enum Mixer {
 }
 
 struct DenseFfn {
-    ffn_norm: Tensor, // f32 [hidden]
-    gate: Q4Dense,    // [ffn_inter, hidden]
-    up: Q4Dense,      // [ffn_inter, hidden]
-    down: Q4Dense,    // [hidden, ffn_inter]
+    ffn_norm: Tensor,  // f32 [hidden]
+    gate: DenseWeight, // [ffn_inter, hidden]
+    up: DenseWeight,   // [ffn_inter, hidden]
+    down: DenseWeight, // [hidden, ffn_inter]
 }
 
 struct Qwen35Layer {
@@ -619,12 +866,19 @@ struct Q8Head {
 enum LmHead {
     Q8(Q8Head),
     Q4(Q4Dense),
+    Dense16(Dense16),
 }
 impl LmHead {
     fn gemv(&self, dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
         match self {
             LmHead::Q8(h) => ops::gemv_q8(dev, &h.qs, &h.scales, x, h.m, h.k, h.m),
             LmHead::Q4(h) => h.gemv(dev, x),
+            LmHead::Dense16(h) => DenseWeight::Dense16(Dense16 {
+                weight: h.weight.clone(),
+                m: h.m,
+                k: h.k,
+            })
+            .gemv(dev, x),
         }
     }
 }
@@ -806,6 +1060,9 @@ pub struct Qwen35Model {
     // chunked-prefill GDN kernel may want the same precomputed index.
     #[allow(dead_code)]
     gdn_gqa_cyclic_idx: Tensor, // u32 [gdn_num_v_heads], idx[hv] = hv % gdn_num_k_heads
+    /// GGUF conversion uses the validated cyclic GDN head layout. Raw HF
+    /// checkpoints retain the upstream contiguous repeat-interleave layout.
+    gdn_cyclic_gqa: bool,
 }
 
 impl Qwen35Model {
@@ -907,10 +1164,10 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
                 // (10.3-16.4us vs 16.4-71.8us, see
                 // qwen35_marlin_smallproj_microbench.rs) -- routed like the
                 // round-7/8 big shapes instead of plain gemv_q4.
-                wq: load_q4dense_routed(dev, g, &format!("{p}.attn_q.weight"))?,
-                wk: load_q4dense_routed(dev, g, &format!("{p}.attn_k.weight"))?,
-                wv: load_q4dense_routed(dev, g, &format!("{p}.attn_v.weight"))?,
-                wo: load_q4dense_routed(dev, g, &format!("{p}.attn_output.weight"))?,
+                wq: load_q4weight_routed(dev, g, &format!("{p}.attn_q.weight"))?,
+                wk: load_q4weight_routed(dev, g, &format!("{p}.attn_k.weight"))?,
+                wv: load_q4weight_routed(dev, g, &format!("{p}.attn_v.weight"))?,
+                wo: load_q4weight_routed(dev, g, &format!("{p}.attn_output.weight"))?,
                 q_norm: load_f32_vec(dev, g, &format!("{p}.attn_q_norm.weight"))?,
                 k_norm: load_f32_vec(dev, g, &format!("{p}.attn_k_norm.weight"))?,
             })
@@ -938,20 +1195,31 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
                 eprintln!(
                     "QWEN35_DBG layer0 neg_exp_a_log min={:?} max={:?} a_log_raw min={:?} max={:?} n_nan={n_nan} n_pos_input={n_pos_input}",
                     neg_exp_a_log.iter().cloned().fold(f32::INFINITY, f32::min),
-                    neg_exp_a_log.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-                    a_log_raw_host.iter().cloned().filter(|v| !v.is_nan()).fold(f32::INFINITY, f32::min),
-                    a_log_raw_host.iter().cloned().filter(|v| !v.is_nan()).fold(f32::NEG_INFINITY, f32::max),
+                    neg_exp_a_log
+                        .iter()
+                        .cloned()
+                        .fold(f32::NEG_INFINITY, f32::max),
+                    a_log_raw_host
+                        .iter()
+                        .cloned()
+                        .filter(|v| !v.is_nan())
+                        .fold(f32::INFINITY, f32::min),
+                    a_log_raw_host
+                        .iter()
+                        .cloned()
+                        .filter(|v| !v.is_nan())
+                        .fold(f32::NEG_INFINITY, f32::max),
                 );
             }
             let conv_flat = g.dequant_f32(&format!("{p}.ssm_conv1d.weight"))?;
             let conv_repacked = repack_conv1d_weight(&conv_flat, cfg.gdn_conv_dim(), cfg.gdn_conv_kernel);
             Mixer::Gdn(GdnWeights {
                 attn_norm: load_f32_vec(dev, g, &format!("{p}.attn_norm.weight"))?,
-                wqkv: load_q4dense_routed(dev, g, &format!("{p}.attn_qkv.weight"))?,
+                wqkv: load_q4weight_routed(dev, g, &format!("{p}.attn_qkv.weight"))?,
                 // F-85 round-10 (lever 2): see the wk/wv/wo comment above --
                 // gdn_wz is the same (m=6144,k=5120) shape microbenched
                 // there (marlin 16.4us vs gemv 71.7us).
-                wz: load_q4dense_routed(dev, g, &format!("{p}.attn_gate.weight"))?,
+                wz: load_q4weight_routed(dev, g, &format!("{p}.attn_gate.weight"))?,
                 w_alpha: load_f32_dense(dev, g, &format!("{p}.ssm_alpha.weight"))?,
                 w_beta: load_f32_dense(dev, g, &format!("{p}.ssm_beta.weight"))?,
                 dt_bias: load_f32_vec(dev, g, &format!("{p}.ssm_dt.bias"))?,
@@ -973,14 +1241,14 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
                 ssm_norm_w: load_f32_vec(dev, g, &format!("{p}.ssm_norm.weight"))?,
                 // F-85 round-10 (lever 2): gdn_wo is the wo(5120,6144)
                 // shape microbenched above (marlin 16.4us vs gemv 71.8us).
-                wo: load_q4dense_routed(dev, g, &format!("{p}.ssm_out.weight"))?,
+                wo: load_q4weight_routed(dev, g, &format!("{p}.ssm_out.weight"))?,
             })
         };
         let ffn = DenseFfn {
             ffn_norm: load_f32_vec(dev, g, &format!("{p}.post_attention_norm.weight"))?,
-            gate: load_q4dense_routed(dev, g, &format!("{p}.ffn_gate.weight"))?,
-            up: load_q4dense_routed(dev, g, &format!("{p}.ffn_up.weight"))?,
-            down: load_q4dense_routed(dev, g, &format!("{p}.ffn_down.weight"))?,
+            gate: load_q4weight_routed(dev, g, &format!("{p}.ffn_gate.weight"))?,
+            up: load_q4weight_routed(dev, g, &format!("{p}.ffn_up.weight"))?,
+            down: load_q4weight_routed(dev, g, &format!("{p}.ffn_down.weight"))?,
         };
         layers.push(Qwen35Layer { mixer, ffn });
     }
@@ -1006,7 +1274,337 @@ pub fn load_gguf(dev: &dyn Device, g: &Gguf) -> Result<Qwen35Model> {
         gdn_k_scale_tiled,
         gdn_conv_zero_bias,
         gdn_gqa_cyclic_idx,
+        gdn_cyclic_gqa: true,
     })
+}
+
+fn load_hf_vec_f32(dev: &dyn Device, st: &SafeTensors, name: &str) -> Result<Tensor> {
+    let (flat, shape) = st.tensor_f32(name)?;
+    if shape.len() != 1 {
+        return Err(Error::Msg(format!(
+            "qwen35: {name} must be 1-D, got {shape:?}"
+        )));
+    }
+    Ok(Tensor::new(
+        dev.upload(&f32s_to_bytes(&flat))?,
+        shape,
+        DType::F32,
+    ))
+}
+
+fn load_hf_gemma_norm(dev: &dyn Device, st: &SafeTensors, name: &str) -> Result<Tensor> {
+    let (mut flat, shape) = st.tensor_f32(name)?;
+    if shape.len() != 1 {
+        return Err(Error::Msg(format!(
+            "qwen35: {name} must be 1-D, got {shape:?}"
+        )));
+    }
+    for value in &mut flat {
+        *value += 1.0;
+    }
+    Ok(Tensor::new(
+        dev.upload(&f32s_to_bytes(&flat))?,
+        shape,
+        DType::F32,
+    ))
+}
+
+fn load_hf_dense16(dev: &dyn Device, st: &SafeTensors, name: &str) -> Result<Dense16> {
+    let (bytes, dtype, shape) = st.tensor(name)?;
+    if shape.len() != 2 || !matches!(dtype, DType::F16 | DType::BF16 | DType::F32) {
+        return Err(Error::Msg(format!(
+            "qwen35: {name} must be a 2-D F16/BF16/F32 tensor, got {dtype} {shape:?}"
+        )));
+    }
+    Ok(Dense16 {
+        weight: Tensor::new(dev.upload(bytes)?, shape.to_vec(), dtype),
+        m: shape[0],
+        k: shape[1],
+    })
+}
+
+fn load_hf_dense_f32(dev: &dyn Device, st: &SafeTensors, name: &str) -> Result<Tensor> {
+    let (flat, shape) = st.tensor_f32(name)?;
+    if shape.len() != 2 {
+        return Err(Error::Msg(format!(
+            "qwen35: {name} must be 2-D, got {shape:?}"
+        )));
+    }
+    Ok(Tensor::new(
+        dev.upload(&f32s_to_bytes(&flat))?,
+        shape,
+        DType::F32,
+    ))
+}
+
+fn load_hf_nvfp4(dev: &dyn Device, st: &SafeTensors, base: &str) -> Result<Nvfp4Dense> {
+    let matrix = st.load_nvfp4_tensor(base)?;
+    let scale_rows = matrix.rows;
+    let scale_cols = matrix.cols / matrix.block_size;
+    let mut scales_interleaved = vec![0u8; matrix.scales.len()];
+    let scale_col_blocks = scale_cols / 4;
+    for row in 0..scale_rows {
+        for col in 0..scale_cols {
+            let dst = (row / 128) * (512 * scale_col_blocks)
+                + (col / 4) * 512
+                + (row % 32) * 16
+                + ((row / 32) % 4) * 4
+                + col % 4;
+            scales_interleaved[dst] = matrix.scales[row * scale_cols + col];
+        }
+    }
+    Ok(Nvfp4Dense {
+        weight: Tensor::new(
+            dev.upload(matrix.packed)?,
+            vec![matrix.packed.len()],
+            DType::U8,
+        ),
+        scales: Tensor::new(
+            dev.upload(matrix.scales)?,
+            vec![matrix.scales.len()],
+            DType::U8,
+        ),
+        scales_interleaved: Tensor::new(
+            dev.upload(&scales_interleaved)?,
+            vec![scales_interleaved.len()],
+            DType::U8,
+        ),
+        m: matrix.rows,
+        k: matrix.cols,
+        block_size: matrix.block_size,
+        input_multiplier: matrix.input_multiplier,
+        weight_multiplier: matrix.weight_multiplier,
+    })
+}
+
+fn is_hf_nvfp4(st: &SafeTensors, base: &str) -> bool {
+    st.info(&format!("{base}.weight_packed")).is_some()
+        || (st
+            .info(&format!("{base}.weight"))
+            .map(|info| info.dtype == DType::U8)
+            .unwrap_or(false)
+            && st.info(&format!("{base}.weight_scale")).is_some())
+}
+
+fn load_hf_unquantized_weight(
+    dev: &dyn Device,
+    st: &SafeTensors,
+    base: &str,
+) -> Result<DenseWeight> {
+    if is_hf_nvfp4(st, base) {
+        return Err(Error::Msg(format!(
+            "qwen35: {base} must remain unquantized for this checkpoint layout"
+        )));
+    }
+    load_hf_dense16(dev, st, &format!("{base}.weight")).map(DenseWeight::Dense16)
+}
+
+fn load_hf_required_nvfp4(dev: &dyn Device, st: &SafeTensors, base: &str) -> Result<DenseWeight> {
+    if !is_hf_nvfp4(st, base) {
+        return Err(Error::Msg(format!(
+            "qwen35: {base} is not packed NVFP4; refusing host dequantization"
+        )));
+    }
+    load_hf_nvfp4(dev, st, base).map(DenseWeight::Nvfp4)
+}
+
+fn validate_hf_weight_kind(st: &SafeTensors, base: &str, nvfp4: bool) -> Result<()> {
+    if nvfp4 {
+        st.load_nvfp4_tensor(base)?;
+        return Ok(());
+    }
+    if is_hf_nvfp4(st, base) {
+        return Err(Error::Msg(format!(
+            "qwen35: {base} must remain unquantized for this checkpoint layout"
+        )));
+    }
+    let (_, dtype, shape) = st.tensor(&format!("{base}.weight"))?;
+    if shape.len() != 2 || !matches!(dtype, DType::F16 | DType::BF16 | DType::F32) {
+        return Err(Error::Msg(format!(
+            "qwen35: {base}.weight must be a 2-D F16/BF16/F32 tensor, got {dtype} {shape:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the checkpoint's quantization policy before the first upload.
+/// This avoids discovering a late-layer mismatch after most of the model is
+/// already resident and keeps every high-precision attention tensor explicit.
+fn validate_hf_quant_policy(st: &SafeTensors, cfg: &Qwen35Config) -> Result<()> {
+    for i in 0..cfg.n_layers {
+        let p = format!("model.language_model.layers.{i}");
+        if cfg.is_full_layer(i) {
+            let a = format!("{p}.self_attn");
+            for name in ["q_proj", "k_proj", "v_proj"] {
+                validate_hf_weight_kind(st, &format!("{a}.{name}"), false)?;
+            }
+            validate_hf_weight_kind(st, &format!("{a}.o_proj"), true)?;
+        } else {
+            let a = format!("{p}.linear_attn");
+            for name in ["in_proj_qkv", "in_proj_z", "out_proj"] {
+                validate_hf_weight_kind(st, &format!("{a}.{name}"), false)?;
+            }
+        }
+        for name in ["gate_proj", "up_proj", "down_proj"] {
+            validate_hf_weight_kind(st, &format!("{p}.mlp.{name}"), true)?;
+        }
+    }
+    Ok(())
+}
+
+/// Load the language model from a ModelOpt NVFP4 SafeTensors directory.
+/// Only explicitly named language tensors are uploaded, so multimodal
+/// `visual*` tensors remain mmap-only and never become device residents.
+pub fn load_nvfp4_dir(dev: &dyn Device, dir: &str) -> Result<Qwen35Model> {
+    let load_t0 = std::time::Instant::now();
+    let cfg = Qwen35Config::from_hf_dir(dir)?;
+    let st = SafeTensors::open_dir(dir)?;
+    validate_hf_quant_policy(&st, &cfg)?;
+
+    let (embed_bytes, embed_dtype, embed_shape) =
+        st.tensor("model.language_model.embed_tokens.weight")?;
+    if embed_shape != [cfg.vocab, cfg.hidden]
+        || !matches!(embed_dtype, DType::F16 | DType::BF16 | DType::F32)
+    {
+        return Err(Error::Msg(format!(
+            "qwen35: unexpected embedding {embed_dtype} {embed_shape:?}"
+        )));
+    }
+    let tok_embd = Tensor::new(dev.upload(embed_bytes)?, embed_shape.to_vec(), embed_dtype);
+    let out_norm = load_hf_gemma_norm(dev, &st, "model.language_model.norm.weight")?;
+    let lm_head = LmHead::Dense16(load_hf_dense16(dev, &st, "lm_head.weight")?);
+
+    let inv_scale = 1.0 / (cfg.gdn_key_head_dim as f32).sqrt();
+    let gdn_q_scale = Tensor::new(
+        dev.upload(&f32s_to_bytes(&vec![
+            inv_scale * inv_scale;
+            cfg.gdn_key_head_dim
+        ]))?,
+        vec![cfg.gdn_key_head_dim],
+        DType::F32,
+    );
+    let gdn_k_scale = Tensor::new(
+        dev.upload(&f32s_to_bytes(&vec![inv_scale; cfg.gdn_key_head_dim]))?,
+        vec![cfg.gdn_key_head_dim],
+        DType::F32,
+    );
+    let gdn_q_scale_tiled_values =
+        vec![inv_scale * inv_scale; cfg.gdn_num_k_heads * cfg.gdn_key_head_dim];
+    let gdn_q_scale_tiled = Tensor::new(
+        dev.upload(&f32s_to_bytes(&gdn_q_scale_tiled_values))?,
+        vec![gdn_q_scale_tiled_values.len()],
+        DType::F32,
+    );
+    let gdn_k_scale_tiled_values = vec![inv_scale; cfg.gdn_num_k_heads * cfg.gdn_key_head_dim];
+    let gdn_k_scale_tiled = Tensor::new(
+        dev.upload(&f32s_to_bytes(&gdn_k_scale_tiled_values))?,
+        vec![gdn_k_scale_tiled_values.len()],
+        DType::F32,
+    );
+    let gdn_conv_zero_bias_values = vec![0.0f32; cfg.gdn_conv_dim()];
+    let gdn_conv_zero_bias = Tensor::new(
+        dev.upload(&f32s_to_bytes(&gdn_conv_zero_bias_values))?,
+        vec![gdn_conv_zero_bias_values.len()],
+        DType::F32,
+    );
+    let gdn_gqa_cyclic_idx_values: Vec<u32> = (0..cfg.gdn_num_v_heads as u32)
+        .map(|head| head % cfg.gdn_num_k_heads as u32)
+        .collect();
+    let gdn_gqa_cyclic_idx = Tensor::new(
+        dev.upload(&u32s_to_bytes(&gdn_gqa_cyclic_idx_values))?,
+        vec![gdn_gqa_cyclic_idx_values.len()],
+        DType::U32,
+    );
+
+    let mut layers = Vec::with_capacity(cfg.n_layers);
+    for i in 0..cfg.n_layers {
+        let p = format!("model.language_model.layers.{i}");
+        let mixer = if cfg.is_full_layer(i) {
+            let a = format!("{p}.self_attn");
+            Mixer::Full(FullAttnWeights {
+                attn_norm: load_hf_gemma_norm(dev, &st, &format!("{p}.input_layernorm.weight"))?,
+                wq: load_hf_unquantized_weight(dev, &st, &format!("{a}.q_proj"))?,
+                wk: load_hf_unquantized_weight(dev, &st, &format!("{a}.k_proj"))?,
+                wv: load_hf_unquantized_weight(dev, &st, &format!("{a}.v_proj"))?,
+                wo: load_hf_required_nvfp4(dev, &st, &format!("{a}.o_proj"))?,
+                q_norm: load_hf_gemma_norm(dev, &st, &format!("{a}.q_norm.weight"))?,
+                k_norm: load_hf_gemma_norm(dev, &st, &format!("{a}.k_norm.weight"))?,
+            })
+        } else {
+            let a = format!("{p}.linear_attn");
+            let (a_log_raw_host, _) = st.tensor_f32(&format!("{a}.A_log"))?;
+            let neg_exp_a_log_host: Vec<f32> =
+                a_log_raw_host.iter().map(|value| -value.exp()).collect();
+            let (conv_flat, _) = st.tensor_f32(&format!("{a}.conv1d.weight"))?;
+            let conv_repacked =
+                repack_conv1d_weight(&conv_flat, cfg.gdn_conv_dim(), cfg.gdn_conv_kernel);
+            Mixer::Gdn(GdnWeights {
+                attn_norm: load_hf_gemma_norm(dev, &st, &format!("{p}.input_layernorm.weight"))?,
+                wqkv: load_hf_unquantized_weight(dev, &st, &format!("{a}.in_proj_qkv"))?,
+                wz: load_hf_unquantized_weight(dev, &st, &format!("{a}.in_proj_z"))?,
+                w_alpha: load_hf_dense_f32(dev, &st, &format!("{a}.in_proj_a.weight"))?,
+                w_beta: load_hf_dense_f32(dev, &st, &format!("{a}.in_proj_b.weight"))?,
+                dt_bias: load_hf_vec_f32(dev, &st, &format!("{a}.dt_bias"))?,
+                neg_exp_a_log: Tensor::new(
+                    dev.upload(&f32s_to_bytes(&neg_exp_a_log_host))?,
+                    vec![neg_exp_a_log_host.len()],
+                    DType::F32,
+                ),
+                a_log_raw: Tensor::new(
+                    dev.upload(&f32s_to_bytes(&a_log_raw_host))?,
+                    vec![a_log_raw_host.len()],
+                    DType::F32,
+                ),
+                conv_w: Tensor::new(
+                    dev.upload(&f32s_to_bytes(&conv_repacked))?,
+                    vec![conv_repacked.len()],
+                    DType::F32,
+                ),
+                ssm_norm_w: load_hf_vec_f32(dev, &st, &format!("{a}.norm.weight"))?,
+                wo: load_hf_unquantized_weight(dev, &st, &format!("{a}.out_proj"))?,
+            })
+        };
+        let ffn = DenseFfn {
+            ffn_norm: load_hf_gemma_norm(dev, &st, &format!("{p}.post_attention_layernorm.weight"))?,
+            gate: load_hf_required_nvfp4(dev, &st, &format!("{p}.mlp.gate_proj"))?,
+            up: load_hf_required_nvfp4(dev, &st, &format!("{p}.mlp.up_proj"))?,
+            down: load_hf_required_nvfp4(dev, &st, &format!("{p}.mlp.down_proj"))?,
+        };
+        layers.push(Qwen35Layer { mixer, ffn });
+    }
+
+    eprintln!(
+        "Qwen35: NVFP4 language load done in {:.2}s ({} layers, vision skipped)",
+        load_t0.elapsed().as_secs_f64(),
+        cfg.n_layers,
+    );
+    Ok(Qwen35Model {
+        cfg,
+        tok_embd,
+        layers,
+        out_norm,
+        lm_head,
+        mtp: None,
+        gdn_q_scale,
+        gdn_k_scale,
+        gdn_q_scale_tiled,
+        gdn_k_scale_tiled,
+        gdn_conv_zero_bias,
+        gdn_gqa_cyclic_idx,
+        gdn_cyclic_gqa: false,
+    })
+}
+
+fn gather_tokens_f32(dev: &dyn Device, model: &Qwen35Model, ids: &Tensor) -> Result<Tensor> {
+    let gathered = ops::gather(dev, &model.tok_embd, ids)?;
+    match gathered.dtype {
+        DType::F32 => Ok(gathered),
+        DType::F16 => ops::cast_f16_f32(dev, &gathered),
+        DType::BF16 => ops::cast_bf16_f32(dev, &gathered),
+        dtype => Err(Error::Msg(format!(
+            "qwen35: unsupported embedding dtype {dtype}"
+        ))),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1232,7 +1830,7 @@ pub fn decode_step_ex(
     let cfg = &model.cfg;
     let debug = std::env::var("QWEN35_DEBUG").map(|v| v == "1").unwrap_or(false);
     let tok_buf = Tensor::new(dev.upload(&token_id.to_le_bytes())?, vec![1], DType::U32);
-    let mut x = ops::gather(dev, &model.tok_embd, &tok_buf)?.reshaped(vec![cfg.hidden]);
+    let mut x = gather_tokens_f32(dev, model, &tok_buf)?.reshaped(vec![cfg.hidden]);
     if debug { dbg_sum(dev, "x_embed", pos, &x); }
 
     for (i, layer) in model.layers.iter().enumerate() {
@@ -1366,7 +1964,9 @@ fn prefill_layer_gdn(
     )?;
     tr!("gdn_qknorm_prepass_chunk");
     let y = ops::gdn_prep_chunk_fast_27b(
-        dev, &conv_out, &w.a_log_raw, &w.dt_bias, &a_raw, &b_raw, &q_normed, &k_normed, &slot.state, t_len, t,
+        dev, &conv_out, &w.a_log_raw, &w.dt_bias, &a_raw, &b_raw, &q_normed, &k_normed, &slot.state,
+        &model.gdn_conv_zero_bias, t_len, t,
+        model.gdn_cyclic_gqa,
     )?; // [T, Hv, Dv]
     tr!("gdn_prep_chunk_fast_27b");
 
@@ -1569,7 +2169,7 @@ pub fn prefill_at(
         let abs_start = start_pos + start;
 
         let ids = Tensor::new(dev.upload(&u32s_to_bytes(chunk_tokens))?, vec![t], DType::U32);
-        let mut x = ops::gather(dev, &model.tok_embd, &ids)?.reshaped(vec![t, cfg.hidden]);
+        let mut x = gather_tokens_f32(dev, model, &ids)?.reshaped(vec![t, cfg.hidden]);
 
         let pos_vec: Vec<u32> = (0..t).map(|i| (abs_start + i) as u32).collect();
         let positions = Tensor::new(dev.upload(&u32s_to_bytes(&pos_vec))?, vec![t], DType::U32);
@@ -1684,7 +2284,7 @@ pub fn decode_step_census(
     let mut t0 = std::time::Instant::now();
 
     let tok_buf = Tensor::new(dev.upload(&token_id.to_le_bytes())?, vec![1], DType::U32);
-    let mut x = ops::gather(dev, &model.tok_embd, &tok_buf)?.reshaped(vec![cfg.hidden]);
+    let mut x = gather_tokens_f32(dev, model, &tok_buf)?.reshaped(vec![cfg.hidden]);
     mark(dev, &mut t0, &mut b.embed_ms)?;
 
     for (i, layer) in model.layers.iter().enumerate() {
@@ -1800,11 +2400,37 @@ fn gdn_layer_full_census(
     // rmsNorm(ssm_norm)+silu(z)+mul tail (`ops::gdn_tail_gate`) — see
     // their docs in wh-butter-ops. Both stay inside this function's single
     // `gdn_chain_ms` bucket, same as the unfused chain they replace.
-    let y = ops::gdn_decode_fused(
-        dev, &q_raw, &k_raw, &v, &model.gdn_q_scale, &model.gdn_k_scale, &a_raw, &b_raw, &w.dt_bias,
-        &w.neg_exp_a_log, &slot.state, cfg.eps,
-        cfg.gdn_key_head_dim, cfg.gdn_value_head_dim, cfg.gdn_num_v_heads, cfg.gdn_num_k_heads,
-    )?;
+    let y = if model.gdn_cyclic_gqa {
+        ops::gdn_decode_fused(
+            dev, &q_raw, &k_raw, &v, &model.gdn_q_scale, &model.gdn_k_scale, &a_raw, &b_raw, &w.dt_bias,
+            &w.neg_exp_a_log, &slot.state, cfg.eps,
+            cfg.gdn_key_head_dim, cfg.gdn_value_head_dim, cfg.gdn_num_v_heads, cfg.gdn_num_k_heads,
+        )?
+    } else {
+        let q = ops::rms_norm(dev, &q_raw, &model.gdn_q_scale, cfg.eps)?;
+        let k = ops::rms_norm(dev, &k_raw, &model.gdn_k_scale, cfg.eps)?;
+        let (g, beta) = ops::gdn_gate_beta(
+            dev,
+            &a_raw,
+            &b_raw,
+            &w.dt_bias,
+            &w.neg_exp_a_log,
+            cfg.gdn_num_v_heads,
+        )?;
+        ops::gated_delta_step(
+            dev,
+            &q,
+            &k,
+            &v,
+            &g,
+            &beta,
+            &slot.state,
+            cfg.gdn_key_head_dim,
+            cfg.gdn_value_head_dim,
+            cfg.gdn_num_v_heads,
+            cfg.gdn_num_k_heads,
+        )?
+    };
     let gated = ops::gdn_tail_gate(dev, &y, &z, &w.ssm_norm_w, cfg.eps, cfg.gdn_num_v_heads, cfg.gdn_value_head_dim)?;
     mark(dev, t0, &mut b.gdn_chain_ms)?;
 
@@ -1888,11 +2514,37 @@ fn gdn_layer_full(
     // cyclic, the block mapping was ~20% off) is baked into the fused
     // kernel directly, so `q_raw`/`k_raw` are passed at their native
     // `[Hk,Dk]` shape with no pre-expand gather needed.
-    let y = ops::gdn_decode_fused(
-        dev, &q_raw, &k_raw, &v, &model.gdn_q_scale, &model.gdn_k_scale, &a_raw, &b_raw, &w.dt_bias,
-        &w.neg_exp_a_log, &slot.state, cfg.eps,
-        cfg.gdn_key_head_dim, cfg.gdn_value_head_dim, cfg.gdn_num_v_heads, cfg.gdn_num_k_heads,
-    )?;
+    let y = if model.gdn_cyclic_gqa {
+        ops::gdn_decode_fused(
+            dev, &q_raw, &k_raw, &v, &model.gdn_q_scale, &model.gdn_k_scale, &a_raw, &b_raw, &w.dt_bias,
+            &w.neg_exp_a_log, &slot.state, cfg.eps,
+            cfg.gdn_key_head_dim, cfg.gdn_value_head_dim, cfg.gdn_num_v_heads, cfg.gdn_num_k_heads,
+        )?
+    } else {
+        let q = ops::rms_norm(dev, &q_raw, &model.gdn_q_scale, cfg.eps)?;
+        let k = ops::rms_norm(dev, &k_raw, &model.gdn_k_scale, cfg.eps)?;
+        let (g, beta) = ops::gdn_gate_beta(
+            dev,
+            &a_raw,
+            &b_raw,
+            &w.dt_bias,
+            &w.neg_exp_a_log,
+            cfg.gdn_num_v_heads,
+        )?;
+        ops::gated_delta_step(
+            dev,
+            &q,
+            &k,
+            &v,
+            &g,
+            &beta,
+            &slot.state,
+            cfg.gdn_key_head_dim,
+            cfg.gdn_value_head_dim,
+            cfg.gdn_num_v_heads,
+            cfg.gdn_num_k_heads,
+        )?
+    };
     if dbg { dbg_sum(dev, "attn_output-0", pos, &y); }
 
     // F-85 round-11: fused rmsNorm(ssm_norm) + silu(z) + mul, ONE dispatch
@@ -1957,7 +2609,7 @@ fn mtp_draft_step(
     pos: u32,
 ) -> Result<(u32, Tensor)> {
     let tok_buf = Tensor::new(dev.upload(&tok.to_le_bytes())?, vec![1], DType::U32);
-    let e = ops::gather(dev, &model.tok_embd, &tok_buf)?.reshaped(vec![cfg.hidden]);
+    let e = gather_tokens_f32(dev, model, &tok_buf)?.reshaped(vec![cfg.hidden]);
     let e_norm = ops::rms_norm(dev, &e, &w.enorm, cfg.eps)?;
     let h_norm = ops::rms_norm(dev, h, &w.hnorm, cfg.eps)?;
     // eh_proj(concat(e_norm, h_norm)) == eh_proj_e·e_norm + eh_proj_h·h_norm
@@ -2173,4 +2825,47 @@ pub fn speculative_round(
     // confirmed state at `cur_pos`, ready to seed the next round directly.
     let _ = logits;
     Ok((accepted, cur_tok, cur_pos, cur_hidden, SpecDecodeStats { n_drafted: drafts.len(), n_accepted: n_accept }))
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn hf_multimodal_wrapper_reads_text_geometry() {
+        let root = std::env::temp_dir().join(format!("butter-qwen35-config-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = serde_json::json!({
+            "model_type": "qwen3_5",
+            "text_config": {
+                "max_position_embeddings": 1_000_000,
+                "hidden_size": 5120,
+                "num_hidden_layers": 64,
+                "head_dim": 256,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 4,
+                "partial_rotary_factor": 0.25,
+                "rope_parameters": {
+                    "rope_theta": 10_000_000.0,
+                    "original_max_position_embeddings": 262144
+                },
+                "full_attention_interval": 4,
+                "rms_norm_eps": 0.000001,
+                "vocab_size": 248320,
+                "intermediate_size": 17408,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 48,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4
+            }
+        });
+        std::fs::write(root.join("config.json"), config.to_string()).unwrap();
+        let cfg = Qwen35Config::from_hf_dir(root.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.max_seq, 262_144);
+        assert_eq!((cfg.n_layers, cfg.hidden, cfg.ffn_inter), (64, 5120, 17408));
+        assert_eq!((cfg.n_head, cfg.n_kv_heads, cfg.head_dim, cfg.rope_n_rot), (24, 4, 256, 64));
+        assert_eq!((cfg.gdn_num_k_heads, cfg.gdn_num_v_heads), (16, 48));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -7639,28 +7639,48 @@ pub fn gdn_prep_chunk_fast_27b(
     q_normed: &Tensor,
     k_normed: &Tensor,
     state: &Tensor,
+    disabled_planes: &Tensor,
     t_len: &Tensor,
     t: usize,
+    cyclic_gqa: bool,
 ) -> Result<Tensor> {
     const DV: usize = 128;
     const HV: usize = 48;
-    let kernel = lookup("iron_gated_delta_prep_chunk_fast_cyclic_d128_128_48_16", DType::F32)?;
+    let kernel_name = if cyclic_gqa {
+        "iron_gated_delta_prep_chunk_fast_cyclic_d128_128_48_16"
+    } else {
+        "iron_gated_delta_prep_chunk_fast_d128_128_48_16"
+    };
+    let kernel = lookup(kernel_name, DType::F32)?;
     let y = Tensor::empty(dev, vec![t * HV * DV], DType::F32)?;
+    let mut bindings = vec![
+        Binding::Buffer(conv_out.buffer.clone()),
+        Binding::Buffer(a_log_raw.buffer.clone()),
+        Binding::Buffer(dt_bias.buffer.clone()),
+        Binding::Buffer(a_raw.buffer.clone()),
+        Binding::Buffer(b_raw.buffer.clone()),
+        Binding::Buffer(q_normed.buffer.clone()),
+        Binding::Buffer(k_normed.buffer.clone()),
+        Binding::Buffer(state.buffer.clone()), // state_in
+        Binding::Buffer(state.buffer.clone()), // state_out (aliased)
+        Binding::Buffer(y.buffer.clone()),
+        Binding::Buffer(t_len.buffer.clone()),
+    ];
+    if !cyclic_gqa {
+        // The block-GQA kernel also supports optional per-token state
+        // planes. Keep that feature disabled here, but bind its two runtime
+        // buffers so the launch signature matches the Iron kernel exactly.
+        // A single f32 is sufficient for state_planes when the flag is zero.
+        // `disabled_planes` is a persistent all-zero f32 buffer. It is safe
+        // to alias both arguments because the zero flag prevents every
+        // state-plane write, and reading its first four bytes as u32 yields 0.
+        bindings.push(Binding::Buffer(disabled_planes.buffer.clone()));
+        bindings.push(Binding::Buffer(disabled_planes.buffer.clone()));
+        bindings.push(Binding::Scalar((HV as u32).to_le_bytes().to_vec()));
+    }
     dev.dispatch(
         &kernel,
-        &[
-            Binding::Buffer(conv_out.buffer.clone()),
-            Binding::Buffer(a_log_raw.buffer.clone()),
-            Binding::Buffer(dt_bias.buffer.clone()),
-            Binding::Buffer(a_raw.buffer.clone()),
-            Binding::Buffer(b_raw.buffer.clone()),
-            Binding::Buffer(q_normed.buffer.clone()),
-            Binding::Buffer(k_normed.buffer.clone()),
-            Binding::Buffer(state.buffer.clone()), // state_in
-            Binding::Buffer(state.buffer.clone()), // state_out (aliased)
-            Binding::Buffer(y.buffer.clone()),
-            Binding::Buffer(t_len.buffer.clone()),
-        ],
+        &bindings,
         Grid { grid: [(DV as u32).div_ceil(4), HV as u32, 1], block: [128, 1, 1] },
     )?;
     Ok(y)
@@ -10094,6 +10114,7 @@ extern "C" __global__ void lt_fp4_quant_gs(
     for(int i=0;i<16;i++){ v[i]=__half2float(xb[i]); am=fmaxf(am,fabsf(v[i])); }
     float ig=1.f/gs[0];
     unsigned sc=enc_ue4m3((am/6.f)*ig);
+    if(sc==127u) sc=126u;
     if(sc==0u&&am>0.f) sc=1u;
     float sd=dec_ue4m3(sc);
     float inv=(sd>0.f)?(ig/sd):0.f;
@@ -10163,6 +10184,7 @@ extern "C" __global__ void lt_fp4_quant_gs_f32(
     for(int i=0;i<16;i++){ v[i]=xb[i]; am=fmaxf(am,fabsf(v[i])); }
     float ig=1.f/gs[0];
     unsigned sc=enc_ue4m3((am/6.f)*ig);
+    if(sc==127u) sc=126u;
     if(sc==0u&&am>0.f) sc=1u;
     float sd=dec_ue4m3(sc);
     float inv=(sd>0.f)?(ig/sd):0.f;
@@ -11146,6 +11168,60 @@ pub fn lt_fp4_quant_g(dev: &dyn Device, x: &Tensor, r: usize, k: usize) -> Resul
         &[(x.buffer.as_ref(), x.offset), (pack.buffer.as_ref(),0), (sf.buffer.as_ref(),0), (gs.buffer.as_ref(),0)],
         &[i(r as i32), i(k as i32)],
         [nb.div_ceil(256),1,1],[256,1,1],0,false)?;
+    Ok((pack, sf, gs))
+}
+
+/// Quantize activations with a checkpoint-calibrated NVFP4 global scale.
+/// The returned scale buffer is `[global, 1/global]`; `gemm_fp4` restores
+/// this global together with the weight global in its output scale.
+pub fn lt_fp4_quant_with_global(
+    dev: &dyn Device,
+    x: &Tensor,
+    r: usize,
+    k: usize,
+    global: f32,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    if k % 32 != 0 || !(global.is_finite() && global > 0.0) {
+        return Err(Error::Msg(format!(
+            "lt_fp4_quant_with_global: invalid shape/global r={r} k={k} global={global}"
+        )));
+    }
+    let i = |value: i32| value.to_le_bytes().to_vec();
+    let kb = k / 16;
+    let kb4 = kb.div_ceil(4);
+    let sf_bytes = r.div_ceil(128) * 512 * kb4;
+    let globals: Vec<u8> = [global, global.recip()]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let gs = Tensor::new(dev.upload(&globals)?, vec![2], DType::F32);
+    let pack = Tensor::new(dev.alloc((r * k) / 2)?, vec![(r * k) / 2], DType::U32);
+    let sf = Tensor::new(
+        dev.alloc_zeroed(sf_bytes)?,
+        vec![sf_bytes],
+        DType::U32,
+    );
+    let kernel = if x.dtype == DType::F32 {
+        "lt_fp4_quant_gs_f32"
+    } else {
+        "lt_fp4_quant_gs"
+    };
+    dev.dispatch_raw_cuda(
+        MOE_FP4_SRC,
+        "moe_fp4.cu",
+        kernel,
+        &[
+            (x.buffer.as_ref(), x.offset),
+            (pack.buffer.as_ref(), 0),
+            (sf.buffer.as_ref(), 0),
+            (gs.buffer.as_ref(), 0),
+        ],
+        &[i(r as i32), i(k as i32)],
+        [((r * kb) as u32).div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+        false,
+    )?;
     Ok((pack, sf, gs))
 }
 

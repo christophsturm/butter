@@ -43,22 +43,29 @@ pub fn e4m3_decode(code: u8) -> f32 {
 
 fn scalar_f32(st: &SafeTensors, name: &str) -> Result<f32> {
     let (bytes, dtype, shape) = st.tensor(name)?;
-    if dtype != DType::F32 || shape != [1] || bytes.len() != 4 {
+    if dtype != DType::F32 || !(shape.is_empty() || shape == [1]) || bytes.len() != 4 {
         return Err(Error::Msg(format!(
-            "nvfp4: {name} must be an F32 [1] tensor, got {dtype} {shape:?}"
+            "nvfp4: {name} must be an F32 scalar, got {dtype} {shape:?}"
         )));
     }
     Ok(f32::from_le_bytes(bytes.try_into().unwrap()))
 }
 
 impl SafeTensors {
-    /// Load `<base>.weight_packed`, `.weight_scale`,
-    /// `.weight_global_scale`, and `.input_global_scale` without copying.
+    /// Load either ModelOpt's standard `weight` / `weight_scale` /
+    /// `weight_scale_2` / `input_scale` names or the explicit
+    /// `weight_packed` / `weight_global_scale` conversion names without
+    /// copying the packed matrix.
     pub fn load_nvfp4_tensor(&self, base: &str) -> Result<Nvfp4Tensor<'_>> {
-        let (packed, packed_dtype, packed_shape) = self.tensor(&format!("{base}.weight_packed"))?;
+        let packed_name = if self.info(&format!("{base}.weight_packed")).is_some() {
+            format!("{base}.weight_packed")
+        } else {
+            format!("{base}.weight")
+        };
+        let (packed, packed_dtype, packed_shape) = self.tensor(&packed_name)?;
         if packed_dtype != DType::U8 || packed_shape.len() != 2 {
             return Err(Error::Msg(format!(
-                "nvfp4: {base}.weight_packed must be U8 [rows, cols/2], got {packed_dtype} {packed_shape:?}"
+                "nvfp4: {packed_name} must be U8 [rows, cols/2], got {packed_dtype} {packed_shape:?}"
             )));
         }
         let rows = packed_shape[0];
@@ -83,11 +90,24 @@ impl SafeTensors {
             )));
         }
 
-        // The checkpoint records inverse global scales. The dequantized
-        // multiplier is their reciprocal.
-        let weight_global = scalar_f32(self, &format!("{base}.weight_global_scale"))?;
-        let input_global = scalar_f32(self, &format!("{base}.input_global_scale"))?;
-        if !weight_global.is_finite() || weight_global <= 0.0 || !input_global.is_finite() || input_global <= 0.0 {
+        let explicit_globals = self.info(&format!("{base}.weight_global_scale")).is_some();
+        let weight_global_name = if explicit_globals {
+            format!("{base}.weight_global_scale")
+        } else {
+            format!("{base}.weight_scale_2")
+        };
+        let input_global_name = if explicit_globals {
+            format!("{base}.input_global_scale")
+        } else {
+            format!("{base}.input_scale")
+        };
+        let weight_global = scalar_f32(self, &weight_global_name)?;
+        let input_global = scalar_f32(self, &input_global_name)?;
+        if !weight_global.is_finite()
+            || weight_global <= 0.0
+            || !input_global.is_finite()
+            || input_global <= 0.0
+        {
             return Err(Error::Msg(format!(
                 "nvfp4: {base} global scales must be finite and positive"
             )));
@@ -96,8 +116,18 @@ impl SafeTensors {
         Ok(Nvfp4Tensor {
             packed,
             scales,
-            weight_multiplier: weight_global.recip(),
-            input_multiplier: input_global.recip(),
+            // The explicit conversion stores inverse globals. Standard
+            // ModelOpt exports store the dequant multipliers directly.
+            weight_multiplier: if explicit_globals {
+                weight_global.recip()
+            } else {
+                weight_global
+            },
+            input_multiplier: if explicit_globals {
+                input_global.recip()
+            } else {
+                input_global
+            },
             rows,
             cols,
             block_size,
@@ -109,6 +139,27 @@ impl SafeTensors {
 mod tests {
     use super::*;
 
+    fn write_standard_nvfp4_fixture() -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("butter-nvfp4-{}.safetensors", std::process::id()));
+        let header = serde_json::json!({
+            "layer.weight": {"dtype":"U8", "shape":[1,8], "data_offsets":[0,8]},
+            "layer.weight_scale": {"dtype":"F8_E4M3", "shape":[1,1], "data_offsets":[8,9]},
+            "layer.weight_scale_2": {"dtype":"F32", "shape":[], "data_offsets":[9,13]},
+            "layer.input_scale": {"dtype":"F32", "shape":[], "data_offsets":[13,17]}
+        })
+        .to_string();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0x10; 8]);
+        bytes.push(0x38);
+        bytes.extend_from_slice(&0.25f32.to_le_bytes());
+        bytes.extend_from_slice(&0.5f32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
     #[test]
     fn fp_codebooks_have_expected_landmarks() {
         assert_eq!(e2m1_decode(0x0), 0.0);
@@ -116,5 +167,18 @@ mod tests {
         assert_eq!(e2m1_decode(0xf), -6.0);
         assert_eq!(e4m3_decode(0x38), 1.0);
         assert_eq!(e4m3_decode(0xb8), -1.0);
+    }
+
+    #[test]
+    fn standard_modelopt_layout_stays_packed_and_uses_direct_scale() {
+        let path = write_standard_nvfp4_fixture();
+        let st = SafeTensors::open(path.to_str().unwrap()).unwrap();
+        let matrix = st.load_nvfp4_tensor("layer").unwrap();
+        assert_eq!((matrix.rows, matrix.cols, matrix.block_size), (1, 16, 16));
+        assert_eq!(matrix.packed, &[0x10; 8]);
+        assert_eq!(matrix.scales, &[0x38]);
+        assert_eq!(matrix.weight_multiplier, 0.25);
+        assert_eq!(matrix.input_multiplier, 0.5);
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -1,8 +1,8 @@
 // Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 // SPDX-License-Identifier: Apache-2.0
 
-//! Minimal GPT-2/Qwen byte-level BPE tokenizer, read straight from GGUF
-//! metadata (`tokenizer.ggml.tokens` + `.merges`). Pure CPU, no deps — the
+//! Minimal GPT-2/Qwen byte-level BPE tokenizer, read from GGUF metadata or a
+//! Hugging Face `tokenizer.json`. Pure CPU, with no tokenizer runtime dependency. The
 //! same vocab the model was trained with, so encode/decode round-trips the
 //! exact ids llama.cpp would produce for ASCII prompts.
 //!
@@ -12,9 +12,9 @@
 //! are stored in that same mapped-char space, so a token string is matched
 //! directly against the merged symbols.
 
+use std::collections::HashMap;
 use wh_butter_core::{Error, Result};
 use wh_butter_loader::gguf::Gguf;
-use std::collections::HashMap;
 
 /// Which on-disk tokenizer the GGUF carries. GPT-2/Qwen ship byte-level BPE
 /// (`tokenizer.ggml.merges`); Llama/Phi-3 ship SentencePiece ("llama" model,
@@ -70,6 +70,128 @@ fn bytes_to_unicode() -> [char; 256] {
 }
 
 impl GgufTokenizer {
+    fn from_bpe_parts(
+        tokens: Vec<String>,
+        merges: impl IntoIterator<Item = String>,
+        mut special_tokens: Vec<(String, u32)>,
+    ) -> Self {
+        let token_to_id = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| !token.is_empty())
+            .map(|(id, token)| (token.clone(), id as u32))
+            .collect();
+        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        special_tokens.dedup_by(|a, b| a.0 == b.0);
+        let byte_to_char = bytes_to_unicode();
+        let char_to_byte = byte_to_char
+            .iter()
+            .enumerate()
+            .map(|(byte, ch)| (*ch, byte as u8))
+            .collect();
+        let merge_rank = merges
+            .into_iter()
+            .enumerate()
+            .filter_map(|(rank, merge)| {
+                let (a, b) = merge.split_once(' ')?;
+                Some(((a.to_string(), b.to_string()), rank))
+            })
+            .collect();
+        Self {
+            kind: TokKind::Bpe,
+            tokens,
+            token_to_id,
+            special_tokens,
+            merge_rank,
+            scores: Vec::new(),
+            byte_to_char,
+            char_to_byte,
+        }
+    }
+
+    /// Build a byte-level BPE tokenizer from a model directory without
+    /// importing a second tokenizer runtime. This is the resident
+    /// SafeTensors path's counterpart to [`Self::from_gguf`].
+    pub fn from_hf_dir(dir: &str) -> Result<Self> {
+        let path = std::path::Path::new(dir).join("tokenizer.json");
+        let bytes = std::fs::read(&path)
+            .map_err(|e| Error::Msg(format!("read {}: {e}", path.display())))?;
+        let json: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Msg(format!("parse {}: {e}", path.display())))?;
+        let model = json
+            .get("model")
+            .and_then(|value| value.as_object())
+            .ok_or_else(|| Error::Msg("tokenizer.json: model object missing".into()))?;
+        if model.get("type").and_then(|value| value.as_str()) != Some("BPE") {
+            return Err(Error::Msg(
+                "tokenizer.json: only byte-level BPE is supported".into(),
+            ));
+        }
+        let vocab = model
+            .get("vocab")
+            .and_then(|value| value.as_object())
+            .ok_or_else(|| Error::Msg("tokenizer.json: model.vocab missing".into()))?;
+        let max_id = vocab
+            .values()
+            .filter_map(|value| value.as_u64())
+            .max()
+            .ok_or_else(|| Error::Msg("tokenizer.json: empty vocabulary".into()))?
+            as usize;
+        let added = json
+            .get("added_tokens")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let added_max = added
+            .iter()
+            .filter_map(|value| value.get("id").and_then(|id| id.as_u64()))
+            .max()
+            .map(|id| id as usize)
+            .unwrap_or(0);
+        let mut tokens = vec![String::new(); max_id.max(added_max) + 1];
+        for (token, id) in vocab {
+            let Some(id) = id.as_u64().map(|id| id as usize) else {
+                continue;
+            };
+            tokens[id] = token.clone();
+        }
+        let mut special_tokens = Vec::new();
+        for token in added {
+            let Some(id) = token
+                .get("id")
+                .and_then(|id| id.as_u64())
+                .map(|id| id as usize)
+            else {
+                continue;
+            };
+            let Some(content) = token.get("content").and_then(|content| content.as_str()) else {
+                continue;
+            };
+            tokens[id] = content.to_string();
+            if token
+                .get("special")
+                .and_then(|special| special.as_bool())
+                .unwrap_or(false)
+            {
+                special_tokens.push((content.to_string(), id as u32));
+            }
+        }
+        let merges = model
+            .get("merges")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| Error::Msg("tokenizer.json: model.merges missing".into()))?
+            .iter()
+            .filter_map(|merge| match merge {
+                serde_json::Value::String(merge) => Some(merge.clone()),
+                serde_json::Value::Array(pair) if pair.len() == 2 => {
+                    Some(format!("{} {}", pair[0].as_str()?, pair[1].as_str()?))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        Ok(Self::from_bpe_parts(tokens, merges, special_tokens))
+    }
+
     /// Build the tokenizer from a parsed GGUF's metadata arrays.
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let tokens = g
@@ -99,7 +221,11 @@ impl GgufTokenizer {
         // no merges) vs GPT-2/Qwen byte-level BPE (merges present).
         let model = g.meta_str("tokenizer.ggml.model").unwrap_or("gpt2");
         let has_merges = g.metadata_arr_str.contains_key("tokenizer.ggml.merges");
-        let kind = if model == "llama" || (!has_merges) { TokKind::Spm } else { TokKind::Bpe };
+        let kind = if model == "llama" || (!has_merges) {
+            TokKind::Spm
+        } else {
+            TokKind::Bpe
+        };
 
         let (merge_rank, scores) = match kind {
             TokKind::Bpe => {
@@ -162,7 +288,10 @@ impl GgufTokenizer {
             // Find the adjacent pair with the lowest merge rank.
             let mut best: Option<(usize, usize)> = None; // (rank, index)
             for i in 0..symbols.len() - 1 {
-                if let Some(&r) = self.merge_rank.get(&(symbols[i].clone(), symbols[i + 1].clone())) {
+                if let Some(&r) = self
+                    .merge_rank
+                    .get(&(symbols[i].clone(), symbols[i + 1].clone()))
+                {
                     if best.map(|(br, _)| r < br).unwrap_or(true) {
                         best = Some((r, i));
                     }
@@ -186,7 +315,11 @@ impl GgufTokenizer {
             let next = self
                 .special_tokens
                 .iter()
-                .filter_map(|(token, id)| text[cursor..].find(token).map(|offset| (offset, token, *id)))
+                .filter_map(|(token, id)| {
+                    text[cursor..]
+                        .find(token)
+                        .map(|offset| (offset, token, *id))
+                })
                 .min_by_key(|(offset, token, _)| (*offset, std::cmp::Reverse(token.len())));
             let Some((offset, token, id)) = next else {
                 ids.extend(self.encode_plain(&text[cursor..]));
@@ -204,7 +337,10 @@ impl GgufTokenizer {
         if self.kind == TokKind::Spm {
             return self.encode_spm(text);
         }
-        let mapped: String = text.bytes().map(|b| self.byte_to_char[b as usize]).collect();
+        let mapped: String = text
+            .bytes()
+            .map(|b| self.byte_to_char[b as usize])
+            .collect();
         // Split into "words" the way GPT-2 BPE groups them: a run that starts
         // at the mapped-space char ('Ġ') and continues until the next one.
         let space = self.byte_to_char[b' ' as usize];
@@ -321,7 +457,9 @@ impl GgufTokenizer {
     fn decode_spm(&self, ids: &[u32]) -> String {
         let mut bytes: Vec<u8> = Vec::new();
         for &id in ids {
-            let Some(tok) = self.tokens.get(id as usize) else { continue };
+            let Some(tok) = self.tokens.get(id as usize) else {
+                continue;
+            };
             if tok.len() == 6 && tok.starts_with("<0x") && tok.ends_with('>') {
                 if let Ok(b) = u8::from_str_radix(&tok[3..5], 16) {
                     bytes.push(b);
@@ -352,7 +490,13 @@ mod tests {
             .enumerate()
             .map(|(byte, ch)| (*ch, byte as u8))
             .collect();
-        let tokens = vec!["x".to_string(), "<".to_string(), "|".to_string(), ">".to_string(), "<|im_start|>".to_string()];
+        let tokens = vec![
+            "x".to_string(),
+            "<".to_string(),
+            "|".to_string(),
+            ">".to_string(),
+            "<|im_start|>".to_string(),
+        ];
         let token_to_id = tokens
             .iter()
             .enumerate()
@@ -368,6 +512,29 @@ mod tests {
             byte_to_char,
             char_to_byte,
         }
+    }
+
+    #[test]
+    fn hf_json_keeps_added_control_tokens_atomic() {
+        let root = std::env::temp_dir().join(format!(
+            "butter-tokenizer-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let json = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {"x": 0, "<": 1, "|": 2, ">": 3},
+                "merges": []
+            },
+            "added_tokens": [{"id": 4, "content": "<|im_start|>", "special": true}]
+        });
+        std::fs::write(root.join("tokenizer.json"), json.to_string()).unwrap();
+        let tok = GgufTokenizer::from_hf_dir(root.to_str().unwrap()).unwrap();
+        assert_eq!(tok.encode("x<|im_start|>x"), vec![0, 4, 0]);
+        assert_eq!(tok.decode(&[4]), "<|im_start|>");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

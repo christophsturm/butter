@@ -240,10 +240,11 @@ fn dispatch(
                 "object": "model",
                 "owned_by": "butter"
             });
-            if let Some(n) = state.max_context {
-                entry["max_model_len"] = json!(n);
-                entry["context_length"] = json!(n);
-            }
+            let n = state
+                .max_context
+                .unwrap_or_else(|| state.loaded.lock().unwrap().max_model_len());
+            entry["max_model_len"] = json!(n);
+            entry["context_length"] = json!(n);
             let payload = json!({
                 "object": "list",
                 "data": [entry]

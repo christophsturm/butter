@@ -12,6 +12,7 @@ wh-butter-ops.workspace = true
 wh-butter-models.workspace = true
 wh-butter-runtime.workspace = true
 wh-butter-loader.workspace = true
+serde_json.workspace = true
 wh-butter-metal = { workspace = true, optional = true }
 wh-butter-cuda = { workspace = true, optional = true }
 wh-butter-vulkan = { workspace = true, optional = true }
