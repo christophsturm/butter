@@ -7184,6 +7184,12 @@ pub fn conv1d_causal_silu_many(
     let kernel = lookup("iron_conv1d_causal_step_silu_cast_many", DType::F32)?;
     let out_f32 = Tensor::empty(dev, vec![t_len * conv_dim], DType::F32)?;
     let state_out = Tensor::empty(dev, vec![3 * conv_dim], DType::F32)?;
+    // Iron's rollback-capable ABI always carries the optional state-plane
+    // output and its runtime mode flag. This path does not retain rollback
+    // planes, so bind a valid device scalar for both arguments and disable
+    // stores with mode 0. Keeping these bindings in the call is required
+    // even when plane capture is off.
+    let planes_disabled = scalar_buf(dev, 0)?;
     let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
     dev.dispatch(
         &kernel,
@@ -7194,6 +7200,8 @@ pub fn conv1d_causal_silu_many(
             Binding::Buffer(state_in.buffer.clone()),
             Binding::Buffer(out_f32.buffer.clone()),
             Binding::Buffer(state_out.buffer.clone()),
+            Binding::Buffer(planes_disabled.clone()),
+            Binding::Buffer(planes_disabled),
             u(t_len as u32),
             u(conv_dim as u32),
             u(4u32),
@@ -7609,7 +7617,85 @@ pub fn gdn_prep_chunk_fast_27b(
 
 #[cfg(test)]
 mod tests {
-    use super::{dsv4_mhc_sinkhorn_split, permute_q4_from_marlin, permute_q4_to_marlin, quantize_q4, quantize_nvfp4, dec_ue4m3, E2M1_LUT};
+    use super::{
+        E2M1_LUT, conv1d_causal_silu_many, dec_ue4m3, dsv4_mhc_sinkhorn_split,
+        permute_q4_from_marlin, permute_q4_to_marlin, quantize_nvfp4, quantize_q4,
+    };
+    use std::{
+        any::Any,
+        sync::{Arc, Mutex},
+    };
+    use wh_butter_core::{
+        Backend, Binding, DType, Device, DeviceBuffer, Grid, Kernel, Result, Tensor,
+    };
+
+    struct TestBuffer(usize);
+
+    impl DeviceBuffer for TestBuffer {
+        fn len(&self) -> usize {
+            self.0
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingDevice {
+        dispatch: Mutex<Option<(String, usize, usize)>>,
+    }
+
+    impl Device for RecordingDevice {
+        fn backend(&self) -> Backend {
+            Backend::Cpu
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn alloc(&self, len: usize) -> Result<Arc<dyn DeviceBuffer>> {
+            Ok(Arc::new(TestBuffer(len)))
+        }
+        fn upload(&self, bytes: &[u8]) -> Result<Arc<dyn DeviceBuffer>> {
+            self.alloc(bytes.len())
+        }
+        fn download(&self, _buf: &dyn DeviceBuffer, out: &mut [u8]) -> Result<()> {
+            out.fill(0);
+            Ok(())
+        }
+        fn dispatch(&self, kernel: &Kernel, bindings: &[Binding], _grid: Grid) -> Result<()> {
+            let buffers = bindings
+                .iter()
+                .filter(|binding| matches!(binding, Binding::Buffer(_)))
+                .count();
+            let scalars = bindings.len() - buffers;
+            *self.dispatch.lock().unwrap() = Some((kernel.name.clone(), buffers, scalars));
+            Ok(())
+        }
+        fn synchronize(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn causal_conv_binds_disabled_rollback_plane_arguments() {
+        let dev = RecordingDevice::default();
+        let tensor = |n| Tensor::new(dev.alloc(n * 4).unwrap(), vec![n], DType::F32);
+        conv1d_causal_silu_many(
+            &dev,
+            &tensor(8),
+            &tensor(32),
+            &tensor(8),
+            &tensor(24),
+            1,
+            8,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *dev.dispatch.lock().unwrap(),
+            Some(("iron_conv1d_causal_step_silu_cast_many".into(), 8, 3))
+        );
+    }
 
     /// NVFP4 quantize → dequantize round-trip reconstruction error must be on par
     /// with Q4 (the existing argmax-correct path). Validated standalone at ~9.5% on
