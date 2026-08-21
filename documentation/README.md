@@ -7,6 +7,7 @@ Table of contents for the Butter documentation. The top-level [`README`](../READ
 - [Installation](installation.md) — SwiftPM / Xcode setup, platform requirements, sibling-iron checkout.
 - [Quick start](quickstart.md) — generate text in 5 lines.
 - [Using the CLI](using-the-cli.md) — build the `butter` binary and run it via `swift run`, the built path, or a `PATH` symlink.
+- [Serve](serve.md) — `butter serve`, Completions HTTP, one resident checkpoint, prefix reuse and abort.
 - [Architecture](architecture.md) — the three-layer stack (`iron` Rust → `IronSwift` → `Butter`), build pipeline, and per-token dispatch loop.
 - [Models](models.md) — the supported architecture families (dense text, SSM / GDN / conv+attention hybrids, MoE, vision-language, audio, neural codecs), per-family known gaps, and adding a new family.
 

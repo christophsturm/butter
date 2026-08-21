@@ -70,7 +70,7 @@ CLI equivalent (the `butter` executable target):
 butter --model mlx-community/Qwen3.5-0.8B-MLX-4bit --prompt "Once upon a time"
 ```
 
-See [`quickstart.md`](documentation/quickstart.md) for streaming, chat templates, capability gating, and lower-level forward APIs. Using a non-default cache directory (external SSD, shared cache between Python tools, etc.)? See [Custom model cache path](documentation/quickstart.md#custom-model-cache-path).
+See [`quickstart.md`](documentation/quickstart.md) for streaming, chat templates, capability gating, and lower-level forward APIs. Using a non-default cache directory (external SSD, shared cache between Python tools, etc.)? See [Custom model cache path](documentation/quickstart.md#custom-model-cache-path). To plug Completions clients into a local process, see [`documentation/serve.md`](documentation/serve.md).
 
 ## Models Supported
 

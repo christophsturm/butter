@@ -38,6 +38,8 @@ butter --model mlx-community/Qwen3-4B-4bit --prompt "Hello" --max-tokens 128
 
 Tokens are streamed to stdout as they're generated. Pass `--no-streaming` to print the full text once at the end (matches the buffered API exactly). Pass `--stats` for the post-run `[STATS]` block (per-phase memory, TTFT, KV cache, wired ticket — see [observability.md](observability.md)). Pass `--verbose` to print the top-5 next-token distribution from a single prefill instead of generating.
 
+To serve Completions over HTTP instead of a one-shot CLI generate, see [serve.md](serve.md).
+
 ## Customizing the generation
 
 The second argument to `generate` is a [`GenerationParameters`](generation-parameters.md). Omit it (or pass `nil`) to use the family default — overriding a single field with the `with(_:)` copy-mutator preserves the family-tuned baseline:

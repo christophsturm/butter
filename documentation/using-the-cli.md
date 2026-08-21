@@ -36,6 +36,7 @@ butter generate -m mlx-community/Qwen3.5-0.8B-MLX-4bit -p "Once upon a time"
 | Subcommand | One-liner | More |
 |---|---|---|
 | `generate` (default) | Stream a single prompt's continuation to stdout. | `butter generate --help` |
+| `serve` | OpenAI-compatible HTTP server. One loaded checkpoint. | [serve.md](serve.md) |
 | `models` | List every supported model family with copy-paste example repo IDs (bf16 / 8-bit / 4-bit). | `butter models` |
 | `inspect` | Load a model and dump architecture + tokenization + top-K logits for a fixed probe prompt. The first thing to reach for when a new model produces broken output. | `butter inspect --help` |
 | `convert` | Quantize a bf16/fp16 HuggingFace checkpoint to MLX 4-bit affine format using Butter's own GPU kernels — no Python / mlx-lm dependency. Optionally upload to HF. | [§ `convert`](#convert--quantize-a-checkpoint-to-mlx-4-bit) |
