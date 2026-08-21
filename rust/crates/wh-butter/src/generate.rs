@@ -179,12 +179,13 @@ where
     }
 }
 
-/// Live KV / GDN cache carried across serve requests. `tokens` is
-/// prompt + generated (not generated-only) so the next request can
-/// decide append-only suffix prefill vs rebuild.
+/// Live KV / GDN cache carried across serve requests at the completed prompt
+/// boundary. Decode may write later full-attention KV positions, but recurrent
+/// state is restored before this value is published again.
 pub struct LiveGenerateCache {
     pub cache: qwen35::Qwen35Cache,
     pub tokens: Vec<u32>,
+    prompt_logits: Vec<f32>,
 }
 
 /// Longest common prefix length of two token sequences.
@@ -210,20 +211,23 @@ pub fn n_past(cached: &[u32], new: &[u32]) -> usize {
 /// Pure append-vs-rebuild decision for a live Qwen3.5 cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReusePlan {
+    Exact,
     Append { n_past: usize },
     Rebuild,
 }
 
-/// Suffix-only prefill is valid only when `new` strictly appends to
-/// `cached` (`n_past == cached.len()` after [`n_past`]), capacity fits
-/// `need`, and neither side is empty. Any rewind / fork / undersize →
-/// [`ReusePlan::Rebuild`].
+/// An exact prompt reuses its saved prompt logits. Suffix-only prefill is
+/// valid when `new` strictly appends to `cached`, capacity fits `need`, and
+/// neither side is empty. Any rewind, fork, or undersize rebuilds.
 pub fn reuse_plan(cached: &[u32], new: &[u32], cap: usize, need: usize) -> ReusePlan {
     if cached.is_empty() || new.is_empty() || cap < need {
         return ReusePlan::Rebuild;
     }
-    let n = n_past(cached, new);
-    if n == cached.len() && n < new.len() {
+    if cached == new {
+        return ReusePlan::Exact;
+    }
+    let n = common_prefix(cached, new);
+    if n == cached.len() {
         ReusePlan::Append { n_past: n }
     } else {
         ReusePlan::Rebuild
@@ -295,32 +299,42 @@ where
         None => ReusePlan::Rebuild,
     };
     let cached_tokens = match plan {
+        ReusePlan::Exact => ids.len(),
         ReusePlan::Append { n_past } => n_past,
         ReusePlan::Rebuild => 0,
     };
 
-    let mut cache = match plan {
-        ReusePlan::Append { .. } => live.take().expect("Append implies live cache").cache,
+    let (mut cache, cached_prompt_logits) = match plan {
+        ReusePlan::Exact | ReusePlan::Append { .. } => {
+            let cached = live.take().expect("cache reuse plan implies live cache");
+            (cached.cache, Some(cached.prompt_logits))
+        }
         ReusePlan::Rebuild => {
             let _ = live.take();
-            qwen35::Qwen35Cache::new(dev, &model.cfg, cap)?
+            (qwen35::Qwen35Cache::new(dev, &model.cfg, cap)?, None)
         }
     };
 
     // ---- Prompt processing: batched chunked prefill (F-85) ----
     let t_prefill = Instant::now();
-    let logits = match plan {
+    let mut last_logits = match plan {
+        ReusePlan::Exact => cached_prompt_logits.unwrap_or_default(),
         ReusePlan::Append { n_past } => qwen35::prefill_at(
             dev, model, &mut cache, &ids[n_past..], n_past, opts.chunk, opts.abort.as_deref(),
-        )?,
+        )
+        .and_then(|logits| download_logits(dev, &logits, model.cfg.vocab))?,
         ReusePlan::Rebuild => qwen35::prefill_at(
             dev, model, &mut cache, &ids, 0, opts.chunk, opts.abort.as_deref(),
-        )?,
+        )
+        .and_then(|logits| download_logits(dev, &logits, model.cfg.vocab))?,
     };
+    if matches!(plan, ReusePlan::Exact) && last_logits.is_empty() {
+        return Err(Error::Msg("generate: exact cache hit missing prompt logits".into()));
+    }
     dev.synchronize()?;
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
-
-    let mut last_logits = download_logits(dev, &logits, model.cfg.vocab)?;
+    let prompt_logits = last_logits.clone();
+    let prompt_snapshot = cache.snapshot_prompt(dev)?;
     let mut pos = ids.len() as u32;
 
     // ---- Decode: the existing per-token decode_step path, unchanged ----
@@ -348,9 +362,8 @@ where
 
     let generated_tokens = out_ids.len();
     let text = tok.decode(&out_ids);
-    let mut all_tokens = ids.clone();
-    all_tokens.extend_from_slice(&out_ids);
-    *live = Some(LiveGenerateCache { cache, tokens: all_tokens });
+    cache.restore_prompt(prompt_snapshot)?;
+    *live = Some(LiveGenerateCache { cache, tokens: ids.clone(), prompt_logits });
 
     Ok(GenerateReport {
         architecture: "qwen35".to_string(),
@@ -413,15 +426,15 @@ fn download_logits(dev: &dyn Device, t: &Tensor, vocab: usize) -> Result<Vec<f32
 mod tests {
     use super::*;
 
-    /// Product: append only on a strict extension that fits. Mutation: treat
-    /// equal/shorter/fork as Append, or ignore `cap < need`.
+    /// Product: exact prompts reuse saved logits; append only on a strict
+    /// extension that fits. Shorter prompts and forks rebuild.
     #[test]
     fn reuse_plan_table() {
         assert_eq!(
             reuse_plan(&[1, 2, 3, 4], &[1, 2, 3, 4, 5, 6], 64, 16),
             ReusePlan::Append { n_past: 4 }
         );
-        assert_eq!(reuse_plan(&[1, 2, 3, 4], &[1, 2, 3, 4], 64, 16), ReusePlan::Rebuild);
+        assert_eq!(reuse_plan(&[1, 2, 3, 4], &[1, 2, 3, 4], 64, 16), ReusePlan::Exact);
         assert_eq!(reuse_plan(&[1, 2, 3, 4], &[1, 2], 64, 16), ReusePlan::Rebuild);
         assert_eq!(reuse_plan(&[1, 2, 3, 4], &[9, 9], 64, 16), ReusePlan::Rebuild);
         assert_eq!(

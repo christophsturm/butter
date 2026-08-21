@@ -31,6 +31,9 @@ pub struct GgufTokenizer {
     tokens: Vec<String>,
     /// token string → id.
     token_to_id: HashMap<String, u32>,
+    /// Chat/control tokens that must bypass ordinary BPE or SentencePiece.
+    /// Longest first so overlapping spellings choose the complete token.
+    special_tokens: Vec<(String, u32)>,
     /// "a b" merge pair → rank (lower = applied first). BPE only.
     merge_rank: HashMap<(String, String), usize>,
     /// id → SentencePiece score (higher = preferred merge). SPM only.
@@ -79,6 +82,13 @@ impl GgufTokenizer {
         for (i, t) in tokens.iter().enumerate() {
             token_to_id.insert(t.clone(), i as u32);
         }
+        let mut special_tokens: Vec<(String, u32)> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| token.starts_with("<|") && token.ends_with("|>"))
+            .map(|(id, token)| (token.clone(), id as u32))
+            .collect();
+        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         let byte_to_char = bytes_to_unicode();
         let mut char_to_byte = HashMap::with_capacity(256);
         for (b, &c) in byte_to_char.iter().enumerate() {
@@ -123,6 +133,7 @@ impl GgufTokenizer {
             kind,
             tokens,
             token_to_id,
+            special_tokens,
             merge_rank,
             scores,
             byte_to_char,
@@ -169,6 +180,27 @@ impl GgufTokenizer {
     /// pre-tokenizer regex (word/space splitting) — instead it splits on the
     /// leading-space convention, which suffices for plain prompts.
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        let mut ids = Vec::new();
+        let mut cursor = 0;
+        while cursor < text.len() {
+            let next = self
+                .special_tokens
+                .iter()
+                .filter_map(|(token, id)| text[cursor..].find(token).map(|offset| (offset, token, *id)))
+                .min_by_key(|(offset, token, _)| (*offset, std::cmp::Reverse(token.len())));
+            let Some((offset, token, id)) = next else {
+                ids.extend(self.encode_plain(&text[cursor..]));
+                break;
+            };
+            let start = cursor + offset;
+            ids.extend(self.encode_plain(&text[cursor..start]));
+            ids.push(id);
+            cursor = start + token.len();
+        }
+        ids
+    }
+
+    fn encode_plain(&self, text: &str) -> Vec<u32> {
         if self.kind == TokKind::Spm {
             return self.encode_spm(text);
         }
@@ -306,5 +338,42 @@ impl GgufTokenizer {
             }
         }
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_bpe() -> GgufTokenizer {
+        let byte_to_char = bytes_to_unicode();
+        let char_to_byte = byte_to_char
+            .iter()
+            .enumerate()
+            .map(|(byte, ch)| (*ch, byte as u8))
+            .collect();
+        let tokens = vec!["x".to_string(), "<".to_string(), "|".to_string(), ">".to_string(), "<|im_start|>".to_string()];
+        let token_to_id = tokens
+            .iter()
+            .enumerate()
+            .map(|(id, token)| (token.clone(), id as u32))
+            .collect();
+        GgufTokenizer {
+            kind: TokKind::Bpe,
+            tokens,
+            token_to_id,
+            special_tokens: vec![("<|im_start|>".to_string(), 4)],
+            merge_rank: HashMap::new(),
+            scores: Vec::new(),
+            byte_to_char,
+            char_to_byte,
+        }
+    }
+
+    #[test]
+    fn encode_keeps_chat_control_token_atomic() {
+        let tok = tiny_bpe();
+        assert_eq!(tok.encode("x<|im_start|>x"), vec![0, 4, 0]);
+        assert_eq!(tok.decode(&[4]), "<|im_start|>");
     }
 }

@@ -1033,6 +1033,14 @@ pub struct Qwen35Cache {
     slots: Vec<LayerSlot>,
 }
 
+/// Recurrent state at a completed prompt boundary. Full-attention KV is not
+/// copied: earlier positions are immutable and a later suffix overwrites any
+/// speculative/generated positions beyond the boundary. GDN state is mutable
+/// in place, so it must be preserved before decode advances it.
+pub struct Qwen35PromptSnapshot {
+    gdn: Vec<Option<(Tensor, Tensor)>>,
+}
+
 impl Qwen35Cache {
     pub fn new(dev: &dyn Device, cfg: &Qwen35Config, max_seq: usize) -> Result<Self> {
         let mut slots = Vec::with_capacity(cfg.n_layers);
@@ -1075,6 +1083,38 @@ impl Qwen35Cache {
                 LayerSlot::Gdn(_) => None,
             })
             .unwrap_or(0)
+    }
+
+    pub fn snapshot_prompt(&self, dev: &dyn Device) -> Result<Qwen35PromptSnapshot> {
+        let mut gdn = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            match slot {
+                LayerSlot::Full(_) => gdn.push(None),
+                LayerSlot::Gdn(slot) => {
+                    let state = ops::slice(dev, &slot.state, 0, slot.state.elem_count())?;
+                    let conv_state = ops::slice(dev, &slot.conv_state, 0, slot.conv_state.elem_count())?;
+                    gdn.push(Some((state, conv_state)));
+                }
+            }
+        }
+        Ok(Qwen35PromptSnapshot { gdn })
+    }
+
+    pub fn restore_prompt(&mut self, snapshot: Qwen35PromptSnapshot) -> Result<()> {
+        if snapshot.gdn.len() != self.slots.len() {
+            return Err(Error::Msg("qwen35: prompt snapshot layer count mismatch".into()));
+        }
+        for (slot, saved) in self.slots.iter_mut().zip(snapshot.gdn) {
+            match (slot, saved) {
+                (LayerSlot::Full(_), None) => {}
+                (LayerSlot::Gdn(slot), Some((state, conv_state))) => {
+                    slot.state = state;
+                    slot.conv_state = conv_state;
+                }
+                _ => return Err(Error::Msg("qwen35: prompt snapshot layer kind mismatch".into())),
+            }
+        }
+        Ok(())
     }
 }
 

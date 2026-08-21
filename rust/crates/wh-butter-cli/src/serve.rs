@@ -276,7 +276,10 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
         .and_then(|k| k.get("enable_thinking"))
         .and_then(|b| b.as_bool());
     let thinking = kwargs_thinking.unwrap_or(state.enable_thinking);
-    let prompt = render_messages(messages, thinking, v.get("tools"));
+    // This checkpoint's no-thinking generation prompt can terminate before
+    // producing an answer. Generate through its working reasoning path, then
+    // apply the client's visibility choice to the response.
+    let prompt = render_messages(messages, true, v.get("tools"));
     let stream_flag = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let include_usage = v
         .get("stream_options")
@@ -315,6 +318,7 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
 
     if stream_flag {
         write_sse_headers(stream)?;
+        let mut visible_stream = VisibleStream::new(thinking);
         let id_c = id.clone();
         let model_c = model_id.to_string();
         let loaded = state.loaded.lock().unwrap();
@@ -326,6 +330,7 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
             &opts,
             &mut live,
             |text, _tok| {
+                let Some(text) = visible_stream.push(text) else { return true };
                 let chunk = json!({
                     "id": id_c,
                     "object": "chat.completion.chunk",
@@ -446,7 +451,7 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
                 }]),
                 "tool_calls",
             ),
-            None => (json!(report.text), Value::Null, "stop"),
+            None => (json!(client_visible(&report.text, thinking)), Value::Null, "stop"),
         };
         let mut message = json!({"role": "assistant", "content": content});
         if !tool_calls.is_null() {
@@ -599,7 +604,7 @@ fn messages(state: &ServerState, stream: &mut TcpStream, body: &[u8]) -> std::io
     let max_new = parsed.max_new;
     let stream_flag = parsed.stream;
     let thinking = parsed.thinking.unwrap_or(state.enable_thinking);
-    let rendered = render_messages(&parsed.flat, thinking, None);
+    let rendered = render_messages(&parsed.flat, true, None);
     let model_id = parsed
         .model
         .clone()
@@ -645,6 +650,7 @@ fn messages(state: &ServerState, stream: &mut TcpStream, body: &[u8]) -> std::io
             .to_string(),
         )?;
         let mut assembled = String::new();
+        let mut visible_stream = VisibleStream::new(thinking);
         let mut text_started = false;
         let loaded = state.loaded.lock().unwrap();
         let mut live = state.live.lock().unwrap();
@@ -659,6 +665,7 @@ fn messages(state: &ServerState, stream: &mut TcpStream, body: &[u8]) -> std::io
                 if assembled.contains("<tool_call") || assembled.contains("[TOOL_CALLS]") {
                     return true;
                 }
+                let Some(text) = visible_stream.push(text) else { return true };
                 if !text_started {
                     let _ = write_event(
                         stream,
@@ -727,7 +734,7 @@ fn messages(state: &ServerState, stream: &mut TcpStream, body: &[u8]) -> std::io
             content.push(json!({"type":"tool_use","id":"toolu_000000000000","name":name,"input":input}));
             finish = "tool_use";
         } else {
-            content.push(json!({"type":"text","text": report.text}));
+            content.push(json!({"type":"text","text": client_visible(&report.text, thinking)}));
         }
         let payload = json!({
             "id": id,
@@ -830,8 +837,64 @@ fn strip_think_blocks(text: &str) -> String {
     s
 }
 
+fn strip_control_tokens(text: &str) -> String {
+    ["<|im_start|>", "<|im_end|>", "<|endoftext|>"]
+        .into_iter()
+        .fold(text.to_string(), |text, marker| text.replace(marker, ""))
+}
+
+fn trim_incomplete_marker(mut text: String, markers: &[&str]) -> String {
+    let cut = markers
+        .iter()
+        .flat_map(|marker| (1..marker.len()).map(move |n| &marker[..n]))
+        .filter(|prefix| text.ends_with(prefix))
+        .map(|prefix| text.len() - prefix.len())
+        .min();
+    if let Some(cut) = cut {
+        text.truncate(cut);
+    }
+    text
+}
+
+fn client_visible(text: &str, expose_thinking: bool) -> String {
+    let visible = if expose_thinking { text.to_string() } else { strip_think_blocks(text) };
+    let visible = strip_control_tokens(&visible);
+    let visible = if let Some(start) = visible.find("<tool_call") {
+        visible[..start].to_string()
+    } else {
+        visible
+    };
+    trim_incomplete_marker(
+        visible,
+        &["<think>", "</think>", "<tool_call>", "<|im_start|>", "<|im_end|>", "<|endoftext|>"],
+    )
+}
+
+struct VisibleStream {
+    raw: String,
+    emitted: String,
+    expose_thinking: bool,
+}
+
+impl VisibleStream {
+    fn new(expose_thinking: bool) -> Self {
+        Self { raw: String::new(), emitted: String::new(), expose_thinking }
+    }
+
+    fn push(&mut self, piece: &str) -> Option<String> {
+        self.raw.push_str(piece);
+        let visible = client_visible(&self.raw, self.expose_thinking);
+        if !visible.starts_with(&self.emitted) || visible.len() == self.emitted.len() {
+            return None;
+        }
+        let delta = visible[self.emitted.len()..].to_string();
+        self.emitted = visible;
+        Some(delta)
+    }
+}
+
 fn recover_tools(text: &str) -> Option<(String, String, String)> {
-    let visible = strip_think_blocks(text);
+    let visible = strip_control_tokens(&strip_think_blocks(text));
     recover_json_markup(&visible).or_else(|| recover_xml_markup(&visible))
 }
 
@@ -898,20 +961,61 @@ fn write_event(stream: &mut TcpStream, event: &str, json: &str) -> std::io::Resu
 
 fn render_messages(messages: &[Value], enable_thinking: bool, tools: Option<&Value>) -> String {
     let mut s = String::new();
+    let mut first_message = 0;
     if let Some(t) = tools {
-        s.push_str(&format!("<|im_start|>system\ntools\n{t}<|im_end|>\n"));
+        s.push_str("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        if let Some(tools) = t.as_array() {
+            for tool in tools {
+                s.push('\n');
+                s.push_str(&tool.to_string());
+            }
+        }
+        s.push_str("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST use an inner <function=...></function> block inside <tool_call></tool_call> tags\n- Required parameters MUST be specified\n- You may reason before the function call, but do not add text after it\n</IMPORTANT>");
+        if let Some(system) = messages.first().filter(|message| message["role"] == "system") {
+            let content = extract_content(system.get("content"));
+            if !content.is_empty() {
+                s.push_str("\n\n");
+                s.push_str(&content);
+            }
+            first_message = 1;
+        }
+        s.push_str("<|im_end|>\n");
     }
-    for m in messages {
+    for m in &messages[first_message..] {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
         let role = if role == "developer" { "system" } else { role };
-        let mut content = extract_content(m.get("content"));
-        if let Some(tcs) = m.get("tool_calls") {
-            content.push_str(&format!("\ntool_calls:{tcs}"));
+        let content = extract_content(m.get("content"));
+        if role == "assistant" {
+            s.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+            s.push_str(&content);
+            if let Some(calls) = m.get("tool_calls").and_then(|calls| calls.as_array()) {
+                for call in calls {
+                    let function = call.get("function").unwrap_or(call);
+                    let name = function.get("name").and_then(|name| name.as_str()).unwrap_or("");
+                    s.push_str(&format!("<tool_call>\n<function={name}>\n"));
+                    if let Some(arguments) = function.get("arguments") {
+                        let arguments = arguments
+                            .as_str()
+                            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                            .unwrap_or_else(|| arguments.clone());
+                        if let Some(arguments) = arguments.as_object() {
+                            for (key, value) in arguments {
+                                let value = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+                                s.push_str(&format!("<parameter={key}>\n{value}\n</parameter>\n"));
+                            }
+                        }
+                    }
+                    s.push_str("</function>\n</tool_call>");
+                }
+            }
+            s.push_str("<|im_end|>\n");
+        } else if role == "tool" {
+            s.push_str(&format!(
+                "<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n"
+            ));
+        } else {
+            s.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
         }
-        if let Some(id) = m.get("tool_call_id") {
-            content.push_str(&format!("\ntool_call_id:{id}"));
-        }
-        s.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
     }
     // Qwen 3.x chat template: thinking off closes the think block up
     // front so the model doesn't emit a reasoning prefix.
@@ -1152,6 +1256,22 @@ mod tests {
     }
 
     #[test]
+    fn tool_render_uses_checkpoint_xml_contract() {
+        let tools = json!([{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}]);
+        let messages = [
+            json!({"role":"user","content":"read x"}),
+            json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"read","arguments":"{\"path\":\"x\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"call_1","content":"ok"}),
+        ];
+        let prompt = render_messages(&messages, true, Some(&tools));
+        assert!(prompt.contains("<tools>\n"));
+        assert!(prompt.contains("<function=read>"));
+        assert!(prompt.contains("<parameter=path>\nx\n</parameter>"));
+        assert!(prompt.contains("<tool_response>\nok\n</tool_response>"));
+        assert!(!prompt.contains("tool_calls:"));
+    }
+
+    #[test]
     fn event_frame_has_event_name() {
         // Mutation: OpenAI `data:` only : Messages clients never start a block.
         let f = event_frame("message_start", r#"{"type":"message_start"}"#);
@@ -1227,6 +1347,25 @@ mod tests {
     fn think_block_hides_json_leak() {
         let s = "<think><tool_call>{\"name\":\"bash\",\"arguments\":{}}</tool_call></think>ok";
         assert!(recover_tools(s).is_none());
+    }
+
+    #[test]
+    fn default_visibility_removes_reasoning_and_control_tokens() {
+        let raw = "<think>private</think>\n\nParis.<|im_end|><|endoftext|>";
+        assert_eq!(client_visible(raw, false).trim(), "Paris.");
+    }
+
+    #[test]
+    fn streaming_visibility_does_not_leak_split_reasoning_tag() {
+        let mut visible = VisibleStream::new(false);
+        for piece in ["<", "think", ">secret", "</think>", "Paris"] {
+            let delta = visible.push(piece);
+            if piece != "Paris" {
+                assert!(delta.is_none(), "leaked {delta:?} after {piece:?}");
+            } else {
+                assert_eq!(delta.as_deref(), Some("Paris"));
+            }
+        }
     }
 
     #[test]
