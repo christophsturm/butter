@@ -21,12 +21,18 @@ import Testing
 
 @Suite("Ops")
 struct OpsTests {
-    @Test("AURA two-pass support includes 4v2 d256")
-    func auraTwoPassSupports4v2D256() {
+    @Test("AURA two-pass support follows emitted pass-1 kernels")
+    func auraTwoPassSupportMatchesPass1Kernels() {
         for dtype in [DType.f32, .f16, .bf16] {
             #expect(
-                Ops.supportsAuraFlashSdpa2Pass(
+                !Ops.supportsAuraFlashSdpa2Pass(
                     keyBits: 4, valueBits: 2, headDim: 256, dtype: dtype))
+            #expect(
+                Ops.supportsAuraFlashSdpa2Pass(
+                    keyBits: 4, valueBits: 2, headDim: 128, dtype: dtype))
+            #expect(
+                Ops.supportsAuraFlashSdpa2Pass(
+                    keyBits: 4, valueBits: 4, headDim: 128, dtype: dtype))
         }
         #expect(
             !Ops.supportsAuraFlashSdpa2Pass(
