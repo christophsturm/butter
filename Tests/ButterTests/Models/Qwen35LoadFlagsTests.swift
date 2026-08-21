@@ -60,9 +60,10 @@ struct Qwen35LoadFlagsTests {
             eviction: .window(maxSize: 32, keep: 4))
         let caches = model.makeLayerCaches(maxSeq: nil, device: .shared)
         let kv = caches.compactMap { $0 as? KVCache }
-        #expect(kv.allSatisfy {
-            if case .window(let s, let k) = $0.eviction { s == 32 && k == 4 } else { false }
-        })
+        #expect(
+            kv.allSatisfy {
+                if case .window(let s, let k) = $0.eviction { s == 32 && k == 4 } else { false }
+            })
     }
 
     @Test("AURA flash window size follows eviction")
@@ -125,9 +126,9 @@ struct Qwen35LoadFlagsTests {
 func makeTinyQwen35(
     kv: KVCacheKind,
     maxSeq: Int,
-    eviction: KVEviction = .unbounded
+    eviction: KVEviction = .unbounded,
+    vocab: Int = 64
 ) -> Qwen35Model {
-    let vocab = 64
     let hidden = 512
     let nHeads = 4
     let nKVHeads = 1

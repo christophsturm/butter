@@ -28,15 +28,18 @@ struct PrefillDropTests {
     @Test("TCP close mid-prefill stops leftover GPU chunks")
     func tcpCloseStopsRemainingPrefillChunks() async throws {
         PrefillAbortProbe.reset()
+        PrefillAbortProbe.target(promptCount: 48, firstToken: 63, chunkSize: 1)
         PrefillAbortProbe.enabled = true
+        PrefillAbortProbe.holdAfterFirstCommit = true
         defer {
+            PrefillAbortProbe.holdAfterFirstCommit = false
             PrefillAbortProbe.enabled = false
             PrefillAbortProbe.reset()
         }
 
         let engine = makeTinyQwen35(kv: .raw, maxSeq: 128)
         let promptLen = 48
-        let tokenizer = ProbeTokenizer(count: promptLen)
+        let tokenizer = ProbeTokenizer(count: promptLen, tokenId: 63)
         let model = Model(
             engine: engine,
             tokenizer: tokenizer,
@@ -59,7 +62,7 @@ struct PrefillDropTests {
             + "Connection: keep-alive\r\n\r\n\(body)"
 
         let conn = try await prefillDropOpen(port: server.boundPort, send: req)
-        try await waitUntil(timeout: 8) { PrefillAbortProbe.committed >= 1 }
+        #expect(PrefillAbortProbe.waitForFirstCommit(timeout: 8))
         conn.send(
             content: nil,
             contentContext: .finalMessage,
@@ -68,9 +71,31 @@ struct PrefillDropTests {
         try await Task.sleep(for: .seconds(2))
 
         #expect(PrefillAbortProbe.committed >= 1)
+        #expect(PrefillAbortProbe.cancellationObserved)
         #expect(
             PrefillAbortProbe.committed < promptLen,
             "leftover prefill completed: committed=\(PrefillAbortProbe.committed) begun=\(PrefillAbortProbe.begun)")
+    }
+
+    @Test("prefill abort probe ignores unrelated generation")
+    func probeIsScopedToTargetPrompt() {
+        PrefillAbortProbe.reset()
+        PrefillAbortProbe.target(promptCount: 48, firstToken: 63, chunkSize: 1)
+        PrefillAbortProbe.enabled = true
+        defer {
+            PrefillAbortProbe.enabled = false
+            PrefillAbortProbe.reset()
+        }
+
+        PrefillAbortProbe.markBegun(promptCount: 5, firstToken: 1, chunkSize: 2)
+        PrefillAbortProbe.markCommitted(promptCount: 5, firstToken: 1, chunkSize: 2)
+        #expect(PrefillAbortProbe.begun == 0)
+        #expect(PrefillAbortProbe.committed == 0)
+
+        PrefillAbortProbe.markBegun(promptCount: 48, firstToken: 63, chunkSize: 1)
+        PrefillAbortProbe.markCommitted(promptCount: 48, firstToken: 63, chunkSize: 1)
+        #expect(PrefillAbortProbe.begun == 1)
+        #expect(PrefillAbortProbe.committed == 1)
     }
 }
 
@@ -131,15 +156,19 @@ private final class PrefillDropOnce: @unchecked Sendable {
 }
 
 /// Fixed-length encode so HTTP `encodePrompt` yields `count` token ids.
-private final class ProbeTokenizer: Tokenizer, @unchecked Sendable {
+class ProbeTokenizer: Tokenizer, @unchecked Sendable {
     let count: Int
-    init(count: Int) { self.count = count }
+    let tokenId: Int
+    init(count: Int, tokenId: Int = 1) {
+        self.count = count
+        self.tokenId = tokenId
+    }
 
     func tokenize(text: String) -> [String] { Array(repeating: "t", count: count) }
-    func encode(text: String) -> [Int] { Array(repeating: 1, count: count) }
+    func encode(text: String) -> [Int] { Array(repeating: tokenId, count: count) }
     func encode(text: String, addSpecialTokens: Bool) -> [Int] { encode(text: text) }
     func decode(tokens: [Int], skipSpecialTokens: Bool) -> String { "" }
-    func convertTokenToId(_ token: String) -> Int? { 1 }
+    func convertTokenToId(_ token: String) -> Int? { tokenId }
     func convertIdToToken(_ id: Int) -> String? { "t" }
     var bosToken: String? { nil }
     var bosTokenId: Int? { nil }
@@ -147,6 +176,7 @@ private final class ProbeTokenizer: Tokenizer, @unchecked Sendable {
     var eosTokenId: Int? { 0 }
     var unknownToken: String? { nil }
     var unknownTokenId: Int? { nil }
+    var hasChatTemplate: Bool { false }
 
     func applyChatTemplate(messages: [Message]) throws -> [Int] {
         throw TokenizerError.missingChatTemplate

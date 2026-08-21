@@ -437,9 +437,10 @@ private final class ConnectionHandler: @unchecked Sendable {
                 }
                 if chunk.tokens.isEmpty && chunk.text.isEmpty { continue }
                 assembled += chunk.text
-                if let tagStart = toolTagStart(assembled) {
+                let visible = ToolCallParser.stripThinkBlocks(assembled)
+                if let tagStart = toolTagStart(visible) {
                     if tagStart > emittedChars {
-                        let extra = substring(assembled, from: emittedChars, to: tagStart)
+                        let extra = substring(visible, from: emittedChars, to: tagStart)
                         if !extra.isEmpty {
                             writeSSE(id: id, created: created, model: model, content: extra)
                         }
@@ -447,16 +448,17 @@ private final class ConnectionHandler: @unchecked Sendable {
                     }
                     continue
                 }
-                if assembled.count > emittedChars {
-                    let extra = substring(assembled, from: emittedChars, to: assembled.count)
+                if visible.count > emittedChars {
+                    let extra = substring(visible, from: emittedChars, to: visible.count)
                     if !extra.isEmpty {
                         writeSSE(id: id, created: created, model: model, content: extra)
                     }
-                    emittedChars = assembled.count
+                    emittedChars = visible.count
                 }
             }
             try Task.checkCancellation()
-            let held = substring(assembled, from: emittedChars, to: assembled.count)
+            let visible = ToolCallParser.stripThinkBlocks(assembled)
+            let held = substring(visible, from: emittedChars, to: visible.count)
             let recovered = ToolCallParser.recover(from: assembled)
             var finish =
                 (maxTokens > 0 && completionTokens >= maxTokens) ? "length" : "stop"
@@ -468,10 +470,18 @@ private final class ConnectionHandler: @unchecked Sendable {
                 } else if emittedChars == 0, !recovered.residual.isEmpty {
                     writeSSE(id: id, created: created, model: model, content: recovered.residual)
                 }
-                writeSSE(id: id, created: created, model: model, toolCalls: recovered.calls)
+                writeSSE(
+                    id: id, created: created, model: model, toolCalls: recovered.calls,
+                    toolDelta: .first)
+                writeSSE(
+                    id: id, created: created, model: model, toolCalls: recovered.calls,
+                    toolDelta: .arguments)
                 finish = "tool_calls"
-            } else if !held.isEmpty {
-                writeSSE(id: id, created: created, model: model, content: held)
+            } else {
+                let safe = contentBeforeToolMarkup(held)
+                if !safe.isEmpty {
+                    writeSSE(id: id, created: created, model: model, content: safe)
+                }
             }
             writeSSE(id: id, created: created, model: model, finishReason: finish)
             if includeUsage {
@@ -511,7 +521,9 @@ private final class ConnectionHandler: @unchecked Sendable {
             var finish =
                 (maxTokens > 0 && completionTokens >= maxTokens) ? "length" : "stop"
             var toolCalls: [ParsedToolCall]?
-            var content: String? = text
+            let visible = ToolCallParser.stripThinkBlocks(text)
+            let safeVisible = contentBeforeToolMarkup(visible)
+            var content: String? = safeVisible.isEmpty ? nil : safeVisible
             if let recovered = ToolCallParser.recover(from: text) {
                 toolCalls = recovered.calls
                 content = recovered.residual.isEmpty ? nil : recovered.residual
@@ -566,20 +578,22 @@ private final class ConnectionHandler: @unchecked Sendable {
                 }
                 if chunk.tokens.isEmpty && chunk.text.isEmpty { continue }
                 assembled += chunk.text
-                if let tagStart = toolTagStart(assembled) {
+                let visible = ToolCallParser.stripThinkBlocks(assembled)
+                if let tagStart = toolTagStart(visible) {
                     if tagStart > emittedChars {
-                        emitTextDelta(substring(assembled, from: emittedChars, to: tagStart))
+                        emitTextDelta(substring(visible, from: emittedChars, to: tagStart))
                         emittedChars = tagStart
                     }
                     continue
                 }
-                if assembled.count > emittedChars {
-                    emitTextDelta(substring(assembled, from: emittedChars, to: assembled.count))
-                    emittedChars = assembled.count
+                if visible.count > emittedChars {
+                    emitTextDelta(substring(visible, from: emittedChars, to: visible.count))
+                    emittedChars = visible.count
                 }
             }
             try Task.checkCancellation()
-            let held = substring(assembled, from: emittedChars, to: assembled.count)
+            let visible = ToolCallParser.stripThinkBlocks(assembled)
+            let held = substring(visible, from: emittedChars, to: visible.count)
             let recovered = ToolCallParser.recover(from: assembled)
             var stopReason = MessagesCodec.stopReason(
                 finish: (maxTokens > 0 && completionTokens >= maxTokens) ? "length" : "stop")
@@ -614,7 +628,7 @@ private final class ConnectionHandler: @unchecked Sendable {
                 }
                 stopReason = "tool_use"
             } else {
-                emitTextDelta(held)
+                emitTextDelta(contentBeforeToolMarkup(held))
                 if !textStarted {
                     writeAnthropEvent(
                         "content_block_start", MessagesCodec.contentBlockStartText(index: 0))
@@ -658,7 +672,9 @@ private final class ConnectionHandler: @unchecked Sendable {
             }
             var finish =
                 (maxTokens > 0 && completionTokens >= maxTokens) ? "length" : "stop"
-            var residual: String? = text
+            let visible = ToolCallParser.stripThinkBlocks(text)
+            let safeVisible = contentBeforeToolMarkup(visible)
+            var residual: String? = safeVisible.isEmpty ? nil : safeVisible
             var toolCalls: [ParsedToolCall]?
             if let recovered = ToolCallParser.recover(from: text) {
                 toolCalls = recovered.calls
@@ -682,22 +698,36 @@ private final class ConnectionHandler: @unchecked Sendable {
         writeRawBody(Data("event: \(event)\r\ndata: \(data)\r\n\r\n".utf8))
     }
 
+    private enum ToolDelta {
+        case first
+        case arguments
+    }
+
     private func writeSSE(
         id: String, created: Int, model: String,
         content: String? = nil,
         toolCalls: [ParsedToolCall]? = nil,
+        toolDelta: ToolDelta = .first,
         finishReason: String? = nil
     ) {
         var delta: [String: Any] = [:]
         if let content { delta["content"] = content }
         if let toolCalls {
             delta["tool_calls"] = toolCalls.enumerated().map { i, tc in
-                [
-                    "index": i,
-                    "id": tc.id,
-                    "type": "function",
-                    "function": ["name": tc.name, "arguments": tc.arguments],
-                ] as [String: Any]
+                switch toolDelta {
+                case .first:
+                    [
+                        "index": i,
+                        "id": tc.id,
+                        "type": "function",
+                        "function": ["name": tc.name, "arguments": ""],
+                    ] as [String: Any]
+                case .arguments:
+                    [
+                        "index": i,
+                        "function": ["arguments": tc.arguments],
+                    ] as [String: Any]
+                }
             }
         }
         let payload: [String: Any] = [
@@ -796,9 +826,11 @@ private final class ConnectionHandler: @unchecked Sendable {
         }
         let data = writeQueue.removeFirst()
         lock.unlock()
-        connection.send(content: data, completion: .contentProcessed { [weak self] _ in
-            self?.pumpWrites()
-        })
+        connection.send(
+            content: data,
+            completion: .contentProcessed { [weak self] _ in
+                self?.pumpWrites()
+            })
     }
 
     private func finishAndClose() {
@@ -853,8 +885,23 @@ private func toolTagStart(_ s: String) -> Int? {
             let i = s.distance(from: s.startIndex, to: r.lowerBound)
             best = min(best ?? i, i)
         }
+        // A network chunk may end midway through a marker. Hold that
+        // suffix until the next chunk proves whether it is markup.
+        if !s.isEmpty {
+            for length in 1 ..< m.count where s.hasSuffix(m.prefix(length)) {
+                let i = s.count - length
+                best = min(best ?? i, i)
+            }
+        }
     }
     return best
+}
+
+private func contentBeforeToolMarkup(_ text: String) -> String {
+    guard ToolCallParser.looksLikeToolMarkup(text) else { return text }
+    let markers = ["<tool", "<function=", "<parameter", "<|tool", "[TOOL_CALLS"]
+    let start = markers.compactMap { text.range(of: $0)?.lowerBound }.min() ?? text.endIndex
+    return String(text[..<start]).trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 private func substring(_ s: String, from: Int, to: Int) -> String {
@@ -945,7 +992,8 @@ private func decodeChunkedBody(_ buffer: Data, bodyStart: Int) -> ChunkedBodyRes
     var body = Data()
     while true {
         guard let line = readChunkLine(buffer, from: &offset) else { return .needMore }
-        let sizeToken = line.split(separator: ";", maxSplits: 1).first
+        let sizeToken =
+            line.split(separator: ";", maxSplits: 1).first
             .map(String.init)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard let size = Int(sizeToken, radix: 16) else { return .error }
@@ -1085,8 +1133,15 @@ struct ChatCompletionHTTPRequest: Sendable {
             default: role = .user
             }
             let content = extractContent(m["content"])
-            let thinking = m["thinking"] as? String
-            messages.append(ChatMessage(role: role, content: content, thinking: thinking))
+            let thinking =
+                m["thinking"] as? String
+                ?? m["reasoning_content"] as? String
+            let toolCalls = parseChatToolCalls(m["tool_calls"])
+            let toolCallId = m["tool_call_id"] as? String
+            messages.append(
+                ChatMessage(
+                    role: role, content: content, thinking: thinking,
+                    toolCalls: toolCalls, toolCallId: toolCallId))
         }
         if messages.isEmpty { throw ServeError.badRequest("messages required") }
 
@@ -1185,6 +1240,30 @@ func extractContent(_ value: Any?) -> String {
         }.joined()
     }
     return ""
+}
+
+private func parseChatToolCalls(_ value: Any?) -> [ChatToolCall]? {
+    guard let rawCalls = value as? [Any] else { return nil }
+    let calls = rawCalls.compactMap { raw -> ChatToolCall? in
+        guard let call = raw as? [String: Any] else { return nil }
+        let function = (call["function"] as? [String: Any]) ?? call
+        guard let name = function["name"] as? String, !name.isEmpty else { return nil }
+        let arguments: String
+        if let string = function["arguments"] as? String {
+            arguments = string
+        } else if let object = function["arguments"],
+            JSONSerialization.isValidJSONObject(object),
+            let data = try? JSONSerialization.data(withJSONObject: object),
+            let string = String(data: data, encoding: .utf8)
+        {
+            arguments = string
+        } else {
+            arguments = "{}"
+        }
+        return ChatToolCall(
+            id: call["id"] as? String, name: name, arguments: arguments)
+    }
+    return calls.isEmpty ? nil : calls
 }
 
 func encodeChatCompletion(

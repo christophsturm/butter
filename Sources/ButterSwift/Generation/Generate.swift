@@ -35,7 +35,7 @@
 import Foundation
 import Tokenizers
 #if canImport(Darwin)
-import Darwin
+    import Darwin
 #endif
 
 // MARK: - Public types
@@ -264,7 +264,8 @@ extension Model {
         profile: Profile,
         continuation: AsyncThrowingStream<GenerationChunk, Error>.Continuation,
         sessionCaches: [any LayerCacheProtocol]?,
-        prefillStart: Int
+        prefillStart: Int,
+        onPrefillComplete: (@Sendable () -> Void)? = nil
     ) async throws -> [Int] {
         // T38: pin the executing thread's OS-visible QoS class to
         // user-interactive for the duration of this generate call (covers
@@ -284,9 +285,9 @@ extension Model {
         // has no such restriction and applies to whichever OS thread is
         // actually running this code at the time of the call.
         #if canImport(Darwin)
-        if ButterEnv["BUTTER_DECODE_QOS"] != "0" {
-            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
-        }
+            if ButterEnv["BUTTER_DECODE_QOS"] != "0" {
+                pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
+            }
         #endif
         // T21 hygiene: re-pin the weight residency set at the top of
         // every generate call, not just at load: cheap
@@ -546,7 +547,8 @@ extension Model {
             var pos = nPast
             var lastLogits: Tensor?
             while pos < n {
-                PrefillAbortProbe.markBegun()
+                PrefillAbortProbe.markBegun(
+                    promptCount: n, firstToken: promptTokens.first, chunkSize: chunkSize)
                 try Task.checkCancellation()
                 let end = min(pos + chunkSize, n)
                 let chunk = Array(promptTokens[pos ..< end])
@@ -568,7 +570,8 @@ extension Model {
                 }
                 cmd.commit()
                 cmd.waitUntilCompleted()
-                PrefillAbortProbe.markCommitted()
+                PrefillAbortProbe.markCommitted(
+                    promptCount: n, firstToken: promptTokens.first, chunkSize: chunkSize)
                 if let head = qwenMTPPrefillHead,
                     let hiddenRows = qwenPromptHidden,
                     let qwen = qwenMTPPrefillModel
@@ -639,6 +642,7 @@ extension Model {
             }
         }
         memTracker.endPrefill()
+        onPrefillComplete?()
         let prefillTime = Date().timeIntervalSince(prefillStart)
         profile.recordPhase("prefill", durationS: prefillTime)
         profile.event("ttft")

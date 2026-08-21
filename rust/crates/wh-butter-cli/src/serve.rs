@@ -276,7 +276,7 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
         .and_then(|k| k.get("enable_thinking"))
         .and_then(|b| b.as_bool());
     let thinking = kwargs_thinking.unwrap_or(state.enable_thinking);
-    let prompt = render_messages(messages, thinking);
+    let prompt = render_messages(messages, thinking, v.get("tools"));
     let stream_flag = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let include_usage = v
         .get("stream_options")
@@ -353,7 +353,7 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
         let tools = recover_tools(&report.text);
         let finish_reason = if tools.is_some() { "tool_calls" } else { "stop" };
         if let Some((name, args, _)) = &tools {
-            let tc = json!({
+            let first = json!({
                 "id": id,
                 "object": "chat.completion.chunk",
                 "created": created,
@@ -364,12 +364,27 @@ fn chat_completions(state: &ServerState, stream: &mut TcpStream, body: &[u8]) ->
                         "index": 0,
                         "id": "chatcmpl-tool-recovered-000000000000",
                         "type": "function",
-                        "function": {"name": name, "arguments": args}
+                        "function": {"name": name, "arguments": ""}
                     }]},
                     "finish_reason": Value::Null
                 }]
             });
-            write_sse(stream, &tc.to_string())?;
+            write_sse(stream, &first.to_string())?;
+            let args_delta = json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_id,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": args}
+                    }]},
+                    "finish_reason": Value::Null
+                }]
+            });
+            write_sse(stream, &args_delta.to_string())?;
         }
         let finish = json!({
             "id": id,
@@ -491,7 +506,7 @@ fn parse_messages_body(body: &[u8]) -> Result<ParsedMessages, String> {
         model: v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()),
         seed: v.get("seed").and_then(|s| s.as_u64()).unwrap_or(0),
         thinking,
-        prompt: render_messages(&flat, thinking.unwrap_or(false)),
+        prompt: render_messages(&flat, thinking.unwrap_or(false), None),
         flat,
     })
 }
@@ -584,7 +599,7 @@ fn messages(state: &ServerState, stream: &mut TcpStream, body: &[u8]) -> std::io
     let max_new = parsed.max_new;
     let stream_flag = parsed.stream;
     let thinking = parsed.thinking.unwrap_or(state.enable_thinking);
-    let rendered = render_messages(&parsed.flat, thinking);
+    let rendered = render_messages(&parsed.flat, thinking, None);
     let model_id = parsed
         .model
         .clone()
@@ -881,12 +896,21 @@ fn write_event(stream: &mut TcpStream, event: &str, json: &str) -> std::io::Resu
     stream.flush()
 }
 
-fn render_messages(messages: &[Value], enable_thinking: bool) -> String {
+fn render_messages(messages: &[Value], enable_thinking: bool, tools: Option<&Value>) -> String {
     let mut s = String::new();
+    if let Some(t) = tools {
+        s.push_str(&format!("<|im_start|>system\ntools\n{t}<|im_end|>\n"));
+    }
     for m in messages {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
         let role = if role == "developer" { "system" } else { role };
-        let content = extract_content(m.get("content"));
+        let mut content = extract_content(m.get("content"));
+        if let Some(tcs) = m.get("tool_calls") {
+            content.push_str(&format!("\ntool_calls:{tcs}"));
+        }
+        if let Some(id) = m.get("tool_call_id") {
+            content.push_str(&format!("\ntool_call_id:{id}"));
+        }
         s.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
     }
     // Qwen 3.x chat template: thinking off closes the think block up
@@ -1099,10 +1123,32 @@ mod tests {
     fn render_no_think_closes_block() {
         // Mutation: ignore enable_thinking and always open-think.
         let msgs = [json!({"role":"user","content":"hi"})];
-        let off = render_messages(&msgs, false);
+        let off = render_messages(&msgs, false, None);
         assert!(off.contains("</think>"));
-        let on = render_messages(&msgs, true);
+        let on = render_messages(&msgs, true, None);
         assert!(!on.contains("</think>"));
+    }
+
+    #[test]
+    fn tool_round_render_shares_stem() {
+        let tools = json!([{"type":"function","function":{"name":"read"}}]);
+        let first = [
+            json!({"role":"system","content":"You are a helper."}),
+            json!({"role":"user","content":"read /tmp/x"}),
+        ];
+        let second = [
+            json!({"role":"system","content":"You are a helper."}),
+            json!({"role":"user","content":"read /tmp/x"}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"call_1","function":{"name":"read","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"call_1","content":"ok"}),
+        ];
+        let a = render_messages(&first, false, Some(&tools));
+        let b = render_messages(&second, false, Some(&tools));
+        let a_ids: Vec<u32> = a.bytes().map(|x| x as u32).collect();
+        let b_ids: Vec<u32> = b.bytes().map(|x| x as u32).collect();
+        let n = n_past(&a_ids, &b_ids);
+        assert!(n > 0, "tool-round stem must overlap, n_past={n}");
+        assert!(n < b_ids.len(), "second prompt must be longer than the stem");
     }
 
     #[test]

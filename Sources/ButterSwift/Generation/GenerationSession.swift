@@ -30,6 +30,8 @@ public final class GenerationSession: @unchecked Sendable {
     private var cachedTokens: [Int]
     private var lastNPast: Int = 0
     private var producerTask: Task<Void, Never>?
+    private var promptBoundaryTokens: [Int] = []
+    private var promptBoundarySnapshot: [LayerCacheSnapshot]?
 
     public init(model: Model) {
         self.model = model
@@ -100,7 +102,11 @@ public final class GenerationSession: @unchecked Sendable {
                         profile: profile,
                         continuation: continuation,
                         sessionCaches: caches,
-                        prefillStart: nPast
+                        prefillStart: nPast,
+                        onPrefillComplete: {
+                            self.capturePromptBoundary(
+                                tokens: promptTokens, caches: caches)
+                        }
                     )
                     self.commit(promptTokens: promptTokens, generated: generated)
                     continuation.finish()
@@ -158,6 +164,21 @@ public final class GenerationSession: @unchecked Sendable {
 
     private func prepareLocked(for newIds: [Int]) -> Int {
         var nPast = Self.nPast(cached: cachedTokens, new: newIds)
+        if let snapshot = promptBoundarySnapshot,
+            !promptBoundaryTokens.isEmpty,
+            newIds.count > promptBoundaryTokens.count,
+            Self.commonPrefix(promptBoundaryTokens, newIds) == promptBoundaryTokens.count
+        {
+            caches.restoreAll(from: snapshot, device: .shared)
+            nPast = promptBoundaryTokens.count
+            cachedTokens = promptBoundaryTokens
+            promptBoundarySnapshot = nil
+            promptBoundaryTokens = []
+            lastNPast = nPast
+            return nPast
+        }
+        promptBoundarySnapshot = nil
+        promptBoundaryTokens = []
         if !tryTruncateCachesLocked(to: nPast) {
             Device.shared.releaseGenerationCaches()
             caches = makeCaches()
@@ -199,12 +220,25 @@ public final class GenerationSession: @unchecked Sendable {
         }
     }
 
+    private func capturePromptBoundary(
+        tokens: [Int], caches: [any LayerCacheProtocol]
+    ) {
+        guard !tokens.isEmpty, caches.supportsSnapshotAll else { return }
+        let snapshot = caches.snapshotAll(device: .shared)
+        lock.withLock {
+            promptBoundaryTokens = tokens
+            promptBoundarySnapshot = snapshot
+        }
+    }
+
     private func invalidate() {
         lock.withLock {
             Device.shared.releaseGenerationCaches()
             caches = makeCaches()
             cachedTokens = []
             lastNPast = 0
+            promptBoundaryTokens = []
+            promptBoundarySnapshot = nil
         }
     }
 }

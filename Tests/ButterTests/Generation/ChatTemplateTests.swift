@@ -45,6 +45,21 @@ struct ChatTemplateTests {
             thinking: "<reasoning here>")
         let dict2 = m2.asTemplateMessage
         #expect(dict2["thinking"] as? String == "<reasoning here>")
+        #expect(dict2["reasoning_content"] as? String == "<reasoning here>")
+
+        let call = ChatToolCall(
+            id: "call_1", name: "read",
+            arguments: #"{"path":"/tmp/x","lines":2}"#)
+        let m3 = ChatMessage(
+            role: .assistant, content: "", toolCalls: [call])
+        let dict3 = m3.asTemplateMessage
+        let calls = dict3["tool_calls"] as? [[String: any Sendable]]
+        let function = calls?.first?["function"] as? [String: any Sendable]
+        let arguments = function?["arguments"] as? [String: any Sendable]
+        #expect(calls?.first?["id"] as? String == "call_1")
+        #expect(function?["name"] as? String == "read")
+        #expect(arguments?["path"] as? String == "/tmp/x")
+        #expect(arguments?["lines"] as? Int == 2)
     }
 
     @Test("ChatMessage Equatable")

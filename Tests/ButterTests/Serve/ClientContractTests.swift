@@ -87,6 +87,16 @@ struct ClientContractTests {
     @Test("xml leak becomes tool_calls")
     func xmlLeakBecomesToolCalls() async throws {
         let xml = """
+            <think>
+            private plan
+            <tool_call>
+            <function=delete_note>
+            <parameter=path>private.md</parameter>
+            </function>
+            </tool_call>
+            </think>
+            <tool_call>
+            !function
             <tool_call>
             <function=read>
             <parameter=path>
@@ -97,11 +107,15 @@ struct ClientContractTests {
             </parameter>
             </function>
             </tool_call>
+            <parameter
             """
+        let marker = try #require(xml.range(of: "<tool_call>"))
+        let split = xml.distance(from: xml.startIndex, to: marker.lowerBound) + 6
         let backend = StubServeBackend(
             modelId: "stub-model",
             chunks: [
-                GenerationChunk(text: xml, tokens: [1, 2, 3], position: 3),
+                GenerationChunk(text: String(xml.prefix(split)), tokens: [1], position: 1),
+                GenerationChunk(text: String(xml.dropFirst(split)), tokens: [2, 3], position: 3),
                 GenerationChunk(text: "", tokens: [], position: 3, stats: contractStats(prompt: 2, generated: 3)),
             ])
         let server = ServeServer(host: "127.0.0.1", port: 0, backend: backend)
@@ -119,12 +133,20 @@ struct ClientContractTests {
         #expect(resp.status == 200)
         let text = String(data: resp.body, encoding: .utf8) ?? ""
         #expect(text.contains("tool_calls"), "body: \(text)")
+        #expect(!text.contains("private plan"), "thinking leaked: \(text)")
+        #expect(!text.contains("delete_note"), "nested thinking call leaked: \(text)")
+        #expect(!text.contains("private.md"), "nested thinking arguments leaked: \(text)")
+        #expect(!text.contains("<tool"), "raw tool markup leaked: \(text)")
         #expect(
             text.contains("\"finish_reason\":\"tool_calls\"")
                 || text.contains("\"finish_reason\": \"tool_calls\""),
             "body: \(text)")
         // Client must not be forced to parse XML from content alone.
-        var sawStructuredName = false
+        var firstName: String?
+        var firstId: String?
+        var laterHadIdOrName = false
+        var sawArgs = false
+        var toolDeltas = 0
         for line in text.split(whereSeparator: \.isNewline) {
             let line = line.trimmingCharacters(in: .whitespacesAndNewlines)
             guard line.hasPrefix("data: ") else { continue }
@@ -134,14 +156,24 @@ struct ClientContractTests {
                 let choices = obj["choices"] as? [[String: Any]],
                 let delta = choices.first?["delta"] as? [String: Any],
                 let tcs = delta["tool_calls"] as? [[String: Any]],
-                let fn = tcs.first?["function"] as? [String: Any],
-                let name = fn["name"] as? String, name == "read",
-                let args = fn["arguments"] as? String
+                let tc = tcs.first
             else { continue }
-            #expect(args.contains("path") || args.contains("/tmp"))
-            sawStructuredName = true
+            toolDeltas += 1
+            let fn = tc["function"] as? [String: Any]
+            if toolDeltas == 1 {
+                firstId = tc["id"] as? String
+                firstName = fn?["name"] as? String
+            } else if tc["id"] != nil || fn?["name"] != nil {
+                laterHadIdOrName = true
+            }
+            if let args = fn?["arguments"] as? String, args.contains("path") || args.contains("/tmp") {
+                sawArgs = true
+            }
         }
-        #expect(sawStructuredName, "structured delta.tool_calls missing; body: \(text)")
+        #expect(toolDeltas >= 1, "loop on tool_calls presence; body: \(text)")
+        #expect(firstId != nil && firstName == "read", "id/name on first tool delta")
+        #expect(!laterHadIdOrName, "id/name only on first tool delta")
+        #expect(sawArgs, "arguments on a tool delta; body: \(text)")
     }
 
     // MARK: - Completions with Authorization
@@ -178,7 +210,7 @@ struct ClientContractTests {
     @Test("json leak becomes tool_calls")
     func jsonLeakBecomesToolCalls() async throws {
         let leak =
-            #"<tool_call>{"name":"bash","arguments":{"command":"ls"}}</tool_call>"#
+            #"<think>do not return this</think><tool_call>{"name":"bash","arguments":{"command":"ls"}}</tool_call>"#
         let backend = StubServeBackend(
             modelId: "stub-model",
             chunks: [
@@ -203,9 +235,39 @@ struct ClientContractTests {
         #expect(fn?["name"] as? String == "bash")
         #expect(fn?["arguments"] is String)
         #expect((fn?["arguments"] as? String)?.contains("ls") == true)
+        #expect(message?["content"] is NSNull)
         #expect(
             (obj?["choices"] as? [[String: Any]])?.first?["finish_reason"] as? String
                 == "tool_calls")
+    }
+
+    @Test("truncated tool markup is not returned as content")
+    func truncatedToolMarkupIsNotContent() async throws {
+        let backend = StubServeBackend(
+            modelId: "stub-model",
+            chunks: [
+                GenerationChunk(
+                    text: "visible answer<tool_call><function=read><parameter=path>",
+                    tokens: [1], position: 1),
+                GenerationChunk(
+                    text: "", tokens: [], position: 1,
+                    stats: contractStats(prompt: 1, generated: 1)),
+            ])
+        let server = ServeServer(host: "127.0.0.1", port: 0, backend: backend)
+        try await server.start()
+        defer { server.stop() }
+
+        for stream in [false, true] {
+            let body =
+                #"{"stream":\#(stream),"messages":[{"role":"user","content":"run"}]}"#
+            let resp = try await contractPost(
+                "http://127.0.0.1:\(server.boundPort)/v1/chat/completions", json: body)
+            let text = String(data: resp.body, encoding: .utf8) ?? ""
+            #expect(resp.status == 200)
+            #expect(text.contains("visible answer"))
+            #expect(!text.contains("<tool"), "raw tool markup leaked: \(text)")
+            #expect(!text.contains("<function"), "raw function markup leaked: \(text)")
+        }
     }
 
     // MARK: - Messages

@@ -61,6 +61,17 @@ public enum LayerCacheSnapshot {
 }
 
 extension Array where Element == any LayerCacheProtocol {
+    var supportsSnapshotAll: Bool {
+        allSatisfy { cache in
+            if let kv = cache as? any KVCacheProtocol {
+                if case .unbounded = kv.eviction { return true }
+                return false
+            }
+            return cache is Qwen35GDNLayerCache || cache is GDNStateCache
+                || cache is Mamba2LayerCache || cache is StatelessLayerCache
+        }
+    }
+
     /// Snapshot every layer cache. The blits themselves are ~150 µs
     /// aggregate; the cost that matters is SYNCHRONISATION, so every
     /// layer's blit is encoded onto ONE command buffer and committed
@@ -85,7 +96,7 @@ extension Array where Element == any LayerCacheProtocol {
                     currentState: gdn.snapshotEncode(on: cmd, device: device),
                     length: gdn.length)
             }
-            if let kv = cache as? KVCache {
+            if let kv = cache as? any KVCacheProtocol {
                 return .kv(
                     length: kv.length,
                     absolutePosition: kv.absolutePosition)
@@ -137,7 +148,7 @@ extension Array where Element == any LayerCacheProtocol {
             case let (gdn as GDNStateCache, .gdn(currentT, length)):
                 gdn.restoreEncode(from: currentT, on: cmd)
                 gdn.setLength(length)
-            case let (kv as KVCache, .kv(length, _)):
+            case let (kv as any KVCacheProtocol, .kv(length, _)):
                 if !recurrentOnly { kv.truncate(toLength: length) }
             case let (mamba as Mamba2LayerCache, .mamba2(ssmT, convT, length)):
                 mamba.restoreEncode(ssm: ssmT, conv: convT, on: cmd)

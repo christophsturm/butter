@@ -40,11 +40,22 @@ public struct ChatMessage: Sendable, Equatable {
     /// multi-turn conversations where the prior assistant turn included
     /// a thinking segment that the template wants to re-emit.
     public var thinking: String?
+    /// Structured calls from an assistant turn. Keeping these on the
+    /// message lets a client send the full conversation back for the
+    /// next tool-result round without flattening the call into content.
+    public var toolCalls: [ChatToolCall]?
+    /// Identifier associated with a tool result when the template uses it.
+    public var toolCallId: String?
 
-    public init(role: Role, content: String, thinking: String? = nil) {
+    public init(
+        role: Role, content: String, thinking: String? = nil,
+        toolCalls: [ChatToolCall]? = nil, toolCallId: String? = nil
+    ) {
         self.role = role
         self.content = content
         self.thinking = thinking
+        self.toolCalls = toolCalls
+        self.toolCallId = toolCallId
     }
 
     /// Convert to the `[String: any Sendable]` shape swift-transformers
@@ -54,8 +65,62 @@ public struct ChatMessage: Sendable, Equatable {
             "role": role.rawValue,
             "content": content,
         ]
-        if let t = thinking { dict["thinking"] = t }
+        if let t = thinking {
+            dict["thinking"] = t
+            dict["reasoning_content"] = t
+        }
+        if let toolCalls {
+            dict["tool_calls"] = toolCalls.map(\.asTemplateToolCall)
+        }
+        if let toolCallId { dict["tool_call_id"] = toolCallId }
         return dict
+    }
+}
+
+public struct ChatToolCall: Sendable, Equatable {
+    public var id: String?
+    public var name: String
+    /// Function arguments in the wire-format JSON object string.
+    public var arguments: String
+
+    public init(id: String? = nil, name: String, arguments: String) {
+        self.id = id
+        self.name = name
+        self.arguments = arguments
+    }
+
+    public var asTemplateToolCall: [String: any Sendable] {
+        var function: [String: any Sendable] = ["name": name]
+        if let data = arguments.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data),
+            let dict = object as? [String: Any]
+        {
+            function["arguments"] = dict.mapValues(templateSendable)
+        } else {
+            function["arguments"] = [:] as [String: any Sendable]
+        }
+        var call: [String: any Sendable] = [
+            "type": "function",
+            "function": function,
+        ]
+        if let id { call["id"] = id }
+        return call
+    }
+}
+
+public typealias ChatMessageToolCall = ChatToolCall
+
+private func templateSendable(_ value: Any) -> any Sendable {
+    switch value {
+    case let value as String: return value
+    case let value as Bool: return value
+    case let value as Int: return value
+    case let value as Double: return value
+    case let value as NSNumber: return value
+    case let value as [Any]: return value.map(templateSendable)
+    case let value as [String: Any]: return value.mapValues(templateSendable)
+    case is NSNull: return Optional<String>.none as String?
+    default: return String(describing: value)
     }
 }
 

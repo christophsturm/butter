@@ -47,10 +47,10 @@ public enum ToolCallParser {
     public static func stripThinkBlocks(_ content: String) -> String {
         var s = content
         while let start = s.range(of: "<think>") {
-            if let end = s.range(of: "</think>", range: start.lowerBound..<s.endIndex) {
-                s.removeSubrange(start.lowerBound..<end.upperBound)
+            if let end = s.range(of: "</think>", range: start.lowerBound ..< s.endIndex) {
+                s.removeSubrange(start.lowerBound ..< end.upperBound)
             } else {
-                s.removeSubrange(start.lowerBound..<s.endIndex)
+                s.removeSubrange(start.lowerBound ..< s.endIndex)
                 break
             }
         }
@@ -58,8 +58,9 @@ public enum ToolCallParser {
     }
 
     public static func looksLikeToolMarkup(_ text: String) -> Bool {
-        text.contains("<tool_call") || text.contains("<|tool_call")
-            || text.contains("[TOOL_CALLS]")
+        text.contains("<tool") || text.contains("<function=")
+            || text.contains("<parameter") || text.contains("<|tool")
+            || text.contains("[TOOL_CALLS")
     }
 
     public static func makeId(_ seed: Int) -> String {
@@ -99,8 +100,7 @@ public enum ToolCallParser {
             let body = m.groups[1]
             var params: [String: String] = [:]
             let ns = body as NSString
-            for pm in paramRe.matches(in: body, range: NSRange(location: 0, length: ns.length))
-            {
+            for pm in paramRe.matches(in: body, range: NSRange(location: 0, length: ns.length)) {
                 guard pm.numberOfRanges >= 3,
                     let kr = Range(pm.range(at: 1), in: body),
                     let vr = Range(pm.range(at: 2), in: body)
@@ -172,8 +172,9 @@ public enum ToolCallParser {
     }
 
     private static func matchAll(_ content: String, pattern: String) -> [RegexMatch] {
-        guard let re = try? NSRegularExpression(
-            pattern: pattern, options: [.dotMatchesLineSeparators])
+        guard
+            let re = try? NSRegularExpression(
+                pattern: pattern, options: [.dotMatchesLineSeparators])
         else { return [] }
         let ns = content as NSString
         let full = NSRange(location: 0, length: ns.length)
@@ -204,7 +205,10 @@ public enum ToolCallParser {
             cursor = m.range.upperBound
         }
         residual += content[cursor...]
-        return (calls, residual.trimmingCharacters(in: .whitespacesAndNewlines))
+        let trimmed = residual.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Once a structured call was recovered, never put malformed or
+        // truncated protocol leftovers back into user-visible content.
+        return (calls, looksLikeToolMarkup(trimmed) ? "" : trimmed)
     }
 
     private static func validateFunction(name: Any?, arguments: Any?) -> (
