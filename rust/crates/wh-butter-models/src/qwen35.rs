@@ -1645,6 +1645,15 @@ enum LayerSlot {
     Gdn(GdnSlot),
 }
 
+fn fp8_decode_blocks(n_kv: u32) -> u32 {
+    match n_kv {
+        ..=1_024 => 64,
+        1_025..=8_192 => 128,
+        8_193..=32_768 => 256,
+        _ => 1_024,
+    }
+}
+
 pub struct Qwen35Cache {
     slots: Vec<LayerSlot>,
 }
@@ -1665,14 +1674,15 @@ impl Qwen35Cache {
                 let n = cfg.n_kv_heads * max_seq * cfg.head_dim;
                 let kv = if cfg.fp8_kv {
                     let groups = n / 16;
+                    let blocks = fp8_decode_blocks(max_seq as u32) as usize;
                     FullKvCache::Fp8 {
                         k_codes: Tensor::new(dev.alloc_zeroed(n)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim], DType::U8),
                         k_scales: Tensor::new(dev.alloc_zeroed(groups * 4)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim / 16], DType::F32),
                         v_codes: Tensor::new(dev.alloc_zeroed(n)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim], DType::U8),
                         v_scales: Tensor::new(dev.alloc_zeroed(groups * 4)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim / 16], DType::F32),
-                        partial_o: Tensor::new(dev.alloc_zeroed(cfg.n_head * 256 * cfg.head_dim * 4)?, vec![cfg.n_head, 256, cfg.head_dim], DType::F32),
-                        partial_m: Tensor::new(dev.alloc_zeroed(cfg.n_head * 256 * 4)?, vec![cfg.n_head, 256], DType::F32),
-                        partial_l: Tensor::new(dev.alloc_zeroed(cfg.n_head * 256 * 4)?, vec![cfg.n_head, 256], DType::F32),
+                        partial_o: Tensor::new(dev.alloc_zeroed(cfg.n_head * blocks * cfg.head_dim * 4)?, vec![cfg.n_head, blocks, cfg.head_dim], DType::F32),
+                        partial_m: Tensor::new(dev.alloc_zeroed(cfg.n_head * blocks * 4)?, vec![cfg.n_head, blocks], DType::F32),
+                        partial_l: Tensor::new(dev.alloc_zeroed(cfg.n_head * blocks * 4)?, vec![cfg.n_head, blocks], DType::F32),
                         prefill: None,
                     }
                 } else {
@@ -1829,7 +1839,7 @@ fn append_decode_full_kv(
         FullKvCache::Fp8 { k_codes, k_scales, v_codes, v_scales, partial_o, partial_m, partial_l, .. } => {
             ops::kv_append_fp8_e4m3_many(dev, k, posbuf, k_codes, k_scales, cfg.n_kv_heads, cfg.head_dim, slot.cap, 16)?;
             ops::kv_append_fp8_e4m3_many(dev, v, posbuf, v_codes, v_scales, cfg.n_kv_heads, cfg.head_dim, slot.cap, 16)?;
-            let blocks = if n_kv <= 1024 { 64 } else if n_kv <= 8192 { 128 } else { 256 };
+            let blocks = fp8_decode_blocks(n_kv);
             ops::sdpa_decode_fp8_e4m3_2pass(
                 dev, q, k_codes, k_scales, v_codes, v_scales, partial_o, partial_m, partial_l,
                 cfg.head_dim, n_kv, slot.cap as u32, heads_per_group, 16, blocks, cfg.attn_scale(),
@@ -2908,6 +2918,17 @@ pub fn speculative_round(
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    #[test]
+    fn fp8_decode_blocks_tracks_long_context_parallelism() {
+        assert_eq!(fp8_decode_blocks(1_024), 64);
+        assert_eq!(fp8_decode_blocks(1_025), 128);
+        assert_eq!(fp8_decode_blocks(8_192), 128);
+        assert_eq!(fp8_decode_blocks(8_193), 256);
+        assert_eq!(fp8_decode_blocks(32_768), 256);
+        assert_eq!(fp8_decode_blocks(32_769), 1_024);
+        assert_eq!(fp8_decode_blocks(262_144), 1_024);
+    }
 
     #[test]
     fn hf_multimodal_wrapper_reads_text_geometry() {
