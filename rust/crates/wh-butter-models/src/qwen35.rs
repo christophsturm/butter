@@ -1545,6 +1545,9 @@ pub fn load_nvfp4_dir(dev: &dyn Device, dir: &str) -> Result<Qwen35Model> {
     let use_bf16_gdn = std::env::var("BUTTER_QWEN35_BF16_GDN")
         .map(|value| value == "1")
         .unwrap_or(false);
+    let use_bf16_attn = std::env::var("BUTTER_QWEN35_BF16_ATTN")
+        .map(|value| value == "1")
+        .unwrap_or(false);
 
     let (embed_bytes, embed_dtype, embed_shape) =
         st.tensor("model.language_model.embed_tokens.weight")?;
@@ -1615,9 +1618,21 @@ pub fn load_nvfp4_dir(dev: &dyn Device, dir: &str) -> Result<Qwen35Model> {
             let a = format!("{p}.self_attn");
             Mixer::Full(FullAttnWeights {
                 attn_norm: load_hf_gemma_norm(dev, &st, &format!("{p}.input_layernorm.weight"))?,
-                wq: load_hf_unquantized_weight(dev, &st, &format!("{a}.q_proj"))?,
-                wk: load_hf_unquantized_weight(dev, &st, &format!("{a}.k_proj"))?,
-                wv: load_hf_unquantized_weight(dev, &st, &format!("{a}.v_proj"))?,
+                wq: if use_bf16_attn {
+                    load_hf_unquantized_weight(dev, &st, &format!("{a}.q_proj"))?
+                } else {
+                    load_hf_fp8_weight(dev, &st, &format!("{a}.q_proj.weight"))?
+                },
+                wk: if use_bf16_attn {
+                    load_hf_unquantized_weight(dev, &st, &format!("{a}.k_proj"))?
+                } else {
+                    load_hf_fp8_weight(dev, &st, &format!("{a}.k_proj.weight"))?
+                },
+                wv: if use_bf16_attn {
+                    load_hf_unquantized_weight(dev, &st, &format!("{a}.v_proj"))?
+                } else {
+                    load_hf_fp8_weight(dev, &st, &format!("{a}.v_proj.weight"))?
+                },
                 wo: load_hf_required_nvfp4(dev, &st, &format!("{a}.o_proj"))?,
                 q_norm: load_hf_gemma_norm(dev, &st, &format!("{a}.q_norm.weight"))?,
                 k_norm: load_hf_gemma_norm(dev, &st, &format!("{a}.k_norm.weight"))?,

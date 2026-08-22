@@ -432,8 +432,7 @@ fn real_checkpoint_bf16_lm_head_rows_match_host_reference() {
     );
 }
 
-#[test]
-fn real_checkpoint_fp8_gdn_projection_matches_host_reference() {
+fn check_real_checkpoint_fp8_projection(name: &str, label: &str) {
     let Ok(dir) = std::env::var("BUTTER_QWEN35_NVFP4") else {
         eprintln!("BUTTER_QWEN35_NVFP4 is unset, skipping checkpoint test");
         return;
@@ -444,8 +443,7 @@ fn real_checkpoint_fp8_gdn_projection_matches_host_reference() {
     };
     let device = device.as_ref();
     let st = SafeTensors::open_dir(&dir).expect("open checkpoint");
-    let name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
-    let (all_weights, dtype, shape) = st.tensor(name).expect("load GDN projection");
+    let (all_weights, dtype, shape) = st.tensor(name).expect("load FP8 projection source");
     assert_eq!(dtype, DType::BF16);
     assert_eq!(shape.len(), 2);
 
@@ -507,9 +505,9 @@ fn real_checkpoint_fp8_gdn_projection_matches_host_reference() {
     let actual_norm: f64 = actual.iter().map(|value| (*value as f64).powi(2)).sum();
     let expected_norm: f64 = expected.iter().map(|value| (*value as f64).powi(2)).sum();
     let cosine = dot / (actual_norm * expected_norm).sqrt();
-    eprintln!("checkpoint FP8 GDN projection max_abs={max_abs}, cosine={cosine:.8}");
-    assert!(max_abs < 0.02, "checkpoint FP8 GDN max_abs={max_abs}");
-    assert!(cosine > 0.999, "checkpoint FP8 GDN cosine={cosine}");
+    eprintln!("checkpoint FP8 {label} projection max_abs={max_abs}, cosine={cosine:.8}");
+    assert!(max_abs < 0.02, "checkpoint FP8 {label} max_abs={max_abs}");
+    assert!(cosine > 0.999, "checkpoint FP8 {label} cosine={cosine}");
 
     let mut scale_bytes = vec![0u8; rows * 4];
     device
@@ -550,6 +548,22 @@ fn real_checkpoint_fp8_gdn_projection_matches_host_reference() {
     assert!(
         wrong_max_abs > 0.01,
         "rotated per-channel scales should diverge, max_abs={wrong_max_abs}"
+    );
+}
+
+#[test]
+fn real_checkpoint_fp8_gdn_projection_matches_host_reference() {
+    check_real_checkpoint_fp8_projection(
+        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+        "GDN",
+    );
+}
+
+#[test]
+fn real_checkpoint_fp8_attention_projection_matches_host_reference() {
+    check_real_checkpoint_fp8_projection(
+        "model.language_model.layers.3.self_attn.q_proj.weight",
+        "attention",
     );
 }
 
