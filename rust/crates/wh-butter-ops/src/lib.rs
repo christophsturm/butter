@@ -7117,6 +7117,143 @@ pub fn kv_append_many(
     Ok(())
 }
 
+/// Quantize token-major K or V rows directly into a resident E4M3 cache.
+/// `src` is `[n_positions, n_kv_heads, head_dim]`; codes are
+/// `[n_kv_heads, max_seq, head_dim]` u8 and scales use groups of 16 f32.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_append_fp8_e4m3_many(
+    dev: &dyn Device, src: &Tensor, positions: &Tensor, codes: &Tensor,
+    scales: &Tensor, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    group_size: usize,
+) -> Result<()> {
+    use wh_iron_core::ir::KernelMode;
+    if src.dtype != DType::F32 || scales.dtype != DType::F32 || codes.dtype != DType::U8 {
+        return Err(Error::Msg("kv_append_fp8_e4m3_many: f32 source/scales and u8 codes required".into()));
+    }
+    let row = n_kv_heads * head_dim;
+    if row == 0 || src.elem_count() % row != 0 || group_size == 0 || head_dim % group_size != 0 {
+        return Err(Error::Msg("kv_append_fp8_e4m3_many: invalid cache geometry".into()));
+    }
+    let n_positions = src.elem_count() / row;
+    let kernel = cached_ir("iron_quantize_kv_fp8_e4m3_many", src.dtype, || {
+        let mut kernel = wh_iron_std::kernels::kv_cache::cache::iron_quantize_kv_fp8_e4m3_many::kernel_ir_for(src.dtype);
+        kernel.mode = KernelMode::Grid3D;
+        kernel
+    });
+    let u = |value: u32| Binding::Scalar(value.to_le_bytes().to_vec());
+    let groups = n_positions * n_kv_heads * (head_dim / group_size);
+    let block = 256u32;
+    dev.dispatch(&kernel, &[
+        Binding::Buffer(src.buffer.clone()), Binding::Buffer(positions.buffer.clone()),
+        Binding::Buffer(codes.buffer.clone()), Binding::Buffer(scales.buffer.clone()),
+        u(head_dim as u32), u(max_seq as u32), u(group_size as u32),
+        u(n_kv_heads as u32), u(n_positions as u32),
+    ], Grid { grid: [(groups as u32).div_ceil(block), 1, 1], block: [block, 1, 1] })
+}
+
+/// Reconstruct an active E4M3 prefix into temporary dense prefill storage.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_dequant_fp8_e4m3_prefix(
+    dev: &dyn Device, codes: &Tensor, scales: &Tensor, out: &Tensor,
+    n_kv_heads: usize, head_dim: usize, max_seq: usize, group_size: usize,
+    n_positions: usize,
+) -> Result<()> {
+    use wh_iron_core::ir::KernelMode;
+    let kernel = cached_ir("iron_bulk_dequant_kv_fp8_e4m3", out.dtype, || {
+        let mut kernel = wh_iron_std::kernels::kv_cache::cache::iron_bulk_dequant_kv_fp8_e4m3::kernel_ir_for(out.dtype);
+        kernel.mode = KernelMode::Grid3D;
+        kernel
+    });
+    let u = |value: u32| Binding::Scalar(value.to_le_bytes().to_vec());
+    let total = n_kv_heads * n_positions * head_dim;
+    let block = 256u32;
+    if total == 0 || total % block as usize != 0 {
+        return Err(Error::Msg("kv_dequant_fp8_e4m3_prefix: invalid d256 cache geometry".into()));
+    }
+    dev.dispatch(&kernel, &[
+        Binding::Buffer(codes.buffer.clone()), Binding::Buffer(scales.buffer.clone()),
+        Binding::Buffer(out.buffer.clone()), u(head_dim as u32), u(max_seq as u32),
+        u(group_size as u32), u(n_positions as u32),
+    ], Grid { grid: [total as u32 / block, 1, 1], block: [block, 1, 1] })
+}
+
+/// Decode attention over a resident E4M3 K/V cache with per-group f32 scales.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_fp8_e4m3(
+    dev: &dyn Device, q: &Tensor, k_codes: &Tensor, k_scales: &Tensor,
+    v_codes: &Tensor, v_scales: &Tensor, sinks: &Tensor, head_dim: usize,
+    n_kv: u32, kv_stride: u32, heads_per_group: u32, group_size: u32,
+    scale: f32,
+) -> Result<Tensor> {
+    use wh_iron_core::ir::KernelMode;
+    if head_dim != 256 {
+        return Err(Error::Msg(format!("sdpa_decode_fp8_e4m3: unsupported head_dim {head_dim}")));
+    }
+    let n_q_heads = q.elem_count() / head_dim;
+    let out = Tensor::empty(dev, vec![n_q_heads, head_dim], q.dtype)?;
+    let kernel = cached_ir("iron_nvfp8_flash_sdpa_d256", q.dtype, || {
+        let mut kernel = wh_iron_std::kernels::sdpa::flash_block_scaled_sdpa::iron_nvfp8_flash_sdpa_d256::kernel_ir_for(q.dtype);
+        kernel.mode = KernelMode::Grid3D;
+        kernel
+    });
+    let u = |value: u32| Binding::Scalar(value.to_le_bytes().to_vec());
+    let f = |value: f32| Binding::Scalar(value.to_le_bytes().to_vec());
+    dev.dispatch(&kernel, &[
+        Binding::Buffer(q.buffer.clone()), Binding::Buffer(k_codes.buffer.clone()),
+        Binding::Buffer(k_scales.buffer.clone()), Binding::Buffer(v_codes.buffer.clone()),
+        Binding::Buffer(v_scales.buffer.clone()), Binding::Buffer(sinks.buffer.clone()),
+        Binding::Buffer(out.buffer.clone()), u(head_dim as u32), u(n_kv), u(kv_stride),
+        u(heads_per_group), u(group_size), u(n_q_heads as u32), u(0), u(0), f(scale),
+    ], Grid { grid: [1, n_q_heads as u32, 1], block: [32, 1, 1] })?;
+    Ok(out)
+}
+
+/// Parallel two-pass decode over the resident E4M3 cache. Pass 1 assigns
+/// interleaved token blocks across threadgroups; pass 2 merges their online
+/// softmax partials.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_fp8_e4m3_2pass(
+    dev: &dyn Device, q: &Tensor, k_codes: &Tensor, k_scales: &Tensor,
+    v_codes: &Tensor, v_scales: &Tensor, partial_o: &Tensor,
+    partial_m: &Tensor, partial_l: &Tensor, head_dim: usize, n_kv: u32,
+    kv_stride: u32, heads_per_group: u32, group_size: u32, blocks: u32,
+    scale: f32,
+) -> Result<Tensor> {
+    use wh_iron_core::ir::KernelMode;
+    if head_dim != 256 || blocks == 0 || blocks % 32 != 0 {
+        return Err(Error::Msg("sdpa_decode_fp8_e4m3_2pass: requires d256 and blocks divisible by 32".into()));
+    }
+    let n_q_heads = q.elem_count() / head_dim;
+    let n_kv_heads = n_q_heads / heads_per_group as usize;
+    let pass1 = cached_ir("iron_fp8_e4m3_sdpa_decode_2pass_pass1_d256", q.dtype, || {
+        let mut kernel = wh_iron_std::kernels::sdpa::sdpa_decode_2pass::iron_fp8_e4m3_sdpa_decode_2pass_pass1_d256::kernel_ir_for(q.dtype);
+        kernel.mode = KernelMode::Reduction;
+        kernel
+    });
+    let pass2 = cached_ir("iron_sdpa_decode_2pass_pass2_d256", q.dtype, || {
+        let mut kernel = wh_iron_std::kernels::sdpa::sdpa_decode_2pass::iron_sdpa_decode_2pass_pass2_d256::kernel_ir_for(q.dtype);
+        kernel.mode = KernelMode::Reduction;
+        kernel
+    });
+    let u = |value: u32| Binding::Scalar(value.to_le_bytes().to_vec());
+    let f = |value: f32| Binding::Scalar(value.to_le_bytes().to_vec());
+    dev.dispatch(&pass1, &[
+        Binding::Buffer(q.buffer.clone()), Binding::Buffer(k_codes.buffer.clone()),
+        Binding::Buffer(k_scales.buffer.clone()), Binding::Buffer(v_codes.buffer.clone()),
+        Binding::Buffer(v_scales.buffer.clone()), Binding::Buffer(partial_o.buffer.clone()),
+        Binding::Buffer(partial_m.buffer.clone()), Binding::Buffer(partial_l.buffer.clone()),
+        u(head_dim as u32), u(n_kv), u(kv_stride), u(heads_per_group), u(blocks),
+        u(group_size), f(scale),
+    ], Grid { grid: [n_kv_heads as u32, blocks, 1], block: [32, heads_per_group, 1] })?;
+    let out = Tensor::empty(dev, vec![n_q_heads, head_dim], q.dtype)?;
+    dev.dispatch(&pass2, &[
+        Binding::Buffer(partial_o.buffer.clone()), Binding::Buffer(partial_m.buffer.clone()),
+        Binding::Buffer(partial_l.buffer.clone()), Binding::Buffer(out.buffer.clone()),
+        u(head_dim as u32), u(blocks),
+    ], Grid { grid: [n_q_heads as u32, 1, 1], block: [1024, 1, 1] })?;
+    Ok(out)
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────
 // Qwen3.5 / Qwen3.6 (GGUF arch "qwen35") GDN + hybrid-attention support.

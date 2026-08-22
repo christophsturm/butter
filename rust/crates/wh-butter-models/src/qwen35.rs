@@ -113,6 +113,8 @@ pub struct Qwen35Config {
     pub gdn_key_head_dim: usize,       // 128
     pub gdn_value_head_dim: usize,     // 128
     pub gdn_conv_kernel: usize,        // 4
+    /// Use a resident E4M3 cache for full-attention K/V.
+    pub fp8_kv: bool,
 }
 
 impl Qwen35Config {
@@ -197,6 +199,7 @@ impl Qwen35Config {
             gdn_key_head_dim,
             gdn_value_head_dim,
             gdn_conv_kernel,
+            fp8_kv: false,
         }
     }
 
@@ -262,6 +265,7 @@ impl Qwen35Config {
             gdn_key_head_dim: u("linear_key_head_dim")?,
             gdn_value_head_dim: gdn_value_dim_total / gdn_num_v_heads.max(1),
             gdn_conv_kernel: u("linear_conv_kernel_dim")?,
+            fp8_kv: false,
         })
     }
 }
@@ -1457,7 +1461,8 @@ fn validate_hf_quant_policy(st: &SafeTensors, cfg: &Qwen35Config) -> Result<()> 
 /// `visual*` tensors remain mmap-only and never become device residents.
 pub fn load_nvfp4_dir(dev: &dyn Device, dir: &str) -> Result<Qwen35Model> {
     let load_t0 = std::time::Instant::now();
-    let cfg = Qwen35Config::from_hf_dir(dir)?;
+    let mut cfg = Qwen35Config::from_hf_dir(dir)?;
+    cfg.fp8_kv = true;
     let st = SafeTensors::open_dir(dir)?;
     validate_hf_quant_policy(&st, &cfg)?;
 
@@ -1611,9 +1616,22 @@ fn gather_tokens_f32(dev: &dyn Device, model: &Qwen35Model, ids: &Tensor) -> Res
 // KV / recurrent-state cache
 // ─────────────────────────────────────────────────────────────────────────
 
+enum FullKvCache {
+    Dense { k: Tensor, v: Tensor },
+    Fp8 {
+        k_codes: Tensor,
+        k_scales: Tensor,
+        v_codes: Tensor,
+        v_scales: Tensor,
+        partial_o: Tensor,
+        partial_m: Tensor,
+        partial_l: Tensor,
+        prefill: Option<(Tensor, Tensor, usize)>,
+    },
+}
+
 struct FullAttnSlot {
-    k: Tensor, // f32 [n_kv_heads, cap, head_dim]
-    v: Tensor,
+    kv: FullKvCache,
     cap: usize,
 }
 
@@ -1645,17 +1663,25 @@ impl Qwen35Cache {
         for i in 0..cfg.n_layers {
             if cfg.is_full_layer(i) {
                 let n = cfg.n_kv_heads * max_seq * cfg.head_dim;
-                let k = Tensor::new(
-                    dev.alloc_zeroed(n * 4)?,
-                    vec![cfg.n_kv_heads, max_seq, cfg.head_dim],
-                    DType::F32,
-                );
-                let v = Tensor::new(
-                    dev.alloc_zeroed(n * 4)?,
-                    vec![cfg.n_kv_heads, max_seq, cfg.head_dim],
-                    DType::F32,
-                );
-                slots.push(LayerSlot::Full(FullAttnSlot { k, v, cap: max_seq }));
+                let kv = if cfg.fp8_kv {
+                    let groups = n / 16;
+                    FullKvCache::Fp8 {
+                        k_codes: Tensor::new(dev.alloc_zeroed(n)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim], DType::U8),
+                        k_scales: Tensor::new(dev.alloc_zeroed(groups * 4)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim / 16], DType::F32),
+                        v_codes: Tensor::new(dev.alloc_zeroed(n)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim], DType::U8),
+                        v_scales: Tensor::new(dev.alloc_zeroed(groups * 4)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim / 16], DType::F32),
+                        partial_o: Tensor::new(dev.alloc_zeroed(cfg.n_head * 256 * cfg.head_dim * 4)?, vec![cfg.n_head, 256, cfg.head_dim], DType::F32),
+                        partial_m: Tensor::new(dev.alloc_zeroed(cfg.n_head * 256 * 4)?, vec![cfg.n_head, 256], DType::F32),
+                        partial_l: Tensor::new(dev.alloc_zeroed(cfg.n_head * 256 * 4)?, vec![cfg.n_head, 256], DType::F32),
+                        prefill: None,
+                    }
+                } else {
+                    FullKvCache::Dense {
+                        k: Tensor::new(dev.alloc_zeroed(n * 4)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim], DType::F32),
+                        v: Tensor::new(dev.alloc_zeroed(n * 4)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim], DType::F32),
+                    }
+                };
+                slots.push(LayerSlot::Full(FullAttnSlot { kv, cap: max_seq }));
             } else {
                 let state_n = cfg.gdn_num_v_heads * cfg.gdn_value_head_dim * cfg.gdn_key_head_dim;
                 let state = Tensor::new(
@@ -1681,6 +1707,38 @@ impl Qwen35Cache {
                 LayerSlot::Gdn(_) => None,
             })
             .unwrap_or(0)
+    }
+
+    pub fn uses_fp8_kv(&self) -> bool {
+        self.slots.iter().any(|slot| matches!(slot, LayerSlot::Full(FullAttnSlot { kv: FullKvCache::Fp8 { .. }, .. })))
+    }
+
+    fn begin_prefill(&mut self, dev: &dyn Device, cfg: &Qwen35Config, start_pos: usize, total: usize) -> Result<()> {
+        if !self.uses_fp8_kv() { return Ok(()); }
+        for slot in &mut self.slots {
+            if let LayerSlot::Full(FullAttnSlot {
+                kv: FullKvCache::Fp8 { k_codes, k_scales, v_codes, v_scales, prefill, .. }, cap,
+            }) = slot {
+                let prefill_cap = if start_pos == 0 { total } else { *cap };
+                let n = cfg.n_kv_heads * prefill_cap * cfg.head_dim;
+                let k = Tensor::new(dev.alloc_zeroed(n * 4)?, vec![cfg.n_kv_heads, prefill_cap, cfg.head_dim], DType::F32);
+                let v = Tensor::new(dev.alloc_zeroed(n * 4)?, vec![cfg.n_kv_heads, prefill_cap, cfg.head_dim], DType::F32);
+                if start_pos > 0 {
+                    ops::kv_dequant_fp8_e4m3_prefix(dev, k_codes, k_scales, &k, cfg.n_kv_heads, cfg.head_dim, *cap, 16, start_pos)?;
+                    ops::kv_dequant_fp8_e4m3_prefix(dev, v_codes, v_scales, &v, cfg.n_kv_heads, cfg.head_dim, *cap, 16, start_pos)?;
+                }
+                *prefill = Some((k, v, prefill_cap));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_prefill(&mut self) {
+        for slot in &mut self.slots {
+            if let LayerSlot::Full(FullAttnSlot { kv: FullKvCache::Fp8 { prefill, .. }, .. }) = slot {
+                *prefill = None;
+            }
+        }
     }
 
     pub fn snapshot_prompt(&self, dev: &dyn Device) -> Result<Qwen35PromptSnapshot> {
@@ -1757,6 +1815,29 @@ fn dbg_sum_rows(dev: &dyn Device, tag: &str, positions: &[u32], t: &Tensor, hidd
     }
 }
 
+fn append_decode_full_kv(
+    dev: &dyn Device, cfg: &Qwen35Config, slot: &FullAttnSlot,
+    q: &Tensor, k: &Tensor, v: &Tensor, posbuf: &Tensor, n_kv: u32,
+) -> Result<Tensor> {
+    let heads_per_group = (cfg.n_head / cfg.n_kv_heads) as u32;
+    match &slot.kv {
+        FullKvCache::Dense { k: cache_k, v: cache_v } => {
+            ops::kv_append(dev, k, cache_k, posbuf, cfg.head_dim, slot.cap, cfg.n_kv_heads * cfg.head_dim)?;
+            ops::kv_append(dev, v, cache_v, posbuf, cfg.head_dim, slot.cap, cfg.n_kv_heads * cfg.head_dim)?;
+            ops::sdpa_decode(dev, q, cache_k, cache_v, cfg.head_dim, n_kv, slot.cap as u32, heads_per_group, cfg.attn_scale())
+        }
+        FullKvCache::Fp8 { k_codes, k_scales, v_codes, v_scales, partial_o, partial_m, partial_l, .. } => {
+            ops::kv_append_fp8_e4m3_many(dev, k, posbuf, k_codes, k_scales, cfg.n_kv_heads, cfg.head_dim, slot.cap, 16)?;
+            ops::kv_append_fp8_e4m3_many(dev, v, posbuf, v_codes, v_scales, cfg.n_kv_heads, cfg.head_dim, slot.cap, 16)?;
+            let blocks = if n_kv <= 1024 { 64 } else if n_kv <= 8192 { 128 } else { 256 };
+            ops::sdpa_decode_fp8_e4m3_2pass(
+                dev, q, k_codes, k_scales, v_codes, v_scales, partial_o, partial_m, partial_l,
+                cfg.head_dim, n_kv, slot.cap as u32, heads_per_group, 16, blocks, cfg.attn_scale(),
+            )
+        }
+    }
+}
+
 fn full_attn_layer(
     dev: &dyn Device,
     cfg: &Qwen35Config,
@@ -1789,14 +1870,8 @@ fn full_attn_layer(
     let k = ops::rope_yarn_partial(dev, &k, pos, cfg.rope_n_rot, cfg.rope_theta, 1.0, 0.0, 1.0, 32.0, 1.0, 262144)?;
 
     let posbuf = Tensor::new(dev.upload(&pos.to_le_bytes())?, vec![1], DType::U32);
-    ops::kv_append(dev, &k, &slot.k, &posbuf, cfg.head_dim, slot.cap, cfg.n_kv_heads * cfg.head_dim)?;
-    ops::kv_append(dev, &v, &slot.v, &posbuf, cfg.head_dim, slot.cap, cfg.n_kv_heads * cfg.head_dim)?;
-
-    let heads_per_group = (cfg.n_head / cfg.n_kv_heads) as u32;
     let n_kv_used = pos + 1;
-    let attn = ops::sdpa_decode(
-        dev, &q, &slot.k, &slot.v, cfg.head_dim, n_kv_used, slot.cap as u32, heads_per_group, cfg.attn_scale(),
-    )?; // [n_head, head_dim]
+    let attn = append_decode_full_kv(dev, cfg, slot, &q, &k, &v, &posbuf, n_kv_used)?; // [n_head, head_dim]
 
     // Sigmoid output gate (NOT swish — see module doc).
     let attn_flat = attn.reshaped(vec![cfg.n_head * cfg.head_dim]);
@@ -2050,8 +2125,17 @@ fn prefill_layer_full(
     tr!("rope_yarn_partial_many x2");
     let v3 = v.reshaped(vec![t, n_kv_heads, hd]);
 
-    ops::kv_append_many(dev, &k3, positions, &slot.k, n_kv_heads, hd, slot.cap)?;
-    ops::kv_append_many(dev, &v3, positions, &slot.v, n_kv_heads, hd, slot.cap)?;
+    let (cache_k, cache_v, dense_cap) = match &slot.kv {
+        FullKvCache::Dense { k, v } => (k, v, slot.cap),
+        FullKvCache::Fp8 { k_codes, k_scales, v_codes, v_scales, prefill, .. } => {
+            ops::kv_append_fp8_e4m3_many(dev, &k3, positions, k_codes, k_scales, n_kv_heads, hd, slot.cap, 16)?;
+            ops::kv_append_fp8_e4m3_many(dev, &v3, positions, v_codes, v_scales, n_kv_heads, hd, slot.cap, 16)?;
+            let (k, v, cap) = prefill.as_ref().ok_or_else(|| Error::Msg("qwen35: packed KV prefill scratch is not prepared".into()))?;
+            (k, v, *cap)
+        }
+    };
+    ops::kv_append_many(dev, &k3, positions, cache_k, n_kv_heads, hd, dense_cap)?;
+    ops::kv_append_many(dev, &v3, positions, cache_v, n_kv_heads, hd, dense_cap)?;
     tr!("kv_append_many x2");
 
     // Every query attends the full causal prefix: seg_lo = 0 for all rows,
@@ -2059,8 +2143,8 @@ fn prefill_layer_full(
     // branch (`sdpa_varlen_1`), this architecture has no sliding layers.
     let seg_lo = Tensor::new(dev.alloc_zeroed(t * 4)?, vec![t], DType::U32);
     let attn = ops::sdpa_multi_tc_varlen(
-        dev, &q3, &slot.k, &slot.v, &seg_lo, 0, hd, n_head as u32,
-        start as u32, t as u32, slot.cap as u32, heads_per_group, true, cfg.attn_scale(), 0,
+        dev, &q3, cache_k, cache_v, &seg_lo, 0, hd, n_head as u32,
+        start as u32, t as u32, dense_cap as u32, heads_per_group, true, cfg.attn_scale(), 0,
     )?; // [T, n_head, hd]
     tr!("sdpa_multi_tc_varlen");
 
@@ -2154,6 +2238,8 @@ pub fn prefill_at(
     if total == 0 {
         return Err(Error::Msg("prefill: empty prompt".into()));
     }
+    cache.begin_prefill(dev, cfg, start_pos, total)?;
+    let result = (|| {
     let chunk = if chunk == 0 { default_prefill_chunk(total) } else { chunk.max(1) };
     PREFILL_CHUNKS_DONE.store(0, AtomicOrdering::Relaxed);
 
@@ -2200,6 +2286,9 @@ pub fn prefill_at(
     let xn = ops::rms_norm(dev, &last_row, &model.out_norm, cfg.eps)?;
     let logits = model.lm_head.gemv(dev, &xn)?;
     Ok(logits)
+    })();
+    cache.finish_prefill();
+    result
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2346,13 +2435,8 @@ fn full_attn_layer_census(
     let q = ops::rope_yarn_partial(dev, &q, pos, cfg.rope_n_rot, cfg.rope_theta, 1.0, 0.0, 1.0, 32.0, 1.0, 262144)?;
     let k = ops::rope_yarn_partial(dev, &k, pos, cfg.rope_n_rot, cfg.rope_theta, 1.0, 0.0, 1.0, 32.0, 1.0, 262144)?;
     let posbuf = Tensor::new(dev.upload(&pos.to_le_bytes())?, vec![1], DType::U32);
-    ops::kv_append(dev, &k, &slot.k, &posbuf, cfg.head_dim, slot.cap, cfg.n_kv_heads * cfg.head_dim)?;
-    ops::kv_append(dev, &v, &slot.v, &posbuf, cfg.head_dim, slot.cap, cfg.n_kv_heads * cfg.head_dim)?;
-    let heads_per_group = (cfg.n_head / cfg.n_kv_heads) as u32;
     let n_kv_used = pos + 1;
-    let attn = ops::sdpa_decode(
-        dev, &q, &slot.k, &slot.v, cfg.head_dim, n_kv_used, slot.cap as u32, heads_per_group, cfg.attn_scale(),
-    )?;
+    let attn = append_decode_full_kv(dev, cfg, slot, &q, &k, &v, &posbuf, n_kv_used)?;
     let attn_flat = attn.reshaped(vec![cfg.n_head * cfg.head_dim]);
     let gated = ops::sigmoid_mul(dev, &attn_flat, &gate)?;
     mark(dev, t0, &mut b.attention_ms)?;
@@ -2580,7 +2664,7 @@ impl MtpCache {
         let n = cfg.n_kv_heads * max_seq * cfg.head_dim;
         let k = Tensor::new(dev.alloc_zeroed(n * 4)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim], DType::F32);
         let v = Tensor::new(dev.alloc_zeroed(n * 4)?, vec![cfg.n_kv_heads, max_seq, cfg.head_dim], DType::F32);
-        Ok(MtpCache { slot: FullAttnSlot { k, v, cap: max_seq } })
+        Ok(MtpCache { slot: FullAttnSlot { kv: FullKvCache::Dense { k, v }, cap: max_seq } })
     }
 }
 
@@ -2636,14 +2720,8 @@ fn mtp_draft_step(
     let k = ops::rope_yarn_partial(dev, &k, pos, cfg.rope_n_rot, cfg.rope_theta, 1.0, 0.0, 1.0, 32.0, 1.0, 262144)?;
 
     let posbuf = Tensor::new(dev.upload(&pos.to_le_bytes())?, vec![1], DType::U32);
-    ops::kv_append(dev, &k, &slot.k, &posbuf, cfg.head_dim, slot.cap, cfg.n_kv_heads * cfg.head_dim)?;
-    ops::kv_append(dev, &v, &slot.v, &posbuf, cfg.head_dim, slot.cap, cfg.n_kv_heads * cfg.head_dim)?;
-
-    let heads_per_group = (cfg.n_head / cfg.n_kv_heads) as u32;
     let n_kv_used = pos + 1;
-    let attn = ops::sdpa_decode(
-        dev, &q, &slot.k, &slot.v, cfg.head_dim, n_kv_used, slot.cap as u32, heads_per_group, cfg.attn_scale(),
-    )?;
+    let attn = append_decode_full_kv(dev, cfg, slot, &q, &k, &v, &posbuf, n_kv_used)?;
     let attn_flat = attn.reshaped(vec![cfg.n_head * cfg.head_dim]);
     let gated = ops::sigmoid_mul(dev, &attn_flat, &gate)?;
     let o = w.wo.gemv(dev, &gated)?;

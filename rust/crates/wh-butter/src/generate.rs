@@ -600,4 +600,25 @@ mod tests {
         assert!(done >= 1, "no GPU chunk ran");
         assert!(done < 64, "leftover prefill completed: chunks={done}");
     }
+
+    #[test]
+    fn fp8_suffix_prefill_reuses_real_prefix() {
+        let Ok(path) = std::env::var("BUTTER_QWEN35_NVFP4") else {
+            eprintln!("skip fp8_suffix_prefill_reuses_real_prefix: no checkpoint");
+            return;
+        };
+        let devices = crate::devices();
+        let Some(dev) = devices.first() else { return };
+        let loaded = load(dev.as_ref(), &path).expect("load");
+        let opts = GenerateOpts { max_new: 1, max_context: Some(256), ..GenerateOpts::default() };
+        let stem = "The capital of France is";
+        let extended = "The capital of France is Paris. The capital of Germany is";
+        let mut live = None;
+        let first = generate_with_sink_cached(dev.as_ref(), &loaded, stem, &opts, &mut live, |_, _| true).expect("stem");
+        let reused = generate_with_sink_cached(dev.as_ref(), &loaded, extended, &opts, &mut live, |_, _| true).expect("suffix");
+        let mut fresh = None;
+        let rebuilt = generate_with_sink_cached(dev.as_ref(), &loaded, extended, &opts, &mut fresh, |_, _| true).expect("rebuild");
+        assert_eq!(reused.cached_tokens, first.prompt_tokens);
+        assert_eq!(reused.token_ids, rebuilt.token_ids, "suffix prefill diverged from a rebuild");
+    }
 }

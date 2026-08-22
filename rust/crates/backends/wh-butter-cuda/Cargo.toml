@@ -120,3 +120,7 @@ required-features = ["cuda"]
 [[test]]
 name = "qwen35_nvfp4_checkpoint"
 required-features = ["cuda"]
+
+[[test]]
+name = "qwen35_fp8_kv"
+required-features = ["cuda"]
