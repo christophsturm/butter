@@ -2118,6 +2118,58 @@ pub fn quantize_q8(w: &[f32], m: usize, k: usize) -> (Vec<u32>, Vec<f32>) {
     (qs, scales)
 }
 
+/// Stream a row-major BF16 matrix into the resident Q8 layout without first
+/// materializing a same-size F32 copy. Quantization matches [`quantize_q8`]
+/// applied to the BF16-rounded values.
+pub fn quantize_bf16_q8(bytes: &[u8], m: usize, k: usize) -> Result<(Vec<u32>, Vec<f32>)> {
+    if k % 32 != 0 {
+        return Err(Error::Msg(format!(
+            "quantize_bf16_q8: k={k} must be divisible by 32"
+        )));
+    }
+    let expected_bytes = m
+        .checked_mul(k)
+        .and_then(|elements| elements.checked_mul(2))
+        .ok_or_else(|| Error::Msg("quantize_bf16_q8: matrix size overflow".into()))?;
+    if bytes.len() != expected_bytes {
+        return Err(Error::Msg(format!(
+            "quantize_bf16_q8: expected {expected_bytes} bytes for [{m},{k}], got {}",
+            bytes.len()
+        )));
+    }
+    let value = |index: usize| {
+        let offset = index * 2;
+        f32::from_bits(
+            (u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) as u32) << 16,
+        )
+    };
+    let blocks_per_row = k / 32;
+    let mut qs = vec![0u32; m * blocks_per_row * 8];
+    let mut scales = vec![0.0f32; m * blocks_per_row];
+    for row in 0..m {
+        for block in 0..blocks_per_row {
+            let base = row * k + block * 32;
+            let amax = (0..32).fold(0.0f32, |maximum, index| {
+                maximum.max(value(base + index).abs())
+            });
+            let scale = amax / 127.0;
+            scales[row * blocks_per_row + block] = scale;
+            let inverse = if scale > 0.0 { scale.recip() } else { 0.0 };
+            for word in 0..8 {
+                let mut packed = 0u32;
+                for index in 0..4 {
+                    let quantized = (value(base + word * 4 + index) * inverse)
+                        .round()
+                        .clamp(-127.0, 127.0) as i32;
+                    packed |= ((quantized as u8) as u32) << (index * 8);
+                }
+                qs[row * blocks_per_row * 8 + block * 8 + word] = packed;
+            }
+        }
+    }
+    Ok((qs, scales))
+}
+
 /// e2m1 (FP4) codebook magnitudes (index 0..7); sign bit is bit 3.
 const E2M1_LUT: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 
@@ -7827,8 +7879,10 @@ pub fn gdn_prep_chunk_fast_27b(
 mod tests {
     use super::{
         E2M1_LUT, conv1d_causal_silu_many, dec_ue4m3, dsv4_mhc_sinkhorn_split,
-        permute_q4_from_marlin, permute_q4_to_marlin, quantize_nvfp4, quantize_q4,
+        permute_q4_from_marlin, permute_q4_to_marlin, quantize_bf16_q8, quantize_nvfp4,
+        quantize_q4, quantize_q8,
     };
+
     use std::{
         any::Any,
         sync::{Arc, Mutex},
@@ -7836,6 +7890,29 @@ mod tests {
     use wh_butter_core::{
         Backend, Binding, DType, Device, DeviceBuffer, Grid, Kernel, Result, Tensor,
     };
+
+    #[test]
+    fn streaming_bf16_q8_matches_rounded_f32_quantization() {
+        let values: Vec<f32> = (0..128)
+            .map(|index| ((index as f32 * 0.173).sin() * 3.0) + (index % 7) as f32 * 0.01)
+            .collect();
+        let bf16: Vec<u8> = values
+            .iter()
+            .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let rounded: Vec<f32> = bf16
+            .chunks_exact(2)
+            .map(|chunk| {
+                f32::from_bits((u16::from_le_bytes([chunk[0], chunk[1]]) as u32) << 16)
+            })
+            .collect();
+        assert_eq!(
+            quantize_bf16_q8(&bf16, 2, 64).unwrap(),
+            quantize_q8(&rounded, 2, 64)
+        );
+        assert!(quantize_bf16_q8(&bf16[..bf16.len() - 2], 2, 64).is_err());
+        assert!(quantize_bf16_q8(&bf16, 4, 16).is_err());
+    }
 
     struct TestBuffer(usize);
 

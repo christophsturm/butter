@@ -1341,6 +1341,31 @@ fn load_hf_dense_f32(dev: &dyn Device, st: &SafeTensors, name: &str) -> Result<T
     ))
 }
 
+fn load_hf_q8_head(dev: &dyn Device, st: &SafeTensors, name: &str) -> Result<Q8Head> {
+    let (bytes, dtype, shape) = st.tensor(name)?;
+    if dtype != DType::BF16 || shape.len() != 2 {
+        return Err(Error::Msg(format!(
+            "qwen35: {name} must be a 2-D BF16 tensor for resident Q8, got {dtype} {shape:?}"
+        )));
+    }
+    let (m, k) = (shape[0], shape[1]);
+    let (qs, scales) = ops::quantize_bf16_q8(bytes, m, k)?;
+    Ok(Q8Head {
+        qs: Tensor::new(
+            dev.upload(&u32s_to_bytes(&qs))?,
+            vec![qs.len()],
+            DType::U32,
+        ),
+        scales: Tensor::new(
+            dev.upload(&f32s_to_bytes(&scales))?,
+            vec![scales.len()],
+            DType::F32,
+        ),
+        m,
+        k,
+    })
+}
+
 fn load_hf_nvfp4(dev: &dyn Device, st: &SafeTensors, base: &str) -> Result<Nvfp4Dense> {
     let matrix = st.load_nvfp4_tensor(base)?;
     let scale_rows = matrix.rows;
@@ -1477,7 +1502,14 @@ pub fn load_nvfp4_dir(dev: &dyn Device, dir: &str) -> Result<Qwen35Model> {
     }
     let tok_embd = Tensor::new(dev.upload(embed_bytes)?, embed_shape.to_vec(), embed_dtype);
     let out_norm = load_hf_gemma_norm(dev, &st, "model.language_model.norm.weight")?;
-    let lm_head = LmHead::Dense16(load_hf_dense16(dev, &st, "lm_head.weight")?);
+    let use_bf16_head = std::env::var("BUTTER_QWEN35_BF16_HEAD")
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    let lm_head = if use_bf16_head {
+        LmHead::Dense16(load_hf_dense16(dev, &st, "lm_head.weight")?)
+    } else {
+        LmHead::Q8(load_hf_q8_head(dev, &st, "lm_head.weight")?)
+    };
 
     let inv_scale = 1.0 / (cfg.gdn_key_head_dim as f32).sqrt();
     let gdn_q_scale = Tensor::new(

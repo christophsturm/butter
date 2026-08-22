@@ -5,7 +5,9 @@ use std::time::Instant;
 use wh_butter_core::{DType, Tensor};
 use wh_butter_cuda::CudaDevice;
 use wh_butter_loader::{nvfp4::{e2m1_decode, e4m3_decode}, SafeTensors};
-use wh_butter_ops::{gemm_fp4, gemv, gemv_nvfp4, lt_fp4_quant_with_global};
+use wh_butter_ops::{
+    gemm_fp4, gemv, gemv_nvfp4, gemv_q8, lt_fp4_quant_with_global, quantize_bf16_q8,
+};
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|value| value.to_le_bytes()).collect()
@@ -317,10 +319,10 @@ fn real_checkpoint_bf16_lm_head_rows_match_host_reference() {
     let cols = shape[1];
     let weight_bytes = &all_weights[..rows * cols * 2];
     let weights = bf16_to_f32(weight_bytes);
-    let input: Vec<f32> = (0..cols)
+    let input_values: Vec<f32> = (0..cols)
         .map(|i| ((i % 31) as f32 - 15.0) / 310.0)
         .collect();
-    let input_bf16 = f32_to_bf16_bytes(&input);
+    let input_bf16 = f32_to_bf16_bytes(&input_values);
     let rounded_input = bf16_to_f32(&input_bf16);
     let expected: Vec<f32> = weights
         .chunks_exact(cols)
@@ -332,12 +334,13 @@ fn real_checkpoint_bf16_lm_head_rows_match_host_reference() {
         vec![rows, cols],
         DType::BF16,
     );
-    let input = Tensor::new(
+    let input_bf16_tensor = Tensor::new(
         device.upload(&input_bf16).unwrap(),
         vec![cols],
         DType::BF16,
     );
-    let output = gemv(device, &weight, &input).expect("dispatch BF16 lm_head GEMV");
+    let output =
+        gemv(device, &weight, &input_bf16_tensor).expect("dispatch BF16 lm_head GEMV");
     device.synchronize().unwrap();
     let mut output_bytes = vec![0u8; rows * 2];
     device
@@ -350,6 +353,82 @@ fn real_checkpoint_bf16_lm_head_rows_match_host_reference() {
         .map(|(actual, expected)| (actual - expected).abs())
         .fold(0.0f32, f32::max);
     assert!(max_abs < 0.01, "checkpoint BF16 lm_head GEMV max_abs={max_abs}");
+
+    let (q8, q8_scales) = quantize_bf16_q8(weight_bytes, rows, cols).unwrap();
+    let blocks_per_row = cols / 32;
+    let expected_q8: Vec<f32> = (0..rows)
+        .map(|row| {
+            (0..cols)
+                .map(|col| {
+                    let block = col / 32;
+                    let packed = q8[row * blocks_per_row * 8 + block * 8 + (col % 32) / 4];
+                    let code = ((packed >> ((col % 4) * 8)) as u8) as i8 as f32;
+                    code * q8_scales[row * blocks_per_row + block] * input_values[col]
+                })
+                .sum()
+        })
+        .collect();
+    let q8_bytes: Vec<u8> = q8.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let q8_tensor = Tensor::new(
+        device.upload(&q8_bytes).unwrap(),
+        vec![q8.len()],
+        DType::U32,
+    );
+    let q8_scale_tensor = Tensor::new(
+        device
+            .upload(
+                &q8_scales
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        vec![q8_scales.len()],
+        DType::F32,
+    );
+    let input_f32 = Tensor::new(
+        device.upload(&f32_bytes(&input_values)).unwrap(),
+        vec![cols],
+        DType::F32,
+    );
+    let q8_output = gemv_q8(
+        device,
+        &q8_tensor,
+        &q8_scale_tensor,
+        &input_f32,
+        rows,
+        cols,
+        rows,
+    )
+    .expect("dispatch Q8 lm_head GEMV");
+    device.synchronize().unwrap();
+    let mut q8_bytes = vec![0u8; rows * 4];
+    device.download(q8_output.buffer.as_ref(), &mut q8_bytes).unwrap();
+    let actual_q8: Vec<f32> = q8_bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    let q8_oracle_max_abs = actual_q8
+        .iter()
+        .zip(&expected_q8)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    let q8_vs_bf16_max_abs = actual_q8
+        .iter()
+        .zip(&expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "checkpoint Q8 lm_head oracle max_abs={q8_oracle_max_abs}, versus BF16 max_abs={q8_vs_bf16_max_abs}"
+    );
+    assert!(
+        q8_oracle_max_abs < 1e-3,
+        "checkpoint Q8 lm_head oracle max_abs={q8_oracle_max_abs}"
+    );
+    assert!(
+        q8_vs_bf16_max_abs < 0.1,
+        "checkpoint Q8 versus BF16 lm_head max_abs={q8_vs_bf16_max_abs}"
+    );
 }
 
 #[test]
