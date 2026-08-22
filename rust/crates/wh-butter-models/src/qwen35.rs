@@ -307,6 +307,34 @@ struct Dense16 {
     k: usize,
 }
 
+struct Fp8Dense {
+    weight: Tensor,
+    scales: Tensor,
+    m: usize,
+    k: usize,
+}
+
+impl Fp8Dense {
+    fn project(&self, dev: &dyn Device, x: &Tensor, rows: usize) -> Result<Tensor> {
+        let (x_q, x_scales) = ops::fp8_quant_perrow(dev, x, rows, self.k)?;
+        let output = ops::gemm_fp8_perchan(
+            dev,
+            &x_q,
+            &x_scales,
+            &self.weight,
+            &self.scales,
+            rows,
+            self.m,
+            self.k,
+        )?;
+        Ok(if rows == 1 {
+            output.reshaped(vec![self.m])
+        } else {
+            output
+        })
+    }
+}
+
 struct Nvfp4Dense {
     weight: Tensor,
     scales: Tensor,
@@ -320,6 +348,7 @@ struct Nvfp4Dense {
 
 enum DenseWeight {
     Q4(Q4Dense),
+    Fp8(Fp8Dense),
     Dense16(Dense16),
     Nvfp4(Nvfp4Dense),
 }
@@ -328,6 +357,7 @@ impl DenseWeight {
     fn gemv(&self, dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Q4(weight) => weight.gemv(dev, x),
+            Self::Fp8(weight) => weight.project(dev, x, 1),
             Self::Dense16(weight) => {
                 let input = match weight.weight.dtype {
                     DType::F32 => x.clone(),
@@ -398,6 +428,7 @@ impl DenseWeight {
     fn gemm(&self, dev: &dyn Device, x: &Tensor, rows: usize) -> Result<Tensor> {
         match self {
             Self::Q4(weight) => weight.gemm(dev, x, rows),
+            Self::Fp8(weight) => weight.project(dev, x, rows),
             Self::Dense16(weight) => {
                 let input = match weight.weight.dtype {
                     DType::F16 => ops::cast_f32_f16(dev, x)?,
@@ -1366,6 +1397,27 @@ fn load_hf_q8_head(dev: &dyn Device, st: &SafeTensors, name: &str) -> Result<Q8H
     })
 }
 
+fn load_hf_fp8_weight(dev: &dyn Device, st: &SafeTensors, name: &str) -> Result<DenseWeight> {
+    let dense = load_hf_dense16(dev, st, name)?;
+    let weight_f32 = match dense.weight.dtype {
+        DType::BF16 => ops::cast_bf16_f32(dev, &dense.weight)?,
+        DType::F16 => ops::cast_f16_f32(dev, &dense.weight)?,
+        dtype => {
+            return Err(Error::Msg(format!(
+                "qwen35: {name} must be F16 or BF16 for resident FP8, got {dtype}"
+            )));
+        }
+    };
+    let (weight, scales) = ops::fp8_quant_perrow(dev, &weight_f32, dense.m, dense.k)?;
+    dev.synchronize()?;
+    Ok(DenseWeight::Fp8(Fp8Dense {
+        weight,
+        scales,
+        m: dense.m,
+        k: dense.k,
+    }))
+}
+
 fn load_hf_nvfp4(dev: &dyn Device, st: &SafeTensors, base: &str) -> Result<Nvfp4Dense> {
     let matrix = st.load_nvfp4_tensor(base)?;
     let scale_rows = matrix.rows;
@@ -1490,6 +1542,9 @@ pub fn load_nvfp4_dir(dev: &dyn Device, dir: &str) -> Result<Qwen35Model> {
     cfg.fp8_kv = true;
     let st = SafeTensors::open_dir(dir)?;
     validate_hf_quant_policy(&st, &cfg)?;
+    let use_bf16_gdn = std::env::var("BUTTER_QWEN35_BF16_GDN")
+        .map(|value| value == "1")
+        .unwrap_or(false);
 
     let (embed_bytes, embed_dtype, embed_shape) =
         st.tensor("model.language_model.embed_tokens.weight")?;
@@ -1577,8 +1632,16 @@ pub fn load_nvfp4_dir(dev: &dyn Device, dir: &str) -> Result<Qwen35Model> {
                 repack_conv1d_weight(&conv_flat, cfg.gdn_conv_dim(), cfg.gdn_conv_kernel);
             Mixer::Gdn(GdnWeights {
                 attn_norm: load_hf_gemma_norm(dev, &st, &format!("{p}.input_layernorm.weight"))?,
-                wqkv: load_hf_unquantized_weight(dev, &st, &format!("{a}.in_proj_qkv"))?,
-                wz: load_hf_unquantized_weight(dev, &st, &format!("{a}.in_proj_z"))?,
+                wqkv: if use_bf16_gdn {
+                    load_hf_unquantized_weight(dev, &st, &format!("{a}.in_proj_qkv"))?
+                } else {
+                    load_hf_fp8_weight(dev, &st, &format!("{a}.in_proj_qkv.weight"))?
+                },
+                wz: if use_bf16_gdn {
+                    load_hf_unquantized_weight(dev, &st, &format!("{a}.in_proj_z"))?
+                } else {
+                    load_hf_fp8_weight(dev, &st, &format!("{a}.in_proj_z.weight"))?
+                },
                 w_alpha: load_hf_dense_f32(dev, &st, &format!("{a}.in_proj_a.weight"))?,
                 w_beta: load_hf_dense_f32(dev, &st, &format!("{a}.in_proj_b.weight"))?,
                 dt_bias: load_hf_vec_f32(dev, &st, &format!("{a}.dt_bias"))?,
@@ -1598,7 +1661,11 @@ pub fn load_nvfp4_dir(dev: &dyn Device, dir: &str) -> Result<Qwen35Model> {
                     DType::F32,
                 ),
                 ssm_norm_w: load_hf_vec_f32(dev, &st, &format!("{a}.norm.weight"))?,
-                wo: load_hf_unquantized_weight(dev, &st, &format!("{a}.out_proj"))?,
+                wo: if use_bf16_gdn {
+                    load_hf_unquantized_weight(dev, &st, &format!("{a}.out_proj"))?
+                } else {
+                    load_hf_fp8_weight(dev, &st, &format!("{a}.out_proj.weight"))?
+                },
             })
         };
         let ffn = DenseFfn {

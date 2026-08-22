@@ -6,7 +6,8 @@ use wh_butter_core::{DType, Tensor};
 use wh_butter_cuda::CudaDevice;
 use wh_butter_loader::{nvfp4::{e2m1_decode, e4m3_decode}, SafeTensors};
 use wh_butter_ops::{
-    gemm_fp4, gemv, gemv_nvfp4, gemv_q8, lt_fp4_quant_with_global, quantize_bf16_q8,
+    cast_bf16_f32, fp8_quant_perrow, gemm_fp4, gemm_fp8_perchan, gemv, gemv_nvfp4,
+    gemv_q8, lt_fp4_quant_with_global, quantize_bf16_q8,
 };
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -428,6 +429,127 @@ fn real_checkpoint_bf16_lm_head_rows_match_host_reference() {
     assert!(
         q8_vs_bf16_max_abs < 0.1,
         "checkpoint Q8 versus BF16 lm_head max_abs={q8_vs_bf16_max_abs}"
+    );
+}
+
+#[test]
+fn real_checkpoint_fp8_gdn_projection_matches_host_reference() {
+    let Ok(dir) = std::env::var("BUTTER_QWEN35_NVFP4") else {
+        eprintln!("BUTTER_QWEN35_NVFP4 is unset, skipping checkpoint test");
+        return;
+    };
+    let Some(device) = CudaDevice::create().unwrap() else {
+        eprintln!("CUDA is unavailable, skipping checkpoint test");
+        return;
+    };
+    let device = device.as_ref();
+    let st = SafeTensors::open_dir(&dir).expect("open checkpoint");
+    let name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+    let (all_weights, dtype, shape) = st.tensor(name).expect("load GDN projection");
+    assert_eq!(dtype, DType::BF16);
+    assert_eq!(shape.len(), 2);
+
+    let rows = 48;
+    let cols = shape[1];
+    let weight_bytes = &all_weights[..rows * cols * 2];
+    let weights = bf16_to_f32(weight_bytes);
+    let input_values: Vec<f32> = (0..cols)
+        .map(|index| ((index % 31) as f32 - 15.0) / 310.0)
+        .collect();
+    let expected: Vec<f32> = weights
+        .chunks_exact(cols)
+        .map(|row| row.iter().zip(&input_values).map(|(w, x)| w * x).sum())
+        .collect();
+
+    let weight_bf16 = Tensor::new(
+        device.upload(weight_bytes).unwrap(),
+        vec![rows, cols],
+        DType::BF16,
+    );
+    let weight_f32 = cast_bf16_f32(device, &weight_bf16).unwrap();
+    let (weight_fp8, weight_scales) = fp8_quant_perrow(device, &weight_f32, rows, cols).unwrap();
+    let input = Tensor::new(
+        device.upload(&f32_bytes(&input_values)).unwrap(),
+        vec![1, cols],
+        DType::F32,
+    );
+    let (input_fp8, input_scales) = fp8_quant_perrow(device, &input, 1, cols).unwrap();
+    let output = gemm_fp8_perchan(
+        device,
+        &input_fp8,
+        &input_scales,
+        &weight_fp8,
+        &weight_scales,
+        1,
+        rows,
+        cols,
+    )
+    .unwrap();
+    device.synchronize().unwrap();
+    let mut output_bytes = vec![0u8; rows * 4];
+    device
+        .download(output.buffer.as_ref(), &mut output_bytes)
+        .unwrap();
+    let actual: Vec<f32> = output_bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    let max_abs = actual
+        .iter()
+        .zip(&expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    let dot: f64 = actual
+        .iter()
+        .zip(&expected)
+        .map(|(actual, expected)| *actual as f64 * *expected as f64)
+        .sum();
+    let actual_norm: f64 = actual.iter().map(|value| (*value as f64).powi(2)).sum();
+    let expected_norm: f64 = expected.iter().map(|value| (*value as f64).powi(2)).sum();
+    let cosine = dot / (actual_norm * expected_norm).sqrt();
+    eprintln!("checkpoint FP8 GDN projection max_abs={max_abs}, cosine={cosine:.8}");
+    assert!(max_abs < 0.02, "checkpoint FP8 GDN max_abs={max_abs}");
+    assert!(cosine > 0.999, "checkpoint FP8 GDN cosine={cosine}");
+
+    let mut scale_bytes = vec![0u8; rows * 4];
+    device
+        .download(weight_scales.buffer.as_ref(), &mut scale_bytes)
+        .unwrap();
+    let mut wrong_scales: Vec<f32> = scale_bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    wrong_scales.rotate_left(1);
+    let wrong_scale_tensor = Tensor::new(
+        device.upload(&f32_bytes(&wrong_scales)).unwrap(),
+        vec![rows],
+        DType::F32,
+    );
+    let wrong = gemm_fp8_perchan(
+        device,
+        &input_fp8,
+        &input_scales,
+        &weight_fp8,
+        &wrong_scale_tensor,
+        1,
+        rows,
+        cols,
+    )
+    .unwrap();
+    device.synchronize().unwrap();
+    let mut wrong_bytes = vec![0u8; rows * 4];
+    device
+        .download(wrong.buffer.as_ref(), &mut wrong_bytes)
+        .unwrap();
+    let wrong_max_abs = wrong_bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .zip(&actual)
+        .map(|(wrong, actual)| (wrong - actual).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        wrong_max_abs > 0.01,
+        "rotated per-channel scales should diverge, max_abs={wrong_max_abs}"
     );
 }
 
