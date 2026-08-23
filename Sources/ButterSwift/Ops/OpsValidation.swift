@@ -199,6 +199,23 @@ public enum OpsValidation {
         return nil
     }
 
+    // ─── sdpaPrefillMmaD256 BK16 widened-query-tile knob ────────────
+    // `bq` must be one of the two geometries the BK=16 kernel's
+    // threadgroup-memory budget and coop-load strided walk are
+    // written for (see sdpa_prefill_mma_d256_bk16.rs module doc):
+    // dispatched threadgroup width MUST equal `(bq/8)*32`. A third
+    // `bq=128` geometry (`tpg=512`) was dropped for fleet portability
+    // -- it exceeds the 384-thread `maxTotalThreadsPerThreadgroup`
+    // cap some fleet GPUs impose, well under the 1024-thread ceiling
+    // this repo's primary dev hardware allows -- with no perf win to
+    // justify keeping it as an opt-in.
+    public static func validateSdpaPrefillBQ(_ bq: Int) -> String? {
+        guard [32, 64].contains(bq) else {
+            return "bq must be one of {32, 64} (got \(bq))"
+        }
+        return nil
+    }
+
     // ─── sdpaMultiD256Gqa ──────────────────────────────────────────
     //
     // Kernel invariants (from

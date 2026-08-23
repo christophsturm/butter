@@ -5593,6 +5593,81 @@ public enum Ops {
     private static let sdpaBK16Enabled: Bool =
         ButterEnv["BUTTER_SDPA_BK16"] != "0"
 
+    /// Widened-query-tile knob for the BK=16 kernel family
+    /// (`iron_sdpa_prefill_mma_d256_bk16_bq{32,64}` -- see
+    /// `crates/iron-std/src/kernels/sdpa/sdpa_prefill_mma_d256_bk16.rs`
+    /// module doc): `bq` in `{32, 64}` selects which of two
+    /// SEPARATELY COMPILED kernel entry points to dispatch, dispatched
+    /// threadgroup width `tpg = (bq / 8) * 32` (128/256).
+    ///
+    /// Default **32** as of 2026-08-23 (`BUTTER_SDPA_PREFILL_BQ=64`
+    /// opts into the wider tile).
+    ///
+    /// ## History
+    ///
+    /// commit eb4edb2 (iron) / 780045b8 (butter) first shipped this
+    /// lever as a single kernel with a RUNTIME `#[constexpr] bq: u32`
+    /// (a `constant uint&` buffer arg) and flipped the default to 128
+    /// on an e2e A/B that, on adversarial re-verification, turned out
+    /// to be new-vs-new only (no comparison against the kernel that
+    /// was actually shipping): every `bq` value regressed vs the
+    /// unchanged BK=8 sibling (bq=32 "reverted" geometry measured
+    /// ~40% slower in isolation, ~12.5% slower end-to-end at 32K) --
+    /// because a *runtime* `bq` made the coop K/V load's stride and
+    /// trip count unknowable to the Metal compiler, blocking the
+    /// unroll that made the original kernel fast. See
+    /// `campaign/prefill/verify/NOTES.md` for the full root-cause
+    /// writeup and `campaign/prefill/fix/NOTES.md` for this fix.
+    ///
+    /// This revision converts `bq` to a **compile-time** kernel
+    /// variant (`#[kernel(variants(BQ = [32, 64], ...))]`) -- real,
+    /// separately-compiled Metal functions, not one kernel reading a
+    /// uniform -- and restructures the coop load to a row-major walk
+    /// whose trip count is the literal `BK = 16` for every `BQ`
+    /// (matching the original kernel's own loop shape), so every `BQ`
+    /// value's coop load is now genuinely unrollable.
+    ///
+    /// MEASURED 2026-08-23 (M5 Max; full numbers in
+    /// `campaign/prefill/fix/NOTES.md`): kernel bench at the reference
+    /// shape (32Q/8KV, 1024q/8192kv) -- bq=32 now 4.2 GB/s (>= the
+    /// unchanged BK=8 sibling's 4.1 GB/s, matching the pre-regression
+    /// bar), bq=64 also 4.2 GB/s (previously regressed to 3.05, now
+    /// fixed by the same row-major redesign). At the deployed shape
+    /// (24Q/4KV, 1024q on a 122,880-deep prefix, bf16) bq=32 and
+    /// bq=64 are tied for fastest (1.8 GB/s) -- bq=32 is no longer
+    /// strictly worse than the wider tile at either shape, so it is
+    /// restored as the default rather than kept as a same-perf
+    /// fallback. bq=64 stays available as opt-in for future headroom
+    /// work. Every `bq` remains bit-identical output (correctness
+    /// tests pass across both variants). Ragged/short chunks
+    /// (`nQuery < bq`) always fall back to `bq = 32` regardless of
+    /// this setting.
+    ///
+    /// A third `bq=128` variant was tried alongside 32/64 in this same
+    /// revision (kernel bench: 3.5 GB/s at the reference shape, 1.7
+    /// GB/s at the deployed shape -- the weakest of the three at both,
+    /// its coop load leaving half its 512 lanes idle per K-block
+    /// iteration) and was DROPPED before landing: its `tpg = 512`
+    /// exceeds the 384-thread `maxTotalThreadsPerThreadgroup` some
+    /// fleet GPUs (including a CI runner) cap PSO creation at, well
+    /// under the 1024-thread ceiling this repo's primary dev hardware
+    /// (M5 Max) allows -- see the kernel's module doc `BQ` section.
+    /// With no perf win to justify the portability risk, `bq=128` is
+    /// not offered as an opt-in.
+    private static let sdpaPrefillBQ: Int = {
+        let raw = Int(ButterEnv["BUTTER_SDPA_PREFILL_BQ"] ?? "32") ?? 32
+        return [32, 64].contains(raw) ? raw : 32
+    }()
+
+    /// PSO name for the BK=16 `bq`-variant kernel at the given `bq` and
+    /// dtype -- `"f16"` / `"bf16"` only (the BK16 path never dispatches
+    /// f32, see `sdpaPrefillMmaD256`'s module doc below). Shared by the
+    /// dispatch switch and the `maxTotalThreadsPerThreadgroup`
+    /// precondition, so the two can never name mismatched kernels.
+    private static func sdpaBK16PSOName(bq: Int, dtypeSuffix: String) -> String {
+        "iron_sdpa_prefill_mma_d256_bk16_bq\(bq)_\(dtypeSuffix)"
+    }
+
     public static func sdpaPrefillMmaD256(
         q: Tensor, k: Tensor, v: Tensor,
         nQHeads: Int, nKVHeads: Int, headDim: Int,
@@ -5616,12 +5691,38 @@ public enum Ops {
         // Do NOT scale by tg.width the way the dispatchThreads-based
         // sdpaPrefillQtiledD256 does above -- dispatchThreadgroups
         // takes a threadgroup-count grid, not a total-thread grid.
+        // Used by f32 (no bq param on that kernel) and by the
+        // non-BK16 f16/bf16 fallback path.
         let bq = 32
         let tgX = (nQuery + bq - 1) / bq
         let tgGrid = MTLSize(width: tgX, height: nQHeads, depth: 1)
         let tg = MTLSize(width: 128, height: 1, depth: 1)
+        // BK16-kernel-only grid: widened query tile via sdpaPrefillBQ,
+        // clamped back to 32 for chunks too short to fill a wider tile.
+        let bk16Bq = nQuery >= Self.sdpaPrefillBQ ? Self.sdpaPrefillBQ : 32
+        if let reason = OpsValidation.validateSdpaPrefillBQ(bk16Bq) {
+            preconditionFailure("Ops.sdpaPrefillMmaD256: \(reason)")
+        }
+        let bk16TgX = (nQuery + bk16Bq - 1) / bk16Bq
+        let bk16TgGrid = MTLSize(width: bk16TgX, height: nQHeads, depth: 1)
+        let bk16Tg = MTLSize(width: (bk16Bq / 8) * 32, height: 1, depth: 1)
         let causalFlag = UInt32(causal ? 1 : 0)
         let useBK16 = Self.sdpaBK16Enabled
+        // `bk16Tg.width` must not exceed the chosen bq-variant PSO's own
+        // `maxTotalThreadsPerThreadgroup` -- register/threadgroup-memory
+        // pressure can push that below the 1024 hardware ceiling, and a
+        // mismatch here is silent corruption (missing simdgroups), not a
+        // dispatch error (module doc "bq" invariants).
+        func checkBK16PSOWidth(dtypeSuffix: String) {
+            guard useBK16 else { return }
+            let name = Self.sdpaBK16PSOName(bq: bk16Bq, dtypeSuffix: dtypeSuffix)
+            let pso = PSOCache.shared.pipelineState(for: name)
+            precondition(
+                pso.maxTotalThreadsPerThreadgroup >= bk16Tg.width,
+                "Ops.sdpaPrefillMmaD256: PSO \"\(name)\" maxTotalThreadsPerThreadgroup "
+                    + "(\(pso.maxTotalThreadsPerThreadgroup)) < dispatched threadgroup width "
+                    + "(\(bk16Tg.width)) at bq=\(bk16Bq)")
+        }
         switch q.dtype {
         case .f32:
             IronKernels.iron_sdpa_prefill_mma_d256_f32_threadgroups(
@@ -5634,14 +5735,27 @@ public enum Ops {
                 gridSize: tgGrid, threadgroupSize: tg, on: cmd)
         case .f16:
             if useBK16 {
-                IronKernels.iron_sdpa_prefill_mma_d256_bk16_f16_threadgroups(
-                    q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
-                    v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
-                    head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
-                    base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
-                    kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
-                    causal: causalFlag, scale: scale,
-                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+                checkBK16PSOWidth(dtypeSuffix: "f16")
+                switch bk16Bq {
+                case 64:
+                    IronKernels.iron_sdpa_prefill_mma_d256_bk16_bq64_f16_threadgroups(
+                        q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                        v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                        head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                        base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                        kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                        causal: causalFlag, scale: scale,
+                        gridSize: bk16TgGrid, threadgroupSize: bk16Tg, on: cmd)
+                default:
+                    IronKernels.iron_sdpa_prefill_mma_d256_bk16_bq32_f16_threadgroups(
+                        q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                        v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                        head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                        base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                        kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                        causal: causalFlag, scale: scale,
+                        gridSize: bk16TgGrid, threadgroupSize: bk16Tg, on: cmd)
+                }
             } else {
                 IronKernels.iron_sdpa_prefill_mma_d256_f16_threadgroups(
                     q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
@@ -5654,14 +5768,27 @@ public enum Ops {
             }
         case .bf16:
             if useBK16 {
-                IronKernels.iron_sdpa_prefill_mma_d256_bk16_bf16_threadgroups(
-                    q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
-                    v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
-                    head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
-                    base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
-                    kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
-                    causal: causalFlag, scale: scale,
-                    gridSize: tgGrid, threadgroupSize: tg, on: cmd)
+                checkBK16PSOWidth(dtypeSuffix: "bf16")
+                switch bk16Bq {
+                case 64:
+                    IronKernels.iron_sdpa_prefill_mma_d256_bk16_bq64_bf16_threadgroups(
+                        q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                        v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                        head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                        base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                        kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                        causal: causalFlag, scale: scale,
+                        gridSize: bk16TgGrid, threadgroupSize: bk16Tg, on: cmd)
+                default:
+                    IronKernels.iron_sdpa_prefill_mma_d256_bk16_bq32_bf16_threadgroups(
+                        q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                        v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                        head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                        base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                        kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                        causal: causalFlag, scale: scale,
+                        gridSize: bk16TgGrid, threadgroupSize: bk16Tg, on: cmd)
+                }
             } else {
                 IronKernels.iron_sdpa_prefill_mma_d256_bf16_threadgroups(
                     q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
