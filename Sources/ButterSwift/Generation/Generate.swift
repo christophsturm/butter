@@ -307,6 +307,62 @@ extension Model {
             Device.shared.releaseGenerationCaches()
             caches = engine.makeLayerCaches()
         }
+
+        // D9: fail fast, before any prefill work, when this call can
+        // never fit the KV cache's fixed physical capacity
+        // (`engine.maxSeq` — the ceiling every `.unbounded`
+        // attention-cache layer allocates its buffer at, sized once at
+        // load from `--max-context` / the family default; see
+        // `KVCache.init`'s `KVEvictionState(policy:bufferCapacity:)`).
+        // NOT every layer's physical buffer is `maxSeq`-sized, though:
+        // a `.window` layer allocates only `min(slidingWindow, maxSeq)`
+        // slots (see e.g. `Gemma4Text.makeLayerCaches`'s `physicalCap`)
+        // — that's fine, because a windowed layer's whole point is to
+        // never need more than its window regardless of how long the
+        // conversation runs. `promptTokens` is always the FULL
+        // cumulative token count — for session calls it includes prior
+        // turns, not just the new suffix (`GenerationSession.complete`
+        // passes the whole conversation) — so this one check covers
+        // both entry points.
+        //
+        // Skipped only when EVERY attention-cache layer uses `.window`
+        // eviction: a windowed cache is *designed* to run past its
+        // physical capacity forever (FIFO rotation, e.g.
+        // streaming-LLM-style attention sinks — see
+        // `KVCacheEviction.swift`), so `promptTokens.count + maxTokens`
+        // legitimately exceeding `maxSeq` is the normal, intended way
+        // to use it there, not an error. Eviction policy is NOT
+        // engine-wide, though: several hybrid families mix `.window`
+        // local layers with `.unbounded` global layers within the same
+        // engine (Gemma 2/3/4, GPT-OSS, Laguna, MuseGlimmer), and those
+        // `.unbounded` layers have the same fixed physical ceiling as a
+        // plain model — checking only the first attention layer, or
+        // exempting on ANY `.window` hit, silently disabled this guard
+        // for exactly those families. So: collect every attention-cache
+        // layer and only skip the check when the set is non-empty AND
+        // every one of them is `.window`. Without this guard, an
+        // `.unbounded` cache instead runs the full (possibly
+        // multi-chunk) prefill and only then hits
+        // `KVEvictionState.reserveNextSlot()`'s precondition mid-decode
+        // — a much later, less actionable failure for the same root
+        // cause.
+        let attentionCaches = caches.compactMap { $0 as? any KVCacheProtocol }
+        let allWindowed =
+            !attentionCaches.isEmpty
+            && attentionCaches.allSatisfy {
+                if case .window = $0.eviction { return true }
+                return false
+            }
+        if !allWindowed {
+            let required = promptTokens.count + params.maxTokens
+            if required > engine.maxSeq {
+                throw GenerationError.contextOverflow(
+                    promptTokens: promptTokens.count,
+                    maxNewTokens: params.maxTokens,
+                    maxContextLength: engine.maxSeq)
+            }
+        }
+
         let nPast = min(max(prefillStart, 0), promptTokens.count)
         // Gemma 3+, several Qwen variants, and a few llama-tuned models
         // publish `eos_token_id` as a *list* (model EOS plus end-of-turn
@@ -1079,10 +1135,24 @@ extension Model {
 
 public enum GenerationError: Error, CustomStringConvertible {
     case streamEndedWithoutFinalChunk
+    /// D9: `promptTokens + maxNewTokens` exceeds the KV cache's fixed
+    /// physical capacity (`engine.maxSeq`). See the fail-fast check in
+    /// `driveGeneration` for when this fires (and when it doesn't —
+    /// exempt only when EVERY attention-cache layer uses `.window`
+    /// eviction; a hybrid engine with even one `.unbounded` layer is
+    /// still checked).
+    case contextOverflow(promptTokens: Int, maxNewTokens: Int, maxContextLength: Int)
     public var description: String {
         switch self {
         case .streamEndedWithoutFinalChunk:
             return "GenerationStream finished without yielding the final stats chunk"
+        case .contextOverflow(let promptTokens, let maxNewTokens, let maxContextLength):
+            let total = promptTokens + maxNewTokens
+            return
+                "prompt (\(promptTokens) tokens) + max-tokens (\(maxNewTokens)) = "
+                + "\(total) exceeds the KV cache capacity (\(maxContextLength) positions). "
+                + "Raise --max-context to fit the full request, or pass --kv-window-size "
+                + "to run with a bounded sliding-window cache instead."
         }
     }
 }

@@ -931,10 +931,34 @@ extension SpecDecode {
                 // which this `if let seedHidden` branch already is (the
                 // priming iteration never reaches here, so it never
                 // pollutes the stats or the trailing window).
-                let effectiveGamma =
+                //
+                // Physical-capacity clamp (D9 follow-up): the batched
+                // verify pass below appends `effectiveGamma + 1` rows
+                // (`prev` + every draft) to the REAL attention caches at
+                // absolute positions `pos ... pos + effectiveGamma`
+                // — Generate.swift's D9 guard only proves
+                // `promptTokens.count + maxNewTokens <= model.maxSeq`
+                // at call entry, i.e. that the FINAL committed position
+                // fits, not that a mid-stream burst's SPECULATIVE
+                // over-draft does. Near the tail of a long
+                // `maxNewTokens` budget (`model.maxSeq - pos` down to a
+                // handful of slots) an uncapped `gamma`-sized burst
+                // would ask the verify forward pass to write past the
+                // physical buffer end, panicking deep inside
+                // `KVEvictionState.reserveNextSlot()` instead of at this
+                // call's entry. Clamping to the true remaining headroom
+                // minus one (room for `prev`'s own row) makes every
+                // burst fit by construction; `drafts.isEmpty` (down to
+                // 0 slots of headroom) is already a first-class case —
+                // see `planMTPAccept`'s "priming / draft-free iteration"
+                // branch, which commits `prev` alone via the replay
+                // path.
+                let physicalHeadroom = max(0, model.maxSeq - pos - 1)
+                let effectiveGamma = min(
                     costModelGamma?.nextCycleGamma()
-                    ?? adaptiveGamma?.nextCycleGamma()
-                    ?? gamma
+                        ?? adaptiveGamma?.nextCycleGamma()
+                        ?? gamma,
+                    physicalHeadroom)
                 for j in 0 ..< effectiveGamma {
                     let dT = Date()
                     let dCmd = device.makeCommandBuffer()
