@@ -164,8 +164,13 @@ public struct GenerationStats: Sendable {
     }
 
     private static func fmt(_ bytes: Int) -> String {
+        // 1024-based (binary) division throughout — label as GiB/MiB,
+        // not GB/MB, so --stats output doesn't read as decimal
+        // gigabytes when it's actually gibibytes (verifier-flagged
+        // mislabel; campaign/aura/REPORT.md quoted this printer's
+        // output as "GB").
         let mb = Double(bytes) / 1024.0 / 1024.0
-        if mb >= 1024 { return String(format: "%.2f GB", mb / 1024) }
-        return String(format: "%.1f MB", mb)
+        if mb >= 1024 { return String(format: "%.2f GiB", mb / 1024) }
+        return String(format: "%.1f MiB", mb)
     }
 }

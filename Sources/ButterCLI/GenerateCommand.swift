@@ -30,12 +30,24 @@ struct GenerateCommand: AsyncParsableCommand {
     // bypasses argument-parser range niceties) reached the generation
     // loop's `0 ..< maxTokens` range and died on a messageless SIGTRAP;
     // negative temperatures produced special-token garbage.
-    func validate() throws {
+    mutating func validate() throws {
         if let n = maxTokens, n < 0 {
             throw ValidationError("--max-tokens must be >= 0 (got \(n))")
         }
         if let t = temperature, t < 0 {
             throw ValidationError("--temperature must be >= 0 (got \(t))")
+        }
+        // --prompt-file wins over -p/--prompt when both are given. Added so
+        // very large prompts (100s of KB — long-context ladder runs) don't
+        // have to ride through argv, which shares macOS's 1 MB ARG_MAX with
+        // envp. Read here (validate() runs once, after parsing, before
+        // run()) so every downstream use of `prompt` picks it up for free.
+        if let promptFile {
+            do {
+                prompt = try String(contentsOfFile: promptFile, encoding: .utf8)
+            } catch {
+                throw ValidationError("--prompt-file \(promptFile): \(error.localizedDescription)")
+            }
         }
     }
 
@@ -44,6 +56,11 @@ struct GenerateCommand: AsyncParsableCommand {
 
     @Option(name: .shortAndLong, help: "Prompt to generate from.")
     var prompt: String = "Once upon a time"
+
+    @Option(
+        name: .long,
+        help: "Read the prompt from this file instead of -p/--prompt (whole file contents, UTF-8). Use for large prompts that risk argv's ARG_MAX limit; overrides --prompt when both are given.")
+    var promptFile: String?
 
     @Option(name: .long, help: "Maximum tokens to generate. Defaults to the model family's value.")
     var maxTokens: Int?

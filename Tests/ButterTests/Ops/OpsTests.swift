@@ -23,9 +23,18 @@ import Testing
 struct OpsTests {
     @Test("AURA two-pass support follows emitted pass-1 kernels")
     func auraTwoPassSupportMatchesPass1Kernels() {
+        // kb4_vb2 (aura4v2) is the one scheme with an emitted d256
+        // two-pass kernel — re-widened from a d128-only gate in
+        // 3e558b34 (campaign/aura/REPORT.md: 32K needle hit, byte-exact
+        // per PR #207) but this test wasn't updated alongside that
+        // commit, so it had been asserting the opposite of the shipped
+        // gate ever since. kb4_vb4 (aura4v4) stops at d128 — iron never
+        // emitted a kb4_vb4_d256 two-pass kernel — so it stays false at
+        // 256 (asserted below) and aura4v4 `--aura-decode-path
+        // compressed` falls through to the dense dequant-mirror path.
         for dtype in [DType.f32, .f16, .bf16] {
             #expect(
-                !Ops.supportsAuraFlashSdpa2Pass(
+                Ops.supportsAuraFlashSdpa2Pass(
                     keyBits: 4, valueBits: 2, headDim: 256, dtype: dtype))
             #expect(
                 Ops.supportsAuraFlashSdpa2Pass(

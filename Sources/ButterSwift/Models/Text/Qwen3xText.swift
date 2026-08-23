@@ -122,6 +122,7 @@
 // (mRoPE only differs for 2-D vision-token positions).
 
 import Foundation
+import IronSwift
 import Metal
 
 // ─── Layer kind ──────────────────────────────────────────────────────
@@ -3388,6 +3389,20 @@ public final class Qwen35AttentionMixer: Module {
             // threadgroups in pass1, merges in pass2. Wins over single-pass
             // when nKV is at the decode-page threshold; env var
             // `BUTTER_SDPA_2PASS_THRESHOLD` overrides.
+            //
+            // AURA dequant-mirror — CORRECTED (see `campaign/aura/REPORT.md`
+            // + verifier writeup): the repetition/miss collapse formerly
+            // attributed to "AURA-specific 2-pass merge corruption" was
+            // actually `Ops.sdpaDecode2Pass` dispatching a d128-only
+            // generic kernel at this model's headDim=256, which silently
+            // computed attention over half the head — a bug that hit RAW
+            // K/V too (raw needle MISSes at 32K/128K were the same root
+            // cause, not a separate "D1 depth-scaling gap"). Fixed at the
+            // source in `Ops.sdpaDecode2Pass` (headDim-keyed dispatch to
+            // the emitted `_d256` kernels + a precondition against
+            // unsupported widths). AURA no longer needs to be routed
+            // around 2-pass — it uses the same threshold-gated path as
+            // raw, same as every other cache kind.
             if useTwoPassDecode && kv.length >= sdpa2PassThreshold {
                 if partialOScratch == nil
                     || partialOScratch!.elementCount
@@ -4634,6 +4649,20 @@ public final class Qwen35Model: LanguageModel {
         var h = Profile.signpost("model.embed") {
             embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
         }
+        // Census tap (additive, env-gated, off by default): reuses T39's
+        // forced-checkpoint decode-kernel-timing probe
+        // (LagunaDecodeKernelTiming, previously only wired into
+        // LagunaText.swift) to bucket ONE decode token's Qwen3.5-hybrid
+        // backbone by phase — "embed" here, "attn"/"gdn" per-layer below.
+        // Forced commit+wait every checkpoint is the same inflating-but-
+        // share-transfers caveat as every other T39/T26 forced-sync probe
+        // in this codebase; see LagunaDecodeKernelTiming.swift's header.
+        // No-op (falls through to the pre-existing plain path) when
+        // BUTTER_LAGUNA_DECODE_KERNEL_TIMING is unset.
+        let decodeCensus = LagunaDecodeKernelTiming.enabled
+        if decodeCensus {
+            workCmd = LagunaDecodeKernelTiming.checkpoint("embed", cmd: workCmd, device: device)
+        }
 
         // See `Sources/ButterSwift/Telemetry/InspectTap.swift` — no-op
         // when BUTTER_INSPECT isn't set. `butter inspect --layer-trace`.
@@ -4645,15 +4674,26 @@ public final class Qwen35Model: LanguageModel {
                 h = layer.decode(
                     h, position: position, cache: caches[i],
                     cmd: workCmd, device: device)
-                // Refresh `workCmd` if the layer committed it.
-                let committed: Bool
-                switch layer {
-                case let l as Qwen35GDNLayer: committed = l.commitsCommandBuffer
-                case let l as Qwen35AttentionLayer: committed = l.commitsCommandBuffer
-                default: committed = false
-                }
-                if committed { workCmd = device.makeCommandBuffer() }
                 let kind = layer is Qwen35AttentionLayer ? "attn" : (layer is Qwen35GDNLayer ? "gdn" : "other")
+                if decodeCensus {
+                    // Forced checkpoint every layer, keyed by layer-kind —
+                    // LagunaDecodeKernelTiming.record accumulates by label,
+                    // so this sums to one "attn" total across all 16
+                    // attention layers and one "gdn" total across all 48
+                    // GDN layers for the whole token. Supersedes the plain
+                    // committed-layer refresh below (checkpoint() itself
+                    // commits-if-needed + waits + returns a fresh buffer).
+                    workCmd = LagunaDecodeKernelTiming.checkpoint(kind, cmd: workCmd, device: device)
+                } else {
+                    // Refresh `workCmd` if the layer committed it.
+                    let committed: Bool
+                    switch layer {
+                    case let l as Qwen35GDNLayer: committed = l.commitsCommandBuffer
+                    case let l as Qwen35AttentionLayer: committed = l.commitsCommandBuffer
+                    default: committed = false
+                    }
+                    if committed { workCmd = device.makeCommandBuffer() }
+                }
                 workCmd = tap.dumpLayerBoundary(h, label: "\(kind)_out", layer: i, cmd: workCmd, device: device)
             }
         }
@@ -5062,6 +5102,11 @@ public final class Qwen35Model: LanguageModel {
 
         var workCmd = device.makeCommandBuffer()
         let embWall0 = profileLayers ? CFAbsoluteTimeGetCurrent() : 0
+        // Census: non-destructive dispatch-count delta for this one chunk.
+        // Snapshot-diff only (never resets DispatchCensus) so the
+        // Generate.swift prefill-boundary aggregate report still sees
+        // every chunk's dispatches. No-op unless BUTTER_DISPATCH_CENSUS=1.
+        let chunkDispatch0 = DispatchCensus.enabled ? DispatchCensus.snapshot().total : 0
         var h = embedTokens(idsTensor, on: workCmd).reshaped(to: [t * hidden])
         // h is `[T, hidden]` flat. Dtype follows the embedding output —
         // for QuantizedEmbedding that's `scales.dtype` (model running
@@ -5240,6 +5285,18 @@ public final class Qwen35Model: LanguageModel {
                     gdnWall * 1000, gdnGpu * 1000,
                     totalGpu > 0 ? 100 * gdnGpu / totalGpu : 0,
                     totalGpu * 1000, nAttn, nGdn),
+                stderr)
+        }
+
+        // Census: per-chunk dispatch-count line, independent of
+        // profileLayers so a plain BUTTER_DISPATCH_CENSUS=1 run (no
+        // BUTTER_PROFILE_LAYERS) still gets a chunk-by-chunk dispatch
+        // scaling curve. Delta-only (see chunkDispatch0 above) — never
+        // resets the counter.
+        if DispatchCensus.enabled {
+            let chunkDispatch1 = DispatchCensus.snapshot().total
+            fputs(
+                "[census] prefill chunk startPos=\(startPosition) T=\(t) dispatches=\(chunkDispatch1 - chunkDispatch0)\n",
                 stderr)
         }
 

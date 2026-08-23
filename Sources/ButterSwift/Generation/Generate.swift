@@ -33,6 +33,7 @@
 // `GenerationStats` is always populated.
 
 import Foundation
+import IronSwift
 import Tokenizers
 #if canImport(Darwin)
     import Darwin
@@ -513,6 +514,12 @@ extension Model {
         // override `forwardMulti` with a batched attention/MLP path.
         //
         // Empty prompts hit the early-return below.
+        // Census tap (additive, env-gated): reset the standing
+        // per-kernel-name dispatch histogram (Sources/IronSwift/
+        // DispatchCensus.swift) right before prefill so counts below
+        // exclude model-load dispatches. No-op when
+        // BUTTER_DISPATCH_CENSUS is unset.
+        if DispatchCensus.enabled { DispatchCensus.reset() }
         let prefillStart = Date()
         var nextToken = 0
         // Qwen3.8 MTP attends over the committed prompt, not just tokens
@@ -552,6 +559,13 @@ extension Model {
                 try Task.checkCancellation()
                 let end = min(pos + chunkSize, n)
                 let chunk = Array(promptTokens[pos ..< end])
+                // Census tap (additive, env-gated): REAL (unforced) wall
+                // time for this chunk's forward + commit + wait, using the
+                // chunk boundary this loop already pays for — no extra
+                // synchronization added, so unlike BUTTER_PROFILE_LAYERS
+                // this number is NOT inflated. Reuses BUTTER_DISPATCH_CENSUS
+                // rather than adding a new flag.
+                let chunkWallT0 = DispatchCensus.enabled ? CFAbsoluteTimeGetCurrent() : 0
                 let cmd = Device.shared.makeCommandBuffer()
                 var qwenPromptHidden: Tensor?
                 if let qwen = qwenMTPPrefillModel,
@@ -570,6 +584,12 @@ extension Model {
                 }
                 cmd.commit()
                 cmd.waitUntilCompleted()
+                if DispatchCensus.enabled {
+                    let ms = (CFAbsoluteTimeGetCurrent() - chunkWallT0) * 1000
+                    fputs(
+                        "[census] prefill chunk REAL startPos=\(pos) T=\(chunk.count) wallMs=\(String(format: "%.2f", ms))\n",
+                        stderr)
+                }
                 PrefillAbortProbe.markCommitted(
                     promptCount: n, firstToken: promptTokens.first, chunkSize: chunkSize)
                 if let head = qwenMTPPrefillHead,
@@ -643,6 +663,11 @@ extension Model {
         }
         memTracker.endPrefill()
         onPrefillComplete?()
+        if DispatchCensus.enabled {
+            fputs("[dispatch-census] === PREFILL (\(promptTokens.count) tokens) ===\n", stderr)
+            DispatchCensus.report()
+            DispatchCensus.reset()
+        }
         let prefillTime = Date().timeIntervalSince(prefillStart)
         profile.recordPhase("prefill", durationS: prefillTime)
         profile.event("ttft")
@@ -971,6 +996,10 @@ extension Model {
                 lastStep = now
                 pos += 1
             }
+        }
+        if DispatchCensus.enabled {
+            fputs("[dispatch-census] === DECODE (\(generated.count) tokens) ===\n", stderr)
+            DispatchCensus.report()
         }
         let decodeTime = Date().timeIntervalSince(decodeStart)
         memTracker.endDecode()

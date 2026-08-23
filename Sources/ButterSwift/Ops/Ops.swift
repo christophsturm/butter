@@ -4853,6 +4853,27 @@ public enum Ops {
     ///   - `partialO` : `[nQHeads, blocks, headDim]` matching `q.dtype`
     ///   - `partialM` : `[nQHeads, blocks]` fp32 (running max)
     ///   - `partialL` : `[nQHeads, blocks]` fp32 (running lse)
+    /// Head dims with an emitted `iron_sdpa_decode_2pass_pass{1,2}_*`
+    /// kernel. `128` is the "generic" (unsuffixed) kernel name; the
+    /// others are dedicated `_d{64,96,256}` specializations. There is
+    /// no `_d512` 2-pass kernel — `sdpaDecode`'s single-pass d512 case
+    /// is the only route at that width.
+    ///
+    /// **This set is load-bearing for correctness, not just a nice
+    /// error message.** Before this precondition existed, every
+    /// headDim silently fell through to the generic (d128) kernel
+    /// below, which hardcodes a d=128 per-lane width (pass1: `lane*4`
+    /// over 32 lanes → reads/writes dims [0,128) only; pass2: `sg*4`
+    /// over 32 simdgroups → writes dims [0,128) only). At d=256
+    /// (Qwen3.8-27B's full-attention layers) that silently computed
+    /// attention over only the first half of the head and left
+    /// `attnOutScratch`'s [128,256) half stale for every decode step
+    /// once `kv.length` crossed `sdpa2PassThreshold` — for BOTH raw and
+    /// AURA K/V (see `campaign/aura/REPORT.md` for the corrected
+    /// root-cause writeup; the original `cf781222` AURA-only diagnosis
+    /// was wrong, this bug hits raw too).
+    private static let sdpa2PassSupportedHeadDims: Set<Int> = [64, 96, 128, 256]
+
     public static func sdpaDecode2Pass(
         q: Tensor, k: Tensor, v: Tensor,
         nQHeads: Int, nKVHeads: Int, headDim: Int,
@@ -4882,6 +4903,14 @@ public enum Ops {
         precondition(
             partialO.dtype == q.dtype && out.dtype == q.dtype,
             "Ops.sdpaDecode2Pass: partialO / out dtype must match q")
+        precondition(
+            sdpa2PassSupportedHeadDims.contains(headDim),
+            "Ops.sdpaDecode2Pass: head_dim must be one of "
+                + "\(sdpa2PassSupportedHeadDims.sorted()) (got \(headDim)); "
+                + "no iron_sdpa_decode_2pass_pass{1,2} kernel is emitted for "
+                + "this width — the generic (d128) kernel silently truncates "
+                + "wider heads instead of failing loudly, so this must reject "
+                + "rather than fall through")
 
         // Pass 1: per-block partial O / m / l. One TG per
         // (kv_head, block) with `gqa_factor` simdgroups × 32 lanes,
@@ -4898,8 +4927,13 @@ public enum Ops {
             width: nQHeads * pass2TgWidth, height: 1, depth: 1)
         let pass2Tg = MTLSize(width: pass2TgWidth, height: 1, depth: 1)
 
-        switch q.dtype {
-        case .f32:
+        // Dispatch on (headDim, dtype). `128` uses the generic
+        // (unsuffixed) kernel name; 64/96/256 route to the dedicated
+        // `_d{64,96,256}` specializations iron emits alongside it —
+        // same params, same pass1/pass2 threadgroup geometry, just a
+        // different per-lane width baked into the kernel body.
+        switch (headDim, q.dtype) {
+        case (128, .f32):
             IronKernels.iron_sdpa_decode_2pass_pass1_f32(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
@@ -4919,7 +4953,7 @@ public enum Ops {
                 out: out.buffer, outOffset: out.offset,
                 head_dim: UInt32(headDim), blocks: UInt32(blocks),
                 gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
-        case .f16:
+        case (128, .f16):
             IronKernels.iron_sdpa_decode_2pass_pass1_f16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
@@ -4939,7 +4973,7 @@ public enum Ops {
                 out: out.buffer, outOffset: out.offset,
                 head_dim: UInt32(headDim), blocks: UInt32(blocks),
                 gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
-        case .bf16:
+        case (128, .bf16):
             IronKernels.iron_sdpa_decode_2pass_pass1_bf16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
@@ -4959,8 +4993,189 @@ public enum Ops {
                 out: out.buffer, outOffset: out.offset,
                 head_dim: UInt32(headDim), blocks: UInt32(blocks),
                 gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        case (64, .f32):
+            IronKernels.iron_sdpa_decode_2pass_pass1_d64_f32(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            IronKernels.iron_sdpa_decode_2pass_pass2_d64_f32(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        case (64, .f16):
+            IronKernels.iron_sdpa_decode_2pass_pass1_d64_f16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            IronKernels.iron_sdpa_decode_2pass_pass2_d64_f16(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        case (64, .bf16):
+            IronKernels.iron_sdpa_decode_2pass_pass1_d64_bf16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            IronKernels.iron_sdpa_decode_2pass_pass2_d64_bf16(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        case (96, .f32):
+            IronKernels.iron_sdpa_decode_2pass_pass1_d96_f32(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            IronKernels.iron_sdpa_decode_2pass_pass2_d96_f32(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        case (96, .f16):
+            IronKernels.iron_sdpa_decode_2pass_pass1_d96_f16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            IronKernels.iron_sdpa_decode_2pass_pass2_d96_f16(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        case (96, .bf16):
+            IronKernels.iron_sdpa_decode_2pass_pass1_d96_bf16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            IronKernels.iron_sdpa_decode_2pass_pass2_d96_bf16(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        case (256, .f32):
+            IronKernels.iron_sdpa_decode_2pass_pass1_d256_f32(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            IronKernels.iron_sdpa_decode_2pass_pass2_d256_f32(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        case (256, .f16):
+            IronKernels.iron_sdpa_decode_2pass_pass1_d256_f16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            IronKernels.iron_sdpa_decode_2pass_pass2_d256_f16(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        case (256, .bf16):
+            IronKernels.iron_sdpa_decode_2pass_pass1_d256_bf16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            IronKernels.iron_sdpa_decode_2pass_pass2_d256_bf16(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
         default:
-            fatalError("Ops.sdpaDecode2Pass: unsupported dtype \(q.dtype)")
+            fatalError(
+                "Ops.sdpaDecode2Pass: unsupported (head_dim=\(headDim), dtype=\(q.dtype))")
         }
     }
 
@@ -6262,6 +6477,120 @@ public enum Ops {
                 heads_chunk: headsChunk, q_start_position: qStartPosition,
                 has_sinks: sinksFlag, window_size: win,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
+        // d=256 cases (kb4_vb2 + kb4_vb4). iron emits these under
+        // `iron_aura_flash_sdpa<T>`'s DIM=[64,128,256] variant axis
+        // (aura_flash_sdpa.rs) for both value widths — see
+        // "## DISPATCH INVARIANTS" in that file's module doc. This
+        // dispatch reuses the legacy `heads_chunk == 1` / grid=[32,
+        // nQHeads,1] / tg=[32,1,1] launch already computed above for
+        // d128 — the doc explicitly states that launch "remains
+        // correct for heads_chunk == 1", so no new grid math is
+        // needed for correctness. The faster 8-way parallel-KV-walk
+        // launch (`grid=[nKVHeads*(repeat_count/heads_chunk),1,1]`,
+        // `tg=[256,1,1]`) is a follow-up perf lever, not required to
+        // enable d256 — see campaign/03-aura-d256-enable-notes.md.
+        case (4, 2, 256, .f32):
+            IronKernels.iron_aura_flash_sdpa_kb4_vb2_d256_f32(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount, num_q_heads: numQ,
+                heads_chunk: headsChunk, q_start_position: qStartPosition,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 2, 256, .f16):
+            IronKernels.iron_aura_flash_sdpa_kb4_vb2_d256_f16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount, num_q_heads: numQ,
+                heads_chunk: headsChunk, q_start_position: qStartPosition,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 2, 256, .bf16):
+            IronKernels.iron_aura_flash_sdpa_kb4_vb2_d256_bf16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount, num_q_heads: numQ,
+                heads_chunk: headsChunk, q_start_position: qStartPosition,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 4, 256, .f32):
+            IronKernels.iron_aura_flash_sdpa_kb4_vb4_d256_f32(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount, num_q_heads: numQ,
+                heads_chunk: headsChunk, q_start_position: qStartPosition,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 4, 256, .f16):
+            IronKernels.iron_aura_flash_sdpa_kb4_vb4_d256_f16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount, num_q_heads: numQ,
+                heads_chunk: headsChunk, q_start_position: qStartPosition,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (4, 4, 256, .bf16):
+            IronKernels.iron_aura_flash_sdpa_kb4_vb4_d256_bf16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                sinks: sinks.buffer, sinksOffset: sinks.offset,
+                out: out.buffer, outOffset: out.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount, num_q_heads: numQ,
+                heads_chunk: headsChunk, q_start_position: qStartPosition,
+                has_sinks: sinksFlag, window_size: win,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
             preconditionFailure(
                 "Ops.auraFlashSdpa: unsupported (keyBits=\(keyBits), "
@@ -6279,6 +6608,35 @@ public enum Ops {
         guard [DType.f32, .f16, .bf16].contains(dtype) else { return false }
         // d=64 iron kernels exist but Butter side hasn't wired their
         // Ops dispatch yet — gate to d=128 (Qwen3 / Llama-3 family).
+        //
+        // d=256 (Qwen3.8-27B's full-attention layers) is DELIBERATELY
+        // NOT enabled here even though `iron_aura_flash_sdpa_kb4_vb{2,4}
+        // _d256_*` are emitted and dispatched below (case (4,2,256,*) /
+        // (4,4,256,*)) — CONFIRMED SLOW on this worktree
+        // (campaign/aura/REPORT.md, verifier-corrected): 0.89–3.45 tok/s
+        // decode (vs ~20-25 tok/s for the working paths), using the
+        // legacy `heads_chunk==1` / grid=[32,nQHeads,1] launch this
+        // dispatch reuses from the d128 case above — that alone is
+        // reason enough to keep it gated off. Correctness is NOT shown
+        // broken: the earlier "32K needle MISS" claim for this specific
+        // path was a mis-transcription (the actual 32K single-pass d256
+        // run HIT; see the verifier's gate-table correction) — treat
+        // correctness here as unproven either way, not disproven. The
+        // sibling TWO-PASS d256 kernel (`supportsAuraFlashSdpa2Pass`
+        // below, kb4_vb2 only) is CONFIRMED CORRECT (32K needle hit,
+        // byte-exact per PR #207) and stays enabled — this single-pass
+        // path is the ONLY route for kb4_vb4 (aura4v4, the default
+        // recipe) since iron never emitted a kb4_vb4_d256 two-pass
+        // kernel, so aura4v4 `--aura-decode-path compressed` correctly
+        // falls through to the dense dequant-mirror path via the `else`
+        // branch in `Qwen3xText.swift`'s dispatch chain (safe, just not
+        // the fast path). Root cause of the slowness NOT isolated
+        // (ruled out: legacy-launch grid math per iron's own module doc,
+        // kv_stride/q_start_position wiring — both verified correct
+        // here); prime suspect is the missing heads_chunk-parallel
+        // launch (iron #128) starving/serializing the walk. Re-enable
+        // only after a fresh perf pass confirms it's fixed (correctness
+        // can be re-checked in the same pass but is not the blocker).
         guard headDim == 128 else { return false }
         if keyBits == 4 && (valueBits == 2 || valueBits == 4) { return true }
         return false
@@ -6460,6 +6818,90 @@ public enum Ops {
                 output: out.buffer, outputOffset: out.offset,
                 dim: dim, num_blocks: numBlocksU,
                 gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
+        // d256 two-pass, kb4_vb2 ONLY — iron never emitted a
+        // kb4_vb4_d256 pass-1 kernel (aura_flash_p1.rs's variant
+        // axis is VB=[2,2,2,4,4], DIM=[64,128,256,64,128] — 4v4
+        // stops at d128). Reinstates the cases PR #213 removed;
+        // see campaign/03-aura-d256-enable-notes.md for why #213's
+        // "incoherent fallback" observation is most likely a
+        // stale-IRON_DIR artifact, not a real kernel bug — VERIFY
+        // against a freshly regenerated IronKernels.swift before
+        // trusting this reinstatement.
+        case (4, 2, 256, .f32):
+            IronKernels.iron_aura_flash_p1_kb4_vb2_d256_f32(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount,
+                num_blocks: numBlocksU, block_size: blockSizeU,
+                q_position: qPosition,
+                gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
+            IronKernels.iron_aura_flash_pass2_d256_f32(
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                output: out.buffer, outputOffset: out.offset,
+                dim: dim, num_blocks: numBlocksU,
+                gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
+        case (4, 2, 256, .f16):
+            IronKernels.iron_aura_flash_p1_kb4_vb2_d256_f16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount,
+                num_blocks: numBlocksU, block_size: blockSizeU,
+                q_position: qPosition,
+                gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
+            IronKernels.iron_aura_flash_pass2_d256_f16(
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                output: out.buffer, outputOffset: out.offset,
+                dim: dim, num_blocks: numBlocksU,
+                gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
+        case (4, 2, 256, .bf16):
+            IronKernels.iron_aura_flash_p1_kb4_vb2_d256_bf16(
+                q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
+                key_packed: kPacked.buffer, key_packedOffset: kPacked.offset,
+                key_norms: kNorms.buffer, key_normsOffset: kNorms.offset,
+                key_codebook: kCodebook.buffer, key_codebookOffset: kCodebook.offset,
+                val_packed: vPacked.buffer, val_packedOffset: vPacked.offset,
+                val_norms: vNorms.buffer, val_normsOffset: vNorms.offset,
+                val_codebook: vCodebook.buffer, val_codebookOffset: vCodebook.offset,
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                dim: dim, key_packed_width: kpw, value_packed_width: vpw,
+                tokens: tokens, kv_stride: kvStrideU,
+                repeat_count: repeatCount,
+                num_blocks: numBlocksU, block_size: blockSizeU,
+                q_position: qPosition,
+                gridSize: p1Grid, threadgroupSize: p1Tg, on: cmd)
+            IronKernels.iron_aura_flash_pass2_d256_bf16(
+                o_partials: partialO.buffer, o_partialsOffset: partialO.offset,
+                m_partials: partialM.buffer, m_partialsOffset: partialM.offset,
+                l_partials: partialL.buffer, l_partialsOffset: partialL.offset,
+                output: out.buffer, outputOffset: out.offset,
+                dim: dim, num_blocks: numBlocksU,
+                gridSize: p2Grid, threadgroupSize: p2Tg, on: cmd)
         case (4, 4, 128, .f32):
             IronKernels.iron_aura_flash_p1_kb4_vb4_d128_f32(
                 q_rot: qScratch.buffer, q_rotOffset: qScratch.offset,
@@ -6545,13 +6987,20 @@ public enum Ops {
     }
 
     /// Predicate for the `auraFlashSdpa2Pass` supported-scheme set.
-    /// Matches the emitted pass-1 kernels: 4v2 and 4v4 at d128.
+    /// Matches the emitted pass-1 kernels: 4v2 at d128 AND d256 (iron
+    /// aura_flash_p1.rs DIM=[64,128,256,64,128] for VB=[2,2,2,4,4] —
+    /// 4v4 stops at d128, no kb4_vb4_d256 pass-1 kernel exists), plus
+    /// 4v4 at d128. Re-widened from #213's d128-only gate — see
+    /// campaign/03-aura-d256-enable-notes.md before trusting this on a
+    /// freshly regenerated IronKernels.swift.
     public static func supportsAuraFlashSdpa2Pass(
         keyBits: Int, valueBits: Int, headDim: Int, dtype: DType
     ) -> Bool {
         guard [DType.f32, .f16, .bf16].contains(dtype) else { return false }
-        guard headDim == 128 else { return false }
-        if keyBits == 4 && (valueBits == 2 || valueBits == 4) { return true }
+        if keyBits == 4 && valueBits == 2 && (headDim == 128 || headDim == 256) {
+            return true
+        }
+        if keyBits == 4 && valueBits == 4 && headDim == 128 { return true }
         return false
     }
 
