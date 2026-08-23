@@ -752,6 +752,22 @@ extension SpecDecode {
             statePlanes && ButterEnv["BUTTER_GDN_TAIL_STATE_PLANES"] != "0"
         var planeSteps = 0
         var fullPlaneAdoptionsSkipped = 0
+        // KNOWN ISSUE (campaign/specverify/REPORT.md section 4, filed during
+        // the specverify fix loop, not yet root-caused): with
+        // BUTTER_QWEN_MTP_ALWAYS_REPLAY=1 and these two knobs at their
+        // defaults (statePlanes on, batchedReplay on), two back-to-back
+        // runs — identical env, identical binary, idle GPU — produced
+        // DIFFERENT greedy token streams (228/256 mismatch from idx 26).
+        // D1 (BUTTER_SDPA_2PASS_DEPTH_BLOCKS) was off in both runs, so this
+        // is orthogonal to and predates that investigation. Practical
+        // consequence: a single-run "N/N golden" gate against this default
+        // combination is not trustworthy evidence of correctness on its
+        // own — only the full bit-exact recipe (BUTTER_GDN_STATE_PLANES=0
+        // BUTTER_QWEN_MTP_STATE_REWIND=0 BUTTER_QWEN_MTP_BATCHED_REPLAY=0
+        // BUTTER_QWEN_MTP_ALWAYS_REPLAY=1) has been confirmed
+        // run-to-run deterministic. Leading suspects (unconfirmed):
+        // `adoptPlanes`'s plane-select path, or batched replay's cache-
+        // write ordering interacting with command-buffer scheduling.
         let batchedReplay =
             ButterEnv["BUTTER_QWEN_MTP_BATCHED_REPLAY"] != "0"
         // Batched lockstep is the Qwen3.8 default; set

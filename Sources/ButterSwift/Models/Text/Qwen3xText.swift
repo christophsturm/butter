@@ -2888,7 +2888,60 @@ public final class Qwen35AttentionMixer: Module {
     private var partialOScratch: Tensor?
     private var partialMScratch: Tensor?
     private var partialLScratch: Tensor?
-    private let sdpa2PassBlocks: Int = 32
+    /// D1 (campaign/07-main-session-directives.md): depth-scale the
+    /// T=1 decode 2-pass block count instead of a fixed 32. Mirrors the
+    /// MTP-verify nq path (`Ops.recommendedBlocksM5Max`, already
+    /// depth-scaled there) — before this fix, T=1 decode pinned 32
+    /// threadgroups regardless of KV depth (128 threadgroups of 192
+    /// threads walking all 131,072 KV rows at 128K each), while the
+    /// verify path used up to 1024.
+    ///
+    /// DEFAULT OFF (opt in with `BUTTER_SDPA_2PASS_DEPTH_BLOCKS=1`).
+    ///
+    /// ROOT-CAUSE UPDATE (campaign/specverify/REPORT.md section 1,
+    /// fix-loop pass after the adversarial verifier's must-fix list):
+    /// the divergence below is NOT a kernel bug and NOT GPU contention
+    /// (both were checked and refuted — see the report). New GPU
+    /// correctness tests dispatch `iron_sdpa_decode_2pass_pass1_d256` +
+    /// `pass2_d256` directly at every block tier this function can
+    /// select, at the real GQA shape and with a production-realistic
+    /// padded `kv_stride`, against a CPU SDPA reference:
+    /// `sdpa_decode_2pass_d256_blocks_sweep_gqa_f32` and
+    /// `_padded_stride_blocks_gqa_f32` in iron's
+    /// `sdpa_decode_2pass_gpu.rs` — max|diff| ~1e-8 (float32 noise) at
+    /// every tier. The kernel is mathematically correct everywhere D1
+    /// can route it.
+    ///
+    /// What actually happens: depth-scaling `blocks` changes the
+    /// partial-reduction tree's summation order for a mathematically
+    /// equivalent result, and the sub-ULP rounding difference from that
+    /// reordering occasionally crosses a greedy-argmax decision
+    /// boundary — inherent to any numerically different decode kernel,
+    /// not specific to this one. Confirmed via 3 clean interleaved
+    /// plain-decode A/B pairs at 32K (top-1 13/64, diverging at the
+    /// SAME idx 13 every time — fully deterministic, not contention)
+    /// and 2 clean pairs at 128K (64/64, bit-exact every time) on a
+    /// verified-idle GPU. Once one token flips, the autoregressive
+    /// continuation is a different — but not wrong — trajectory for
+    /// good, which is why spec-decode's bit-exact replay gate (which
+    /// requires literal token-ID identity vs a blocks=32 reference)
+    /// sees this as "201/256 mismatch from idx 54": one flip, then the
+    /// rest cascade. See the report for the full evidence chain.
+    ///
+    /// Stays default OFF: it still fails the directive's own BAR
+    /// (top-1 ≥63/64 vs blocks=32) at 32K, so it isn't a safe default
+    /// flip as-is — but the failure mode is now understood rather than
+    /// attributed to a phantom kernel bug or a contending process.
+    /// `partialOScratch`'s resize check below re-keys on the CURRENT
+    /// value every call regardless of which branch runs (cheap: an Int
+    /// compare against 4 tiers), same pattern `nqPartialBlocks` already
+    /// uses for the verify tile.
+    private func sdpa2PassBlocks(nKV: Int, headsPerGroup: Int) -> Int {
+        if ButterEnv["BUTTER_SDPA_2PASS_DEPTH_BLOCKS"] == "1" {
+            return Ops.recommendedBlocksM5Max(nKV: nKV, nSimds: headsPerGroup)
+        }
+        return 32
+    }
     /// Multi-query (MTP verify) 2-pass partials. Separate from T=1
     /// partial*Scratch: shape is [nQuery, nHeads, blocks, headDim] /
     /// [nQuery, nHeads, blocks] and blocks follow recommendedBlocksM5Max.
@@ -3404,23 +3457,24 @@ public final class Qwen35AttentionMixer: Module {
             // around 2-pass — it uses the same threshold-gated path as
             // raw, same as every other cache kind.
             if useTwoPassDecode && kv.length >= sdpa2PassThreshold {
+                let blocks = sdpa2PassBlocks(
+                    nKV: kv.length, headsPerGroup: nHeads / nKVHeads)
                 if partialOScratch == nil
-                    || partialOScratch!.elementCount
-                        != nHeads * sdpa2PassBlocks * headDim
+                    || partialOScratch!.elementCount != nHeads * blocks * headDim
                     || partialOScratch!.dtype != qNormed.dtype
                 {
                     partialOScratch = Tensor.empty(
-                        shape: [nHeads, sdpa2PassBlocks, headDim],
+                        shape: [nHeads, blocks, headDim],
                         dtype: qNormed.dtype, device: device)
                     partialMScratch = Tensor.empty(
-                        shape: [nHeads, sdpa2PassBlocks], dtype: .f32, device: device)
+                        shape: [nHeads, blocks], dtype: .f32, device: device)
                     partialLScratch = Tensor.empty(
-                        shape: [nHeads, sdpa2PassBlocks], dtype: .f32, device: device)
+                        shape: [nHeads, blocks], dtype: .f32, device: device)
                 }
                 Ops.sdpaDecode2Pass(
                     q: qForSdpa, k: cacheK, v: cacheV,
                     nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-                    nKV: kv.length, kvStride: kv.maxSeq, blocks: sdpa2PassBlocks,
+                    nKV: kv.length, kvStride: kv.maxSeq, blocks: blocks,
                     scale: scale,
                     partialO: partialOScratch!,
                     partialM: partialMScratch!,
@@ -5094,11 +5148,30 @@ public final class Qwen35Model: LanguageModel {
         // only (kills pipelining). =2 also records per-layer phases.
         // GPU windows cover the outer workCmd only — layers that commit
         // internal buffers (MoE FFN paths) undercount slightly.
+        //
+        // BUTTER_PROFILE_LAYERS_MAX_T=<n> (specverify wave, D10): this
+        // call site serves BOTH large-T prefill chunks (default step
+        // 1024) AND small-T MTP verify rounds (T = gamma, typically
+        // 3-9) — forcing a commit+wait after every one of 64 layers is
+        // ~cheap relative to a 1024-row chunk's real GPU work (~1.1-1.7x
+        // wall inflation, matches the T31/T26 prior-art caveat) but at
+        // 128K depth that is still ~125 chunks x 9s/chunk of pure
+        // instrumentation overhead with zero benefit for a task that
+        // only needs the verify rounds' attn/gdn split. Unset (default)
+        // preserves the exact prior behavior (profiles every call).
+        // When set, calls with `t` above the threshold skip forced
+        // per-layer sync entirely (plain pipelined dispatch, as if
+        // BUTTER_PROFILE_LAYERS were unset for that one call) so a
+        // prefill-to-128K-then-profile-the-verify-rounds run isn't
+        // paying O(chunks x layers) forced round-trips it doesn't need.
+        let profileLayersMaxT = Int(ButterEnv["BUTTER_PROFILE_LAYERS_MAX_T"] ?? "")
+        let profileLayersGatedByT = profileLayersMaxT.map { t <= $0 } ?? true
         let profileLayers =
-            ButterEnv["BUTTER_PROFILE_LAYERS"] == "1"
-                || ButterEnv["BUTTER_PROFILE_LAYERS"] == "2"
+            (ButterEnv["BUTTER_PROFILE_LAYERS"] == "1"
+                || ButterEnv["BUTTER_PROFILE_LAYERS"] == "2")
+            && profileLayersGatedByT
         let profilePerLayer =
-            ButterEnv["BUTTER_PROFILE_LAYERS"] == "2"
+            ButterEnv["BUTTER_PROFILE_LAYERS"] == "2" && profileLayersGatedByT
 
         var workCmd = device.makeCommandBuffer()
         let embWall0 = profileLayers ? CFAbsoluteTimeGetCurrent() : 0
